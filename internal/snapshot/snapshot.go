@@ -25,9 +25,9 @@ const MetaDir = "meta"
 
 // Manager uploads snapshots of one SQLite database to one session directory.
 type Manager struct {
-	MetaPath string           // local sqlite database path
+	MetaPath string            // local sqlite database path
 	Store    *pelicanobj.Store // federation prefix store
-	Session  string           // unique per-session subdirectory name
+	Session  string            // unique per-session subdirectory name
 
 	seq int
 }

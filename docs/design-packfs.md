@@ -107,7 +107,49 @@ self-contained blob, packed, content-addressed.
 - **Splitting:** when a catalog exceeds its threshold, it splits at a
   directory boundary chosen by subtree weight; the parent catalog carries a
   transition-point row (the CVMFS nested-catalog scheme). Split at S_max,
-  merge back at S_min << S_max — hysteresis prevents thrashing.
+  merge back at S_min << S_max — hysteresis prevents thrashing. Policy and
+  thresholds below are **measured**, not guessed (simulation over four
+  real trees: a miniconda root, a node_modules, glibc, and a 16GB/677K-
+  entry Go module cache; proto-catalog SQLite validated the row model).
+
+  **Weight function:** W = 200·entries + inline_bytes (+ xattr bytes).
+  Measured structural cost is 176 B/entry, so 200 is mildly conservative.
+  Inline bytes MUST be in the weight — they dominate real catalogs (62-91%
+  of files inline across the sample trees; 46 of 59 MB of a miniconda's
+  catalog weight is inline data). An entry-count threshold alone (CVMFS's
+  choice) would produce wildly variable catalog sizes here.
+
+  **Policy: bottom-up, peel largest child first.** Walking post-order, a
+  directory whose accumulated weight exceeds S_max detaches its largest
+  attached child subtree (which becomes a nested catalog), repeating until
+  it fits. The naive alternative — detach the whole directory when it
+  exceeds — measurably fails: a directory of many medium children detaches
+  as one catalog 10-15x over threshold. Peeling keeps p95 <= S_max on
+  every sampled tree.
+
+  **Thresholds: S_max = 8 MiB, S_min = 1 MiB** (merge a nested catalog
+  below S_min into its parent only if the parent stays under S_max; 8:1
+  hysteresis). At 8 MiB: miniconda = 31 catalogs (nest depth <= 3),
+  node_modules = 87, glibc = 10, Go module cache = 527 (depth <= 4, zero
+  pathological). 2 MiB explodes catalog counts (1,447 for the module
+  cache, depth 6) for no churn benefit; 32 MiB collapses miniconda to two
+  catalogs, making a one-file touch republish ~30 MB. Dirty amplification
+  at 8 MiB: a leaf write republishes the leaf catalog plus <= 4 ancestors,
+  and post-split ancestors hold only residue rows, so the republish unit
+  is ~one catalog (<= 8 MiB raw, ~1/3 of that compressed — catalogs
+  measure 36% under zlib).
+
+  **Flat-directory exception:** a single directory whose own rows exceed
+  S_max cannot split (catalog roots are directories) and remains one
+  oversized catalog. Measured worst case: @mui/icons-material at 13.3 MiB
+  (thousands of tiny inlined files in one directory) — under 5 MiB
+  compressed, tolerable, and rare (one to two per sampled ecosystem tree).
+
+  **Hardlink validation:** the miniconda tree carries 23,598 hardlink
+  groups and every one of them spans catalogs at any reasonable S_max —
+  confirming both that eager promotion was the right call (lazy promotion
+  would have bought nothing) and that its cost is trivial: ~24K shard
+  records, roughly 5 MB, for a full conda installation.
 - Catalogs contain **only** records with nlink == 1, plus references
   (see hardlinks). This makes every directory boundary a legal split point
   unconditionally — the splitter needs no hardlink awareness.
@@ -681,7 +723,9 @@ transactionality (the CUT/RECONCILE/TRANSFORM/UPLOAD/FLIP pipeline, with
 repack folded into TRANSFORM); chunk identity and hashing (keyed BLAKE3
 content addressing, FastCDC 1/4/16 MiB); phase-2 hydration (full metadata,
 lazy data; lazy descent is phase 3); versioned pack lists (identity vs.
-location); disaster recovery provisions.
+location); disaster recovery provisions; catalog split heuristics
+(measured: peel-largest-child policy, W = 200·entries + inline bytes,
+S_max 8 MiB / S_min 1 MiB).
 
 Roughly ordered by how much they block implementation:
 
@@ -691,29 +735,26 @@ Roughly ordered by how much they block implementation:
    is the pack). Narrowed by the publish design: repack is now a
    TRANSFORM step, so in v2 there is no out-of-band pack mutation left to
    design — only retention policy.
-2. **Catalog split heuristics.** Weight function (entries vs bytes vs
-   inline data), S_max/S_min values, split-point search; validate against
-   real trees (conda env, linux kernel, home directory).
-3. **Superblock signing and key management.** Same key as KEK or a separate
+2. **Superblock signing and key management.** Same key as KEK or a separate
    signing identity; key rotation; what a reader trusts on first mount
    (TOFU vs pinned key vs federation-issued).
-4. **Federation namespace layout.** Object naming (outer hash), prefix
+3. **Federation namespace layout.** Object naming (outer hash), prefix
    layout, how gc/fsck/`pelfs`-tooling enumerate packs efficiently
    (PROPFIND vs a pack manifest object).
-5. **Schema details.** Dirent/record column layout, xattrs, special files,
+4. **Schema details.** Dirent/record column layout, xattrs, special files,
    sparse files; what of the JuiceFS schema is kept vs dropped (sessions,
    trash, counters all go).
-6. **`pelfs rescue`.** The scavenging tool from the disaster-recovery
+5. **`pelfs rescue`.** The scavenging tool from the disaster-recovery
    section: pack inventory, generation assembly, damage report,
    lost+found materialization. Depends on typed entries (reserved in the
    phase-1 trailer already), self-identifying catalogs, and
    superblock-backup entries — all format provisions that must land with
    phase 2, since retrofitting them later leaves early volumes
    unrescuable.
-7. **Benchmarks and acceptance criteria.** conda env create, git clone,
+6. **Benchmarks and acceptance criteria.** conda env create, git clone,
    kernel untar, JupyterLab cold-start; targets for publish latency and
    mount-to-first-byte.
-8. **v1 -> v2 migration.** Probably "none — scratch volumes drain and
+7. **v1 -> v2 migration.** Probably "none — scratch volumes drain and
     recreate," but that should be an explicit decision, and phase 1's pack
     middleware must not paint v1 volumes into a corner.
 

@@ -81,6 +81,9 @@ func (hc *handleCache) knownSize(e *cachedHandle) int64 {
 // acquire returns the cached write handle for name (bumping its refcount),
 // or nil when none is cached.
 func (hc *handleCache) acquire(name string) *cachedHandle {
+	if nfsNoHandleCache {
+		return nil
+	}
 	hc.mu.Lock()
 	defer hc.mu.Unlock()
 	e := hc.entries[name]
@@ -96,6 +99,10 @@ func (hc *handleCache) acquire(name string) *cachedHandle {
 // entry for the same path is evicted first (its holders finish on the old
 // handle; new opens see the new one).
 func (hc *handleCache) add(name string, f *jfs.File, size int64) *cachedHandle {
+	if nfsNoHandleCache {
+		// Not cached: the caller closes the handle when the RPC ends.
+		return nil
+	}
 	hc.mu.Lock()
 	defer hc.mu.Unlock()
 	if old := hc.entries[name]; old != nil {

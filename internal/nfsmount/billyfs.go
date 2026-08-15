@@ -10,6 +10,7 @@
 package nfsmount
 
 import (
+	"io"
 	"os"
 	"path"
 	"strings"
@@ -213,6 +214,7 @@ func (b *billyFS) Stat(filename string) (os.FileInfo, error) {
 	// (and the client's post-op attribute checks) see current state without
 	// forcing a slice-fragmenting flush.
 	if size, mtime, ok := b.hc.statOverlay(name); ok && size > wrapped.Size() {
+		nfsDebugf("Stat %s: meta=%d buffered=%d (overlaying)", name, wrapped.Size(), size)
 		wrapped = &overlaidFileInfo{FileInfo: wrapped, size: size, mtime: mtime}
 	}
 	return wrapped, nil
@@ -395,7 +397,30 @@ func (f *billyFile) Read(p []byte) (int, error) {
 }
 
 func (f *billyFile) ReadAt(p []byte, off int64) (int, error) {
-	return f.f.Pread(f.ctx, p, off)
+	// io.ReaderAt requires the buffer to be filled unless a non-nil error is
+	// returned, and go-nfs's READ handler depends on that: it issues a
+	// single ReadAt and, when the request reaches the end of the file,
+	// marks the reply EOF. A short count with a nil error would therefore
+	// be reported to the client as "the file ends here". jfs.Pread makes no
+	// such guarantee, so loop.
+	total := 0
+	for total < len(p) {
+		n, err := f.f.Pread(f.ctx, p[total:], off+int64(total))
+		total += n
+		if err != nil {
+			if total == len(p) && err == io.EOF {
+				return total, nil
+			}
+			nfsDebugf("ReadAt %s off=%d want=%d got=%d: %v", f.name, off, len(p), total, err)
+			return total, err
+		}
+		if n == 0 {
+			nfsDebugf("ReadAt %s off=%d want=%d got=%d: short read with no error",
+				f.name, off, len(p), total)
+			return total, io.EOF
+		}
+	}
+	return total, nil
 }
 
 func (f *billyFile) Write(p []byte) (int, error) {
@@ -412,6 +437,9 @@ func (f *billyFile) WriteAt(p []byte, off int64) (int, error) {
 	n, errno := f.f.Pwrite(f.ctx, p, off)
 	if errno == 0 && f.ch != nil {
 		f.hc.noteWrite(f.ch, off+int64(n))
+	}
+	if errno != 0 || n != len(p) {
+		nfsDebugf("WriteAt %s off=%d want=%d got=%d errno=%v", f.name, off, len(p), n, errno)
 	}
 	return n, pe("write", f.name, errno)
 }

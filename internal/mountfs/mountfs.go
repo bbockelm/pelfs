@@ -150,6 +150,18 @@ func Mount(opts Options) (*Mounted, error) {
 		opts.Compression = "none"
 	}
 
+	// Unprivileged sessions take ownership of the whole volume before
+	// mounting: files created by other sessions (e.g. the root-running
+	// Docker fallback) would otherwise be unwritable through the kernel's
+	// mode-bit checks on a FUSE mount.
+	if os.Getuid() != 0 {
+		if n, err := squashOwnership(opts.MetaPath, uint32(os.Getuid()), uint32(os.Getgid())); err != nil {
+			logger.Warnf("could not normalize volume ownership: %s", err)
+		} else if n > 0 {
+			logger.Infof("took ownership of %d inodes created by other sessions", n)
+		}
+	}
+
 	metaConf := meta.DefaultConf()
 	metaConf.MountPoint = opts.MountPoint
 	metaConf.AtimeMode = meta.NoAtime

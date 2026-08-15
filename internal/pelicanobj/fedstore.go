@@ -61,6 +61,11 @@ func newFedStore(ctx context.Context, cfg Config) (*fedStore, error) {
 		opts = append(opts, client.WithTokenLocation(cfg.TokenPath))
 	}
 	opts = append(opts, client.WithAcquireToken(cfg.AcquireToken))
+	// Accept either CRC32C (the client default) or MD5 for transfer
+	// verification. Most deployed origins provide only MD5; without it in
+	// the requested set, every block transfer logs a warning about falling
+	// back to a checksum type that wasn't asked for.
+	opts = append(opts, client.WithRequestChecksums([]client.ChecksumType{client.AlgCRC32C, client.AlgMD5}))
 
 	prefix := strings.TrimRight(cfg.PrefixURL, "/")
 	return &fedStore{

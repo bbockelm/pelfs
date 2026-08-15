@@ -166,10 +166,19 @@ func (hc *handleCache) noteTruncate(e *cachedHandle, size int64) {
 // statOverlay reports the freshest known size/mtime for name when a dirty
 // cached handle exists: buffered writes are invisible to path-based Stat
 // until flushed.
+// The dirty flag deliberately does NOT gate this. While a handle is cached
+// the metadata length can lag arbitrarily far behind — a 59MB git pack was
+// observed with meta=0 for its entire write, because nothing closed or
+// flushed the handle — so falling back to the metadata size the moment
+// dirty happens to be false reports a file as far shorter than it is, and
+// go-nfs turns that into obj.Count=0 with EOF set: the client is told the
+// file ends there. Reporting the largest size we know is always safe;
+// callers only apply it when it exceeds the metadata size, so it can never
+// under-report.
 func (hc *handleCache) statOverlay(name string) (size int64, mtime time.Time, ok bool) {
 	hc.mu.Lock()
 	defer hc.mu.Unlock()
-	if e := hc.entries[name]; e != nil && e.dirty {
+	if e := hc.entries[name]; e != nil {
 		return e.size, e.lastUse, true
 	}
 	return 0, time.Time{}, false

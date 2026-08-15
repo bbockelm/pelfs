@@ -230,9 +230,18 @@ func (b *billyFS) Stat(filename string) (os.FileInfo, error) {
 	// flushes; overlay the freshest known size so go-nfs's per-WRITE stat
 	// (and the client's post-op attribute checks) see current state without
 	// forcing a slice-fragmenting flush.
-	if size, mtime, ok := b.hc.statOverlay(name); ok && size > wrapped.Size() {
+	size, mtime, ok := b.hc.statOverlay(name)
+	switch {
+	case ok && size > wrapped.Size():
 		nfsDebugf("Stat %s: meta=%d buffered=%d (overlaying)", name, wrapped.Size(), size)
 		wrapped = &overlaidFileInfo{FileInfo: wrapped, size: size, mtime: mtime}
+	case ok:
+		// Cached handle exists but does not extend the file. Logged because
+		// a size here that is far below what was written is what makes
+		// go-nfs report a false EOF.
+		nfsDebugf("Stat %s: meta=%d buffered=%d (no overlay)", name, wrapped.Size(), size)
+	default:
+		nfsDebugf("Stat %s: meta=%d (uncached)", name, wrapped.Size())
 	}
 	return wrapped, nil
 }
@@ -420,6 +429,13 @@ func (f *billyFile) ReadAt(p []byte, off int64) (int, error) {
 	// marks the reply EOF. A short count with a nil error would therefore
 	// be reported to the client as "the file ends here". jfs.Pread makes no
 	// such guarantee, so loop.
+	if len(p) == 0 {
+		// go-nfs sizes the buffer from Stat, so an empty one means it
+		// decided the file ends at this offset — the shape of a false EOF.
+		nfsDebugf("ReadAt %s off=%d want=0 (server believes file ends here)%s",
+			f.name, off, f.sizeDiagnosis())
+		return 0, nil
+	}
 	total := 0
 	for total < len(p) {
 		n, err := f.f.Pread(f.ctx, p[total:], off+int64(total))

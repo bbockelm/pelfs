@@ -92,14 +92,18 @@ func Run(opts Options) (int, error) {
 			"-v", opts.TokenPath+":/run/pelfs/token:ro",
 			"-e", "BEARER_TOKEN_FILE=/run/pelfs/token")
 	}
-	// Share the host's Pelican credential store (wallet, refresh tokens)
-	// so the client inside the container reuses existing credentials
-	// instead of launching fresh device-authorization flows. Mounted
-	// read-write: token refreshes are written back.
+	// Share the host's Pelican client config base — which holds the
+	// credential wallet at <base>/credentials/client-credentials.pem —
+	// so the client inside the container reuses credentials acquired on
+	// the host instead of launching fresh device-authorization flows.
+	// Path resolution differs by privilege: non-root on the host resolves
+	// the base to ~/.config/pelican, while the container runs as root and
+	// resolves it to /etc/pelican. Mounted read-write: token refreshes
+	// are written back to the host wallet.
 	if home, err := os.UserHomeDir(); err == nil {
-		pelicanDir := filepath.Join(home, ".pelican")
-		if fi, err := os.Stat(pelicanDir); err == nil && fi.IsDir() {
-			args = append(args, "-v", pelicanDir+":/root/.pelican")
+		hostBase := filepath.Join(home, ".config", "pelican")
+		if err := os.MkdirAll(hostBase, 0700); err == nil {
+			args = append(args, "-v", hostBase+":/etc/pelican")
 		}
 	}
 	if opts.EncryptKeyPath != "" {

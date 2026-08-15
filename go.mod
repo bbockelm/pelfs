@@ -3,12 +3,14 @@ module github.com/bbockelm/pelfs
 go 1.26.0
 
 require (
+	github.com/go-git/go-billy/v5 v5.9.1
 	github.com/google/uuid v1.6.0
 	github.com/juicedata/juicefs v1.4.0-dev.0.20260814030623-a617e1b01696
 	github.com/mattn/go-sqlite3 v1.14.24
 	github.com/pelicanplatform/pelican v0.0.0-20260813210837-7a5e7ab292c3
 	github.com/prometheus/client_golang v1.21.1
 	github.com/sirupsen/logrus v1.9.3
+	github.com/willscott/go-nfs v0.0.4
 )
 
 require (
@@ -246,6 +248,7 @@ require (
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	github.com/vmware/go-nfs-client v0.0.0-20190605212624-d43b92724c1b // indirect
 	github.com/volcengine/ve-tos-golang-sdk/v2 v2.9.0 // indirect
+	github.com/willscott/go-nfs-client v0.0.0-20240104095149-b44639837b00 // indirect
 	github.com/winfsp/cgofuse v1.6.0 // indirect
 	github.com/xrash/smetrics v0.0.0-20201216005158-039620a65673 // indirect
 	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78 // indirect
@@ -271,7 +274,7 @@ require (
 	go.yaml.in/yaml/v2 v2.4.3 // indirect
 	golang.org/x/arch v0.11.0 // indirect
 	golang.org/x/crypto v0.54.0 // indirect
-	golang.org/x/exp v0.0.0-20250620022241-b7579e27df2b // indirect
+	golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f // indirect
 	golang.org/x/net v0.56.0 // indirect
 	golang.org/x/oauth2 v0.34.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect

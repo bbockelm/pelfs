@@ -88,6 +88,7 @@ type cmdOpts struct {
 	cacheSizeMiB     int64
 	blockSizeKiB     int
 	writeback        bool
+	ioRetries        int
 	volume           string
 	readOnly         bool
 	compress         string
@@ -98,6 +99,7 @@ type cmdOpts struct {
 	noAcquireToken   bool
 	insecure         bool
 	debug            bool
+	mountBackend     string
 	forceDocker      bool
 	noDocker         bool
 	dockerImage      string
@@ -118,6 +120,7 @@ func registerFlags(fs *flag.FlagSet, o *cmdOpts) {
 	fs.Int64Var(&o.cacheSizeMiB, "cache-size", 10240, "local block cache size limit, in MiB")
 	fs.IntVar(&o.blockSizeKiB, "block-size", 4096, "object block size, in KiB (fixed at volume creation)")
 	fs.BoolVar(&o.writeback, "writeback", false, "upload blocks asynchronously (faster writes, weaker durability)")
+	fs.IntVar(&o.ioRetries, "io-retries", 5, "retries per failing block operation; with the 60s per-attempt timeout this bounds how long I/O hangs before EIO when the federation is unreachable")
 	fs.StringVar(&o.volume, "volume", "pelfs", "JuiceFS volume name")
 	fs.BoolVar(&o.readOnly, "ro", false, "mount read-only: no writes, no snapshots, no session state uploaded")
 	fs.StringVar(&o.compress, "compress", "none", "block compression: none or zstd (fixed at volume creation)")
@@ -128,8 +131,9 @@ func registerFlags(fs *flag.FlagSet, o *cmdOpts) {
 	fs.BoolVar(&o.noAcquireToken, "no-acquire-token", false, "never run interactive token-acquisition flows; rely on discovered tokens only")
 	fs.BoolVar(&o.insecure, "insecure", false, "skip TLS verification (test federations only)")
 	fs.BoolVar(&o.debug, "debug", false, "verbose logging")
-	fs.BoolVar(&o.forceDocker, "docker", false, "shell only: force running inside a Docker container")
-	fs.BoolVar(&o.noDocker, "no-docker", false, "never fall back to Docker; fail if FUSE is unavailable")
+	fs.StringVar(&o.mountBackend, "mount-backend", "auto", "how to attach the filesystem: auto, fuse, nfs (loopback NFS server + OS NFS client; no kext or macFUSE needed on macOS), or docker")
+	fs.BoolVar(&o.forceDocker, "docker", false, "shell only: force running inside a Docker container (same as --mount-backend docker)")
+	fs.BoolVar(&o.noDocker, "no-docker", false, "never fall back to Docker; fail if no native backend is usable")
 	fs.StringVar(&o.dockerImage, "docker-image", dockerrun.DefaultImage, "container image for the Docker fallback")
 	fs.StringVar(&o.shellPath, "shell", "", "shell to launch (default: $SHELL, else /bin/sh)")
 	fs.StringVar(&o.prefetch, "prefetch", "none", "download all blocks into the local cache at startup: none, all (blocking; refuse to start on any failure), or background")
@@ -405,6 +409,37 @@ func fuseUsable() bool {
 		return err == nil
 	default:
 		return false
+	}
+}
+
+// resolveBackend picks the mount backend: an explicit --mount-backend wins;
+// otherwise prefer native FUSE, then (on macOS, where mount_nfs works
+// unprivileged with no kext) the loopback-NFS backend, then Docker.
+func resolveBackend(o *cmdOpts) (string, error) {
+	switch o.mountBackend {
+	case "fuse":
+		if !fuseUsable() {
+			return "", errors.New("--mount-backend fuse: FUSE is not available on this host")
+		}
+		return "fuse", nil
+	case "nfs", "docker":
+		return o.mountBackend, nil
+	case "", "auto":
+		if o.forceDocker {
+			return "docker", nil
+		}
+		if fuseUsable() {
+			return "fuse", nil
+		}
+		if runtime.GOOS == "darwin" {
+			return "nfs", nil
+		}
+		if !o.noDocker {
+			return "docker", nil
+		}
+		return "", errors.New("no usable mount backend: FUSE is unavailable and --no-docker was given")
+	default:
+		return "", fmt.Errorf("unknown --mount-backend %q (want auto, fuse, nfs, or docker)", o.mountBackend)
 	}
 }
 

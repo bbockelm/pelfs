@@ -61,9 +61,14 @@ func cmdMount(args []string) int {
 		return exitErr(err)
 	}
 	prefix := pos[0]
-	if !fuseUsable() {
-		return exitErr(errors.New("pelfs mount requires native FUSE support (the Docker fallback only applies to `pelfs shell`)"))
+	backend, err := resolveBackend(o)
+	if err != nil {
+		return exitErr(err)
 	}
+	if backend == "docker" {
+		return exitErr(errors.New("pelfs mount requires a native backend (fuse or nfs); the Docker fallback only applies to `pelfs shell`"))
+	}
+	o.mountBackend = backend
 
 	dir := volDir(prefix)
 	if o.stateDir == "" {

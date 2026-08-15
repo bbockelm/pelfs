@@ -26,12 +26,14 @@ func cmdShell(args []string) int {
 	}
 	prefix := pos[0]
 
-	if o.forceDocker || (!o.noDocker && !fuseUsable()) {
+	backend, err := resolveBackend(o)
+	if err != nil {
+		return exitErr(err)
+	}
+	if backend == "docker" {
 		return runInDocker(o, prefix)
 	}
-	if !fuseUsable() {
-		return exitErr(errors.New("FUSE is not available on this host (and --no-docker was given)"))
-	}
+	o.mountBackend = backend
 	code, err := runShellNative(o, prefix)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "pelfs: %v\n", err)
@@ -139,12 +141,14 @@ func mountOptions(s *session) mountfs.Options {
 		BlockSizeKiB:   s.o.blockSizeKiB,
 		CacheSizeMiB:   s.o.cacheSizeMiB,
 		Writeback:      s.o.writeback,
+		IORetries:      s.o.ioRetries,
 		ReadOnly:       s.o.readOnly,
 		Debug:          s.o.debug,
 		Compression:    s.o.compress,
 		EncryptKeyPEM:  s.encryptPEM,
 		FlushTimeout:   s.o.flushTimeout,
 		CacheFreeRatio: s.o.cacheFreeRatio,
+		Backend:        s.o.mountBackend,
 	}
 }
 
@@ -179,6 +183,7 @@ func runInDocker(o *cmdOpts, prefix string) int {
 		"--cache-size", fmt.Sprint(o.cacheSizeMiB),
 		"--block-size", fmt.Sprint(o.blockSizeKiB),
 		"--volume", o.volume,
+		"--io-retries", fmt.Sprint(o.ioRetries),
 		"--compress", o.compress,
 		"--prefetch", o.prefetch,
 		"--flush-timeout", o.flushTimeout.String(),

@@ -17,6 +17,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/juicedata/juicefs/pkg/chunk"
+	jfs "github.com/juicedata/juicefs/pkg/fs"
 	"github.com/juicedata/juicefs/pkg/fuse"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/object"
@@ -25,6 +26,8 @@ import (
 	"github.com/juicedata/juicefs/pkg/vfs"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
+
+	"github.com/bbockelm/pelfs/internal/nfsmount"
 )
 
 var logger = utils.GetLogger("pelfs")
@@ -68,12 +71,23 @@ type Options struct {
 	Writeback    bool  // asynchronous block upload
 	ReadOnly     bool  // mount read-only (metadata rejects modification)
 	Debug        bool
+	// IORetries caps how many times a failing block operation is retried
+	// (default 5). Each attempt is bounded by a 60s timeout, so this also
+	// bounds how long a blocked read/write hangs when the federation is
+	// unreachable before the caller sees EIO.
+	IORetries int
 	// FlushTimeout bounds how long Close waits for writeback-staged blocks
 	// to finish uploading (0 = wait forever). Only relevant with Writeback.
 	FlushTimeout time.Duration
 	// CacheFreeRatio is the minimum free space/inode fraction the block
 	// cache tries to preserve on its filesystem (default 0.05).
 	CacheFreeRatio float64
+
+	// Backend selects how the filesystem is exposed to the OS: "fuse"
+	// (default) uses the kernel FUSE interface; "nfs" serves NFSv3 on
+	// 127.0.0.1 and mounts it with the OS NFS client — kext- and
+	// install-free on macOS (works unprivileged).
+	Backend string
 
 	// Compression ("none" or "zstd") is recorded in the volume format at
 	// creation; an existing volume's setting always wins.
@@ -91,12 +105,16 @@ type Mounted struct {
 
 	m            meta.Meta
 	blob         object.ObjectStorage
-	v            *vfs.VFS
+	v            *vfs.VFS // FUSE backend only
 	store        chunk.ChunkStore
 	registry     *prometheus.Registry
 	writeback    bool
 	flushTimeout time.Duration
 	served       chan error
+
+	// NFS backend only.
+	jfs    *jfs.FileSystem
+	nfsSrv *nfsmount.Server
 }
 
 // Mount formats the metadata database if needed, starts a FUSE server on
@@ -107,6 +125,9 @@ func Mount(opts Options) (*Mounted, error) {
 	}
 	if opts.CacheSizeMiB <= 0 {
 		opts.CacheSizeMiB = 10240
+	}
+	if opts.IORetries <= 0 {
+		opts.IORetries = 5
 	}
 	if opts.CacheFreeRatio <= 0 {
 		opts.CacheFreeRatio = 0.05
@@ -179,7 +200,7 @@ func Mount(opts Options) (*Mounted, error) {
 		PutTimeout:  time.Minute,
 		MaxUpload:   20,
 		MaxDownload: 100,
-		MaxRetries:  10,
+		MaxRetries:  opts.IORetries,
 		Writeback:   opts.Writeback,
 		Prefetch:    1,
 		BufferSize:  300 << 20,
@@ -225,6 +246,45 @@ func Mount(opts Options) (*Mounted, error) {
 		UMask:    0xFFFF,
 	}
 
+	mnt := &Mounted{
+		MountPoint:   opts.MountPoint,
+		m:            m,
+		blob:         opts.Blob,
+		store:        store,
+		registry:     registry,
+		writeback:    opts.Writeback,
+		flushTimeout: opts.FlushTimeout,
+		served:       make(chan error, 1),
+	}
+
+	if opts.Backend == "nfs" {
+		fsys, err := jfs.NewFileSystem(vfsConf, m, store, registry)
+		if err != nil {
+			_ = m.CloseSession()
+			return nil, fmt.Errorf("filesystem layer: %w", err)
+		}
+		bfs := nfsmount.NewBillyFS(fsys, uint32(os.Getuid()), uint32(os.Getgid()))
+		srv, err := nfsmount.Serve(bfs)
+		if err != nil {
+			_ = m.CloseSession()
+			return nil, err
+		}
+		if err := srv.Mount(opts.MountPoint, format.Name); err != nil {
+			_ = srv.Close()
+			_ = m.CloseSession()
+			return nil, err
+		}
+		mnt.jfs = fsys
+		mnt.nfsSrv = srv
+		if err := waitForMounted(opts.MountPoint); err != nil {
+			_ = nfsmount.Unmount(opts.MountPoint)
+			_ = srv.Close()
+			_ = m.CloseSession()
+			return nil, err
+		}
+		return mnt, nil
+	}
+
 	var rawOpts string
 	if runtime.GOOS == "darwin" {
 		rawOpts = "allow_recursion"
@@ -233,18 +293,7 @@ func Mount(opts Options) (*Mounted, error) {
 	vfsConf.FuseOpts = &fuseOpts
 
 	v := vfs.NewVFS(vfsConf, m, store, registerer, registry)
-
-	mnt := &Mounted{
-		MountPoint:   opts.MountPoint,
-		m:            m,
-		blob:         opts.Blob,
-		v:            v,
-		store:        store,
-		registry:     registry,
-		writeback:    opts.Writeback,
-		flushTimeout: opts.FlushTimeout,
-		served:       make(chan error, 1),
-	}
+	mnt.v = v
 	go func() {
 		mnt.served <- fuse.Serve(v, rawOpts, false, false)
 	}()
@@ -254,6 +303,19 @@ func Mount(opts Options) (*Mounted, error) {
 		return nil, err
 	}
 	return mnt, nil
+}
+
+// waitForMounted polls until the mountpoint is attached (no server error
+// channel variant, for the NFS backend where mount_nfs already returned).
+func waitForMounted(mp string) error {
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if mounted(mp) {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("timed out waiting for %s to mount", mp)
 }
 
 // waitForMount polls until the mountpoint's device differs from its
@@ -297,6 +359,9 @@ func mounted(mp string) bool {
 // Close unmounts the filesystem, flushes pending writes to the federation,
 // and closes the metadata session. Safe to call once.
 func (mnt *Mounted) Close() error {
+	if mnt.nfsSrv != nil {
+		return mnt.closeNFS()
+	}
 	var umountErr error
 	for attempt := 0; ; attempt++ {
 		umountErr = unmountCmd(mnt.MountPoint, attempt >= 3)
@@ -331,6 +396,37 @@ down:
 		return flushErr
 	}
 	return err
+}
+
+// closeNFS is Close for the loopback-NFS backend: detach the OS mount, stop
+// the server, then flush and shut down the volume like the FUSE path.
+func (mnt *Mounted) closeNFS() error {
+	umountErr := nfsmount.Unmount(mnt.MountPoint)
+	if umountErr != nil {
+		logger.Warnf("unmount %s: %s", mnt.MountPoint, umountErr)
+	}
+	_ = mnt.nfsSrv.Close()
+
+	var flushErr error
+	if err := mnt.jfs.Flush(); err != nil {
+		logger.Errorf("flush delayed data: %s", err)
+		flushErr = fmt.Errorf("flush delayed data: %w", err)
+	}
+	if mnt.writeback && flushErr == nil {
+		if err := mnt.drainStaging(mnt.flushTimeout); err != nil {
+			flushErr = fmt.Errorf("writeback staging: %w", err)
+		}
+	}
+	err := mnt.m.CloseSession()
+	object.Shutdown(mnt.blob)
+	switch {
+	case flushErr != nil:
+		return flushErr
+	case umountErr != nil:
+		return umountErr
+	default:
+		return err
+	}
 }
 
 func unmountCmd(mp string, force bool) error {

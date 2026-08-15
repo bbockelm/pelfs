@@ -65,17 +65,21 @@ func newFedStore(ctx context.Context, cfg Config) (*fedStore, error) {
 		opts = append(opts, client.WithTokenLocation(cfg.TokenPath))
 	}
 	opts = append(opts, client.WithAcquireToken(cfg.AcquireToken))
-	// Accept either CRC32C (the client default) or MD5 for transfer
-	// verification. Most deployed origins provide only MD5; without it in
-	// the requested set, every block transfer logs a warning about falling
-	// back to a checksum type that wasn't asked for.
-	opts = append(opts, client.WithRequestChecksums([]client.ChecksumType{client.AlgCRC32C, client.AlgMD5}))
+
+	// Transfer-only options: accept either CRC32C (the client default) or
+	// MD5 for transfer verification, since many deployed origins provide
+	// only MD5. This must NOT be in the shared opts — DoStat interprets a
+	// checksum request as "collect these digests during stat" and warns
+	// whenever the server omits one, which would fire on every StatKey
+	// (e.g. each 30s lease-renewal ETag check).
+	pfsOpts := append(append([]client.TransferOption{}, opts...),
+		client.WithRequestChecksums([]client.ChecksumType{client.AlgCRC32C, client.AlgMD5}))
 
 	prefix := strings.TrimRight(cfg.PrefixURL, "/")
 	return &fedStore{
 		ctx:        ctx,
 		prefix:     prefix,
-		pfs:        client.NewPelicanFSWithPrefix(ctx, prefix, opts...),
+		pfs:        client.NewPelicanFSWithPrefix(ctx, prefix, pfsOpts...),
 		opts:       opts,
 		directRead: cfg.DirectRead,
 	}, nil

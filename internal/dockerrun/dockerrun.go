@@ -74,6 +74,10 @@ func Run(opts Options) (int, error) {
 
 	args := []string{
 		"run", "--rm",
+		// pelfs is not an init: without one, grandchildren orphaned to
+		// PID 1 (e.g. a process stuck in a FUSE read) become unreapable
+		// zombies and `docker stop` cannot kill the container.
+		"--init",
 		"--device", "/dev/fuse",
 		"--cap-add", "SYS_ADMIN",
 		// JuiceFS renices itself to -19 for FUSE latency; without this cap

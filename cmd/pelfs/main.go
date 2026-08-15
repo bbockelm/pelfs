@@ -225,7 +225,11 @@ func newSession(ctx context.Context, o *cmdOpts, prefix string, needWrite bool) 
 func (s *session) cleanupTemp() {
 	if s.tempState && !s.o.keepState {
 		os.RemoveAll(s.stateDir)
-	} else if !s.tempState || s.o.keepState {
+		return
+	}
+	// Inside the Docker fallback the state dies with the container anyway;
+	// telling the user it was "kept" would be misleading.
+	if os.Getenv("PELFS_IN_DOCKER") != "1" {
 		fmt.Fprintf(os.Stderr, "pelfs: local state kept in %s\n", s.stateDir)
 	}
 }

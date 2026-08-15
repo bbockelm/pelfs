@@ -85,6 +85,51 @@ bin/fakeorigin --root /tmp/origin --listen 127.0.0.1:8081 &
 bin/pelfs shell http://127.0.0.1:8081/ns     # https?/http = direct mode, no discovery
 ```
 
+## Example: running on a Mac without macFUSE (Docker fallback)
+
+`pelfs shell` detects that macFUSE is absent and re-launches itself inside a
+small Linux container with `/dev/fuse`; your subshell then runs *inside* the
+container with the filesystem mounted there. Only two things are needed: the
+Docker CLI, and a Linux build of pelfs next to the host binary.
+
+```console
+$ make                    # builds bin/pelfs AND bin/pelfs-linux-arm64 (the container payload)
+$ bin/pelfs shell pelican://osg-htc.org/my/namespace/scratch
+pelfs: FUSE unavailable on host; launching container (alpine:3.21)
+pelfs: restored metadata from meta/20260815T011225Z-pelfs-cbab14f5/final.db
+pelfs: mounting pelican://osg-htc.org/my/namespace/scratch on /var/tmp/pelfs/mnt
+pelfs: starting /bin/sh in /var/tmp/pelfs/mnt (exit the shell to unmount)
+/var/tmp/pelfs/mnt # echo hello > greeting.txt
+/var/tmp/pelfs/mnt # ls -l
+-rw-r--r--    1 root     root             6 Aug 15 01:21 greeting.txt
+/var/tmp/pelfs/mnt # exit
+pelfs: unmounting and flushing data to the federation...
+pelfs: final metadata snapshot uploaded (session 20260815T012201Z-pelfs-8c1f22a0)
+```
+
+Details worth knowing:
+
+- The container is plain `alpine` (override with `--docker-image`); no image
+  build happens — the `bin/pelfs-linux-<arch>` binary is bind-mounted in.
+  If the binary lives elsewhere, point at it with `$PELFS_LINUX_BINARY`.
+- Your bearer token is found on the host (`--token`, `$BEARER_TOKEN_FILE`,
+  or WLCG discovery) and bind-mounted read-only into the container; an
+  `--encrypt-key` file is forwarded the same way.
+- The subshell is `/bin/sh` inside the container, not your host shell, and
+  the mount is only visible inside the container. Local state (block cache,
+  metadata db) lives in the container and vanishes with it — durability
+  comes from the flushed blocks and the final metadata snapshot, exactly as
+  in the native case.
+- `--docker` forces the container path even where FUSE exists;
+  `--no-docker` forbids it.
+- Piping commands works too, for scripted use (the container then runs
+  without a TTY). Note the commands execute inside the container, so they
+  can only see the mounted filesystem, not host paths:
+
+  ```console
+  $ echo 'sha256sum big-dataset.bin' | bin/pelfs shell --docker pelican://.../scratch
+  ```
+
 ## Flags
 
 See `pelfs -h`. Highlights: `--ro` (read-only: restore + mount, upload

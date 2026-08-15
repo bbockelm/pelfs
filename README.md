@@ -114,7 +114,11 @@ Details worth knowing:
   If the binary lives elsewhere, point at it with `$PELFS_LINUX_BINARY`.
 - Your bearer token is found on the host (`--token`, `$BEARER_TOKEN_FILE`,
   or WLCG discovery) and bind-mounted read-only into the container; an
-  `--encrypt-key` file is forwarded the same way.
+  `--encrypt-key` file is forwarded the same way. The host's `~/.pelican`
+  credential store is also shared into the container, and the access
+  preflight — including any interactive token acquisition (device flow,
+  wallet password) — runs on the **host, before** the container starts, so
+  existing credentials are reused and prompts happen where your browser is.
 - The subshell is `/bin/sh` inside the container, not your host shell, and
   the mount is only visible inside the container. Local state (block cache,
   metadata db) lives in the container and vanishes with it — durability

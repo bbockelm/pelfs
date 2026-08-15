@@ -7,10 +7,12 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/bbockelm/pelfs/internal/dockerrun"
 	"github.com/bbockelm/pelfs/internal/mountfs"
+	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/snapshot"
 )
 
@@ -110,6 +112,30 @@ func mountOptions(s *session) mountfs.Options {
 }
 
 func runInDocker(o *cmdOpts, prefix string) int {
+	// Run the access preflight on the HOST before launching the container:
+	// any interactive token acquisition (device flow, wallet password)
+	// happens where the user's browser and existing credential store live,
+	// and the resulting credentials are shared into the container via the
+	// ~/.pelican bind mount. This also surfaces scope problems immediately
+	// instead of from inside the container. Direct http(s) test prefixes
+	// are skipped: they may only resolve inside the container (e.g.
+	// host.docker.internal).
+	if strings.HasPrefix(prefix, "pelican://") || strings.HasPrefix(prefix, "osdf://") {
+		ctx := context.Background()
+		store, err := pelicanobj.New(ctx, pelicanobj.Config{
+			PrefixURL:    prefix,
+			TokenPath:    o.token,
+			AcquireToken: !o.noAcquireToken,
+			Insecure:     o.insecure,
+		})
+		if err != nil {
+			return exitErr(err)
+		}
+		if err := pelicanobj.Preflight(ctx, store, prefix, o.readOnly); err != nil {
+			return exitErr(err)
+		}
+	}
+
 	extra := []string{
 		"--snapshot-interval", o.snapshotInterval.String(),
 		"--keep-sessions", fmt.Sprint(o.keepSessions),

@@ -92,6 +92,16 @@ func Run(opts Options) (int, error) {
 			"-v", opts.TokenPath+":/run/pelfs/token:ro",
 			"-e", "BEARER_TOKEN_FILE=/run/pelfs/token")
 	}
+	// Share the host's Pelican credential store (wallet, refresh tokens)
+	// so the client inside the container reuses existing credentials
+	// instead of launching fresh device-authorization flows. Mounted
+	// read-write: token refreshes are written back.
+	if home, err := os.UserHomeDir(); err == nil {
+		pelicanDir := filepath.Join(home, ".pelican")
+		if fi, err := os.Stat(pelicanDir); err == nil && fi.IsDir() {
+			args = append(args, "-v", pelicanDir+":/root/.pelican")
+		}
+	}
 	if opts.EncryptKeyPath != "" {
 		args = append(args, "-v", opts.EncryptKeyPath+":/run/pelfs/encrypt-key:ro")
 	}

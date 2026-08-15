@@ -338,3 +338,11 @@ replace (
 	github.com/vmware/go-nfs-client v0.0.0-20190605212624-d43b92724c1b => github.com/juicedata/go-nfs-client v0.0.0-20250220101412-d3a8c1ca64a1
 	xorm.io/xorm v1.0.7 => gitea.com/davies/xorm v1.0.8-0.20220528043536-552d84d1b34a
 )
+
+// TEMPORARY local replace: picks up the client fix that requests
+// storage.modify for uploads when Client.EnableOverwrites is set (branch
+// pelfs-overwrite-scopes, commit cbe4b6eb5). Drop this and bump the pinned
+// pelican version once the fix lands on main. NOTE: CI cannot resolve a
+// local path; the integration workflow must check out that branch (or the
+// replace must be removed) before CI goes green.
+replace github.com/pelicanplatform/pelican => /Users/bbockelm/projects/pelican.worktrees/pelfs-overwrite-scopes

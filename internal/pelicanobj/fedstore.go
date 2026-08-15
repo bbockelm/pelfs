@@ -115,6 +115,21 @@ func mapNotFound(err error) error {
 	return err
 }
 
+// stat resolves one object's metadata through the transfer engine, so the
+// director response is taken from the engine's cache rather than re-queried.
+// This is the hot path for mutable objects: the mount lease stats every 30s
+// to check its ETag, and the snapshot manager stats before every overwrite.
+// Cache entries are keyed by flavor (verb, routing, query), so this store's
+// ?directread stats can never be answered with the cache-routed response the
+// chunk store gets -- the isolation the lease depends on.
+func (s *fedStore) stat(ctx context.Context, key string) (*client.FileInfo, error) {
+	url := s.keyURL(key)
+	if te := s.pfs.Engine(); te != nil {
+		return te.Stat(ctx, url, s.opts...)
+	}
+	return client.DoStat(ctx, url, s.opts...)
+}
+
 func (s *fedStore) String() string {
 	return s.prefix + "/"
 }
@@ -170,7 +185,7 @@ func (s *fedStore) Put(ctx context.Context, key string, in io.Reader, getters ..
 }
 
 func (s *fedStore) Delete(ctx context.Context, key string, getters ...object.AttrGetter) error {
-	err := client.DoDelete(ctx, s.keyURL(key), false, s.opts...)
+	err := s.deleteKey(ctx, key)
 	if err != nil && errors.Is(mapNotFound(err), os.ErrNotExist) {
 		// Deletes are idempotent per the ObjectStorage contract.
 		return nil
@@ -179,7 +194,7 @@ func (s *fedStore) Delete(ctx context.Context, key string, getters ...object.Att
 }
 
 func (s *fedStore) Head(ctx context.Context, key string) (object.Object, error) {
-	fi, err := client.DoStat(ctx, s.keyURL(key), s.opts...)
+	fi, err := s.stat(ctx, key)
 	if err != nil {
 		return nil, mapNotFound(err)
 	}
@@ -187,16 +202,37 @@ func (s *fedStore) Head(ctx context.Context, key string) (object.Object, error) 
 }
 
 func (s *fedStore) StatKey(ctx context.Context, key string) (*KeyInfo, error) {
-	fi, err := client.DoStat(ctx, s.keyURL(key), s.opts...)
+	fi, err := s.stat(ctx, key)
 	if err != nil {
 		return nil, mapNotFound(err)
 	}
 	return &KeyInfo{Size: fi.Size, Mtime: fi.ModTime, ETag: fi.ETag}, nil
 }
 
+// deleteKey and list mirror stat: they route through the transfer engine so
+// the director response comes from its cache. Snapshot pruning deletes and
+// lists many objects in one namespace at shutdown, which otherwise costs a
+// director round trip -- and, for listings, a whole transfer engine built and
+// torn down -- per object.
+func (s *fedStore) deleteKey(ctx context.Context, key string) error {
+	url := s.keyURL(key)
+	if te := s.pfs.Engine(); te != nil {
+		return te.Delete(ctx, url, false, s.opts...)
+	}
+	return client.DoDelete(ctx, url, false, s.opts...)
+}
+
+func (s *fedStore) list(ctx context.Context, dir string) ([]client.FileInfo, error) {
+	url := s.keyURL(dir)
+	if te := s.pfs.Engine(); te != nil {
+		return te.List(ctx, url, s.opts...)
+	}
+	return client.DoList(ctx, url, s.opts...)
+}
+
 func (s *fedStore) ListDir(ctx context.Context, dir string) ([]DirEntry, error) {
 	dir = strings.Trim(dir, "/")
-	fis, err := client.DoList(ctx, s.keyURL(dir), s.opts...)
+	fis, err := s.list(ctx, dir)
 	if err != nil {
 		return nil, mapNotFound(err)
 	}

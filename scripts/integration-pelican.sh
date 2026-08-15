@@ -100,7 +100,15 @@ PELICAN_CONFIGDIR="$WORK/client-config" \
 PELICAN_TLSSKIPVERIFY=true \
 PELICAN_TRANSPORT_TLSHANDSHAKETIMEOUT=60s \
 PELICAN_TRANSPORT_RESPONSEHEADERTIMEOUT=60s \
-  go test -tags "integration,nogspt,notikv" -count=1 -v -timeout 15m ./internal/integration \
+  go test -tags "integration,nogspt,notikv" -count=1 -v -timeout 15m ${IT_RUN:+-run "$IT_RUN"} ./internal/integration 2>&1 | tee "$WORK/gotest.log"; \
+  [ "${PIPESTATUS[0]}" = 0 ] \
   || { echo "---- server log tail ----"; tail -60 "$WORK/server.log" "$WORK/pelican-server.log" 2>/dev/null; exit 1; }
+
+# The client logs one line per director query it actually issues (cache
+# misses only). It caches per namespace and flavor, so this stays flat no
+# matter how many objects the tests touch; a count that tracks object count
+# means the cache is being bypassed.
+echo "== director queries issued by the client: $(grep -c "Will query director at" "$WORK/gotest.log" || true) =="
+
 
 echo "== PASS: integration tests against real pelican federation =="

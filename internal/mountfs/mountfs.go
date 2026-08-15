@@ -6,6 +6,7 @@ package mountfs
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -80,6 +81,11 @@ type Options struct {
 	// FlushTimeout bounds how long Close waits for writeback-staged blocks
 	// to finish uploading (0 = wait forever). Only relevant with Writeback.
 	FlushTimeout time.Duration
+	// FlushPacks, when set, uploads any locally spooled pack data (see
+	// internal/packstore). Close invokes it after the writeback staging
+	// area drains, so "staging empty" plus "packs flushed" together mean
+	// every block is durable in the federation.
+	FlushPacks func(ctx context.Context) error
 	// CacheFreeRatio is the minimum free space/inode fraction the block
 	// cache tries to preserve on its filesystem (default 0.05).
 	CacheFreeRatio float64
@@ -111,6 +117,7 @@ type Mounted struct {
 	registry     *prometheus.Registry
 	writeback    bool
 	flushTimeout time.Duration
+	flushPacks   func(ctx context.Context) error
 	served       chan error
 
 	// NFS backend only.
@@ -268,6 +275,7 @@ func Mount(opts Options) (*Mounted, error) {
 		registry:     registry,
 		writeback:    opts.Writeback,
 		flushTimeout: opts.FlushTimeout,
+		flushPacks:   opts.FlushPacks,
 		served:       make(chan error, 1),
 	}
 
@@ -405,6 +413,15 @@ down:
 			flushErr = fmt.Errorf("writeback staging: %w", err)
 		}
 	}
+	// Staging drains into the pack spool; upload what accumulated there.
+	if mnt.flushPacks != nil {
+		if err := mnt.flushPacks(context.Background()); err != nil {
+			logger.Errorf("flush packs: %s", err)
+			if flushErr == nil {
+				flushErr = fmt.Errorf("flush packs: %w", err)
+			}
+		}
+	}
 	err := mnt.m.CloseSession()
 	object.Shutdown(mnt.blob)
 	if flushErr != nil {
@@ -443,6 +460,15 @@ func (mnt *Mounted) closeNFS() error {
 	if mnt.writeback && flushErr == nil {
 		if err := mnt.drainStaging(mnt.flushTimeout); err != nil {
 			flushErr = fmt.Errorf("writeback staging: %w", err)
+		}
+	}
+	// Staging drains into the pack spool; upload what accumulated there.
+	if mnt.flushPacks != nil {
+		if err := mnt.flushPacks(context.Background()); err != nil {
+			logger.Errorf("flush packs: %s", err)
+			if flushErr == nil {
+				flushErr = fmt.Errorf("flush packs: %w", err)
+			}
 		}
 	}
 	err := mnt.m.CloseSession()

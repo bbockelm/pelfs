@@ -59,6 +59,41 @@ Packs hold everything: data chunks, whole small files, catalogs, inode
 shards. Target pack size and the open-pack append strategy are open
 questions (see below).
 
+**Write path (the "memtable"):** the accumulating structure is a local
+spool file — an append-only file whose byte layout is already the final
+pack layout, plus an in-memory key -> (offset, length) table. There is no
+merge step: cutting a pack appends the index trailer and uploads the spool
+verbatim (zero-copy publish). Reads of not-yet-flushed entries are served
+from the spool. The spool is not mmap'd (plain WriteAt/ReadAt; mmap of a
+growing file buys remap churn, not speed). Entries are byte-packed with
+**no alignment padding**: HTTP range requests are byte-granular and the
+local block cache reads whole entries, so alignment would pay only if
+packs were mmap'd locally — revisit then, not before.
+
+**Compression is per-entry, never per-pack-stream.** Each entry is
+independently compressed, and the compression algorithm is recorded
+explicitly (an algo id in the entry's index/catalog record — never sniffed
+from magic bytes) so it is per-entry flexible: zstd by default, `none`
+under a store-if-smaller policy (compress, keep the smaller of the two —
+the git/borg trick that avoids paying for incompressible data), future
+algorithms are new ids. Order is compress-then-encrypt — encrypting first
+would destroy compressibility. (Noted: compressed sizes leak through
+encryption, a CRIME-family side channel we accept for a scratch
+filesystem.)
+
+This resolves the classic tension between **sub-pack fetching and
+compression ratio** in favor of fetching: per-entry compression makes
+every entry independently range-readable, at the cost of losing cross-file
+compression context. Two mitigations keep the ratio loss small: tiny files
+— where solid compression wins big — mostly live *inline in catalogs*,
+so pack entries skew large, where per-entry zstd approaches solid ratios
+anyway; and if small-entry corpora ever matter, a per-pack **zstd
+dictionary** (trained over the pack's entries, stored in the pack header,
+referenced by algo id) recovers most of the solid-compression gap while
+preserving per-entry independence. Whole-pack solid compression is
+rejected outright: one cold read would fetch and decompress everything
+before it.
+
 ### 2. Path catalogs
 
 SQLite databases (schema inspired by JuiceFS's node/edge/chunk tables, not
@@ -178,6 +213,23 @@ Consequences, deliberate and otherwise:
   reachability from all refs plus the grace window. Refs are enumerated by
   listing (they are few); no refs-manifest object exists. Deleting a
   branch is how space is actually freed.
+
+  Kept scalable by four structural properties. (1) Content addressing
+  dedups the mark walk: unchanged subtrees share catalog hashes, so each
+  distinct catalog is visited once regardless of how many refs and
+  generations reference it — mark cost is proportional to *distinct*
+  metadata, not refs × tree. (2) The walk is two-level: each catalog
+  carries a summary of the **pack ids** it references, so the mark phase
+  unions pack-id sets and computes per-pack liveness ratios without
+  touching chunk-level detail; only packs falling below a liveness
+  threshold get exact, entry-level accounting — and that happens as part
+  of repacking them anyway (copy live entries forward, delete the pack).
+  The GC unit is the pack. (3) The generational frontier is free:
+  monotonic naming means objects younger than the grace window are never
+  candidates, so GC scans only the old tail. (4) The fork rule makes
+  concurrent GC sound without coordination: forks come only from
+  ref-reachable generations, so an object unreachable from every ref and
+  older than the grace window can never become reachable again.
 - **Inode uniqueness is per-lineage.** Fork descendants allocate from the
   same counter and may assign equal inode values to different files —
   harmless, since inodes need uniqueness only within a mounted tree and
@@ -280,10 +332,25 @@ Two independent mechanisms, cleanly layered:
   anyone can forge valid tags; a signed-but-unencrypted DEK provides no
   integrity at all. AEAD tags under a secret DEK are redundant with the
   hash tree, which is strictly stronger.)
-- **Confidentiality: the DEK, optional.** One volume DEK, wrapped by the
-  user's KEK, stored in the superblock. Catalogs and shards are encrypted
-  too — filenames leak otherwise. An unencrypted volume simply has no DEK
-  and loses nothing else.
+- **Confidentiality: DEKs, optional and per-ref.** The superblock carries
+  a **key table**: key-id -> KEK-wrapped DEK. Every object reference
+  (catalog row, shard row, routing entry) records the key-id its target
+  was encrypted under (id 0 = plaintext). Catalogs and shards are
+  encrypted too — filenames leak otherwise. An unencrypted volume simply
+  has an empty key table.
+
+  Making the key-id per-reference rather than per-volume buys three things:
+  **encryption as a branch property** — a fork of an unencrypted base can
+  introduce a fresh DEK in its own superblock, and everything written
+  after the fork is protected while inherited plaintext objects are read
+  as-is (the confidentiality boundary is copy-on-write: what diverges is
+  protected, what stays shared stays at the base's level); **key
+  rotation** — new writes under a new key-id, old objects readable under
+  old ids, re-encryption deferred to repack; and **honest declassify
+  semantics** — an encrypted base can NOT be forked into a public branch
+  by pointer games, because the shared objects stay ciphertext; publishing
+  them requires an explicit re-encrypting repack, which is exactly the
+  operation a user should have to consciously invoke.
 
 Open interaction (see open questions): content addressing over plaintext
 leaks equality between chunks to anyone who can see object names/indexes;
@@ -316,10 +383,21 @@ in JuiceFS while invalidating its battle-testing.
 
 ## Migration phases
 
-1. **Pack store as ObjectStorage middleware.** Writeback staging already
-   batches blocks locally; drain-time packing plus an indexed range-read
-   GET fixes small-object overhead and read RTTs with zero metadata format
-   change. Independently valuable even if later phases shift.
+1. **Pack store as ObjectStorage middleware.** — **IMPLEMENTED**
+   (internal/packstore). Writeback staging batches blocks locally;
+   drain-time packing plus indexed range-read GETs fixes small-object
+   overhead and read RTTs with zero metadata format change. Packs carry a
+   JSON index trailer (entries + tombstones); packs sort by name in
+   creation order and later tombstones shadow earlier entries, so a fresh
+   session bootstraps by listing packs/ and fetching trailers. Write-side
+   packing requires --writeback (Put defers durability to the pack flush;
+   flushes precede every metadata snapshot and run at shutdown after the
+   staging drain); the read side is always active, so any session — 
+   including gc/fsck and non-writeback restores — reads packed volumes.
+   Space from deleted entries is reclaimed by a future `pelfs repack`
+   (tombstoned entries remain in their packs until then); gc --delete of a
+   packed entry from a read-only session is non-durable (the entry
+   resurfaces at the next bootstrap — space, never correctness).
 2. **Cold format.** Publish/restore of catalogs + shards + superblock;
    JuiceFS remains the hot engine; v1 snapshot machinery (lease, ETag,
    stats) collapses onto the superblock.

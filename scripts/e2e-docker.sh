@@ -66,12 +66,14 @@ assert s["object_errors_total"] == 0, s
 print(f"   stats OK: {s['put']['ops']} puts, {s['put']['bytes']} bytes up, staging drained")
 PY
 
-echo "== federation state after session 1 =="
+echo "== federation state after session 1 (writeback => packed) =="
 find "$WORK/origin" -type f | sed "s|$WORK/origin/||" | sort | head -20
-CHUNKS=$(find "$WORK/origin/e2e/ns/chunks" -type f | wc -l | tr -d ' ')
+LOOSE=$( (find "$WORK/origin/e2e/ns/chunks" -type f 2>/dev/null || true) | wc -l | tr -d ' ')
+PACKS=$( (find "$WORK/origin/e2e/ns/packs" -type f 2>/dev/null || true) | wc -l | tr -d ' ')
 SNAPS=$(find "$WORK/origin/e2e/ns/meta" -type f | wc -l | tr -d ' ')
-echo "   $CHUNKS chunk objects, $SNAPS metadata snapshots"
-[ "$CHUNKS" -ge 2 ] || { echo "FAIL: expected >=2 chunk objects"; exit 1; }
+echo "   $PACKS pack objects, $LOOSE loose chunk objects, $SNAPS metadata snapshots"
+[ "$PACKS" -ge 1 ] || { echo "FAIL: expected >=1 pack object"; exit 1; }
+[ "$LOOSE" -eq 0 ] || { echo "FAIL: expected 0 loose chunk objects with packing, got $LOOSE"; exit 1; }
 [ "$SNAPS" -ge 1 ] || { echo "FAIL: expected >=1 metadata snapshot"; exit 1; }
 
 echo "== session 2: fresh state, restore + read back =="
@@ -88,7 +90,7 @@ SHA2=$(grep -E '^[0-9a-f]{64}$' "$WORK/run2.log" | head -1)
 echo "== session 3: encrypted + zstd-compressed volume =="
 openssl genrsa -out "$WORK/enc.pem" 2048 2>/dev/null
 ENCPREFIX="http://host.docker.internal:$PORT/e2e/enc"
-"$BIN"/pelfs shell --docker --snapshot-interval 0 --compress zstd --encrypt-key "$WORK/enc.pem" "$ENCPREFIX" > "$WORK/run3.log" 2>&1 <<'EOF'
+"$BIN"/pelfs shell --docker --snapshot-interval 0 --writeback --compress zstd --encrypt-key "$WORK/enc.pem" "$ENCPREFIX" > "$WORK/run3.log" 2>&1 <<'EOF'
 set -e
 echo "secret-data-marker" > s.txt
 cat s.txt
@@ -97,6 +99,8 @@ grep -q "final metadata snapshot uploaded" "$WORK/run3.log" || { echo "FAIL: enc
 if grep -rq "secret-data-marker" "$WORK/origin/e2e/enc"; then
   echo "FAIL: plaintext found in encrypted volume's objects"; exit 1
 fi
+ENCPACKS=$( (find "$WORK/origin/e2e/enc/packs" -type f 2>/dev/null || true) | wc -l | tr -d ' ')
+[ "$ENCPACKS" -ge 1 ] || { echo "FAIL: encrypted volume should be packed too"; exit 1; }
 SNAP=$(find "$WORK/origin/e2e/enc/meta" -name "final.db" | head -1)
 if head -c 15 "$SNAP" | grep -q "SQLite format 3"; then
   echo "FAIL: metadata snapshot stored in plaintext"; exit 1
@@ -117,8 +121,8 @@ python3 -c "import json,sys; s=json.load(open('$WORK/stats-pf.json')); assert s[
   || { echo "FAIL: prefetch stats wrong"; cat "$WORK/stats-pf.json"; exit 1; }
 
 echo "== prefetch: strict mode refuses when a block is missing =="
-MISSING=$(find "$WORK/origin/e2e/ns/chunks" -type f -size +1M | head -1)
-[ -n "$MISSING" ] || { echo "FAIL: no chunk to remove"; exit 1; }
+MISSING=$(find "$WORK/origin/e2e/ns/packs" -type f -size +1M | head -1)
+[ -n "$MISSING" ] || { echo "FAIL: no pack to remove"; exit 1; }
 mv "$MISSING" "$WORK/chunk.bak"
 if echo exit | "$BIN"/pelfs shell --docker --snapshot-interval 0 --prefetch all --stats-file "$WORK/stats-pf2.json" "$PREFIX" > "$WORK/run-pf2.log" 2>&1; then
   echo "FAIL: strict prefetch should refuse to start with a missing block"

@@ -62,6 +62,11 @@ type Manager struct {
 	// OnError, when set, is called for each failed periodic snapshot (used
 	// by the session statistics collector).
 	OnError func(err error)
+	// PrePublish, when set, runs before every snapshot is taken. It is
+	// used to flush the pack spool: the database copy about to be uploaded
+	// references blocks, and every one of them must be durable in the
+	// federation before the snapshot that references them is.
+	PrePublish func(ctx context.Context) error
 
 	lastETag string // ETag of current.db after our most recent upload
 }
@@ -111,6 +116,11 @@ func (mgr *Manager) sessionKey(name string) string {
 // object's ETag is compared with the one from our previous upload to detect
 // a concurrent writer.
 func (mgr *Manager) Snapshot(ctx context.Context, final bool) error {
+	if mgr.PrePublish != nil {
+		if err := mgr.PrePublish(ctx); err != nil {
+			return fmt.Errorf("pre-publish flush: %w", err)
+		}
+	}
 	if mgr.lastETag != "" {
 		if ki, err := mgr.Meta.StatKey(ctx, mgr.sessionKey(currentName)); err == nil &&
 			ki.ETag != "" && ki.ETag != mgr.lastETag {

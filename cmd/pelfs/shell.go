@@ -147,6 +147,7 @@ func mountOptions(s *session) mountfs.Options {
 		Compression:    s.o.compress,
 		EncryptKeyPEM:  s.encryptPEM,
 		FlushTimeout:   s.o.flushTimeout,
+		FlushPacks:     s.packs.Flush,
 		CacheFreeRatio: s.o.cacheFreeRatio,
 		Backend:        s.o.mountBackend,
 	}
@@ -188,6 +189,7 @@ func runInDocker(o *cmdOpts, prefix string) int {
 		"--prefetch", o.prefetch,
 		"--flush-timeout", o.flushTimeout.String(),
 		"--cache-free-ratio", fmt.Sprint(o.cacheFreeRatio),
+		"--pack-size", fmt.Sprint(o.packSizeMiB),
 		"--no-docker", // never recurse
 	}
 	if o.encryptKeyPath != "" {
@@ -211,6 +213,7 @@ func runInDocker(o *cmdOpts, prefix string) int {
 		"--ro":               o.readOnly,
 		"--no-restore":       o.noRestore,
 		"--no-lease":         o.noLease,
+		"--no-pack":          o.noPack,
 		"--steal-lease":      o.stealLease,
 		"--no-acquire-token": o.noAcquireToken,
 		"--insecure":         o.insecure,

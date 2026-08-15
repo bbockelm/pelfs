@@ -134,6 +134,36 @@ Details worth knowing:
   $ echo 'sha256sum big-dataset.bin' | bin/pelfs shell --docker pelican://.../scratch
   ```
 
+## Batch / JupyterLab usage (e.g. inside an HTCondor job)
+
+For a user working interactively inside a job sandbox, the intended pattern
+is:
+
+```
+pelfs shell --writeback --prefetch background --stats-file $_CONDOR_SCRATCH_DIR/pelfs-stats.json \
+    pelican://osg-htc.org/.../scratch
+```
+
+- `--writeback` buffers block uploads locally and pushes them to the
+  federation asynchronously; transient upload failures during the session
+  are retried in the background. At exit, pelfs **waits for every staged
+  block to finish uploading** (bounded by `--flush-timeout`, default:
+  forever) and reports failure if the final upload cannot complete.
+- `--prefetch all` downloads every block into the local cache at startup
+  and **refuses to start** if any block is unavailable; `--prefetch
+  background` starts the same warmup without blocking, recording the
+  outcome in the statistics.
+- `--stats-file` writes a JSON session summary (updated every 30 s and
+  finalized at exit) that a supervisor like HTCondor can inspect:
+  object-store operation/error counts with error samples, bytes moved,
+  snapshot successes/failures, prefetch completeness, writeback drain
+  status, lease conflicts, and an overall `clean_shutdown` verdict plus
+  exit code. Error counts include attempts that JuiceFS retried
+  successfully, so nonzero errors with `clean_shutdown: true` means
+  "transient trouble, but all data made it".
+  In Docker-fallback mode the file is bind-mounted out of the container
+  (default `./pelfs-stats.json`).
+
 ## Flags
 
 See `pelfs -h`. Highlights: `--ro` (read-only: restore + mount, upload

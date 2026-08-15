@@ -59,6 +59,9 @@ type Manager struct {
 	// OnSnapshot, when set, is called after each successful upload (used to
 	// surface last-snapshot time in `pelfs status`).
 	OnSnapshot func(key string, when time.Time)
+	// OnError, when set, is called for each failed periodic snapshot (used
+	// by the session statistics collector).
+	OnError func(err error)
 
 	lastETag string // ETag of current.db after our most recent upload
 }
@@ -87,6 +90,9 @@ func (mgr *Manager) Run(ctx context.Context, interval time.Duration) {
 		case <-t.C:
 			if err := mgr.Snapshot(ctx, false); err != nil {
 				fmt.Fprintf(os.Stderr, "pelfs: metadata snapshot failed: %v\n", err)
+				if mgr.OnError != nil {
+					mgr.OnError(err)
+				}
 				if errors.Is(err, ErrConflict) {
 					return
 				}

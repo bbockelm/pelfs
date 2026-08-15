@@ -21,6 +21,7 @@ type Options struct {
 	PrefixURL      string
 	TokenPath      string   // host path of bearer token file ("" = none found)
 	EncryptKeyPath string   // host path of the encryption private key ("" = none)
+	StatsPath      string   // host path for the stats file ("" = none); its directory is mounted rw
 	Image          string   // container image; DefaultImage if empty
 	ExtraArgs      []string // pelfs shell flags forwarded into the container
 }
@@ -109,6 +110,11 @@ func Run(opts Options) (int, error) {
 	}
 	if opts.EncryptKeyPath != "" {
 		args = append(args, "-v", opts.EncryptKeyPath+":/run/pelfs/encrypt-key:ro")
+	}
+	if opts.StatsPath != "" {
+		// The summary must outlive the container; mount the target
+		// directory and let the in-container pelfs write into it.
+		args = append(args, "-v", filepath.Dir(opts.StatsPath)+":/run/pelfs/stats")
 	}
 	args = append(args, passthroughEnv()...)
 	args = append(args, image, "/usr/local/bin/pelfs", "shell",

@@ -50,6 +50,9 @@ type Options struct {
 	Writeback    bool  // asynchronous block upload
 	ReadOnly     bool  // mount read-only (metadata rejects modification)
 	Debug        bool
+	// FlushTimeout bounds how long Close waits for writeback-staged blocks
+	// to finish uploading (0 = wait forever). Only relevant with Writeback.
+	FlushTimeout time.Duration
 
 	// Compression ("none" or "zstd") is recorded in the volume format at
 	// creation; an existing volume's setting always wins.
@@ -65,10 +68,14 @@ type Options struct {
 type Mounted struct {
 	MountPoint string
 
-	m      meta.Meta
-	blob   object.ObjectStorage
-	v      *vfs.VFS
-	served chan error
+	m            meta.Meta
+	blob         object.ObjectStorage
+	v            *vfs.VFS
+	store        chunk.ChunkStore
+	registry     *prometheus.Registry
+	writeback    bool
+	flushTimeout time.Duration
+	served       chan error
 }
 
 // Mount formats the metadata database if needed, starts a FUSE server on
@@ -196,11 +203,15 @@ func Mount(opts Options) (*Mounted, error) {
 	v := vfs.NewVFS(vfsConf, m, store, registerer, registry)
 
 	mnt := &Mounted{
-		MountPoint: opts.MountPoint,
-		m:          m,
-		blob:       opts.Blob,
-		v:          v,
-		served:     make(chan error, 1),
+		MountPoint:   opts.MountPoint,
+		m:            m,
+		blob:         opts.Blob,
+		v:            v,
+		store:        store,
+		registry:     registry,
+		writeback:    opts.Writeback,
+		flushTimeout: opts.FlushTimeout,
+		served:       make(chan error, 1),
 	}
 	go func() {
 		mnt.served <- fuse.Serve(v, rawOpts, false, false)
@@ -270,11 +281,23 @@ func (mnt *Mounted) Close() error {
 		}
 	}
 down:
+	var flushErr error
 	if err := mnt.v.FlushAll(""); err != nil {
 		logger.Errorf("flush delayed data: %s", err)
+		flushErr = fmt.Errorf("flush delayed data: %w", err)
+	}
+	// With writeback, blocks may still sit in the local staging area; they
+	// are the only copy of the data, so the final upload must complete.
+	if mnt.writeback && flushErr == nil {
+		if err := mnt.drainStaging(mnt.flushTimeout); err != nil {
+			flushErr = fmt.Errorf("writeback staging: %w", err)
+		}
 	}
 	err := mnt.m.CloseSession()
 	object.Shutdown(mnt.blob)
+	if flushErr != nil {
+		return flushErr
+	}
 	return err
 }
 

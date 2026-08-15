@@ -35,6 +35,9 @@ type billyFS struct {
 	ctx meta.Context
 	uid uint32 // ownership presented to the NFS client
 	gid uint32
+	// hc keeps write handles open across go-nfs's open-write-close-per-RPC
+	// pattern so writes coalesce into full-size blocks; see handlecache.go.
+	hc *handleCache
 }
 
 var (
@@ -54,12 +57,21 @@ var (
 // only for presentation: every file is reported to the NFS client as owned
 // by the mounting user.
 func NewBillyFS(fs *jfs.FileSystem, uid, gid uint32) billy.Filesystem {
+	ctx := meta.NewContext(uint32(os.Getpid()), 0, []uint32{0})
 	return &billyFS{
 		fs:  fs,
-		ctx: meta.NewContext(uint32(os.Getpid()), 0, []uint32{0}),
+		ctx: ctx,
 		uid: uid,
 		gid: gid,
+		hc:  newHandleCache(ctx),
 	}
+}
+
+// Close flushes and closes every handle the write cache still holds. The
+// caller MUST invoke this after the NFS server stops and before the
+// underlying filesystem is torn down, or buffered writes are lost.
+func (b *billyFS) Close() error {
+	return b.hc.closeAll()
 }
 
 // wrapFI presents a jfs FileInfo to go-nfs with the mount user as owner and
@@ -118,11 +130,38 @@ func (b *billyFS) Open(filename string) (billy.File, error) {
 
 func (b *billyFS) OpenFile(filename string, flag int, perm os.FileMode) (billy.File, error) {
 	name := clean(filename)
+	writeIntent := flag&(os.O_APPEND|os.O_RDWR|os.O_WRONLY) != 0
+
+	if writeIntent {
+		if flag&(os.O_TRUNC|os.O_EXCL) != 0 {
+			// A truncating or must-create open must not resume a cached
+			// handle's buffered state.
+			_ = b.hc.invalidate(name)
+		} else if e := b.hc.acquire(name); e != nil {
+			// Reuse the cached write handle so consecutive NFS WRITE RPCs
+			// coalesce in one JuiceFS writer instead of flushing a tiny
+			// slice per RPC.
+			bf := &billyFile{name: name, f: e.f, ctx: b.ctx, ch: e, hc: b.hc}
+			if flag&os.O_APPEND != 0 {
+				atomic.StoreInt64(&bf.pos, b.hc.knownSize(e))
+			}
+			return bf, nil
+		}
+	} else if e := b.hc.acquire(name); e != nil {
+		// Serve the read from the cached handle that holds the buffered
+		// writes. JuiceFS clamps reads to the length captured when the
+		// reading handle was opened, and pread flushes that handle's own
+		// pending writes first — so reading through this handle is always
+		// consistent, whereas opening a fresh one depends on the flush and
+		// the attribute cache having already caught up.
+		return &billyFile{name: name, f: e.f, ctx: b.ctx, ch: e, hc: b.hc}, nil
+	}
+
 	var mode int
 	if flag&os.O_WRONLY == 0 {
 		mode |= vfs.MODE_MASK_R
 	}
-	if flag&(os.O_APPEND|os.O_RDWR|os.O_WRONLY) != 0 {
+	if writeIntent {
 		mode |= vfs.MODE_MASK_W
 	}
 	f, errno := b.fs.Open(b.ctx, name, uint32(mode))
@@ -146,21 +185,48 @@ func (b *billyFS) OpenFile(filename string, flag int, perm os.FileMode) (billy.F
 		}
 	}
 	bf := &billyFile{name: name, f: f, ctx: b.ctx}
+	size := int64(0)
+	if fi, err := f.Stat(); err == nil {
+		size = fi.Size()
+	}
+	if flag&os.O_TRUNC != 0 {
+		size = 0
+	}
+	if writeIntent {
+		bf.ch, bf.hc = b.hc.add(name, f, size), b.hc
+	}
 	if flag&os.O_APPEND != 0 {
-		if fi, err := f.Stat(); err == nil {
-			atomic.StoreInt64(&bf.pos, fi.Size())
-		}
+		atomic.StoreInt64(&bf.pos, size)
 	}
 	return bf, nil
 }
 
 func (b *billyFS) Stat(filename string) (os.FileInfo, error) {
-	fi, errno := b.fs.Stat(b.ctx, clean(filename))
+	name := clean(filename)
+	fi, errno := b.fs.Stat(b.ctx, name)
 	if errno != 0 {
 		return nil, pe("stat", filename, errno)
 	}
-	return b.wrapFI(fi), nil
+	wrapped := b.wrapFI(fi)
+	// Buffered writes are invisible to path-based Stat until the handle
+	// flushes; overlay the freshest known size so go-nfs's per-WRITE stat
+	// (and the client's post-op attribute checks) see current state without
+	// forcing a slice-fragmenting flush.
+	if size, mtime, ok := b.hc.statOverlay(name); ok && size > wrapped.Size() {
+		wrapped = &overlaidFileInfo{FileInfo: wrapped, size: size, mtime: mtime}
+	}
+	return wrapped, nil
 }
+
+// overlaidFileInfo overrides size/mtime while preserving the wrapped Sys().
+type overlaidFileInfo struct {
+	os.FileInfo
+	size  int64
+	mtime time.Time
+}
+
+func (o *overlaidFileInfo) Size() int64        { return o.size }
+func (o *overlaidFileInfo) ModTime() time.Time { return o.mtime }
 
 func (b *billyFS) Lstat(filename string) (os.FileInfo, error) {
 	fi, errno := b.fs.Lstat(b.ctx, clean(filename))
@@ -171,11 +237,22 @@ func (b *billyFS) Lstat(filename string) (os.FileInfo, error) {
 }
 
 func (b *billyFS) Rename(oldpath, newpath string) error {
+	// Flush+drop cached handles on both ends so no buffered data lands
+	// under the old identity after the rename. A failed flush here means
+	// buffered bytes would be lost, so it fails the rename rather than
+	// silently renaming a short file (git relies on write-then-rename).
+	if err := b.hc.invalidate(clean(oldpath)); err != nil {
+		return err
+	}
+	if err := b.hc.invalidate(clean(newpath)); err != nil {
+		return err
+	}
 	return pe("rename", oldpath, b.fs.Rename(b.ctx, clean(oldpath), clean(newpath), 0))
 }
 
 func (b *billyFS) Remove(filename string) error {
 	name := clean(filename)
+	_ = b.hc.invalidate(name)
 	fi, errno := b.fs.Lstat(b.ctx, name)
 	if errno != 0 {
 		return pe("remove", name, errno)
@@ -281,6 +358,12 @@ func (b *billyFS) Lchown(name string, uid, gid int) error {
 }
 
 func (b *billyFS) Chtimes(name string, atime, mtime time.Time) error {
+	// Commit buffered writes first: an explicitly-set mtime must stick, and
+	// the Stat overlay (which reports last-write time while a handle is
+	// dirty) must stand down in its favor.
+	if err := b.hc.flushIfDirty(clean(name)); err != nil {
+		return err
+	}
 	return b.withFile("chtimes", name, func(f *jfs.File) syscall.Errno {
 		return f.Utime(b.ctx, atime.UnixMilli(), mtime.UnixMilli())
 	})
@@ -295,6 +378,10 @@ type billyFile struct {
 	f    *jfs.File
 	ctx  meta.Context
 	pos  int64
+	// ch/hc are set when f is a shared cached write handle: Close releases
+	// the reference instead of closing (the janitor flushes after idle).
+	ch *cachedHandle
+	hc *handleCache
 }
 
 var _ billy.File = (*billyFile)(nil)
@@ -312,13 +399,20 @@ func (f *billyFile) ReadAt(p []byte, off int64) (int, error) {
 }
 
 func (f *billyFile) Write(p []byte) (int, error) {
-	n, errno := f.f.Pwrite(f.ctx, p, atomic.LoadInt64(&f.pos))
+	off := atomic.LoadInt64(&f.pos)
+	n, errno := f.f.Pwrite(f.ctx, p, off)
 	atomic.AddInt64(&f.pos, int64(n))
+	if errno == 0 && f.ch != nil {
+		f.hc.noteWrite(f.ch, off+int64(n))
+	}
 	return n, pe("write", f.name, errno)
 }
 
 func (f *billyFile) WriteAt(p []byte, off int64) (int, error) {
 	n, errno := f.f.Pwrite(f.ctx, p, off)
+	if errno == 0 && f.ch != nil {
+		f.hc.noteWrite(f.ch, off+int64(n))
+	}
 	return n, pe("write", f.name, errno)
 }
 
@@ -340,11 +434,28 @@ func (f *billyFile) Seek(offset int64, whence int) (int64, error) {
 }
 
 func (f *billyFile) Truncate(size int64) error {
-	return pe("truncate", f.name, f.f.Truncate(f.ctx, uint64(size)))
+	errno := f.f.Truncate(f.ctx, uint64(size))
+	if errno == 0 && f.ch != nil {
+		f.hc.noteTruncate(f.ch, size)
+	}
+	return pe("truncate", f.name, errno)
 }
 
 func (f *billyFile) Close() error {
+	if f.ch != nil {
+		return f.hc.release(f.ch)
+	}
 	return pe("close", f.name, f.f.Close(f.ctx))
+}
+
+// Sync commits buffered writes without closing the handle. go-nfs's COMMIT
+// handler looks for this optional method to implement NFSv3 stable-storage
+// semantics.
+func (f *billyFile) Sync() error {
+	if f.ch != nil {
+		return f.hc.sync(f.name)
+	}
+	return pe("sync", f.name, f.f.Fsync(f.ctx))
 }
 
 // Lock/Unlock: advisory locks are not served (mounted with nolocks).

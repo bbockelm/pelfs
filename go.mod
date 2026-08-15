@@ -349,3 +349,10 @@ replace (
 // local path; the integration workflow must check out that branch (or the
 // replace must be removed) before CI goes green.
 replace github.com/pelicanplatform/pelican => /Users/bbockelm/projects/pelican.worktrees/pelfs-overwrite-scopes
+
+// TEMPORARY local replace: adds NFSv3 EXCLUSIVE create support (upstream
+// rejects every O_CREAT|O_EXCL open, which git does constantly) and makes
+// COMMIT flush backends that buffer writes. Branch pelfs-exclusive-create,
+// commit 67d9b3e -- upstreamable. Drop once merged. NOTE: CI cannot resolve
+// a local path; this must be pushed or removed before CI goes green.
+replace github.com/willscott/go-nfs => /Users/bbockelm/projects/go-nfs

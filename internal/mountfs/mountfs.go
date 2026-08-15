@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/go-git/go-billy/v5"
 	"github.com/google/uuid"
 	"github.com/juicedata/juicefs/pkg/chunk"
 	jfs "github.com/juicedata/juicefs/pkg/fs"
@@ -114,6 +115,7 @@ type Mounted struct {
 
 	// NFS backend only.
 	jfs    *jfs.FileSystem
+	bfs    billy.Filesystem // NFS backend: holds the write-handle cache
 	nfsSrv *nfsmount.Server
 }
 
@@ -276,6 +278,7 @@ func Mount(opts Options) (*Mounted, error) {
 			return nil, fmt.Errorf("filesystem layer: %w", err)
 		}
 		bfs := nfsmount.NewBillyFS(fsys, uint32(os.Getuid()), uint32(os.Getgid()))
+		mnt.bfs = bfs
 		srv, err := nfsmount.Serve(bfs)
 		if err != nil {
 			_ = m.CloseSession()
@@ -420,9 +423,22 @@ func (mnt *Mounted) closeNFS() error {
 	_ = mnt.nfsSrv.Close()
 
 	var flushErr error
+	// The NFS adapter keeps write handles open to coalesce writes, and
+	// jfs.FileSystem.Flush() does NOT flush open file writers — only the
+	// log buffer and session heartbeat. Closing those handles first is what
+	// actually commits recently written bytes; skipping it silently
+	// truncates every file written in the last few seconds.
+	if c, ok := mnt.bfs.(interface{ Close() error }); ok {
+		if err := c.Close(); err != nil {
+			logger.Errorf("flush buffered NFS writes: %s", err)
+			flushErr = fmt.Errorf("flush buffered NFS writes: %w", err)
+		}
+	}
 	if err := mnt.jfs.Flush(); err != nil {
 		logger.Errorf("flush delayed data: %s", err)
-		flushErr = fmt.Errorf("flush delayed data: %w", err)
+		if flushErr == nil {
+			flushErr = fmt.Errorf("flush delayed data: %w", err)
+		}
 	}
 	if mnt.writeback && flushErr == nil {
 		if err := mnt.drainStaging(mnt.flushTimeout); err != nil {

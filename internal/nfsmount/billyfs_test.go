@@ -25,7 +25,16 @@ import (
 // its pkg/fs layer.
 func newTestVolume(t *testing.T) *jfs.FileSystem {
 	t.Helper()
-	srv := httptest.NewServer(fakeorigin.Handler(t.TempDir()))
+	fsys, _ := newTestVolumeWithRoot(t)
+	return fsys
+}
+
+// newTestVolumeWithRoot additionally returns the fakeorigin's backing
+// directory so tests can inspect the objects that actually landed.
+func newTestVolumeWithRoot(t *testing.T) (*jfs.FileSystem, string) {
+	t.Helper()
+	originRoot := t.TempDir()
+	srv := httptest.NewServer(fakeorigin.Handler(originRoot))
 	t.Cleanup(srv.Close)
 	store, err := pelicanobj.New(context.Background(), pelicanobj.Config{PrefixURL: srv.URL + "/vol"})
 	if err != nil {
@@ -89,7 +98,7 @@ func newTestVolume(t *testing.T) *jfs.FileSystem {
 	if err != nil {
 		t.Fatalf("NewFileSystem: %v", err)
 	}
-	return fsys
+	return fsys, originRoot
 }
 
 func TestBillyFSRoundtrip(t *testing.T) {

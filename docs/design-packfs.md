@@ -136,8 +136,9 @@ The single mutable object and the root of both trust and consistency:
 | root catalog hash | entry point of the namespace |
 | catalog routing (transition points -> pack locations) | find any catalog without fetching parents' bodies |
 | inode-shard ranges -> pack locations | find any promoted inode record |
+| **pack list** (name, size, trailer hash per pack) | the generation's location layer: which packs constitute this snapshot |
 | `next_inode` | allocator high-water mark |
-| wrapped DEK | confidentiality key, wrapped by the user's KEK |
+| key table (key-id -> wrapped DEK) | confidentiality keys, wrapped by the user's KEK |
 | previous-superblock hash | lineage: snapshot history, fork detection |
 | signature | trust root over all of the above |
 
@@ -177,6 +178,49 @@ Rejected: heartbeating through the superblock itself (to keep a
 "one mutable object" purity claim). That conflates roles — re-signing
 every 30s, lineage polluted or bypassed by heartbeats, and readers unable
 to distinguish "new generation" from "still alive" without parsing.
+
+## Identity vs. location: how snapshots record where chunks land
+
+A snapshot must capture *what* every file's chunks are without freezing
+*where* they live, or repack would invalidate history. The decomposition:
+
+- **Identity lives in catalogs.** A file's row records its chunk list as
+  content hashes — location-free, which is what lets an unchanged
+  subtree's catalog stay hash-identical (and therefore shared) across any
+  number of generations.
+- **Location lives in pack trailers, versioned by the superblock's pack
+  list.** Trailers (hash -> offset, length within their pack) are
+  immutable and shared; each superblock records the *set of packs* that
+  constitutes its generation — a per-pack list (name, size, trailer
+  hash), not a per-chunk map, so it stays small (hundreds of entries for
+  a million-chunk volume, versus tens of MB for a chunk-level manifest).
+  Resolution is: hash -> this generation's pack set -> trailer -> range.
+
+Consequences:
+
+- **Tagged generations never rot.** A generation pins its pack set;
+  repack emits a *new* generation whose list routes moved chunks to the
+  new pack, while retained older generations keep their old packs alive.
+  GC's pack-liveness question is simply "does any retained generation's
+  pack list name this pack" (plus the reader grace window).
+- **Repack remains metadata-free in v2**: catalogs never change; only the
+  next superblock's pack list does.
+- **Bootstrap-by-listing dies with phase 1.** Today a session lists
+  packs/ and trusts name-ordered shadowing; in v2 the superblock hands a
+  fresh session the authoritative, generation-consistent pack set — no
+  listing, no race against concurrent repack.
+- File versioning in the user-visible sense falls out: mount any tagged
+  generation for its point-in-time tree; a file's versions across
+  generations are different chunk lists in (mostly shared) catalogs, with
+  CDC + content addressing sharing every unchanged chunk between
+  versions. Retention policy is ref/tag retention.
+
+(Contrast with v1, which has the same two layers — metadata references
+logical block names, trailers map names to locations — but does not
+version the pack set and deletes overwritten blocks eagerly: a v1
+"snapshot" is a crash-recovery checkpoint whose older siblings rot as
+later sessions tombstone their blocks. Only the newest is guaranteed
+consistent, by the pre-snapshot flush ordering.)
 
 ## Refs: branches, tags, and forks
 

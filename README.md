@@ -96,6 +96,25 @@ bin/fakeorigin --root /tmp/origin --listen 127.0.0.1:8081 &
 bin/pelfs shell http://127.0.0.1:8081/ns     # https?/http = direct mode, no discovery
 ```
 
+## macOS without macFUSE: the NFS backend
+
+On a Mac with neither macFUSE nor FUSE-T installed, `pelfs shell` (and
+`pelfs mount`) attach the filesystem through a **loopback NFS mount**: pelfs
+runs a pure-Go NFSv3 server on 127.0.0.1 and mounts it with macOS's built-in
+`mount_nfs`, which works unprivileged. No kernel extension, no third-party
+installs, no closed-source components — this is the same mechanism FUSE-T
+uses internally, minus the middleman (FUSE-T's libfuse ABI can't host our
+go-fuse stack anyway, which speaks /dev/fuse directly).
+
+Backend selection is automatic (`--mount-backend auto`): native FUSE if
+macFUSE is present, else NFS on macOS, else the Docker fallback. Force one
+with `--mount-backend fuse|nfs|docker`.
+
+One macOS quirk: the first time an application touches the mounted volume,
+macOS shows its one-time "would like to access files on a network volume"
+permission prompt (TCC) for that app — click Allow once per app
+(Terminal, Finder, ...).
+
 ## Example: running on a Mac without macFUSE (Docker fallback)
 
 `pelfs shell` detects that macFUSE is absent and re-launches itself inside a

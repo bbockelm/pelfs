@@ -222,6 +222,52 @@ version the pack set and deletes overwritten blocks eagerly: a v1
 later sessions tombstone their blocks. Only the newest is guaranteed
 consistent, by the pre-snapshot flush ordering.)
 
+## Disaster recovery: scavenging a lost superblock
+
+The superblock is the only mutable object, which makes it the natural
+worry: what survives if it is lost or corrupted? Answer: everything except
+the map — packs contain the catalogs and inode shards as well as the data,
+so recovery is a scavenging problem, made tractable by three format
+provisions:
+
+1. **Typed pack entries.** Every trailer entry carries a type (data chunk,
+   catalog, inode shard, superblock backup; absent = data). One byte of
+   JSON per entry; without it, recovery would have to sniff SQLite magic,
+   which encryption makes impossible.
+2. **Self-identifying catalogs.** Each catalog embeds a metadata table:
+   volume UUID, its covered subtree root path, the generation that
+   produced it, and — because transition-point rows carry child catalog
+   hashes — the tree is *self-assembling*: find all catalog entries,
+   descend by embedded child hashes, and a root candidate is any catalog
+   covering "/" that no other catalog references. Generation stamps order
+   candidates; recovery prefers the newest generation whose reachable
+   closure is complete (a crash mid-publish legitimately leaves a newer,
+   incomplete set — publish ordering uploads packs before flipping the
+   superblock — so fall back a generation when the closure has holes).
+3. **Superblock backups ride in packs.** Superblocks are tiny; each pack
+   carries the most recent one as an entry (type: superblock-backup,
+   including its ref name). Losing the mutable object then costs only the
+   generations since the last pack — recovery becomes "restore the newest
+   embedded backup, verify its signature, re-point the ref," recovering
+   the allocator counter, shard ranges, pack list, and the KEK-wrapped
+   key table exactly. (A lost KEK is still fatal for encrypted data, by
+   design; the wrapped DEK in a backup is harmless to expose.)
+
+`pelfs rescue` (the human-facing tool, v2 open work): enumerate packs,
+inventory trailers, assemble the newest complete generation, then report —
+subtrees intact, files damaged by missing chunks, catalogs missing (their
+siblings remain fine), and a hash-only lost+found for data reachable from
+no surviving catalog (promoted inode-shard records can even recover file
+bodies whose dirents are gone). Partial pack loss degrades proportionally
+and legibly, because the hash tree makes "what is missing" exactly
+enumerable rather than a guess.
+
+(Phase-1/v1 note: today the metadata snapshot objects under meta/ are the
+only namespace record; packs hold logically-named blocks, so losing every
+snapshot leaves lost+found-grade recovery only. keep-sessions retention is
+the v1 mitigation. The phase-1 trailer format already reserves the entry
+type field so existing packs stay forward-compatible with scavenging.)
+
 ## Refs: branches, tags, and forks
 
 A superblock generation is already a commit: immutable once written, signed,
@@ -576,10 +622,17 @@ Roughly ordered by how much they block implementation:
 8. **Schema details.** Dirent/record column layout, xattrs, special files,
    sparse files; what of the JuiceFS schema is kept vs dropped (sessions,
    trash, counters all go).
-9. **Benchmarks and acceptance criteria.** conda env create, git clone,
+9. **`pelfs rescue`.** The scavenging tool from the disaster-recovery
+   section: pack inventory, generation assembly, damage report,
+   lost+found materialization. Depends on typed entries (reserved in the
+   phase-1 trailer already), self-identifying catalogs, and
+   superblock-backup entries — all format provisions that must land with
+   phase 2, since retrofitting them later leaves early volumes
+   unrescuable.
+10. **Benchmarks and acceptance criteria.** conda env create, git clone,
    kernel untar, JupyterLab cold-start; targets for publish latency and
    mount-to-first-byte.
-10. **v1 -> v2 migration.** Probably "none — scratch volumes drain and
+11. **v1 -> v2 migration.** Probably "none — scratch volumes drain and
     recreate," but that should be an explicit decision, and phase 1's pack
     middleware must not paint v1 volumes into a corner.
 

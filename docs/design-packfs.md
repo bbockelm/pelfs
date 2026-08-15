@@ -279,6 +279,59 @@ phase 2 — read-only mounts hydrating the JuiceFS hot engine from catalogs
 — refresh means remount. Acceptable for batch; stated here so nobody
 discovers it in production.
 
+## Overwrite churn
+
+The hostile workload is a file — or one hot 32KB byte range — rewritten
+and fsynced over and over (notebook autosave, a database WAL, checkpoint
+files). Immutable-object designs turn every fsynced version into new
+objects; without countermeasures, storage grows with write volume rather
+than live data. Four layers absorb it, ordered by how early they act:
+
+1. **Die-young elimination (implemented, phase 1).** Every fsync of a hot
+   range creates a new JuiceFS slice; the chunk's slice stack triggers
+   compaction at just **5 slices**, which tombstones the stale versions'
+   blocks. Blocks tombstoned while still pending in the pack spool are
+   dropped at cut time: the pack uploads only live extents (re-based to
+   fresh offsets), so versions that die within the pack window — a
+   64MiB/snapshot-interval horizon — never reach the federation at all.
+   A same-range fsync loop thus costs one live version per pack cut, not
+   one per fsync.
+
+   Sealing at snapshot cadence is *optimal* under the durability contract:
+   a block that survives until the snapshot is live at publish time and
+   must be uploaded regardless, so holding the active pack open longer can
+   never reduce garbage — the die-young window is automatically maximal.
+   Conversely, sealed packs are never reworked on the snapshot path: seal
+   compaction is synchronous and cheap (a local sequential copy of live
+   bytes, bounded by the 64MiB target — it cannot fall behind the writer,
+   which blocks on cut), while sealed-pack cleanup is repack's job on its
+   own schedule. Repack is self-limiting in the adversarial case: the more
+   a pack's contents have died, the fewer live bytes a repack must move —
+   pathological churn makes repack cheaper per pack, not dearer.
+2. **Slice compaction (wired since v1).** JuiceFS merges a chunk's slice
+   stack into one slice (reading only the union of written ranges, so a
+   hot 32KB range compacts by reading 32KB, not the 64MiB chunk). This
+   bounds metadata growth and read fan-out between publishes; its
+   tombstones feed layer 1.
+3. **Repack (designed; implementation pending).** Versions that survive a
+   pack cut and die later become dead entries inside immutable packs.
+   Per-pack liveness is exact and free (the bootstrap index knows every
+   entry; tombstones and shadowing mark the dead). Repack rewrites the
+   live entries of packs below a liveness threshold into the current
+   spool and then deletes the old packs whole. Three properties make it
+   simple: **cost is proportional to live bytes moved**, not pack size;
+   **no tombstones are needed** — the moved entries reappear in a newer
+   pack, and name-ordered shadowing already makes the newer copy
+   authoritative; and **crash mid-repack is idempotent** — duplicates
+   resolve newest-wins, and the old pack is deleted only after the new
+   one is durable (plus, in the v2 refs world, the GC grace window).
+   Policy: trigger on liveness ratio with an age floor so the hot tail is
+   never repacked.
+4. **Content addressing (v2).** The endgame: identical content hashes to
+   the same chunk — a rewrite that changes nothing costs nothing — and
+   CDC re-chunking makes an edit cost proportional to the changed bytes,
+   not the file. Layers 1–3 then handle only genuinely novel dead data.
+
 ## Identity: inodes and hardlinks
 
 **Inodes are opaque, stable 64-bit values** allocated monotonically from

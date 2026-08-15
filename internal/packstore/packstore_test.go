@@ -581,3 +581,65 @@ func TestReadOnlyPutPassthrough(t *testing.T) {
 		t.Fatalf("Head %s size = %d, want %d", key, obj.Size(), len(data))
 	}
 }
+
+// TestOverwriteChurnCompactsAtCut models a file (or hot 32KB byte range)
+// overwritten repeatedly within one pack window: each version is a new
+// block key, and JuiceFS chunk compaction tombstones the stale versions
+// (blob.Delete) while they are still pending in the spool. The cut-time
+// compaction must upload only the surviving version — blocks that die
+// young never reach the federation.
+func TestOverwriteChurnCompactsAtCut(t *testing.T) {
+	ctx := context.Background()
+	inner, vol := newInner(t)
+	s := newPack(t, inner, Config{TargetSize: 1 << 30, WriteEnabled: true})
+
+	const versions = 10
+	const blockSize = 32 << 10
+	var lastKey string
+	for v := 1; v <= versions; v++ {
+		key := fmt.Sprintf("chunks/0/0/%d_0_%d", v, blockSize)
+		if err := s.Put(ctx, key, bytes.NewReader(blob(key, blockSize))); err != nil {
+			t.Fatalf("Put v%d: %v", v, err)
+		}
+		if lastKey != "" {
+			if err := s.Delete(ctx, lastKey); err != nil {
+				t.Fatalf("Delete stale v%d: %v", v-1, err)
+			}
+		}
+		lastKey = key
+	}
+	if err := s.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	// One pack, sized for ONE version plus the index — not ten.
+	packs, err := filepath.Glob(filepath.Join(vol, "packs", "*"))
+	if err != nil || len(packs) != 1 {
+		t.Fatalf("packs on origin = %v (err %v), want exactly 1", packs, err)
+	}
+	fi, err := os.Stat(packs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Size() >= 2*blockSize {
+		t.Fatalf("pack is %d bytes; churn was uploaded instead of compacted (want < %d)", fi.Size(), 2*blockSize)
+	}
+	if fi.Size() < blockSize {
+		t.Fatalf("pack is %d bytes; live version missing", fi.Size())
+	}
+
+	// The survivor reads back (fresh instance too); stale versions are gone.
+	if got := readObj(t, s, lastKey, 0, -1); !bytes.Equal(got, blob(lastKey, blockSize)) {
+		t.Fatalf("live version corrupted")
+	}
+	fresh := newPack(t, inner, Config{})
+	if got := readObj(t, fresh, lastKey, 0, -1); !bytes.Equal(got, blob(lastKey, blockSize)) {
+		t.Fatalf("fresh instance: live version corrupted")
+	}
+	for v := 1; v < versions; v++ {
+		key := fmt.Sprintf("chunks/0/0/%d_0_%d", v, blockSize)
+		if _, err := fresh.Head(ctx, key); err == nil {
+			t.Fatalf("stale version %s still visible", key)
+		}
+	}
+}

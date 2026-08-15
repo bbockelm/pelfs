@@ -499,13 +499,33 @@ func (s *Store) Flush(ctx context.Context) error {
 	s.dead = nil
 	s.mu.Unlock()
 
-	// Build the trailer and upload outside the lock.
+	// Compact at cut time: the spool may contain bytes whose entries were
+	// tombstoned while pending — a file overwritten (or a hot byte range
+	// re-flushed) several times within the pack window leaves only its
+	// newest version live, and JuiceFS chunk compaction (triggered at just
+	// 5 slices) tombstones stale versions quickly. Upload only the live
+	// extents, re-based to fresh offsets, so blocks that die young never
+	// reach the federation at all.
+	keys := make([]string, 0, len(pending))
+	for k := range pending {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return pending[keys[i]].off < pending[keys[j]].off })
+
 	tr := trailer{Version: 1, Created: created}
-	for k, e := range pending {
-		tr.Entries = append(tr.Entries, trailerEntry{Key: k, Off: e.off, Length: e.length})
+	newOff := make(map[string]int64, len(keys))
+	var liveSz int64
+	for _, k := range keys {
+		e := pending[k]
+		newOff[k] = liveSz
+		tr.Entries = append(tr.Entries, trailerEntry{Key: k, Off: liveSz, Length: e.length})
+		liveSz += e.length
 	}
 	sort.Slice(tr.Entries, func(i, j int) bool { return tr.Entries[i].Key < tr.Entries[j].Key })
 	tr.Dead = dead
+	if droppedBytes := spoolSz - liveSz; droppedBytes > 0 {
+		logDroppedBytes(droppedBytes)
+	}
 	idx, err := json.Marshal(&tr)
 	if err != nil {
 		return err
@@ -513,18 +533,33 @@ func (s *Store) Flush(ctx context.Context) error {
 	footer := make([]byte, footerSize)
 	binary.LittleEndian.PutUint64(footer[:8], uint64(len(idx)))
 	copy(footer[8:], magic)
-	if _, err := spool.WriteAt(append(idx, footer...), spoolSz); err != nil {
-		return fmt.Errorf("finalize pack: %w", err)
-	}
-	if _, err := spool.Seek(0, io.SeekStart); err != nil {
+
+	upload, err := os.CreateTemp(s.cfg.SpoolDir, "upload.pack.*")
+	if err != nil {
 		return err
 	}
-	if err := s.inner.Put(ctx, s.packKey(name), spool); err != nil {
-		// Upload failed: restore the entries as pending on the (new) spool?
-		// Simpler and safe: keep the finalized file and re-register its
-		// entries against it as a committed-but-local pack is NOT possible
-		// (readers use inner). Put the entries back so a later Flush retries
-		// with a fresh pack.
+	defer func() {
+		_ = upload.Close()
+		_ = os.Remove(upload.Name())
+	}()
+	for _, k := range keys {
+		e := pending[k]
+		if _, err := io.Copy(upload, io.NewSectionReader(spool, e.off, e.length)); err != nil {
+			s.requeue(spool, pending, dead)
+			return fmt.Errorf("compact pack: %w", err)
+		}
+	}
+	if _, err := upload.Write(append(idx, footer...)); err != nil {
+		s.requeue(spool, pending, dead)
+		return fmt.Errorf("finalize pack: %w", err)
+	}
+	if _, err := upload.Seek(0, io.SeekStart); err != nil {
+		s.requeue(spool, pending, dead)
+		return err
+	}
+	if err := s.inner.Put(ctx, s.packKey(name), upload); err != nil {
+		// Put the entries back (from the original spool) so a later Flush
+		// retries them in a fresh pack.
 		s.requeue(spool, pending, dead)
 		return fmt.Errorf("upload pack: %w", err)
 	}
@@ -533,10 +568,14 @@ func (s *Store) Flush(ctx context.Context) error {
 
 	s.mu.Lock()
 	for k, e := range pending {
-		s.index[k] = entry{pack: name, off: e.off, length: e.length, created: created}
+		s.index[k] = entry{pack: name, off: newOff[k], length: e.length, created: created}
 	}
 	s.mu.Unlock()
 	return nil
+}
+
+func logDroppedBytes(n int64) {
+	fmt.Fprintf(os.Stderr, "pelfs: pack cut dropped %d bytes of blocks deleted while pending\n", n)
 }
 
 // requeue merges a failed upload's entries back into the current spool by

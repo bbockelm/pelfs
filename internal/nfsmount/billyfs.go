@@ -10,6 +10,7 @@
 package nfsmount
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"path"
@@ -427,12 +428,13 @@ func (f *billyFile) ReadAt(p []byte, off int64) (int, error) {
 			if total == len(p) && err == io.EOF {
 				return total, nil
 			}
-			nfsDebugf("ReadAt %s off=%d want=%d got=%d: %v", f.name, off, len(p), total, err)
+			nfsDebugf("ReadAt %s off=%d want=%d got=%d: %v%s",
+				f.name, off, len(p), total, err, f.sizeDiagnosis())
 			return total, err
 		}
 		if n == 0 {
-			nfsDebugf("ReadAt %s off=%d want=%d got=%d: short read with no error",
-				f.name, off, len(p), total)
+			nfsDebugf("ReadAt %s off=%d want=%d got=%d: short read with no error%s",
+				f.name, off, len(p), total, f.sizeDiagnosis())
 			return total, io.EOF
 		}
 	}
@@ -458,6 +460,31 @@ func (f *billyFile) WriteAt(p []byte, off int64) (int, error) {
 		nfsDebugf("WriteAt %s off=%d want=%d got=%d errno=%v", f.name, off, len(p), n, errno)
 	}
 	return n, pe("write", f.name, errno)
+}
+
+// sizeDiagnosis reports the three lengths that must agree for a read to be
+// correct: what this handle believes the file is (pread clamps to it), what
+// the cache believes was written through it (Stat reports this, and go-nfs
+// sizes the read and decides EOF from it), and whether writes are still
+// buffered. A short read at the end of a file is reported to the client as
+// end-of-file, so any disagreement here truncates the file.
+func (f *billyFile) sizeDiagnosis() string {
+	if !nfsDebug {
+		return ""
+	}
+	handle := int64(-1)
+	if fi, err := f.f.Stat(); err == nil {
+		handle = fi.Size()
+	}
+	cached, dirty := int64(-1), false
+	if f.ch != nil {
+		cached = f.hc.knownSize(f.ch)
+		f.hc.mu.Lock()
+		dirty = f.ch.dirty
+		f.hc.mu.Unlock()
+	}
+	return fmt.Sprintf(" [handle=%d cached=%d dirty=%v shared=%v]",
+		handle, cached, dirty, f.ch != nil)
 }
 
 func (f *billyFile) Seek(offset int64, whence int) (int64, error) {

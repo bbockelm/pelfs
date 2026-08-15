@@ -1,0 +1,205 @@
+package pelicanobj
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path"
+	"sort"
+	"strings"
+	"sync"
+
+	"github.com/juicedata/juicefs/pkg/object"
+	"github.com/pelicanplatform/pelican/client"
+	"github.com/pelicanplatform/pelican/config"
+	"github.com/pelicanplatform/pelican/param"
+)
+
+// fedStore stores objects in a Pelican federation via the Pelican client
+// library, getting its director handling, endpoint failover, retries, and
+// token acquisition for free.
+type fedStore struct {
+	object.DefaultObjectStorage
+	// ctx is the long-lived context the PelicanFS (and its transfer engine)
+	// is bound to. The Pelican fs API does not take per-operation contexts;
+	// per-op cancellation is bounded by JuiceFS's chunk-store timeouts.
+	ctx    context.Context
+	prefix string // pelican://host/path, no trailing slash
+	pfs    *client.PelicanFS
+	opts   []client.TransferOption
+}
+
+var _ Store = (*fedStore)(nil)
+
+var (
+	initClientOnce sync.Once
+	initClientErr  error
+)
+
+func newFedStore(ctx context.Context, cfg Config) (*fedStore, error) {
+	if cfg.Insecure {
+		// Must be set before the client config is initialized.
+		os.Setenv("PELICAN_TLSSKIPVERIFY", "true")
+	}
+	initClientOnce.Do(func() {
+		if initClientErr = config.InitClient(); initClientErr != nil {
+			return
+		}
+		// Object-storage PUT semantics are upsert: JuiceFS re-uploads keys
+		// on retry and the snapshot manager overwrites its session object
+		// in place (guarded by ETag checks).
+		initClientErr = param.Client_EnableOverwrites.Set(true)
+	})
+	if initClientErr != nil {
+		return nil, fmt.Errorf("initialize pelican client: %w", initClientErr)
+	}
+
+	var opts []client.TransferOption
+	if cfg.TokenPath != "" {
+		opts = append(opts, client.WithTokenLocation(cfg.TokenPath))
+	}
+	opts = append(opts, client.WithAcquireToken(cfg.AcquireToken))
+
+	prefix := strings.TrimRight(cfg.PrefixURL, "/")
+	return &fedStore{
+		ctx:    ctx,
+		prefix: prefix,
+		pfs:    client.NewPelicanFSWithPrefix(ctx, prefix, opts...),
+		opts:   opts,
+	}, nil
+}
+
+// keyURL maps an object key to its absolute pelican:// URL.
+func (s *fedStore) keyURL(key string) string {
+	return s.prefix + "/" + strings.TrimLeft(key, "/")
+}
+
+// mapNotFound folds the client's various not-found signals into
+// os.ErrNotExist so JuiceFS's checks work.
+func mapNotFound(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	msg := err.Error()
+	if errors.Is(err, client.ErrObjectNotFound) ||
+		strings.Contains(msg, "404") || strings.Contains(strings.ToLower(msg), "not found") {
+		return fmt.Errorf("%w: %w", err, os.ErrNotExist)
+	}
+	return err
+}
+
+func (s *fedStore) String() string {
+	return s.prefix + "/"
+}
+
+func (s *fedStore) Limits() object.Limits {
+	return object.Limits{IsSupportMultipartUpload: false}
+}
+
+func (s *fedStore) Create(ctx context.Context) error {
+	// The namespace exists a priori in the federation; nothing to create.
+	return nil
+}
+
+func (s *fedStore) Get(ctx context.Context, key string, off, limit int64, getters ...object.AttrGetter) (io.ReadCloser, error) {
+	f, err := s.pfs.OpenFile("/"+strings.TrimLeft(key, "/"), os.O_RDONLY)
+	if err != nil {
+		return nil, mapNotFound(err)
+	}
+	if off > 0 {
+		if _, err := f.(io.Seeker).Seek(off, io.SeekStart); err != nil {
+			f.Close()
+			return nil, err
+		}
+	}
+	if limit > 0 {
+		return struct {
+			io.Reader
+			io.Closer
+		}{io.LimitReader(f.(io.Reader), limit), f}, nil
+	}
+	return f.(io.ReadCloser), nil
+}
+
+func (s *fedStore) Put(ctx context.Context, key string, in io.Reader, getters ...object.AttrGetter) error {
+	f, err := s.pfs.OpenFile("/"+strings.TrimLeft(key, "/"), os.O_WRONLY|os.O_CREATE)
+	if err != nil {
+		return err
+	}
+	w, ok := f.(io.Writer)
+	if !ok {
+		f.Close()
+		return fmt.Errorf("pelican put %q: file handle is not writable", key)
+	}
+	if _, err := io.Copy(w, in); err != nil {
+		f.Close()
+		return fmt.Errorf("pelican put %q: %w", key, err)
+	}
+	// Close drains the upload pipe and reports the transfer result.
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("pelican put %q: %w", key, err)
+	}
+	return nil
+}
+
+func (s *fedStore) Delete(ctx context.Context, key string, getters ...object.AttrGetter) error {
+	err := client.DoDelete(ctx, s.keyURL(key), false, s.opts...)
+	if err != nil && errors.Is(mapNotFound(err), os.ErrNotExist) {
+		// Deletes are idempotent per the ObjectStorage contract.
+		return nil
+	}
+	return err
+}
+
+func (s *fedStore) Head(ctx context.Context, key string) (object.Object, error) {
+	fi, err := client.DoStat(ctx, s.keyURL(key), s.opts...)
+	if err != nil {
+		return nil, mapNotFound(err)
+	}
+	return newObj(key, fi.Size, fi.ModTime, fi.IsCollection), nil
+}
+
+func (s *fedStore) StatKey(ctx context.Context, key string) (*KeyInfo, error) {
+	fi, err := client.DoStat(ctx, s.keyURL(key), s.opts...)
+	if err != nil {
+		return nil, mapNotFound(err)
+	}
+	return &KeyInfo{Size: fi.Size, Mtime: fi.ModTime, ETag: fi.ETag}, nil
+}
+
+func (s *fedStore) ListDir(ctx context.Context, dir string) ([]DirEntry, error) {
+	dir = strings.Trim(dir, "/")
+	fis, err := client.DoList(ctx, s.keyURL(dir), s.opts...)
+	if err != nil {
+		return nil, mapNotFound(err)
+	}
+	selfName := path.Base("/" + dir)
+	entries := make([]DirEntry, 0, len(fis))
+	for _, fi := range fis {
+		name := path.Base(strings.TrimRight(fi.Name, "/"))
+		if name == "" || name == "." || name == "/" {
+			continue
+		}
+		// Some endpoints include the collection itself in the listing.
+		if fi.IsCollection && name == selfName {
+			continue
+		}
+		entries = append(entries, DirEntry{
+			Name:  name,
+			IsDir: fi.IsCollection,
+			Size:  fi.Size,
+			Mtime: fi.ModTime,
+		})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
+	return entries, nil
+}
+
+func (s *fedStore) ListAll(ctx context.Context, prefix, marker string, followLink bool) (<-chan object.Object, error) {
+	return listAll(ctx, s, prefix, marker)
+}

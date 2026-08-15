@@ -69,6 +69,7 @@ type shellOpts struct {
 	writeback        bool
 	volume           string
 	noRestore        bool
+	noAcquireToken   bool
 	insecure         bool
 	debug            bool
 	forceDocker      bool
@@ -88,6 +89,7 @@ func shellFlags(fs *flag.FlagSet) *flag.FlagSet {
 	fs.Bool("writeback", false, "upload blocks asynchronously (faster writes, weaker durability)")
 	fs.String("volume", "pelfs", "JuiceFS volume name")
 	fs.Bool("no-restore", false, "do not restore the latest metadata snapshot from the federation")
+	fs.Bool("no-acquire-token", false, "never run interactive token-acquisition flows; rely on discovered tokens only")
 	fs.Bool("insecure", false, "skip TLS verification (test federations only)")
 	fs.Bool("debug", false, "verbose logging")
 	fs.Bool("docker", false, "force running inside a Docker container")
@@ -109,6 +111,7 @@ func parseShellFlags(args []string) (*shellOpts, string, error) {
 	fs.BoolVar(&o.writeback, "writeback", false, "")
 	fs.StringVar(&o.volume, "volume", "pelfs", "")
 	fs.BoolVar(&o.noRestore, "no-restore", false, "")
+	fs.BoolVar(&o.noAcquireToken, "no-acquire-token", false, "")
 	fs.BoolVar(&o.insecure, "insecure", false, "")
 	fs.BoolVar(&o.debug, "debug", false, "")
 	fs.BoolVar(&o.forceDocker, "docker", false, "")
@@ -175,6 +178,9 @@ func runInDocker(o *shellOpts, prefix string) int {
 	if o.noRestore {
 		extra = append(extra, "--no-restore")
 	}
+	if o.noAcquireToken {
+		extra = append(extra, "--no-acquire-token")
+	}
 	if o.insecure {
 		extra = append(extra, "--insecure")
 	}
@@ -237,9 +243,10 @@ func runShellNative(o *shellOpts, prefix string) (int, error) {
 	}
 
 	store, err := pelicanobj.New(ctx, pelicanobj.Config{
-		PrefixURL: prefix,
-		TokenPath: o.token,
-		Insecure:  o.insecure,
+		PrefixURL:    prefix,
+		TokenPath:    o.token,
+		AcquireToken: !o.noAcquireToken,
+		Insecure:     o.insecure,
 	})
 	if err != nil {
 		return 1, err
@@ -299,7 +306,7 @@ func runShellNative(o *shellOpts, prefix string) (int, error) {
 			code = 1
 		}
 	}
-	if err := mgr.Snapshot(ctx, "final"); err != nil {
+	if err := mgr.Snapshot(ctx, true); err != nil {
 		fmt.Fprintf(os.Stderr, "pelfs: final metadata snapshot failed: %v\n", err)
 		if code == 0 {
 			code = 1

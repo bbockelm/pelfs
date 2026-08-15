@@ -25,6 +25,12 @@ type origin struct {
 	root string
 }
 
+// etagFor derives a strong ETag from a file's size and mtime, mimicking the
+// modern origin behavior pelfs's snapshot conflict detection relies on.
+func etagFor(fi os.FileInfo) string {
+	return fmt.Sprintf("\"%x-%x\"", fi.Size(), fi.ModTime().UnixNano())
+}
+
 // fsPath maps a URL path to a filesystem path, rejecting escapes.
 func (o *origin) fsPath(urlPath string) (string, bool) {
 	clean := path.Clean("/" + urlPath)
@@ -47,7 +53,8 @@ func (o *origin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
-		http.ServeFile(w, r, p) // handles Range, HEAD, Last-Modified
+		w.Header().Set("ETag", etagFor(fi))
+		http.ServeFile(w, r, p) // handles Range, HEAD, Last-Modified, If-Match
 	case http.MethodPut:
 		if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -74,6 +81,9 @@ func (o *origin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			os.Remove(tmp)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
+		}
+		if fi, err := os.Stat(p); err == nil {
+			w.Header().Set("ETag", etagFor(fi))
 		}
 		w.WriteHeader(http.StatusCreated)
 	case http.MethodDelete:

@@ -4,8 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,11 +12,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bbockelm/pelfs/internal/fakeorigin"
 )
 
-func newDirectStore(t *testing.T, prefix string) (*Store, string) {
+func newTestStore(t *testing.T, prefix string) (Store, string) {
 	t.Helper()
 	root := t.TempDir()
 	srv := httptest.NewServer(fakeorigin.Handler(root))
@@ -31,7 +31,7 @@ func newDirectStore(t *testing.T, prefix string) (*Store, string) {
 
 func TestPutGetHeadDelete(t *testing.T) {
 	ctx := context.Background()
-	s, root := newDirectStore(t, "/ns/base")
+	s, root := newTestStore(t, "/ns/base")
 
 	data := make([]byte, 1<<20)
 	if _, err := rand.Read(data); err != nil {
@@ -73,10 +73,8 @@ func TestPutGetHeadDelete(t *testing.T) {
 		t.Fatalf("Head size = %d, want %d", obj.Size(), len(data))
 	}
 
-	if _, err := s.Head(ctx, "no/such/key"); err == nil || !os.IsNotExist(unwrapAll(err)) {
-		if err == nil || !strings.Contains(err.Error(), "file does not exist") && !os.IsNotExist(err) {
-			t.Fatalf("Head missing: err = %v, want not-exist", err)
-		}
+	if _, err := s.Head(ctx, "no/such/key"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Head missing: err = %v, want os.ErrNotExist", err)
 	}
 
 	if err := s.Delete(ctx, "chunks/0/0/1_0_1048576"); err != nil {
@@ -90,11 +88,9 @@ func TestPutGetHeadDelete(t *testing.T) {
 	}
 }
 
-func unwrapAll(err error) error { return err }
-
 func TestListDirAndListAll(t *testing.T) {
 	ctx := context.Background()
-	s, _ := newDirectStore(t, "/ns")
+	s, _ := newTestStore(t, "/ns")
 
 	files := []string{"meta/s1/0001-a.db", "meta/s2/0001-b.db", "chunks/0/0/1_0_100", "chunks/0/0/2_0_100"}
 	for _, f := range files {
@@ -178,33 +174,33 @@ func TestRedirectKeepsAuth(t *testing.T) {
 	}
 }
 
-// TestFederationDiscovery checks pelican:// prefix resolution via
-// .well-known/pelican-configuration.
-func TestFederationDiscovery(t *testing.T) {
+// TestStatKeyETag checks the ETag surface the snapshot manager depends on.
+func TestStatKeyETag(t *testing.T) {
 	ctx := context.Background()
-	root := t.TempDir()
-	inner := fakeorigin.Handler(root)
+	s, _ := newTestStore(t, "/ns")
 
-	var srvURL string
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/.well-known/pelican-configuration" {
-			_ = json.NewEncoder(w).Encode(map[string]string{"director_endpoint": srvURL})
-			return
-		}
-		inner.ServeHTTP(w, r)
-	}))
-	defer srv.Close()
-	srvURL = srv.URL
-
-	host := strings.TrimPrefix(srv.URL, "https://")
-	s, err := New(ctx, Config{PrefixURL: fmt.Sprintf("pelican://%s/ns/sub", host), Insecure: true})
+	if err := s.Put(ctx, "meta/s/current.db", strings.NewReader("one")); err != nil {
+		t.Fatal(err)
+	}
+	ki1, err := s.StatKey(ctx, "meta/s/current.db")
 	if err != nil {
-		t.Fatalf("New with discovery: %v", err)
+		t.Fatalf("StatKey: %v", err)
 	}
-	if err := s.Put(ctx, "hello.txt", strings.NewReader("hi")); err != nil {
-		t.Fatalf("Put: %v", err)
+	if ki1.ETag == "" || ki1.Size != 3 {
+		t.Fatalf("StatKey = %+v", ki1)
 	}
-	if _, err := os.Stat(filepath.Join(root, "ns/sub/hello.txt")); err != nil {
-		t.Fatalf("object not under discovered prefix: %v", err)
+	time.Sleep(10 * time.Millisecond)
+	if err := s.Put(ctx, "meta/s/current.db", strings.NewReader("two-longer")); err != nil {
+		t.Fatal(err)
+	}
+	ki2, err := s.StatKey(ctx, "meta/s/current.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ki2.ETag == ki1.ETag {
+		t.Fatal("ETag did not change on overwrite")
+	}
+	if _, err := s.StatKey(ctx, "meta/s/missing.db"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("StatKey missing: %v", err)
 	}
 }

@@ -17,21 +17,25 @@ and uploads a final metadata snapshot. Everything runs unprivileged.
 
 - **Data path**: JuiceFS splits files into 4 MiB blocks. A custom JuiceFS
   object-storage backend ([internal/pelicanobj](internal/pelicanobj/))
-  streams each block to/from the federation with plain HTTP
-  (GET/PUT/DELETE/HEAD + WebDAV PROPFIND for listings), storing them under
-  `<prefix>/chunks/...`. `pelican://` prefixes are resolved to the
-  federation's director via `.well-known/pelican-configuration`; requests
-  follow director redirects, re-attaching the bearer token.
+  stores each block under `<prefix>/chunks/...`. For `pelican://` / `osdf://`
+  prefixes it is built on the Pelican client library's filesystem interface
+  (`client.PelicanFS`, plus `DoStat`/`DoList`/`DoDelete`), inheriting the
+  client's director handling, endpoint failover, retries, ETag plumbing, and
+  token discovery/acquisition. A small direct-HTTP transport handles plain
+  `http(s)://` prefixes for tests and development against a bare server.
 - **Metadata**: JuiceFS's SQLite metadata engine, kept in a local temp
   directory alongside a block cache. Every `--snapshot-interval` (default
-  5 min) — and once more at shutdown — a consistent copy is taken with
-  `VACUUM INTO` and uploaded to `<prefix>/meta/<session-id>/NNNN-<label>.db`,
-  a subdirectory unique to each mount session. On startup, the newest
-  snapshot found under `<prefix>/meta/` is restored, so a later session picks
-  up where the last one left off.
-- **Auth**: a bearer token from `--token`, or WLCG bearer-token discovery
-  (`$BEARER_TOKEN`, `$BEARER_TOKEN_FILE`, `$XDG_RUNTIME_DIR/bt_u$UID`,
-  `/tmp/bt_u$UID`). The token file is re-read as it is refreshed externally.
+  5 min) a consistent copy is taken with `VACUUM INTO` and uploaded to
+  `<prefix>/meta/<session-id>/current.db`, overwriting the previous copy in
+  place; a separate `final.db` is written at shutdown after the filesystem
+  quiesces. Overwrites lean on the origin's ETag support: the ETag observed
+  after each upload is compared before the next one, so a concurrent writer
+  on the same session is detected rather than silently clobbered. On
+  startup, the newest snapshot under `<prefix>/meta/` is restored, so a
+  later session picks up where the last one left off.
+- **Auth**: `--token <file>`, or the Pelican client's own token machinery
+  (WLCG discovery plus, unless `--no-acquire-token`, interactive
+  acquisition).
 - **No FUSE? Docker.** On macOS without macFUSE (or Linux without
   `/dev/fuse`), pelfs re-launches itself inside a small container
   (`alpine` + the bind-mounted `pelfs-linux-<arch>` binary, `--device
@@ -56,9 +60,12 @@ cgo-tainted optional paths (proc-title setting and the TiKV meta engine).
 ## Building and testing
 
 ```
-make            # bin/pelfs (host) + bin/pelfs-linux-<arch> (for Docker fallback)
-make test       # unit tests (object backend, sqlite/zstd/lz4 shims, meta engine smoke)
-make e2e        # full loop in Docker against a fake origin: write → snapshot → restore → read
+make             # bin/pelfs (host) + bin/pelfs-linux-<arch> (for Docker fallback)
+make test        # unit tests (object backend, snapshots, shims, meta engine smoke)
+make e2e         # full mount loop in Docker against a fake origin: write → snapshot → restore → read
+make integration # object + snapshot layers against a real federation-in-a-box
+                 # (pelican serve --module director,registry,origin; needs xrootd
+                 #  on PATH and a pelican binary via $PELICAN_BIN/$PELICAN_SRC)
 ```
 
 `cmd/fakeorigin` is a tiny origin-like HTTP server over a local directory,
@@ -78,8 +85,10 @@ block upload), `--cache-size`, `--no-restore`, `--docker` / `--no-docker`,
 
 ## Caveats (prototype)
 
-- **Single writer.** Nothing prevents two concurrent mounts of the same
-  prefix; they would corrupt each other's view. Last snapshot wins.
+- **Single writer.** Nothing yet prevents two concurrent mounts of the same
+  prefix. Snapshot uploads detect interference via ETags (a foreign write to
+  the session's `current.db` stops further snapshots loudly), but block-level
+  writes are not fenced; a proper lease object is future work.
 - The origin must permit GET/PUT/DELETE and PROPFIND on the prefix (i.e. a
   token with read/modify scopes for the namespace).
 - Trash is disabled (`TrashDays=0`); deleted blocks are removed eagerly.

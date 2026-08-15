@@ -1,7 +1,7 @@
 TAGS  := nogspt,notikv
 ARCH  := $(shell go env GOARCH)
 
-.PHONY: all build linux test e2e vet clean
+.PHONY: all build linux test e2e integration vet clean
 
 all: build linux
 
@@ -17,6 +17,9 @@ test:
 
 e2e:
 	./scripts/e2e-docker.sh
+
+integration:
+	./scripts/integration-pelican.sh
 
 vet:
 	CGO_ENABLED=0 go vet -tags "$(TAGS)" ./...

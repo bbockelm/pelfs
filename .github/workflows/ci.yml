@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  TAGS: nogspt,notikv
+
+jobs:
+  unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+      - name: Vet
+        run: CGO_ENABLED=0 go vet -tags "$TAGS" ./...
+      - name: Unit tests
+        run: CGO_ENABLED=0 go test -tags "$TAGS" -count=1 ./internal/...
+      - name: Cross-builds (cgo-free)
+        run: |
+          CGO_ENABLED=0 GOOS=linux  GOARCH=amd64 go build -tags "$TAGS" -o /dev/null ./cmd/pelfs
+          CGO_ENABLED=0 GOOS=linux  GOARCH=arm64 go build -tags "$TAGS" -o /dev/null ./cmd/pelfs
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -tags "$TAGS" -o /dev/null ./cmd/pelfs
+
+  e2e-docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+      - name: Full mount loop in Docker against fakeorigin
+        run: ./scripts/e2e-docker.sh
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Determine pinned pelican commit
+        id: pelican
+        run: echo "sha=$(go list -m -f '{{.Version}}' github.com/pelicanplatform/pelican | grep -oE '[0-9a-f]{12}$')" >> "$GITHUB_OUTPUT"
+      - name: Fetch pelican source at pinned commit
+        run: |
+          git clone --filter=blob:none https://github.com/PelicanPlatform/pelican pelican-src
+          git -C pelican-src checkout ${{ steps.pelican.outputs.sha }}
+      - name: Build pelican web assets
+        working-directory: pelican-src
+        run: make web-build
+      - name: Build pelican binary
+        working-directory: pelican-src
+        run: go build -tags forceposix,server -o "$GITHUB_WORKSPACE/pelican-bin" ./cmd
+      - name: Integration tests against federation-in-a-box
+        run: PELICAN_BIN="$GITHUB_WORKSPACE/pelican-bin" ./scripts/integration-pelican.sh

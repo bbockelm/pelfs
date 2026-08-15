@@ -9,7 +9,14 @@
 // observed after each upload is compared against the object before the next
 // overwrite, so a concurrent writer to the same session directory is
 // detected instead of silently clobbered. A separate final.db is written
-// once at shutdown, after the filesystem has quiesced.
+// once at shutdown, after the filesystem has quiesced, and the superseded
+// current.db is removed.
+//
+// Snapshot bytes flow through the Data storage handle, which is the
+// encryption-wrapped store when volume encryption is enabled — so metadata
+// snapshots (filenames, directory structure) are protected the same way as
+// data blocks. Listing and ETag checks use the raw Meta store, since ETags
+// are server-side properties.
 package snapshot
 
 import (
@@ -21,7 +28,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"time"
+
+	"github.com/juicedata/juicefs/pkg/object"
 
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 )
@@ -41,9 +51,14 @@ var ErrConflict = errors.New("snapshot object was modified by another writer (co
 
 // Manager uploads snapshots of one SQLite database to one session directory.
 type Manager struct {
-	MetaPath string           // local sqlite database path
-	Store    pelicanobj.Store // federation prefix store
-	Session  string           // unique per-session subdirectory name
+	MetaPath string               // local sqlite database path
+	Meta     pelicanobj.Store     // raw store: listings and ETag checks
+	Data     object.ObjectStorage // snapshot bytes; encrypted wrapper when enabled
+	Session  string               // unique per-session subdirectory name
+
+	// OnSnapshot, when set, is called after each successful upload (used to
+	// surface last-snapshot time in `pelfs status`).
+	OnSnapshot func(key string, when time.Time)
 
 	lastETag string // ETag of current.db after our most recent upload
 }
@@ -80,19 +95,20 @@ func (mgr *Manager) Run(ctx context.Context, interval time.Duration) {
 	}
 }
 
-func (mgr *Manager) currentKey() string {
-	return fmt.Sprintf("%s/%s/%s", MetaDir, mgr.Session, currentName)
+func (mgr *Manager) sessionKey(name string) string {
+	return fmt.Sprintf("%s/%s/%s", MetaDir, mgr.Session, name)
 }
 
 // Snapshot takes one consistent copy of the database and uploads it,
 // overwriting meta/<session>/current.db (or writing final.db when final is
-// set). Before overwriting, the object's ETag is compared with the one from
-// our previous upload to detect a concurrent writer.
+// set, then removing the superseded current.db). Before overwriting, the
+// object's ETag is compared with the one from our previous upload to detect
+// a concurrent writer.
 func (mgr *Manager) Snapshot(ctx context.Context, final bool) error {
 	if mgr.lastETag != "" {
-		if ki, err := mgr.Store.StatKey(ctx, mgr.currentKey()); err == nil &&
+		if ki, err := mgr.Meta.StatKey(ctx, mgr.sessionKey(currentName)); err == nil &&
 			ki.ETag != "" && ki.ETag != mgr.lastETag {
-			return fmt.Errorf("%s: %w", mgr.currentKey(), ErrConflict)
+			return fmt.Errorf("%s: %w", mgr.sessionKey(currentName), ErrConflict)
 		}
 	}
 
@@ -114,26 +130,74 @@ func (mgr *Manager) Snapshot(ctx context.Context, final bool) error {
 		return err
 	}
 	defer f.Close()
-	key := mgr.currentKey()
+	key := mgr.sessionKey(currentName)
 	if final {
-		key = fmt.Sprintf("%s/%s/%s", MetaDir, mgr.Session, finalName)
+		key = mgr.sessionKey(finalName)
 	}
-	if err := mgr.Store.Put(ctx, key, f); err != nil {
+	if err := mgr.Data.Put(ctx, key, f); err != nil {
 		return fmt.Errorf("upload %s: %w", key, err)
 	}
-	if !final {
-		if ki, err := mgr.Store.StatKey(ctx, key); err == nil {
-			mgr.lastETag = ki.ETag
+	if final {
+		// final.db supersedes this session's periodic snapshot.
+		if err := mgr.Data.Delete(ctx, mgr.sessionKey(currentName)); err != nil {
+			fmt.Fprintf(os.Stderr, "pelfs: could not remove superseded %s: %v\n", mgr.sessionKey(currentName), err)
+		}
+	} else if ki, err := mgr.Meta.StatKey(ctx, key); err == nil {
+		mgr.lastETag = ki.ETag
+	}
+	if mgr.OnSnapshot != nil {
+		mgr.OnSnapshot(key, time.Now())
+	}
+	return nil
+}
+
+// PruneSessions removes snapshot files from all but the newest keep session
+// directories (session names sort chronologically). The current session is
+// always kept.
+func (mgr *Manager) PruneSessions(ctx context.Context, keep int) error {
+	if keep < 1 {
+		keep = 1
+	}
+	sessions, err := mgr.Meta.ListDir(ctx, MetaDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	var names []string
+	for _, s := range sessions {
+		if s.IsDir && s.Name != mgr.Session {
+			names = append(names, s.Name)
+		}
+	}
+	sort.Strings(names)
+	if len(names) <= keep-1 { // current session counts toward keep
+		return nil
+	}
+	for _, name := range names[:len(names)-(keep-1)] {
+		files, err := mgr.Meta.ListDir(ctx, MetaDir+"/"+name)
+		if err != nil {
+			continue
+		}
+		for _, f := range files {
+			if f.IsDir {
+				continue
+			}
+			key := MetaDir + "/" + name + "/" + f.Name
+			if err := mgr.Data.Delete(ctx, key); err != nil {
+				fmt.Fprintf(os.Stderr, "pelfs: prune %s: %v\n", key, err)
+			}
 		}
 	}
 	return nil
 }
 
 // Restore finds the newest snapshot in any session directory under meta/ and
-// downloads it to metaPath. It returns the key restored from, or "" when no
-// snapshot exists.
-func Restore(ctx context.Context, store pelicanobj.Store, metaPath string) (string, error) {
-	sessions, err := store.ListDir(ctx, MetaDir)
+// downloads it (through data, so encrypted snapshots decrypt) to metaPath.
+// It returns the key restored from, or "" when no snapshot exists.
+func Restore(ctx context.Context, meta pelicanobj.Store, data object.ObjectStorage, metaPath string) (string, error) {
+	sessions, err := meta.ListDir(ctx, MetaDir)
 	if err != nil {
 		// A missing meta/ directory means a brand-new prefix.
 		if errors.Is(err, os.ErrNotExist) {
@@ -147,7 +211,7 @@ func Restore(ctx context.Context, store pelicanobj.Store, metaPath string) (stri
 		if !s.IsDir {
 			continue
 		}
-		files, err := store.ListDir(ctx, MetaDir+"/"+s.Name)
+		files, err := meta.ListDir(ctx, MetaDir+"/"+s.Name)
 		if err != nil {
 			continue
 		}
@@ -166,7 +230,7 @@ func Restore(ctx context.Context, store pelicanobj.Store, metaPath string) (stri
 	if bestKey == "" {
 		return "", nil
 	}
-	rc, err := store.Get(ctx, bestKey, 0, -1)
+	rc, err := data.Get(ctx, bestKey, 0, -1)
 	if err != nil {
 		return "", fmt.Errorf("download %s: %w", bestKey, err)
 	}

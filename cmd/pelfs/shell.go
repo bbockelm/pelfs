@@ -1,0 +1,199 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"os/signal"
+	"syscall"
+
+	"github.com/bbockelm/pelfs/internal/dockerrun"
+	"github.com/bbockelm/pelfs/internal/mountfs"
+	"github.com/bbockelm/pelfs/internal/snapshot"
+)
+
+func cmdShell(args []string) int {
+	o, pos, err := parseArgs("shell", args, 1, 1, nil)
+	if err != nil {
+		return exitErr(err)
+	}
+	prefix := pos[0]
+
+	if o.forceDocker || (!o.noDocker && !fuseUsable()) {
+		return runInDocker(o, prefix)
+	}
+	if !fuseUsable() {
+		return exitErr(errors.New("FUSE is not available on this host (and --no-docker was given)"))
+	}
+	code, err := runShellNative(o, prefix)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "pelfs: %v\n", err)
+	}
+	return code
+}
+
+func runShellNative(o *cmdOpts, prefix string) (int, error) {
+	ctx := context.Background()
+	s, err := newSession(ctx, o, prefix, !o.readOnly)
+	if err != nil {
+		return 1, err
+	}
+
+	fmt.Fprintf(os.Stderr, "pelfs: mounting %s on %s\n", prefix, s.mountPoint)
+	mnt, err := mountfs.Mount(mountOptions(s))
+	if err != nil {
+		s.cleanupTemp()
+		return 1, fmt.Errorf("mount: %w", err)
+	}
+
+	var mgr *snapshot.Manager
+	snapCtx, stopSnaps := context.WithCancel(ctx)
+	snapsDone := make(chan struct{})
+	if !o.readOnly {
+		mgr = s.newSnapshotManager()
+		go func() {
+			defer close(snapsDone)
+			if o.snapshotInterval > 0 {
+				mgr.Run(snapCtx, o.snapshotInterval)
+			}
+		}()
+	} else {
+		close(snapsDone)
+	}
+
+	code := launchSubshell(o, prefix, s.mountPoint)
+
+	stopSnaps()
+	<-snapsDone
+	fmt.Fprintln(os.Stderr, "pelfs: unmounting and flushing data to the federation...")
+	if err := mnt.Close(); err != nil {
+		fmt.Fprintf(os.Stderr, "pelfs: unmount: %v\n", err)
+		if code == 0 {
+			code = 1
+		}
+	}
+	if mgr != nil {
+		if err := mgr.Snapshot(ctx, true); err != nil {
+			fmt.Fprintf(os.Stderr, "pelfs: final metadata snapshot failed: %v\n", err)
+			if code == 0 {
+				code = 1
+			}
+		} else {
+			fmt.Fprintf(os.Stderr, "pelfs: final metadata snapshot uploaded (session %s)\n", mgr.Session)
+			if err := mgr.PruneSessions(ctx, o.keepSessions); err != nil {
+				fmt.Fprintf(os.Stderr, "pelfs: prune old snapshots: %v\n", err)
+			}
+		}
+	}
+	s.cleanupTemp()
+	return code, nil
+}
+
+func mountOptions(s *session) mountfs.Options {
+	return mountfs.Options{
+		VolumeName:    s.o.volume,
+		MetaPath:      s.metaPath,
+		MountPoint:    s.mountPoint,
+		CacheDir:      s.cacheDir,
+		PrefixURL:     s.prefix,
+		Blob:          s.data,
+		BlockSizeKiB:  s.o.blockSizeKiB,
+		CacheSizeMiB:  s.o.cacheSizeMiB,
+		Writeback:     s.o.writeback,
+		ReadOnly:      s.o.readOnly,
+		Debug:         s.o.debug,
+		Compression:   s.o.compress,
+		EncryptKeyPEM: s.encryptPEM,
+	}
+}
+
+func runInDocker(o *cmdOpts, prefix string) int {
+	extra := []string{
+		"--snapshot-interval", o.snapshotInterval.String(),
+		"--keep-sessions", fmt.Sprint(o.keepSessions),
+		"--cache-size", fmt.Sprint(o.cacheSizeMiB),
+		"--block-size", fmt.Sprint(o.blockSizeKiB),
+		"--volume", o.volume,
+		"--compress", o.compress,
+		"--no-docker", // never recurse
+	}
+	if o.encryptKeyPath != "" {
+		// dockerrun bind-mounts the key at this fixed path.
+		extra = append(extra, "--encrypt-key", "/run/pelfs/encrypt-key")
+	}
+	for flagName, set := range map[string]bool{
+		"--writeback":        o.writeback,
+		"--ro":               o.readOnly,
+		"--no-restore":       o.noRestore,
+		"--no-acquire-token": o.noAcquireToken,
+		"--insecure":         o.insecure,
+		"--debug":            o.debug,
+	} {
+		if set {
+			extra = append(extra, flagName)
+		}
+	}
+	code, err := dockerrun.Run(dockerrun.Options{
+		PrefixURL:      prefix,
+		TokenPath:      resolveTokenPath(o.token),
+		EncryptKeyPath: o.encryptKeyPath,
+		Image:          o.dockerImage,
+		ExtraArgs:      extra,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "pelfs: %v\n", err)
+	}
+	return code
+}
+
+func launchSubshell(o *cmdOpts, prefix, mountPoint string) int {
+	shellPath := o.shellPath
+	if shellPath == "" {
+		shellPath = os.Getenv("SHELL")
+	}
+	if shellPath == "" {
+		shellPath = "/bin/sh"
+	}
+
+	fmt.Fprintf(os.Stderr, "pelfs: starting %s in %s (exit the shell to unmount)\n", shellPath, mountPoint)
+	cmd := exec.Command(shellPath)
+	cmd.Dir = mountPoint
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = append(os.Environ(),
+		"PELFS_MOUNT="+mountPoint,
+		"PELFS_PREFIX="+prefix,
+	)
+
+	// Ctrl-C belongs to the subshell (same foreground process group); make
+	// sure it doesn't kill us mid-cleanup. SIGTERM/SIGHUP terminate the
+	// shell so cleanup can run.
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGHUP)
+	signal.Ignore(syscall.SIGINT)
+	defer signal.Reset(syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "pelfs: launch shell %s: %v\n", shellPath, err)
+		return 1
+	}
+	go func() {
+		for s := range sigs {
+			_ = cmd.Process.Signal(s)
+		}
+	}()
+	err := cmd.Wait()
+	close(sigs)
+	if err == nil {
+		return 0
+	}
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return ee.ExitCode()
+	}
+	fmt.Fprintf(os.Stderr, "pelfs: shell: %v\n", err)
+	return 1
+}

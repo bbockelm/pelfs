@@ -45,7 +45,7 @@ func TestSnapshotOverwriteAndConflict(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t)
 	metaPath, db := newDB(t)
-	mgr := &Manager{MetaPath: metaPath, Store: store, Session: "sess-a"}
+	mgr := &Manager{MetaPath: metaPath, Meta: store, Data: store, Session: "sess-a"}
 
 	if err := mgr.Snapshot(ctx, false); err != nil {
 		t.Fatalf("first snapshot: %v", err)
@@ -91,7 +91,7 @@ func TestFinalSnapshotAndRestore(t *testing.T) {
 
 	// Session A: periodic snapshot only.
 	pathA, _ := newDB(t)
-	mgrA := &Manager{MetaPath: pathA, Store: store, Session: "sess-a"}
+	mgrA := &Manager{MetaPath: pathA, Meta: store, Data: store, Session: "sess-a"}
 	if err := mgrA.Snapshot(ctx, false); err != nil {
 		t.Fatal(err)
 	}
@@ -102,13 +102,13 @@ func TestFinalSnapshotAndRestore(t *testing.T) {
 	if _, err := dbB.Exec("INSERT INTO t VALUES (42)"); err != nil {
 		t.Fatal(err)
 	}
-	mgrB := &Manager{MetaPath: pathB, Store: store, Session: "sess-b"}
+	mgrB := &Manager{MetaPath: pathB, Meta: store, Data: store, Session: "sess-b"}
 	if err := mgrB.Snapshot(ctx, true); err != nil {
 		t.Fatal(err)
 	}
 
 	restored := filepath.Join(t.TempDir(), "restored.db")
-	key, err := Restore(ctx, store, restored)
+	key, err := Restore(ctx, store, store, restored)
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
@@ -128,7 +128,7 @@ func TestFinalSnapshotAndRestore(t *testing.T) {
 
 func TestRestoreEmptyPrefix(t *testing.T) {
 	store := newStore(t)
-	key, err := Restore(context.Background(), store, filepath.Join(t.TempDir(), "meta.db"))
+	key, err := Restore(context.Background(), store, store, filepath.Join(t.TempDir(), "meta.db"))
 	if err != nil {
 		t.Fatalf("Restore on empty prefix: %v", err)
 	}
@@ -142,7 +142,7 @@ func TestSnapshotCleansTemp(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t)
 	metaPath, _ := newDB(t)
-	mgr := &Manager{MetaPath: metaPath, Store: store, Session: "s"}
+	mgr := &Manager{MetaPath: metaPath, Meta: store, Data: store, Session: "s"}
 	if err := mgr.Snapshot(ctx, false); err != nil {
 		t.Fatal(err)
 	}

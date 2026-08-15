@@ -17,10 +17,11 @@ const DefaultImage = "alpine:3.21"
 
 // Options for the containerized run.
 type Options struct {
-	PrefixURL string
-	TokenPath string   // host path of bearer token file ("" = none found)
-	Image     string   // container image; DefaultImage if empty
-	ExtraArgs []string // pelfs shell flags forwarded into the container
+	PrefixURL      string
+	TokenPath      string   // host path of bearer token file ("" = none found)
+	EncryptKeyPath string   // host path of the encryption private key ("" = none)
+	Image          string   // container image; DefaultImage if empty
+	ExtraArgs      []string // pelfs shell flags forwarded into the container
 }
 
 // Available reports whether the docker CLI is usable.
@@ -74,6 +75,9 @@ func Run(opts Options) (int, error) {
 		"--device", "/dev/fuse",
 		"--cap-add", "SYS_ADMIN",
 		"--security-opt", "apparmor=unconfined",
+		// Docker Desktop provides host.docker.internal natively; on Linux
+		// engines it needs the host-gateway alias (harmless elsewhere).
+		"--add-host", "host.docker.internal:host-gateway",
 		"-v", bin + ":/usr/local/bin/pelfs:ro",
 		"-e", "PELFS_IN_DOCKER=1",
 		"--hostname", "pelfs",
@@ -87,6 +91,9 @@ func Run(opts Options) (int, error) {
 		args = append(args,
 			"-v", opts.TokenPath+":/run/pelfs/token:ro",
 			"-e", "BEARER_TOKEN_FILE=/run/pelfs/token")
+	}
+	if opts.EncryptKeyPath != "" {
+		args = append(args, "-v", opts.EncryptKeyPath+":/run/pelfs/encrypt-key:ro")
 	}
 	args = append(args, image, "/usr/local/bin/pelfs", "shell",
 		"--state-dir", "/var/tmp/pelfs", "--shell", "/bin/sh")

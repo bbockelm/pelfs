@@ -27,6 +27,15 @@ import (
 
 var logger = utils.GetLogger("pelfs")
 
+// encryptAlgo records the (only) data-encryption algorithm pelfs uses when a
+// key is configured; empty otherwise so the format omits it.
+func encryptAlgo(keyPEM string) string {
+	if keyPEM == "" {
+		return ""
+	}
+	return "aes256gcm-rsa"
+}
+
 // Options configures an in-process JuiceFS mount.
 type Options struct {
 	VolumeName string // JuiceFS volume name
@@ -39,7 +48,17 @@ type Options struct {
 	BlockSizeKiB int   // object block size in KiB (default 4096)
 	CacheSizeMiB int64 // local cache size limit (default 10240)
 	Writeback    bool  // asynchronous block upload
+	ReadOnly     bool  // mount read-only (metadata rejects modification)
 	Debug        bool
+
+	// Compression ("none" or "zstd") is recorded in the volume format at
+	// creation; an existing volume's setting always wins.
+	Compression string
+	// EncryptKeyPEM, when non-empty, is recorded in the volume format at
+	// creation and signals that opts.Blob is already wrapped with
+	// client-side encryption. Mounting an encrypted volume without it (or
+	// vice versa) is refused.
+	EncryptKeyPEM string
 }
 
 // Mounted is a live mount; Close unmounts and flushes it.
@@ -67,13 +86,21 @@ func Mount(opts Options) (*Mounted, error) {
 		utils.SetLogLevel(logrus.WarnLevel)
 	}
 
+	if opts.Compression == "" {
+		opts.Compression = "none"
+	}
+
 	metaConf := meta.DefaultConf()
 	metaConf.MountPoint = opts.MountPoint
 	metaConf.AtimeMode = meta.NoAtime
+	metaConf.ReadOnly = opts.ReadOnly
 
 	m := meta.NewClient("sqlite3://"+opts.MetaPath, metaConf)
 	format, err := m.Load(true)
 	if err != nil {
+		if opts.ReadOnly {
+			return nil, fmt.Errorf("no volume metadata found (and read-only mode cannot create one): %w", err)
+		}
 		// Fresh database: create the volume.
 		format = &meta.Format{
 			Name:        opts.VolumeName,
@@ -81,7 +108,9 @@ func Mount(opts Options) (*Mounted, error) {
 			Storage:     "pelican",
 			Bucket:      opts.PrefixURL,
 			BlockSize:   opts.BlockSizeKiB,
-			Compression: "none",
+			Compression: opts.Compression,
+			EncryptKey:  opts.EncryptKeyPEM,
+			EncryptAlgo: encryptAlgo(opts.EncryptKeyPEM),
 			TrashDays:   0,
 			DirStats:    true,
 		}
@@ -91,6 +120,15 @@ func Mount(opts Options) (*Mounted, error) {
 		if format, err = m.Load(true); err != nil {
 			return nil, fmt.Errorf("load volume metadata: %w", err)
 		}
+	}
+	if format.EncryptKey != "" && opts.EncryptKeyPEM == "" {
+		return nil, fmt.Errorf("volume %q is encrypted; supply --encrypt-key", format.Name)
+	}
+	if format.EncryptKey == "" && opts.EncryptKeyPEM != "" {
+		return nil, fmt.Errorf("volume %q is not encrypted, but --encrypt-key was given; refusing to mix encrypted and plaintext blocks", format.Name)
+	}
+	if format.Compression != opts.Compression {
+		logger.Warnf("volume compression is %q (fixed at creation); ignoring requested %q", format.Compression, opts.Compression)
 	}
 
 	chunkConf := chunk.Config{

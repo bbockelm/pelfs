@@ -170,7 +170,7 @@ func TestSnapshotCycle(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	mgr := &snapshot.Manager{MetaPath: metaPath, Store: s, Session: snapshot.NewSessionID()}
+	mgr := &snapshot.Manager{MetaPath: metaPath, Meta: s, Data: s, Session: snapshot.NewSessionID()}
 	if err := mgr.Snapshot(ctx, false); err != nil {
 		t.Fatalf("periodic snapshot: %v", err)
 	}
@@ -186,7 +186,7 @@ func TestSnapshotCycle(t *testing.T) {
 	}
 
 	restored := filepath.Join(t.TempDir(), "restored.db")
-	key, err := snapshot.Restore(ctx, s, restored)
+	key, err := snapshot.Restore(ctx, s, s, restored)
 	if err != nil {
 		t.Fatalf("Restore: %v", err)
 	}

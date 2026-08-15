@@ -64,4 +64,33 @@ grep -q "hello pelican" "$WORK/run2.log" || { echo "FAIL: hello.txt content miss
 SHA2=$(grep -E '^[0-9a-f]{64}$' "$WORK/run2.log" | head -1)
 [ "$SHA1" = "$SHA2" ] || { echo "FAIL: checksum mismatch: $SHA1 vs $SHA2"; cat "$WORK/run2.log"; exit 1; }
 
-echo "== PASS: write, snapshot, restore, and read-back all succeeded =="
+echo "== session 3: encrypted + zstd-compressed volume =="
+openssl genrsa -out "$WORK/enc.pem" 2048 2>/dev/null
+ENCPREFIX="http://host.docker.internal:$PORT/e2e/enc"
+bin/pelfs shell --docker --snapshot-interval 0 --compress zstd --encrypt-key "$WORK/enc.pem" "$ENCPREFIX" > "$WORK/run3.log" 2>&1 <<'EOF'
+set -e
+echo "secret-data-marker" > s.txt
+cat s.txt
+EOF
+grep -q "final metadata snapshot uploaded" "$WORK/run3.log" || { echo "FAIL: encrypted session did not snapshot"; cat "$WORK/run3.log"; exit 1; }
+if grep -rq "secret-data-marker" "$WORK/origin/e2e/enc"; then
+  echo "FAIL: plaintext found in encrypted volume's objects"; exit 1
+fi
+SNAP=$(find "$WORK/origin/e2e/enc/meta" -name "final.db" | head -1)
+if head -c 15 "$SNAP" | grep -q "SQLite format 3"; then
+  echo "FAIL: metadata snapshot stored in plaintext"; exit 1
+fi
+
+echo "== session 4: read back from encrypted volume =="
+bin/pelfs shell --docker --snapshot-interval 0 --encrypt-key "$WORK/enc.pem" "$ENCPREFIX" > "$WORK/run4.log" 2>&1 <<'EOF'
+cat s.txt
+EOF
+grep -q "secret-data-marker" "$WORK/run4.log" || { echo "FAIL: encrypted read-back"; cat "$WORK/run4.log"; exit 1; }
+
+echo "== gc + fsck against the federation (native, no FUSE needed) =="
+bin/pelfs gc "http://127.0.0.1:$PORT/e2e/ns" > "$WORK/gc.log" 2>&1 || { echo "FAIL: gc"; cat "$WORK/gc.log"; exit 1; }
+grep -Eq "leaked: +0 " "$WORK/gc.log" || { echo "FAIL: gc reported leaks on a clean volume"; cat "$WORK/gc.log"; exit 1; }
+bin/pelfs fsck "http://127.0.0.1:$PORT/e2e/ns" > "$WORK/fsck.log" 2>&1 || { echo "FAIL: fsck"; cat "$WORK/fsck.log"; exit 1; }
+grep -q "volume is consistent" "$WORK/fsck.log" || { echo "FAIL: fsck did not report consistency"; cat "$WORK/fsck.log"; exit 1; }
+
+echo "== PASS: write, snapshot, restore, read-back, gc, and fsck all succeeded =="

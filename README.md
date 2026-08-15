@@ -6,12 +6,21 @@ filesystem, mounted locally via FUSE, whose data lives in a Pelican
 federation under a namespace prefix you control.
 
 ```
-pelfs shell pelican://osg-htc.org/my/namespace/scratch
+pelfs shell  pelican://osg-htc.org/my/namespace/scratch    # mount + subshell
+pelfs mount  pelican://.../scratch [mountpoint]            # background mount
+pelfs umount pelican://.../scratch                         # stop it cleanly
+pelfs status                                               # list background mounts
+pelfs gc     [--delete] pelican://.../scratch              # collect leaked blocks
+pelfs fsck   pelican://.../scratch                         # verify referenced blocks
 ```
 
-mounts the filesystem on a temporary mountpoint and drops you into a subshell
-there. Exiting the shell unmounts, flushes all data blocks to the federation,
-and uploads a final metadata snapshot. Everything runs unprivileged.
+`shell` mounts the filesystem on a temporary mountpoint and drops you into a
+subshell there; exiting unmounts, flushes all data blocks to the federation,
+and uploads a final metadata snapshot. `mount` does the same as a background
+daemon with persistent per-prefix local state (`~/.local/state/pelfs/`).
+Everything runs unprivileged. Before mounting, a preflight probe checks the
+credential's read/write/delete access to the prefix and reports missing
+scopes up front.
 
 ## How it works
 
@@ -78,9 +87,12 @@ bin/pelfs shell http://127.0.0.1:8081/ns     # https?/http = direct mode, no dis
 
 ## Flags
 
-See `pelfs shell -h`. Highlights: `--state-dir` (persist local state between
-sessions instead of a fresh temp dir), `--keep-state`, `--writeback` (async
-block upload), `--cache-size`, `--no-restore`, `--docker` / `--no-docker`,
+See `pelfs -h`. Highlights: `--ro` (read-only: restore + mount, upload
+nothing), `--compress zstd`, `--encrypt-key key.pem` (client-side encryption
+of data blocks **and** metadata snapshots — the same key must be supplied on
+every later mount), `--state-dir` (persist local state between sessions),
+`--writeback` (async block upload), `--cache-size`, `--keep-sessions`
+(snapshot pruning depth), `--no-restore`, `--docker` / `--no-docker`,
 `--volume`.
 
 ## Caveats (prototype)
@@ -89,8 +101,9 @@ block upload), `--cache-size`, `--no-restore`, `--docker` / `--no-docker`,
   prefix. Snapshot uploads detect interference via ETags (a foreign write to
   the session's `current.db` stops further snapshots loudly), but block-level
   writes are not fenced; a proper lease object is future work.
-- The origin must permit GET/PUT/DELETE and PROPFIND on the prefix (i.e. a
-  token with read/modify scopes for the namespace).
+- The origin must permit GET/PUT/DELETE and listing on the prefix (i.e. a
+  token with read/modify scopes for the namespace); `pelfs` checks this up
+  front and says which scope is missing.
 - Trash is disabled (`TrashDays=0`); deleted blocks are removed eagerly.
-- `pelfs mount` (async mount, no subshell) is a planned future mode.
+  Blocks orphaned by crashed sessions are reclaimed with `pelfs gc --delete`.
 - JuiceFS is Apache-2.0; this project links it as a library.

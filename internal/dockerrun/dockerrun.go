@@ -76,6 +76,9 @@ func Run(opts Options) (int, error) {
 		"run", "--rm",
 		"--device", "/dev/fuse",
 		"--cap-add", "SYS_ADMIN",
+		// JuiceFS renices itself to -19 for FUSE latency; without this cap
+		// the setpriority call fails with a per-mount warning.
+		"--cap-add", "SYS_NICE",
 		"--security-opt", "apparmor=unconfined",
 		// Docker Desktop provides host.docker.internal natively; on Linux
 		// engines it needs the host-gateway alias (harmless elsewhere).

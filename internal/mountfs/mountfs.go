@@ -5,7 +5,9 @@
 package mountfs
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"runtime"
@@ -26,6 +28,22 @@ import (
 )
 
 var logger = utils.GetLogger("pelfs")
+
+// lineFilterWriter drops log lines containing any of the given substrings.
+// logrus writes one entry per Write call, so per-call matching is safe.
+type lineFilterWriter struct {
+	w    io.Writer
+	drop []string
+}
+
+func (f *lineFilterWriter) Write(p []byte) (int, error) {
+	for _, s := range f.drop {
+		if bytes.Contains(p, []byte(s)) {
+			return len(p), nil
+		}
+	}
+	return f.w.Write(p)
+}
 
 // encryptAlgo records the (only) data-encryption algorithm pelfs uses when a
 // key is configured; empty otherwise so the format omits it.
@@ -53,6 +71,9 @@ type Options struct {
 	// FlushTimeout bounds how long Close waits for writeback-staged blocks
 	// to finish uploading (0 = wait forever). Only relevant with Writeback.
 	FlushTimeout time.Duration
+	// CacheFreeRatio is the minimum free space/inode fraction the block
+	// cache tries to preserve on its filesystem (default 0.05).
+	CacheFreeRatio float64
 
 	// Compression ("none" or "zstd") is recorded in the volume format at
 	// creation; an existing volume's setting always wins.
@@ -87,11 +108,22 @@ func Mount(opts Options) (*Mounted, error) {
 	if opts.CacheSizeMiB <= 0 {
 		opts.CacheSizeMiB = 10240
 	}
+	if opts.CacheFreeRatio <= 0 {
+		opts.CacheFreeRatio = 0.05
+	}
 	if opts.Debug {
 		utils.SetLogLevel(logrus.DebugLevel)
 	} else {
 		utils.SetLogLevel(logrus.WarnLevel)
 	}
+	// pelfs always uses a local SQLite metadata file, so JuiceFS's
+	// database-latency warning (a fixed 5ms ping threshold aimed at remote
+	// MySQL/Postgres) is noise — the first ping includes file open and WAL
+	// setup, which slow container filesystems routinely exceed.
+	utils.SetOutput(&lineFilterWriter{
+		w:    os.Stderr,
+		drop: []string{"The latency to database is too high"},
+	})
 
 	if opts.Compression == "" {
 		opts.Compression = "none"
@@ -154,7 +186,7 @@ func Mount(opts Options) (*Mounted, error) {
 
 		CacheDir:       opts.CacheDir,
 		CacheSize:      uint64(opts.CacheSizeMiB) << 20,
-		FreeSpace:      0.1,
+		FreeSpace:      float32(opts.CacheFreeRatio),
 		CacheMode:      0600,
 		CacheFullBlock: true,
 		CacheChecksum:  "full",

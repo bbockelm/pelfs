@@ -114,13 +114,73 @@ per-pack chunk index ever holds millions of entries, a sorted-hash-array
 with binary search on mmap is the next step there — still not MPH.
 
 Because everything else is immutable and content-addressed, the superblock
-is the only object that needs `?directread`, the only object the
-single-writer lease must guard (ETag compare-and-set on overwrite), and the
-only thing a reader must re-fetch to observe a new generation. Readers get
-snapshot-consistent views by pinning a generation. This one property —
-*exactly one mutable object* — is the strongest Pelican-fit argument for
-the whole design: federation caches work at full strength for all data and
-all metadata.
+is the only object a *reader* ever depends on that mutates, and the only
+thing a reader must re-fetch to observe a new generation. Readers get
+snapshot-consistent views by pinning a generation. Federation caches work
+at full strength for all data and all metadata; `?directread` is needed
+only for the superblock (and the advisory lease, which no reader touches —
+see the concurrency section).
+
+## Concurrency: CAS is the guard, the lease is a courtesy
+
+The volume has exactly **two** mutable objects, with disjoint roles:
+
+- **Superblock — consistency.** The publish-time superblock flip is an ETag
+  compare-and-swap. If two writers race, the loser's flip fails cleanly:
+  its packs are uploaded but unreferenced (orphans for GC), nothing
+  interleaves, nothing corrupts. This is a categorical improvement over
+  v1, where concurrent writers destructively interleave chunk objects and
+  the lease is load-bearing for correctness.
+- **Lease — liveness (advisory).** The v1 lease survives essentially
+  unchanged (heartbeat + TTL + takeover warning), but demoted: its only
+  job in v2 is preventing *wasted work* — fail fast at mount instead of at
+  the first failed publish, warn mid-session on takeover. It is unsigned,
+  not content-addressed, never read by read-only mounts, and its loss or
+  corruption affects no data. `--no-lease` and `--ro` semantics carry over.
+
+Rejected: heartbeating through the superblock itself (to keep a
+"one mutable object" purity claim). That conflates roles — re-signing
+every 30s, lineage polluted or bypassed by heartbeats, and readers unable
+to distinguish "new generation" from "still alive" without parsing.
+
+## Read-only mounts and update propagation
+
+Read-only clients ingest external updates by polling the superblock and
+atomically swapping generations. CVMFS's propagation pain — often
+misdiagnosed — was never "caches served the wrong object" (their objects
+are content-addressed too); it was (a) manifest freshness behind TTL'd
+squid hierarchies with no bypass, and (b) live catalog reload renumbering
+inodes under the kernel (their inodes are assigned per catalog load),
+which broke open files and spawned years of translation machinery. Both
+are structurally absent here:
+
+- **Freshness signal:** a conditional GET (`If-None-Match` + ETag,
+  `?directread`) of one tiny object against the origin. A stream of 304s;
+  no TTL guessing. Poll interval is a mount option.
+- **Generation swap:** verify signature; verify **lineage** (the new
+  generation must chain, via previous-superblock hashes, to a known
+  ancestor — a fork from a stolen lease is detected exactly here); then
+  atomically replace the in-memory routing table. Stable inodes mean
+  generations agree on file identity: kernel-cached dentries/inodes for
+  unchanged files remain valid, changed files keep their inode.
+- **Per-handle snapshot isolation:** an open file's chunk list was
+  resolved at open against immutable chunks, so open handles keep reading
+  their generation's content consistently across a swap — no torn files,
+  ever. The GC grace window (retain the last K generations' objects) is
+  the contract backing this; a reader older than the window gets an
+  explicit "snapshot expired, refresh" rather than a silent mixture.
+- **Refresh policy is per-mount, not architectural:** batch jobs
+  (HTCondor) default to **pinned** — one generation for the job's
+  lifetime, for reproducibility; interactive read-only mounts default to
+  polling. No reader registration exists (readers stay invisible, no
+  third mutable object); staleness bounds come from the time-based GC
+  grace window instead.
+
+Phase caveat: live refresh requires the catalog-native runtime (phase 3),
+where a swap is a routing-pointer change over directly-read catalogs. In
+phase 2 — read-only mounts hydrating the JuiceFS hot engine from catalogs
+— refresh means remount. Acceptable for batch; stated here so nobody
+discovers it in production.
 
 ## Identity: inodes and hardlinks
 

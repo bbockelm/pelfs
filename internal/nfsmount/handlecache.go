@@ -57,6 +57,12 @@ type cachedHandle struct {
 	dirty   bool
 	size    int64 // highest byte written through this handle
 	lastUse time.Time
+	// modTime advances only when the file's data actually changes. It must
+	// not follow lastUse: an NFS client decides whether its cached pages
+	// are still valid by comparing mtime, so an mtime that moved on a
+	// read-only open (which bumps lastUse) would tell the client the file
+	// had been modified behind its back.
+	modTime time.Time
 	evicted bool // dropped from the map; close on last release
 }
 
@@ -121,7 +127,14 @@ func (hc *handleCache) add(name string, f *jfs.File, size int64) (*cachedHandle,
 		incumbent.lastUse = time.Now()
 		return incumbent, false
 	}
-	e := &cachedHandle{name: name, f: f, refs: 1, size: size, lastUse: time.Now()}
+	now := time.Now()
+	// modTime seeds from the file's current mtime, not now: caching a
+	// handle is not a modification.
+	modTime := now
+	if fi, err := f.Stat(); err == nil {
+		modTime = fi.ModTime()
+	}
+	e := &cachedHandle{name: name, f: f, refs: 1, size: size, lastUse: now, modTime: modTime}
 	hc.entries[name] = e
 	if len(hc.entries) > handleCacheLimit {
 		hc.closeOldestIdleLocked()
@@ -150,7 +163,8 @@ func (hc *handleCache) noteWrite(e *cachedHandle, end int64) {
 	if end > e.size {
 		e.size = end
 	}
-	e.lastUse = time.Now()
+	now := time.Now()
+	e.lastUse, e.modTime = now, now
 	hc.mu.Unlock()
 }
 
@@ -159,7 +173,8 @@ func (hc *handleCache) noteTruncate(e *cachedHandle, size int64) {
 	hc.mu.Lock()
 	e.dirty = true
 	e.size = size
-	e.lastUse = time.Now()
+	now := time.Now()
+	e.lastUse, e.modTime = now, now
 	hc.mu.Unlock()
 }
 
@@ -179,7 +194,7 @@ func (hc *handleCache) statOverlay(name string) (size int64, mtime time.Time, ok
 	hc.mu.Lock()
 	defer hc.mu.Unlock()
 	if e := hc.entries[name]; e != nil {
-		return e.size, e.lastUse, true
+		return e.size, e.modTime, true
 	}
 	return 0, time.Time{}, false
 }

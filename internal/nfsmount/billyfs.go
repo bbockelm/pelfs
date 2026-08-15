@@ -464,6 +464,7 @@ func (f *billyFile) Write(p []byte) (int, error) {
 	if errno == 0 && f.ch != nil {
 		f.hc.noteWrite(f.ch, off+int64(n))
 	}
+	nfsDebugf("Write %s off=%d len=%d wrote=%d errno=%v", f.name, off, len(p), n, errno)
 	return n, pe("write", f.name, errno)
 }
 
@@ -472,9 +473,10 @@ func (f *billyFile) WriteAt(p []byte, off int64) (int, error) {
 	if errno == 0 && f.ch != nil {
 		f.hc.noteWrite(f.ch, off+int64(n))
 	}
-	if errno != 0 || n != len(p) {
-		nfsDebugf("WriteAt %s off=%d want=%d got=%d errno=%v", f.name, off, len(p), n, errno)
-	}
+	// Every write is traced, not just failures: proving whether a file's
+	// final partial write ever reached the server is the whole question
+	// when a client reports a file ending early.
+	nfsDebugf("WriteAt %s off=%d len=%d wrote=%d errno=%v", f.name, off, len(p), n, errno)
 	return n, pe("write", f.name, errno)
 }
 

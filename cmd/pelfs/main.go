@@ -25,8 +25,11 @@ import (
 	"github.com/juicedata/juicefs/pkg/object"
 
 	"github.com/bbockelm/pelfs/internal/dockerrun"
+	"github.com/bbockelm/pelfs/internal/lease"
+	"github.com/bbockelm/pelfs/internal/mountfs"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/snapshot"
+	"github.com/bbockelm/pelfs/internal/stats"
 )
 
 func main() {
@@ -90,6 +93,8 @@ type cmdOpts struct {
 	compress         string
 	encryptKeyPath   string
 	noRestore        bool
+	noLease          bool
+	stealLease       bool
 	noAcquireToken   bool
 	insecure         bool
 	debug            bool
@@ -98,6 +103,10 @@ type cmdOpts struct {
 	dockerImage      string
 	shellPath        string
 	gcDelete         bool
+	prefetch         string
+	statsFile        string
+	flushTimeout     time.Duration
+	cacheFreeRatio   float64
 }
 
 func registerFlags(fs *flag.FlagSet, o *cmdOpts) {
@@ -114,6 +123,8 @@ func registerFlags(fs *flag.FlagSet, o *cmdOpts) {
 	fs.StringVar(&o.compress, "compress", "none", "block compression: none or zstd (fixed at volume creation)")
 	fs.StringVar(&o.encryptKeyPath, "encrypt-key", "", "PEM private key enabling client-side encryption of blocks AND metadata snapshots (required again on every later mount)")
 	fs.BoolVar(&o.noRestore, "no-restore", false, "do not restore the latest metadata snapshot from the federation")
+	fs.BoolVar(&o.noLease, "no-lease", false, "do not take or check the advisory mount lease (concurrent writers will NOT be detected)")
+	fs.BoolVar(&o.stealLease, "steal-lease", false, "take over a live lease held by another client (use only when that client is known dead)")
 	fs.BoolVar(&o.noAcquireToken, "no-acquire-token", false, "never run interactive token-acquisition flows; rely on discovered tokens only")
 	fs.BoolVar(&o.insecure, "insecure", false, "skip TLS verification (test federations only)")
 	fs.BoolVar(&o.debug, "debug", false, "verbose logging")
@@ -121,6 +132,10 @@ func registerFlags(fs *flag.FlagSet, o *cmdOpts) {
 	fs.BoolVar(&o.noDocker, "no-docker", false, "never fall back to Docker; fail if FUSE is unavailable")
 	fs.StringVar(&o.dockerImage, "docker-image", dockerrun.DefaultImage, "container image for the Docker fallback")
 	fs.StringVar(&o.shellPath, "shell", "", "shell to launch (default: $SHELL, else /bin/sh)")
+	fs.StringVar(&o.prefetch, "prefetch", "none", "download all blocks into the local cache at startup: none, all (blocking; refuse to start on any failure), or background")
+	fs.StringVar(&o.statsFile, "stats-file", "", "write a JSON session-statistics summary to this path (default: <state-dir>/pelfs-stats.json)")
+	fs.DurationVar(&o.flushTimeout, "flush-timeout", 0, "with --writeback, how long to wait at exit for staged blocks to finish uploading (0 = wait forever)")
+	fs.Float64Var(&o.cacheFreeRatio, "cache-free-ratio", 0.05, "minimum free space/inode fraction the block cache preserves on its filesystem")
 }
 
 func parseArgs(name string, args []string, minPos, maxPos int, extra func(*flag.FlagSet, *cmdOpts)) (*cmdOpts, []string, error) {
@@ -139,6 +154,9 @@ func parseArgs(name string, args []string, minPos, maxPos int, extra func(*flag.
 	if o.compress != "none" && o.compress != "zstd" {
 		return nil, nil, fmt.Errorf("--compress must be none or zstd")
 	}
+	if o.prefetch != "none" && o.prefetch != "all" && o.prefetch != "background" {
+		return nil, nil, fmt.Errorf("--prefetch must be none, all, or background")
+	}
 	return o, fs.Args(), nil
 }
 
@@ -152,15 +170,21 @@ type session struct {
 	cacheDir   string
 	mountPoint string
 
-	store      pelicanobj.Store     // raw transport (listings, ETags)
-	data       object.ObjectStorage // block/snapshot bytes; encrypted wrapper when enabled
+	store      pelicanobj.Store     // raw transport (immutable blocks; cache-served reads)
+	data       object.ObjectStorage // block bytes; encrypted + stats wrappers applied
+	metaStore  pelicanobj.Store     // direct-read transport for MUTABLE objects (lease, snapshot listings/ETags)
+	metaData   object.ObjectStorage // snapshot bytes over metaStore; encrypted + stats wrappers applied
 	encryptPEM string
+
+	sessionID string
+	lease     *lease.Lease // held for write sessions unless --no-lease
+	stats     *stats.Collector
 }
 
 // newSession builds the store, wraps encryption, runs the preflight access
 // check, sets up local state, and restores the latest metadata snapshot.
 func newSession(ctx context.Context, o *cmdOpts, prefix string, needWrite bool) (*session, error) {
-	s := &session{o: o, prefix: prefix}
+	s := &session{o: o, prefix: prefix, sessionID: snapshot.NewSessionID()}
 
 	if o.stateDir != "" {
 		s.stateDir = o.stateDir
@@ -181,6 +205,16 @@ func newSession(ctx context.Context, o *cmdOpts, prefix string, needWrite bool) 
 		return nil, err
 	}
 
+	statsPath := o.statsFile
+	if statsPath == "" {
+		statsPath = filepath.Join(s.stateDir, "pelfs-stats.json")
+	}
+	s.stats = stats.New(prefix, s.sessionID, statsPath)
+	s.stats.Update(func(sum *stats.Summary) {
+		sum.MountPoint = s.mountPoint
+		sum.PrefetchMode = o.prefetch
+	})
+
 	store, err := pelicanobj.New(ctx, pelicanobj.Config{
 		PrefixURL:    prefix,
 		TokenPath:    o.token,
@@ -193,6 +227,25 @@ func newSession(ctx context.Context, o *cmdOpts, prefix string, needWrite bool) 
 	s.store = store
 	s.data = store
 
+	// Mutable objects (the mount lease, snapshot current.db and its ETag
+	// checks, restore listings) must never be read through federation
+	// caches: a stale cached copy breaks read-after-write — e.g. lease
+	// acquisition would read an old holder record and refuse to mount.
+	// This second store forces origin reads (?directread). Immutable
+	// chunks stay on the cache-served store above.
+	metaStore, err := pelicanobj.New(ctx, pelicanobj.Config{
+		PrefixURL:    prefix,
+		TokenPath:    o.token,
+		AcquireToken: !o.noAcquireToken,
+		Insecure:     o.insecure,
+		DirectRead:   true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	s.metaStore = metaStore
+	s.metaData = metaStore
+
 	if o.encryptKeyPath != "" {
 		pem, err := os.ReadFile(o.encryptKeyPath)
 		if err != nil {
@@ -202,16 +255,51 @@ func newSession(ctx context.Context, o *cmdOpts, prefix string, needWrite bool) 
 		if s.data, err = pelicanobj.WrapEncrypted(store, pem); err != nil {
 			return nil, err
 		}
+		if s.metaData, err = pelicanobj.WrapEncrypted(metaStore, pem); err != nil {
+			return nil, err
+		}
 	}
+	// Count every data-path operation (blocks and snapshots) for the
+	// session statistics summary.
+	s.data = stats.WrapStorage(s.data, s.stats)
+	s.metaData = stats.WrapStorage(s.metaData, s.stats)
 
 	if err := pelicanobj.Preflight(ctx, store, prefix, !needWrite); err != nil {
 		s.cleanupTemp()
 		return nil, err
 	}
 
+	// Write sessions hold an advisory lease so a second client on the same
+	// prefix is detected up front (and we notice if one appears later).
+	// The lease uses the direct-read store, never the encryption wrapper:
+	// even a client with a wrong volume key must see the prefix is busy,
+	// and a cached stale copy must not fake or hide a holder. Acquired
+	// before the snapshot restore so we never restore state another
+	// writer is changing.
+	if needWrite && !o.readOnly && !o.noLease {
+		l, err := lease.Acquire(ctx, lease.Options{
+			Store:   metaStore,
+			Session: s.sessionID,
+			Steal:   o.stealLease,
+			OnConflict: func(holder *lease.Info) {
+				s.stats.Update(func(sum *stats.Summary) { sum.LeaseConflictObserved = true })
+				fmt.Fprintf(os.Stderr,
+					"pelfs: WARNING: another client took over this prefix: %s\n"+
+						"pelfs: WARNING: concurrent writers WILL corrupt each other; stop one of them.\n"+
+						"pelfs: WARNING: this session keeps running but no longer renews the lease.\n",
+					holder.Describe())
+			},
+		})
+		if err != nil {
+			s.cleanupTemp()
+			return nil, err
+		}
+		s.lease = l
+	}
+
 	if !o.noRestore {
 		if _, err := os.Stat(s.metaPath); os.IsNotExist(err) {
-			key, err := snapshot.Restore(ctx, s.store, s.data, s.metaPath)
+			key, err := snapshot.Restore(ctx, s.metaStore, s.metaData, s.metaPath)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "pelfs: no metadata snapshot restored (%v); starting fresh\n", err)
 			} else if key != "" {
@@ -222,7 +310,23 @@ func newSession(ctx context.Context, o *cmdOpts, prefix string, needWrite bool) 
 	return s, nil
 }
 
+// releaseLease stops renewals and removes the lease object. Idempotent and
+// nil-safe; runs last in shutdown so the lease covers the full write window
+// (flush + final snapshot).
+func (s *session) releaseLease() {
+	if s.lease == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := s.lease.Release(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "pelfs: release lease: %v\n", err)
+	}
+	s.lease = nil
+}
+
 func (s *session) cleanupTemp() {
+	s.releaseLease()
 	if s.tempState && !s.o.keepState {
 		os.RemoveAll(s.stateDir)
 		return
@@ -237,10 +341,57 @@ func (s *session) cleanupTemp() {
 func (s *session) newSnapshotManager() *snapshot.Manager {
 	return &snapshot.Manager{
 		MetaPath: s.metaPath,
-		Meta:     s.store,
-		Data:     s.data,
-		Session:  snapshot.NewSessionID(),
+		Meta:     s.metaStore,
+		Data:     s.metaData,
+		Session:  s.sessionID,
+		OnSnapshot: func(key string, when time.Time) {
+			s.stats.Update(func(sum *stats.Summary) { sum.SnapshotsUploaded++ })
+		},
+		OnError: func(err error) {
+			s.stats.Update(func(sum *stats.Summary) { sum.SnapshotErrors++ })
+		},
 	}
+}
+
+// runPrefetch performs the --prefetch policy after a successful mount. In
+// "all" mode it blocks and returns an error when any block could not be
+// downloaded (the caller refuses to continue); in "background" mode it
+// returns immediately and records the outcome in the statistics.
+func (s *session) runPrefetch(ctx context.Context, mnt *mountfs.Mounted) error {
+	record := func(rep *mountfs.PrefetchReport, err error) {
+		s.stats.Update(func(sum *stats.Summary) {
+			sum.PrefetchSlices = int64(rep.Slices)
+			sum.PrefetchFailed = int64(rep.Failed)
+			sum.PrefetchComplete = err == nil && rep.Failed == 0
+		})
+		_ = s.stats.Flush()
+	}
+	switch s.o.prefetch {
+	case "all":
+		fmt.Fprintln(os.Stderr, "pelfs: prefetching all blocks into the local cache...")
+		rep, err := mnt.Prefetch(ctx, 16)
+		if rep != nil {
+			record(rep, err)
+		}
+		if err != nil {
+			return fmt.Errorf("prefetch: %w", err)
+		}
+		if rep.Failed > 0 {
+			return fmt.Errorf("prefetch incomplete: %d of %d slices failed (first error: %v)", rep.Failed, rep.Slices, rep.FirstErr)
+		}
+		fmt.Fprintf(os.Stderr, "pelfs: prefetched %d slices\n", rep.Slices)
+	case "background":
+		go func() {
+			rep, err := mnt.Prefetch(ctx, 8)
+			if rep != nil {
+				record(rep, err)
+				if err != nil || rep.Failed > 0 {
+					fmt.Fprintf(os.Stderr, "pelfs: background prefetch incomplete: %d of %d slices failed\n", rep.Failed, rep.Slices)
+				}
+			}
+		}()
+	}
+	return nil
 }
 
 // fuseUsable reports whether this host can plausibly mount FUSE.

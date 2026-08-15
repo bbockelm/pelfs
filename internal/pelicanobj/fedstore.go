@@ -29,6 +29,10 @@ type fedStore struct {
 	prefix string // pelican://host/path, no trailing slash
 	pfs    *client.PelicanFS
 	opts   []client.TransferOption
+	// directRead appends ?directread to every operation so reads bypass
+	// federation caches — mandatory for mutable objects (lease, snapshots)
+	// whose read-after-write semantics a stale cache copy would break.
+	directRead bool
 }
 
 var _ Store = (*fedStore)(nil)
@@ -69,16 +73,25 @@ func newFedStore(ctx context.Context, cfg Config) (*fedStore, error) {
 
 	prefix := strings.TrimRight(cfg.PrefixURL, "/")
 	return &fedStore{
-		ctx:    ctx,
-		prefix: prefix,
-		pfs:    client.NewPelicanFSWithPrefix(ctx, prefix, opts...),
-		opts:   opts,
+		ctx:        ctx,
+		prefix:     prefix,
+		pfs:        client.NewPelicanFSWithPrefix(ctx, prefix, opts...),
+		opts:       opts,
+		directRead: cfg.DirectRead,
 	}, nil
+}
+
+// querySuffix is appended to every object URL/path this store builds.
+func (s *fedStore) querySuffix() string {
+	if s.directRead {
+		return "?directread"
+	}
+	return ""
 }
 
 // keyURL maps an object key to its absolute pelican:// URL.
 func (s *fedStore) keyURL(key string) string {
-	return s.prefix + "/" + strings.TrimLeft(key, "/")
+	return s.prefix + "/" + strings.TrimLeft(key, "/") + s.querySuffix()
 }
 
 // mapNotFound folds the client's various not-found signals into
@@ -112,7 +125,7 @@ func (s *fedStore) Create(ctx context.Context) error {
 }
 
 func (s *fedStore) Get(ctx context.Context, key string, off, limit int64, getters ...object.AttrGetter) (io.ReadCloser, error) {
-	f, err := s.pfs.OpenFile("/"+strings.TrimLeft(key, "/"), os.O_RDONLY)
+	f, err := s.pfs.OpenFile("/"+strings.TrimLeft(key, "/")+s.querySuffix(), os.O_RDONLY)
 	if err != nil {
 		return nil, mapNotFound(err)
 	}

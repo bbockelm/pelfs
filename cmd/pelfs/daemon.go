@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/bbockelm/pelfs/internal/mountfs"
+	"github.com/bbockelm/pelfs/internal/stats"
 )
 
 const daemonEnv = "PELFS_MOUNT_DAEMON"
@@ -31,6 +32,9 @@ type mountInfo struct {
 	Started      time.Time `json:"started"`
 	LastSnapshot time.Time `json:"last_snapshot,omitempty"`
 	LastSnapKey  string    `json:"last_snapshot_key,omitempty"`
+	// LeaseConflict is set when another client overwrote our mount lease:
+	// a second writer is (or was) active on the same prefix.
+	LeaseConflict bool `json:"lease_conflict,omitempty"`
 }
 
 func stateRoot() string {
@@ -133,8 +137,21 @@ func runMountDaemon(o *cmdOpts, prefix string, pos []string, infoPath string) in
 
 	mnt, err := mountfs.Mount(mountOptions(s))
 	if err != nil {
+		_ = s.stats.Finalize(1, false)
+		s.cleanupTemp()
 		return exitErr(fmt.Errorf("mount: %w", err))
 	}
+
+	// Strict prefetch refuses to publish the mount when incomplete.
+	if err := s.runPrefetch(ctx, mnt); err != nil {
+		_ = mnt.Close()
+		_ = s.stats.Finalize(1, false)
+		s.cleanupTemp()
+		return exitErr(err)
+	}
+
+	statsCtx, stopStats := context.WithCancel(ctx)
+	go s.stats.RunPeriodic(statsCtx, 30*time.Second)
 
 	info := &mountInfo{
 		PID:        os.Getpid(),
@@ -156,7 +173,11 @@ func runMountDaemon(o *cmdOpts, prefix string, pos []string, infoPath string) in
 		close(snapsDone)
 	} else {
 		info.Session = mgr.Session
+		prevOnSnapshot := mgr.OnSnapshot // keep the stats-counting hook
 		mgr.OnSnapshot = func(key string, when time.Time) {
+			if prevOnSnapshot != nil {
+				prevOnSnapshot(key, when)
+			}
 			info.LastSnapshot = when
 			info.LastSnapKey = key
 			writeInfo()
@@ -170,6 +191,18 @@ func runMountDaemon(o *cmdOpts, prefix string, pos []string, infoPath string) in
 	}
 	writeInfo()
 
+	// Surface lease conflicts in mount.json even when snapshots are off.
+	leaseWatch := time.NewTicker(30 * time.Second)
+	defer leaseWatch.Stop()
+	go func() {
+		for range leaseWatch.C {
+			if s.lease != nil && s.lease.Conflicted() && !info.LeaseConflict {
+				info.LeaseConflict = true
+				writeInfo()
+			}
+		}
+	}()
+
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 	sig := <-sigs
@@ -178,17 +211,34 @@ func runMountDaemon(o *cmdOpts, prefix string, pos []string, infoPath string) in
 	stopSnaps()
 	<-snapsDone
 	code := 0
-	if err := mnt.Close(); err != nil {
-		fmt.Fprintf(os.Stderr, "pelfs: unmount: %v\n", err)
+	closeErr := mnt.Close()
+	if closeErr != nil {
+		fmt.Fprintf(os.Stderr, "pelfs: unmount: %v\n", closeErr)
 		code = 1
 	}
+	if o.writeback {
+		drained := closeErr == nil
+		s.stats.Update(func(sum *stats.Summary) {
+			sum.StagingDrained = &drained
+			if !drained {
+				sum.StagingBlocksLeft = mnt.StagingBlocks()
+			}
+		})
+	}
+	finalOK := true
 	if mgr != nil {
 		if err := mgr.Snapshot(ctx, true); err != nil {
 			fmt.Fprintf(os.Stderr, "pelfs: final metadata snapshot failed: %v\n", err)
+			finalOK = false
 			code = 1
 		} else if err := mgr.PruneSessions(ctx, o.keepSessions); err != nil {
 			fmt.Fprintf(os.Stderr, "pelfs: prune old snapshots: %v\n", err)
 		}
+		s.stats.Update(func(sum *stats.Summary) { sum.FinalSnapshotOK = &finalOK })
+	}
+	stopStats()
+	if err := s.stats.Finalize(code, closeErr == nil && finalOK); err != nil {
+		fmt.Fprintf(os.Stderr, "pelfs: write stats file: %v\n", err)
 	}
 	_ = os.Remove(infoPath)
 	return code
@@ -256,6 +306,9 @@ func cmdStatus(args []string) int {
 		if !e.info.LastSnapshot.IsZero() {
 			fmt.Printf("  last snapshot: %s (%s)\n",
 				e.info.LastSnapshot.Format(time.RFC3339), e.info.LastSnapKey)
+		}
+		if e.info.LeaseConflict {
+			fmt.Printf("  LEASE CONFLICT: another client took over this prefix; concurrent writers corrupt each other\n")
 		}
 	}
 	return 0

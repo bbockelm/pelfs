@@ -45,6 +45,17 @@ scopes up front.
 - **Auth**: `--token <file>`, or the Pelican client's own token machinery
   (WLCG discovery plus, unless `--no-acquire-token`, interactive
   acquisition).
+- **Concurrent-writer detection**: every write session holds an advisory
+  lease at `<prefix>/meta/lease.json`, renewed every 30s (2 min TTL). A
+  second `pelfs` pointed at the same prefix refuses to mount while the
+  lease is live, naming the holder; `--steal-lease` overrides it, `--ro`
+  mounts skip it, and a crashed client's lease simply expires. If another
+  client takes the lease over mid-session, pelfs warns loudly (and flags it
+  in `pelfs status`) but cannot hard-fence: the transport has no
+  compare-and-swap, so this is detection, not mutual exclusion. Lease and
+  snapshot reads always bypass federation caches (`?directread`) — mutable
+  objects must never be served stale, while immutable data chunks keep
+  enjoying cache-served reads.
 - **No FUSE? Docker.** On macOS without macFUSE (or Linux without
   `/dev/fuse`), pelfs re-launches itself inside a small container
   (`alpine` + the bind-mounted `pelfs-linux-<arch>` binary, `--device

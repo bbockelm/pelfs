@@ -39,6 +39,12 @@ type Config struct {
 	// AcquireToken lets the Pelican client run token-acquisition flows
 	// (e.g. OIDC) when no usable token is found. Federation mode only.
 	AcquireToken bool
+	// DirectRead forces reads to come from the origin (?directread),
+	// bypassing federation caches. Required for MUTABLE objects — the
+	// mount lease and metadata snapshots — where a cached stale copy
+	// breaks read-after-write (e.g. lease acquisition verification).
+	// Immutable data chunks should leave this off and enjoy the caches.
+	DirectRead bool
 	// Insecure skips TLS verification (for local test federations).
 	Insecure bool
 }

@@ -85,7 +85,9 @@ func Run(opts Options) (int, error) {
 		"--add-host", "host.docker.internal:host-gateway",
 		"-v", bin + ":/usr/local/bin/pelfs:ro",
 		"-e", "PELFS_IN_DOCKER=1",
-		"--hostname", "pelfs",
+		// Carry the host's name into the container so lease records and
+		// session IDs identify the actual machine, not a generic "pelfs".
+		"--hostname", containerHostname(),
 	}
 	if isTerminal() {
 		args = append(args, "-it")
@@ -163,6 +165,14 @@ func passthroughEnv() []string {
 		}
 	}
 	return args
+}
+
+// containerHostname names the container after the host machine.
+func containerHostname() string {
+	if h, err := os.Hostname(); err == nil && h != "" {
+		return h + "-pelfs"
+	}
+	return "pelfs"
 }
 
 func isTerminal() bool {

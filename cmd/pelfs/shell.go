@@ -7,13 +7,16 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/bbockelm/pelfs/internal/dockerrun"
 	"github.com/bbockelm/pelfs/internal/mountfs"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/snapshot"
+	"github.com/bbockelm/pelfs/internal/stats"
 )
 
 func cmdShell(args []string) int {
@@ -46,9 +49,22 @@ func runShellNative(o *cmdOpts, prefix string) (int, error) {
 	fmt.Fprintf(os.Stderr, "pelfs: mounting %s on %s\n", prefix, s.mountPoint)
 	mnt, err := mountfs.Mount(mountOptions(s))
 	if err != nil {
+		_ = s.stats.Finalize(1, false)
 		s.cleanupTemp()
 		return 1, fmt.Errorf("mount: %w", err)
 	}
+
+	// Strict prefetch runs before the subshell: refuse to start when any
+	// block could not be downloaded.
+	if err := s.runPrefetch(ctx, mnt); err != nil {
+		_ = mnt.Close()
+		_ = s.stats.Finalize(1, false)
+		s.cleanupTemp()
+		return 1, err
+	}
+
+	statsCtx, stopStats := context.WithCancel(ctx)
+	go s.stats.RunPeriodic(statsCtx, 30*time.Second)
 
 	var mgr *snapshot.Manager
 	snapCtx, stopSnaps := context.WithCancel(ctx)
@@ -70,15 +86,29 @@ func runShellNative(o *cmdOpts, prefix string) (int, error) {
 	stopSnaps()
 	<-snapsDone
 	fmt.Fprintln(os.Stderr, "pelfs: unmounting and flushing data to the federation...")
-	if err := mnt.Close(); err != nil {
-		fmt.Fprintf(os.Stderr, "pelfs: unmount: %v\n", err)
+	// Close unmounts, flushes delayed writes, and (with --writeback) waits
+	// for staged blocks to finish uploading: the "final upload at exit".
+	closeErr := mnt.Close()
+	if closeErr != nil {
+		fmt.Fprintf(os.Stderr, "pelfs: unmount: %v\n", closeErr)
 		if code == 0 {
 			code = 1
 		}
 	}
+	if o.writeback {
+		drained := closeErr == nil
+		s.stats.Update(func(sum *stats.Summary) {
+			sum.StagingDrained = &drained
+			if !drained {
+				sum.StagingBlocksLeft = mnt.StagingBlocks()
+			}
+		})
+	}
+	finalOK := true
 	if mgr != nil {
 		if err := mgr.Snapshot(ctx, true); err != nil {
 			fmt.Fprintf(os.Stderr, "pelfs: final metadata snapshot failed: %v\n", err)
+			finalOK = false
 			if code == 0 {
 				code = 1
 			}
@@ -88,6 +118,11 @@ func runShellNative(o *cmdOpts, prefix string) (int, error) {
 				fmt.Fprintf(os.Stderr, "pelfs: prune old snapshots: %v\n", err)
 			}
 		}
+		s.stats.Update(func(sum *stats.Summary) { sum.FinalSnapshotOK = &finalOK })
+	}
+	stopStats()
+	if err := s.stats.Finalize(code, closeErr == nil && finalOK); err != nil {
+		fmt.Fprintf(os.Stderr, "pelfs: write stats file: %v\n", err)
 	}
 	s.cleanupTemp()
 	return code, nil
@@ -95,19 +130,21 @@ func runShellNative(o *cmdOpts, prefix string) (int, error) {
 
 func mountOptions(s *session) mountfs.Options {
 	return mountfs.Options{
-		VolumeName:    s.o.volume,
-		MetaPath:      s.metaPath,
-		MountPoint:    s.mountPoint,
-		CacheDir:      s.cacheDir,
-		PrefixURL:     s.prefix,
-		Blob:          s.data,
-		BlockSizeKiB:  s.o.blockSizeKiB,
-		CacheSizeMiB:  s.o.cacheSizeMiB,
-		Writeback:     s.o.writeback,
-		ReadOnly:      s.o.readOnly,
-		Debug:         s.o.debug,
-		Compression:   s.o.compress,
-		EncryptKeyPEM: s.encryptPEM,
+		VolumeName:     s.o.volume,
+		MetaPath:       s.metaPath,
+		MountPoint:     s.mountPoint,
+		CacheDir:       s.cacheDir,
+		PrefixURL:      s.prefix,
+		Blob:           s.data,
+		BlockSizeKiB:   s.o.blockSizeKiB,
+		CacheSizeMiB:   s.o.cacheSizeMiB,
+		Writeback:      s.o.writeback,
+		ReadOnly:       s.o.readOnly,
+		Debug:          s.o.debug,
+		Compression:    s.o.compress,
+		EncryptKeyPEM:  s.encryptPEM,
+		FlushTimeout:   s.o.flushTimeout,
+		CacheFreeRatio: s.o.cacheFreeRatio,
 	}
 }
 
@@ -143,16 +180,33 @@ func runInDocker(o *cmdOpts, prefix string) int {
 		"--block-size", fmt.Sprint(o.blockSizeKiB),
 		"--volume", o.volume,
 		"--compress", o.compress,
+		"--prefetch", o.prefetch,
+		"--flush-timeout", o.flushTimeout.String(),
+		"--cache-free-ratio", fmt.Sprint(o.cacheFreeRatio),
 		"--no-docker", // never recurse
 	}
 	if o.encryptKeyPath != "" {
 		// dockerrun bind-mounts the key at this fixed path.
 		extra = append(extra, "--encrypt-key", "/run/pelfs/encrypt-key")
 	}
+	// The stats file must survive the container: resolve a host path
+	// (default: ./pelfs-stats.json), bind-mount its directory, and point
+	// the in-container pelfs at the mounted location.
+	hostStats := o.statsFile
+	if hostStats == "" {
+		if cwd, err := os.Getwd(); err == nil {
+			hostStats = filepath.Join(cwd, "pelfs-stats.json")
+		}
+	}
+	if hostStats != "" {
+		extra = append(extra, "--stats-file", "/run/pelfs/stats/"+filepath.Base(hostStats))
+	}
 	for flagName, set := range map[string]bool{
 		"--writeback":        o.writeback,
 		"--ro":               o.readOnly,
 		"--no-restore":       o.noRestore,
+		"--no-lease":         o.noLease,
+		"--steal-lease":      o.stealLease,
 		"--no-acquire-token": o.noAcquireToken,
 		"--insecure":         o.insecure,
 		"--debug":            o.debug,
@@ -165,6 +219,7 @@ func runInDocker(o *cmdOpts, prefix string) int {
 		PrefixURL:      prefix,
 		TokenPath:      resolveTokenPath(o.token),
 		EncryptKeyPath: o.encryptKeyPath,
+		StatsPath:      hostStats,
 		Image:          o.dockerImage,
 		ExtraArgs:      extra,
 	})

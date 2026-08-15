@@ -27,6 +27,30 @@ type Server struct {
 	serveErr chan error
 }
 
+// quietLogger drops go-nfs log lines that are expected and harmless here,
+// so that real problems stay visible.
+type quietLogger struct {
+	nfs.Logger
+}
+
+// Errorf filters the EXCLUSIVE-create rejection. go-nfs does not implement
+// NFSv3 EXCLUSIVE mode, which is what every O_CREAT|O_EXCL open becomes —
+// git alone does it for each lockfile and every mkstemp, so the message
+// repeats constantly. The client falls back to GUARDED, which preserves the
+// property that matters (the create still fails if the name already
+// exists); only retransmission idempotency is lost, and a loopback TCP
+// mount does not retransmit.
+func (l *quietLogger) Errorf(format string, args ...interface{}) {
+	if strings.Contains(format, "exclusive") {
+		return
+	}
+	l.Logger.Errorf(format, args...)
+}
+
+func init() {
+	nfs.SetLogger(&quietLogger{Logger: nfs.Log})
+}
+
 // Serve starts an NFSv3 server for bfs on a random 127.0.0.1 port.
 func Serve(bfs billy.Filesystem) (*Server, error) {
 	// IPv4 explicitly: mount_nfs is pointed at 127.0.0.1, and a hostname

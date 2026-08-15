@@ -448,9 +448,13 @@ func (f *billyFile) Close() error {
 	return pe("close", f.name, f.f.Close(f.ctx))
 }
 
-// Sync commits buffered writes without closing the handle. go-nfs's COMMIT
-// handler looks for this optional method to implement NFSv3 stable-storage
-// semantics.
+// Sync commits buffered writes without closing the handle.
+//
+// Nothing calls this today: go-nfs's COMMIT handler is a no-op, so an
+// fsync() through this mount does not reach us. Durability instead comes
+// from the janitor, from Rename/Remove (git's write-then-rename is what
+// matters in practice), and from the flush at unmount. This is the method
+// a fixed COMMIT would call — see docs/go-nfs-patches.md.
 func (f *billyFile) Sync() error {
 	if f.ch != nil {
 		return f.hc.sync(f.name)

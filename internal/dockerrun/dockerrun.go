@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 )
 
 // DefaultImage is a small image with a shell and CA certificates; the pelfs
@@ -109,6 +110,7 @@ func Run(opts Options) (int, error) {
 	if opts.EncryptKeyPath != "" {
 		args = append(args, "-v", opts.EncryptKeyPath+":/run/pelfs/encrypt-key:ro")
 	}
+	args = append(args, passthroughEnv()...)
 	args = append(args, image, "/usr/local/bin/pelfs", "shell",
 		"--state-dir", "/var/tmp/pelfs", "--shell", "/bin/sh")
 	args = append(args, opts.ExtraArgs...)
@@ -127,6 +129,31 @@ func Run(opts Options) (int, error) {
 		return 1, fmt.Errorf("docker run: %w", err)
 	}
 	return 0, nil
+}
+
+// passthroughEnv forwards Pelican-related environment variables into the
+// container so configuration set on the host (log level, timeouts, ...)
+// applies inside as well. Variables that name host filesystem paths are
+// excluded: they would be meaningless (or harmful) in the container, where
+// the config base and token file are provided by bind mounts instead.
+func passthroughEnv() []string {
+	excluded := map[string]bool{
+		"PELICAN_CONFIGDIR":             true,
+		"PELICAN_CONFIGBASE":            true,
+		"PELICAN_CLIENT_CREDENTIALFILE": true,
+	}
+	var args []string
+	for _, kv := range os.Environ() {
+		name, _, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		if (strings.HasPrefix(name, "PELICAN_") && !excluded[name]) ||
+			name == "BEARER_TOKEN" || name == "JFS_RSA_PASSPHRASE" {
+			args = append(args, "-e", kv)
+		}
+	}
+	return args
 }
 
 func isTerminal() bool {

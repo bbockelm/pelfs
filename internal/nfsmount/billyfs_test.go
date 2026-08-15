@@ -15,6 +15,7 @@ import (
 	"github.com/juicedata/juicefs/pkg/version"
 	"github.com/juicedata/juicefs/pkg/vfs"
 	"github.com/prometheus/client_golang/prometheus"
+	nfsfile "github.com/willscott/go-nfs/file"
 
 	"github.com/bbockelm/pelfs/internal/fakeorigin"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
@@ -204,5 +205,76 @@ func TestBillyFSTempFile(t *testing.T) {
 	f.Close()
 	if _, err := b.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600); !os.IsExist(err) {
 		t.Fatalf("O_EXCL on existing file: %v", err)
+	}
+}
+
+// TestForeignOwnedFileWritable is the vim-on-macOS regression: files created
+// by other sessions (e.g. the Docker fallback, which runs as root) carry
+// foreign uids in the volume metadata. The NFS adapter must still be able to
+// write them — it operates as superuser and presents ownership as the
+// mounting user.
+func TestForeignOwnedFileWritable(t *testing.T) {
+	fsys := newTestVolume(t)
+
+	// Create a file owned by a foreign uid (simulating a root/other-session
+	// creation), mode 0644.
+	foreign := meta.NewContext(uint32(os.Getpid()), 12345, []uint32{12345})
+	f, errno := fsys.Create(foreign, "/docker-made.txt", 0644, 022)
+	if errno != 0 {
+		t.Fatalf("foreign create: %v", errno)
+	}
+	if _, errno := f.Pwrite(foreign, []byte("original"), 0); errno != 0 {
+		t.Fatalf("foreign write: %v", errno)
+	}
+	if errno := f.Close(foreign); errno != 0 {
+		t.Fatalf("foreign close: %v", errno)
+	}
+
+	b := NewBillyFS(fsys, 501, 20)
+
+	// Append through the adapter (what `echo foo >> file` does).
+	bf, err := b.OpenFile("/docker-made.txt", os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatalf("adapter open for append: %v", err)
+	}
+	if _, err := bf.Write([]byte(" appended")); err != nil {
+		t.Fatalf("adapter append: %v", err)
+	}
+	bf.Close()
+
+	// Truncate-rewrite through the adapter (what vim's save does).
+	bf, err = b.OpenFile("/docker-made.txt", os.O_WRONLY|os.O_TRUNC, 0)
+	if err != nil {
+		t.Fatalf("adapter open for truncate: %v", err)
+	}
+	if _, err := bf.Write([]byte("rewritten")); err != nil {
+		t.Fatalf("adapter rewrite: %v", err)
+	}
+	bf.Close()
+
+	bf, _ = b.Open("/docker-made.txt")
+	data, err := io.ReadAll(bf)
+	if err != nil && err != io.EOF {
+		t.Fatal(err)
+	}
+	bf.Close()
+	if string(data) != "rewritten" {
+		t.Fatalf("content = %q, want %q", data, "rewritten")
+	}
+
+	// Ownership is presented as the mounting user, with a real inode.
+	fi, err := b.Stat("/docker-made.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sys, ok := fi.Sys().(*nfsfile.FileInfo)
+	if !ok {
+		t.Fatalf("Sys() type = %T, want *nfsfile.FileInfo", fi.Sys())
+	}
+	if sys.UID != 501 || sys.GID != 20 {
+		t.Fatalf("presented owner = %d:%d, want 501:20", sys.UID, sys.GID)
+	}
+	if sys.Fileid == 0 {
+		t.Fatal("Fileid should be the real inode, not zero")
 	}
 }

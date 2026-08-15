@@ -22,6 +22,7 @@ import (
 	jfs "github.com/juicedata/juicefs/pkg/fs"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/vfs"
+	nfsfile "github.com/willscott/go-nfs/file"
 )
 
 const defaultUmask = 022
@@ -32,6 +33,8 @@ const defaultUmask = 022
 type billyFS struct {
 	fs  *jfs.FileSystem
 	ctx meta.Context
+	uid uint32 // ownership presented to the NFS client
+	gid uint32
 }
 
 var (
@@ -40,15 +43,56 @@ var (
 	_ billy.Capable    = (*billyFS)(nil)
 )
 
-// NewBillyFS wraps a JuiceFS filesystem for the go-nfs server. All
-// operations run with the given uid/gid identity (typically the mounting
-// user; the volume is a single-user local mount).
+// NewBillyFS wraps a JuiceFS filesystem for the go-nfs server.
+//
+// Operations run with a superuser context: a pelfs volume is a single-user
+// scratch space, but its files may carry uids from other sessions (the
+// Docker fallback runs as root, so files it created are uid-0 in the
+// metadata). Running the local mount under the invoking user's uid would
+// make those files silently unwritable — vim's save would fail server-side
+// while the client page cache made it look fine. The given uid/gid are used
+// only for presentation: every file is reported to the NFS client as owned
+// by the mounting user.
 func NewBillyFS(fs *jfs.FileSystem, uid, gid uint32) billy.Filesystem {
 	return &billyFS{
 		fs:  fs,
-		ctx: meta.NewContext(uint32(os.Getpid()), uid, []uint32{gid}),
+		ctx: meta.NewContext(uint32(os.Getpid()), 0, []uint32{0}),
+		uid: uid,
+		gid: gid,
 	}
 }
+
+// wrapFI presents a jfs FileInfo to go-nfs with the mount user as owner and
+// the real JuiceFS inode as the NFS fileid (stable across renames, unlike
+// go-nfs's path-hash fallback).
+func (b *billyFS) wrapFI(fi os.FileInfo) os.FileInfo {
+	fstat, ok := fi.(*jfs.FileStat)
+	if !ok {
+		return fi
+	}
+	nlink := uint32(1)
+	if attr, ok := fstat.Sys().(*meta.Attr); ok && attr != nil && attr.Nlink > 0 {
+		nlink = attr.Nlink
+	}
+	return &ownedFileInfo{
+		FileInfo: fi,
+		sys: nfsfile.FileInfo{
+			Nlink:  nlink,
+			UID:    b.uid,
+			GID:    b.gid,
+			Fileid: uint64(fstat.Inode()),
+		},
+	}
+}
+
+// ownedFileInfo overrides Sys() with the go-nfs file.FileInfo type so
+// ToFileAttribute picks up our ownership and fileid.
+type ownedFileInfo struct {
+	os.FileInfo
+	sys nfsfile.FileInfo
+}
+
+func (o *ownedFileInfo) Sys() interface{} { return &o.sys }
 
 // pe converts a JuiceFS syscall.Errno into a *fs.PathError so callers (and
 // go-nfs's error mapping) can use errors.Is/os.IsNotExist tests.
@@ -115,7 +159,7 @@ func (b *billyFS) Stat(filename string) (os.FileInfo, error) {
 	if errno != 0 {
 		return nil, pe("stat", filename, errno)
 	}
-	return fi, nil
+	return b.wrapFI(fi), nil
 }
 
 func (b *billyFS) Lstat(filename string) (os.FileInfo, error) {
@@ -123,7 +167,7 @@ func (b *billyFS) Lstat(filename string) (os.FileInfo, error) {
 	if errno != 0 {
 		return nil, pe("lstat", filename, errno)
 	}
-	return fi, nil
+	return b.wrapFI(fi), nil
 }
 
 func (b *billyFS) Rename(oldpath, newpath string) error {
@@ -173,7 +217,11 @@ func (b *billyFS) ReadDir(p string) ([]os.FileInfo, error) {
 	if errno != 0 {
 		return nil, pe("readdir", name, errno)
 	}
-	return fis, nil
+	wrapped := make([]os.FileInfo, len(fis))
+	for i, fi := range fis {
+		wrapped[i] = b.wrapFI(fi)
+	}
+	return wrapped, nil
 }
 
 func (b *billyFS) MkdirAll(filename string, perm os.FileMode) error {

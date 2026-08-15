@@ -185,7 +185,6 @@ func (b *billyFS) OpenFile(filename string, flag int, perm os.FileMode) (billy.F
 			}
 		}
 	}
-	bf := &billyFile{name: name, f: f, ctx: b.ctx}
 	size := int64(0)
 	if fi, err := f.Stat(); err == nil {
 		size = fi.Size()
@@ -193,8 +192,25 @@ func (b *billyFS) OpenFile(filename string, flag int, perm os.FileMode) (billy.F
 	if flag&os.O_TRUNC != 0 {
 		size = 0
 	}
+
+	bf := &billyFile{name: name, f: f, ctx: b.ctx}
 	if writeIntent {
-		bf.ch, bf.hc = b.hc.add(name, f, size), b.hc
+		e, mine := b.hc.add(name, f, size)
+		if e != nil && !mine {
+			// Another caller cached a handle for this path while we were
+			// opening ours. Ours must not survive: writes through it would
+			// be invisible to the cached handle's length view. Hand the
+			// work to the incumbent and drop the redundant handle.
+			nfsDebugf("OpenFile %s: discarding redundant handle, using incumbent", name)
+			if errno := f.Close(b.ctx); errno != 0 {
+				_ = b.hc.release(e)
+				return nil, pe("close", name, errno)
+			}
+			bf = &billyFile{name: name, f: e.f, ctx: b.ctx, ch: e, hc: b.hc}
+			size = b.hc.knownSize(e)
+		} else if e != nil {
+			bf.ch, bf.hc = e, b.hc
+		}
 	}
 	if flag&os.O_APPEND != 0 {
 		atomic.StoreInt64(&bf.pos, size)

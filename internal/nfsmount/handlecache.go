@@ -95,25 +95,38 @@ func (hc *handleCache) acquire(name string) *cachedHandle {
 	return e
 }
 
-// add registers a freshly opened write handle (refcount 1). An existing
-// entry for the same path is evicted first (its holders finish on the old
-// handle; new opens see the new one).
-func (hc *handleCache) add(name string, f *jfs.File, size int64) *cachedHandle {
+// add caches a freshly opened write handle for name (refcount 1) and
+// reports true. If another caller cached a handle for the same path first —
+// concurrent WRITE RPCs on a file with no cached handle each open their own
+// — it instead returns that incumbent (refcount bumped) and reports false,
+// and the caller MUST close the handle it opened.
+//
+// Exactly one handle per path is a correctness requirement, not an
+// optimization: a jfs.File caches the length it saw when it was opened and
+// only advances it for writes made through itself, while pread clamps every
+// read to that length. A second, orphaned handle would take writes that the
+// cached handle's length view never learns about — and whose buffered bytes
+// flushIfDirty, which only knows about the cached handle, would never
+// commit — so the file reads back short even though every byte was written.
+// That is the git-clone "premature end of pack file" truncation.
+func (hc *handleCache) add(name string, f *jfs.File, size int64) (*cachedHandle, bool) {
 	if nfsNoHandleCache {
-		// Not cached: the caller closes the handle when the RPC ends.
-		return nil
+		// Not cached: the caller keeps and closes its own handle.
+		return nil, true
 	}
 	hc.mu.Lock()
 	defer hc.mu.Unlock()
-	if old := hc.entries[name]; old != nil {
-		hc.evictLocked(old)
+	if incumbent := hc.entries[name]; incumbent != nil {
+		incumbent.refs++
+		incumbent.lastUse = time.Now()
+		return incumbent, false
 	}
 	e := &cachedHandle{name: name, f: f, refs: 1, size: size, lastUse: time.Now()}
 	hc.entries[name] = e
 	if len(hc.entries) > handleCacheLimit {
 		hc.closeOldestIdleLocked()
 	}
-	return e
+	return e, true
 }
 
 // release drops one reference. Entries stay cached (open) until the janitor

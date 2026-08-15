@@ -6,7 +6,57 @@ import (
 	"os"
 	"sync"
 	"testing"
+
+	"github.com/juicedata/juicefs/pkg/vfs"
 )
+
+// TestAddRefusesSecondHandle pins the single-handle invariant directly,
+// without depending on hitting the (very narrow) race window in OpenFile:
+// once a path has a cached handle, a second one offered for the same path
+// must be refused so the caller closes it, because writes through a second
+// handle are invisible to the first handle's length view.
+func TestAddRefusesSecondHandle(t *testing.T) {
+	if nfsNoHandleCache {
+		t.Skip("handle cache disabled via PELFS_NFS_NO_HANDLE_CACHE")
+	}
+	fsys, _ := newTestVolumeWithRoot(t)
+	bfs := NewBillyFS(fsys, uint32(os.Getuid()), uint32(os.Getgid())).(*billyFS)
+	defer bfs.hc.closeAll()
+
+	if f, err := bfs.Create("/x.bin"); err != nil {
+		t.Fatal(err)
+	} else if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Create leaves its own handle cached; drop it so this test starts from
+	// an empty cache for the path.
+	if err := bfs.hc.invalidate("/x.bin"); err != nil {
+		t.Fatal(err)
+	}
+
+	h1, errno := bfs.fs.Open(bfs.ctx, "/x.bin", vfs.MODE_MASK_W)
+	if errno != 0 {
+		t.Fatal(errno)
+	}
+	h2, errno := bfs.fs.Open(bfs.ctx, "/x.bin", vfs.MODE_MASK_W)
+	if errno != 0 {
+		t.Fatal(errno)
+	}
+	defer h2.Close(bfs.ctx)
+
+	e1, mine := bfs.hc.add("/x.bin", h1, 0)
+	if !mine || e1 == nil {
+		t.Fatal("first handle for a path must be cached")
+	}
+	e2, mine := bfs.hc.add("/x.bin", h2, 0)
+	if mine {
+		t.Fatal("second handle for the same path was cached; its writes would be " +
+			"invisible to the first handle and reads would clamp short")
+	}
+	if e2 != e1 {
+		t.Fatal("the incumbent handle must be returned so the caller can use it")
+	}
+}
 
 // TestConcurrentFirstWritesShareOneHandle reproduces the git-clone
 // truncation, which the PELFS_NFS_NO_HANDLE_CACHE bisect pinned on the

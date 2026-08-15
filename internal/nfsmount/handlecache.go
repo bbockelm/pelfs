@@ -178,6 +178,17 @@ func (hc *handleCache) noteTruncate(e *cachedHandle, size int64) {
 	hc.mu.Unlock()
 }
 
+// noteMtime records an explicitly set modification time (utimes/SETATTR).
+// Such a set is authoritative and may move mtime backwards, so it overrides
+// the monotonic tracking that ordinary writes get.
+func (hc *handleCache) noteMtime(name string, t time.Time) {
+	hc.mu.Lock()
+	defer hc.mu.Unlock()
+	if e := hc.entries[name]; e != nil {
+		e.modTime = t
+	}
+}
+
 // statOverlay reports the freshest known size/mtime for name when a dirty
 // cached handle exists: buffered writes are invisible to path-based Stat
 // until flushed.

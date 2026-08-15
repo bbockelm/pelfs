@@ -36,7 +36,15 @@ func dialTestServer(t *testing.T) (*nfsc.Target, *billyFS) {
 	handler := nfshelper.NewCachingHandler(nfshelper.NewNullAuthHandler(bfs), 1024)
 	go func() { _ = nfs.Serve(ln, handler) }()
 
-	c, err := rpc.DialTCP(ln.Addr().Network(), ln.Addr().(*net.TCPAddr).String(), false)
+	// go-nfs-client binds a local port explicitly, so repeated runs can
+	// collide with one in TIME_WAIT; retry rather than reporting a port
+	// clash as a filesystem failure.
+	var c *rpc.Client
+	for attempt := 0; attempt < 50; attempt++ {
+		if c, err = rpc.DialTCP(ln.Addr().Network(), ln.Addr().(*net.TCPAddr).String(), false); err == nil {
+			break
+		}
+	}
 	if err != nil {
 		t.Fatal(err)
 	}

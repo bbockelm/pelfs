@@ -219,31 +219,51 @@ func (b *billyFS) OpenFile(filename string, flag int, perm os.FileMode) (billy.F
 	return bf, nil
 }
 
+// applyOverlay reports a file's attributes with the size and mtime of any
+// buffered writes a cached handle still holds.
+//
+// EVERY path that reports attributes must go through this. The metadata
+// length does not advance while a handle stays cached — a 59MB git pack was
+// observed with meta=0 for its entire write — so a raw attribute is not
+// merely stale, it says the file is empty. NFS clients treat the post-op
+// attributes in a WRITE reply as authoritative and clamp their page cache
+// to that size, which makes every later read hit a phantom EOF. That was
+// the git "premature end of pack file" truncation: go-nfs builds those
+// post-op attributes with Lstat, which used to skip this.
+func (b *billyFS) applyOverlay(name string, fi os.FileInfo, op string) os.FileInfo {
+	wrapped := b.wrapFI(fi)
+	size, mtime, ok := b.hc.statOverlay(name)
+	if !ok {
+		nfsDebugf("%s %s: meta=%d (uncached)", op, name, wrapped.Size())
+		return wrapped
+	}
+	// Both attributes are reported monotonically — the larger size, the
+	// later mtime. Neither may go backwards as the metadata catches up with
+	// the buffer and the overlay stops applying: a client reads a shrinking
+	// size as truncation and a receding mtime as a modification by someone
+	// else, and invalidates its cache on either.
+	outSize, outMtime := wrapped.Size(), wrapped.ModTime()
+	if size > outSize {
+		outSize = size
+	}
+	if mtime.After(outMtime) {
+		outMtime = mtime
+	}
+	if outSize == wrapped.Size() && outMtime.Equal(wrapped.ModTime()) {
+		nfsDebugf("%s %s: meta=%d buffered=%d (no overlay)", op, name, wrapped.Size(), size)
+		return wrapped
+	}
+	nfsDebugf("%s %s: meta=%d buffered=%d (overlaying)", op, name, wrapped.Size(), size)
+	return &overlaidFileInfo{FileInfo: wrapped, size: outSize, mtime: outMtime}
+}
+
 func (b *billyFS) Stat(filename string) (os.FileInfo, error) {
 	name := clean(filename)
 	fi, errno := b.fs.Stat(b.ctx, name)
 	if errno != 0 {
 		return nil, pe("stat", filename, errno)
 	}
-	wrapped := b.wrapFI(fi)
-	// Buffered writes are invisible to path-based Stat until the handle
-	// flushes; overlay the freshest known size so go-nfs's per-WRITE stat
-	// (and the client's post-op attribute checks) see current state without
-	// forcing a slice-fragmenting flush.
-	size, mtime, ok := b.hc.statOverlay(name)
-	switch {
-	case ok && size > wrapped.Size():
-		nfsDebugf("Stat %s: meta=%d buffered=%d (overlaying)", name, wrapped.Size(), size)
-		wrapped = &overlaidFileInfo{FileInfo: wrapped, size: size, mtime: mtime}
-	case ok:
-		// Cached handle exists but does not extend the file. Logged because
-		// a size here that is far below what was written is what makes
-		// go-nfs report a false EOF.
-		nfsDebugf("Stat %s: meta=%d buffered=%d (no overlay)", name, wrapped.Size(), size)
-	default:
-		nfsDebugf("Stat %s: meta=%d (uncached)", name, wrapped.Size())
-	}
-	return wrapped, nil
+	return b.applyOverlay(name, fi, "Stat"), nil
 }
 
 // overlaidFileInfo overrides size/mtime while preserving the wrapped Sys().
@@ -257,11 +277,14 @@ func (o *overlaidFileInfo) Size() int64        { return o.size }
 func (o *overlaidFileInfo) ModTime() time.Time { return o.mtime }
 
 func (b *billyFS) Lstat(filename string) (os.FileInfo, error) {
-	fi, errno := b.fs.Lstat(b.ctx, clean(filename))
+	name := clean(filename)
+	fi, errno := b.fs.Lstat(b.ctx, name)
 	if errno != 0 {
 		return nil, pe("lstat", filename, errno)
 	}
-	return b.wrapFI(fi), nil
+	// go-nfs's tryStat builds the post-op attributes of every WRITE reply
+	// from Lstat, and clients treat those as authoritative for file size.
+	return b.applyOverlay(name, fi, "Lstat"), nil
 }
 
 func (b *billyFS) Rename(oldpath, newpath string) error {
@@ -389,12 +412,19 @@ func (b *billyFS) Chtimes(name string, atime, mtime time.Time) error {
 	// Commit buffered writes first: an explicitly-set mtime must stick, and
 	// the Stat overlay (which reports last-write time while a handle is
 	// dirty) must stand down in its favor.
-	if err := b.hc.flushIfDirty(clean(name)); err != nil {
+	cleaned := clean(name)
+	if err := b.hc.flushIfDirty(cleaned); err != nil {
 		return err
 	}
-	return b.withFile("chtimes", name, func(f *jfs.File) syscall.Errno {
+	err := b.withFile("chtimes", name, func(f *jfs.File) syscall.Errno {
 		return f.Utime(b.ctx, atime.UnixMilli(), mtime.UnixMilli())
 	})
+	if err == nil {
+		// An explicit set is authoritative and may move mtime backwards;
+		// the overlay must report it rather than the write-tracked time.
+		b.hc.noteMtime(cleaned, mtime)
+	}
+	return err
 }
 
 // billyFile adapts *jfs.File to billy.File. The NFS server issues

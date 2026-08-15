@@ -515,12 +515,40 @@ Two independent mechanisms, cleanly layered:
   them requires an explicit re-encrypting repack, which is exactly the
   operation a user should have to consciously invoke.
 
-Open interaction (see open questions): content addressing over plaintext
-leaks equality between chunks to anyone who can see object names/indexes;
-addressing over ciphertext destroys dedup unless convergent encryption is
-used. Current leaning: hash plaintext for dedup, encrypt with DEK + random
-nonce, keep hashes only inside encrypted indexes/catalogs, name federation
-objects by an outer (ciphertext) hash. Needs a decision.
+**Chunk identity: keyed content addressing (decided).** The tension:
+plaintext hashes give dedup but leak content-equality (an adversary with
+a candidate file can test for its presence — the confirmation attack that
+plagues convergent encryption); ciphertext hashes with random nonces kill
+dedup. Resolution — separate the *identity key* from the *data keys*:
+
+- **Unencrypted volume:** identity = BLAKE3(plaintext). Anyone can verify
+  the Merkle path; maximal transparency.
+- **Encrypted volume:** identity = BLAKE3 in **keyed mode** with a
+  per-volume identity key stored in the superblock key table alongside
+  the DEKs. Dedup works fully inside the volume and across its forks
+  (forks inherit the identity key even when they introduce a fresh DEK,
+  so cross-branch dedup survives encryption changes; a declassify-style
+  fork rotates both). No party without the identity key can test content
+  presence, and cross-tenant dedup — which we never wanted — is
+  structurally impossible. Data encryption stays DEK + random nonce,
+  fully independent of identity.
+- Identities appear only inside encrypted catalogs/shards/indexes;
+  federation-visible object names are never content-derived. Readers
+  verify integrity by decrypting a chunk and recomputing its keyed
+  identity — every reader of an encrypted volume holds the key table by
+  definition, so the Merkle chain stays verifiable exactly where it needs
+  to be.
+- Rejected: convergent encryption (confirmation attacks by construction,
+  breaks rotation); plaintext hashes as object names (leaks equality to
+  the whole federation); pure ciphertext addressing (no dedup).
+
+**Chunking parameters (decided, recorded per-volume in the superblock):**
+FastCDC with min/avg/max = 1/4/16 MiB, inline threshold 4 KiB (well below
+the CDC minimum). Rationale: scientific data dedups modestly, so the
+per-chunk costs — a catalog row and a range-GET per chunk — argue for
+large chunks; 4 MiB average preserves continuity with the v1 block size,
+and a 64 MiB pack holds ~16 chunks. Hash digests are 32 bytes (BLAKE3 in
+both modes).
 
 ## Read path / write path / publish
 
@@ -532,17 +560,77 @@ in JuiceFS while invalidating its battle-testing.
 
 - **Hot:** exactly today's runtime — live JuiceFS SQLite + local block
   cache + FUSE/NFS frontends. Unmodified in phases 1-2.
-- **Publish** (replaces the v1 whole-DB snapshot): walk dirty subtrees;
-  flatten JuiceFS slices into contiguous chunk extents (fragmentation from
-  small writes compacts away here, for free); CDC-chunk large files; append
-  chunks/small files to an open pack; rewrite dirty catalogs and shards;
-  upload packs -> catalogs -> shards -> superblock, in that order, so a
-  crash mid-publish leaves only unreferenced garbage, never a broken
-  generation; flip the superblock last (ETag-guarded). Publish cost is
-  proportional to churn, not volume size.
-- **Restore/read:** fetch superblock, verify signature; fetch root catalog;
-  hydrate catalogs lazily on directory descent; chunk reads are range-GETs
-  into packs, served through federation caches.
+- **Publish:** the transactional pipeline below (replaces the v1 whole-DB
+  snapshot). Cost is proportional to churn, not volume size.
+- **Restore/read:** fetch superblock, verify signature; fetch root
+  catalog; hydrate (see the hydration decision below); chunk reads are
+  range-GETs into packs, served through federation caches.
+
+### Publish: the transactional pipeline
+
+Publish turns a continuously-mutating hot volume into a consistent
+generation without pausing writers. The key inversion: **the cut is
+defined by a metadata snapshot taken first, and durability is reconciled
+against exactly that cut afterward** — not "flush everything, then
+snapshot," which races new writes into the snapshot between the flush and
+the cut (a hole v1 carries).
+
+State machine, one publish at a time (single writer, single publisher):
+
+1. **CUT.** Take a consistent local snapshot of the hot metadata (SQLite
+   makes this cheap and instantaneous relative to I/O). This defines
+   generation N+1's contents; writes continuing during publish belong to
+   N+2 and are irrelevant.
+2. **RECONCILE.** For every chunk the cut references: if already sealed,
+   done; if pending in the spool, seal; if still in a JuiceFS writer,
+   flush that inode's writer and seal. Reconciliation touches only the
+   cut's dirty set, and force-seals at most one partial pack.
+3. **TRANSFORM.** From the cut, regenerate every dirty path catalog and
+   inode shard (dirty = owns a row changed since the last published cut —
+   in phase 2, a local indexed `changed-since` query; in phase 3 the
+   engine maintains the dirty set natively). Flatten slices into extent
+   lists; CDC-chunk; dedup against the chunk index; append new chunks,
+   small files, catalogs, shards, and the superblock backup into packs.
+   Ancestor catalogs of dirty catalogs are dirty too (transition hashes
+   change), up to the root. Content addressing makes this idempotent: a
+   regenerated-but-identical catalog hashes the same and is skipped.
+   **Repack folds in here** as one more transform: live entries of
+   condemned packs move into the open pack, and the condemned packs are
+   simply omitted from the new pack list — repack becomes
+   generation-atomic and grace-windowed by ref retention, rather than a
+   separate mutation as in phase 1.
+4. **UPLOAD.** All new packs, in parallel. Everything uploaded is
+   content-addressed and unreferenced until the flip.
+5. **FLIP.** Write the new superblock (root hash, routing, pack list,
+   allocator high-water, lineage pointer, signature) via ETag
+   compare-and-swap on the ref. CAS failure = concurrent writer: abort
+   loudly; uploaded objects are orphans, nothing corrupts.
+
+Crash analysis, by phase: before UPLOAD — nothing remote changed; during
+UPLOAD — complete or partial packs exist unreferenced (orphans; rescue can
+adopt, GC will sweep); after UPLOAD, before FLIP — a complete generation
+exists unreferenced (same); FLIP is atomic. Re-publishing after any crash
+re-derives the same content hashes, skips what already uploaded, and
+completes — publish is idempotent end to end. If a publish overruns the
+interval, the next tick is skipped and its churn coalesces into the
+following cut; publishes never overlap.
+
+Readers observe generation N or N+1, never a mixture: the superblock is
+the sole entry point, and everything beneath it is immutable.
+
+### Hydration (phase-2 decision)
+
+Phase 2 mounts hydrate the hot engine with **full metadata, lazy data**:
+download all catalogs/shards for the pinned generation (parallel,
+resumable — compressed metadata for a million files is a few hundred MB,
+tens of seconds on decent links, and batch jobs pay it once), build the
+hot DB, then fetch chunk data on demand through the block cache. True
+lazy *metadata* descent — mount instantly, fault catalogs in on first
+lookup — requires intercepting lookups inside the metadata engine and is
+deliberately deferred to phase 3, where the catalog-native engine reads
+catalogs directly and lazy descent is its natural mode, not a retrofit.
+This also restates the earlier read-only caveat: phase-2 refresh is
+remount; live generation swap arrives with phase 3.
 
 ## Migration phases
 
@@ -588,51 +676,44 @@ in JuiceFS while invalidating its battle-testing.
 
 ## Open design work
 
+Resolved since the first draft (details in their sections above): publish
+transactionality (the CUT/RECONCILE/TRANSFORM/UPLOAD/FLIP pipeline, with
+repack folded into TRANSFORM); chunk identity and hashing (keyed BLAKE3
+content addressing, FastCDC 1/4/16 MiB); phase-2 hydration (full metadata,
+lazy data; lazy descent is phase 3); versioned pack lists (identity vs.
+location); disaster recovery provisions.
+
 Roughly ordered by how much they block implementation:
 
-1. **Publish transactionality details.** Dirty-subtree tracking in the hot
-   layer; whether publish runs against a frozen view (copy-on-publish) or
-   tolerates concurrent writes; crash recovery mid-publish (safe by upload
-   ordering, but needs an orphan-sweep story); publish duration targets.
-2. **Pack lifecycle and GC.** Target pack size; open-pack append vs
-   session-scoped packs; repack policy for sparse packs; multi-root
-   mark-sweep from the union of all refs (see the refs section) vs
-   refcounts; how long superseded generations' objects must live
-   (reader-pinning grace period); ref-listing atomicity vs concurrent
-   fork/branch creation; Pelican DELETE granularity (whole packs only — a
-   nice property: the GC unit is the pack).
-3. **Chunking and hashing parameters.** FastCDC min/avg/max (interacts with
-   the 4KB inline threshold and pack size); hash algorithm (BLAKE3 vs
-   SHA-256) for content addressing; the dedup-vs-confidentiality decision
-   for encrypted volumes (plaintext-hash inside encrypted indexes vs
-   convergent encryption vs no cross-file dedup).
-4. **Phase-2 lazy hydration mechanics.** How a restored session populates
-   the live JuiceFS engine per-catalog on descent (a meta wrapper that
-   faults in catalogs? full metadata hydration as an interim?). This is
-   the least-designed piece of phase 2.
-5. **Catalog split heuristics.** Weight function (entries vs bytes vs
+1. **Pack lifecycle and GC.** Target pack size; grace-period length for
+   reader pinning; ref-listing atomicity vs concurrent fork/branch
+   creation; Pelican DELETE granularity (whole packs only — the GC unit
+   is the pack). Narrowed by the publish design: repack is now a
+   TRANSFORM step, so in v2 there is no out-of-band pack mutation left to
+   design — only retention policy.
+2. **Catalog split heuristics.** Weight function (entries vs bytes vs
    inline data), S_max/S_min values, split-point search; validate against
    real trees (conda env, linux kernel, home directory).
-6. **Superblock signing and key management.** Same key as KEK or a separate
+3. **Superblock signing and key management.** Same key as KEK or a separate
    signing identity; key rotation; what a reader trusts on first mount
    (TOFU vs pinned key vs federation-issued).
-7. **Federation namespace layout.** Object naming (outer hash), prefix
+4. **Federation namespace layout.** Object naming (outer hash), prefix
    layout, how gc/fsck/`pelfs`-tooling enumerate packs efficiently
    (PROPFIND vs a pack manifest object).
-8. **Schema details.** Dirent/record column layout, xattrs, special files,
+5. **Schema details.** Dirent/record column layout, xattrs, special files,
    sparse files; what of the JuiceFS schema is kept vs dropped (sessions,
    trash, counters all go).
-9. **`pelfs rescue`.** The scavenging tool from the disaster-recovery
+6. **`pelfs rescue`.** The scavenging tool from the disaster-recovery
    section: pack inventory, generation assembly, damage report,
    lost+found materialization. Depends on typed entries (reserved in the
    phase-1 trailer already), self-identifying catalogs, and
    superblock-backup entries — all format provisions that must land with
    phase 2, since retrofitting them later leaves early volumes
    unrescuable.
-10. **Benchmarks and acceptance criteria.** conda env create, git clone,
+7. **Benchmarks and acceptance criteria.** conda env create, git clone,
    kernel untar, JupyterLab cold-start; targets for publish latency and
    mount-to-first-byte.
-11. **v1 -> v2 migration.** Probably "none — scratch volumes drain and
+8. **v1 -> v2 migration.** Probably "none — scratch volumes drain and
     recreate," but that should be an explicit decision, and phase 1's pack
     middleware must not paint v1 volumes into a corner.
 

@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/juicedata/juicefs/pkg/object"
+
 	"github.com/bbockelm/pelfs/internal/fakeorigin"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 )
@@ -742,5 +744,51 @@ func TestRepackReclaimsGarbage(t *testing.T) {
 	// Idempotent: a second pass has nothing to do.
 	if err := s.Repack(ctx); err != nil {
 		t.Fatalf("second Repack: %v", err)
+	}
+}
+
+// rangeLiar wraps a store and ignores Get ranges, always returning the
+// whole object from offset zero — modeling a federation transport that
+// mishandles Range requests (the observed "bad pack magic" failure).
+type rangeLiar struct {
+	pelicanobj.Store
+}
+
+func (r rangeLiar) Get(ctx context.Context, key string, off, limit int64, getters ...object.AttrGetter) (io.ReadCloser, error) {
+	return r.Store.Get(ctx, key, 0, -1)
+}
+
+// TestBootstrapSurvivesRangeLiar: when the tail range probe returns wrong
+// bytes, bootstrap must fall back to a whole-object fetch, warn, and still
+// build a correct index rather than refusing to mount.
+func TestBootstrapSurvivesRangeLiar(t *testing.T) {
+	ctx := context.Background()
+	inner, _ := newInner(t)
+	s := newPack(t, inner, Config{WriteEnabled: true})
+	want := make(map[string][]byte)
+	for i := 0; i < 5; i++ {
+		key := fmt.Sprintf("chunks/0/0/%d_0_128", i+1)
+		want[key] = blob(key, 128)
+		if err := s.Put(ctx, key, bytes.NewReader(want[key])); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	if err := s.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	liar := rangeLiar{Store: inner}
+	ro, err := New(ctx, liar, Config{})
+	if err != nil {
+		t.Fatalf("bootstrap over range-lying transport failed: %v", err)
+	}
+	keys, sizes := listKeys(t, ro, "chunks/")
+	if len(keys) != len(want) {
+		t.Fatalf("ListAll = %d keys, want %d", len(keys), len(want))
+	}
+	for key, data := range want {
+		if sizes[key] != int64(len(data)) {
+			t.Fatalf("size for %s = %d, want %d", key, sizes[key], len(data))
+		}
 	}
 }

@@ -69,6 +69,14 @@ type Config struct {
 	WriteEnabled bool
 	// Packable decides which keys are packed (default: chunks/...).
 	Packable func(key string) bool
+
+	// Repack policy (see repack.go): a sealed pack whose live fraction
+	// falls below RepackLiveness is condemned once total garbage exceeds
+	// RepackMinGarbage, unless younger than RepackAgeFloor. Zero values
+	// select the defaults (0.5, 256MiB, 10m).
+	RepackLiveness   float64
+	RepackMinGarbage int64
+	RepackAgeFloor   time.Duration
 }
 
 // entry locates one object inside a pack (or the open spool).
@@ -103,12 +111,16 @@ type Store struct {
 	ctx      context.Context
 	packable func(string) bool
 
-	mu      sync.Mutex
-	index   map[string]entry // committed: packed and uploaded
-	pending map[string]entry // in the open spool, not yet uploaded
-	dead    []string         // tombstones awaiting the next pack upload
-	spool   *os.File
-	spoolSz int64
+	mu        sync.Mutex
+	index     map[string]entry // committed: packed and uploaded
+	pending   map[string]entry // in the open spool, not yet uploaded
+	dead      []string         // tombstones awaiting the next pack upload
+	spool     *os.File
+	spoolSz   int64
+	packBytes map[string]int64 // sealed pack -> stored entry bytes (garbage accounting)
+
+	// repackMu admits one repacker at a time (TryLock: skip, don't queue).
+	repackMu sync.Mutex
 
 	// flushMu serializes Flush end-to-end: a caller returning from Flush
 	// must know every block spooled before the call is durable, even when
@@ -128,13 +140,14 @@ func New(ctx context.Context, inner pelicanobj.Store, cfg Config) (*Store, error
 		cfg.Packable = func(key string) bool { return strings.HasPrefix(key, "chunks/") }
 	}
 	s := &Store{
-		Store:    inner,
-		inner:    inner,
-		cfg:      cfg,
-		ctx:      ctx,
-		packable: cfg.Packable,
-		index:    make(map[string]entry),
-		pending:  make(map[string]entry),
+		Store:     inner,
+		inner:     inner,
+		cfg:       cfg,
+		ctx:       ctx,
+		packable:  cfg.Packable,
+		index:     make(map[string]entry),
+		pending:   make(map[string]entry),
+		packBytes: make(map[string]int64),
 	}
 	if err := s.bootstrap(ctx); err != nil {
 		return nil, err
@@ -186,11 +199,12 @@ func (s *Store) bootstrap(ctx context.Context) error {
 		if e.IsDir || !strings.HasPrefix(e.Name, "p-") {
 			continue
 		}
-		tr, err := s.fetchTrailer(ctx, e.Name, e.Size)
+		tr, idxLen, err := s.fetchTrailer(ctx, e.Name, e.Size)
 		if err != nil {
 			return fmt.Errorf("pack %s: %w", e.Name, err)
 		}
 		s.applyTrailer(e.Name, tr)
+		s.packBytes[e.Name] = e.Size - idxLen - footerSize
 	}
 	return nil
 }
@@ -204,10 +218,12 @@ func (s *Store) applyTrailer(packName string, tr *trailer) {
 	}
 }
 
-// fetchTrailer reads a pack's index with (usually) one range request.
-func (s *Store) fetchTrailer(ctx context.Context, name string, size int64) (*trailer, error) {
+// fetchTrailer reads a pack's index with (usually) one range request,
+// returning the parsed trailer and the index length (for entry-byte
+// accounting).
+func (s *Store) fetchTrailer(ctx context.Context, name string, size int64) (*trailer, int64, error) {
 	if size < footerSize {
-		return nil, fmt.Errorf("pack too small (%d bytes)", size)
+		return nil, 0, fmt.Errorf("pack too small (%d bytes)", size)
 	}
 	probe := int64(tailProbe)
 	if probe > size {
@@ -215,14 +231,14 @@ func (s *Store) fetchTrailer(ctx context.Context, name string, size int64) (*tra
 	}
 	tail, err := s.readRange(ctx, s.packKey(name), size-probe, probe)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if len(tail) < footerSize || string(tail[len(tail)-8:]) != magic {
-		return nil, fmt.Errorf("bad pack magic")
+		return nil, 0, fmt.Errorf("bad pack magic")
 	}
 	idxLen := int64(binary.LittleEndian.Uint64(tail[len(tail)-16 : len(tail)-8]))
 	if idxLen <= 0 || idxLen+footerSize > size {
-		return nil, fmt.Errorf("bad index length %d", idxLen)
+		return nil, 0, fmt.Errorf("bad index length %d", idxLen)
 	}
 	var raw []byte
 	if idxLen+footerSize <= int64(len(tail)) {
@@ -230,17 +246,17 @@ func (s *Store) fetchTrailer(ctx context.Context, name string, size int64) (*tra
 	} else {
 		raw, err = s.readRange(ctx, s.packKey(name), size-footerSize-idxLen, idxLen)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 	}
 	var tr trailer
 	if err := json.Unmarshal(raw, &tr); err != nil {
-		return nil, fmt.Errorf("parse index: %w", err)
+		return nil, 0, fmt.Errorf("parse index: %w", err)
 	}
 	if tr.Version != 1 {
-		return nil, fmt.Errorf("unsupported pack version %d", tr.Version)
+		return nil, 0, fmt.Errorf("unsupported pack version %d", tr.Version)
 	}
-	return &tr, nil
+	return &tr, idxLen, nil
 }
 
 func (s *Store) readRange(ctx context.Context, key string, off, length int64) ([]byte, error) {
@@ -274,7 +290,18 @@ func (s *Store) Put(ctx context.Context, key string, in io.Reader, getters ...ob
 	if err != nil {
 		return err
 	}
+	// Cut before an append that would push the spool past the target, so
+	// unsealed bytes stay bounded by TargetSize plus whatever concurrent
+	// writers land between the check and the cut. (A single block larger
+	// than the target still spools whole and seals immediately below.)
 	s.mu.Lock()
+	if s.spoolSz > 0 && s.spoolSz+int64(len(data)) > s.cfg.TargetSize {
+		s.mu.Unlock()
+		if err := s.Flush(ctx); err != nil {
+			return err
+		}
+		s.mu.Lock()
+	}
 	if _, err := s.spool.WriteAt(data, s.spoolSz); err != nil {
 		s.mu.Unlock()
 		return fmt.Errorf("pack spool: %w", err)
@@ -570,6 +597,7 @@ func (s *Store) Flush(ctx context.Context) error {
 	for k, e := range pending {
 		s.index[k] = entry{pack: name, off: newOff[k], length: e.length, created: created}
 	}
+	s.packBytes[name] = liveSz
 	s.mu.Unlock()
 	return nil
 }

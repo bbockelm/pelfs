@@ -301,6 +301,17 @@ than live data. Four layers absorb it, ordered by how early they act:
    a block that survives until the snapshot is live at publish time and
    must be uploaded regardless, so holding the active pack open longer can
    never reduce garbage — the die-young window is automatically maximal.
+   The converse also holds: **there is no seal clock other than the
+   snapshot**, deliberately. Sealing more often than snapshotting buys
+   zero recoverable durability — the snapshot is the recovery point, and a
+   sealed block no snapshot references is an orphan after a crash — while
+   every early seal converts would-die-young bytes into sealed garbage
+   for repack. Unsealed bytes are bounded in *size* by the pack target
+   (the cut runs before an append that would exceed it; a lone
+   larger-than-target block seals immediately), and in *time* by the
+   snapshot interval. A session running --snapshot-interval 0 has opted
+   out of periodic durability entirely; its spool still respects the size
+   bound and seals at shutdown.
    Conversely, sealed packs are never reworked on the snapshot path: seal
    compaction is synchronous and cheap (a local sequential copy of live
    bytes, bounded by the 64MiB target — it cannot fall behind the writer,
@@ -313,8 +324,8 @@ than live data. Four layers absorb it, ordered by how early they act:
    hot 32KB range compacts by reading 32KB, not the 64MiB chunk). This
    bounds metadata growth and read fan-out between publishes; its
    tombstones feed layer 1.
-3. **Repack (designed; implementation pending).** Versions that survive a
-   pack cut and die later become dead entries inside immutable packs.
+3. **Repack (implemented).** Versions that survive a pack cut and die
+   later become dead entries inside immutable packs.
    Per-pack liveness is exact and free (the bootstrap index knows every
    entry; tombstones and shadowing mark the dead). Repack rewrites the
    live entries of packs below a liveness threshold into the current
@@ -325,8 +336,17 @@ than live data. Four layers absorb it, ordered by how early they act:
    authoritative; and **crash mid-repack is idempotent** — duplicates
    resolve newest-wins, and the old pack is deleted only after the new
    one is durable (plus, in the v2 refs world, the GC grace window).
-   Policy: trigger on liveness ratio with an age floor so the hot tail is
-   never repacked.
+   Policy: trigger on liveness ratio (default: condemn below 50% live)
+   with an age floor (default 10m) so the hot tail is never repacked, and
+   a total-garbage floor (default 256MiB) so small volumes are left alone.
+   In-session, repack runs opportunistically after each pre-snapshot flush
+   with a per-pass move budget (64MiB of live bytes) bounding the added
+   snapshot latency; `pelfs repack` drains everything offline under the
+   volume lease. **This bounds federation space against overwrite loops:**
+   with liveness threshold L and garbage floor G, steady-state usage is at
+   most live/L + G + one unsealed pack — a client looping overwrites
+   forever caps at roughly 2x its live data plus 256MiB, regardless of
+   write volume.
 4. **Content addressing (v2).** The endgame: identical content hashes to
    the same chunk — a rewrite that changes nothing costs nothing — and
    CDC re-chunking makes an edit cost proportional to the changed bytes,

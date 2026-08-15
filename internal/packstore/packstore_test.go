@@ -11,6 +11,7 @@ import (
 	"sort"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/bbockelm/pelfs/internal/fakeorigin"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
@@ -449,14 +450,22 @@ func TestAutoCutMultiplePacks(t *testing.T) {
 		}
 	}
 
-	// 9 puts of 400 bytes against a 1000-byte target cut a pack after every
-	// third put, with no explicit Flush.
+	// The cut runs BEFORE an append that would exceed the 1000-byte target:
+	// two 400-byte entries fit (800), the third triggers a seal first. Nine
+	// puts therefore auto-cut four 2-entry packs and leave the ninth entry
+	// pending — the unsealed spool never exceeds the target.
 	packs := diskFiles(t, filepath.Join(vol, PackDirKey))
-	if len(packs) != 3 {
-		t.Fatalf("auto-cut produced %d packs, want 3: %v", len(packs), packs)
+	if len(packs) != 4 {
+		t.Fatalf("auto-cut produced %d packs, want 4: %v", len(packs), packs)
+	}
+	if got := s.PendingBlocks(); got != 1 {
+		t.Fatalf("PendingBlocks = %d, want 1", got)
+	}
+	if err := s.Flush(ctx); err != nil {
+		t.Fatalf("final Flush: %v", err)
 	}
 	if got := s.PendingBlocks(); got != 0 {
-		t.Fatalf("PendingBlocks = %d, want 0", got)
+		t.Fatalf("PendingBlocks after final Flush = %d, want 0", got)
 	}
 
 	fresh := newPack(t, inner, Config{})
@@ -641,5 +650,97 @@ func TestOverwriteChurnCompactsAtCut(t *testing.T) {
 		if _, err := fresh.Head(ctx, key); err == nil {
 			t.Fatalf("stale version %s still visible", key)
 		}
+	}
+}
+
+// TestRepackReclaimsGarbage models overwrite churn that OUTLIVES the pack
+// window: versions sealed into packs die later (tombstoned after upload),
+// and repack must bound the resulting space — rewriting survivors into a
+// new pack and deleting the sparse packs whole, with no tombstones needed
+// (name-order shadowing) and idempotently.
+func TestRepackReclaimsGarbage(t *testing.T) {
+	ctx := context.Background()
+	inner, vol := newInner(t)
+	cfg := Config{
+		WriteEnabled:     true,
+		TargetSize:       1 << 30,
+		RepackMinGarbage: 1,
+		RepackAgeFloor:   time.Nanosecond,
+	}
+	s := newPack(t, inner, cfg)
+
+	// Pack 1: six versions sealed while all still live.
+	const n = 6
+	const sz = 4 << 10
+	keys := make([]string, n)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("chunks/0/0/%d_0_%d", i+1, sz)
+		if err := s.Put(ctx, keys[i], bytes.NewReader(blob(keys[i], sz))); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	if err := s.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	// Churn after the seal: four of six die; the tombstones seal into a
+	// second (tiny) pack alongside one fresh key.
+	for _, k := range keys[:4] {
+		if err := s.Delete(ctx, k); err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+	}
+	fresh := "chunks/0/0/9_0_" + fmt.Sprint(sz)
+	if err := s.Put(ctx, fresh, bytes.NewReader(blob(fresh, sz))); err != nil {
+		t.Fatalf("Put fresh: %v", err)
+	}
+	if err := s.Flush(ctx); err != nil {
+		t.Fatalf("Flush 2: %v", err)
+	}
+
+	garbage := s.Garbage()
+	if garbage != 4*sz {
+		t.Fatalf("Garbage = %d, want %d", garbage, 4*sz)
+	}
+	packsBefore := diskFiles(t, filepath.Join(vol, PackDirKey))
+
+	if err := s.Repack(ctx); err != nil {
+		t.Fatalf("Repack: %v", err)
+	}
+	if g := s.Garbage(); g != 0 {
+		t.Fatalf("Garbage after repack = %d, want 0", g)
+	}
+	packsAfter := diskFiles(t, filepath.Join(vol, PackDirKey))
+	if len(packsAfter) >= len(packsBefore)+1 {
+		t.Fatalf("repack did not delete the sparse pack: before=%d after=%d", len(packsBefore), len(packsAfter))
+	}
+	var total int64
+	for _, p := range packsAfter {
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		total += fi.Size()
+	}
+	if total >= int64(n+1)*sz {
+		t.Fatalf("stored bytes %d not reduced (live is %d)", total, 3*sz)
+	}
+
+	// Survivors intact — including from a cold bootstrap.
+	ro := newPack(t, inner, Config{})
+	for _, k := range append([]string{fresh}, keys[4:]...) {
+		if got := readObj(t, ro, k, 0, -1); !bytes.Equal(got, blob(k, sz)) {
+			t.Fatalf("survivor %s corrupted after repack", k)
+		}
+	}
+	for _, k := range keys[:4] {
+		if _, err := ro.Head(ctx, k); err == nil {
+			t.Fatalf("deleted key %s visible after repack", k)
+		}
+	}
+
+	// Idempotent: a second pass has nothing to do.
+	if err := s.Repack(ctx); err != nil {
+		t.Fatalf("second Repack: %v", err)
 	}
 }

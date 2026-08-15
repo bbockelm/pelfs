@@ -25,6 +25,34 @@ func toolSession(ctx context.Context, o *cmdOpts, prefix string, needWrite bool)
 	return s, nil
 }
 
+// cmdRepack reclaims federation space held by dead entries inside sealed
+// packs: live entries of sparse packs are rewritten into new packs and the
+// old packs deleted whole. Runs under the volume lease (write session).
+func cmdRepack(args []string) int {
+	o, pos, err := parseArgs("repack", args, 1, 1, nil)
+	if err != nil {
+		return exitErr(err)
+	}
+	// The pack store's write side is normally gated on --writeback; a
+	// repack session writes packs by definition.
+	o.writeback = true
+	o.noPack = false
+	ctx := context.Background()
+	s, err := toolSession(ctx, o, pos[0], true)
+	if err != nil {
+		return exitErr(err)
+	}
+	defer s.cleanupTemp()
+
+	before := s.packs.Garbage()
+	fmt.Fprintf(os.Stderr, "pelfs: %d bytes of dead pack data before repack\n", before)
+	if err := s.packs.RepackAll(ctx); err != nil {
+		return exitErr(err)
+	}
+	fmt.Printf("repack reclaimed %d bytes (%d remaining)\n", before-s.packs.Garbage(), s.packs.Garbage())
+	return 0
+}
+
 func cmdGC(args []string) int {
 	o, pos, err := parseArgs("gc", args, 1, 1, func(fs *flag.FlagSet, o *cmdOpts) {
 		fs.BoolVar(&o.gcDelete, "delete", false, "delete leaked objects (default: report only)")

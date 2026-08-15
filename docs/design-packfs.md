@@ -143,6 +143,51 @@ Rejected: heartbeating through the superblock itself (to keep a
 every 30s, lineage polluted or bypassed by heartbeats, and readers unable
 to distinguish "new generation" from "still alive" without parsing.
 
+## Refs: branches, tags, and forks
+
+A superblock generation is already a commit: immutable once written, signed,
+parent-linked via the lineage hash, rooting an immutable object graph. Refs
+add the missing distinction between a commit and the *name* pointing at it:
+
+- **Branch** — a mutable ref object (`refs/<name>`), advanced by publish.
+  Each ref is independently ETag-CAS'd and guarded by its own advisory
+  lease; the entire concurrency section applies per-ref. The v2 design's
+  single superblock is simply `refs/main`, which bare-prefix mounts use by
+  default.
+- **Tag / named snapshot** — an immutable ref: a frozen superblock under a
+  name, never CAS'd. Costs one tiny object; everything it references is
+  shared. Read-only tag mounts are exactly the pinned-generation mounts
+  described above.
+- **Fork** — a new ref whose first superblock's parent is the forked
+  generation. Copy-on-write over the whole volume: catalogs, shards, and
+  chunks are shared until they diverge.
+
+Consequences, deliberate and otherwise:
+
+- **Single-writer becomes single-writer per branch.** Writers on different
+  branches never conflict: disjoint superblocks, shared immutable objects,
+  and content-addressed pack uploads collide only on identical content
+  (idempotent). This enables the fan-out batch pattern — one tagged base
+  environment, N jobs each forking a private writable branch and
+  publishing results as tags — container-image layering for scratch data.
+- **Fork rule (GC soundness):** forking is allowed only from ref-reachable
+  generations — a branch's history within the GC grace window, or any tag.
+  To fork something older, tag it first. This closes the race between
+  forking a generation and GC condemning it.
+- **GC is multi-root mark-and-sweep:** the live set is the union of
+  reachability from all refs plus the grace window. Refs are enumerated by
+  listing (they are few); no refs-manifest object exists. Deleting a
+  branch is how space is actually freed.
+- **Inode uniqueness is per-lineage.** Fork descendants allocate from the
+  same counter and may assign equal inode values to different files —
+  harmless, since inodes need uniqueness only within a mounted tree and
+  branches mount separately. A future cross-branch *merge* would need to
+  renumber one side; merge is explicitly out of scope, and this rule is
+  why.
+- Retention becomes explicit: "retain last K generations" is anonymous
+  snapshot retention; tags are the user-controlled form. Keep what you
+  name, grace-window the rest.
+
 ## Read-only mounts and update propagation
 
 Read-only clients ingest external updates by polling the superblock and
@@ -309,10 +354,12 @@ Roughly ordered by how much they block implementation:
    tolerates concurrent writes; crash recovery mid-publish (safe by upload
    ordering, but needs an orphan-sweep story); publish duration targets.
 2. **Pack lifecycle and GC.** Target pack size; open-pack append vs
-   session-scoped packs; repack policy for sparse packs; mark-sweep from
-   superblock roots vs refcounts; how long superseded generations' objects
-   must live (reader-pinning grace period); Pelican DELETE granularity
-   (whole packs only — a nice property: the GC unit is the pack).
+   session-scoped packs; repack policy for sparse packs; multi-root
+   mark-sweep from the union of all refs (see the refs section) vs
+   refcounts; how long superseded generations' objects must live
+   (reader-pinning grace period); ref-listing atomicity vs concurrent
+   fork/branch creation; Pelican DELETE granularity (whole packs only — a
+   nice property: the GC unit is the pack).
 3. **Chunking and hashing parameters.** FastCDC min/avg/max (interacts with
    the 4KB inline threshold and pack size); hash algorithm (BLAKE3 vs
    SHA-256) for content addressing; the dedup-vs-confidentiality decision

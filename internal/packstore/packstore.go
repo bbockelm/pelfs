@@ -137,6 +137,13 @@ func decodeTrailer(stored []byte, m string) (*trailer, error) {
 	if tr.Version != 1 {
 		return nil, fmt.Errorf("unsupported pack version %d", tr.Version)
 	}
+	// Trailers are untrusted federation bytes: an entry with a negative
+	// or overflowing extent must never reach the range-read path.
+	for _, e := range tr.Entries {
+		if e.Off < 0 || e.Length < 0 || e.Off+e.Length < 0 {
+			return nil, fmt.Errorf("parse index: entry %q has invalid extent [%d,+%d)", e.Key, e.Off, e.Length)
+		}
+	}
 	return &tr, nil
 }
 

@@ -17,7 +17,11 @@ package rawfuse
 
 import (
 	"context"
+	"runtime"
+	"strings"
+
 	"errors"
+	log "github.com/sirupsen/logrus"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -169,7 +173,34 @@ func errStatus(err error) fuse.Status {
 	case errors.Is(err, context.Canceled):
 		return fuse.EINTR
 	}
+	// Anything unrecognized becomes EIO. Log it: a bare "Input/output
+	// error" reaching a user through tar or cp, with no record anywhere
+	// of what actually failed, is undebuggable -- and EIO is exactly the
+	// status we return when we do not understand our own failure, so it
+	// is the one that most needs explaining. These are meant to be rare;
+	// if a workload produces them in bulk, the volume of log lines is
+	// itself the signal.
+	logUnexpected(err)
 	return fuse.EIO
+}
+
+// logUnexpected reports an error the binding could not translate,
+// attributing it to the FUSE operation that produced it. The op name
+// comes from the caller's frame rather than a parameter threaded through
+// twenty call sites -- this runs only on the error path, so its cost
+// does not matter.
+func logUnexpected(err error) {
+	op := "fuse"
+	if pc, _, _, ok := runtime.Caller(2); ok {
+		if fn := runtime.FuncForPC(pc); fn != nil {
+			name := fn.Name()
+			if i := strings.LastIndex(name, "."); i >= 0 {
+				name = name[i+1:]
+			}
+			op = name
+		}
+	}
+	log.WithError(err).WithField("op", op).Error("pelfs: returning EIO for an unrecognized error")
 }
 
 // typeBits maps a catalog entry type to stat's S_IFMT bits.

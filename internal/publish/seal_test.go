@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"io"
+	"os"
 	"path/filepath"
 	"sort"
 	"testing"
@@ -765,5 +766,42 @@ func TestInitVolumeThenSeal(t *testing.T) {
 	}
 	if _, err := sealed.Lookup(ctx, genfs.RootInode, "d"); err != nil {
 		t.Fatalf("lookup of the created directory: %v", err)
+	}
+}
+
+// TestInitVolumeRootIsOwnedByCreator pins who owns a brand-new volume's
+// root directory. It was left at uid/gid 0 with mode 0755, so any
+// unprivileged user who created a volume could not write to it: the first
+// command run in the fresh mount failed with EPERM. The container gate
+// runs as root and could never see it -- CI's unprivileged runner did.
+func TestInitVolumeRootIsOwnedByCreator(t *testing.T) {
+	ctx := context.Background()
+	inner := newInner(t)
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen0, err := publish.InitVolume(ctx, publish.Options{
+		Inner:      inner,
+		SpoolDir:   t.TempDir(),
+		SigningKey: priv,
+		VolumeID:   [16]byte{0x77},
+	})
+	if err != nil {
+		t.Fatalf("InitVolume: %v", err)
+	}
+	base := openGenfs(t, inner, gen0.Superblock, nil)
+	attr, err := base.GetAttr(ctx, genfs.RootInode)
+	if err != nil {
+		t.Fatalf("GetAttr on a fresh root: %v", err)
+	}
+	if got, want := attr.UID, uint32(os.Getuid()); got != want {
+		t.Errorf("fresh volume root uid = %d, want the creating user %d", got, want)
+	}
+	if got, want := attr.GID, uint32(os.Getgid()); got != want {
+		t.Errorf("fresh volume root gid = %d, want the creating group %d", got, want)
+	}
+	if attr.Mode&0200 == 0 {
+		t.Errorf("fresh volume root mode %#o is not writable by its owner", attr.Mode)
 	}
 }

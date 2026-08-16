@@ -13,15 +13,18 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/go-git/go-billy/v5"
 	"github.com/hanwen/go-fuse/v2/fuse"
 
 	"github.com/bbockelm/pelfs/internal/genfs"
+	"github.com/bbockelm/pelfs/internal/nfsmount"
 	"github.com/bbockelm/pelfs/internal/overlay"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/publish"
 	"github.com/bbockelm/pelfs/internal/rawfuse"
 	"github.com/bbockelm/pelfs/internal/refs"
 	"github.com/bbockelm/pelfs/internal/superblock"
+	"github.com/bbockelm/pelfs/internal/vfsbilly"
 )
 
 // cmdMountGen mounts a published v2 generation read-only through the
@@ -31,7 +34,7 @@ import (
 func cmdMountGen(args []string) int {
 	var branch, tag, pubkeyHex string
 	var rw, noSeal bool
-	var signingKeyPath string
+	var signingKeyPath, backend string
 	var poll time.Duration
 	o, pos, err := parseArgs("mount-gen", args, 2, 2, func(fs *flag.FlagSet, o *cmdOpts) {
 		fs.StringVar(&branch, "branch", "main", "branch to mount")
@@ -39,6 +42,7 @@ func cmdMountGen(args []string) int {
 		fs.StringVar(&pubkeyHex, "volume-pubkey", "", "hex Ed25519 volume key to trust (default: pin on first use)")
 		fs.BoolVar(&rw, "rw", false, "mount read-write through a local overlay; unmount SEALS the changes into the next generation")
 		fs.BoolVar(&noSeal, "no-seal", false, "with --rw, keep the overlay at unmount instead of publishing it (resume by remounting)")
+		fs.StringVar(&backend, "backend", "fuse", "how to attach: fuse (Linux/macFUSE) or nfs (loopback NFS server + the OS client; works on macOS with no kext)")
 		fs.DurationVar(&poll, "poll", 0, "read-only: re-check the branch head this often and swap generations live (0 = pinned, the reproducible-batch default)")
 		fs.StringVar(&signingKeyPath, "signing-key", "", "hex Ed25519 volume signing key file to seal with (default: <state-dir>/v2-signing.key; a volume's key is per-VOLUME, so a second machine must import it)")
 	})
@@ -131,6 +135,7 @@ func cmdMountGen(args []string) int {
 	}
 
 	var srv *fuse.Server
+	var nfsSrv *nfsmount.Server
 	var ov *overlay.FS
 	overlayDir := filepath.Join(stateDir, "overlay")
 	if rw {
@@ -147,12 +152,35 @@ func cmdMountGen(args []string) int {
 			return exitErr(fmt.Errorf("open overlay: %w", err))
 		}
 		defer ov.Close() //nolint:errcheck
-		srv, err = rawfuse.MountRW(mountpoint, ov, o.debug)
-	} else {
-		srv, err = rawfuse.Mount(mountpoint, gfs, o.debug)
+	}
+	switch backend {
+	case "nfs":
+		// A loopback NFS server over the same stack: the only way to
+		// mount on macOS without macFUSE. Generation swap cannot push
+		// invalidations here — NFS caching is client-driven — so --poll
+		// is refused rather than silently doing nothing.
+		var bfs billy.Filesystem
+		if rw {
+			bfs = vfsbilly.New(ov)
+		} else {
+			bfs = vfsbilly.NewReadOnly(gfs)
+		}
+		nfsSrv, err = nfsmount.Serve(bfs)
+		if err == nil {
+			defer nfsSrv.Close() //nolint:errcheck
+			err = nfsSrv.Mount(mountpoint, "pelfs")
+		}
+	case "fuse", "":
+		if rw {
+			srv, err = rawfuse.MountRW(mountpoint, ov, o.debug)
+		} else {
+			srv, err = rawfuse.Mount(mountpoint, gfs, o.debug)
+		}
+	default:
+		return exitErr(fmt.Errorf("unknown --backend %q (want fuse or nfs)", backend))
 	}
 	if err != nil {
-		return exitErr(fmt.Errorf("mount: %w (mount-gen needs Linux FUSE or macFUSE)", err))
+		return exitErr(fmt.Errorf("mount: %w (fuse needs Linux FUSE or macFUSE; try --backend nfs)", err))
 	}
 	mode := "read-only"
 	if rw {
@@ -166,7 +194,9 @@ func cmdMountGen(args []string) int {
 	// shadows, and swapping underneath it would strand its dirty state.
 	refreshCtx, stopRefresh := context.WithCancel(ctx)
 	defer stopRefresh()
-	if poll > 0 && !rw && tag == "" {
+	if poll > 0 && nfsSrv != nil {
+		fmt.Fprintln(os.Stderr, "pelfs: --poll ignored with --backend nfs (NFS caching is client-driven; there is no invalidation channel to push to)")
+	} else if poll > 0 && !rw && tag == "" {
 		r := rawfuse.NewRefresher(gfs, srv, func(c context.Context) (*superblock.Superblock, error) {
 			f, err := rstore.Fetch(c, branch)
 			if err != nil {
@@ -182,11 +212,18 @@ func cmdMountGen(args []string) int {
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
-	go func() {
+	if nfsSrv != nil {
 		<-sigs
-		_ = srv.Unmount()
-	}()
-	srv.Wait()
+		if err := nfsmount.Unmount(mountpoint); err != nil {
+			fmt.Fprintf(os.Stderr, "pelfs: unmount: %v\n", err)
+		}
+	} else {
+		go func() {
+			<-sigs
+			_ = srv.Unmount()
+		}()
+		srv.Wait()
+	}
 
 	if !rw || noSeal {
 		if rw {

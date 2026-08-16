@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"time"
 
@@ -100,11 +101,24 @@ func (s *Server) Mount(mountPoint, volumeName string) error {
 		"actimeo=1", // we are the only writer; keep attr caching short
 		"nobrowse",  // keep Finder from indexing the volume
 	}
-	out, err := exec.Command("mount_nfs",
-		"-o", strings.Join(opts, ","),
-		"127.0.0.1:/", mountPoint).CombinedOutput()
+	// The client command differs by platform: macOS ships mount_nfs and
+	// accepts its own option spellings, Linux mounts through mount(8)
+	// with -t nfs. Keeping both here means Linux CI can exercise the NFS
+	// frontend even though its reason for existing is macOS without
+	// macFUSE.
+	name, args := "mount_nfs", []string{"-o", strings.Join(opts, ","), "127.0.0.1:/", mountPoint}
+	if runtime.GOOS == "linux" {
+		linuxOpts := []string{
+			"nolock", "vers=3", "tcp",
+			fmt.Sprintf("port=%d", s.Port),
+			fmt.Sprintf("mountport=%d", s.Port),
+			"noresvport", "soft", "retrans=3", "actimeo=1",
+		}
+		name, args = "mount", []string{"-t", "nfs", "-o", strings.Join(linuxOpts, ","), "127.0.0.1:/", mountPoint}
+	}
+	out, err := exec.Command(name, args...).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("mount_nfs: %v: %s", err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("%s: %v: %s", name, err, strings.TrimSpace(string(out)))
 	}
 	_ = volumeName // reserved: could set via -o with future macOS support
 	return nil
@@ -118,6 +132,8 @@ func Unmount(mountPoint string) error {
 		var cmds [][]string
 		if attempt < 3 {
 			cmds = [][]string{{"umount", mountPoint}}
+		} else if runtime.GOOS == "linux" {
+			cmds = [][]string{{"umount", "-f", mountPoint}, {"umount", "-l", mountPoint}}
 		} else {
 			cmds = [][]string{{"umount", "-f", mountPoint}, {"diskutil", "unmount", "force", mountPoint}}
 		}

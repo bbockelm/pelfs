@@ -28,7 +28,7 @@ if ! docker image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
   echo "== building the test image (once) =="
   docker build -q -t "$IMAGE_TAG" - <<DOCKERFILE
 FROM ${IMAGE}
-RUN apt-get -qq update && apt-get -qq install -y fuse3 curl \
+RUN apt-get -qq update && apt-get -qq install -y fuse3 curl nfs-common \
  && ln -sf /usr/bin/fusermount3 /bin/fusermount \
  && rm -rf /var/lib/apt/lists/*
 DOCKERFILE

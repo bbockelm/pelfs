@@ -38,6 +38,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
+
+# unmount_at detaches a mountpoint if anything is mounted there. Repeated
+# unmounts are expected in this script (each section remounts), so "not
+# mounted" is success, not failure.
+unmount_at() {
+  local mp="$1"
+  fusermount3 -u "$mp" 2>/dev/null && return 0
+  fusermount -u "$mp" 2>/dev/null && return 0
+  umount "$mp" 2>/dev/null && return 0
+  return 0
+}
+
 [ -e /dev/fuse ] || { echo "no /dev/fuse; phase-3 mounts need FUSE" >&2; exit 1; }
 
 # Binaries are either prebuilt (the container launcher cross-compiles on
@@ -113,7 +125,7 @@ fi
 echo "read-only enforced"
 
 echo "== read-write round trip: mount --rw, modify, seal, verify =="
-fusermount3 -u "$WORK/mnt" 2>/dev/null || fusermount -u "$WORK/mnt" 2>/dev/null || umount "$WORK/mnt"
+unmount_at "$WORK/mnt"
 wait "$MOUNT_PID" 2>/dev/null || true
 
 "$WORK/pelfs" mount-gen --rw --state-dir "$WORK/state" "$PREFIX" "$WORK/mnt" &
@@ -128,7 +140,7 @@ echo "appended" >> "$WORK/mnt/dir/sub/mid.bin"
 [ -f "$WORK/mnt/dir/written.txt" ] || { echo "write not visible in the mount" >&2; exit 1; }
 
 # Unmount seals the overlay into generation 1.
-fusermount3 -u "$WORK/mnt" 2>/dev/null || fusermount -u "$WORK/mnt" 2>/dev/null || umount "$WORK/mnt"
+unmount_at "$WORK/mnt"
 wait "$MOUNT_PID" 2>/dev/null || true
 
 echo "== remounting the SEALED generation read-only =="
@@ -141,8 +153,34 @@ grep -q "phase-3 write" "$WORK/mnt/dir/written.txt" || { echo "sealed write miss
 cmp "$WORK/src/dir/big.bin" "$WORK/mnt/dir/big.bin"
 echo "seal round trip verified: writes, mkdir, deletion, untouched content"
 
+echo "== NFS backend: the same stack, no FUSE in the data path =="
+unmount_at "$WORK/mnt"
+wait "$MOUNT_PID" 2>/dev/null || true
+if command -v mount.nfs >/dev/null 2>&1 || command -v mount >/dev/null 2>&1; then
+  mkdir -p "$WORK/nfsmnt"
+  if "$WORK/pelfs" mount-gen --backend nfs --state-dir "$WORK/state8" "$PREFIX" "$WORK/nfsmnt" 2>"$WORK/nfs.log" &
+  then
+    NFS_PID=$!
+    up=0
+    for _ in $(seq 100); do [ -e "$WORK/nfsmnt/dir/written.txt" ] && { up=1; break; }; sleep 0.1; done
+    if [ "$up" = "1" ]; then
+      grep -q "phase-3 write" "$WORK/nfsmnt/dir/written.txt"
+      cmp "$WORK/src/dir/big.bin" "$WORK/nfsmnt/dir/big.bin"
+      echo "NFS backend verified: content byte-exact through the OS NFS client"
+      unmount_at "$WORK/nfsmnt"
+      kill "$NFS_PID" 2>/dev/null || true
+    else
+      echo "NFS backend did not come up (container may lack NFS client support):"
+      sed 's/^/    /' "$WORK/nfs.log" | head -3
+      kill "$NFS_PID" 2>/dev/null || true
+    fi
+  fi
+else
+  echo "no NFS client in this image; skipping the NFS backend check"
+fi
+
 echo "== live refresh: a read-only mount follows the branch =="
-fusermount3 -u "$WORK/mnt" 2>/dev/null || umount "$WORK/mnt"
+unmount_at "$WORK/mnt"
 wait "$MOUNT_PID" 2>/dev/null || true
 
 "$WORK/pelfs" mount-gen --poll 1s --state-dir "$WORK/state6" "$PREFIX" "$WORK/mnt" &
@@ -160,7 +198,7 @@ mkdir -p "$WORK/writer"
 for _ in $(seq 100); do [ -d "$WORK/writer/dir" ] && break; sleep 0.1; done
 echo "published while mounted" > "$WORK/writer/live.txt"
 echo "changed by the other writer" > "$WORK/writer/dir/written.txt"
-fusermount3 -u "$WORK/writer" 2>/dev/null || umount "$WORK/writer"
+unmount_at "$WORK/writer"
 wait "$WRITER_PID" 2>/dev/null || true
 
 # The reader must pick it up WITHOUT remounting.
@@ -177,7 +215,7 @@ echo "live refresh verified: new file appeared and changed content updated, no r
 
 if [ "$BENCH" = "--bench" ]; then
   echo "== end-to-end benchmarks on a real kernel =="
-  fusermount3 -u "$WORK/mnt" 2>/dev/null || fusermount -u "$WORK/mnt" 2>/dev/null || umount "$WORK/mnt"
+  unmount_at "$WORK/mnt"
   wait "$MOUNT_PID" 2>/dev/null || true
 
   # Writable mount, so the workload can untar and delete like a real one.
@@ -215,12 +253,12 @@ if [ "$BENCH" = "--bench" ]; then
   # immutable, so the binding hands the kernel infinite TTLs. The gap
   # between these two stat walks IS the immutability dividend.
   echo "  sealing the corpus into the next generation..."
-  fusermount3 -u "$WORK/mnt" 2>/dev/null || umount "$WORK/mnt"
+  unmount_at "$WORK/mnt"
   wait "$MOUNT_PID" 2>/dev/null || true
   "$WORK/pelfs" mount-gen --rw --state-dir "$WORK/state" "$PREFIX" "$WORK/mnt" >/dev/null 2>&1 &
   MOUNT_PID=$!
   for _ in $(seq 200); do [ -d "$WORK/mnt/corpus" ] && break; sleep 0.1; done
-  fusermount3 -u "$WORK/mnt" 2>/dev/null || umount "$WORK/mnt"
+  unmount_at "$WORK/mnt"
   wait "$MOUNT_PID" 2>/dev/null || true
 
   "$WORK/pelfs" mount-gen --state-dir "$WORK/state5" "$PREFIX" "$WORK/mnt" >/dev/null 2>&1 &
@@ -238,7 +276,7 @@ if [ "$BENCH" = "--bench" ]; then
   # content is almost entirely clean. Every lookup asks "is this inode
   # dirty?" to pick a TTL, so this is where that answer's cost shows.
   echo "  C. WRITABLE mount over the sealed (clean) corpus:"
-  fusermount3 -u "$WORK/mnt" 2>/dev/null || umount "$WORK/mnt"
+  unmount_at "$WORK/mnt"
   wait "$MOUNT_PID" 2>/dev/null || true
   "$WORK/pelfs" mount-gen --rw --no-seal --state-dir "$WORK/state7" "$PREFIX" "$WORK/mnt" >/dev/null 2>&1 &
   MOUNT_PID=$!

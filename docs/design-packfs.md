@@ -551,6 +551,36 @@ sniffed from magic bytes inside an entry.
 - **Phase 3:** one cache — decoded chunks keyed by identity — becomes
   the only local data store.
 
+## Fuzzing strategy (three tiers)
+
+1. **Parser fuzzing — unrestricted.** Everything that parses untrusted
+   federation bytes has a native Go fuzz target: pack trailers,
+   superblock decode+verify (mutations must never verify; VerifyChain
+   must never panic), entry codec (GCM fails closed), and the chunker
+   (termination, bounds, exact reassembly, determinism). Pure functions
+   on byte slices; run anywhere, run in CI. First run already forced a
+   hardening fix (negative trailer extents reaching the range-read
+   path).
+2. **Op-sequence fuzzing — CONTAINED, ALWAYS.** Random filesystem
+   operation sequences (the fsx/syzkaller shape that historically
+   shakes real bugs out of filesystems) against the overlay+genfs
+   stack, checked against an in-memory reference model, plus a
+   concurrent stress mode under the race detector. This tier mutates
+   real files (staging, SQLite, caches), so a bug under fuzz pressure
+   could write ANYWHERE the process can — containment is mandatory,
+   never optional: the harness only builds under the `opfuzz` tag,
+   refuses to run unless the containment launcher's env is present,
+   does its own path work through os.Root, and the ONLY sanctioned
+   entrypoint is scripts/opfuzz-docker.sh — a network-less,
+   cap-dropped, unprivileged, read-only-rootfs container whose only
+   writable space is a tmpfs (the repo and module cache mount
+   read-only).
+3. **Mounted-FS fuzzing — future, same containment.** Driving real
+   syscalls through the kernel against a `mount-gen`/phase-3 mount
+   (Linux CI): the fuzzer process lives in the same launcher-shaped
+   container with the mountpoint as its os.Root, so neither a VFS bug
+   nor a fuzzer bug can traverse out. Lands with Linux CI mounts.
+
 ## Benchmarks and acceptance criteria (v2)
 
 Fixed suite, run against a local posixv2 federation and one real OSDF

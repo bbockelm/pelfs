@@ -35,7 +35,7 @@ const rootIno = genfs.RootInode
 // The fixture publishes a fixed base tree over fakeorigin exactly as the
 // genfs tests do, then the overlay shadows it.
 
-func newInner(t *testing.T) pelicanobj.Store {
+func newInner(t testing.TB) pelicanobj.Store {
 	t.Helper()
 	root := t.TempDir()
 	srv := httptest.NewServer(fakeorigin.Handler(root))
@@ -50,7 +50,7 @@ func newInner(t *testing.T) pelicanobj.Store {
 // testVolume is a live JuiceFS volume the fixture mutates and cuts (the
 // publish/genfs test pattern).
 type testVolume struct {
-	t        *testing.T
+	t        testing.TB
 	metaPath string
 	m        meta.Meta
 	blob     object.ObjectStorage
@@ -58,7 +58,7 @@ type testVolume struct {
 	cuts     int
 }
 
-func newTestVolume(t *testing.T, uuid string) *testVolume {
+func newTestVolume(t testing.TB, uuid string) *testVolume {
 	t.Helper()
 	metaPath := filepath.Join(t.TempDir(), "meta.db")
 	conf := meta.DefaultConf()
@@ -164,7 +164,7 @@ func pseudorandom(n int, seed int64) []byte {
 	return b
 }
 
-func publishVolume(t *testing.T, v *testVolume, inner pelicanobj.Store, opts publish.Options) *publish.Result {
+func publishVolume(t testing.TB, v *testVolume, inner pelicanobj.Store, opts publish.Options) *publish.Result {
 	t.Helper()
 	opts.CutPath = v.cut()
 	opts.Blob = v.blob
@@ -185,7 +185,7 @@ func publishVolume(t *testing.T, v *testVolume, inner pelicanobj.Store, opts pub
 	return res
 }
 
-func openBase(t *testing.T, inner pelicanobj.Store, sb *superblock.Superblock) *genfs.FS {
+func openBase(t testing.TB, inner pelicanobj.Store, sb *superblock.Superblock) *genfs.FS {
 	t.Helper()
 	fs, err := genfs.Open(context.Background(), genfs.Options{Inner: inner, SB: sb, CacheDir: t.TempDir()})
 	if err != nil {
@@ -210,7 +210,7 @@ type fixture struct {
 	body  map[string][]byte
 }
 
-func newFixture(t *testing.T, uuid string) *fixture {
+func newFixture(t testing.TB, uuid string) *fixture {
 	t.Helper()
 	inner := newInner(t)
 	v := newTestVolume(t, uuid)
@@ -247,7 +247,7 @@ func (fx *fixture) options() overlay.Options {
 	}
 }
 
-func openOverlay(t *testing.T, fx *fixture, dir string) *overlay.FS {
+func openOverlay(t testing.TB, fx *fixture, dir string) *overlay.FS {
 	t.Helper()
 	if dir == "" {
 		dir = t.TempDir()

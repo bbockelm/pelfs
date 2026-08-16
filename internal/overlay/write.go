@@ -335,12 +335,14 @@ func (fs *FS) Rmdir(ctx context.Context, parent uint64, name string) error {
 func (fs *FS) Rename(ctx context.Context, srcParent uint64, srcName string, dstParent uint64, dstName string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
-	if srcParent == dstParent && srcName == dstName {
-		return nil
-	}
 	src, err := fs.resolveLocked(ctx, srcParent, srcName)
 	if err != nil {
 		return err
+	}
+	// Same-name no-op only AFTER the source resolves: rename("x","x") on
+	// a nonexistent x is ENOENT, not success (op-fuzzer finding).
+	if srcParent == dstParent && srcName == dstName {
+		return nil
 	}
 	dst, dstErr := fs.resolveLocked(ctx, dstParent, dstName)
 	if dstErr != nil && !errors.Is(dstErr, ErrNotExist) {

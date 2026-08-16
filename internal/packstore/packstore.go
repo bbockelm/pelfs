@@ -730,6 +730,23 @@ func (s *Store) Flush(ctx context.Context) error {
 	if droppedBytes := spoolSz - liveSz; droppedBytes > 0 {
 		logDroppedBytes(droppedBytes)
 	}
+	// Everything in this pack died before it was sealed — an overwrite
+	// loop is the usual cause. There is nothing to store, so upload
+	// nothing: a pack of pure trailer would cost a round trip, a
+	// federation object, and a pack-list entry to say "empty". The
+	// tombstones still need to reach the federation, so they ride the
+	// next pack that has real content.
+	if len(tr.Entries) == 0 {
+		s.mu.Lock()
+		s.dead = append(dead, s.dead...)
+		s.mu.Unlock()
+		_ = spool.Close()
+		_ = os.Remove(spool.Name())
+		if spoolSz > 0 {
+			fmt.Fprintf(os.Stderr, "pelfs: pack cut dropped entirely (%d bytes, all deleted before seal); nothing uploaded\n", spoolSz)
+		}
+		return nil
+	}
 	idx, footer, err := encodeTrailer(&tr)
 	if err != nil {
 		return err

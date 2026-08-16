@@ -210,3 +210,49 @@ func TestRetryOnTransientFailures(t *testing.T) {
 		t.Fatalf("read through retried bootstrap mismatched (%d bytes)", len(got))
 	}
 }
+
+// A pack whose entries all died before the seal must not be uploaded:
+// there is nothing to store, and an empty pack costs a round trip, an
+// object, and a pack-list entry to say so. Its tombstones must still
+// survive, riding the next pack that has content.
+func TestFullyDeadPackIsNotUploaded(t *testing.T) {
+	inner, _ := newInner(t)
+	ctx := context.Background()
+	s := newPack(t, inner, Config{WriteEnabled: true, TargetSize: 1 << 30})
+
+	key := "chunks/0/0/1_0_4096"
+	if err := s.Put(ctx, key, bytes.NewReader(blob(key, 4096))); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Delete(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	packs, _ := listKeys(t, inner, PackDirKey+"/")
+	if len(packs) != 0 {
+		t.Fatalf("uploaded %v for a pack with no live entries", packs)
+	}
+
+	// The tombstone must not be lost: a later pack carries it, so a fresh
+	// reader does not resurrect the deleted key.
+	live := "chunks/0/0/2_0_4096"
+	if err := s.Put(ctx, live, bytes.NewReader(blob(live, 4096))); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	packs, _ = listKeys(t, inner, PackDirKey+"/")
+	if len(packs) != 1 {
+		t.Fatalf("expected exactly one pack after a live write, got %v", packs)
+	}
+	rs := newPack(t, inner, Config{})
+	if _, err := rs.Get(ctx, key, 0, -1); err == nil {
+		t.Fatal("the deleted key resurfaced after a bootstrap: its tombstone was lost")
+	}
+	if got := readObj(t, rs, live, 0, -1); len(got) != 4096 {
+		t.Fatalf("live key read back %d bytes", len(got))
+	}
+}

@@ -122,6 +122,7 @@ type cmdOpts struct {
 	cacheFreeRatio   float64
 	noPack           bool
 	packSizeMiB      int64
+	accumulate       bool
 }
 
 func registerFlags(fs *flag.FlagSet, o *cmdOpts) {
@@ -154,6 +155,7 @@ func registerFlags(fs *flag.FlagSet, o *cmdOpts) {
 	fs.DurationVar(&o.flushTimeout, "flush-timeout", 0, "with --writeback, how long to wait at exit for staged blocks to finish uploading (0 = wait forever)")
 	fs.Float64Var(&o.cacheFreeRatio, "cache-free-ratio", 0.05, "minimum free space/inode fraction the block cache preserves on its filesystem")
 	fs.BoolVar(&o.noPack, "no-pack", false, "with --writeback, do not pack uploaded blocks into large pack objects (reading packed volumes always works)")
+	fs.BoolVar(&o.accumulate, "accumulate", false, "batch mode: NOTHING uploads during the session; all output stays local and the v2 publish at exit is the only durability step (experimental; the volume is consumed via v2 restore)")
 	fs.Int64Var(&o.packSizeMiB, "pack-size", 64, "target pack object size, in MiB")
 }
 

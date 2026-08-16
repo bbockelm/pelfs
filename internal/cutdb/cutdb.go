@@ -70,6 +70,12 @@ type Options struct {
 	// the session's cache dir so TRANSFORM reads hit blocks the writer
 	// just produced instead of re-fetching them.
 	CacheDir string
+	// Staging serves reads from the session's writeback staging area
+	// (accumulate mode: staged blocks are the ONLY copy of the data —
+	// they never uploaded). The store is opened writeback-mode with
+	// uploads deferred past any plausible run time, so reading a cut
+	// never triggers block uploads.
+	Staging bool
 }
 
 // Open opens the cut database at metaPath.
@@ -105,6 +111,10 @@ func Open(metaPath string, o Options) (*DB, error) {
 		if o.CacheDir == "" {
 			cc.CacheDir = "memory"
 			cc.CacheSize = 64 << 20
+		}
+		if o.Staging {
+			cc.Writeback = true
+			cc.UploadDelay = 365 * 24 * time.Hour
 		}
 		db.store = chunk.NewCachedStore(o.Blob, cc, prometheus.NewRegistry())
 	}

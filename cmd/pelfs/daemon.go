@@ -177,7 +177,9 @@ func runMountDaemon(o *cmdOpts, prefix string, pos []string, infoPath string) in
 	snapCtx, stopSnaps := context.WithCancel(ctx)
 	snapsDone := make(chan struct{})
 	mgr := s.newSnapshotManager()
-	if o.readOnly {
+	if o.readOnly || o.accumulate {
+		// Accumulate sessions never take v1 snapshots: they would
+		// reference staged blocks that exist nowhere in the federation.
 		mgr = nil
 		close(snapsDone)
 	} else {
@@ -235,6 +237,18 @@ func runMountDaemon(o *cmdOpts, prefix string, pos []string, infoPath string) in
 		})
 	}
 	finalOK := true
+	if o.accumulate {
+		fmt.Fprintln(os.Stderr, "pelfs: accumulate mode: publishing the session as a v2 generation...")
+		if res, err := publishCore(ctx, s, "main", ""); err != nil {
+			fmt.Fprintf(os.Stderr, "pelfs: MANDATORY final publish FAILED — session output is only in %s: %v\n", s.stateDir, err)
+			finalOK = false
+			code = 1
+		} else {
+			fmt.Fprintf(os.Stderr, "pelfs: published generation %d (%d chunks, %d catalogs)\n",
+				res.Superblock.Generation, res.Stats.ChunksAdded, res.Stats.Catalogs)
+		}
+		s.stats.Update(func(sum *stats.Summary) { sum.FinalSnapshotOK = &finalOK })
+	}
 	if mgr != nil {
 		if err := mgr.Snapshot(ctx, true); err != nil {
 			fmt.Fprintf(os.Stderr, "pelfs: final metadata snapshot failed: %v\n", err)

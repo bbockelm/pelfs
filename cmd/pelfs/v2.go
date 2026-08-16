@@ -106,6 +106,7 @@ func publishCore(ctx context.Context, s *session, branch, pubkeyHex string) (*pu
 		Prev:           prev,
 		PrevRaw:        prevRaw,
 		DedupIndexPath: filepath.Join(s.stateDir, "v2-dedup.db"),
+		ReadStaging:    s.o.accumulate,
 	}
 	if s.encryptPEM != "" {
 		if err := wireEncryption(&popts, s.encryptPEM, prev); err != nil {

@@ -123,6 +123,10 @@ type Options struct {
 	// dedup.go); empty disables it. Missing/stale/foreign indexes are
 	// ignored — re-uploads are harmless duplicates.
 	DedupIndexPath string
+	// ReadStaging serves cut content from the session's writeback staging
+	// area (accumulate mode, where staged blocks never uploaded and the
+	// publish IS the durability step).
+	ReadStaging bool
 }
 
 // Stats summarizes one publish.
@@ -152,7 +156,7 @@ func Publish(ctx context.Context, o Options) (*Result, error) {
 	if err := applyDefaults(&o); err != nil {
 		return nil, err
 	}
-	db, err := cutdb.Open(o.CutPath, cutdb.Options{Blob: o.Blob, CacheDir: o.CacheDir})
+	db, err := cutdb.Open(o.CutPath, cutdb.Options{Blob: o.Blob, CacheDir: o.CacheDir, Staging: o.ReadStaging})
 	if err != nil {
 		return nil, fmt.Errorf("publish: open cut: %w", err)
 	}

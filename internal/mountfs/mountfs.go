@@ -71,8 +71,14 @@ type Options struct {
 	BlockSizeKiB int   // object block size in KiB (default 4096)
 	CacheSizeMiB int64 // local cache size limit (default 10240)
 	Writeback    bool  // asynchronous block upload
-	ReadOnly     bool  // mount read-only (metadata rejects modification)
-	Debug        bool
+	// Accumulate is the batch-job disposition: writeback staging with
+	// uploads deferred indefinitely — NOTHING uploads during the session;
+	// all output stays in local staging (reads are served from it) and
+	// durability comes from the v2 publish the caller runs at exit. Close
+	// deliberately skips the staging drain. Implies Writeback.
+	Accumulate bool
+	ReadOnly   bool // mount read-only (metadata rejects modification)
+	Debug      bool
 	// IORetries caps how many times a failing block operation is retried
 	// (default 5). Each attempt is bounded by a 60s timeout, so this also
 	// bounds how long a blocked read/write hangs when the federation is
@@ -116,6 +122,7 @@ type Mounted struct {
 	store        chunk.ChunkStore
 	registry     *prometheus.Registry
 	writeback    bool
+	accumulate   bool
 	flushTimeout time.Duration
 	flushPacks   func(ctx context.Context) error
 	served       chan error
@@ -212,6 +219,12 @@ func Mount(opts Options) (*Mounted, error) {
 		logger.Warnf("volume compression is %q (fixed at creation); ignoring requested %q", format.Compression, opts.Compression)
 	}
 
+	// Accumulate defers every staged upload past any plausible session
+	// lifetime; the store's uploader simply never fires.
+	var uploadDelay time.Duration
+	if opts.Accumulate {
+		uploadDelay = 365 * 24 * time.Hour
+	}
 	chunkConf := chunk.Config{
 		BlockSize:  format.BlockSize * 1024,
 		Compress:   format.Compression,
@@ -222,9 +235,11 @@ func Mount(opts Options) (*Mounted, error) {
 		MaxUpload:   20,
 		MaxDownload: 100,
 		MaxRetries:  opts.IORetries,
-		Writeback:   opts.Writeback,
-		Prefetch:    1,
-		BufferSize:  300 << 20,
+		Writeback:   opts.Writeback || opts.Accumulate,
+		UploadDelay: uploadDelay,
+
+		Prefetch:   1,
+		BufferSize: 300 << 20,
 
 		CacheDir:       opts.CacheDir,
 		CacheSize:      uint64(opts.CacheSizeMiB) << 20,
@@ -273,7 +288,8 @@ func Mount(opts Options) (*Mounted, error) {
 		blob:         opts.Blob,
 		store:        store,
 		registry:     registry,
-		writeback:    opts.Writeback,
+		writeback:    opts.Writeback || opts.Accumulate,
+		accumulate:   opts.Accumulate,
 		flushTimeout: opts.FlushTimeout,
 		flushPacks:   opts.FlushPacks,
 		served:       make(chan error, 1),
@@ -407,8 +423,10 @@ down:
 		flushErr = fmt.Errorf("flush delayed data: %w", err)
 	}
 	// With writeback, blocks may still sit in the local staging area; they
-	// are the only copy of the data, so the final upload must complete.
-	if mnt.writeback && flushErr == nil {
+	// are the only copy of the data, so the final upload must complete —
+	// except in accumulate mode, where staged blocks NEVER upload and the
+	// caller's v2 publish at exit is the durability step.
+	if mnt.writeback && !mnt.accumulate && flushErr == nil {
 		if err := mnt.drainStaging(mnt.flushTimeout); err != nil {
 			flushErr = fmt.Errorf("writeback staging: %w", err)
 		}
@@ -457,7 +475,7 @@ func (mnt *Mounted) closeNFS() error {
 			flushErr = fmt.Errorf("flush delayed data: %w", err)
 		}
 	}
-	if mnt.writeback && flushErr == nil {
+	if mnt.writeback && !mnt.accumulate && flushErr == nil {
 		if err := mnt.drainStaging(mnt.flushTimeout); err != nil {
 			flushErr = fmt.Errorf("writeback staging: %w", err)
 		}

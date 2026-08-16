@@ -2,6 +2,7 @@
 // snapshots live in a Pelican federation.
 //
 //	pelfs shell  <prefix>            mount + subshell; exit to unmount
+//	pelfs shell  <prefix> -- <cmd>   mount + run one command; its status is ours
 //	pelfs mount  <prefix> [mnt]      mount in the background (daemon)
 //	pelfs umount <prefix|mnt>        stop a background mount cleanly
 //	pelfs status                     list background mounts
@@ -80,6 +81,7 @@ func usage() {
 
 Usage:
   pelfs shell  [flags] pelican://<federation>/<prefix>   mount + subshell
+  pelfs shell  [flags] <prefix> -- <command> [args...]   mount + run one command
   pelfs mount  [flags] <prefix> [mountpoint]             background mount
   pelfs umount <prefix-or-mountpoint>                    stop a background mount
   pelfs status                                           list background mounts
@@ -88,6 +90,7 @@ Usage:
   pelfs publish [flags] <prefix>                         publish a v2 generation (experimental)
   pelfs init   [flags] <prefix>                          create a new catalog-native volume (experimental)
   pelfs mount-gen [flags] [--rw] <prefix> <mountpoint>   mount a published v2 generation (experimental)
+                  [--subshell] [-- <command> [args...]]  run in the mount, then unmount (sealing, with --rw)
   pelfs ctl    <prefix-or-mountpoint> <verb>             control a running mount
                                                          (status|stats|flush|publish|bugreport)
   pelfs fsck   [flags] <prefix>                          verify referenced blocks
@@ -189,6 +192,38 @@ func parseArgs(name string, args []string, minPos, maxPos int, extra func(*flag.
 		return nil, nil, fmt.Errorf("--prefetch must be none, all, or background")
 	}
 	return o, fs.Args(), nil
+}
+
+// splitCommandTail separates a trailing `-- command args...` from the
+// arguments the flag package will parse.
+//
+// The split happens BEFORE flag parsing on purpose: Go's flag package stops
+// at the first non-flag argument, so `shell --writeback pfx -- ls -la`
+// would otherwise reach fs.Args() as four positional arguments and the
+// min/max positional check would no longer mean what it says.
+func splitCommandTail(args []string) (head, tail []string, hasTail bool) {
+	for i, a := range args {
+		if a == "--" {
+			return args[:i], args[i+1:], true
+		}
+	}
+	return args, nil, false
+}
+
+// parseArgsWithCommand is parseArgs for the commands that accept a trailing
+// `-- command args...`: everything after the separator runs inside the mount
+// instead of an interactive shell. Commands without a tail keep the flag
+// package's own treatment of a bare `--`.
+func parseArgsWithCommand(name string, args []string, minPos, maxPos int, extra func(*flag.FlagSet, *cmdOpts)) (*cmdOpts, []string, []string, error) {
+	head, tail, hasTail := splitCommandTail(args)
+	if hasTail && len(tail) == 0 {
+		return nil, nil, nil, errors.New("`--` must be followed by the command to run inside the mount")
+	}
+	o, pos, err := parseArgs(name, head, minPos, maxPos, extra)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return o, pos, tail, nil
 }
 
 // session holds everything a command needs to talk to one prefix.

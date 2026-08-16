@@ -20,7 +20,7 @@ import (
 )
 
 func cmdShell(args []string) int {
-	o, pos, err := parseArgs("shell", args, 1, 1, nil)
+	o, pos, command, err := parseArgsWithCommand("shell", args, 1, 1, nil)
 	if err != nil {
 		return exitErr(err)
 	}
@@ -31,17 +31,27 @@ func cmdShell(args []string) int {
 		return exitErr(err)
 	}
 	if backend == "docker" {
+		// dockerrun appends the prefix after the forwarded flags, so there
+		// is no position left in the container's argv where a `--` tail
+		// could not be mistaken for the prefix.
+		if len(command) > 0 {
+			return exitErr(errors.New("the Docker fallback cannot run a `-- command`; start the container shell and run it there"))
+		}
 		return runInDocker(o, prefix)
 	}
 	o.mountBackend = backend
-	code, err := runShellNative(o, prefix)
+	code, err := runShellNative(o, prefix, command)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "pelfs: %v\n", err)
 	}
 	return code
 }
 
-func runShellNative(o *cmdOpts, prefix string) (int, error) {
+// runShellNative mounts the prefix and runs the session's payload in it: an
+// interactive subshell, or `command` when the caller gave a `-- ...` tail.
+// Teardown — unmount, drain, final snapshot — runs whatever the payload's
+// exit status was; only the status is carried out.
+func runShellNative(o *cmdOpts, prefix string, command []string) (int, error) {
 	ctx := context.Background()
 	s, err := newSession(ctx, o, prefix, !o.readOnly)
 	if err != nil {
@@ -90,7 +100,7 @@ func runShellNative(o *cmdOpts, prefix string) (int, error) {
 		close(snapsDone)
 	}
 
-	code := launchSubshell(o, prefix, s.mountPoint)
+	code := runInMount(o, prefix, s.mountPoint, command)
 
 	stopSnaps()
 	<-snapsDone
@@ -259,52 +269,121 @@ func runInDocker(o *cmdOpts, prefix string) int {
 	return code
 }
 
-func launchSubshell(o *cmdOpts, prefix, mountPoint string) int {
-	shellPath := o.shellPath
-	if shellPath == "" {
-		shellPath = os.Getenv("SHELL")
+// mountEnv is the environment the payload runs with: the caller's, plus the
+// mount's location. PWD is rewritten because the child starts in the mount,
+// and an inherited PWD naming the invoking directory is simply wrong there.
+func mountEnv(prefix, mountPoint string) []string {
+	env := os.Environ()
+	kept := env[:0]
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "PWD=") || strings.HasPrefix(kv, "OLDPWD=") {
+			continue
+		}
+		kept = append(kept, kv)
 	}
-	if shellPath == "" {
-		shellPath = "/bin/sh"
+	return append(kept,
+		"PELFS_MOUNT="+mountPoint,
+		"PELFS_PREFIX="+prefix,
+		"PWD="+mountPoint,
+	)
+}
+
+// runInMount runs the session's payload with the mount as its working
+// directory and returns its exit status. With no command it is an
+// interactive subshell (exit to unmount); with one — the trailing `-- ...`
+// form — it is exactly that command, so scripts can branch on the status
+// pelfs exits with.
+func runInMount(o *cmdOpts, prefix, mountPoint string, command []string) int {
+	argv := command
+	if len(argv) == 0 {
+		shellPath := o.shellPath
+		if shellPath == "" {
+			shellPath = os.Getenv("SHELL")
+		}
+		if shellPath == "" {
+			shellPath = "/bin/sh"
+		}
+		argv = []string{shellPath}
+		fmt.Fprintf(os.Stderr, "pelfs: starting %s in %s (exit the shell to unmount)\n", shellPath, mountPoint)
+	} else {
+		fmt.Fprintf(os.Stderr, "pelfs: running %s in %s\n", strings.Join(argv, " "), mountPoint)
 	}
 
-	fmt.Fprintf(os.Stderr, "pelfs: starting %s in %s (exit the shell to unmount)\n", shellPath, mountPoint)
-	cmd := exec.Command(shellPath)
+	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = mountPoint
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = append(os.Environ(),
-		"PELFS_MOUNT="+mountPoint,
-		"PELFS_PREFIX="+prefix,
-	)
+	cmd.Env = mountEnv(prefix, mountPoint)
+	// Deliberately NO Setpgid: the child stays in pelfs's process group,
+	// which is the terminal's foreground group, so the tty driver delivers
+	// Ctrl+C/Ctrl+\/Ctrl+Z to it. A new group would receive none of them
+	// until it was also made the foreground group with tcsetpgrp — a
+	// job-control implementation (plus SIGTTOU handling and restoring the
+	// old foreground group at exit) that buys nothing here, because an
+	// interactive child sets up its own job control from the controlling
+	// terminal it inherits.
 
-	// Ctrl-C belongs to the subshell (same foreground process group); make
-	// sure it doesn't kill us mid-cleanup. SIGTERM/SIGHUP terminate the
-	// shell so cleanup can run.
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGHUP)
-	signal.Ignore(syscall.SIGINT)
-	defer signal.Reset(syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	// For as long as the child runs it owns the terminal, so pelfs does not
+	// act on the keyboard signals the tty driver sends to the whole
+	// foreground group — the system(3) convention. Acting on SIGINT here
+	// would start tearing the mount down under a shell the user is still
+	// using. SIGTERM/SIGHUP are aimed at pelfs itself (`pelfs umount`, a
+	// closed terminal) and are forwarded so the child ends and teardown runs.
+	//
+	// This MUST be signal.Notify and not signal.Ignore: signal.Ignore sets
+	// the disposition to SIG_IGN, which execve PRESERVES, so the shell and
+	// everything it spawns would inherit an un-interruptible SIGINT — the
+	// reason `sleep 5m` inside `pelfs shell` used to survive Ctrl+C. A
+	// notified signal leaves a handler installed here, and execve resets
+	// handlers to SIG_DFL in the child.
+	sigs := make(chan os.Signal, 4)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGQUIT, syscall.SIGTERM, syscall.SIGHUP)
+	defer signal.Stop(sigs)
 
 	if err := cmd.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "pelfs: launch shell %s: %v\n", shellPath, err)
+		fmt.Fprintf(os.Stderr, "pelfs: run %s: %v\n", argv[0], err)
+		if errors.Is(err, exec.ErrNotFound) || errors.Is(err, os.ErrNotExist) {
+			return 127 // shell convention: command not found
+		}
 		return 1
 	}
+	done := make(chan struct{})
 	go func() {
-		for s := range sigs {
-			_ = cmd.Process.Signal(s)
+		for {
+			select {
+			case <-done:
+				return
+			case s := <-sigs:
+				switch s {
+				case syscall.SIGINT, syscall.SIGQUIT:
+					// The terminal already delivered these to the child.
+				default:
+					_ = cmd.Process.Signal(s)
+				}
+			}
 		}
 	}()
 	err := cmd.Wait()
-	close(sigs)
+	close(done)
+	return waitStatus(err)
+}
+
+// waitStatus turns a cmd.Wait error into the status pelfs exits with. A
+// child killed by a signal reports 128+signum, the convention every shell
+// uses (130 for an interrupted command) — exec.ExitError.ExitCode() would
+// report -1, which os.Exit turns into a meaningless 255.
+func waitStatus(err error) int {
 	if err == nil {
 		return 0
 	}
 	var ee *exec.ExitError
 	if errors.As(err, &ee) {
+		if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+			return 128 + int(ws.Signal())
+		}
 		return ee.ExitCode()
 	}
-	fmt.Fprintf(os.Stderr, "pelfs: shell: %v\n", err)
+	fmt.Fprintf(os.Stderr, "pelfs: wait: %v\n", err)
 	return 1
 }

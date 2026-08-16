@@ -111,13 +111,13 @@ func cmdMountGen(args []string) int {
 	var signingKeyPath, backend string
 	var subshell bool
 	var poll time.Duration
-	o, pos, err := parseArgs("mount-gen", args, 2, 2, func(fs *flag.FlagSet, o *cmdOpts) {
+	o, pos, command, err := parseArgsWithCommand("mount-gen", args, 2, 2, func(fs *flag.FlagSet, o *cmdOpts) {
 		fs.StringVar(&branch, "branch", "main", "branch to mount")
 		fs.StringVar(&tag, "tag", "", "mount a tag instead of a branch head (pinned exactly)")
 		fs.StringVar(&pubkeyHex, "volume-pubkey", "", "hex Ed25519 volume key to trust (default: pin on first use)")
 		fs.BoolVar(&rw, "rw", false, "mount read-write through a local overlay; unmount SEALS the changes into the next generation")
 		fs.BoolVar(&noSeal, "no-seal", false, "with --rw, keep the overlay at unmount instead of publishing it (resume by remounting)")
-		fs.BoolVar(&subshell, "subshell", false, "run a subshell in the mount and unmount (sealing, with --rw) when it exits — the `pelfs shell` workflow on the catalog-native stack")
+		fs.BoolVar(&subshell, "subshell", false, "run a subshell in the mount and unmount (sealing, with --rw) when it exits — the `pelfs shell` workflow on the catalog-native stack; a trailing `-- command [args...]` runs that instead of a shell and implies this flag")
 		fs.StringVar(&backend, "backend", "fuse", "how to attach: fuse (Linux/macFUSE) or nfs (loopback NFS server + the OS client; works on macOS with no kext)")
 		fs.DurationVar(&poll, "poll", 0, "read-only: re-check the branch head this often and swap generations live (0 = pinned, the reproducible-batch default)")
 		fs.StringVar(&signingKeyPath, "signing-key", "", "hex Ed25519 volume signing key file to seal with (default: <state-dir>/v2-signing.key; a volume's key is per-VOLUME, so a second machine must import it)")
@@ -126,6 +126,11 @@ func cmdMountGen(args []string) int {
 		return exitErr(err)
 	}
 	prefix, mountpoint := pos[0], pos[1]
+	// A `-- command` tail is the non-interactive form of --subshell: run it
+	// in the mount, then unmount and seal exactly as an exiting shell does.
+	if len(command) > 0 {
+		subshell = true
+	}
 	ctx := context.Background()
 
 	stateDir := o.stateDir
@@ -372,10 +377,11 @@ func cmdMountGen(args []string) int {
 	code := 0
 	var unmountErr error
 	if subshell {
-		// The shell owns the session: when it exits we unmount, and the
+		// The payload owns the session: when it exits we unmount, and the
 		// seal (with --rw) happens on the way out just as it does for a
-		// signalled mount.
-		code = launchSubshell(o, prefix, mountpoint)
+		// signalled mount — a failing command still gets its teardown, and
+		// still carries its status out.
+		code = runInMount(o, prefix, mountpoint, command)
 		if nfsSrv != nil {
 			unmountErr = nfsmount.Unmount(mountpoint)
 			if unmountErr != nil {
@@ -408,7 +414,11 @@ func cmdMountGen(args []string) int {
 	sealErr := g.sealAtExit(ctx)
 	if sealErr != nil {
 		fmt.Fprintf(os.Stderr, "pelfs: %v\n", sealErr)
-		code = 1
+		// A failing payload already reported a status; keep it rather than
+		// flattening it to 1.
+		if code == 0 {
+			code = 1
+		}
 	}
 	g.refresh()
 	if err := g.stats.Finalize(code, unmountErr == nil && sealErr == nil); err != nil {

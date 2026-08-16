@@ -172,6 +172,75 @@ grep -q "written from the subshell" "$WORK/mnt/shell-made.txt" || { echo "subshe
 [ -d "$WORK/mnt/shell-dir" ] || { echo "subshell mkdir did not survive" >&2; exit 1; }
 echo "subshell workflow verified: work in a shell, exit, changes sealed into the next generation"
 
+echo "== non-interactive form: mount-gen --rw -- <command> =="
+unmount_at "$WORK/mnt"
+wait "$MOUNT_PID" 2>/dev/null || true
+
+# The command runs IN the mount, its writes are sealed on the way out, and
+# its exit status is the one pelfs exits with — the property scripts branch
+# on. Note this needs NO --subshell: a `--` tail implies it.
+set +e
+"$WORK/pelfs" mount-gen --rw --state-dir "$WORK/state" "$PREFIX" "$WORK/mnt" \
+  -- /bin/sh -c 'pwd > cmd-cwd.txt; echo "$PELFS_MOUNT" >> cmd-cwd.txt; echo "written by -- command" > cmd-made.txt; exit 0' \
+  > "$WORK/cmd0.log" 2>&1
+rc=$?
+set -e
+[ "$rc" = "0" ] || { echo "successful command exited $rc, want 0:" >&2; sed 's/^/    /' "$WORK/cmd0.log"; exit 1; }
+grep -q "sealed generation" "$WORK/cmd0.log" || { echo "the command form did not seal on the way out:" >&2; sed 's/^/    /' "$WORK/cmd0.log"; exit 1; }
+
+# A FAILING command must still get its teardown, and still propagate.
+set +e
+"$WORK/pelfs" mount-gen --rw --state-dir "$WORK/state" "$PREFIX" "$WORK/mnt" \
+  -- /bin/sh -c 'echo "written by a failing command" > cmd-failed.txt; exit 42' \
+  > "$WORK/cmd42.log" 2>&1
+rc=$?
+set -e
+[ "$rc" = "42" ] || { echo "failing command exited $rc, want 42:" >&2; sed 's/^/    /' "$WORK/cmd42.log"; exit 1; }
+grep -q "sealed generation" "$WORK/cmd42.log" || { echo "a failing command skipped the seal:" >&2; sed 's/^/    /' "$WORK/cmd42.log"; exit 1; }
+
+"$WORK/pelfs" mount-gen --state-dir "$WORK/state11" "$PREFIX" "$WORK/mnt" &
+MOUNT_PID=$!
+for _ in $(seq 200); do [ -e "$WORK/mnt/cmd-failed.txt" ] && break; sleep 0.1; done
+grep -q "written by -- command" "$WORK/mnt/cmd-made.txt" || { echo "the command's writes did not survive the seal" >&2; exit 1; }
+grep -q "written by a failing command" "$WORK/mnt/cmd-failed.txt" || { echo "a failing command's writes were not sealed" >&2; exit 1; }
+# The command ran with the mount as its cwd and saw the session environment.
+grep -qx "$WORK/mnt" "$WORK/mnt/cmd-cwd.txt" || { echo "the command did not run in the mount:" >&2; cat "$WORK/mnt/cmd-cwd.txt"; exit 1; }
+echo "-- command verified: runs in the mount, seals on exit, status propagates (0 and 42)"
+
+echo "== SIGINT to the foreground process group (Ctrl+C) =="
+unmount_at "$WORK/mnt"
+wait "$MOUNT_PID" 2>/dev/null || true
+
+# A terminal sends Ctrl+C to the whole foreground process GROUP: pelfs and
+# its payload both get it. pelfs must not act on it — the payload owns the
+# terminal — but must still tear the mount down once the payload dies.
+# `set -m` gives the background job its own process group, which is what
+# makes signalling a group here safe (and what a tty would give it).
+rm -f "$WORK/sigint-ready"
+set -m
+"$WORK/pelfs" mount-gen --rw --state-dir "$WORK/state" "$PREFIX" "$WORK/mnt" \
+  -- /bin/sh -c "echo ready > $WORK/sigint-ready; sleep 60" > "$WORK/sigint.log" 2>&1 &
+SIGINT_PID=$!
+set +m
+for _ in $(seq 300); do [ -e "$WORK/sigint-ready" ] && break; sleep 0.1; done
+[ -e "$WORK/sigint-ready" ] || { echo "the interrupt payload never started:" >&2; sed 's/^/    /' "$WORK/sigint.log"; exit 1; }
+PGID=$(ps -o pgid= -p "$SIGINT_PID" | tr -d ' ')
+[ "$PGID" != "$(ps -o pgid= -p $$ | tr -d ' ')" ] || { echo "the mount shares this script's process group; refusing to signal it" >&2; exit 1; }
+kill -INT "-$PGID"
+set +e
+wait "$SIGINT_PID"
+rc=$?
+set -e
+[ "$rc" = "130" ] || { echo "interrupted command exited $rc, want 130:" >&2; sed 's/^/    /' "$WORK/sigint.log"; exit 1; }
+grep -q "nothing changed\|sealed generation" "$WORK/sigint.log" || {
+  echo "Ctrl+C tore the mount down without reaching the seal:" >&2; sed 's/^/    /' "$WORK/sigint.log"; exit 1; }
+if mountpoint -q "$WORK/mnt" 2>/dev/null; then echo "the mount survived teardown" >&2; exit 1; fi
+echo "Ctrl+C verified: payload interrupted (130), pelfs completed its teardown"
+
+"$WORK/pelfs" mount-gen --state-dir "$WORK/state12" "$PREFIX" "$WORK/mnt" &
+MOUNT_PID=$!
+for _ in $(seq 200); do [ -e "$WORK/mnt/cmd-made.txt" ] && break; sleep 0.1; done
+
 echo "== strict prefetch: everything local before serving =="
 unmount_at "$WORK/mnt"
 wait "$MOUNT_PID" 2>/dev/null || true

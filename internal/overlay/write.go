@@ -226,6 +226,9 @@ func (fs *FS) Unlink(ctx context.Context, parent uint64, name string) error {
 	if r.typ == catalog.TypeDir {
 		return ErrIsDir
 	}
+	// The target's own rows change too (a surviving link's nlink, or a
+	// purge), which the dirty set cannot express once they are gone.
+	fs.bumpSeqLocked(r.ino)
 	var removeStaging string
 	err = fs.withTx(func(tx *sql.Tx) error {
 		if err := fs.removeEdgeLocked(ctx, tx, parent, name, r.overlay); err != nil {
@@ -320,6 +323,7 @@ func (fs *FS) Rmdir(ctx context.Context, parent uint64, name string) error {
 	if err := fs.emptyDirLocked(ctx, r.ino); err != nil {
 		return err
 	}
+	fs.bumpSeqLocked(r.ino)
 	return fs.withTx(func(tx *sql.Tx) error {
 		if err := fs.removeDirLocked(tx, r.ino); err != nil {
 			return err
@@ -348,6 +352,9 @@ func (fs *FS) Rename(ctx context.Context, srcParent uint64, srcName string, dstP
 	if srcParent == dstParent && srcName == dstName {
 		return nil
 	}
+	// The moved inode is named by the destination oedge, which is exactly
+	// what the table-derived dirty set reports for it.
+	fs.markDirtyLocked(src.ino)
 	dst, dstErr := fs.resolveLocked(ctx, dstParent, dstName)
 	if dstErr != nil && !errors.Is(dstErr, ErrNotExist) {
 		return dstErr
@@ -356,6 +363,7 @@ func (fs *FS) Rename(ctx context.Context, srcParent uint64, srcName string, dstP
 		if dst.ino == src.ino {
 			return nil // hardlinks to the same inode: POSIX no-op
 		}
+		fs.bumpSeqLocked(dst.ino) // replaced: its rows go or lose a link
 		srcDir := src.typ == catalog.TypeDir
 		dstDir := dst.typ == catalog.TypeDir
 		switch {
@@ -511,6 +519,11 @@ func (fs *FS) Write(ctx context.Context, ino uint64, off int64, data []byte) (in
 		if err := fs.materializeContentLocked(ctx, tx, row, row.Length); err != nil {
 			return err
 		}
+		// Bytes below off are the only ones this write disturbs, so a
+		// pure append never copies for a live snapshot.
+		if err := fs.breakSnapshotLinkLocked(ino, off); err != nil {
+			return err
+		}
 		f, err := os.OpenFile(fs.stagingPath(ino), os.O_WRONLY, 0600)
 		if err != nil {
 			return err
@@ -570,6 +583,11 @@ func (fs *FS) SetAttr(ctx context.Context, ino uint64, in SetAttrIn) (Node, erro
 			// Only the surviving prefix is copied; extension zero-fills
 			// via ftruncate.
 			if err := fs.materializeContentLocked(ctx, tx, row, *in.Size); err != nil {
+				return err
+			}
+			// A shrink destroys bytes below the new size; an extension
+			// only adds above it, which no snapshot can see.
+			if err := fs.breakSnapshotLinkLocked(ino, *in.Size); err != nil {
 				return err
 			}
 			if err := os.Truncate(fs.stagingPath(ino), *in.Size); err != nil {

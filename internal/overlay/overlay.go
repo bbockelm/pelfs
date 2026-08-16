@@ -126,6 +126,23 @@ type FS struct {
 	// base.Lookup succeeded for ino via the recorded edge, and residency
 	// is pinned (Forget is never forwarded to the base).
 	prov map[uint64]provEdge
+
+	// seq counts mutating operations; modSeq records, per inode, the seq
+	// of its last modification. Snapshot names the seq it froze, and
+	// Rebase drops exactly the state whose last modification is at or
+	// below a sealed snapshot's seq (see snapshot.go).
+	seq    uint64
+	modSeq map[uint64]uint64
+	// rebasedSeq is the highest seq already rebased away.
+	rebasedSeq uint64
+	// snapEdges holds, per snapshot seq, the merged namespace that
+	// snapshot published (child inode -> the edge naming it). Rebase
+	// replays it against the sealed base.
+	snapEdges map[uint64]map[uint64]provEdge
+	// snapPins is one entry per LIVE snapshot: the staging lengths that
+	// snapshot froze, which the write path copies out from before
+	// disturbing (snapshot.go, breakSnapshotLinkLocked).
+	snapPins []*snapPin
 }
 
 const (
@@ -284,6 +301,8 @@ func Open(dir string, base *genfs.FS, opts Options) (*FS, error) {
 		dir:        dir,
 		stagingDir: stagingDir,
 		prov:       make(map[uint64]provEdge),
+		modSeq:     make(map[uint64]uint64),
+		snapEdges:  make(map[uint64]map[uint64]provEdge),
 	}, nil
 }
 
@@ -295,6 +314,10 @@ func (fs *FS) Close() error {
 	}
 	return fs.db.Close()
 }
+
+// RootInode reports the inode a walk starts at. It exists so one
+// interface accepts both an FS and a Snapshot (the seal walks either).
+func (fs *FS) RootInode() uint64 { return RootInode }
 
 // Forget is accepted for API symmetry with genfs and does nothing: all
 // overlay state is persistent, and base residency stays pinned for the

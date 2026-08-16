@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"io"
+	"math"
 	"strconv"
 )
 
@@ -89,10 +90,12 @@ func (fs *FS) loadDirtyLocked() error {
 	return nil
 }
 
-// markDirtyLocked records inodes as dirty. Every mutating path calls it
-// with the inodes it touched, under the filesystem lock, so the set never
-// disagrees with the tables.
+// markDirtyLocked records inodes as dirty and stamps them with this
+// operation's modification sequence. Every mutating path calls it with
+// the inodes it touched, under the filesystem lock, so neither the set
+// nor the sequence map disagrees with the tables.
 func (fs *FS) markDirtyLocked(inos ...uint64) {
+	fs.bumpSeqLocked(inos...)
 	if fs.dirtySet == nil {
 		// Not seeded yet; the first IsDirty will read the tables, which
 		// by then include this mutation.
@@ -103,6 +106,35 @@ func (fs *FS) markDirtyLocked(inos ...uint64) {
 			fs.dirtySet[ino] = struct{}{}
 		}
 	}
+}
+
+// bumpSeqLocked stamps inos as modified by this operation without
+// claiming they are dirty. It is the seq half of markDirtyLocked, for
+// the inodes an operation REMOVES state from (an unlink target losing a
+// link, a replaced rename destination): their rows changed, so a rebase
+// must not treat them as published, but the dirty set is derived from
+// rows that may no longer exist.
+func (fs *FS) bumpSeqLocked(inos ...uint64) {
+	fs.seq++
+	for _, ino := range inos {
+		if ino != 0 {
+			fs.modSeq[ino] = fs.seq
+		}
+	}
+}
+
+// modSeqOfLocked reports when an inode was last modified. An inode with
+// no entry is state this session did not write — dirt a previous session
+// left behind, which no seal of THIS session's snapshots is known to have
+// published — so it reads as modified more recently than any snapshot and
+// is never rebased away. Conservative by construction: the cost is a
+// resumed session keeping its inherited dirt at zero TTLs until it
+// touches it again, never a dropped change.
+func (fs *FS) modSeqOfLocked(ino uint64) uint64 {
+	if v, ok := fs.modSeq[ino]; ok {
+		return v
+	}
+	return math.MaxUint64
 }
 
 // AllXattrs returns every visible xattr of an inode in one pass, honoring

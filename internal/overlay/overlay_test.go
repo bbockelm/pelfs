@@ -209,6 +209,12 @@ type fixture struct {
 	base  *genfs.FS
 	ino   map[string]uint64
 	body  map[string][]byte
+	// key and head carry the volume forward: sealing an overlay into the
+	// next generation needs the volume's signing key and the generation
+	// the overlay sits over (sealAndSwap, snapshot_test.go). head tracks
+	// the generation base currently serves.
+	key  ed25519.PrivateKey
+	head *publish.Result
 }
 
 func newFixture(t testing.TB, uuid string) *fixture {
@@ -216,6 +222,11 @@ func newFixture(t testing.TB, uuid string) *fixture {
 	inner := newInner(t)
 	v := newTestVolume(t, uuid)
 	fx := &fixture{inner: inner, ino: map[string]uint64{}, body: map[string][]byte{}}
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fx.key = priv
 	fx.body["base.txt"] = []byte("the base file body, generation zero")
 	fx.body["big.bin"] = pseudorandom(64<<10, 42)
 	fx.body["dir/child.txt"] = []byte("child body")
@@ -235,16 +246,19 @@ func newFixture(t testing.TB, uuid string) *fixture {
 	v.setxattr(fx.ino["tagged.txt"], "user.color", []byte("blue"))
 	v.setxattr(fx.ino["tagged.txt"], "user.keep", []byte("yes"))
 
-	fx.res = publishVolume(t, v, inner, publish.Options{TargetPackSize: 1 << 20})
+	fx.res = publishVolume(t, v, inner, publish.Options{TargetPackSize: 1 << 20, SigningKey: priv})
+	fx.head = fx.res
 	fx.base = openBase(t, inner, fx.res.Superblock)
 	return fx
 }
 
+// options describes the generation base is serving RIGHT NOW, which a
+// rebased fixture has advanced past the one it started on.
 func (fx *fixture) options() overlay.Options {
 	return overlay.Options{
-		NextInode:      fx.res.Superblock.NextInode,
-		BaseRoot:       fx.res.Superblock.RootCatalog,
-		BaseGeneration: fx.res.Superblock.Generation,
+		NextInode:      fx.head.Superblock.NextInode,
+		BaseRoot:       fx.head.Superblock.RootCatalog,
+		BaseGeneration: fx.head.Superblock.Generation,
 	}
 }
 
@@ -263,7 +277,7 @@ func openOverlay(t testing.TB, fx *fixture, dir string) *overlay.FS {
 
 // lookupPath walks path from the root through overlay Lookups (the
 // kernel descent pattern every operation relies on).
-func lookupPath(t *testing.T, ov *overlay.FS, path string) overlay.Node {
+func lookupPath(t *testing.T, ov readView, path string) overlay.Node {
 	t.Helper()
 	n, err := lookupPathErr(ov, path)
 	if err != nil {
@@ -272,7 +286,7 @@ func lookupPath(t *testing.T, ov *overlay.FS, path string) overlay.Node {
 	return n
 }
 
-func lookupPathErr(ov *overlay.FS, path string) (overlay.Node, error) {
+func lookupPathErr(ov readView, path string) (overlay.Node, error) {
 	ctx := context.Background()
 	ino := uint64(rootIno)
 	var n overlay.Node
@@ -786,7 +800,7 @@ func TestXattr(t *testing.T) {
 
 // mergedView walks the whole overlay and captures identity, shape, and
 // content of every entry — the reopen test's equality subject.
-func mergedView(t *testing.T, ov *overlay.FS) map[string]string {
+func mergedView(t *testing.T, ov readView) map[string]string {
 	t.Helper()
 	out := map[string]string{}
 	var walk func(ino uint64, prefix string)

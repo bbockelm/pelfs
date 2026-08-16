@@ -19,7 +19,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.25.x"
+          go-version: "1.26.x"
       - name: Vet
         run: CGO_ENABLED=0 go vet -tags "$TAGS" ./...
       - name: Unit tests
@@ -36,7 +36,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.25.x"
+          go-version: "1.26.x"
       - name: Full mount loop in Docker against fakeorigin
         run: ./scripts/e2e-docker.sh
 
@@ -46,7 +46,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.25.x"
+          go-version: "1.26.x"
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -65,3 +65,73 @@ jobs:
         run: go build -tags forceposix,server -o "$GITHUB_WORKSPACE/pelican-bin" ./cmd
       - name: Integration tests against federation-in-a-box
         run: PELICAN_BIN="$GITHUB_WORKSPACE/pelican-bin" ./scripts/integration-pelican.sh
+
+  fuzz:
+    # Tier 1 (parsers): unrestricted — pure functions over untrusted
+    # federation bytes, safe to run anywhere. Short smoke runs; the
+    # corpus in testdata/ carries forward every past finding.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+      - name: Fuzz parsers (30s each)
+        run: |
+          set -e
+          for t in \
+            "internal/packstore FuzzDecodeTrailer" \
+            "internal/packstore FuzzParseTail" \
+            "internal/superblock FuzzDecodeVerify" \
+            "internal/entrycodec FuzzDecode" \
+            "internal/chunkid FuzzChunker"; do
+            set -- $t
+            echo "== $2 =="
+            CGO_ENABLED=0 go test -tags "$TAGS" -run xxx -fuzz "^$2\$" -fuzztime 30s "./$1/"
+          done
+
+  opfuzz:
+    # Tier 2 (filesystem operation sequences): CONTAINED, always. The
+    # launcher cross-compiles on the host and runs the binary in a
+    # sealed, network-less, read-only container — never on the runner
+    # filesystem directly.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+      - name: Op-sequence fuzzing (contained)
+        run: ./scripts/opfuzz-docker.sh 120s FuzzOps
+      - name: Concurrent op stress under -race (contained)
+        run: ./scripts/opfuzz-docker.sh 0 ConcurrentOpsStress
+
+  phase3-mount:
+    # The phase-3 gate: a REAL kernel mount of a published generation
+    # through genfs+rawfuse (no JuiceFS in the stack), exercised by the
+    # end-to-end benchmark script. Linux only — this is the coverage a
+    # macFUSE-less dev machine cannot provide.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+      - name: Enable FUSE
+        run: |
+          sudo modprobe fuse
+          sudo chmod 666 /dev/fuse
+      - name: Mount a published generation and benchmark it
+        run: ./scripts/phase3-mount-test.sh
+
+  bench:
+    # Benchmarks are not a pass/fail gate; they run to catch build rot in
+    # the harness and to leave numbers in the log for comparison.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+      - name: Microbenchmarks
+        run: CGO_ENABLED=0 go test -tags "$TAGS" -run xxx -bench . -benchtime 0.3s ./internal/genfs/

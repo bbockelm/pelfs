@@ -716,3 +716,62 @@ func TestCatalogLRU(t *testing.T) {
 		t.Fatalf("b re-readdir = %v (%v)", entryNames(got), err)
 	}
 }
+
+// Parent answers "..", LookupPath re-attaches by path, and the
+// generation accessors expose what a writer layered above needs.
+func TestParentLookupPathAndAccessors(t *testing.T) {
+	ctx := context.Background()
+	inner, _ := newInner(t)
+	v := newTestVolume(t, "abcdabcd-0000-4000-8000-0000000000aa")
+	dir := v.mkdir(1, "d")
+	sub := v.mkdir(dir, "sub")
+	fileIno := v.create(sub, "f.txt")
+	v.write(fileIno, []byte("hello"))
+	res := publishVolume(t, v, inner, publish.Options{})
+	fs := openFS(t, inner, res.Superblock, genfs.Options{})
+
+	// Root is its own parent; unlooked-up inodes are stale.
+	if p, err := fs.Parent(genfs.RootInode); err != nil || p != genfs.RootInode {
+		t.Fatalf("Parent(root) = %d, %v; want root, nil", p, err)
+	}
+	if _, err := fs.Parent(fileIno); !errors.Is(err, genfs.ErrStale) {
+		t.Fatalf("Parent of never-looked-up inode = %v, want ErrStale", err)
+	}
+
+	// LookupPath establishes residency the whole way down.
+	node, err := fs.LookupPath(ctx, "/d/sub/f.txt")
+	if err != nil {
+		t.Fatalf("LookupPath: %v", err)
+	}
+	if node.Inode != fileIno || node.Length != 5 {
+		t.Fatalf("LookupPath node = %+v, want inode %d length 5", node, fileIno)
+	}
+	// ..-chain walks back to the root.
+	p, err := fs.Parent(node.Inode)
+	if err != nil || p != sub {
+		t.Fatalf("Parent(f.txt) = %d, %v; want %d", p, err, sub)
+	}
+	if p, err = fs.Parent(p); err != nil || p != dir {
+		t.Fatalf("Parent(sub) = %d, %v; want %d", p, err, dir)
+	}
+	if p, err = fs.Parent(p); err != nil || p != genfs.RootInode {
+		t.Fatalf("Parent(d) = %d, %v; want root", p, err)
+	}
+	if _, err := fs.LookupPath(ctx, "/d/nope"); !errors.Is(err, genfs.ErrNotExist) {
+		t.Fatalf("LookupPath(missing) = %v, want ErrNotExist", err)
+	}
+
+	if got := fs.Generation(); got != res.Superblock.Generation {
+		t.Fatalf("Generation = %d, want %d", got, res.Superblock.Generation)
+	}
+	if got := fs.RootCatalog(); got != res.Superblock.RootCatalog {
+		t.Fatalf("RootCatalog mismatch")
+	}
+	if got := fs.NextInode(); got != res.Superblock.NextInode || got <= fileIno {
+		t.Fatalf("NextInode = %d, want %d (> %d)", got, res.Superblock.NextInode, fileIno)
+	}
+	bytes, inodes := fs.Usage()
+	if bytes <= 0 || inodes != res.Superblock.NextInode {
+		t.Fatalf("Usage = %d bytes, %d inodes; want positive bytes and NextInode", bytes, inodes)
+	}
+}

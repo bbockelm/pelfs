@@ -26,6 +26,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/bbockelm/pelfs/internal/catalog"
@@ -108,6 +109,13 @@ type packLoc struct {
 type residency struct {
 	cat     string // catalog identity, hex
 	nlookup uint64
+	// parent is the inode this one was reached through. Descent already
+	// knows it, so recording it costs nothing and answers ".." — which a
+	// kernel binding (and NFS export) cannot synthesize otherwise. A
+	// directory has exactly one parent, so there is no ambiguity; for
+	// hardlinked FILES the value is simply the most recent path used,
+	// which is all POSIX promises.
+	parent uint64
 }
 
 // FS serves one verified generation read-only. Safe for concurrent use.
@@ -242,7 +250,7 @@ func (fs *FS) residencyOf(ino uint64) (string, error) {
 // retain records or bumps an inode's residency. Within a generation an
 // inode's rows are immutable, so a second path reaching the same inode
 // (hardlinks) keeps the first-recorded catalog — both carry the node row.
-func (fs *FS) retain(ino uint64, catHex string) {
+func (fs *FS) retain(ino uint64, catHex string, parent uint64) {
 	if ino == RootInode {
 		return
 	}
@@ -250,9 +258,10 @@ func (fs *FS) retain(ino uint64, catHex string) {
 	defer fs.mu.Unlock()
 	if r := fs.res[ino]; r != nil {
 		r.nlookup++
+		r.parent = parent
 		return
 	}
-	fs.res[ino] = &residency{cat: catHex, nlookup: 1}
+	fs.res[ino] = &residency{cat: catHex, nlookup: 1, parent: parent}
 }
 
 // Lookup resolves name under parent, records the child's residency, and
@@ -287,8 +296,76 @@ func (fs *FS) Lookup(ctx context.Context, parent uint64, name string) (Node, err
 	if lr.NestedIdentity != nil {
 		childCat = hex.EncodeToString(lr.NestedIdentity)
 	}
-	fs.retain(uint64(lr.Dirent.Inode), childCat)
+	fs.retain(uint64(lr.Dirent.Inode), childCat, parent)
 	return nodeOf(n), nil
+}
+
+// Parent returns the inode this one was reached through, answering "..".
+// The root is its own parent, as POSIX requires. ErrStale when the inode
+// has no residency (the kernel looked nothing up).
+func (fs *FS) Parent(ino uint64) (uint64, error) {
+	if ino == RootInode {
+		return RootInode, nil
+	}
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+	r, ok := fs.res[ino]
+	if !ok {
+		return 0, ErrStale
+	}
+	if r.parent == 0 {
+		return RootInode, nil
+	}
+	return r.parent, nil
+}
+
+// LookupPath descends from the root along a slash-separated path,
+// establishing residency at every step, and returns the final node. It
+// is how a caller re-attaches to an inode it knows only by path — the
+// overlay reopening across sessions, or a binding resolving a stored
+// handle — without genfs keeping a reverse index (the catalog is a
+// locator BY DESCENT; a registry would rebuild the CVMFS hotspot).
+func (fs *FS) LookupPath(ctx context.Context, p string) (Node, error) {
+	ino := RootInode
+	node, err := fs.GetAttr(ctx, ino)
+	if err != nil {
+		return Node{}, err
+	}
+	for _, part := range strings.Split(strings.Trim(p, "/"), "/") {
+		if part == "" || part == "." {
+			continue
+		}
+		node, err = fs.Lookup(ctx, ino, part)
+		if err != nil {
+			return Node{}, err
+		}
+		ino = node.Inode
+	}
+	return node, nil
+}
+
+// Generation reports the served generation number.
+func (fs *FS) Generation() uint64 { return fs.sb.Generation }
+
+// RootCatalog reports the generation's root catalog identity — the value
+// an overlay pins to refuse reopening over a different generation.
+func (fs *FS) RootCatalog() [32]byte { return fs.sb.RootCatalog }
+
+// NextInode reports the generation's allocator high-water mark, so a
+// writer layered above allocates inodes that never collide with the
+// base's.
+func (fs *FS) NextInode() uint64 { return fs.sb.NextInode }
+
+// Usage reports total stored bytes and the allocator high-water mark,
+// for synthesizing statfs. Bytes come from the generation's pack list
+// (the only size the format actually knows); inode counts are bounded by
+// NextInode, not counted — a true count would mean walking every
+// catalog.
+func (fs *FS) Usage() (bytes int64, inodes uint64) {
+	for _, pe := range fs.sb.PackList {
+		bytes += pe.Size
+	}
+	return bytes, fs.sb.NextInode
 }
 
 // GetAttr returns an inode's attributes from its residency catalog.

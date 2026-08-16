@@ -153,6 +153,18 @@ grep -q "phase-3 write" "$WORK/mnt/dir/written.txt" || { echo "sealed write miss
 cmp "$WORK/src/dir/big.bin" "$WORK/mnt/dir/big.bin"
 echo "seal round trip verified: writes, mkdir, deletion, untouched content"
 
+echo "== strict prefetch: everything local before serving =="
+unmount_at "$WORK/mnt"
+wait "$MOUNT_PID" 2>/dev/null || true
+"$WORK/pelfs" mount-gen --prefetch all --state-dir "$WORK/state9" "$PREFIX" "$WORK/mnt" 2>"$WORK/pf.log" &
+MOUNT_PID=$!
+for _ in $(seq 200); do [ -e "$WORK/mnt/dir/big.bin" ] && break; sleep 0.1; done
+[ -e "$WORK/mnt/dir/big.bin" ] || { echo "prefetch mount did not come up" >&2; sed 's/^/    /' "$WORK/pf.log"; exit 1; }
+grep -q "prefetched" "$WORK/pf.log" || { echo "no prefetch report" >&2; sed 's/^/    /' "$WORK/pf.log"; exit 1; }
+sed -n 's/^/    /p' "$WORK/pf.log" | grep prefetched
+cmp "$WORK/src/dir/big.bin" "$WORK/mnt/dir/big.bin"
+echo "strict prefetch verified: generation warmed, content byte-exact"
+
 echo "== NFS backend: the same stack, no FUSE in the data path =="
 unmount_at "$WORK/mnt"
 wait "$MOUNT_PID" 2>/dev/null || true

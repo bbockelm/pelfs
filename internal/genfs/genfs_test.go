@@ -933,3 +933,74 @@ func TestBoundedResidency(t *testing.T) {
 		t.Fatalf("unbounded residency evicted an inode: %v", err)
 	}
 }
+
+// Prefetch warms the whole generation's chunk cache: the batch mode that
+// wants every byte local before a job starts.
+func TestPrefetchWarmsCache(t *testing.T) {
+	ctx := context.Background()
+	inner, originDir := newInner(t)
+	v := newTestVolume(t, "9efe7c40-0000-4000-8000-000000000077")
+	dir := v.mkdir(1, "d")
+	big := v.create(dir, "big.bin")
+	bigContent := pseudorandom(6<<20, 99)
+	v.write(big, bigContent)
+	twin := v.create(dir, "twin.bin") // identical content: one chunk set
+	v.write(twin, bigContent)
+	small := v.create(dir, "small.txt")
+	v.write(small, []byte("inline, nothing to fetch"))
+	res := publishVolume(t, v, inner, publish.Options{})
+
+	cache := t.TempDir()
+	fs := openFS(t, inner, res.Superblock, genfs.Options{CacheDir: cache})
+	rep, err := fs.Prefetch(ctx, 4)
+	if err != nil {
+		t.Fatalf("Prefetch: %v", err)
+	}
+	if rep.Failed != 0 {
+		t.Fatalf("prefetch reported %d failures: %v", rep.Failed, rep.Sample)
+	}
+	if rep.Files != 3 {
+		t.Fatalf("walked %d files, want 3", rep.Files)
+	}
+	if rep.Chunks == 0 {
+		t.Fatalf("fetched no chunks: %+v", rep)
+	}
+	if rep.Bytes < int64(len(bigContent)) {
+		t.Fatalf("warmed %d bytes, want at least one copy of the %d-byte file", rep.Bytes, len(bigContent))
+	}
+
+	// The twin shares every chunk identity, so dedup means the warm set
+	// is one file's worth, not two.
+	if rep.Bytes > int64(len(bigContent))*3/2 {
+		t.Fatalf("warmed %d bytes for two identical files; dedup did not apply", rep.Bytes)
+	}
+
+	// The cache is genuinely warm: delete the packs and reads still work.
+	if err := os.RemoveAll(filepath.Join(originDir, "packs")); err != nil {
+		t.Fatal(err)
+	}
+	dirNode, err := fs.Lookup(ctx, genfs.RootInode, "d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := fs.Lookup(ctx, dirNode.Inode, "big.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(bigContent))
+	if _, err := fs.Read(ctx, n.Inode, 0, got); err != nil {
+		t.Fatalf("read after prefetch with packs deleted: %v", err)
+	}
+	if !bytes.Equal(got, bigContent) {
+		t.Fatal("prefetched content mismatch")
+	}
+
+	// A second pass finds everything cached and transfers nothing.
+	rep2, err := fs.Prefetch(ctx, 4)
+	if err != nil {
+		t.Fatalf("second Prefetch: %v", err)
+	}
+	if rep2.Chunks != 0 || rep2.Cached == 0 {
+		t.Fatalf("second pass fetched %d chunks (cached %d); want all cached", rep2.Chunks, rep2.Cached)
+	}
+}

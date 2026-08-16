@@ -138,6 +138,37 @@ func cmdMountGen(args []string) int {
 	}
 	defer gfs.Close() //nolint:errcheck
 
+	// --prefetch is a common flag; phase 3 honors the same three modes.
+	switch o.prefetch {
+	case "", "none":
+	case "all":
+		fmt.Fprintln(os.Stderr, "pelfs: prefetching the generation into the local cache...")
+		rep, err := gfs.Prefetch(ctx, pelicanobj.TransferWorkers())
+		if err != nil {
+			return exitErr(fmt.Errorf("prefetch: %w", err))
+		}
+		if rep.Failed > 0 {
+			return exitErr(fmt.Errorf("prefetch: %d chunk(s) could not be fetched (%v); refusing to mount",
+				rep.Failed, rep.Sample))
+		}
+		fmt.Fprintf(os.Stderr, "pelfs: prefetched %d chunks (%d already cached) across %d files, %.1f MB\n",
+			rep.Chunks, rep.Cached, rep.Files, float64(rep.Bytes)/1e6)
+	case "background":
+		go func() {
+			// Half the transfer pool, so warming never starves the
+			// interactive I/O the mount is serving.
+			rep, err := gfs.Prefetch(ctx, max(1, pelicanobj.TransferWorkers()/2))
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "pelfs: background prefetch: %v\n", err)
+				return
+			}
+			fmt.Fprintf(os.Stderr, "pelfs: background prefetch done: %d chunks, %d failed\n",
+				rep.Chunks, rep.Failed)
+		}()
+	default:
+		return exitErr(fmt.Errorf("unknown --prefetch %q (want none, all, or background)", o.prefetch))
+	}
+
 	if err := os.MkdirAll(mountpoint, 0755); err != nil {
 		return exitErr(err)
 	}

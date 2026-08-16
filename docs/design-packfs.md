@@ -1048,18 +1048,35 @@ remount; live generation swap arrives with phase 3.
    hydrated data from packs. JuiceFS remains the hot engine. Remaining
    wiring: hydrate-backed restore in mounts (today restore is still v1
    snapshots), production Storage config in the rebuilt Format.
-3. **Catalog-native runtime.** — **IN PROGRESS**. Landed: internal/genfs
-   (the FUSE-agnostic generation resolver), internal/rawfuse (the raw
-   read-only kernel binding), `pelfs mount-gen` (mount a published
-   generation with no JuiceFS in the stack). In flight: the write
-   overlay. Remaining: seal (walk overlay+base directly into
-   catalogs/packs — publish stops translating), generation swap with
-   enumerated invalidation, then eject JuiceFS — the pin, the fork
-   replaces, and the cgo shims all go with it. Tractable because pelfs
-   is single-writer scratch: no distributed sessions, no multi-client
-   coherence. JuiceFS is ejected last, after the format has production
-   mileage; what is battle-tested by then is our format, not their
-   schema.
+3. **Catalog-native runtime.** — **THE LOOP CLOSES**. Landed:
+   internal/genfs (generation resolver), internal/rawfuse (raw kernel
+   binding, read and write), internal/overlay (crash-safe write path),
+   and seal (internal/publish reads a Source, so an overlay becomes a
+   generation directly). `pelfs mount-gen [--rw]` mounts a published
+   generation with NO JuiceFS in the stack and, read-write, seals the
+   overlay into the next generation at unmount. Remaining before
+   JuiceFS can be ejected: generation swap with enumerated invalidation
+   (needs per-handle generation pinning), splice reads, and production
+   mileage — v1 still owns the default mount path. JuiceFS goes last;
+   what is battle-tested by then is our format, not their schema.
+
+   Measured on the phase-3 read path (M-series, 512-entry catalog,
+   loopback origin) after the prepared-statement, pooling, and
+   readdirplus-join work:
+
+   | op | before | after |
+   |---|---|---|
+   | Lookup, 1 thread | 19.1 us | 15.3 us |
+   | Lookup, 64 threads | 48.6 us | 15.7 us |
+   | GetAttr, 64 threads | 34.1 us | 5.7 us |
+   | Readdir (512 entries) | 12.6 ms | 0.78 ms |
+   | warm 1 MiB read | 24.5 GB/s | 33.9 GB/s |
+   | inline read | 32 ns, 0 allocs | unchanged |
+
+   Metadata latency is now FLAT under concurrency instead of degrading
+   2.5x, and a cold 1M-entry walk falls from ~25 s to ~1.5 s — the
+   phase-3 "usable in seconds" target, met by the resolver before the
+   kernel's infinite-TTL caching is even counted.
 
 ## Phase 3 VFS architecture
 

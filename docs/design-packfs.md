@@ -474,6 +474,52 @@ compression). All tables WITHOUT ROWID where the key is natural.
   owns them), trash, and ACL tables (POSIX ACLs out of scope for v2.0;
   xattrs can carry them opaquely).
 
+## Session control socket
+
+The primary interface stays `pelfs shell` / `mount` / `umount`; publish
+is a session activity, not a separate workflow. Each session listens on
+a Unix-domain socket in its state directory (`control.sock`) speaking
+plain HTTP (the Docker pattern — curl-able, no custom framing):
+
+- `GET  /v1/status`    — mount point, prefix, generation, uptime
+- `GET  /v1/stats`     — the live session-statistics JSON
+- `POST /v1/flush`     — drain staging + packs now
+- `POST /v1/publish`   — cut + publish a v2 generation now
+- `GET  /v1/bugreport` — tar.gz: stats, status, config (redacted),
+  goroutine dump (the "client hung" debugging kit)
+
+`pelfs ctl <prefix-or-mountpoint> <verb>` is the CLI client. The socket
+is 0600 in the per-volume state dir; possession of the state dir is
+already possession of the volume's local keys, so no further auth.
+
+## Writeback modes and the dirty cap
+
+Three write dispositions per session:
+
+- **Synchronous** (no --writeback): today's default; every block upload
+  completes before the write returns durable.
+- **Writeback** (--writeback): staged locally, uploaded ASAP in the
+  background. The dirty-bytes cap rides the staging store's existing
+  full-detection: when staged bytes exceed the cap
+  (--writeback-cap, default: the cache budget), new writes fall back to
+  SYNCHRONOUS upload — writers slow down, the session never explodes
+  local disk (the 5 GB-of-overwrites concern, capped at the other
+  layer).
+- **Accumulate** (--accumulate, explicitly NOT default): the
+  traditional HTCondor shape — nothing uploads during the job; all
+  output stays in local staging (reads are served from it), and
+  PUBLICATION at job end pushes v2 packs + catalogs directly. The v1
+  block objects are never uploaded at all, and v1 snapshots are
+  disabled in this mode (they would reference blocks that exist
+  nowhere); the publish at exit is mandatory, and a crash before it
+  loses the session's writes — exactly the stated batch contract
+  ("mid-job upload failures are fine iff the final upload succeeds").
+  Cap-full in accumulate mode is ENOSPC to the writer, never a silent
+  mid-job upload. Implementation note: staging-forever is JuiceFS's
+  UploadDelay knob; the accumulate publish reads file content through
+  the chunk store, which serves staged-but-never-uploaded blocks
+  locally.
+
 ## Codec marking: every compression/encryption site, enumerated
 
 The CVMFS scar to avoid: bytes whose compression algorithm is implied by

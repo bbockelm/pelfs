@@ -24,10 +24,15 @@ const daemonEnv = "PELFS_MOUNT_DAEMON"
 // mountInfo is the state file a background mount maintains at
 // <stateRoot>/vol-<id>/mount.json.
 type mountInfo struct {
-	PID          int       `json:"pid"`
-	Prefix       string    `json:"prefix"`
-	MountPoint   string    `json:"mountpoint"`
-	Session      string    `json:"session,omitempty"`
+	PID        int    `json:"pid"`
+	Prefix     string `json:"prefix"`
+	MountPoint string `json:"mountpoint"`
+	Session    string `json:"session,omitempty"`
+	// StateDir is where the session's control socket and local state
+	// live. It is NOT always the directory holding this record: a mount
+	// started with --state-dir puts state elsewhere, and `pelfs ctl`
+	// must follow the session, not the record.
+	StateDir     string    `json:"state_dir,omitempty"`
 	ReadOnly     bool      `json:"read_only,omitempty"`
 	Started      time.Time `json:"started"`
 	LastSnapshot time.Time `json:"last_snapshot,omitempty"`
@@ -166,6 +171,7 @@ func runMountDaemon(o *cmdOpts, prefix string, pos []string, infoPath string) in
 		PID:        os.Getpid(),
 		Prefix:     prefix,
 		MountPoint: s.mountPoint,
+		StateDir:   s.stateDir,
 		ReadOnly:   o.readOnly,
 		Started:    time.Now(),
 	}

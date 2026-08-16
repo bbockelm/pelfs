@@ -159,9 +159,15 @@ func findSessionState(target string) (string, error) {
 		if e.info.Prefix != target && filepath.Clean(e.info.MountPoint) != filepath.Clean(target) {
 			continue
 		}
-		dir := filepath.Dir(e.path)
+		// Follow the session's state dir when it recorded one: a mount
+		// started with --state-dir keeps its socket there, not beside
+		// this record.
+		dir := e.info.StateDir
+		if dir == "" {
+			dir = filepath.Dir(e.path)
+		}
 		if _, err := os.Stat(filepath.Join(dir, control.SocketName)); err != nil {
-			return "", fmt.Errorf("mount %s has no control socket (older session?)", e.info.MountPoint)
+			return "", fmt.Errorf("mount %s has no control socket at %s (older session?)", e.info.MountPoint, dir)
 		}
 		return dir, nil
 	}

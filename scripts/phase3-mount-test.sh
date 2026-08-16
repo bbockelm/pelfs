@@ -53,7 +53,7 @@ echo "== ingesting the tree through a v1 mount =="
 mkdir -p "$WORK/v1mnt"
 "$WORK/pelfs" mount --state-dir "$WORK/state" --writeback --no-lease \
   --snapshot-interval 0 "$PREFIX" "$WORK/v1mnt"
-cp -a "$WORK/src/." "$WORK/v1mnt/"
+cp -R "$WORK/src/." "$WORK/v1mnt/"
 
 echo "== publishing generation 0 through the control socket =="
 "$WORK/pelfs" ctl "$PREFIX" publish

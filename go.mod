@@ -101,6 +101,7 @@ require (
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/flynn/noise v1.0.0 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
+	github.com/fxamacker/cbor/v2 v2.9.2 // indirect
 	github.com/gabriel-vasile/mimetype v1.4.11 // indirect
 	github.com/gammazero/toposort v0.1.1 // indirect
 	github.com/geoffgarside/ber v1.1.0 // indirect
@@ -250,6 +251,7 @@ require (
 	github.com/volcengine/ve-tos-golang-sdk/v2 v2.9.0 // indirect
 	github.com/willscott/go-nfs-client v0.0.0-20240104095149-b44639837b00 // indirect
 	github.com/winfsp/cgofuse v1.6.0 // indirect
+	github.com/x448/float16 v0.8.4 // indirect
 	github.com/xrash/smetrics v0.0.0-20201216005158-039620a65673 // indirect
 	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78 // indirect
 	github.com/zeebo/blake3 v0.2.3 // indirect
@@ -298,6 +300,7 @@ require (
 	k8s.io/client-go v0.36.3 // indirect
 	kernel.org/pub/linux/libs/security/libcap/cap v1.2.69 // indirect
 	kernel.org/pub/linux/libs/security/libcap/psx v1.2.69 // indirect
+	lukechampine.com/blake3 v1.4.1 // indirect
 	modernc.org/fileutil v1.3.8 // indirect
 	modernc.org/libc v1.66.3 // indirect
 	modernc.org/mathutil v1.7.1 // indirect

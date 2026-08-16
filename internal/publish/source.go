@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"sort"
 
 	"github.com/juicedata/juicefs/pkg/meta"
 
@@ -196,11 +195,18 @@ type overlaySource struct {
 
 func (s *overlaySource) Root() uint64 { return overlay.RootInode }
 
-// NextInode is unavailable: overlay.FS keeps a persisted next_inode
-// counter but exposes no accessor. Publish falls back to max-inode-seen
-// and the previous generation's mark, which is exact for every inode the
-// sealed tree contains.
-func (s *overlaySource) NextInode() uint64 { return 0 }
+// NextInode reads the overlay's PERSISTED counter, which includes
+// numbers burned by inodes created and then deleted in this session — a
+// tree walk cannot see those, and reusing one would break the
+// stable-inode contract across generations. Zero (an overlay too old to
+// answer) falls back to max-inode-seen.
+func (s *overlaySource) NextInode() uint64 {
+	n, err := s.fs.NextInode()
+	if err != nil {
+		return 0
+	}
+	return n
+}
 
 func (s *overlaySource) Readdir(ctx context.Context, ino uint64) ([]SrcEntry, error) {
 	des, err := s.fs.Readdir(ctx, ino)
@@ -231,27 +237,8 @@ func (s *overlaySource) Readlink(ctx context.Context, ino uint64) (string, error
 }
 
 func (s *overlaySource) Xattrs(ctx context.Context, ino uint64) (map[string][]byte, error) {
-	names, err := s.fs.ListXattr(ctx, ino)
-	if err != nil {
-		return nil, err
-	}
-	if len(names) == 0 {
-		return nil, nil
-	}
-	sort.Strings(names)
-	out := make(map[string][]byte, len(names))
-	for _, name := range names {
-		v, err := s.fs.GetXattr(ctx, ino, name)
-		if err != nil {
-			// A name listed but unreadable is a torn view, not an empty
-			// attribute: fail the seal rather than publish a partial set.
-			return nil, fmt.Errorf("publish: seal xattr %q of inode %d: %w", name, ino, err)
-		}
-		out[name] = v
-	}
-	return out, nil
+	return s.fs.AllXattrs(ctx, ino)
 }
-
 func (s *overlaySource) Open(ctx context.Context, ino uint64, length int64) (io.ReadCloser, error) {
 	return &overlayReader{ctx: ctx, fs: s.fs, ino: ino, end: length}, nil
 }

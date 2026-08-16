@@ -33,67 +33,49 @@ func MountRW(mountpoint string, ov *overlay.FS, debug bool) (*fuse.Server, error
 }
 
 // dirtySet answers the TTL question "has the overlay touched this inode".
+// Clean inodes get effectively infinite entry/attr validity (the kernel
+// becomes the dentry cache); dirty ones must get zero, or the kernel
+// serves stale metadata for a file the overlay is changing.
 //
-// GAP: overlay exposes no per-inode dirty predicate — only Dirty(), a full
-// ordered dump of the changed set, which is far too expensive to consult
-// per Lookup. So the set is seeded once from that dump (closing the
-// reopened-overlay hole: state dirtied by a previous session is dirty for
-// this one too) and thereafter maintained locally from what this binding
-// mutates. Two consequences of working around the gap here:
-//   - inodes never go clean again for the mount's lifetime, so a mount
-//     that touched an inode keeps paying userspace round-trips for it;
-//   - if the seed dump fails, every inode is treated as dirty. Correct and
-//     slow beats fast and stale.
+// The overlay is the authority (IsDirty: one indexed EXISTS), consulted
+// lazily and cached positively. Dirt is sticky for an overlay's lifetime
+// — rows persist until seal — so a positive answer never needs
+// rechecking, and clean inodes cost one query the FIRST time the kernel
+// looks them up and nothing after that, since the reply it caches is the
+// infinite-TTL one. A query error is treated as dirty: correct and slow
+// beats fast and stale.
 type dirtySet struct {
+	ov *overlay.FS
+
 	mu  sync.RWMutex
-	all bool
 	set map[uint64]struct{}
 }
 
 func newDirtySet(ov *overlay.FS) *dirtySet {
-	d := &dirtySet{set: make(map[uint64]struct{})}
-	rep, err := ov.Dirty()
-	if err != nil {
-		d.all = true
-		return d
-	}
-	for _, n := range rep.Nodes {
-		d.set[n.Node.Inode] = struct{}{}
-	}
-	for _, e := range rep.Edges {
-		// The parent's namespace changed; the target (0 for a whiteout) is
-		// dirty in its own right.
-		d.set[e.Parent] = struct{}{}
-		if e.Inode != 0 {
-			d.set[e.Inode] = struct{}{}
-		}
-	}
-	for _, x := range rep.Xattrs {
-		d.set[x.Inode] = struct{}{}
-	}
-	for _, s := range rep.Symlinks {
-		d.set[s.Inode] = struct{}{}
-	}
-	for _, ino := range rep.Content {
-		d.set[ino] = struct{}{}
-	}
-	return d
+	return &dirtySet{ov: ov, set: make(map[uint64]struct{})}
 }
 
 func (d *dirtySet) has(ino uint64) bool {
 	d.mu.RLock()
-	defer d.mu.RUnlock()
-	if d.all {
+	_, ok := d.set[ino]
+	d.mu.RUnlock()
+	if ok {
 		return true
 	}
-	_, ok := d.set[ino]
-	return ok
+	dirty, err := d.ov.IsDirty(ino)
+	if err != nil {
+		return true
+	}
+	if dirty {
+		d.mark(ino)
+	}
+	return dirty
 }
 
-// mark records inodes as dirty. Callers mark BEFORE the mutation whenever
-// the inode number is already known, so no reply can slip out with an
-// infinite TTL between the change and the marking; a spurious mark from a
-// failed operation only costs TTL.
+// mark records inodes as dirty without consulting the overlay. Callers
+// mark BEFORE a mutation whenever the inode number is already known, so
+// no reply can slip out with an infinite TTL between the change and the
+// marking; a spurious mark from a failed operation only costs TTL.
 func (d *dirtySet) mark(inos ...uint64) {
 	d.mu.Lock()
 	defer d.mu.Unlock()

@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	mrand "math/rand"
 	"net/http/httptest"
 	"path/filepath"
@@ -1004,5 +1005,100 @@ func TestDirty(t *testing.T) {
 	}
 	if want := int64(len(fx.body["big.bin"]) + len(tail) + len(nBody)); s.StagedBytes != want {
 		t.Fatalf("staged bytes = %d, want %d", s.StagedBytes, want)
+	}
+}
+
+// The accessors exist to replace consumer workarounds; each is checked
+// against the behavior it replaces.
+func TestAccessors(t *testing.T) {
+	ctx := context.Background()
+	fx := newFixture(t, "acce5501-0000-4000-8000-000000000001")
+	ov := openOverlay(t, fx, t.TempDir())
+
+	// NextInode advances past created inodes and SURVIVES deletion — the
+	// tree-walk reconstruction seal used cannot see burned numbers.
+	start, err := ov.NextInode()
+	if err != nil {
+		t.Fatalf("NextInode: %v", err)
+	}
+	n, err := ov.Create(ctx, 1, "burned.txt", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ov.Unlink(ctx, 1, "burned.txt"); err != nil {
+		t.Fatal(err)
+	}
+	after, err := ov.NextInode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after <= start || after <= n.Inode {
+		t.Fatalf("NextInode = %d after burning inode %d (was %d); must never reuse", after, n.Inode, start)
+	}
+
+	// IsDirty: a clean base inode is clean, and writing it makes it dirty.
+	base := lookupPath(t, ov, "base.txt")
+	dirty, err := ov.IsDirty(base.Inode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dirty {
+		t.Fatal("untouched base inode reports dirty")
+	}
+	if _, err := ov.Write(ctx, base.Inode, 0, []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if dirty, err = ov.IsDirty(base.Inode); err != nil || !dirty {
+		t.Fatalf("written inode dirty=%v err=%v, want dirty", dirty, err)
+	}
+
+	// AllXattrs matches ListXattr+GetXattr, tombstones honored.
+	if err := ov.SetXattr(ctx, base.Inode, "user.a", []byte("1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := ov.SetXattr(ctx, base.Inode, "user.b", []byte("2")); err != nil {
+		t.Fatal(err)
+	}
+	if err := ov.RemoveXattr(ctx, base.Inode, "user.a"); err != nil {
+		t.Fatal(err)
+	}
+	all, err := ov.AllXattrs(ctx, base.Inode)
+	if err != nil {
+		t.Fatalf("AllXattrs: %v", err)
+	}
+	names, err := ov.ListXattr(ctx, base.Inode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != len(names) {
+		t.Fatalf("AllXattrs has %d entries, ListXattr %d", len(all), len(names))
+	}
+	if _, gone := all["user.a"]; gone {
+		t.Fatal("AllXattrs returned a tombstoned attribute")
+	}
+	if string(all["user.b"]) != "2" {
+		t.Fatalf("AllXattrs[user.b] = %q, want 2", all["user.b"])
+	}
+
+	// OpenFile streams the merged content exactly.
+	big, err := ov.Create(ctx, 1, "stream.bin", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := bytes.Repeat([]byte("streaming!"), 5000)
+	if _, err := ov.Write(ctx, big.Inode, 0, want); err != nil {
+		t.Fatal(err)
+	}
+	rc, err := ov.OpenFile(ctx, big.Inode, int64(len(want)))
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	defer rc.Close() //nolint:errcheck
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("stream read: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("streamed %d bytes, want %d", len(got), len(want))
 	}
 }

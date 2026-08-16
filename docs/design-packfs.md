@@ -463,12 +463,47 @@ compression). All tables WITHOUT ROWID where the key is natural.
   saves 8 bytes/row); holes in sparse files are rows with NULL identity
   and llen = hole length.
 - `inline(inode PK, data BLOB)` — separate table keeps node rows hot.
+  Inline data is stored RAW: the catalog file is itself zstd-compressed
+  as one pack entry, so per-row compression would only degrade the
+  catalog-level ratio (and the 36% measured compression already has
+  inline bytes dominating the input).
 - `xattr(inode, name, value)`; `symlink(inode PK, target)`.
 - Inode shards reuse node/chunkref/inline/xattr keyed purely by inode.
 - Dropped from the JuiceFS lineage: sessions, sustained inodes, flocks,
   plocks, delayed-slices, dir-stats (recomputable), counters (superblock
   owns them), trash, and ACL tables (POSIX ACLs out of scope for v2.0;
   xattrs can carry them opaquely).
+
+## Codec marking: every compression/encryption site, enumerated
+
+The CVMFS scar to avoid: bytes whose compression algorithm is implied by
+convention rather than recorded. Every place v2 transforms bytes, and
+where its algorithm lives:
+
+| bytes | compression | encryption | recorded where |
+|---|---|---|---|
+| chunk pack entries | zstd or none (store-if-smaller) | AES-256-GCM or none | `chunkref.alg` + `chunkref.keyid` columns, per entry |
+| catalog / shard / superblock-backup pack entries | always zstd | one volume key or none | fixed by rule + `superblock.catalog_key_id` (their references have no per-entry columns) |
+| pack trailer | zstd (PELFSPK2) or none (PELFSPK1) | never | footer magic versions the codec |
+| superblock | none | never (signed, public) | `format_version` field |
+| catalog SQLite | n/a (SQLite is self-describing for schema) | n/a | `catalog_meta` carries `format version` + `identity algo` — semantics are versioned even though the container describes itself |
+| inline rows | raw (see schema note) | rides inside the catalog entry | n/a |
+
+New algorithms are new ids (or a new footer magic); nothing is ever
+sniffed from magic bytes inside an entry.
+
+## Where decoded data is cached
+
+- **Phase 1 / v1 blocks:** the JuiceFS block cache (`CacheDir`) stores
+  block objects as they exist in the federation (post any v1
+  compression/encryption); packstore below it adds nothing.
+- **Phase 2 hydrated reads:** the hydrate layer caches DECODED chunks
+  (post-zstd, post-AES) keyed by chunk identity in the volume state
+  directory; the JuiceFS block cache above it additionally caches the
+  block objects it synthesizes from them. The double caching is an
+  accepted phase-2 cost.
+- **Phase 3:** one cache — decoded chunks keyed by identity — becomes
+  the only local data store.
 
 ## Benchmarks and acceptance criteria (v2)
 

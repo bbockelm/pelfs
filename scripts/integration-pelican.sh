@@ -8,6 +8,19 @@
 #
 # The pelican binary is located via $PELICAN_BIN, then PATH, then built from
 # $PELICAN_SRC (default ~/projects/pelican).
+#
+# XRootD: the federation this script starts never runs an XRootD process --
+# posixv2 is served in-process by pelican's own Go code. Pelican nevertheless
+# probes `xrootd -v` unconditionally at origin startup (CheckDefaults ->
+# xrootd.CheckXrootdEnv -> xrootd.CheckXrootdVersion; the check is NOT gated on
+# originUsesXRootD()), so a runner without XRootD sees
+#     Error: XRootD binary not found in PATH.
+# and the server dies before it listens. Rather than install a ~300MB storage
+# daemon that would never be executed, this script puts a stub `xrootd` on the
+# server's PATH that answers the version probe and REFUSES anything else, then
+# asserts afterwards that the probe was the only thing ever asked of it. The
+# stub is prepended, so it shadows any real XRootD on a developer machine too:
+# a local run exercises exactly the same code path CI does.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -50,7 +63,29 @@ else
 fi
 echo "== using pelican: $PELICAN_BIN =="
 
-mkdir -p "$WORK/origin-data" "$WORK/server-config" "$WORK/client-config"
+mkdir -p "$WORK/origin-data" "$WORK/server-config" "$WORK/client-config" "$WORK/xrootd-stub"
+
+# The stub `xrootd`. It records every invocation so the assertion at the end of
+# this script can prove the federation only ever probed the version and never
+# tried to run a storage daemon. Any invocation other than the bare `-v` probe
+# fails loudly instead of silently degrading into "XRootD is required after
+# all" -- which is the whole point of keeping a stub rather than a real install.
+XROOTD_STUB_LOG="$WORK/xrootd-stub-invocations.log"
+cat > "$WORK/xrootd-stub/xrootd" <<EOF
+#!/bin/sh
+# Stub XRootD, installed by scripts/integration-pelican.sh. See that script.
+printf '%s\n' "\$*" >> "$XROOTD_STUB_LOG"
+if [ "\$#" -eq 1 ] && [ "\$1" = "-v" ]; then
+  # Real xrootd prints its version to stderr; pelican reads CombinedOutput.
+  echo "v5.8.2" >&2
+  exit 0
+fi
+echo "pelfs integration: the federation tried to RUN XRootD (args: \$*)." >&2
+echo "This test is meant to be XRootD-free; see scripts/integration-pelican.sh." >&2
+exit 127
+EOF
+chmod +x "$WORK/xrootd-stub/xrootd"
+: > "$XROOTD_STUB_LOG"
 
 cat > "$WORK/pelican.yaml" <<EOF
 Logging:
@@ -82,6 +117,7 @@ fi
 sed 's/^/    /' "$WORK/pelican-version.txt" | head -3
 
 PELICAN_CONFIGDIR="$WORK/server-config" \
+PATH="$WORK/xrootd-stub:$PATH" \
   "$PELICAN_BIN" serve --module director,registry,origin --config "$WORK/pelican.yaml" \
   > "$WORK/server.log" 2>&1 &
 SERVER_PID=$!
@@ -102,6 +138,12 @@ dumpServerLog() {
   else
     echo "    (empty or missing — the process wrote nothing)"
     ls -la "$WORK" | sed 's/^/    /'
+  fi
+  echo "--- xrootd stub invocations ---"
+  if [ -s "$XROOTD_STUB_LOG" ]; then
+    sed 's/^/    xrootd /' "$XROOTD_STUB_LOG"
+  else
+    echo "    (none — the server died before probing XRootD)"
   fi
   echo "--- config ---"
   sed 's/^/    /' "$WORK/pelican.yaml"
@@ -153,5 +195,19 @@ PELICAN_TRANSPORT_RESPONSEHEADERTIMEOUT=60s \
 # means the cache is being bypassed.
 echo "== director queries issued by the client: $(grep -c "Will query director at" "$WORK/gotest.log" || true) =="
 
+# Prove the claim in the header: the only thing the federation ever wanted from
+# XRootD was the version string. Anything else in the log means a real XRootD
+# dependency crept back in and the stub is now hiding it.
+# Count rather than test grep's exit status: `grep -vq` reports whether the
+# PATTERN matched, not whether any line was selected, under the ugrep-flavored
+# /usr/bin/grep some developers have installed -- which silently inverted this
+# check into a no-op.
+NON_PROBE=$(grep -cvx -- '-v' "$XROOTD_STUB_LOG" || true)
+if [ "${NON_PROBE:-0}" -ne 0 ]; then
+  echo "FAIL: the federation invoked XRootD for something other than the version probe:"
+  sed 's/^/    xrootd /' "$XROOTD_STUB_LOG"
+  exit 1
+fi
+echo "== XRootD invocations (all version probes): $(wc -l < "$XROOTD_STUB_LOG" | tr -d ' ') =="
 
 echo "== PASS: integration tests against real pelican federation =="

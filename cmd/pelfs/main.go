@@ -52,6 +52,8 @@ func main() {
 		code = cmdGC(os.Args[2:])
 	case "repack":
 		code = cmdRepack(os.Args[2:])
+	case "publish":
+		code = cmdPublish(os.Args[2:])
 	case "fsck":
 		code = cmdFsck(os.Args[2:])
 	case "-h", "--help", "help":
@@ -74,6 +76,7 @@ Usage:
   pelfs status                                           list background mounts
   pelfs gc     [flags] [--delete] <prefix>               collect leaked blocks
   pelfs repack [flags] <prefix>                          reclaim dead pack space
+  pelfs publish [flags] <prefix>                         publish a v2 generation (experimental)
   pelfs fsck   [flags] <prefix>                          verify referenced blocks
 
 Common flags:

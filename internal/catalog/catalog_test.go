@@ -267,3 +267,42 @@ func TestCreateRefusesExisting(t *testing.T) {
 		t.Error("Create over an existing catalog succeeded, want error (write-once)")
 	}
 }
+
+// ReaddirPlus must agree with Readdir+Stat exactly — it exists only to
+// collapse those 1+N pager round trips into one join.
+func TestReaddirPlusMatchesReaddirStat(t *testing.T) {
+	c, err := Open(buildTestCatalog(t))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer c.Close()
+
+	dirents, _, err := c.Readdir(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plus, err := c.ReaddirPlus(1)
+	if err != nil {
+		t.Fatalf("ReaddirPlus: %v", err)
+	}
+	if len(plus) != len(dirents) {
+		t.Fatalf("ReaddirPlus returned %d entries, Readdir %d", len(plus), len(dirents))
+	}
+	for i, d := range dirents {
+		if !bytes.Equal(plus[i].Name, d.Name) {
+			t.Fatalf("entry %d name %q, want %q (both sorted by name)", i, plus[i].Name, d.Name)
+		}
+		want, err := c.Stat(d.Inode)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if plus[i].Node != want {
+			t.Fatalf("entry %q node = %+v, want %+v", d.Name, plus[i].Node, want)
+		}
+	}
+	// A directory with no ordinary entries yields none (transition-only
+	// parents must not error).
+	if got, err := c.ReaddirPlus(9999); err != nil || len(got) != 0 {
+		t.Fatalf("ReaddirPlus(absent) = %v, %v; want empty, nil", got, err)
+	}
+}

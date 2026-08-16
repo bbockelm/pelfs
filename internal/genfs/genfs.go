@@ -328,17 +328,15 @@ func (fs *FS) Readdir(ctx context.Context, ino uint64) ([]DirEntry, error) {
 		return nil, err
 	}
 	defer release()
-	dirents, _, err := cat.Readdir(int64(ino))
+	// One join instead of 1+N pager round trips: the kernel's readdirplus
+	// wants names and attributes together anyway.
+	plus, err := cat.ReaddirPlus(int64(ino))
 	if err != nil {
 		return nil, err
 	}
-	out := make([]DirEntry, 0, len(dirents))
-	for _, d := range dirents {
-		n, err := cat.Stat(d.Inode)
-		if err != nil {
-			return nil, fmt.Errorf("genfs: readdir %d: node row for %q: %w", ino, d.Name, err)
-		}
-		out = append(out, DirEntry{Name: string(d.Name), Node: nodeOf(n)})
+	out := make([]DirEntry, 0, len(plus))
+	for _, e := range plus {
+		out = append(out, DirEntry{Name: string(e.Name), Node: nodeOf(e.Node)})
 	}
 	return out, nil
 }

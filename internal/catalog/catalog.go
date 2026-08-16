@@ -342,6 +342,7 @@ type Catalog struct {
 	stLookupNested  *sql.Stmt
 	stReaddirEdges  *sql.Stmt
 	stReaddirNested *sql.Stmt
+	stReaddirPlus   *sql.Stmt
 	stStat          *sql.Stmt
 	stChunks        *sql.Stmt
 	stInline        *sql.Stmt
@@ -358,7 +359,10 @@ func Open(path string) (*Catalog, error) {
 	if _, err := os.Stat(path); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=query_only(1)")
+	// cache_size is negative = KiB: catalogs are bounded by SMax (8 MiB)
+	// by construction, so the whole file fits in the pager and a cold
+	// readdir stops pread-storming (87% of Readdir CPU was syscalls).
+	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=query_only(1)&_pragma=cache_size(-16384)")
 	if err != nil {
 		return nil, err
 	}
@@ -387,6 +391,7 @@ func (c *Catalog) prepare() error {
 		{&c.stLookupNested, `SELECT catalog_identity FROM nested WHERE parent = ? AND name = ?`},
 		{&c.stReaddirEdges, `SELECT name, inode, type FROM edge WHERE parent = ? ORDER BY name`},
 		{&c.stReaddirNested, `SELECT name, catalog_identity FROM nested WHERE parent = ? ORDER BY name`},
+		{&c.stReaddirPlus, `SELECT e.name, n.inode, n.type, n.mode, n.uid, n.gid, n.mtime_ns, n.ctime_ns, n.nlink, n.length, n.rdev, n.keyid, n.flags FROM edge e JOIN node n ON n.inode = e.inode WHERE e.parent = ? ORDER BY e.name`},
 		{&c.stStat, `SELECT inode, type, mode, uid, gid, mtime_ns, ctime_ns, nlink, length, rdev, keyid, flags FROM node WHERE inode = ?`},
 		{&c.stChunks, `SELECT identity, llen, clen, alg, keyid FROM chunkref WHERE inode = ? ORDER BY idx`},
 		{&c.stInline, `SELECT data FROM inline WHERE inode = ?`},
@@ -613,3 +618,33 @@ func (c *Catalog) Symlink(inode int64) ([]byte, error) {
 
 // Close releases the underlying database.
 func (c *Catalog) Close() error { return c.db.Close() }
+
+// DirentNode pairs a directory entry with its full node row.
+type DirentNode struct {
+	Name []byte
+	Node Node
+}
+
+// ReaddirPlus lists a directory's ordinary entries WITH their attributes
+// in one query. The FUSE readdirplus path needs both, and issuing a
+// per-entry Stat turned one directory read into 1+N pager round trips.
+// Transition points are not included — Readdir's nested half still
+// reports them (they resolve in the child catalog).
+func (c *Catalog) ReaddirPlus(parent int64) ([]DirentNode, error) {
+	rows, err := c.stReaddirPlus.Query(parent)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close() //nolint:errcheck
+	var out []DirentNode
+	for rows.Next() {
+		var e DirentNode
+		if err := rows.Scan(&e.Name, &e.Node.Inode, &e.Node.Type, &e.Node.Mode,
+			&e.Node.UID, &e.Node.GID, &e.Node.MtimeNS, &e.Node.CtimeNS,
+			&e.Node.Nlink, &e.Node.Length, &e.Node.Rdev, &e.Node.KeyID, &e.Node.Flags); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}

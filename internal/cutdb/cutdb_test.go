@@ -208,3 +208,23 @@ func edgesInode(t *testing.T, db *DB, parent uint64, name string) uint64 {
 	}
 	return found
 }
+
+func TestCounter(t *testing.T) {
+	metaPath, _, _, fileIno := buildVolume(t, []byte("x"))
+	db, err := Open(metaPath, Options{})
+	if err != nil {
+		t.Fatalf("open cut: %v", err)
+	}
+	defer db.Close() //nolint:errcheck
+	v, err := db.Counter("nextInode")
+	if err != nil {
+		t.Fatalf("Counter: %v", err)
+	}
+	// The allocator must be beyond every inode the volume handed out.
+	if uint64(v) <= fileIno {
+		t.Fatalf("nextInode = %d, want > %d", v, fileIno)
+	}
+	if _, err := db.Counter("no-such-counter"); err == nil {
+		t.Fatal("missing counter did not error")
+	}
+}

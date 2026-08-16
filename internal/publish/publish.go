@@ -715,10 +715,14 @@ func (p *pipeline) buildSuperblock(newPacks []packstore.SealedPack, shards []sup
 		packList = append(packList, superblock.PackEntry{Name: sp.Name, TrailerHash: sp.TrailerHash, Size: sp.Size})
 	}
 	// The cut does not expose the allocator counter, so the high-water mark
-	// is reconstructed as max-inode-seen + 1, never regressing below the
-	// previous generation's (crash-burned numbers stay burned). TODO: read
-	// the real counter once cutdb exposes it.
+	// prefers the cut's real allocator counter; the max-inode-seen
+	// fallback covers only a counter table the engine has not written
+	// yet. Never regress below the previous generation's (crash-burned
+	// numbers stay burned).
 	nextInode := p.maxInode + 1
+	if v, err := p.db.Counter("nextInode"); err == nil && uint64(v) > nextInode {
+		nextInode = uint64(v)
+	}
 	if p.o.Prev != nil && p.o.Prev.NextInode > nextInode {
 		nextInode = p.o.Prev.NextInode
 	}

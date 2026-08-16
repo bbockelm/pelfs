@@ -276,6 +276,29 @@ func (s *Store) applyTrailer(packName string, tr *trailer) {
 // which both self-heals the mount and tells us whether the object itself
 // is intact.
 func (s *Store) fetchTrailer(ctx context.Context, name string, size int64) (*trailer, int64, error) {
+	return fetchTrailer(ctx, s.inner, name, size)
+}
+
+// FetchTrailer reads and parses one pack trailer directly from a transport
+// (no Store needed): the v2 restore path resolves identities from a
+// GENERATION pack list, not a directory listing, and rescue inventories
+// packs the same way. A non-positive size is looked up with a stat.
+func FetchTrailer(ctx context.Context, inner pelicanobj.Store, name string, size int64) ([]PackEntry, error) {
+	if size <= 0 {
+		ki, err := inner.StatKey(ctx, PackDirKey+"/"+name)
+		if err != nil {
+			return nil, fmt.Errorf("stat pack %s: %w", name, err)
+		}
+		size = ki.Size
+	}
+	tr, _, err := fetchTrailer(ctx, inner, name, size)
+	if err != nil {
+		return nil, fmt.Errorf("pack %s: %w", name, err)
+	}
+	return tr.Entries, nil
+}
+
+func fetchTrailer(ctx context.Context, inner pelicanobj.Store, name string, size int64) (*trailer, int64, error) {
 	if size < footerSize {
 		return nil, 0, fmt.Errorf("pack too small (%d bytes)", size)
 	}
@@ -283,11 +306,11 @@ func (s *Store) fetchTrailer(ctx context.Context, name string, size int64) (*tra
 	if probe > size {
 		probe = size
 	}
-	tail, err := s.readRange(ctx, s.packKey(name), size-probe, probe)
+	tail, err := readRangeFrom(ctx, inner, PackDirKey+"/"+name, size-probe, probe)
 	if err != nil {
 		return nil, 0, err
 	}
-	tr, idxLen, terr := s.parseTail(ctx, name, size, tail)
+	tr, idxLen, terr := parseTail(ctx, inner, name, size, tail)
 	if terr == nil {
 		return tr, idxLen, nil
 	}
@@ -295,9 +318,9 @@ func (s *Store) fetchTrailer(ctx context.Context, name string, size int64) (*tra
 	// end. Success here means the object is fine and the RANGE read lied
 	// (wrong bytes or wrong length) — report that loudly, because every
 	// chunk read depends on ranges working.
-	whole, werr := s.readRange(ctx, s.packKey(name), 0, size)
+	whole, werr := readRangeFrom(ctx, inner, PackDirKey+"/"+name, 0, size)
 	if werr == nil && int64(len(whole)) == size {
-		if tr, idxLen, ferr := s.parseTail(ctx, name, size, whole); ferr == nil {
+		if tr, idxLen, ferr := parseTail(ctx, inner, name, size, whole); ferr == nil {
 			fmt.Fprintf(os.Stderr,
 				"pelfs: WARNING: pack %s: tail range read returned invalid bytes (%v) but the full object is intact — a transport in the path is mishandling Range requests; reads may be unreliable\n",
 				name, terr)
@@ -314,7 +337,7 @@ func (s *Store) fetchTrailer(ctx context.Context, name string, size int64) (*tra
 
 // parseTail validates and parses a trailer from buf, which is the final
 // portion of a pack of the given total size.
-func (s *Store) parseTail(ctx context.Context, name string, size int64, buf []byte) (*trailer, int64, error) {
+func parseTail(ctx context.Context, inner pelicanobj.Store, name string, size int64, buf []byte) (*trailer, int64, error) {
 	if len(buf) < footerSize {
 		return nil, 0, fmt.Errorf("bad pack magic")
 	}
@@ -331,7 +354,7 @@ func (s *Store) parseTail(ctx context.Context, name string, size int64, buf []by
 	if idxLen+footerSize <= int64(len(buf)) {
 		stored = buf[int64(len(buf))-footerSize-idxLen : int64(len(buf))-footerSize]
 	} else {
-		stored, err = s.readRange(ctx, s.packKey(name), size-footerSize-idxLen, idxLen)
+		stored, err = readRangeFrom(ctx, inner, PackDirKey+"/"+name, size-footerSize-idxLen, idxLen)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -344,7 +367,11 @@ func (s *Store) parseTail(ctx context.Context, name string, size int64, buf []by
 }
 
 func (s *Store) readRange(ctx context.Context, key string, off, length int64) ([]byte, error) {
-	rc, err := s.inner.Get(ctx, key, off, length)
+	return readRangeFrom(ctx, s.inner, key, off, length)
+}
+
+func readRangeFrom(ctx context.Context, inner pelicanobj.Store, key string, off, length int64) ([]byte, error) {
+	rc, err := inner.Get(ctx, key, off, length)
 	if err != nil {
 		return nil, err
 	}

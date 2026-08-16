@@ -11,6 +11,7 @@ package cutdb
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"io"
 	"syscall"
@@ -20,6 +21,7 @@ import (
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/prometheus/client_golang/prometheus"
+	_ "modernc.org/sqlite" // direct read-only access to counters
 )
 
 // Node is the subset of JuiceFS attributes the v2 catalog schema persists
@@ -54,6 +56,7 @@ type DB struct {
 	format    *meta.Format
 	store     chunk.ChunkStore
 	chunkSize uint64
+	metaPath  string
 }
 
 // Options configures Open.
@@ -82,7 +85,7 @@ func Open(metaPath string, o Options) (*DB, error) {
 	if err := m.NewSession(false); err != nil {
 		return nil, fmt.Errorf("cut metadata session: %w", err)
 	}
-	db := &DB{m: m, format: format, chunkSize: uint64(meta.ChunkSize)}
+	db := &DB{m: m, format: format, chunkSize: uint64(meta.ChunkSize), metaPath: metaPath}
 	if o.Blob != nil {
 		cc := chunk.Config{
 			BlockSize:  format.BlockSize * 1024,
@@ -118,6 +121,25 @@ func (db *DB) Format() *meta.Format { return db.format }
 
 // RootInode is the tree root of every JuiceFS volume.
 const RootInode = uint64(meta.RootInode)
+
+// Counter reads one allocator counter (e.g. "nextInode", "nextChunk")
+// straight from the cut database. The meta interface exposes no counter
+// getter, and publish needs the REAL high-water mark: reconstructing it
+// as max-inode-seen loses numbers burned by files deleted before the
+// cut, and inode reuse across generations would break the stable-inode
+// contract.
+func (db *DB) Counter(name string) (int64, error) {
+	sq, err := sql.Open("sqlite", "file:"+db.metaPath+"?mode=ro")
+	if err != nil {
+		return 0, err
+	}
+	defer sq.Close() //nolint:errcheck
+	var v int64
+	if err := sq.QueryRow(`SELECT value FROM jfs_counter WHERE name = ?`, name).Scan(&v); err != nil {
+		return 0, fmt.Errorf("counter %q: %w", name, err)
+	}
+	return v, nil
+}
 
 // Walk visits every edge reachable from the root in breadth-first order:
 // fn(parent, name, node) for each directory entry. Attributes ride along

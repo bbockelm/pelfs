@@ -99,7 +99,7 @@ func cmdShell(args []string) int {
 		if len(command) > 0 {
 			return exitErr(errors.New("the Docker fallback cannot run a `-- command`; start the container shell and run it there"))
 		}
-		return runInDocker(o, prefix)
+		return runInDocker(o, prefix, engine, branch)
 	}
 	o.mountBackend = backend
 	code, err := runShellNative(o, prefix, command)
@@ -247,7 +247,7 @@ func mountOptions(s *session) mountfs.Options {
 	}
 }
 
-func runInDocker(o *cmdOpts, prefix string) int {
+func runInDocker(o *cmdOpts, prefix, engine, branch string) int {
 	// Run the access preflight on the HOST before launching the container:
 	// any interactive token acquisition (device flow, wallet password)
 	// happens where the user's browser and existing credential store live,
@@ -272,7 +272,30 @@ func runInDocker(o *cmdOpts, prefix string) int {
 		}
 	}
 
+	// The engine choice must travel with the invocation. Without it the
+	// in-container pelfs re-decided from scratch, and on an empty prefix
+	// that meant creating a v2 volume and then failing to mount it --
+	// the fallback image has no fusermount. The fallback runs v1, so an
+	// `auto` here resolves to v1 explicitly rather than being re-guessed
+	// inside; but v1 must never be pointed at a v2 volume, where it
+	// would write JuiceFS metadata into a catalog-native namespace.
+	innerEngine := engine
+	if innerEngine == "" || innerEngine == "auto" {
+		switch kind, err := classifyVolume(o, prefix, branch); {
+		case err != nil:
+			fmt.Fprintf(os.Stderr, "pelfs: could not classify %s (%v); using the v1 engine\n", prefix, err)
+			innerEngine = "v1"
+		case kind == volumeV2:
+			return exitErr(fmt.Errorf("%s holds a v2 volume, which only the catalog-native engine can serve, "+
+				"and the Docker fallback image has no FUSE; install macFUSE to mount natively, or use --backend nfs", prefix))
+		default:
+			innerEngine = "v1"
+		}
+	}
+
 	extra := []string{
+		"--engine", innerEngine,
+		"--branch", branch,
 		"--snapshot-interval", o.snapshotInterval.String(),
 		"--keep-sessions", fmt.Sprint(o.keepSessions),
 		"--cache-size", fmt.Sprint(o.cacheSizeMiB),

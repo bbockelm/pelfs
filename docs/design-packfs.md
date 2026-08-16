@@ -277,6 +277,18 @@ at full strength for all data and all metadata; `?directread` is needed
 only for the superblock (and the advisory lease, which no reader touches —
 see the concurrency section).
 
+That "only" is a trap, and we fell into it. Because the direct-read
+requirement applies to just two objects, it was originally satisfied at
+each call site — and an audit found three of four `refs.New` callers
+passing a cache-served store, including the mount itself. The symptom on a
+real federation was not a stale read but an md5 mismatch on `refs/main`: a
+cache that mis-reports object length returns a truncated body, so a
+caching bug arrives disguised as corruption. The invariant now lives
+inside `refs.New` and `lease.Acquire`, which switch any store they are
+handed to its direct variant (`pelicanobj.DirectReader`). Rule of thumb:
+an invariant that holds for exactly the objects one package owns belongs
+inside that package, not in its callers' heads.
+
 ## Concurrency: CAS is the guard, the lease is a courtesy
 
 The volume has exactly **two** mutable objects, with disjoint roles:

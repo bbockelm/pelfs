@@ -247,9 +247,12 @@ ORIGIN2_PID=$!
 mkdir -p "$WORK/origin2"
 for _ in $(seq 50); do curl -fsS "http://127.0.0.1:18998/" >/dev/null 2>&1 && break; sleep 0.1; done
 NEWPREFIX="http://127.0.0.1:18998/fresh"
+# `set -e` aborts the script the moment this command fails, so capturing
+# $? on the next line never runs and CI reports a bare "exit 1" with no
+# reason. Take the status inline instead.
+fresh_status=0
 "$WORK/pelfs" shell --state-dir "$WORK/state-fresh" "$NEWPREFIX" -- \
-  sh -c 'echo hello > greeting.txt; mkdir -p sub' > "$WORK/fresh.log" 2>&1
-fresh_status=$?
+  sh -c 'echo hello > greeting.txt; mkdir -p sub' > "$WORK/fresh.log" 2>&1 || fresh_status=$?
 [ "$fresh_status" = "0" ] || { echo "shell on empty prefix failed ($fresh_status):" >&2; sed 's/^/    /' "$WORK/fresh.log" | tail -8; exit 1; }
 grep -q "created volume" "$WORK/fresh.log" || { echo "shell did not CREATE a volume:" >&2; sed 's/^/    /' "$WORK/fresh.log" | tail -8; exit 1; }
 grep -q "catalog-native engine" "$WORK/fresh.log" || { echo "new volume was not native:" >&2; sed 's/^/    /' "$WORK/fresh.log" | tail -8; exit 1; }

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"lukechampine.com/blake3"
@@ -124,4 +126,19 @@ func (w *PackWriter) Abort() {
 		_ = os.Remove(w.f.Name())
 		w.f = nil
 	}
+}
+
+// PackNameTime extracts the creation timestamp embedded in a pack name
+// (p-<unixnano hex>-<rand>). GC's age guard rests on this: packs young by
+// name are never deletion candidates, which is what makes the sweep safe
+// against concurrent writers without coordination.
+func PackNameTime(name string) (time.Time, bool) {
+	if !strings.HasPrefix(name, "p-") || len(name) < 18 {
+		return time.Time{}, false
+	}
+	ns, err := strconv.ParseUint(name[2:18], 16, 64)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return time.Unix(0, int64(ns)), true
 }

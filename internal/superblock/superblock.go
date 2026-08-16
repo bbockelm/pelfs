@@ -57,6 +57,18 @@ type PackEntry struct {
 	Size        int64    `cbor:"size"`
 }
 
+// CondemnedPack records a pack repack removed from the pack list: the
+// name and when it was condemned. Publish carries entries forward until
+// they age past Params.TGraceSeconds, then drops them; GC retains
+// condemned packs younger than the grace window so readers pinned to a
+// recent anonymous generation keep their packs
+// (docs/design-packfs.md, "Retention and GC"). This replaces walking
+// lineage ancestors, whose superblocks are not reliably fetchable.
+type CondemnedPack struct {
+	Name            string `cbor:"name"`
+	CondemnedAtUnix int64  `cbor:"condemned_at_unix"`
+}
+
 // ShardEntry routes one inode-range shard holding promoted (nlink > 1)
 // records. Ranges are inclusive and must not overlap; the shard body is
 // the content-addressed blob named by Identity.
@@ -112,6 +124,9 @@ type Superblock struct {
 	NextInode   uint64       `cbor:"next_inode"`
 	Params      Params       `cbor:"params"`
 	KeyTable    []KeyEntry   `cbor:"key_table"`
+	// Condemned lists recently repacked-away packs still inside the GC
+	// grace window (omitempty per the evolution rule below).
+	Condemned []CondemnedPack `cbor:"condemned,omitempty"`
 
 	// SigningPub is informational — it names the key that produced
 	// Signature so tooling can report custody, but Verify never trusts it

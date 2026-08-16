@@ -83,9 +83,15 @@ type Fetched struct {
 
 func refKey(branch string) string { return RefDirKey + "/" + branch }
 
-func (s *Store) pinPath(branch string) string {
-	return filepath.Join(s.stateDir, "refs", branch+".pub")
+// The pin is VOLUME-level, not per-branch: every branch and tag of a
+// volume is signed by the one volume identity. A per-branch pin would
+// hand an attacker a fresh TOFU on every branch name they invent.
+func (s *Store) pinPath() string {
+	return filepath.Join(s.stateDir, "refs", "volume.pub")
 }
+
+// lastPath is per-branch: custody-chain rotation is verified against the
+// last superblock this client accepted on that branch's lineage.
 func (s *Store) lastPath(branch string) string {
 	return filepath.Join(s.stateDir, "refs", branch+".sb")
 }
@@ -95,8 +101,10 @@ func (s *Store) lastPath(branch string) string {
 //
 //  1. An explicitly supplied key must verify directly — no TOFU, no
 //     rotation shortcut (an explicit key is a statement of intent).
-//  2. A pinned key verifies directly, or via one custody-chain step from
-//     the last accepted superblock (which advances the pin).
+//  2. The pinned volume key verifies directly, or via one custody-chain
+//     step from the last accepted superblock of this branch — which
+//     REPLACES the pin: the old key is retired, and sibling branches
+//     still signed by it fail until republished with the new key.
 //  3. No pin yet: trust-on-first-use — pin the embedded key, loudly.
 func (s *Store) Fetch(ctx context.Context, branch string) (*Fetched, error) {
 	if strings.ContainsAny(branch, "/\\") {
@@ -118,7 +126,7 @@ func (s *Store) Fetch(ctx context.Context, branch string) (*Fetched, error) {
 		return &Fetched{Superblock: sb, Raw: raw, ETag: etag}, nil
 	}
 
-	pinned, err := s.readPin(branch)
+	pinned, err := s.readPin()
 	if err != nil {
 		return nil, err
 	}
@@ -126,8 +134,8 @@ func (s *Store) Fetch(ctx context.Context, branch string) (*Fetched, error) {
 		// TOFU: nothing pinned yet. Loud, because this is the one moment
 		// an active attacker could substitute a key undetected.
 		fmt.Fprintf(os.Stderr,
-			"pelfs: pinning volume key %s for branch %q on first use; verify the fingerprint out of band if this volume is shared\n",
-			hex.EncodeToString(sb.SigningPub[:]), branch)
+			"pelfs: pinning volume key %s on first use; verify the fingerprint out of band if this volume is shared\n",
+			hex.EncodeToString(sb.SigningPub[:]))
 		if err := sb.Verify(ed25519.PublicKey(sb.SigningPub[:])); err != nil {
 			return nil, fmt.Errorf("ref %s: %w", branch, err)
 		}
@@ -144,7 +152,7 @@ func (s *Store) Fetch(ctx context.Context, branch string) (*Fetched, error) {
 		return &Fetched{Superblock: sb, Raw: raw, ETag: etag}, nil
 	}
 	// Direct verification failed: accept only a custody-chain step from
-	// the last superblock this client accepted.
+	// the last superblock this client accepted on this branch.
 	prevRaw, err := os.ReadFile(s.lastPath(branch))
 	if err != nil {
 		return nil, fmt.Errorf("ref %s: %w (no prior generation on record to rotate from)", branch, ErrUntrusted)
@@ -152,8 +160,8 @@ func (s *Store) Fetch(ctx context.Context, branch string) (*Fetched, error) {
 	if err := superblock.VerifyChain(prevRaw, sb, pinned); err != nil {
 		return nil, fmt.Errorf("ref %s: %w: %w", branch, ErrUntrusted, err)
 	}
-	fmt.Fprintf(os.Stderr, "pelfs: branch %q rotated its signing key to %s (announced by the previous generation)\n",
-		branch, hex.EncodeToString(sb.SigningPub[:]))
+	fmt.Fprintf(os.Stderr, "pelfs: volume signing key rotated to %s (announced by branch %q's previous generation)\n",
+		hex.EncodeToString(sb.SigningPub[:]), branch)
 	if err := s.persist(branch, sb.SigningPub[:], raw); err != nil {
 		return nil, err
 	}
@@ -214,14 +222,14 @@ func (s *Store) FetchTag(ctx context.Context, name string) (*superblock.Superblo
 	}
 	key := s.trusted
 	if key == nil {
-		// Any branch pin of this volume vouches for a tag; try them all.
-		pins, _ := filepath.Glob(filepath.Join(s.stateDir, "refs", "*.pub"))
-		for _, p := range pins {
-			if k, err := readKeyFile(p); err == nil && sb.Verify(k) == nil {
-				return sb, raw, nil
-			}
+		pinned, err := s.readPin()
+		if err != nil {
+			return nil, nil, err
 		}
-		return nil, nil, fmt.Errorf("tag %s: %w (no pinned key verifies it)", name, ErrUntrusted)
+		if pinned == nil {
+			return nil, nil, fmt.Errorf("tag %s: %w (no volume key pinned; fetch a branch first or supply --volume-pubkey)", name, ErrUntrusted)
+		}
+		key = pinned
 	}
 	if err := sb.Verify(key); err != nil {
 		return nil, nil, fmt.Errorf("tag %s: %w: %w", name, ErrUntrusted, err)
@@ -249,8 +257,8 @@ func (s *Store) read(ctx context.Context, key string) ([]byte, string, error) {
 	return raw, etag, nil
 }
 
-func (s *Store) readPin(branch string) (ed25519.PublicKey, error) {
-	k, err := readKeyFile(s.pinPath(branch))
+func (s *Store) readPin() (ed25519.PublicKey, error) {
+	k, err := readKeyFile(s.pinPath())
 	if os.IsNotExist(err) {
 		return nil, nil
 	}
@@ -269,9 +277,10 @@ func readKeyFile(path string) (ed25519.PublicKey, error) {
 	return k, nil
 }
 
-// persist atomically records the pinned key and last accepted superblock.
+// persist atomically records the volume pin and the branch's last
+// accepted superblock.
 func (s *Store) persist(branch string, pub []byte, raw []byte) error {
-	if err := writeAtomic(s.pinPath(branch), []byte(hex.EncodeToString(pub)+"\n")); err != nil {
+	if err := writeAtomic(s.pinPath(), []byte(hex.EncodeToString(pub)+"\n")); err != nil {
 		return err
 	}
 	return writeAtomic(s.lastPath(branch), raw)

@@ -1,14 +1,18 @@
 // Package rawfuse is the phase-3 raw FUSE binding (docs/design-packfs.md,
 // "Phase 3 VFS architecture"): fuse.RawFileSystem mapped 1:1 onto the genfs
-// generation resolver. Read-only in this iteration — the write overlay is a
-// separate layer — so every mutating op returns EROFS (the op is understood
-// and refused, not unimplemented).
+// generation resolver (Bind, read-only) or onto the write overlay over that
+// generation (BindRW, read-write). A read-only binding answers EROFS to
+// every mutating op — the op is understood and refused, not unimplemented.
 //
-// The immutability dividend: within a generation clean inodes never change,
-// so every EntryOut/AttrOut carries an effectively infinite validity and the
-// kernel is the dentry/attr cache. Residency is FORGET-driven: Lookup (and
-// each entry a ReadDirPlus emits) counts as one nlookup against genfs;
-// Forget retires it. Plain ReadDir creates no residency.
+// The immutability dividend: within a generation CLEAN inodes never change,
+// so their EntryOut/AttrOut carry an effectively infinite validity and the
+// kernel is the dentry/attr cache. DIRTY inodes — anything the overlay has
+// touched — carry ZERO validity so the kernel re-asks on every reference.
+// That split is the load-bearing correctness rule of the design.
+//
+// Residency is FORGET-driven: Lookup (and each entry a ReadDirPlus emits)
+// counts as one nlookup against the base; Forget retires it. Plain ReadDir
+// creates no residency.
 package rawfuse
 
 import (
@@ -23,39 +27,72 @@ import (
 
 	"github.com/bbockelm/pelfs/internal/catalog"
 	"github.com/bbockelm/pelfs/internal/genfs"
+	"github.com/bbockelm/pelfs/internal/overlay"
 )
 
-// entryValidity is the entry/attr TTL stamped on every reply: ~10 years,
-// effectively infinite. Clean inodes never change within a generation; a
-// generation swap invalidates by notification, not by TTL expiry.
+// entryValidity is the entry/attr TTL stamped on every CLEAN reply: ~10
+// years, effectively infinite. Clean inodes never change within a
+// generation; a generation swap invalidates by notification, not by TTL
+// expiry.
 const entryValidity = 10 * 365 * 24 * time.Hour
 
 // errStale maps genfs.ErrStale: the kernel references an inode it never
 // looked up (or already forgot).
 var errStale = fuse.Status(syscall.ESTALE)
 
-// Bind wraps a genfs generation as a raw FUSE filesystem.
-func Bind(fs *genfs.FS) fuse.RawFileSystem {
-	return &raw{
-		RawFileSystem: fuse.NewDefaultRawFileSystem(),
-		fs:            fs,
-		dirs:          make(map[uint64]*dirHandle),
-	}
+// reader is the read surface both layers implement: genfs.FS over a clean
+// generation and overlay.FS over the merged view. overlay's Node/DirEntry
+// are aliases of the genfs types, so one shape serves both.
+type reader interface {
+	Lookup(ctx context.Context, parent uint64, name string) (genfs.Node, error)
+	GetAttr(ctx context.Context, ino uint64) (genfs.Node, error)
+	Readdir(ctx context.Context, ino uint64) ([]genfs.DirEntry, error)
+	Readlink(ctx context.Context, ino uint64) (string, error)
+	GetXattr(ctx context.Context, ino uint64, name string) ([]byte, error)
+	ListXattr(ctx context.Context, ino uint64) ([]string, error)
+	Read(ctx context.Context, ino uint64, off int64, dst []byte) (int, error)
+	Forget(ino uint64, nlookup uint64)
 }
 
-// Mount serves fs at mountpoint (Linux FUSE / macFUSE) and returns the
-// running server once the mount is complete.
+// Bind wraps a genfs generation as a read-only raw FUSE filesystem.
+func Bind(fs *genfs.FS) fuse.RawFileSystem {
+	return newRaw(fs, nil)
+}
+
+func newRaw(rd reader, ov *overlay.FS) *raw {
+	r := &raw{
+		RawFileSystem: fuse.NewDefaultRawFileSystem(),
+		fs:            rd,
+		ov:            ov,
+		dirs:          make(map[uint64]*dirHandle),
+	}
+	if ov != nil {
+		r.dirty = newDirtySet(ov)
+	}
+	return r
+}
+
+// Mount serves fs at mountpoint (Linux FUSE / macFUSE) read-only and
+// returns the running server once the mount is complete.
 func Mount(mountpoint string, fs *genfs.FS, debug bool) (*fuse.Server, error) {
+	return mount(mountpoint, Bind(fs), debug, true)
+}
+
+func mount(mountpoint string, rfs fuse.RawFileSystem, debug, readOnly bool) (*fuse.Server, error) {
+	// Access stays ENOSYS: with default_permissions the kernel checks
+	// permissions itself from the attrs it already holds.
+	options := []string{"default_permissions"}
+	if readOnly {
+		options = append([]string{"ro"}, options...)
+	}
 	opts := &fuse.MountOptions{
 		AllowOther: false,
 		FsName:     "pelfs",
 		Name:       "pelfs",
 		Debug:      debug,
-		// Access stays ENOSYS: with default_permissions the kernel checks
-		// permissions itself from the (infinitely cached) attrs.
-		Options: []string{"ro", "default_permissions"},
+		Options:    options,
 	}
-	srv, err := fuse.NewServer(Bind(fs), mountpoint, opts)
+	srv, err := fuse.NewServer(rfs, mountpoint, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -74,11 +111,16 @@ type dirHandle struct {
 	entries []genfs.DirEntry
 }
 
-// raw binds genfs to the raw FUSE protocol. Ops not implemented here come
-// from NewDefaultRawFileSystem (ENOSYS), except the mutating set below.
+// raw binds one layer to the raw FUSE protocol. Ops not implemented here
+// come from NewDefaultRawFileSystem (ENOSYS), except the mutating set,
+// which is refused with EROFS when ov is nil (read-only binding).
 type raw struct {
 	fuse.RawFileSystem
-	fs *genfs.FS
+	fs reader
+	// ov is the write half; nil means a read-only binding.
+	ov *overlay.FS
+	// dirty is the TTL predicate, nil alongside ov.
+	dirty *dirtySet
 
 	lastFh atomic.Uint64
 	mu     sync.Mutex
@@ -107,12 +149,23 @@ func (c cancelCtx) Err() error {
 
 func ctxOf(cancel <-chan struct{}) context.Context { return cancelCtx{done: cancel} }
 
+// errStatus is the single error translator for both halves; the overlay's
+// sentinels join genfs's. Anything unrecognized is EIO — the kernel must
+// never see a Go error shape.
 func errStatus(err error) fuse.Status {
 	switch {
 	case errors.Is(err, genfs.ErrNotExist):
 		return fuse.ENOENT
 	case errors.Is(err, genfs.ErrStale):
 		return errStale
+	case errors.Is(err, overlay.ErrExist):
+		return errExist
+	case errors.Is(err, overlay.ErrNotEmpty):
+		return errNotEmpty
+	case errors.Is(err, overlay.ErrNotDir):
+		return fuse.ENOTDIR
+	case errors.Is(err, overlay.ErrIsDir):
+		return fuse.EISDIR
 	case errors.Is(err, context.Canceled):
 		return fuse.EINTR
 	}
@@ -160,14 +213,26 @@ func fillAttr(n *genfs.Node, a *fuse.Attr) {
 	a.Atimensec = a.Mtimensec
 }
 
+// validity is the TTL for one inode's reply: effectively infinite while
+// the inode is clean (immutable within the generation), ZERO once the
+// overlay has touched it so the kernel re-asks instead of trusting a
+// snapshot that can change under it.
+func (r *raw) validity(ino uint64) time.Duration {
+	if r.dirty != nil && r.dirty.has(ino) {
+		return 0
+	}
+	return entryValidity
+}
+
 // fillEntry completes an EntryOut: stable inode as NodeId (inodes NEVER
-// recycle within a mount, hence Generation 0) and infinite validity.
-func fillEntry(n *genfs.Node, out *fuse.EntryOut) {
+// recycle within a mount, hence Generation 0) and the inode's validity.
+func (r *raw) fillEntry(n *genfs.Node, out *fuse.EntryOut) {
 	out.NodeId = n.Inode
 	out.Generation = 0
 	fillAttr(n, &out.Attr)
-	out.SetEntryTimeout(entryValidity)
-	out.SetAttrTimeout(entryValidity)
+	v := r.validity(n.Inode)
+	out.SetEntryTimeout(v)
+	out.SetAttrTimeout(v)
 }
 
 func (r *raw) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name string, out *fuse.EntryOut) fuse.Status {
@@ -175,7 +240,7 @@ func (r *raw) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name string,
 	if err != nil {
 		return errStatus(err)
 	}
-	fillEntry(&n, out)
+	r.fillEntry(&n, out)
 	return fuse.OK
 }
 
@@ -191,19 +256,24 @@ func (r *raw) GetAttr(cancel <-chan struct{}, input *fuse.GetAttrIn, out *fuse.A
 		return errStatus(err)
 	}
 	fillAttr(&n, &out.Attr)
-	out.SetTimeout(entryValidity)
+	out.SetTimeout(r.validity(input.NodeId))
 	return fuse.OK
 }
 
-// Open is stateless (Fh 0): content is immutable, so there is no per-handle
-// state and the page cache survives close/open (FOPEN_KEEP_CACHE). Any
-// write-access flag is refused up front.
+// Open is stateless (Fh 0). FOPEN_KEEP_CACHE holds the page cache across
+// close/open, which is sound only while the content is immutable: a
+// read-only binding always keeps it, a read-write one drops it for a
+// writable open or an already-dirty inode. Write access itself is refused
+// up front on a read-only binding.
 func (r *raw) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenOut) fuse.Status {
-	if input.Flags&fuse.O_ANYWRITE != 0 {
+	writable := input.Flags&fuse.O_ANYWRITE != 0
+	if writable && r.ov == nil {
 		return fuse.EROFS
 	}
 	out.Fh = 0
-	out.OpenFlags |= fuse.FOPEN_KEEP_CACHE
+	if !writable && r.validity(input.NodeId) > 0 {
+		out.OpenFlags |= fuse.FOPEN_KEEP_CACHE
+	}
 	return fuse.OK
 }
 
@@ -298,11 +368,12 @@ func (r *raw) ReadDirPlus(cancel <-chan struct{}, input *fuse.ReadIn, out *fuse.
 		}
 		n, err := r.fs.Lookup(ctx, h.ino, ge.Name)
 		if err != nil {
-			// Immutable generation: an entry cannot vanish mid-listing.
-			// Emit it uncached rather than fail the whole page.
+			// The listing is a snapshot; an entry can only vanish from
+			// under it via this mount's own overlay. Emit it uncached
+			// rather than fail the whole page.
 			continue
 		}
-		fillEntry(&n, eo)
+		r.fillEntry(&n, eo)
 	}
 	return fuse.OK
 }
@@ -368,61 +439,18 @@ func (r *raw) StatFs(cancel <-chan struct{}, input *fuse.InHeader, out *fuse.Sta
 	return fuse.OK
 }
 
-// Mutating ops: EROFS — a read-only mount refuses them, it does not fail to
-// understand them.
-
-func (r *raw) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse.AttrOut) fuse.Status {
-	return fuse.EROFS
-}
-
-func (r *raw) Mknod(cancel <-chan struct{}, input *fuse.MknodIn, name string, out *fuse.EntryOut) fuse.Status {
-	return fuse.EROFS
-}
-
-func (r *raw) Mkdir(cancel <-chan struct{}, input *fuse.MkdirIn, name string, out *fuse.EntryOut) fuse.Status {
-	return fuse.EROFS
-}
-
-func (r *raw) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name string) fuse.Status {
-	return fuse.EROFS
-}
-
-func (r *raw) Rmdir(cancel <-chan struct{}, header *fuse.InHeader, name string) fuse.Status {
-	return fuse.EROFS
-}
-
-func (r *raw) Rename(cancel <-chan struct{}, input *fuse.RenameIn, oldName, newName string) fuse.Status {
-	return fuse.EROFS
-}
-
-func (r *raw) Link(cancel <-chan struct{}, input *fuse.LinkIn, name string, out *fuse.EntryOut) fuse.Status {
-	return fuse.EROFS
-}
-
-func (r *raw) Symlink(cancel <-chan struct{}, header *fuse.InHeader, pointedTo, linkName string, out *fuse.EntryOut) fuse.Status {
-	return fuse.EROFS
-}
-
-func (r *raw) Create(cancel <-chan struct{}, input *fuse.CreateIn, name string, out *fuse.CreateOut) fuse.Status {
-	return fuse.EROFS
-}
-
-func (r *raw) Write(cancel <-chan struct{}, input *fuse.WriteIn, data []byte) (uint32, fuse.Status) {
-	return 0, fuse.EROFS
-}
-
-func (r *raw) SetXAttr(cancel <-chan struct{}, input *fuse.SetXAttrIn, attr string, data []byte) fuse.Status {
-	return fuse.EROFS
-}
-
-func (r *raw) RemoveXAttr(cancel <-chan struct{}, header *fuse.InHeader, attr string) fuse.Status {
-	return fuse.EROFS
-}
+// The mutating ops live in rw.go: they refuse with EROFS when ov is nil (a
+// read-only mount understands them, it does not fail to parse them) and
+// forward to the overlay otherwise.
 
 func (r *raw) Fallocate(cancel <-chan struct{}, in *fuse.FallocateIn) fuse.Status {
+	// Not implemented even read-write: the overlay has no preallocation
+	// primitive, and the format has no holes to reserve.
 	return fuse.EROFS
 }
 
 func (r *raw) CopyFileRange(cancel <-chan struct{}, input *fuse.CopyFileRangeIn) (uint32, fuse.Status) {
+	// Left to the kernel's read/write fallback; a server-side copy would
+	// duplicate staging bytes for no gain in v0.
 	return 0, fuse.EROFS
 }

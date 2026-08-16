@@ -11,8 +11,22 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-WORK="$(mktemp -d)"
 BENCH="${1:-}"
+
+# This script mounts a real filesystem and writes a scratch tree. It runs
+# in CI (Linux) or a container — NEVER casually on a developer's machine,
+# and never anywhere near $HOME. On macOS it cannot work at all: NFS/FUSE
+# mounts come up but the shell is denied access to them, whatever the
+# location. Set PELFS_MOUNT_TEST_OK=1 to override on a Linux box you own.
+if [ "${PELFS_MOUNT_TEST_OK:-}" != "1" ] && [ "${CI:-}" != "true" ]; then
+  echo "refusing to mount on this host: run in CI, or in a container," >&2
+  echo "or set PELFS_MOUNT_TEST_OK=1 on a Linux machine you own." >&2
+  exit 2
+fi
+[ "$(uname -s)" = "Linux" ] || { echo "phase-3 mounts need Linux FUSE (macOS denies shell access to mounts)" >&2; exit 2; }
+
+# Scratch lives under the repo's own build area, never $HOME.
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/pelfs-phase3.XXXXXX")"
 cleanup() {
   if mountpoint -q "$WORK/mnt" 2>/dev/null || mount | grep -q " $WORK/mnt "; then
     fusermount3 -u "$WORK/mnt" 2>/dev/null || fusermount -u "$WORK/mnt" 2>/dev/null || \

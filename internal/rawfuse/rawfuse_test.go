@@ -593,6 +593,30 @@ func TestReadOnly(t *testing.T) {
 	if st := f.raw.SetAttr(nil, &fuse.SetAttrIn{}, &fuse.AttrOut{}); st != fuse.EROFS {
 		t.Fatalf("SetAttr = %v, want EROFS", st)
 	}
+	if st := f.raw.Create(nil, &fuse.CreateIn{InHeader: *header(rootIno), Mode: 0644}, "new.txt", &fuse.CreateOut{}); st != fuse.EROFS {
+		t.Fatalf("Create = %v, want EROFS", st)
+	}
+	if st := f.raw.Mknod(nil, &fuse.MknodIn{InHeader: *header(rootIno), Mode: 0644}, "node", &fuse.EntryOut{}); st != fuse.EROFS {
+		t.Fatalf("Mknod = %v, want EROFS", st)
+	}
+	if st := f.raw.Rmdir(nil, header(rootIno), "dir"); st != fuse.EROFS {
+		t.Fatalf("Rmdir = %v, want EROFS", st)
+	}
+	if st := f.raw.Rename(nil, &fuse.RenameIn{InHeader: *header(rootIno), Newdir: rootIno}, "big.bin", "other.bin"); st != fuse.EROFS {
+		t.Fatalf("Rename = %v, want EROFS", st)
+	}
+	if st := f.raw.Link(nil, &fuse.LinkIn{InHeader: *header(rootIno), Oldnodeid: f.bigIno}, "hard", &fuse.EntryOut{}); st != fuse.EROFS {
+		t.Fatalf("Link = %v, want EROFS", st)
+	}
+	if st := f.raw.Symlink(nil, header(rootIno), "big.bin", "sym", &fuse.EntryOut{}); st != fuse.EROFS {
+		t.Fatalf("Symlink = %v, want EROFS", st)
+	}
+	if st := f.raw.SetXAttr(nil, &fuse.SetXAttrIn{InHeader: *header(f.bigIno)}, "user.x", []byte("y")); st != fuse.EROFS {
+		t.Fatalf("SetXAttr = %v, want EROFS", st)
+	}
+	if st := f.raw.RemoveXAttr(nil, header(f.bigIno), "user.x"); st != fuse.EROFS {
+		t.Fatalf("RemoveXAttr = %v, want EROFS", st)
+	}
 }
 
 func TestXattrAndReadlink(t *testing.T) {

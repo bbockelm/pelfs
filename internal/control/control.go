@@ -17,6 +17,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -135,6 +136,15 @@ func registerRoutes(mux *http.ServeMux, h Hooks) {
 		w.Header().Set("Content-Disposition", "attachment; filename=pelfs-bugreport.tar.gz")
 		writeBugreport(w, h)
 	})
+	// Live profiling of a running session: the socket is the auth
+	// boundary (0600 in the state dir), so the full pprof surface is
+	// safe to expose. `pelfs ctl <target> pprof cpu` fetches profiles;
+	// `go tool pprof` can read the saved files.
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

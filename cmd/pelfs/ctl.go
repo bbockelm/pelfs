@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/bbockelm/pelfs/internal/control"
@@ -103,6 +104,22 @@ func cmdCtl(args []string) int {
 		body, err = c.Do(ctx, "POST", "/v1/flush")
 	case "publish":
 		body, err = c.Do(ctx, "POST", "/v1/publish")
+	case "pprof":
+		// pelfs ctl <target> pprof [cpu|heap|goroutine|...] [-o file]
+		kind := "profile?seconds=30"
+		if len(args) >= 3 && args[2] != "-o" {
+			kind = args[2]
+			if kind == "cpu" {
+				kind = "profile?seconds=30"
+			}
+			if len(args) >= 5 && args[3] == "-o" {
+				out = args[4]
+			}
+		}
+		body, err = c.Do(ctx, "GET", "/debug/pprof/"+kind)
+		if err == nil && out == "" {
+			out = "pelfs-" + strings.SplitN(kind, "?", 2)[0] + ".pprof"
+		}
 	case "bugreport":
 		body, err = c.Do(ctx, "GET", "/v1/bugreport")
 		if err == nil {

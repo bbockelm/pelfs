@@ -1172,6 +1172,41 @@ shard routing, chunk reads) is `internal/genfs`, built during phase 2 as
 independent groundwork; the raw FUSE binding and the overlay are the
 phase-3 work proper.
 
+## Ejecting JuiceFS: what is left
+
+Audited by import, not by impression. The phase-3 runtime — genfs,
+overlay, rawfuse, vfsbilly, catalog, chunkid, entrycodec, superblock,
+refs, retention — has ZERO JuiceFS imports in non-test code. What
+remains splits cleanly:
+
+**Tier A — the v1 engine itself. Deleted, not ported:**
+
+| package | uses | replaced by |
+|---|---|---|
+| `mountfs` | fs, fuse, vfs, meta, chunk | `rawfuse` + `mount-gen` |
+| `nfsmount/billyfs.go`, `handlecache.go` | fs, meta, vfs | `vfsbilly` |
+| `offline` (gc/fsck) | meta | `retention` (v2 GC); a v2 fsck is still owed |
+| `snapshot` | object | superblock generations |
+| `cutdb` | chunk, meta | `publish`'s overlay source (seal) |
+| `hydrate` | meta | OBSOLETE: it existed to mount a v2 generation with the v1 engine, which `mount-gen` now does natively |
+
+**Tier B — only the `object.ObjectStorage` INTERFACE** (`packstore`,
+`pelicanobj`, `stats`, `publish`, `cmd/pelfs`). Mechanical to replace
+with our own interface once Tier A is gone; it cannot go earlier
+because Tier A passes real JuiceFS stores across it.
+
+**Feature parity, now complete on the catalog-native path:** mount
+(`mount-gen`), read-write (`--rw`), subshell (`--subshell`), NFS
+frontend (`--backend nfs`, for macOS without macFUSE), prefetch
+(`--prefetch all|background`), live refresh (`--poll`), volume creation
+(`pelfs init`), publish (seal at unmount), and GC (`retention`).
+
+**What is genuinely still owed before deletion:** a v2 `fsck`, stats
+and lease wiring for `mount-gen`, and production mileage. The order
+matters — delete v1 only after the format has run real workloads,
+because what is battle-tested by then must be our format, not their
+schema.
+
 ## Settled decisions (with rejected alternatives)
 
 | decision | rejected alternative | why |

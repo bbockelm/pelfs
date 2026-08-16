@@ -754,6 +754,11 @@ are structurally absent here:
   third mutable object); staleness bounds come from the time-based GC
   grace window instead.
 
+Status: IMPLEMENTED (internal/rawfuse.Refresher, `mount-gen --poll`),
+verified on a real kernel with two independent processes — a reader
+following the branch picks up another writer's sealed generation with
+no remount, invalidating only what it holds. Historical note follows.
+
 Phase caveat: live refresh requires the catalog-native runtime (phase 3),
 where a swap is a routing-pointer change over directly-read catalogs. In
 phase 2 — read-only mounts hydrating the JuiceFS hot engine from catalogs

@@ -56,6 +56,8 @@ func main() {
 		code = cmdPublish(os.Args[2:])
 	case "ctl":
 		code = cmdCtl(os.Args[2:])
+	case "init":
+		code = cmdInit(os.Args[2:])
 	case "mount-gen":
 		code = cmdMountGen(os.Args[2:])
 	case "fsck":
@@ -81,7 +83,8 @@ Usage:
   pelfs gc     [flags] [--delete] <prefix>               collect leaked blocks
   pelfs repack [flags] <prefix>                          reclaim dead pack space
   pelfs publish [flags] <prefix>                         publish a v2 generation (experimental)
-  pelfs mount-gen [flags] <prefix> <mountpoint>          mount a published v2 generation (RO, experimental)
+  pelfs init   [flags] <prefix>                          create a new catalog-native volume (experimental)
+  pelfs mount-gen [flags] [--rw] <prefix> <mountpoint>   mount a published v2 generation (experimental)
   pelfs ctl    <prefix-or-mountpoint> <verb>             control a running mount
                                                          (status|stats|flush|publish|bugreport)
   pelfs fsck   [flags] <prefix>                          verify referenced blocks

@@ -684,3 +684,86 @@ func TestSealRequiresOverlayAndPrev(t *testing.T) {
 		t.Fatalf("Publish with both CutPath and Overlay succeeded")
 	}
 }
+
+// A volume must be creatable without JuiceFS: InitVolume writes
+// generation 0 with an empty root, and the catalog-native write path
+// takes it from there.
+func TestInitVolumeThenSeal(t *testing.T) {
+	ctx := context.Background()
+	inner := newInner(t)
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	volID := [16]byte{0x1a, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x70, 0x81,
+		0x92, 0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8, 0x09}
+
+	gen0, err := publish.InitVolume(ctx, publish.Options{
+		Inner:      inner,
+		SpoolDir:   t.TempDir(),
+		SigningKey: priv,
+		VolumeID:   volID,
+	})
+	if err != nil {
+		t.Fatalf("InitVolume: %v", err)
+	}
+	if gen0.Superblock.Generation != 0 || gen0.Superblock.VolumeID != volID {
+		t.Fatalf("generation %d volume %x, want 0 and %x",
+			gen0.Superblock.Generation, gen0.Superblock.VolumeID, volID)
+	}
+
+	// The empty volume opens and is genuinely empty.
+	base := openGenfs(t, inner, gen0.Superblock, nil)
+	entries, err := base.Readdir(ctx, genfs.RootInode)
+	if err != nil {
+		t.Fatalf("readdir of a fresh volume: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("fresh volume has %d entries, want 0: %+v", len(entries), entries)
+	}
+
+	// Write into it through the phase-3 path and seal: a complete volume
+	// lifecycle with no JuiceFS anywhere.
+	ov, err := overlay.Open(t.TempDir(), base, overlay.Options{
+		NextInode:      base.NextInode(),
+		BaseRoot:       base.RootCatalog(),
+		BaseGeneration: base.Generation(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ov.Close() //nolint:errcheck
+	if _, err := ov.Mkdir(ctx, 1, "d", 0755, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	fn, err := ov.Create(ctx, 1, "hello.txt", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ov.Write(ctx, fn.Inode, 0, []byte("born catalog-native")); err != nil {
+		t.Fatal(err)
+	}
+	gen1, err := publish.Seal(ctx, publish.Options{
+		Overlay: ov, Inner: inner, SpoolDir: t.TempDir(),
+		SigningKey: priv, Prev: gen0.Superblock, PrevRaw: gen0.Raw,
+	})
+	if err != nil {
+		t.Fatalf("Seal onto a fresh volume: %v", err)
+	}
+
+	sealed := openGenfs(t, inner, gen1.Superblock, nil)
+	n, err := sealed.Lookup(ctx, genfs.RootInode, "hello.txt")
+	if err != nil {
+		t.Fatalf("lookup in the sealed volume: %v", err)
+	}
+	got := make([]byte, n.Length)
+	if _, err := sealed.Read(ctx, n.Inode, 0, got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "born catalog-native" {
+		t.Fatalf("content = %q", got)
+	}
+	if _, err := sealed.Lookup(ctx, genfs.RootInode, "d"); err != nil {
+		t.Fatalf("lookup of the created directory: %v", err)
+	}
+}

@@ -137,6 +137,13 @@ type Options struct {
 	// area (accumulate mode, where staged blocks never uploaded and the
 	// publish IS the durability step).
 	ReadStaging bool
+	// VolumeID identifies a volume being created by InitVolume. Every
+	// other path takes identity from the source (a cut's format UUID) or
+	// the previous generation.
+	VolumeID [16]byte
+
+	// emptySource selects the empty-root source (InitVolume).
+	emptySource bool
 }
 
 // Stats summarizes one publish.
@@ -278,6 +285,9 @@ func Publish(ctx context.Context, o Options) (*Result, error) {
 // overlay, which does not carry the superblock it shadows — the previous
 // generation's volume id. The returned func releases source resources.
 func openSource(o Options) (Source, string, func(), error) {
+	if o.emptySource {
+		return &emptyRoot{nextInode: 2}, formatVolumeID(o.VolumeID), func() {}, nil
+	}
 	if o.Overlay != nil {
 		return &overlaySource{fs: o.Overlay}, formatVolumeID(o.Prev.VolumeID), func() {}, nil
 	}
@@ -291,6 +301,8 @@ func openSource(o Options) (Source, string, func(), error) {
 
 func applyDefaults(o *Options) error {
 	switch {
+	case o.emptySource:
+		// InitVolume supplies the tree itself.
 	case o.CutPath == "" && o.Overlay == nil:
 		return errors.New("publish: CutPath or Overlay is required")
 	case o.CutPath != "" && o.Overlay != nil:

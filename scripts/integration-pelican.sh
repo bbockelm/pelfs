@@ -91,7 +91,11 @@ SERVER_PID=$!
 # server was given.
 dumpServerLog() {
   echo "--- server exit status ---"
-  wait "$SERVER_PID" 2>/dev/null; echo "    exit=$?"
+  # `wait` reports the child's nonzero status, which under set -e would
+  # kill this reporter before it reports anything (it did, in CI).
+  local st=0
+  wait "$SERVER_PID" 2>/dev/null || st=$?
+  echo "    exit=$st"
   echo "--- $WORK/server.log ---"
   if [ -s "$WORK/server.log" ]; then
     tail -60 "$WORK/server.log" | sed 's/^/    /'

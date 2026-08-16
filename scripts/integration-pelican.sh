@@ -25,15 +25,26 @@ cleanup() {
 trap cleanup EXIT
 
 PELICAN_SRC=${PELICAN_SRC:-$HOME/projects/pelican}
-if [ -z "${PELICAN_BIN:-}" ]; then
-  if command -v pelican >/dev/null; then
-    PELICAN_BIN=$(command -v pelican)
-  elif [ -d "$PELICAN_SRC" ]; then
-    echo "== building pelican binary from $PELICAN_SRC =="
-    (cd "$PELICAN_SRC" && go build -tags forceposix,server -o "$WORK/pelican" ./cmd)
-    PELICAN_BIN="$WORK/pelican"
-  else
-    echo "SKIP: no pelican binary (set \$PELICAN_BIN or \$PELICAN_SRC)"
+# The harness needs the SERVER-flavored binary (now shipped as
+# `pelican-server`): a client-only `pelican` on PATH must not shadow it.
+# Validate candidates by probing for a server subcommand.
+has_server_cmds() { "$1" origin --help >/dev/null 2>&1; }
+if [ -n "${PELICAN_BIN:-}" ]; then
+  has_server_cmds "$PELICAN_BIN" || { echo "FAIL: \$PELICAN_BIN lacks server subcommands (client-only build?)"; exit 1; }
+else
+  for cand in pelican-server pelican; do
+    if command -v "$cand" >/dev/null && has_server_cmds "$(command -v $cand)"; then
+      PELICAN_BIN=$(command -v "$cand")
+      break
+    fi
+  done
+  if [ -z "${PELICAN_BIN:-}" ] && [ -d "$PELICAN_SRC" ]; then
+    echo "== building pelican-server from $PELICAN_SRC =="
+    (cd "$PELICAN_SRC" && go build -tags forceposix,server -o "$WORK/pelican-server" ./cmd)
+    PELICAN_BIN="$WORK/pelican-server"
+  fi
+  if [ -z "${PELICAN_BIN:-}" ]; then
+    echo "SKIP: no server-flavored pelican binary (set \$PELICAN_BIN or \$PELICAN_SRC)"
     exit 0
   fi
 fi

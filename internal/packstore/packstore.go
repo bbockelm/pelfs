@@ -99,6 +99,11 @@ type trailerEntry struct {
 	Key    string `json:"k"`
 	Off    int64  `json:"o"`
 	Length int64  `json:"l"`
+	// Type distinguishes entry kinds for disaster-recovery scavenging
+	// (docs/design-packfs.md): "" or "data" = data chunk; v2 adds
+	// "catalog", "shard", and "sb" (superblock backup). Reserved now so
+	// phase-1 packs remain forward-compatible with the rescue tooling.
+	Type string `json:"t,omitempty"`
 }
 
 // Store implements pelicanobj.Store over an inner store, packing packable
@@ -297,8 +302,21 @@ func (s *Store) readRange(ctx context.Context, key string, off, length int64) ([
 	if err != nil {
 		return nil, err
 	}
-	defer rc.Close()
-	return io.ReadAll(io.LimitReader(rc, length))
+	buf, rerr := io.ReadAll(io.LimitReader(rc, length))
+	// Transports that stream through a transfer engine may report the
+	// job's failure only at Close: an errored transfer otherwise looks
+	// like a clean zero-byte read. Never swallow it.
+	cerr := rc.Close()
+	if rerr != nil {
+		return nil, rerr
+	}
+	if cerr != nil {
+		return nil, fmt.Errorf("read %s [%d,+%d): %w", key, off, length, cerr)
+	}
+	if int64(len(buf)) != length {
+		return nil, fmt.Errorf("read %s [%d,+%d): short read (%d bytes)", key, off, length, len(buf))
+	}
+	return buf, nil
 }
 
 func (s *Store) packKey(name string) string { return PackDirKey + "/" + name }

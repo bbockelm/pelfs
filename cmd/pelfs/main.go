@@ -27,6 +27,7 @@ import (
 	"github.com/bbockelm/pelfs/internal/dockerrun"
 	"github.com/bbockelm/pelfs/internal/lease"
 	"github.com/bbockelm/pelfs/internal/mountfs"
+	"github.com/bbockelm/pelfs/internal/packstore"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/snapshot"
 	"github.com/bbockelm/pelfs/internal/stats"
@@ -49,6 +50,8 @@ func main() {
 		code = cmdStatus(os.Args[2:])
 	case "gc":
 		code = cmdGC(os.Args[2:])
+	case "repack":
+		code = cmdRepack(os.Args[2:])
 	case "fsck":
 		code = cmdFsck(os.Args[2:])
 	case "-h", "--help", "help":
@@ -70,6 +73,7 @@ Usage:
   pelfs umount <prefix-or-mountpoint>                    stop a background mount
   pelfs status                                           list background mounts
   pelfs gc     [flags] [--delete] <prefix>               collect leaked blocks
+  pelfs repack [flags] <prefix>                          reclaim dead pack space
   pelfs fsck   [flags] <prefix>                          verify referenced blocks
 
 Common flags:
@@ -109,6 +113,8 @@ type cmdOpts struct {
 	statsFile        string
 	flushTimeout     time.Duration
 	cacheFreeRatio   float64
+	noPack           bool
+	packSizeMiB      int64
 }
 
 func registerFlags(fs *flag.FlagSet, o *cmdOpts) {
@@ -140,6 +146,8 @@ func registerFlags(fs *flag.FlagSet, o *cmdOpts) {
 	fs.StringVar(&o.statsFile, "stats-file", "", "write a JSON session-statistics summary to this path (default: <state-dir>/pelfs-stats.json)")
 	fs.DurationVar(&o.flushTimeout, "flush-timeout", 0, "with --writeback, how long to wait at exit for staged blocks to finish uploading (0 = wait forever)")
 	fs.Float64Var(&o.cacheFreeRatio, "cache-free-ratio", 0.05, "minimum free space/inode fraction the block cache preserves on its filesystem")
+	fs.BoolVar(&o.noPack, "no-pack", false, "with --writeback, do not pack uploaded blocks into large pack objects (reading packed volumes always works)")
+	fs.Int64Var(&o.packSizeMiB, "pack-size", 64, "target pack object size, in MiB")
 }
 
 func parseArgs(name string, args []string, minPos, maxPos int, extra func(*flag.FlagSet, *cmdOpts)) (*cmdOpts, []string, error) {
@@ -175,7 +183,8 @@ type session struct {
 	mountPoint string
 
 	store      pelicanobj.Store     // raw transport (immutable blocks; cache-served reads)
-	data       object.ObjectStorage // block bytes; encrypted + stats wrappers applied
+	packs      *packstore.Store     // pack middleware over store (read side always; write side with writeback)
+	data       object.ObjectStorage // block bytes; pack + encrypted + stats wrappers applied
 	metaStore  pelicanobj.Store     // direct-read transport for MUTABLE objects (lease, snapshot listings/ETags)
 	metaData   object.ObjectStorage // snapshot bytes over metaStore; encrypted + stats wrappers applied
 	encryptPEM string
@@ -229,7 +238,21 @@ func newSession(ctx context.Context, o *cmdOpts, prefix string, needWrite bool) 
 		return nil, err
 	}
 	s.store = store
-	s.data = store
+
+	// Pack middleware sits directly on the raw transport (below encryption:
+	// pack entries must be individually encrypted so range reads work). The
+	// read side is always active — any session must read a packed volume —
+	// while write-side packing requires writeback: Put defers durability to
+	// the pack flush, which only writeback semantics permit.
+	s.packs, err = packstore.New(ctx, store, packstore.Config{
+		SpoolDir:     filepath.Join(s.stateDir, "packspool"),
+		TargetSize:   o.packSizeMiB << 20,
+		WriteEnabled: o.writeback && !o.noPack,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("pack store: %w", err)
+	}
+	s.data = s.packs
 
 	// Mutable objects (the mount lease, snapshot current.db and its ETag
 	// checks, restore listings) must never be read through federation
@@ -256,7 +279,7 @@ func newSession(ctx context.Context, o *cmdOpts, prefix string, needWrite bool) 
 			return nil, fmt.Errorf("read --encrypt-key: %w", err)
 		}
 		s.encryptPEM = string(pem)
-		if s.data, err = pelicanobj.WrapEncrypted(store, pem); err != nil {
+		if s.data, err = pelicanobj.WrapEncrypted(s.packs, pem); err != nil {
 			return nil, err
 		}
 		if s.metaData, err = pelicanobj.WrapEncrypted(metaStore, pem); err != nil {
@@ -354,6 +377,19 @@ func (s *session) newSnapshotManager() *snapshot.Manager {
 		OnError: func(err error) {
 			s.stats.Update(func(sum *stats.Summary) { sum.SnapshotErrors++ })
 		},
+		// The snapshot must never reference blocks that are still sitting
+		// in the local pack spool; after the flush, opportunistically bound
+		// overwrite-churn garbage (budgeted; failure never blocks the
+		// snapshot).
+		PrePublish: func(ctx context.Context) error {
+			if err := s.packs.Flush(ctx); err != nil {
+				return err
+			}
+			if err := s.packs.Repack(ctx); err != nil {
+				fmt.Fprintf(os.Stderr, "pelfs: repack: %v\n", err)
+			}
+			return nil
+		},
 	}
 }
 
@@ -373,7 +409,9 @@ func (s *session) runPrefetch(ctx context.Context, mnt *mountfs.Mounted) error {
 	switch s.o.prefetch {
 	case "all":
 		fmt.Fprintln(os.Stderr, "pelfs: prefetching all blocks into the local cache...")
-		rep, err := mnt.Prefetch(ctx, 16)
+		// Strict mode owns the mount (nothing else is running yet), so it
+		// may use the transfer engine's full worker pool.
+		rep, err := mnt.Prefetch(ctx, pelicanobj.TransferWorkers())
 		if rep != nil {
 			record(rep, err)
 		}
@@ -386,7 +424,10 @@ func (s *session) runPrefetch(ctx context.Context, mnt *mountfs.Mounted) error {
 		fmt.Fprintf(os.Stderr, "pelfs: prefetched %d slices\n", rep.Slices)
 	case "background":
 		go func() {
-			rep, err := mnt.Prefetch(ctx, 8)
+			// Background mode uses at most half of the Pelican transfer
+			// engine's workers (Client.WorkerCount) so interactive I/O
+			// through the mount is never starved by the warmup.
+			rep, err := mnt.Prefetch(ctx, max(1, pelicanobj.TransferWorkers()/2))
 			if rep != nil {
 				record(rep, err)
 				if err != nil || rep.Failed > 0 {

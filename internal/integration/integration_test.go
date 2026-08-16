@@ -203,3 +203,65 @@ func TestSnapshotCycle(t *testing.T) {
 		t.Fatalf("restored db contents: n=%d err=%v (restored from %s)", n, err, key)
 	}
 }
+
+// TestPackTailRangeRead exercises exactly the path behind the field-reported
+// "bad pack magic" bootstrap failure: upload a pack-shaped object from a
+// local FILE (the retry-safe DoPut path used by pack seals), then read back
+// narrow ranges — including the trailing bytes, as the trailer probe does —
+// and verify them byte-for-byte against the original.
+func TestPackTailRangeRead(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+
+	payload := make([]byte, 700_000) // spans multiple server read buffers
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatal(err)
+	}
+	copy(payload[len(payload)-8:], []byte("PELFSPK1")) // trailer-like tail
+
+	f, err := os.CreateTemp(t.TempDir(), "pack-*.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	const key = "packs/p-testtail-0001"
+	if err := s.Put(ctx, key, f); err != nil {
+		t.Fatalf("file-based Put: %v", err)
+	}
+	f.Close()
+
+	// Full read-back sanity.
+	rc, err := s.Get(ctx, key, 0, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := io.ReadAll(rc)
+	rc.Close()
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("full read mismatch: %d bytes vs %d", len(got), len(payload))
+	}
+
+	// Tail probe, exactly like packstore's trailer fetch.
+	for _, probe := range []int64{16, 4096, 131072} {
+		off := int64(len(payload)) - probe
+		rc, err := s.Get(ctx, key, off, probe)
+		if err != nil {
+			t.Fatalf("tail range (off=%d len=%d): %v", off, probe, err)
+		}
+		got, err := io.ReadAll(io.LimitReader(rc, probe))
+		rc.Close()
+		if err != nil {
+			t.Fatalf("tail range read (off=%d): %v", off, err)
+		}
+		if !bytes.Equal(got, payload[off:]) {
+			t.Fatalf("tail range (off=%d len=%d) returned wrong bytes: got %d bytes, first mismatch hunting a range-request bug", off, probe, len(got))
+		}
+	}
+
+	_ = s.Delete(ctx, key)
+}

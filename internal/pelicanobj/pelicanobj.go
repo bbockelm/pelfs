@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/object"
@@ -47,6 +48,21 @@ type Config struct {
 	DirectRead bool
 	// Insecure skips TLS verification (for local test federations).
 	Insecure bool
+}
+
+// engineWorkers caches the Pelican client's transfer-engine pool size
+// (Client.WorkerCount), recorded once client config is initialized.
+var engineWorkers atomic.Int64
+
+// TransferWorkers reports how many block transfers the Pelican client runs
+// concurrently — the value of the standard Client.WorkerCount config knob.
+// Falls back to a small default before federation-mode initialization (e.g.
+// direct http:// test stores).
+func TransferWorkers() int {
+	if n := engineWorkers.Load(); n > 0 {
+		return int(n)
+	}
+	return 8
 }
 
 // KeyInfo is metadata about one object, including its ETag when the server

@@ -54,7 +54,15 @@ func newFedStore(ctx context.Context, cfg Config) (*fedStore, error) {
 		// Object-storage PUT semantics are upsert: JuiceFS re-uploads keys
 		// on retry and the snapshot manager overwrites its session object
 		// in place (guarded by ETag checks).
-		initClientErr = param.Client_EnableOverwrites.Set(true)
+		if initClientErr = param.Client_EnableOverwrites.Set(true); initClientErr != nil {
+			return
+		}
+		// Every full-block transfer executes on the client's shared
+		// TransferEngine worker pool, sized by the standard Pelican config
+		// knob Client.WorkerCount (config file or PELICAN_CLIENT_WORKERCOUNT,
+		// which the Docker fallback forwards). Record it so prefetch can
+		// size its own pool to match.
+		engineWorkers.Store(int64(param.Client_WorkerCount.GetInt()))
 	})
 	if initClientErr != nil {
 		return nil, fmt.Errorf("initialize pelican client: %w", initClientErr)
@@ -164,6 +172,18 @@ func (s *fedStore) Get(ctx context.Context, key string, off, limit int64, getter
 }
 
 func (s *fedStore) Put(ctx context.Context, key string, in io.Reader, getters ...object.AttrGetter) error {
+	// Retry safety: the PelicanFS write path streams through a pipe the
+	// transfer engine cannot rewind — a mid-transfer retry re-reads a
+	// half-consumed pipe and corrupts the object (a failure the writing
+	// session never notices, because it reads its own blocks from the
+	// local cache). When the caller hands us a real file — pack seals,
+	// snapshot uploads — upload by path so retries reopen from byte zero.
+	if lf, ok := in.(*os.File); ok && lf.Name() != "" {
+		if _, err := client.DoPut(ctx, lf.Name(), s.prefix+"/"+strings.TrimLeft(key, "/"), false, s.opts...); err != nil {
+			return fmt.Errorf("pelican put %q: %w", key, err)
+		}
+		return nil
+	}
 	f, err := s.pfs.OpenFile("/"+strings.TrimLeft(key, "/"), os.O_WRONLY|os.O_CREATE)
 	if err != nil {
 		return err

@@ -102,7 +102,8 @@ offset 0
 | ...              byte-packed, no alignment padding         |
 | entry N-1 bytes                                            |
 +------------------------------------------------------------+  <- trailer_off
-| trailer: JSON, uncompressed, unencrypted                   |
+| trailer: zstd-compressed JSON, unencrypted                 |
+|   (decompressed:)                                          |
 |   {                                                        |
 |     "v": 1,                                                |
 |     "created_ms": 1755300000000,                           |
@@ -115,8 +116,10 @@ offset 0
 |   }                                                        |
 +------------------------------------------------------------+
 | footer, 16 bytes:                                          |
-|   [0:8)   uint64 little-endian = trailer length in bytes   |
-|   [8:16)  magic "PELFSPK1"                                 |
+|   [0:8)   uint64 little-endian = STORED trailer length    |
+|   [8:16)  magic "PELFSPK2"                                 |
+|           ("PELFSPK1" = legacy uncompressed-JSON trailer,  |
+|            still read, never written)                      |
 +------------------------------------------------------------+
 ```
 
@@ -144,17 +147,17 @@ share and where they differ:
 - **Tombstones** (`"dead"`): phase-1 LSM shadowing only. v2 never needs
   them — liveness is defined by the generation's pack list + catalogs.
 - **Trailer hash**: v2's superblock pack list records BLAKE3-256 of the
-  trailer JSON, so a reader verifies the location map right after the
-  tail read. Entry data integrity does not depend on this — chunk
-  identities are end-to-end.
+  STORED trailer bytes, so a reader verifies the location map right
+  after the tail read, before even decompressing. Entry data integrity
+  does not depend on this — chunk identities are end-to-end.
 
-Index cost: ~100 bytes of JSON per entry. Large-chunk packs (16 entries
-of 4 MiB) pay ~2 KB per 64 MiB; the worst realistic case — a pack full
-of 8 KiB small files, ~8000 entries — pays ~800 KB, about 1.2%. JSON is
-deliberate: rescue tooling and humans can read a trailer with curl and
-jq, and the cost stays marginal. (A binary index becomes worth it only
-if entries shrink well below the 4 KiB inline threshold, which the
-threshold exists to prevent.)
+Index cost: ~100 bytes of JSON per entry before compression; zstd takes
+the structural repetition out, leaving mostly the incompressible hash
+keys (~40-50 B/entry stored). The worst realistic case — a pack full of
+8 KiB small files, ~8000 entries — stores a few hundred KB of trailer
+per 64 MiB pack, well under 1%. JSON-inside-zstd is deliberate: one
+schema across both eras, and rescue tooling still gets human-legible
+structure for the cost of a zstd -d.
 
 This resolves the classic tension between **sub-pack fetching and
 compression ratio** in favor of fetching: per-entry compression makes

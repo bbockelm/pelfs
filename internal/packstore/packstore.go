@@ -45,13 +45,15 @@ import (
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/object"
+	"github.com/klauspost/compress/zstd"
 
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 )
 
 const (
-	magic         = "PELFSPK1"
-	footerSize    = 8 + 8 // index length + magic
+	magic         = "PELFSPK1" // trailer stored as plain JSON (legacy packs)
+	magicZ        = "PELFSPK2" // trailer stored as zstd-compressed JSON
+	footerSize    = 8 + 8      // stored-trailer length + magic
 	tailProbe     = 128 << 10
 	defaultTarget = 64 << 20
 	// PackDirKey is the key-space directory holding pack objects.
@@ -89,13 +91,56 @@ type entry struct {
 
 // trailer is the JSON document at the end of every pack.
 type trailer struct {
-	Version int            `json:"v"`
-	Created int64          `json:"created_ms"`
-	Entries []trailerEntry `json:"entries"`
-	Dead    []string       `json:"dead,omitempty"`
+	Version int         `json:"v"`
+	Created int64       `json:"created_ms"`
+	Entries []PackEntry `json:"entries"`
+	Dead    []string    `json:"dead,omitempty"`
 }
 
-type trailerEntry struct {
+// Trailer codec: written as zstd-compressed JSON under magic PELFSPK2
+// (identity hashes make trailers big and repetitive; nobody reads them by
+// hand), read as either flavor so PELFSPK1 packs stay valid forever. The
+// footer length and the pack list's TrailerHash both refer to the stored
+// (compressed) bytes.
+var (
+	trailerEnc, _ = zstd.NewWriter(nil, zstd.WithEncoderConcurrency(1))
+	trailerDec, _ = zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
+)
+
+// encodeTrailer returns the stored trailer bytes and the 16-byte footer.
+func encodeTrailer(tr *trailer) (stored, footer []byte, err error) {
+	raw, err := json.Marshal(tr)
+	if err != nil {
+		return nil, nil, err
+	}
+	stored = trailerEnc.EncodeAll(raw, nil)
+	footer = make([]byte, footerSize)
+	binary.LittleEndian.PutUint64(footer[:8], uint64(len(stored)))
+	copy(footer[8:], magicZ)
+	return stored, footer, nil
+}
+
+// decodeTrailer parses stored trailer bytes according to the footer magic.
+func decodeTrailer(stored []byte, m string) (*trailer, error) {
+	raw := stored
+	if m == magicZ {
+		var err error
+		if raw, err = trailerDec.DecodeAll(stored, nil); err != nil {
+			return nil, fmt.Errorf("decompress index: %w", err)
+		}
+	}
+	var tr trailer
+	if err := json.Unmarshal(raw, &tr); err != nil {
+		return nil, fmt.Errorf("parse index: %w", err)
+	}
+	if tr.Version != 1 {
+		return nil, fmt.Errorf("unsupported pack version %d", tr.Version)
+	}
+	return &tr, nil
+}
+
+// PackEntry is one entry record in a pack trailer.
+type PackEntry struct {
 	Key    string `json:"k"`
 	Off    int64  `json:"o"`
 	Length int64  `json:"l"`
@@ -270,31 +315,32 @@ func (s *Store) fetchTrailer(ctx context.Context, name string, size int64) (*tra
 // parseTail validates and parses a trailer from buf, which is the final
 // portion of a pack of the given total size.
 func (s *Store) parseTail(ctx context.Context, name string, size int64, buf []byte) (*trailer, int64, error) {
-	if len(buf) < footerSize || string(buf[len(buf)-8:]) != magic {
+	if len(buf) < footerSize {
+		return nil, 0, fmt.Errorf("bad pack magic")
+	}
+	m := string(buf[len(buf)-8:])
+	if m != magic && m != magicZ {
 		return nil, 0, fmt.Errorf("bad pack magic")
 	}
 	idxLen := int64(binary.LittleEndian.Uint64(buf[len(buf)-16 : len(buf)-8]))
 	if idxLen <= 0 || idxLen+footerSize > size {
 		return nil, 0, fmt.Errorf("bad index length %d", idxLen)
 	}
-	var raw []byte
+	var stored []byte
 	var err error
 	if idxLen+footerSize <= int64(len(buf)) {
-		raw = buf[int64(len(buf))-footerSize-idxLen : int64(len(buf))-footerSize]
+		stored = buf[int64(len(buf))-footerSize-idxLen : int64(len(buf))-footerSize]
 	} else {
-		raw, err = s.readRange(ctx, s.packKey(name), size-footerSize-idxLen, idxLen)
+		stored, err = s.readRange(ctx, s.packKey(name), size-footerSize-idxLen, idxLen)
 		if err != nil {
 			return nil, 0, err
 		}
 	}
-	var tr trailer
-	if err := json.Unmarshal(raw, &tr); err != nil {
-		return nil, 0, fmt.Errorf("parse index: %w", err)
+	tr, err := decodeTrailer(stored, m)
+	if err != nil {
+		return nil, 0, err
 	}
-	if tr.Version != 1 {
-		return nil, 0, fmt.Errorf("unsupported pack version %d", tr.Version)
-	}
-	return &tr, idxLen, nil
+	return tr, idxLen, nil
 }
 
 func (s *Store) readRange(ctx context.Context, key string, off, length int64) ([]byte, error) {
@@ -596,7 +642,7 @@ func (s *Store) Flush(ctx context.Context) error {
 	for _, k := range keys {
 		e := pending[k]
 		newOff[k] = liveSz
-		tr.Entries = append(tr.Entries, trailerEntry{Key: k, Off: liveSz, Length: e.length})
+		tr.Entries = append(tr.Entries, PackEntry{Key: k, Off: liveSz, Length: e.length})
 		liveSz += e.length
 	}
 	sort.Slice(tr.Entries, func(i, j int) bool { return tr.Entries[i].Key < tr.Entries[j].Key })
@@ -604,13 +650,10 @@ func (s *Store) Flush(ctx context.Context) error {
 	if droppedBytes := spoolSz - liveSz; droppedBytes > 0 {
 		logDroppedBytes(droppedBytes)
 	}
-	idx, err := json.Marshal(&tr)
+	idx, footer, err := encodeTrailer(&tr)
 	if err != nil {
 		return err
 	}
-	footer := make([]byte, footerSize)
-	binary.LittleEndian.PutUint64(footer[:8], uint64(len(idx)))
-	copy(footer[8:], magic)
 
 	upload, err := os.CreateTemp(s.cfg.SpoolDir, "upload.pack.*")
 	if err != nil {

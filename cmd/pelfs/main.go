@@ -7,6 +7,7 @@
 //	pelfs status                     list background mounts
 //	pelfs gc     [--delete] <prefix> find (remove) leaked block objects
 //	pelfs fsck   <prefix>            verify all referenced blocks exist
+//	pelfs fsck-gen <prefix>          verify a published v2 generation
 //
 // On hosts that cannot mount FUSE (e.g. macOS without macFUSE), `shell`
 // re-launches itself inside a Docker container.
@@ -62,6 +63,8 @@ func main() {
 		code = cmdMountGen(os.Args[2:])
 	case "fsck":
 		code = cmdFsck(os.Args[2:])
+	case "fsck-gen":
+		code = cmdFsckGen(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -88,6 +91,7 @@ Usage:
   pelfs ctl    <prefix-or-mountpoint> <verb>             control a running mount
                                                          (status|stats|flush|publish|bugreport)
   pelfs fsck   [flags] <prefix>                          verify referenced blocks
+  pelfs fsck-gen [flags] [--deep] <prefix>               verify a published v2 generation (experimental)
 
 Common flags:
 `)

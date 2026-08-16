@@ -67,7 +67,43 @@ type Summary struct {
 	PrefetchComplete      bool   `json:"prefetch_complete,omitempty"`
 	StagingDrained        *bool  `json:"staging_drained,omitempty"` // writeback only
 	StagingBlocksLeft     int64  `json:"staging_blocks_left,omitempty"`
+	LeaseHeld             bool   `json:"lease_held,omitempty"`
 	LeaseConflictObserved bool   `json:"lease_conflict_observed,omitempty"`
+
+	// Catalog-native (phase 3) sessions: `pelfs mount-gen`. A v1 session
+	// leaves every field below zero, so one document shape serves both.
+	//
+	// Generation is what the mount serves NOW — with --poll it is the
+	// head the last live refresh swapped to, not the one it started on.
+	Generation      uint64 `json:"generation,omitempty"`
+	Branch          string `json:"branch,omitempty"`
+	Tag             string `json:"tag,omitempty"`
+	Backend         string `json:"backend,omitempty"`  // fuse or nfs
+	Writable        bool   `json:"writable,omitempty"` // --rw: an overlay shadows the generation
+	GenerationSwaps int64  `json:"generation_swaps,omitempty"`
+
+	// Prefetch on a catalog-native mount warms whole chunks, not the
+	// slices a JuiceFS mount counts.
+	PrefetchChunks int64 `json:"prefetch_chunks,omitempty"`
+	PrefetchBytes  int64 `json:"prefetch_bytes,omitempty"`
+
+	// Overlay pressure: unsealed work, i.e. exactly what is lost if the
+	// session dies without a seal.
+	OverlayDirtyNodes  int64 `json:"overlay_dirty_nodes,omitempty"`
+	OverlayDirtyEdges  int64 `json:"overlay_dirty_edges,omitempty"`
+	OverlayStagedFiles int64 `json:"overlay_staged_files,omitempty"`
+	OverlayStagedBytes int64 `json:"overlay_staged_bytes,omitempty"`
+
+	// Seal outcomes. Seals counts every generation this session published
+	// (control-socket checkpoints plus the one at unmount); the Sealed*
+	// fields describe the last of them. SealOK is nil when the session
+	// never needed to seal — read-only, --no-seal, or nothing changed.
+	Seals            int64  `json:"seals,omitempty"`
+	SealedGeneration uint64 `json:"sealed_generation,omitempty"`
+	SealedChunks     int64  `json:"sealed_chunks,omitempty"`
+	SealedCatalogs   int64  `json:"sealed_catalogs,omitempty"`
+	SealedPacks      int64  `json:"sealed_packs,omitempty"`
+	SealOK           *bool  `json:"seal_ok,omitempty"`
 
 	// Overall verdict for supervisors: true only when unmount, flush/drain,
 	// and the final snapshot all succeeded.

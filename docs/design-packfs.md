@@ -975,6 +975,64 @@ remount; live generation swap arrives with phase 3.
    coherence. JuiceFS is ejected last, after the format has production
    mileage; what is battle-tested by then is our format, not their schema.
 
+## Phase 3 VFS architecture
+
+A full POSIX implementation — including kernel dentry caching done
+right — requires the RAW FUSE protocol layer, not a convenience
+wrapper: pelfs implements `fuse.RawFileSystem` (the go-fuse fork we
+already vendor has the complete raw surface: per-reply entry/attr
+validity, entry/inode/delete notification, NotifyStore, readdirplus;
+we start on the fork and move to upstream hanwen/go-fuse when JuiceFS
+is ejected). The high-level layers hide exactly the knobs this design
+exists to exploit.
+
+**The immutability dividend.** Within a generation, clean inodes never
+change — so Lookup and GetAttr replies for them carry effectively
+INFINITE entry/attr timeouts, and the kernel becomes the dentry/attr
+cache. Metadata storms (`git status`, build scans) hit userspace once
+per mount, not once per call. Dirty (overlay) inodes reply with zero
+TTLs. This single decision is why the custom VFS can outperform the
+generic engine it replaces.
+
+**Generation swap = enumerated invalidation.** Stable inodes mean the
+difference between two generations is exactly the catalog diff: swap
+atomically replaces the routing table, then issues EntryNotify for
+changed/removed dirents and InodeNotify for changed content — no TTL
+guessing, no cache flush. Open handles keep their generation's chunk
+lists (per-handle snapshot isolation, unchanged from the read-only
+design).
+
+**Inode residency from kernel lookup order.** The catalog is a locator
+by descent: the kernel always Lookups parent before child, so the VFS
+builds inode -> (catalog, shard) residency on the way down and holds it
+exactly for kernel-live inodes; FORGET/BatchForget (nlookup accounting)
+is what retires entries. Residency is a cache of the descent, never an
+authority — the CVMFS translation-machinery scar stays closed.
+
+**Read path.** ReaddirPlus fills entries and attributes in one pass
+from a catalog page. File reads resolve chunkrefs to the identity-keyed
+decoded-chunk cache, then to pack range reads; cache hits serve via
+splice (ReadResultFd) for zero-copy. FOPEN_KEEP_CACHE holds page cache
+across open/close of immutable files; kernel writeback-cache mode
+batches dirty pages for the overlay.
+
+**Write path = overlay + seal.** Writes never mutate a generation: a
+local overlay (dirty tree + staged chunks, WAL-backed) shadows the
+immutable base; publish seals the overlay into catalogs/packs and flips
+— the CUT/RECONCILE/TRANSFORM pipeline collapses to "seal", as the
+migration section promises. Overlay design details land with phase 3
+implementation.
+
+**Frontend caveat.** The low-level wins are Linux-FUSE (and macFUSE
+where present). The macOS Docker/NFS fallback keeps NFSv4 semantics —
+client-driven caching, no invalidation push — and stays the degraded
+path it already is in v1.
+
+The FUSE-agnostic core (generation resolver: catalog descent, residency,
+shard routing, chunk reads) is `internal/genfs`, built during phase 2 as
+independent groundwork; the raw FUSE binding and the overlay are the
+phase-3 work proper.
+
 ## Settled decisions (with rejected alternatives)
 
 | decision | rejected alternative | why |

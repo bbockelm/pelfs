@@ -92,6 +92,20 @@ type Store interface {
 	StatKey(ctx context.Context, key string) (*KeyInfo, error)
 }
 
+// DirectReader is implemented by transports that can produce a variant of
+// themselves whose reads bypass federation caches. Callers that touch
+// MUTABLE objects use it to enforce read-after-write: a cached copy of an
+// object that was just overwritten is stale by construction, and on a
+// cache that mis-reports object length it can even arrive truncated —
+// which surfaces as a checksum mismatch rather than as anything obviously
+// cache-shaped.
+type DirectReader interface {
+	// DirectVariant returns an equivalent store that never reads through
+	// caches. Implementations may return the receiver when it already
+	// bypasses them.
+	DirectVariant() Store
+}
+
 // New builds a Store for the given prefix URL, selecting the transport from
 // the URL scheme.
 func New(ctx context.Context, cfg Config) (Store, error) {

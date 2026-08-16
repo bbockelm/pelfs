@@ -171,6 +171,18 @@ func (s *fedStore) Get(ctx context.Context, key string, off, limit int64, getter
 	return f.(io.ReadCloser), nil
 }
 
+// DirectVariant returns a copy that appends ?directread to every read.
+// The copy shares the PelicanFS handle and transfer options — only the
+// query suffix differs — so this costs nothing at the transport layer.
+func (s *fedStore) DirectVariant() Store {
+	if s.directRead {
+		return s
+	}
+	c := *s
+	c.directRead = true
+	return &c
+}
+
 func (s *fedStore) Put(ctx context.Context, key string, in io.Reader, getters ...object.AttrGetter) error {
 	// Retry safety: the PelicanFS write path streams through a pipe the
 	// transfer engine cannot rewind — a mid-transfer retry re-reads a

@@ -105,6 +105,13 @@ func Acquire(ctx context.Context, opts Options) (*Lease, error) {
 	if opts.RenewInterval <= 0 {
 		opts.RenewInterval = opts.TTL / 4
 	}
+	// The lease is a mutable object rewritten on every renewal, and its
+	// whole purpose is read-after-write: a cached copy would show a stale
+	// holder and hand two writers the same volume. Enforced here so no
+	// caller can forget it (see refs.New for the same guard).
+	if d, ok := opts.Store.(pelicanobj.DirectReader); ok {
+		opts.Store = d.DirectVariant()
+	}
 
 	holder, ki, err := read(ctx, opts.Store)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {

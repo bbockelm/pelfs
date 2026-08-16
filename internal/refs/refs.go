@@ -70,6 +70,16 @@ func New(inner pelicanobj.Store, stateDir string, trusted ed25519.PublicKey) (*S
 	if err := os.MkdirAll(filepath.Join(stateDir, "refs"), 0700); err != nil {
 		return nil, err
 	}
+	// Refs and tags are the volume's MUTABLE objects, and every one of
+	// them is overwritten in place. Reading them through a federation
+	// cache breaks read-after-write, and against a cache that
+	// mis-reports object length it returns a truncated body — which
+	// surfaces as a checksum mismatch, not as anything recognizably
+	// cache-shaped. Enforcing it here rather than at each call site is
+	// deliberate: three of four callers had already got it wrong.
+	if d, ok := inner.(pelicanobj.DirectReader); ok {
+		inner = d.DirectVariant()
+	}
 	return &Store{inner: inner, stateDir: stateDir, trusted: trusted}, nil
 }
 

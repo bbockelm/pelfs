@@ -397,3 +397,7 @@ func readTokenFile(p string) string {
 	}
 	return strings.TrimSpace(string(data))
 }
+
+// DirectVariant returns the receiver: the direct transport speaks plain
+// HTTP to one origin and has no federation caches to bypass.
+func (s *directStore) DirectVariant() Store { return s }

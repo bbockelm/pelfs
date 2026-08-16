@@ -3,14 +3,21 @@ module github.com/bbockelm/pelfs
 go 1.26.0
 
 require (
+	github.com/fxamacker/cbor/v2 v2.9.2
 	github.com/go-git/go-billy/v5 v5.9.1
 	github.com/google/uuid v1.6.0
+	github.com/hanwen/go-fuse/v2 v2.1.1-0.20210611132105-24a1dfe6b4f8
 	github.com/juicedata/juicefs v1.4.0-dev.0.20260814030623-a617e1b01696
+	github.com/klauspost/compress v1.19.1
 	github.com/mattn/go-sqlite3 v1.14.24
 	github.com/pelicanplatform/pelican v0.0.0-20260813210837-7a5e7ab292c3
 	github.com/prometheus/client_golang v1.21.1
 	github.com/sirupsen/logrus v1.9.3
 	github.com/willscott/go-nfs v0.0.4
+	github.com/willscott/go-nfs-client v0.0.0-20240104095149-b44639837b00
+	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78
+	lukechampine.com/blake3 v1.4.1
+	modernc.org/sqlite v1.39.0
 )
 
 require (
@@ -101,7 +108,6 @@ require (
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/flynn/noise v1.0.0 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
-	github.com/fxamacker/cbor/v2 v2.9.2 // indirect
 	github.com/gabriel-vasile/mimetype v1.4.11 // indirect
 	github.com/gammazero/toposort v0.1.1 // indirect
 	github.com/geoffgarside/ber v1.1.0 // indirect
@@ -140,7 +146,6 @@ require (
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674 // indirect
 	github.com/grpc-ecosystem/go-grpc-middleware v1.1.0 // indirect
 	github.com/gwatts/gin-adapter v1.0.0 // indirect
-	github.com/hanwen/go-fuse/v2 v2.1.1-0.20210611132105-24a1dfe6b4f8 // indirect
 	github.com/hashicorp/go-cleanhttp v0.5.2 // indirect
 	github.com/hashicorp/go-retryablehttp v0.7.8 // indirect
 	github.com/hashicorp/go-uuid v1.0.3 // indirect
@@ -167,7 +172,6 @@ require (
 	github.com/jtolio/noiseconn v0.0.0-20230301220541-88105e6c8ac6 // indirect
 	github.com/juicedata/gogfapi v0.0.0-20241204082332-ecd102647f80 // indirect
 	github.com/juju/ratelimit v1.0.2 // indirect
-	github.com/klauspost/compress v1.19.1 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.5 // indirect
 	github.com/kr/fs v0.1.0 // indirect
 	github.com/ks3sdklib/aws-sdk-go v1.6.0 // indirect
@@ -249,11 +253,9 @@ require (
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	github.com/vmware/go-nfs-client v0.0.0-20190605212624-d43b92724c1b // indirect
 	github.com/volcengine/ve-tos-golang-sdk/v2 v2.9.0 // indirect
-	github.com/willscott/go-nfs-client v0.0.0-20240104095149-b44639837b00 // indirect
 	github.com/winfsp/cgofuse v1.6.0 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	github.com/xrash/smetrics v0.0.0-20201216005158-039620a65673 // indirect
-	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78 // indirect
 	github.com/zeebo/blake3 v0.2.3 // indirect
 	github.com/zeebo/errs v1.4.0 // indirect
 	go.etcd.io/etcd v3.3.27+incompatible // indirect
@@ -300,12 +302,10 @@ require (
 	k8s.io/client-go v0.36.3 // indirect
 	kernel.org/pub/linux/libs/security/libcap/cap v1.2.69 // indirect
 	kernel.org/pub/linux/libs/security/libcap/psx v1.2.69 // indirect
-	lukechampine.com/blake3 v1.4.1 // indirect
 	modernc.org/fileutil v1.3.8 // indirect
 	modernc.org/libc v1.66.3 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
-	modernc.org/sqlite v1.39.0 // indirect
 	sigs.k8s.io/yaml v1.6.0 // indirect
 	storj.io/common v0.0.0-20260514184426-9f076a4a8d52 // indirect
 	storj.io/drpc v0.0.35-0.20250513201419-f7819ea69b55 // indirect
@@ -345,10 +345,11 @@ replace (
 	xorm.io/xorm v1.0.7 => gitea.com/davies/xorm v1.0.8-0.20220528043536-552d84d1b34a
 )
 
-// TEMPORARY local replace: picks up the client fix that requests
-// storage.modify for uploads when Client.EnableOverwrites is set (branch
-// pelfs-overwrite-scopes, commit cbe4b6eb5). Drop this and bump the pinned
-// pelican version once the fix lands on main. NOTE: CI cannot resolve a
-// local path; the integration workflow must check out that branch (or the
-// replace must be removed) before CI goes green.
-replace github.com/pelicanplatform/pelican => /Users/bbockelm/projects/pelican.worktrees/pelfs-overwrite-scopes
+// TEMPORARY fork replace: picks up the client fix that requests
+// storage.modify for uploads when Client.EnableOverwrites is set. The
+// fix is not upstream yet; it lives on branch pelfs-overwrite-scopes of
+// the fork https://github.com/bbockelm/pelican (commit 2736a3b92). A
+// fork replace — not a local path — so CI runners can fetch it.
+// DROP this replace and bump the pinned pelicanplatform/pelican version
+// as soon as the fixes land on pelican main.
+replace github.com/pelicanplatform/pelican => github.com/bbockelm/pelican v0.0.0-20260815190714-2736a3b927a9

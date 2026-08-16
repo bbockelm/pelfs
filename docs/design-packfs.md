@@ -89,6 +89,73 @@ would destroy compressibility. (Noted: compressed sizes leak through
 encryption, a CRIME-family side channel we accept for a scratch
 filesystem.)
 
+**Pack byte layout.** A pack is entry bytes, then a JSON index trailer,
+then a fixed 16-byte footer — nothing else, and nothing at the front (no
+header: the spool file must already be the final layout, and a header
+would have to be rewritten at seal time):
+
+```
+offset 0
++------------------------------------------------------------+
+| entry 0 bytes   (independently compressed, then encrypted) |
+| entry 1 bytes                                              |
+| ...              byte-packed, no alignment padding         |
+| entry N-1 bytes                                            |
++------------------------------------------------------------+  <- trailer_off
+| trailer: JSON, uncompressed, unencrypted                   |
+|   {                                                        |
+|     "v": 1,                                                |
+|     "created_ms": 1755300000000,                           |
+|     "entries": [        // sorted by key                   |
+|       {"k":"<key>", "o":<offset>, "l":<length>,            |
+|        "t":"catalog"},  // "t" omitted for data entries    |
+|       ...                                                  |
+|     ],                                                     |
+|     "dead": ["<key>", ...]   // phase-1 tombstones only    |
+|   }                                                        |
++------------------------------------------------------------+
+| footer, 16 bytes:                                          |
+|   [0:8)   uint64 little-endian = trailer length in bytes   |
+|   [8:16)  magic "PELFSPK1"                                 |
++------------------------------------------------------------+
+```
+
+Reading a pack cold takes at most two range requests: (1) a fixed-size
+tail probe (128 KiB) — the magic and trailer length sit at the very end,
+and the trailer is usually inside the probe; (2) if the trailer is
+longer than the probe, one exact range read for the rest. After that the
+in-memory index maps key → (offset, length) and every entry is a single
+range-GET. There is no separate index object and no index at the front:
+the trailer IS the index, and putting it at the end is what lets the
+local spool file upload verbatim (zero-copy seal).
+
+The `"o"`/`"l"` offsets are relative to the pack start and locate the
+COMPRESSED+ENCRYPTED entry bytes; how to decode them (compression algo,
+key id) is recorded in the record that referenced the entry (catalog
+chunkref columns), never sniffed from the bytes. What the two eras
+share and where they differ:
+
+- **Keys**: phase 1 uses JuiceFS block object keys
+  (`chunks/0/0/1_0_4194304`); v2 uses hex chunk/catalog/shard
+  identities. Same trailer schema either way.
+- **Types** (`"t"`): phase 1 writes only data entries (field omitted);
+  v2 adds `"catalog"`, `"shard"`, `"sb"` (superblock backup) so rescue
+  can inventory a namespace from packs alone.
+- **Tombstones** (`"dead"`): phase-1 LSM shadowing only. v2 never needs
+  them — liveness is defined by the generation's pack list + catalogs.
+- **Trailer hash**: v2's superblock pack list records BLAKE3-256 of the
+  trailer JSON, so a reader verifies the location map right after the
+  tail read. Entry data integrity does not depend on this — chunk
+  identities are end-to-end.
+
+Index cost: ~100 bytes of JSON per entry. Large-chunk packs (16 entries
+of 4 MiB) pay ~2 KB per 64 MiB; the worst realistic case — a pack full
+of 8 KiB small files, ~8000 entries — pays ~800 KB, about 1.2%. JSON is
+deliberate: rescue tooling and humans can read a trailer with curl and
+jq, and the cost stays marginal. (A binary index becomes worth it only
+if entries shrink well below the 4 KiB inline threshold, which the
+threshold exists to prevent.)
+
 This resolves the classic tension between **sub-pack fetching and
 compression ratio** in favor of fetching: per-entry compression makes
 every entry independently range-readable, at the cost of losing cross-file

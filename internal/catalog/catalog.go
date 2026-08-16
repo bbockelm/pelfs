@@ -27,6 +27,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"strconv"
 
 	_ "modernc.org/sqlite"
@@ -326,10 +327,31 @@ func (w *Writer) Close() error {
 }
 
 // Catalog reads a finished catalog. Safe for concurrent use.
+//
+// Read statements are prepared once and cached: profiling the phase-3
+// lookup path showed SQL PARSING (sqlite3's yacc reduce) burning ~13% of
+// CPU because database/sql re-prepares on every Query call with
+// arguments. Catalogs are immutable and read hot, so the parse belongs at
+// open time. The pool is sized for concurrent readers rather than left at
+// the single-connection default the writer needs.
 type Catalog struct {
 	db   *sql.DB
 	meta Meta
+
+	stLookupEdge    *sql.Stmt
+	stLookupNested  *sql.Stmt
+	stReaddirEdges  *sql.Stmt
+	stReaddirNested *sql.Stmt
+	stStat          *sql.Stmt
+	stChunks        *sql.Stmt
+	stInline        *sql.Stmt
+	stXattrs        *sql.Stmt
+	stSymlink       *sql.Stmt
 }
+
+// readerConns bounds prepared-statement replication across pooled
+// connections (each connection holds its own compiled statement).
+var readerConns = min(runtime.NumCPU(), 8)
 
 // Open opens an existing catalog read-only and validates its format version.
 func Open(path string) (*Catalog, error) {
@@ -340,12 +362,44 @@ func Open(path string) (*Catalog, error) {
 	if err != nil {
 		return nil, err
 	}
+	db.SetMaxOpenConns(readerConns)
+	db.SetMaxIdleConns(readerConns)
 	c := &Catalog{db: db}
 	if err := c.loadMeta(); err != nil {
 		db.Close()
 		return nil, err
 	}
+	if err := c.prepare(); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return c, nil
+}
+
+// prepare compiles the read statements once. Failure is fatal to Open:
+// a catalog whose schema does not match this reader is unusable.
+func (c *Catalog) prepare() error {
+	for _, p := range []struct {
+		dst **sql.Stmt
+		sql string
+	}{
+		{&c.stLookupEdge, `SELECT inode, type FROM edge WHERE parent = ? AND name = ?`},
+		{&c.stLookupNested, `SELECT catalog_identity FROM nested WHERE parent = ? AND name = ?`},
+		{&c.stReaddirEdges, `SELECT name, inode, type FROM edge WHERE parent = ? ORDER BY name`},
+		{&c.stReaddirNested, `SELECT name, catalog_identity FROM nested WHERE parent = ? ORDER BY name`},
+		{&c.stStat, `SELECT inode, type, mode, uid, gid, mtime_ns, ctime_ns, nlink, length, rdev, keyid, flags FROM node WHERE inode = ?`},
+		{&c.stChunks, `SELECT identity, llen, clen, alg, keyid FROM chunkref WHERE inode = ? ORDER BY idx`},
+		{&c.stInline, `SELECT data FROM inline WHERE inode = ?`},
+		{&c.stXattrs, `SELECT name, value FROM xattr WHERE inode = ? ORDER BY name`},
+		{&c.stSymlink, `SELECT target FROM symlink WHERE inode = ?`},
+	} {
+		st, err := c.db.Prepare(p.sql)
+		if err != nil {
+			return fmt.Errorf("catalog: prepare %q: %w", p.sql, err)
+		}
+		*p.dst = st
+	}
+	return nil
 }
 
 func (c *Catalog) loadMeta() error {
@@ -409,7 +463,7 @@ type LookupResult struct {
 func (c *Catalog) Lookup(parent int64, name []byte) (LookupResult, error) {
 	var res LookupResult
 	var d Dirent
-	err := c.db.QueryRow(`SELECT inode, type FROM edge WHERE parent = ? AND name = ?`, parent, name).
+	err := c.stLookupEdge.QueryRow(parent, name).
 		Scan(&d.Inode, &d.Type)
 	switch {
 	case err == nil:
@@ -419,7 +473,7 @@ func (c *Catalog) Lookup(parent int64, name []byte) (LookupResult, error) {
 		return LookupResult{}, err
 	}
 	var identity []byte
-	err = c.db.QueryRow(`SELECT catalog_identity FROM nested WHERE parent = ? AND name = ?`, parent, name).
+	err = c.stLookupNested.QueryRow(parent, name).
 		Scan(&identity)
 	switch {
 	case err == nil:
@@ -436,7 +490,7 @@ func (c *Catalog) Lookup(parent int64, name []byte) (LookupResult, error) {
 // Readdir lists a directory: its ordinary entries and its transition
 // points, each sorted by name (the primary-key order).
 func (c *Catalog) Readdir(parent int64) ([]Dirent, []Nested, error) {
-	rows, err := c.db.Query(`SELECT name, inode, type FROM edge WHERE parent = ? ORDER BY name`, parent)
+	rows, err := c.stReaddirEdges.Query(parent)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -452,7 +506,7 @@ func (c *Catalog) Readdir(parent int64) ([]Dirent, []Nested, error) {
 	if err := rows.Err(); err != nil {
 		return nil, nil, err
 	}
-	nrows, err := c.db.Query(`SELECT name, catalog_identity FROM nested WHERE parent = ? ORDER BY name`, parent)
+	nrows, err := c.stReaddirNested.Query(parent)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -471,7 +525,7 @@ func (c *Catalog) Readdir(parent int64) ([]Dirent, []Nested, error) {
 // Stat returns one inode's attributes; ErrNotExist if absent.
 func (c *Catalog) Stat(inode int64) (Node, error) {
 	var n Node
-	err := c.db.QueryRow(`SELECT inode, type, mode, uid, gid, mtime_ns, ctime_ns, nlink, length, rdev, keyid, flags FROM node WHERE inode = ?`, inode).
+	err := c.stStat.QueryRow(inode).
 		Scan(&n.Inode, &n.Type, &n.Mode, &n.UID, &n.GID,
 			&n.MtimeNS, &n.CtimeNS, &n.Nlink, &n.Length, &n.Rdev, &n.KeyID, &n.Flags)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -485,7 +539,7 @@ func (c *Catalog) Stat(inode int64) (Node, error) {
 // back with a nil Identity. When any chunk rows exist, the summed llen must
 // equal node.length; a mismatch is corruption and returns an error.
 func (c *Catalog) Chunks(inode int64) ([]ChunkRef, error) {
-	rows, err := c.db.Query(`SELECT identity, llen, clen, alg, keyid FROM chunkref WHERE inode = ? ORDER BY idx`, inode)
+	rows, err := c.stChunks.Query(inode)
 	if err != nil {
 		return nil, err
 	}
@@ -521,7 +575,7 @@ func (c *Catalog) Chunks(inode int64) ([]ChunkRef, error) {
 // no inline row.
 func (c *Catalog) Inline(inode int64) ([]byte, error) {
 	var data []byte
-	err := c.db.QueryRow(`SELECT data FROM inline WHERE inode = ?`, inode).Scan(&data)
+	err := c.stInline.QueryRow(inode).Scan(&data)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -531,7 +585,7 @@ func (c *Catalog) Inline(inode int64) ([]byte, error) {
 // Xattrs returns an inode's extended attributes sorted by name; empty when
 // there are none.
 func (c *Catalog) Xattrs(inode int64) ([]Xattr, error) {
-	rows, err := c.db.Query(`SELECT name, value FROM xattr WHERE inode = ? ORDER BY name`, inode)
+	rows, err := c.stXattrs.Query(inode)
 	if err != nil {
 		return nil, err
 	}
@@ -550,7 +604,7 @@ func (c *Catalog) Xattrs(inode int64) ([]Xattr, error) {
 // Symlink returns a symlink's target; ErrNotExist if the inode has none.
 func (c *Catalog) Symlink(inode int64) ([]byte, error) {
 	var target []byte
-	err := c.db.QueryRow(`SELECT target FROM symlink WHERE inode = ?`, inode).Scan(&target)
+	err := c.stSymlink.QueryRow(inode).Scan(&target)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotExist
 	}

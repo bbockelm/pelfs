@@ -122,6 +122,8 @@ jobs:
           sudo modprobe fuse
           sudo chmod 666 /dev/fuse
       - name: Mount a published generation and benchmark it
+        env:
+          PELFS_MOUNT_TEST_OK: "1"
         run: ./scripts/phase3-mount-test.sh
 
   bench:

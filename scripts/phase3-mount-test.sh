@@ -40,10 +40,17 @@ trap cleanup EXIT
 
 [ -e /dev/fuse ] || { echo "no /dev/fuse; phase-3 mounts need FUSE" >&2; exit 1; }
 
-cd "$REPO"
-echo "== building pelfs and fakeorigin =="
-CGO_ENABLED=0 go build -tags nogspt,notikv -o "$WORK/pelfs" ./cmd/pelfs
-CGO_ENABLED=0 go build -tags nogspt,notikv -o "$WORK/fakeorigin" ./cmd/fakeorigin
+# Binaries are either prebuilt (the container launcher cross-compiles on
+# the host, since the test image has no toolchain) or built here.
+if [ -n "${PELFS_PREBUILT:-}" ]; then
+  echo "== using prebuilt binaries from $PELFS_PREBUILT =="
+  cp "$PELFS_PREBUILT/pelfs" "$PELFS_PREBUILT/fakeorigin" "$WORK/"
+else
+  cd "$REPO"
+  echo "== building pelfs and fakeorigin =="
+  CGO_ENABLED=0 go build -tags nogspt,notikv -o "$WORK/pelfs" ./cmd/pelfs
+  CGO_ENABLED=0 go build -tags nogspt,notikv -o "$WORK/fakeorigin" ./cmd/fakeorigin
+fi
 
 echo "== starting fakeorigin =="
 mkdir -p "$WORK/origin" "$WORK/src" "$WORK/mnt" "$WORK/state"
@@ -68,6 +75,11 @@ mkdir -p "$WORK/v1mnt"
 "$WORK/pelfs" mount --state-dir "$WORK/state" --writeback --no-lease \
   --snapshot-interval 0 "$PREFIX" "$WORK/v1mnt"
 cp -R "$WORK/src/." "$WORK/v1mnt/"
+# cp -R copies a hardlink as an independent file (and cp -a fails on
+# backends without xattr support), so make the link inside the mount —
+# the point is to publish an inode with nlink > 1.
+rm "$WORK/v1mnt/dir/hard.bin"
+ln "$WORK/v1mnt/dir/big.bin" "$WORK/v1mnt/dir/hard.bin"
 
 echo "== publishing generation 0 through the control socket =="
 "$WORK/pelfs" ctl "$PREFIX" publish
@@ -104,7 +116,7 @@ echo "== read-write round trip: mount --rw, modify, seal, verify =="
 fusermount3 -u "$WORK/mnt" 2>/dev/null || fusermount -u "$WORK/mnt" 2>/dev/null || umount "$WORK/mnt"
 wait "$MOUNT_PID" 2>/dev/null || true
 
-"$WORK/pelfs" mount-gen --rw --state-dir "$WORK/state3" "$PREFIX" "$WORK/mnt" &
+"$WORK/pelfs" mount-gen --rw --state-dir "$WORK/state" "$PREFIX" "$WORK/mnt" &
 MOUNT_PID=$!
 for _ in $(seq 100); do [ -e "$WORK/mnt/dir/small.txt" ] && break; sleep 0.1; done
 [ -e "$WORK/mnt/dir/small.txt" ] || { echo "rw mount did not come up" >&2; exit 1; }
@@ -126,7 +138,7 @@ for _ in $(seq 100); do [ -e "$WORK/mnt/dir/written.txt" ] && break; sleep 0.1; 
 grep -q "phase-3 write" "$WORK/mnt/dir/written.txt" || { echo "sealed write missing" >&2; exit 1; }
 [ -d "$WORK/mnt/newdir" ] || { echo "sealed mkdir missing" >&2; exit 1; }
 [ ! -e "$WORK/mnt/dir/small.txt" ] || { echo "sealed deletion did not stick" >&2; exit 1; }
-cmp <(cat "$WORK/src/dir/big.bin") <(cat "$WORK/mnt/dir/big.bin")
+cmp "$WORK/src/dir/big.bin" "$WORK/mnt/dir/big.bin"
 echo "seal round trip verified: writes, mkdir, deletion, untouched content"
 
 if [ "$BENCH" = "--bench" ]; then

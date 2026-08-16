@@ -30,12 +30,14 @@ import (
 func cmdMountGen(args []string) int {
 	var branch, tag, pubkeyHex string
 	var rw, noSeal bool
+	var signingKeyPath string
 	o, pos, err := parseArgs("mount-gen", args, 2, 2, func(fs *flag.FlagSet, o *cmdOpts) {
 		fs.StringVar(&branch, "branch", "main", "branch to mount")
 		fs.StringVar(&tag, "tag", "", "mount a tag instead of a branch head (pinned exactly)")
 		fs.StringVar(&pubkeyHex, "volume-pubkey", "", "hex Ed25519 volume key to trust (default: pin on first use)")
 		fs.BoolVar(&rw, "rw", false, "mount read-write through a local overlay; unmount SEALS the changes into the next generation")
 		fs.BoolVar(&noSeal, "no-seal", false, "with --rw, keep the overlay at unmount instead of publishing it (resume by remounting)")
+		fs.StringVar(&signingKeyPath, "signing-key", "", "hex Ed25519 volume signing key file to seal with (default: <state-dir>/v2-signing.key; a volume's key is per-VOLUME, so a second machine must import it)")
 	})
 	if err != nil {
 		return exitErr(err)
@@ -177,7 +179,11 @@ func cmdMountGen(args []string) int {
 		return 0
 	}
 	fmt.Fprintln(os.Stderr, "pelfs: sealing the overlay into the next generation...")
-	signingKey, err := loadOrCreateSigningKey(filepath.Join(stateDir, "v2-signing.key"), sb)
+	keyPath := signingKeyPath
+	if keyPath == "" {
+		keyPath = filepath.Join(stateDir, "v2-signing.key")
+	}
+	signingKey, err := loadOrCreateSigningKey(keyPath, sb)
 	if err != nil {
 		return exitErr(err)
 	}

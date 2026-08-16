@@ -347,17 +347,28 @@ consistent, by the pre-snapshot flush ordering.)
 Retention is expressed entirely in the ref/generation layer, and the pack
 list makes the sweep set arithmetic rather than tree traversal:
 
-- **Retained generations** = every ref's current generation, every tag,
-  plus each branch's trailing ancestors within `K` generations or
-  `T_grace` of age (walked via lineage hashes; defaults K=8,
-  T_grace=72h, recorded in the superblock so writers, readers, and GC
-  agree; configurable per volume).
-- **Retained packs** = the union of retained generations' pack lists.
-  No catalog walking is needed for deletion safety — the pack list *is*
-  the reachable closure at pack granularity. (Catalog walking exists only
-  inside publish, for repack liveness accounting.) Retention deliberately
+- **Pack lists carry forward.** Publish appends new packs to the
+  previous generation's list; the only thing that ever REMOVES a pack
+  from the list is repack (inside TRANSFORM). So a branch head's list
+  covers every ancestor's packs except the recently repacked-away ones.
+- **The condemned ledger covers those.** When repack drops a pack from
+  the list, the new superblock records it in a small `condemned` ledger
+  as (name, condemned-at); publish carries ledger entries forward until
+  they age past `T_grace`, then drops them. A reader pinned to a
+  recent anonymous generation therefore keeps its packs for the full
+  grace window, and GC never needs an ancestor's superblock — the head
+  states everything. (An earlier draft walked lineage hashes to
+  ancestors' pack lists instead; rejected because anonymous ancestors'
+  superblocks are not reliably fetchable once the ref moves — they live
+  only as scattered in-pack backups.)
+- **Retained packs** = the union over every ref head and every tag of
+  (pack list + condemned entries younger than T_grace). No catalog
+  walking is needed for deletion safety — the pack list *is* the
+  reachable closure at pack granularity. Retention deliberately
   overapproximates liveness; repack trims dead bytes *within* retained
-  generations.
+  generations. T_grace defaults to 72h, is recorded in the superblock
+  Params so writers, readers, and GC agree, and is configurable per
+  volume.
 - **Sweep** = delete packs that are (a) absent from the retained union
   AND (b) older than T_grace by name timestamp. Guard (b) is what makes
   GC safe to run concurrently with writers and forkers, with no locking:
@@ -370,10 +381,10 @@ list makes the sweep set arithmetic rather than tree traversal:
 - **Granularity:** whole packs, superseded superblock backups, and ref
   debris only — never entries (repack's job). Deleting a branch or tag is
   how space is actually released.
-- **Who runs it:** each publish piggybacks trimming of its own branch's
-  anonymous ancestors (cheap: lineage walk plus set difference);
-  cross-ref sweep after branch/tag deletion is an explicit `pelfs gc`,
-  which needs no lease.
+- **Who runs it:** each publish piggybacks the condemned-ledger upkeep
+  for its own branch (append repacked-away packs, drop entries past
+  T_grace — pure superblock bookkeeping); the actual sweep is an
+  explicit `pelfs gc`, which needs no lease.
 - **The reader contract:** a reader pinned to an untagged generation
   older than T_grace may see "snapshot expired — refresh or remount." A
   workflow that needs a longer pin tags first; tags pin exactly and
@@ -587,9 +598,9 @@ Consequences, deliberate and otherwise:
   branches mount separately. A future cross-branch *merge* would need to
   renumber one side; merge is explicitly out of scope, and this rule is
   why.
-- Retention becomes explicit: "retain last K generations" is anonymous
-  snapshot retention; tags are the user-controlled form. Keep what you
-  name, grace-window the rest.
+- Retention becomes explicit: tags are the user-controlled form of
+  keeping a generation; anonymous generations get the T_grace window
+  via the condemned ledger. Keep what you name, grace-window the rest.
 
 ## Read-only mounts and update propagation
 
@@ -614,8 +625,8 @@ are structurally absent here:
 - **Per-handle snapshot isolation:** an open file's chunk list was
   resolved at open against immutable chunks, so open handles keep reading
   their generation's content consistently across a swap — no torn files,
-  ever. The GC grace window (retain the last K generations' objects) is
-  the contract backing this; a reader older than the window gets an
+  ever. The GC grace window (T_grace via the condemned ledger) is the
+  contract backing this; a reader older than the window gets an
   explicit "snapshot expired, refresh" rather than a silent mixture.
 - **Refresh policy is per-mount, not architectural:** batch jobs
   (HTCondor) default to **pinned** — one generation for the job's

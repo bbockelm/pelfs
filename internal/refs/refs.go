@@ -1,0 +1,286 @@
+// Package refs manages the mutable edge of a v2 volume: the named
+// superblocks under refs/<branch> and tags/<name>
+// (docs/design-packfs.md, "Federation namespace layout" and "Signing and
+// key management").
+//
+// It owns two responsibilities the rest of the stack must never
+// reimplement:
+//
+//   - Trust. Every fetched superblock is verified against the key the
+//     READER trusts — an explicitly supplied public key, or one pinned in
+//     local state on first use (TOFU, the SSH model). Custody-chain
+//     rotation advances the pin only through a verified lineage step
+//     (superblock.VerifyChain); any other key change is a loud error.
+//
+//   - The flip. Publishing a generation overwrites refs/<branch> guarded
+//     by the ETag observed at fetch time: writers detect a lost race
+//     instead of silently clobbering. The transports expose stat-ETags
+//     but not conditional PUT, so the guard is check-then-put with a
+//     narrow window — same as the v1 snapshot manager — and the advisory
+//     lease keeps concurrent writers out of even that window. True
+//     If-Match lands when the transport grows it.
+package refs
+
+import (
+	"context"
+	"crypto/ed25519"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/bbockelm/pelfs/internal/pelicanobj"
+	"github.com/bbockelm/pelfs/internal/superblock"
+)
+
+// RefDirKey and TagDirKey are the key-space directories for branches and
+// tags, relative to the volume prefix.
+const (
+	RefDirKey = "refs"
+	TagDirKey = "tags"
+)
+
+// ErrStaleFlip reports that refs/<branch> changed between Fetch and Flip:
+// another writer published first and this generation must be rebuilt on
+// top of theirs.
+var ErrStaleFlip = errors.New("ref changed since fetch (concurrent publish)")
+
+// ErrUntrusted reports a superblock that does not verify under the pinned
+// (or supplied) key and cannot be reached by a custody-chain step from
+// the last accepted generation.
+var ErrUntrusted = errors.New("superblock not signed by the trusted key")
+
+// Store reads and writes refs with trust enforcement and local pinning.
+type Store struct {
+	inner pelicanobj.Store
+	// stateDir persists, per branch, the pinned public key and the last
+	// accepted superblock (wire bytes, for custody-chain verification).
+	stateDir string
+	// trusted, when non-nil, is an explicitly supplied key: it is
+	// authoritative and TOFU never runs.
+	trusted ed25519.PublicKey
+}
+
+// New builds a ref store. stateDir is the volume's local state directory;
+// trusted is an optional explicit public key (--volume-pubkey).
+func New(inner pelicanobj.Store, stateDir string, trusted ed25519.PublicKey) (*Store, error) {
+	if err := os.MkdirAll(filepath.Join(stateDir, "refs"), 0700); err != nil {
+		return nil, err
+	}
+	return &Store{inner: inner, stateDir: stateDir, trusted: trusted}, nil
+}
+
+// Fetched is the result of one Fetch: the verified superblock, its wire
+// bytes, and the ETag guarding the next Flip.
+type Fetched struct {
+	Superblock *superblock.Superblock
+	Raw        []byte
+	ETag       string
+}
+
+func refKey(branch string) string { return RefDirKey + "/" + branch }
+
+func (s *Store) pinPath(branch string) string {
+	return filepath.Join(s.stateDir, "refs", branch+".pub")
+}
+func (s *Store) lastPath(branch string) string {
+	return filepath.Join(s.stateDir, "refs", branch+".sb")
+}
+
+// Fetch reads refs/<branch>, verifies it, and returns it with its ETag.
+// Verification policy, in order:
+//
+//  1. An explicitly supplied key must verify directly — no TOFU, no
+//     rotation shortcut (an explicit key is a statement of intent).
+//  2. A pinned key verifies directly, or via one custody-chain step from
+//     the last accepted superblock (which advances the pin).
+//  3. No pin yet: trust-on-first-use — pin the embedded key, loudly.
+func (s *Store) Fetch(ctx context.Context, branch string) (*Fetched, error) {
+	if strings.ContainsAny(branch, "/\\") {
+		return nil, fmt.Errorf("invalid branch name %q", branch)
+	}
+	raw, etag, err := s.read(ctx, refKey(branch))
+	if err != nil {
+		return nil, err
+	}
+	sb, err := superblock.Decode(raw)
+	if err != nil {
+		return nil, fmt.Errorf("ref %s: %w", branch, err)
+	}
+
+	if s.trusted != nil {
+		if err := sb.Verify(s.trusted); err != nil {
+			return nil, fmt.Errorf("ref %s: %w: %w", branch, ErrUntrusted, err)
+		}
+		return &Fetched{Superblock: sb, Raw: raw, ETag: etag}, nil
+	}
+
+	pinned, err := s.readPin(branch)
+	if err != nil {
+		return nil, err
+	}
+	if pinned == nil {
+		// TOFU: nothing pinned yet. Loud, because this is the one moment
+		// an active attacker could substitute a key undetected.
+		fmt.Fprintf(os.Stderr,
+			"pelfs: pinning volume key %s for branch %q on first use; verify the fingerprint out of band if this volume is shared\n",
+			hex.EncodeToString(sb.SigningPub[:]), branch)
+		if err := sb.Verify(ed25519.PublicKey(sb.SigningPub[:])); err != nil {
+			return nil, fmt.Errorf("ref %s: %w", branch, err)
+		}
+		if err := s.persist(branch, sb.SigningPub[:], raw); err != nil {
+			return nil, err
+		}
+		return &Fetched{Superblock: sb, Raw: raw, ETag: etag}, nil
+	}
+
+	if err := sb.Verify(pinned); err == nil {
+		if err := s.persist(branch, pinned, raw); err != nil {
+			return nil, err
+		}
+		return &Fetched{Superblock: sb, Raw: raw, ETag: etag}, nil
+	}
+	// Direct verification failed: accept only a custody-chain step from
+	// the last superblock this client accepted.
+	prevRaw, err := os.ReadFile(s.lastPath(branch))
+	if err != nil {
+		return nil, fmt.Errorf("ref %s: %w (no prior generation on record to rotate from)", branch, ErrUntrusted)
+	}
+	if err := superblock.VerifyChain(prevRaw, sb, pinned); err != nil {
+		return nil, fmt.Errorf("ref %s: %w: %w", branch, ErrUntrusted, err)
+	}
+	fmt.Fprintf(os.Stderr, "pelfs: branch %q rotated its signing key to %s (announced by the previous generation)\n",
+		branch, hex.EncodeToString(sb.SigningPub[:]))
+	if err := s.persist(branch, sb.SigningPub[:], raw); err != nil {
+		return nil, err
+	}
+	return &Fetched{Superblock: sb, Raw: raw, ETag: etag}, nil
+}
+
+// Flip publishes raw (an encoded, signed superblock) to refs/<branch>.
+// expectETag is the ETag from the Fetch this generation was built on (""
+// for the first generation, when the ref must not exist yet). Flip never
+// touches the local trust state: pinning belongs to Fetch's verification
+// path alone, or a compromised writer could re-pin its own key by
+// publishing (the writer's next Fetch validates — and records — what it
+// published like any other reader).
+func (s *Store) Flip(ctx context.Context, branch string, raw []byte, expectETag string) error {
+	key := refKey(branch)
+	ki, err := s.inner.StatKey(ctx, key)
+	switch {
+	case err == nil && expectETag == "":
+		return fmt.Errorf("%w: ref %s already exists", ErrStaleFlip, branch)
+	case err == nil && ki.ETag != "" && ki.ETag != expectETag:
+		return fmt.Errorf("%w: ref %s", ErrStaleFlip, branch)
+	case err != nil && expectETag != "":
+		return fmt.Errorf("%w: ref %s vanished", ErrStaleFlip, branch)
+	}
+	if err := s.inner.Put(ctx, key, strings.NewReader(string(raw))); err != nil {
+		return fmt.Errorf("flip ref %s: %w", branch, err)
+	}
+	return nil
+}
+
+// Tag freezes raw under tags/<name>. Tags are immutable: an existing tag
+// is never overwritten.
+func (s *Store) Tag(ctx context.Context, name string, raw []byte) error {
+	if strings.ContainsAny(name, "/\\") {
+		return fmt.Errorf("invalid tag name %q", name)
+	}
+	key := TagDirKey + "/" + name
+	if _, err := s.inner.StatKey(ctx, key); err == nil {
+		return fmt.Errorf("tag %s already exists", name)
+	}
+	if err := s.inner.Put(ctx, key, strings.NewReader(string(raw))); err != nil {
+		return fmt.Errorf("create tag %s: %w", name, err)
+	}
+	return nil
+}
+
+// FetchTag reads and verifies tags/<name> under the same trust policy as
+// branches, except that a tag never advances a pin (it is a frozen
+// generation of some branch whose key the reader already trusts).
+func (s *Store) FetchTag(ctx context.Context, name string) (*superblock.Superblock, []byte, error) {
+	raw, _, err := s.read(ctx, TagDirKey+"/"+name)
+	if err != nil {
+		return nil, nil, err
+	}
+	sb, err := superblock.Decode(raw)
+	if err != nil {
+		return nil, nil, fmt.Errorf("tag %s: %w", name, err)
+	}
+	key := s.trusted
+	if key == nil {
+		// Any branch pin of this volume vouches for a tag; try them all.
+		pins, _ := filepath.Glob(filepath.Join(s.stateDir, "refs", "*.pub"))
+		for _, p := range pins {
+			if k, err := readKeyFile(p); err == nil && sb.Verify(k) == nil {
+				return sb, raw, nil
+			}
+		}
+		return nil, nil, fmt.Errorf("tag %s: %w (no pinned key verifies it)", name, ErrUntrusted)
+	}
+	if err := sb.Verify(key); err != nil {
+		return nil, nil, fmt.Errorf("tag %s: %w: %w", name, ErrUntrusted, err)
+	}
+	return sb, raw, nil
+}
+
+func (s *Store) read(ctx context.Context, key string) ([]byte, string, error) {
+	var etag string
+	if ki, err := s.inner.StatKey(ctx, key); err == nil {
+		etag = ki.ETag
+	}
+	rc, err := s.inner.Get(ctx, key, 0, -1)
+	if err != nil {
+		return nil, "", fmt.Errorf("read %s: %w", key, err)
+	}
+	raw, rerr := io.ReadAll(rc)
+	cerr := rc.Close()
+	if rerr != nil {
+		return nil, "", fmt.Errorf("read %s: %w", key, rerr)
+	}
+	if cerr != nil {
+		return nil, "", fmt.Errorf("read %s: %w", key, cerr)
+	}
+	return raw, etag, nil
+}
+
+func (s *Store) readPin(branch string) (ed25519.PublicKey, error) {
+	k, err := readKeyFile(s.pinPath(branch))
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	return k, err
+}
+
+func readKeyFile(path string) (ed25519.PublicKey, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	k, err := hex.DecodeString(strings.TrimSpace(string(b)))
+	if err != nil || len(k) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("corrupt key pin %s", path)
+	}
+	return k, nil
+}
+
+// persist atomically records the pinned key and last accepted superblock.
+func (s *Store) persist(branch string, pub []byte, raw []byte) error {
+	if err := writeAtomic(s.pinPath(branch), []byte(hex.EncodeToString(pub)+"\n")); err != nil {
+		return err
+	}
+	return writeAtomic(s.lastPath(branch), raw)
+}
+
+func writeAtomic(path string, data []byte) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}

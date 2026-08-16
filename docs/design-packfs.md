@@ -1010,16 +1010,26 @@ remount; live generation swap arrives with phase 3.
    (tombstoned entries remain in their packs until then); gc --delete of a
    packed entry from a read-only session is non-durable (the entry
    resurfaces at the next bootstrap — space, never correctness).
-2. **Cold format.** Publish/restore of catalogs + shards + superblock;
-   JuiceFS remains the hot engine; v1 snapshot machinery (lease, ETag,
-   stats) collapses onto the superblock.
-3. **Catalog-native runtime.** Replace the hot engine and VFS with our own
-   FUSE/NFS filesystem whose live format *is* the catalog format (publish
-   becomes "seal", not "translate"), and eject JuiceFS — the pin, the fork
-   replaces, and the cgo shims all go with it. Tractable because pelfs is
-   single-writer scratch: no distributed sessions, no multi-client
+2. **Cold format.** — **IMPLEMENTED** (internal/publish, internal/
+   hydrate, internal/refs, internal/retention; `pelfs publish`, the
+   control socket's publish verb, and --accumulate). Publish translates
+   a cut into catalogs/shards/packs and flips a signed ref; hydrate
+   rebuilds a mountable JuiceFS volume with exact inodes and serves
+   hydrated data from packs. JuiceFS remains the hot engine. Remaining
+   wiring: hydrate-backed restore in mounts (today restore is still v1
+   snapshots), production Storage config in the rebuilt Format.
+3. **Catalog-native runtime.** — **IN PROGRESS**. Landed: internal/genfs
+   (the FUSE-agnostic generation resolver), internal/rawfuse (the raw
+   read-only kernel binding), `pelfs mount-gen` (mount a published
+   generation with no JuiceFS in the stack). In flight: the write
+   overlay. Remaining: seal (walk overlay+base directly into
+   catalogs/packs — publish stops translating), generation swap with
+   enumerated invalidation, then eject JuiceFS — the pin, the fork
+   replaces, and the cgo shims all go with it. Tractable because pelfs
+   is single-writer scratch: no distributed sessions, no multi-client
    coherence. JuiceFS is ejected last, after the format has production
-   mileage; what is battle-tested by then is our format, not their schema.
+   mileage; what is battle-tested by then is our format, not their
+   schema.
 
 ## Phase 3 VFS architecture
 

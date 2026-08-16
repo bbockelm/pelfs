@@ -35,6 +35,7 @@ func cmdMountGen(args []string) int {
 	var branch, tag, pubkeyHex string
 	var rw, noSeal bool
 	var signingKeyPath, backend string
+	var subshell bool
 	var poll time.Duration
 	o, pos, err := parseArgs("mount-gen", args, 2, 2, func(fs *flag.FlagSet, o *cmdOpts) {
 		fs.StringVar(&branch, "branch", "main", "branch to mount")
@@ -42,6 +43,7 @@ func cmdMountGen(args []string) int {
 		fs.StringVar(&pubkeyHex, "volume-pubkey", "", "hex Ed25519 volume key to trust (default: pin on first use)")
 		fs.BoolVar(&rw, "rw", false, "mount read-write through a local overlay; unmount SEALS the changes into the next generation")
 		fs.BoolVar(&noSeal, "no-seal", false, "with --rw, keep the overlay at unmount instead of publishing it (resume by remounting)")
+		fs.BoolVar(&subshell, "subshell", false, "run a subshell in the mount and unmount (sealing, with --rw) when it exits — the `pelfs shell` workflow on the catalog-native stack")
 		fs.StringVar(&backend, "backend", "fuse", "how to attach: fuse (Linux/macFUSE) or nfs (loopback NFS server + the OS client; works on macOS with no kext)")
 		fs.DurationVar(&poll, "poll", 0, "read-only: re-check the branch head this often and swap generations live (0 = pinned, the reproducible-batch default)")
 		fs.StringVar(&signingKeyPath, "signing-key", "", "hex Ed25519 volume signing key file to seal with (default: <state-dir>/v2-signing.key; a volume's key is per-VOLUME, so a second machine must import it)")
@@ -249,6 +251,31 @@ func cmdMountGen(args []string) int {
 		fmt.Fprintln(os.Stderr, "pelfs: --poll ignored (writable mounts and tags are pinned by design)")
 	}
 
+	if subshell {
+		// The shell owns the session: when it exits we unmount, and the
+		// seal (with --rw) happens on the way out just as it does for a
+		// signalled mount.
+		code := launchSubshell(o, prefix, mountpoint)
+		if nfsSrv != nil {
+			if err := nfsmount.Unmount(mountpoint); err != nil {
+				fmt.Fprintf(os.Stderr, "pelfs: unmount: %v\n", err)
+			}
+		} else {
+			if err := srv.Unmount(); err != nil {
+				fmt.Fprintf(os.Stderr, "pelfs: unmount: %v\n", err)
+			}
+			srv.Wait()
+		}
+		if sealErr := sealOverlay(ctx, sealArgs{
+			rw: rw, noSeal: noSeal, ov: ov, overlayDir: overlayDir,
+			inner: inner, stateDir: stateDir, branch: branch, sb: sb, prevRaw: prevRaw,
+			dek: dek, identityKey: identityKey, keyID: keyID, signingKeyPath: signingKeyPath,
+		}); sealErr != nil {
+			return exitErr(sealErr)
+		}
+		return code
+	}
+
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
 	if nfsSrv != nil {
@@ -264,43 +291,73 @@ func cmdMountGen(args []string) int {
 		srv.Wait()
 	}
 
-	if !rw || noSeal {
-		if rw {
-			fmt.Fprintf(os.Stderr, "pelfs: overlay kept at %s (--no-seal); remount to resume or seal\n", overlayDir)
-		}
-		return 0
-	}
-
-	st, err := ov.Stats()
-	if err == nil && st.DirtyNodes == 0 && st.DirtyEdges == 0 {
-		fmt.Fprintln(os.Stderr, "pelfs: nothing changed; no new generation")
-		return 0
-	}
-	fmt.Fprintln(os.Stderr, "pelfs: sealing the overlay into the next generation...")
-	keyPath := signingKeyPath
-	if keyPath == "" {
-		keyPath = filepath.Join(stateDir, "v2-signing.key")
-	}
-	signingKey, err := loadOrCreateSigningKey(keyPath, sb)
-	if err != nil {
+	if err := sealOverlay(ctx, sealArgs{
+		rw: rw, noSeal: noSeal, ov: ov, overlayDir: overlayDir,
+		inner: inner, stateDir: stateDir, branch: branch, sb: sb, prevRaw: prevRaw,
+		dek: dek, identityKey: identityKey, keyID: keyID, signingKeyPath: signingKeyPath,
+	}); err != nil {
 		return exitErr(err)
 	}
+	return 0
+}
+
+// sealArgs carries what sealing a writable mount needs at exit; both the
+// signalled path and the subshell path end there.
+type sealArgs struct {
+	rw, noSeal     bool
+	ov             *overlay.FS
+	overlayDir     string
+	inner          pelicanobj.Store
+	stateDir       string
+	branch         string
+	sb             *superblock.Superblock
+	prevRaw        []byte
+	dek            []byte
+	identityKey    []byte
+	keyID          uint32
+	signingKeyPath string
+}
+
+// sealOverlay publishes a writable mount's changes as the next
+// generation and retires the spent overlay. A read-only mount, an
+// unchanged session, or --no-seal all return without publishing.
+func sealOverlay(ctx context.Context, a sealArgs) error {
+	if !a.rw || a.noSeal {
+		if a.rw {
+			fmt.Fprintf(os.Stderr, "pelfs: overlay kept at %s (--no-seal); remount to resume or seal\n", a.overlayDir)
+		}
+		return nil
+	}
+	st, err := a.ov.Stats()
+	if err == nil && st.DirtyNodes == 0 && st.DirtyEdges == 0 {
+		fmt.Fprintln(os.Stderr, "pelfs: nothing changed; no new generation")
+		return nil
+	}
+	fmt.Fprintln(os.Stderr, "pelfs: sealing the overlay into the next generation...")
+	keyPath := a.signingKeyPath
+	if keyPath == "" {
+		keyPath = filepath.Join(a.stateDir, "v2-signing.key")
+	}
+	signingKey, err := loadOrCreateSigningKey(keyPath, a.sb)
+	if err != nil {
+		return err
+	}
 	res, err := publish.Seal(ctx, publish.Options{
-		Overlay:        ov,
-		Inner:          inner,
-		SpoolDir:       stateDir,
-		Branch:         branch,
+		Overlay:        a.ov,
+		Inner:          a.inner,
+		SpoolDir:       a.stateDir,
+		Branch:         a.branch,
 		SigningKey:     signingKey,
-		Prev:           sb,
-		PrevRaw:        prevRaw,
-		DEK:            dek,
-		IdentityKey:    identityKey,
-		KeyID:          keyID,
-		KeyTable:       sb.KeyTable,
-		DedupIndexPath: filepath.Join(stateDir, "v2-dedup.db"),
+		Prev:           a.sb,
+		PrevRaw:        a.prevRaw,
+		DEK:            a.dek,
+		IdentityKey:    a.identityKey,
+		KeyID:          a.keyID,
+		KeyTable:       a.sb.KeyTable,
+		DedupIndexPath: filepath.Join(a.stateDir, "v2-dedup.db"),
 	})
 	if err != nil {
-		return exitErr(fmt.Errorf("seal: %w (the overlay is intact at %s; remount to retry)", err, overlayDir))
+		return fmt.Errorf("seal: %w (the overlay is intact at %s; remount to retry)", err, a.overlayDir)
 	}
 	fmt.Fprintf(os.Stderr, "pelfs: sealed generation %d (%d chunks, %d catalogs, %d packs)\n",
 		res.Superblock.Generation, res.Stats.ChunksAdded, res.Stats.Catalogs, len(res.NewPacks))
@@ -308,12 +365,11 @@ func cmdMountGen(args []string) int {
 	// The overlay's contents are now published, and it is pinned to the
 	// generation it shadowed — which is no longer the head. Leaving it
 	// would make this state directory single-use: the next mount would
-	// refuse with a generation mismatch. Retire it now that its work is
-	// durable.
-	_ = ov.Close()
-	if err := os.RemoveAll(overlayDir); err != nil {
+	// refuse with a generation mismatch.
+	_ = a.ov.Close()
+	if err := os.RemoveAll(a.overlayDir); err != nil {
 		fmt.Fprintf(os.Stderr, "pelfs: sealed, but the spent overlay at %s could not be removed: %v\n",
-			overlayDir, err)
+			a.overlayDir, err)
 	}
-	return 0
+	return nil
 }

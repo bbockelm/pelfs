@@ -153,6 +153,25 @@ grep -q "phase-3 write" "$WORK/mnt/dir/written.txt" || { echo "sealed write miss
 cmp "$WORK/src/dir/big.bin" "$WORK/mnt/dir/big.bin"
 echo "seal round trip verified: writes, mkdir, deletion, untouched content"
 
+echo "== subshell workflow: pelfs shell, catalog-native =="
+unmount_at "$WORK/mnt"
+wait "$MOUNT_PID" 2>/dev/null || true
+cat > "$WORK/in-shell.sh" <<'INNER'
+set -e
+echo "written from the subshell" > shell-made.txt
+mkdir -p shell-dir
+INNER
+SHELL=/bin/sh "$WORK/pelfs" mount-gen --rw --subshell --shell /bin/sh \
+  --state-dir "$WORK/state" "$PREFIX" "$WORK/mnt" < "$WORK/in-shell.sh" > "$WORK/shell.log" 2>&1 || true
+grep -q "sealed generation" "$WORK/shell.log" || { echo "subshell exit did not seal:" >&2; sed 's/^/    /' "$WORK/shell.log" | tail -5; exit 1; }
+
+"$WORK/pelfs" mount-gen --state-dir "$WORK/state10" "$PREFIX" "$WORK/mnt" &
+MOUNT_PID=$!
+for _ in $(seq 200); do [ -e "$WORK/mnt/shell-made.txt" ] && break; sleep 0.1; done
+grep -q "written from the subshell" "$WORK/mnt/shell-made.txt" || { echo "subshell write did not survive the seal" >&2; exit 1; }
+[ -d "$WORK/mnt/shell-dir" ] || { echo "subshell mkdir did not survive" >&2; exit 1; }
+echo "subshell workflow verified: work in a shell, exit, changes sealed into the next generation"
+
 echo "== strict prefetch: everything local before serving =="
 unmount_at "$WORK/mnt"
 wait "$MOUNT_PID" 2>/dev/null || true

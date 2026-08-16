@@ -1,8 +1,10 @@
 # pelfs v2 format: packed objects, split catalogs, signed superblock
 
-Status: **design draft** — settled at the architecture level, open questions
-listed at the end. Nothing here is implemented yet; v1 (JuiceFS-native
-storage) is what ships today.
+Status: **design complete** — every section is settled, with rejected
+alternatives recorded; the only deferred items (end of document) wait on
+external partners or production mileage, not on design. Phase 1 (the pack
+middleware) is implemented; v1 (JuiceFS-native storage) is what ships
+today.
 
 ## Why change
 
@@ -29,14 +31,18 @@ a single small signed mutable superblock as the trust and consistency root.
 
 ## Object classes
 
-The federation prefix holds exactly four kinds of objects. All but the
-superblock are content-addressed (named by hash) and immutable.
+The federation prefix holds exactly four kinds of objects. Everything
+under refs/ is mutable and ETag-guarded; everything else is immutable.
+(Full layout, naming, and the no-manifest decision: see "Federation
+namespace layout" below.)
 
 ```
 <prefix>/
-  superblock            <- the ONLY mutable object; small, signed, ETag-guarded
-  packs/<hash>          <- immutable packs: data chunks, small files, catalogs,
-                           inode shards, pack indexes
+  refs/<branch>         <- mutable superblocks; small, signed, ETag-CAS
+  tags/<name>           <- immutable superblocks (frozen generations)
+  leases/<branch>.json  <- advisory liveness beacons
+  packs/p-<ts>-<rand>   <- immutable packs: data chunks, small files,
+                           catalogs, inode shards, superblock backups
 ```
 
 ### 1. Packs
@@ -56,8 +62,10 @@ ancestor via content addressing, at zero read-path cost. True deltas, if
 ever wanted, are confined to small objects and are not in this design.
 
 Packs hold everything: data chunks, whole small files, catalogs, inode
-shards. Target pack size and the open-pack append strategy are open
-questions (see below).
+shards. Target pack size is 64 MiB (matching the phase-1 middleware's
+TargetSize: large enough that a 10 GB write is ~160 uploads, small enough
+that repack passes and range-served cold reads stay granular); the
+open-pack append strategy is the spool-file design below.
 
 **Write path (the "memtable"):** the accumulating structure is a local
 spool file — an append-only file whose byte layout is already the final
@@ -264,6 +272,148 @@ version the pack set and deletes overwritten blocks eagerly: a v1
 later sessions tombstone their blocks. Only the newest is guaranteed
 consistent, by the pre-snapshot flush ordering.)
 
+## Retention and GC (v2)
+
+Retention is expressed entirely in the ref/generation layer, and the pack
+list makes the sweep set arithmetic rather than tree traversal:
+
+- **Retained generations** = every ref's current generation, every tag,
+  plus each branch's trailing ancestors within `K` generations or
+  `T_grace` of age (walked via lineage hashes; defaults K=8,
+  T_grace=72h, recorded in the superblock so writers, readers, and GC
+  agree; configurable per volume).
+- **Retained packs** = the union of retained generations' pack lists.
+  No catalog walking is needed for deletion safety — the pack list *is*
+  the reachable closure at pack granularity. (Catalog walking exists only
+  inside publish, for repack liveness accounting.) Retention deliberately
+  overapproximates liveness; repack trims dead bytes *within* retained
+  generations.
+- **Sweep** = delete packs that are (a) absent from the retained union
+  AND (b) older than T_grace by name timestamp. Guard (b) is what makes
+  GC safe to run concurrently with writers and forkers, with no locking:
+  a writer's new packs are always younger than T_grace, so they are never
+  candidates regardless of when GC listed the refs; and the fork rule
+  (fork only from ref-reachable generations) means any mid-GC fork's
+  closure is already inside the retained set. GC re-lists refs
+  immediately before issuing deletes as a cheap window-narrower, not a
+  correctness requirement.
+- **Granularity:** whole packs, superseded superblock backups, and ref
+  debris only — never entries (repack's job). Deleting a branch or tag is
+  how space is actually released.
+- **Who runs it:** each publish piggybacks trimming of its own branch's
+  anonymous ancestors (cheap: lineage walk plus set difference);
+  cross-ref sweep after branch/tag deletion is an explicit `pelfs gc`,
+  which needs no lease.
+- **The reader contract:** a reader pinned to an untagged generation
+  older than T_grace may see "snapshot expired — refresh or remount." A
+  workflow that needs a longer pin tags first; tags pin exactly and
+  indefinitely.
+
+## Signing and key management (v2)
+
+- **Two keys, two jobs.** The volume *signing* keypair (Ed25519,
+  generated at volume creation) authenticates superblocks; the user KEK
+  wraps DEKs and the identity key for confidentiality. They have
+  different lifecycles and different audiences: every reader verifies
+  signatures, only key-holders decrypt. An unencrypted volume still has a
+  signing key.
+- **First-mount trust**, in order of preference: an explicit
+  `--volume-pubkey` (or fingerprint embedded in a shared tag reference);
+  else trust-on-first-use with the key pinned in local state and loud
+  errors on change (the SSH model). The eventual right answer is
+  federation-issued: Pelican's registry already binds namespaces to
+  issuer keys, and registering the volume public key the same way would
+  give readers a trust root without out-of-band exchange — flagged as a
+  Pelican-integration item, not designed here.
+- **Rotation:** a superblock may introduce a successor public key, signed
+  by the current key; readers follow the custody chain through lineage.
+  Compromise recovery is out-of-band re-pinning (custody chains cannot
+  distinguish a stolen key's rotation from a legitimate one).
+- **Threat model, stated honestly:** the federation origin is dumb
+  storage and cannot verify signatures, so a compromised *write token*
+  permits clobbering the mutable ref objects — an availability attack.
+  Signatures make forgery detectable (readers reject), and lineage plus
+  in-pack superblock backups make recovery mechanical (`pelfs rescue`).
+  Integrity holds; availability under token compromise does not, and no
+  client-side design can change that.
+
+## Federation namespace layout (v2)
+
+```
+<prefix>/
+  refs/<branch>          mutable superblocks (branch heads); ETag-CAS
+  tags/<name>            immutable superblocks (frozen generations)
+  leases/<branch>.json   advisory liveness beacon, one per branch
+  packs/p-<ts>-<rand>    immutable packs (data, catalogs, shards, backups)
+```
+
+Pack names stay time-ordered (`p-<unixnano hex>-<rand>`) rather than
+content-derived: the age guard in GC and the creation ordering come free,
+and integrity does not need hash *names* — each generation's pack list
+records the trailer hash, so a fetched pack verifies against the list.
+(Outer hash-naming was considered and rejected as buying nothing.)
+Normal operation never lists the namespace: the superblock carries the
+pack set, and refs/tags are addressed by name. Listing is needed only by
+`pelfs rescue` and cross-ref GC (PROPFIND over refs/, tags/, packs/). No
+manifest object exists.
+
+## Catalog schema (v2)
+
+Informed by the proto-catalog measurements (176 B/entry structural, 36%
+compression). All tables WITHOUT ROWID where the key is natural.
+
+- `catalog_meta(key, value)` — volume UUID, covered path, generation,
+  format version, identity algo — the self-identification rescue needs.
+- `node(inode PK, type, mode, uid, gid, mtime_ns, ctime_ns, nlink,
+  length, rdev, keyid, flags)` — **no atime** (scratch volumes run
+  noatime; persisting atime would dirty catalogs on read, an absurdity).
+  Special files (fifo/dev/socket) store as types with rdev; the NFS
+  frontend may refuse to expose some — recorded limitation.
+- `edge(parent, name BLOB, inode, type)` PK(parent, name).
+- `nested(parent, name BLOB, catalog_identity BLOB)` — transition points.
+- `chunkref(inode, idx, identity BLOB[32], llen, clen, alg, keyid)` —
+  logical offsets are prefix sums of llen at load (rows per file are few;
+  saves 8 bytes/row); holes in sparse files are rows with NULL identity
+  and llen = hole length.
+- `inline(inode PK, data BLOB)` — separate table keeps node rows hot.
+- `xattr(inode, name, value)`; `symlink(inode PK, target)`.
+- Inode shards reuse node/chunkref/inline/xattr keyed purely by inode.
+- Dropped from the JuiceFS lineage: sessions, sustained inodes, flocks,
+  plocks, delayed-slices, dir-stats (recomputable), counters (superblock
+  owns them), trash, and ACL tables (POSIX ACLs out of scope for v2.0;
+  xattrs can carry them opaquely).
+
+## Benchmarks and acceptance criteria (v2)
+
+Fixed suite, run against a local posixv2 federation and one real OSDF
+prefix; targets follow from the measurements in this document:
+
+1. Kernel-source untar + publish: publish cost ∝ churn; republish after
+   touching one file ≈ one catalog + ancestors (≤ ~4 MB compressed).
+2. `conda create` (the hardlink storm): completes; promotion adds ≤ ~10 MB
+   of shards; subsequent publish seconds, not minutes.
+3. `git clone` + `git status`: correct (the v1 NFS lessons as regression
+   tests) and status latency within 2x local disk on warm cache.
+4. 10 GB single-file write: ≥ 0.8x the raw pelican upload throughput of
+   the same host (chunking+packing overhead budget: 20%).
+5. Cold mount of a 1M-entry volume: ≤ 30 s to usable in phase 2
+   (full-hydrate ≈ 60-120 MB compressed metadata); ≤ 3 s in phase 3
+   (lazy descent).
+6. Overwrite-loop soak: federation usage stays ≤ live/L + G + one pack
+   (the repack bound), verified over hours.
+
+## Migration: v1 -> v2
+
+Decision: **no in-place migration.** A v1 volume is drained by mounting
+it read-only with v1 code and publishing its contents into a fresh v2
+prefix (a copy pipeline through the filesystem layer — `pelfs migrate`
+can automate exactly this and nothing subtler). In-place conversion is
+rejected: it would force every v2 reader to carry v1's slice-name block
+layout and unversioned-snapshot semantics forever, for the convenience of
+volumes that are, by charter, scratch. Phase-1 packs are already
+forward-compatible where it matters (typed trailer entries), and the
+phase-1 middleware never writes anything a v1 mount cannot read back.
+
 ## Disaster recovery: scavenging a lost superblock
 
 The superblock is the only mutable object, which makes it the natural
@@ -295,7 +445,8 @@ provisions:
    key table exactly. (A lost KEK is still fatal for encrypted data, by
    design; the wrapped DEK in a backup is harmless to expose.)
 
-`pelfs rescue` (the human-facing tool, v2 open work): enumerate packs,
+`pelfs rescue` (the human-facing tool; specified here, implemented with
+phase 2): enumerate packs,
 inventory trailers, assemble the newest complete generation, then report —
 subtrees intact, files damaged by missing chunks, catalogs missing (their
 siblings remain fine), and a hash-only lost+found for data reachable from
@@ -715,48 +866,44 @@ remount; live generation swap arrives with phase 3.
 | boring small superblock (CBOR/SQLite) | mmap'd minimal perfect hash | wrong cardinality: thousands of rows, not millions |
 | 4KB inline threshold (configurable) | 512B | SQLite beats the filesystem below ~10KB; kills most dotfiles/configs |
 | hot/cold split; JuiceFS stays live engine until phase 3 | multi-catalog live engine | rewriting JuiceFS's hottest paths forfeits exactly the battle-testing we cited |
+| GC = set arithmetic on retained generations' pack lists | mark-sweep over catalog trees | pack lists ARE the closure at pack granularity; no walk, no marking state |
+| T_grace age guard makes GC lock-free | GC/writer/fork coordination via lease | new packs are always younger than the guard; fork sources are already retained |
+| separate Ed25519 signing key per volume | sign with the KEK | verification is public, decryption is not; unencrypted volumes still need authenticity |
+| TOFU + pinning for first-mount trust | mandatory pre-shared pubkey | SSH model works; registry attestation is the eventual upgrade, not a blocker |
+| time-ordered pack names, trailer hash in pack list | content-hash pack names | age guard + ordering come free; the list-recorded hash gives verification anyway |
+| no atime in catalogs | persisted atime | reads must never dirty metadata on a publish-what-changed filesystem |
+| migration = drain v1 read-only into fresh v2 prefix | in-place format conversion | dual-format readers forever, for volumes that are by charter scratch |
 
 ## Open design work
 
-Resolved since the first draft (details in their sections above): publish
-transactionality (the CUT/RECONCILE/TRANSFORM/UPLOAD/FLIP pipeline, with
-repack folded into TRANSFORM); chunk identity and hashing (keyed BLAKE3
-content addressing, FastCDC 1/4/16 MiB); phase-2 hydration (full metadata,
-lazy data; lazy descent is phase 3); versioned pack lists (identity vs.
-location); disaster recovery provisions; catalog split heuristics
-(measured: peel-largest-child policy, W = 200·entries + inline bytes,
-S_max 8 MiB / S_min 1 MiB).
+**The open list is empty.** Every item from earlier drafts is now settled
+in a section above: publish transactionality (CUT/RECONCILE/TRANSFORM/
+UPLOAD/FLIP, repack folded into TRANSFORM); chunk identity (keyed BLAKE3,
+FastCDC 1/4/16 MiB); phase-2 hydration; versioned pack lists; catalog
+split heuristics (measured: peel-largest-child, W = 200·entries +
+inline bytes, S_max 8 MiB / S_min 1 MiB); retention and GC (set
+arithmetic on pack lists, T_grace age guard replaces locking); signing
+and key management (Ed25519 volume identity separate from KEK, TOFU
+pinning, custody-chain rotation); federation namespace layout (refs/,
+tags/, leases/, packs/; time-ordered pack names, no manifest object);
+catalog schema (atime dropped, prefix-sum chunkrefs, JuiceFS
+session/trash/lock tables removed); benchmarks and acceptance criteria;
+and the migration decision (drain-and-copy, never in-place).
 
-Roughly ordered by how much they block implementation:
+Deliberately deferred, not open — these need external partners or
+production mileage, not more design:
 
-1. **Pack lifecycle and GC.** Target pack size; grace-period length for
-   reader pinning; ref-listing atomicity vs concurrent fork/branch
-   creation; Pelican DELETE granularity (whole packs only — the GC unit
-   is the pack). Narrowed by the publish design: repack is now a
-   TRANSFORM step, so in v2 there is no out-of-band pack mutation left to
-   design — only retention policy.
-2. **Superblock signing and key management.** Same key as KEK or a separate
-   signing identity; key rotation; what a reader trusts on first mount
-   (TOFU vs pinned key vs federation-issued).
-3. **Federation namespace layout.** Object naming (outer hash), prefix
-   layout, how gc/fsck/`pelfs`-tooling enumerate packs efficiently
-   (PROPFIND vs a pack manifest object).
-4. **Schema details.** Dirent/record column layout, xattrs, special files,
-   sparse files; what of the JuiceFS schema is kept vs dropped (sessions,
-   trash, counters all go).
-5. **`pelfs rescue`.** The scavenging tool from the disaster-recovery
-   section: pack inventory, generation assembly, damage report,
-   lost+found materialization. Depends on typed entries (reserved in the
-   phase-1 trailer already), self-identifying catalogs, and
-   superblock-backup entries — all format provisions that must land with
-   phase 2, since retrofitting them later leaves early volumes
-   unrescuable.
-6. **Benchmarks and acceptance criteria.** conda env create, git clone,
-   kernel untar, JupyterLab cold-start; targets for publish latency and
-   mount-to-first-byte.
-7. **v1 -> v2 migration.** Probably "none — scratch volumes drain and
-    recreate," but that should be an explicit decision, and phase 1's pack
-    middleware must not paint v1 volumes into a corner.
+- **Registry-issued volume-key attestation** (signing section): binding
+  the volume public key in Pelican's namespace registry, with the
+  registry/director team.
+- **POSIX ACLs** (schema section): out of scope for v2.0; xattrs carry
+  them opaquely if a frontend ever needs them.
+- **`pelfs rescue` implementation.** Fully specified by the
+  disaster-recovery section; its format prerequisites (typed entries,
+  self-identifying catalogs, in-pack superblock backups) are pinned to
+  land with phase 2 because retrofitting leaves early volumes
+  unrescuable. What remains is code, not design.
+- **Compression dictionaries** for small-chunk cohorts: measure first.
 
 ## Relationship to v1 components
 

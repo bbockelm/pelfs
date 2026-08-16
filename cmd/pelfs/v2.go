@@ -40,12 +40,30 @@ func cmdPublish(args []string) int {
 	}
 	defer s.cleanupTemp()
 
+	res, err := publishCore(ctx, s, branch, pubkeyHex)
+	if err != nil {
+		return exitErr(err)
+	}
+	st := res.Stats
+	fmt.Printf("published generation %d to %s/%s\n", res.Superblock.Generation, refs.RefDirKey, branch)
+	fmt.Printf("  tree: %d dirs, %d files (%d inline, %d chunked), %d symlinks; %d hardlinked inodes promoted\n",
+		st.Dirs, st.Files, st.InlineFiles, st.ChunkedFiles, st.Symlinks, st.PromotedInodes)
+	fmt.Printf("  data: %d chunks uploaded (%.1f MB), %d deduped (%d via index)\n",
+		st.ChunksAdded, float64(st.ChunkBytes)/1e6, st.ChunksDeduped, st.DedupIndexChunks)
+	fmt.Printf("  meta: %d catalogs, %d shards, %d new packs\n", st.Catalogs, st.Shards, len(res.NewPacks))
+	return 0
+}
+
+// publishCore runs the full v2 publish for a session: cut, trust-verified
+// predecessor fetch, key wiring, publish. Shared by the CLI command and
+// the control socket's POST /v1/publish.
+func publishCore(ctx context.Context, s *session, branch, pubkeyHex string) (*publish.Result, error) {
 	// The cut: an instant snapshot of the local metadata. Publish reads
 	// only this copy; the live database is never touched again.
 	cutPath := filepath.Join(s.stateDir, "v2-cut.db")
 	_ = os.Remove(cutPath)
 	if err := vacuumInto(s.metaPath, cutPath); err != nil {
-		return exitErr(fmt.Errorf("cut: %w", err))
+		return nil, fmt.Errorf("cut: %w", err)
 	}
 	defer os.Remove(cutPath) //nolint:errcheck
 
@@ -56,25 +74,25 @@ func cmdPublish(args []string) int {
 	if pubkeyHex != "" {
 		k, err := hex.DecodeString(pubkeyHex)
 		if err != nil || len(k) != ed25519.PublicKeySize {
-			return exitErr(errors.New("--volume-pubkey must be 64 hex characters"))
+			return nil, errors.New("--volume-pubkey must be 64 hex characters")
 		}
 		trusted = k
 	}
 	rstore, err := refs.New(s.metaStore, s.stateDir, trusted)
 	if err != nil {
-		return exitErr(err)
+		return nil, err
 	}
 	var prev *superblock.Superblock
 	var prevRaw []byte
 	if f, err := rstore.Fetch(ctx, branch); err == nil {
 		prev, prevRaw = f.Superblock, f.Raw
 	} else if !isNotFoundErr(err) {
-		return exitErr(fmt.Errorf("fetch ref %s: %w", branch, err))
+		return nil, fmt.Errorf("fetch ref %s: %w", branch, err)
 	}
 
 	signingKey, err := loadOrCreateSigningKey(filepath.Join(s.stateDir, "v2-signing.key"), prev)
 	if err != nil {
-		return exitErr(err)
+		return nil, err
 	}
 
 	popts := publish.Options{
@@ -91,22 +109,10 @@ func cmdPublish(args []string) int {
 	}
 	if s.encryptPEM != "" {
 		if err := wireEncryption(&popts, s.encryptPEM, prev); err != nil {
-			return exitErr(err)
+			return nil, err
 		}
 	}
-
-	res, err := publish.Publish(ctx, popts)
-	if err != nil {
-		return exitErr(err)
-	}
-	st := res.Stats
-	fmt.Printf("published generation %d to %s/%s\n", res.Superblock.Generation, refs.RefDirKey, branch)
-	fmt.Printf("  tree: %d dirs, %d files (%d inline, %d chunked), %d symlinks; %d hardlinked inodes promoted\n",
-		st.Dirs, st.Files, st.InlineFiles, st.ChunkedFiles, st.Symlinks, st.PromotedInodes)
-	fmt.Printf("  data: %d chunks uploaded (%.1f MB), %d deduped (%d via index)\n",
-		st.ChunksAdded, float64(st.ChunkBytes)/1e6, st.ChunksDeduped, st.DedupIndexChunks)
-	fmt.Printf("  meta: %d catalogs, %d shards, %d new packs\n", st.Catalogs, st.Shards, len(res.NewPacks))
-	return 0
+	return publish.Publish(ctx, popts)
 }
 
 // vacuumInto snapshots src into dst (the CUT primitive).

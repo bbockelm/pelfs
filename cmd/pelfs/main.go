@@ -54,6 +54,8 @@ func main() {
 		code = cmdRepack(os.Args[2:])
 	case "publish":
 		code = cmdPublish(os.Args[2:])
+	case "ctl":
+		code = cmdCtl(os.Args[2:])
 	case "fsck":
 		code = cmdFsck(os.Args[2:])
 	case "-h", "--help", "help":
@@ -77,6 +79,8 @@ Usage:
   pelfs gc     [flags] [--delete] <prefix>               collect leaked blocks
   pelfs repack [flags] <prefix>                          reclaim dead pack space
   pelfs publish [flags] <prefix>                         publish a v2 generation (experimental)
+  pelfs ctl    <prefix-or-mountpoint> <verb>             control a running mount
+                                                         (status|stats|flush|publish|bugreport)
   pelfs fsck   [flags] <prefix>                          verify referenced blocks
 
 Common flags:
@@ -195,6 +199,7 @@ type session struct {
 	sessionID string
 	lease     *lease.Lease // held for write sessions unless --no-lease
 	stats     *stats.Collector
+	statsPath string
 }
 
 // newSession builds the store, wraps encryption, runs the preflight access
@@ -226,6 +231,7 @@ func newSession(ctx context.Context, o *cmdOpts, prefix string, needWrite bool) 
 		statsPath = filepath.Join(s.stateDir, "pelfs-stats.json")
 	}
 	s.stats = stats.New(prefix, s.sessionID, statsPath)
+	s.statsPath = statsPath
 	s.stats.Update(func(sum *stats.Summary) {
 		sum.MountPoint = s.mountPoint
 		sum.PrefetchMode = o.prefetch

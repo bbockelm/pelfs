@@ -68,6 +68,10 @@ func runShellNative(o *cmdOpts, prefix string) (int, error) {
 	statsCtx, stopStats := context.WithCancel(ctx)
 	go s.stats.RunPeriodic(statsCtx, 30*time.Second)
 
+	if ctl := s.startControl(time.Now(), o.readOnly, s.mountPoint); ctl != nil {
+		defer ctl.Close() //nolint:errcheck
+	}
+
 	var mgr *snapshot.Manager
 	snapCtx, stopSnaps := context.WithCancel(ctx)
 	snapsDone := make(chan struct{})

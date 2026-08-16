@@ -158,6 +158,10 @@ func runMountDaemon(o *cmdOpts, prefix string, pos []string, infoPath string) in
 	statsCtx, stopStats := context.WithCancel(ctx)
 	go s.stats.RunPeriodic(statsCtx, 30*time.Second)
 
+	if ctl := s.startControl(time.Now(), o.readOnly, s.mountPoint); ctl != nil {
+		defer ctl.Close() //nolint:errcheck
+	}
+
 	info := &mountInfo{
 		PID:        os.Getpid(),
 		Prefix:     prefix,

@@ -238,7 +238,12 @@ func (s *Store) newSpool() (*os.File, error) {
 // creation time, so lexicographic order is creation order; tombstones in
 // later packs shadow entries in earlier ones).
 func (s *Store) bootstrap(ctx context.Context) error {
-	entries, err := s.inner.ListDir(ctx, PackDirKey)
+	var entries []pelicanobj.DirEntry
+	err := retryOn(ctx, "list packs/", defaultRetries, func() error {
+		var err error
+		entries, err = s.inner.ListDir(ctx, PackDirKey)
+		return err
+	})
 	if err != nil {
 		if isNotExist(err) {
 			return nil // brand-new volume
@@ -402,6 +407,16 @@ func (s *Store) readRange(ctx context.Context, key string, off, length int64) ([
 }
 
 func readRangeFrom(ctx context.Context, inner pelicanobj.Store, key string, off, length int64) ([]byte, error) {
+	var buf []byte
+	err := retryOn(ctx, fmt.Sprintf("read %s [%d,+%d)", key, off, length), defaultRetries, func() error {
+		var err error
+		buf, err = readRangeOnce(ctx, inner, key, off, length)
+		return err
+	})
+	return buf, err
+}
+
+func readRangeOnce(ctx context.Context, inner pelicanobj.Store, key string, off, length int64) ([]byte, error) {
 	rc, err := inner.Get(ctx, key, off, length)
 	if err != nil {
 		return nil, err
@@ -732,11 +747,12 @@ func (s *Store) Flush(ctx context.Context) error {
 		s.requeue(spool, pending, dead)
 		return fmt.Errorf("finalize pack: %w", err)
 	}
-	if _, err := upload.Seek(0, io.SeekStart); err != nil {
-		s.requeue(spool, pending, dead)
-		return err
-	}
-	if err := s.inner.Put(ctx, s.packKey(name), upload); err != nil {
+	if err := retryOn(ctx, "upload pack "+name, defaultRetries, func() error {
+		if _, err := upload.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
+		return s.inner.Put(ctx, s.packKey(name), upload)
+	}); err != nil {
 		// Put the entries back (from the original spool) so a later Flush
 		// retries them in a fresh pack.
 		s.requeue(spool, pending, dead)

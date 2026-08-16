@@ -179,7 +179,9 @@ func (s *Store) repack(ctx context.Context, minGarbage int64, ageFloor time.Dura
 		return fmt.Errorf("repack seal: %w", err)
 	}
 	for _, name := range condemned {
-		if err := s.inner.Delete(ctx, s.packKey(name)); err != nil {
+		if err := retryOn(ctx, "delete pack "+name, defaultRetries, func() error {
+			return s.inner.Delete(ctx, s.packKey(name))
+		}); err != nil && !isNotExist(err) {
 			fmt.Fprintf(os.Stderr, "pelfs: repack: delete %s: %v (will retry next repack)\n", name, err)
 			continue
 		}

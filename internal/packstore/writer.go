@@ -107,11 +107,13 @@ func (w *PackWriter) Seal(ctx context.Context, inner pelicanobj.Store) (SealedPa
 	if _, err := w.f.WriteAt(append(idx, footer...), w.size); err != nil {
 		return SealedPack{}, fmt.Errorf("pack writer: finalize: %w", err)
 	}
-	if _, err := w.f.Seek(0, io.SeekStart); err != nil {
-		return SealedPack{}, err
-	}
 	name := newPackName()
-	if err := inner.Put(ctx, PackDirKey+"/"+name, w.f); err != nil {
+	if err := retryOn(ctx, "upload pack "+name, defaultRetries, func() error {
+		if _, err := w.f.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
+		return inner.Put(ctx, PackDirKey+"/"+name, w.f)
+	}); err != nil {
 		return SealedPack{}, fmt.Errorf("pack writer: upload %s: %w", name, err)
 	}
 	sp := SealedPack{Name: name, TrailerHash: blake3.Sum256(idx), Size: w.size + int64(len(idx)) + footerSize}

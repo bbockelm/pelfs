@@ -5,9 +5,15 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
+	"io"
 	"testing"
 
 	"lukechampine.com/blake3"
+
+	"github.com/juicedata/juicefs/pkg/object"
+
+	"github.com/bbockelm/pelfs/internal/pelicanobj"
 )
 
 func TestPackWriterSealAndReadBack(t *testing.T) {
@@ -127,5 +133,80 @@ func TestLegacyJSONTrailerStillReadable(t *testing.T) {
 	got := readObj(t, s, "chunks/0/0/7_0_4096", 0, -1)
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("legacy pack entry mismatch: %d bytes", len(got))
+	}
+}
+
+// flakyStore fails the first N calls of Put/Get/ListDir with a transient
+// error, then behaves.
+type flakyStore struct {
+	pelicanobj.Store
+	failures int
+}
+
+func (f *flakyStore) trip() error {
+	if f.failures > 0 {
+		f.failures--
+		return fmt.Errorf("transient: connection reset by peer")
+	}
+	return nil
+}
+
+func (f *flakyStore) Put(ctx context.Context, key string, in io.Reader, getters ...object.AttrGetter) error {
+	if err := f.trip(); err != nil {
+		// Consume part of the body to prove retries rewind correctly.
+		_, _ = io.CopyN(io.Discard, in, 10)
+		return err
+	}
+	return f.Store.Put(ctx, key, in, getters...)
+}
+
+func (f *flakyStore) Get(ctx context.Context, key string, off, limit int64, getters ...object.AttrGetter) (io.ReadCloser, error) {
+	if err := f.trip(); err != nil {
+		return nil, err
+	}
+	return f.Store.Get(ctx, key, off, limit, getters...)
+}
+
+func (f *flakyStore) ListDir(ctx context.Context, dir string) ([]pelicanobj.DirEntry, error) {
+	if err := f.trip(); err != nil {
+		return nil, err
+	}
+	return f.Store.ListDir(ctx, dir)
+}
+
+// Transient federation failures must be retried with rewind: a seal whose
+// first Put died mid-stream still uploads the complete pack, and
+// bootstrap survives flaky listings and trailer reads.
+func TestRetryOnTransientFailures(t *testing.T) {
+	inner, _ := newInner(t)
+	ctx := context.Background()
+	flaky := &flakyStore{Store: inner, failures: 2}
+
+	w, err := NewPackWriter(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Abort()
+	payload := blob("retry", 100000)
+	if err := w.Add("retry-key", EntryData, payload); err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := w.Seal(ctx, flaky)
+	if err != nil {
+		t.Fatalf("Seal through flaky store: %v", err)
+	}
+	_, sizes := listKeys(t, inner, PackDirKey+"/")
+	if sizes[PackDirKey+"/"+sealed.Name] != sealed.Size {
+		t.Fatalf("uploaded pack size %d, want %d (mid-stream retry corrupted the upload?)",
+			sizes[PackDirKey+"/"+sealed.Name], sealed.Size)
+	}
+
+	// Bootstrap through a flaky store: ListDir fails twice, trailer read
+	// fails twice more; the store must still come up with the entry.
+	flaky.failures = 4
+	rs := newPack(t, flaky, Config{Packable: func(string) bool { return true }})
+	got := readObj(t, rs, "retry-key", 0, -1)
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("read through retried bootstrap mismatched (%d bytes)", len(got))
 	}
 }

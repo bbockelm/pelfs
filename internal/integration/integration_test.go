@@ -15,9 +15,12 @@ package integration
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"database/sql"
+	"fmt"
 	"io"
+	mrand "math/rand"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,7 +29,15 @@ import (
 
 	_ "github.com/mattn/go-sqlite3" // the pure-Go shim driver
 
+	"github.com/juicedata/juicefs/pkg/chunk"
+	"github.com/juicedata/juicefs/pkg/meta"
+	"github.com/juicedata/juicefs/pkg/object"
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/bbockelm/pelfs/internal/genfs"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
+	"github.com/bbockelm/pelfs/internal/publish"
+	"github.com/bbockelm/pelfs/internal/refs"
 	"github.com/bbockelm/pelfs/internal/snapshot"
 )
 
@@ -264,4 +275,150 @@ func TestPackTailRangeRead(t *testing.T) {
 	}
 
 	_ = s.Delete(ctx, key)
+}
+
+// TestV2PublishGenfsRoundTrip is the phase-2/3 federation e2e: publish a
+// generation into the REAL federation (packs, superblock backup, signed
+// ref — exercising trailer range reads, ETag stat, and the pinning store
+// over pelican-server), then resolve it back with genfs and verify every
+// byte. The source volume content is local (mem blob): publish reads
+// sources locally and uploads packs, exactly the accumulate-mode shape.
+func TestV2PublishGenfsRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	base := os.Getenv("PELFS_TEST_PREFIX")
+	if base == "" {
+		t.Skip("PELFS_TEST_PREFIX not set; run via scripts/integration-pelican.sh")
+	}
+	inner, err := pelicanobj.New(ctx, pelicanobj.Config{
+		PrefixURL:    fmt.Sprintf("%s/v2e2e-%d", base, time.Now().UnixNano()),
+		TokenPath:    os.Getenv("PELFS_TEST_TOKEN"),
+		AcquireToken: false,
+		Insecure:     true,
+	})
+	if err != nil {
+		t.Fatalf("construct store: %v", err)
+	}
+
+	// Local source volume: a chunked multi-MiB file, an inline file, a
+	// symlink, an xattr, and a hardlink pair.
+	metaPath := filepath.Join(t.TempDir(), "src.db")
+	conf := meta.DefaultConf()
+	conf.NoBGJob = true
+	m := meta.NewClient("sqlite3://"+metaPath, conf)
+	if err := m.Init(&meta.Format{Name: "e2e", UUID: "0f0e0d0c-0b0a-0908-0706-050403020100",
+		Storage: "mem", BlockSize: 4096}, false); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := m.NewSession(true); err != nil {
+		t.Fatal(err)
+	}
+	blob, _ := object.CreateStorage("mem", "", "", "", "")
+	store := chunk.NewCachedStore(blob, chunk.Config{
+		BlockSize: 4096 * 1024, CacheDir: "memory", CacheSize: 64 << 20,
+		GetTimeout: 10 * time.Second, PutTimeout: 10 * time.Second,
+		MaxUpload: 2, MaxDownload: 2, MaxRetries: 1, BufferSize: 32 << 20,
+	}, prometheus.NewRegistry())
+	mctx := meta.WrapContext(ctx)
+	var dir, big, small, link meta.Ino
+	var attr meta.Attr
+	if st := m.Mkdir(mctx, meta.RootInode, "d", 0755, 0, 0, &dir, &attr); st != 0 {
+		t.Fatal(st)
+	}
+	if st := m.Create(mctx, dir, "big.bin", 0644, 0, 0, &big, &attr); st != 0 {
+		t.Fatal(st)
+	}
+	bigContent := make([]byte, 3<<20)
+	mrand.New(mrand.NewSource(42)).Read(bigContent)
+	var sid uint64
+	if st := m.NewSlice(mctx, &sid); st != 0 {
+		t.Fatal(st)
+	}
+	w := store.NewWriter(sid, 0)
+	if _, err := w.WriteAt(bigContent, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Finish(len(bigContent)); err != nil {
+		t.Fatal(err)
+	}
+	if st := m.Write(mctx, big, 0, 0, meta.Slice{Id: sid, Size: uint32(len(bigContent)), Len: uint32(len(bigContent))}, time.Now()); st != 0 {
+		t.Fatal(st)
+	}
+	if st := m.Create(mctx, dir, "small.txt", 0644, 0, 0, &small, &attr); st != 0 {
+		t.Fatal(st)
+	}
+	if st := m.SetXattr(mctx, small, "user.k", []byte("v"), 0); st != 0 {
+		t.Fatal(st)
+	}
+	if st := m.Symlink(mctx, dir, "ln", "big.bin", &link, &attr); st != 0 {
+		t.Fatal(st)
+	}
+	if st := m.Link(mctx, big, dir, "big2", &attr); st != 0 {
+		t.Fatal(st)
+	}
+	_ = m.CloseSession()
+
+	_, priv, _ := ed25519.GenerateKey(nil)
+	res, err := publish.Publish(ctx, publish.Options{
+		CutPath:    metaPath,
+		Blob:       blob,
+		CacheDir:   t.TempDir(),
+		Inner:      inner,
+		SpoolDir:   t.TempDir(),
+		SigningKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("publish into federation: %v", err)
+	}
+	t.Logf("published generation %d: %d chunks, %d catalogs, %d packs",
+		res.Superblock.Generation, res.Stats.ChunksAdded, res.Stats.Catalogs, len(res.NewPacks))
+
+	// TOFU-fetch the ref back and resolve the tree via genfs — every read
+	// below is a real HTTP range request against pelican-server.
+	rstore, err := refs.New(inner, t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := rstore.Fetch(ctx, "main")
+	if err != nil {
+		t.Fatalf("fetch ref: %v", err)
+	}
+	gfs, err := genfs.Open(ctx, genfs.Options{Inner: inner, SB: f.Superblock, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("genfs open: %v", err)
+	}
+	defer gfs.Close() //nolint:errcheck
+
+	dn, err := gfs.Lookup(ctx, genfs.RootInode, "d")
+	if err != nil {
+		t.Fatalf("lookup d: %v", err)
+	}
+	bn, err := gfs.Lookup(ctx, dn.Inode, "big.bin")
+	if err != nil {
+		t.Fatalf("lookup big.bin: %v", err)
+	}
+	if bn.Nlink != 2 || bn.Length != int64(len(bigContent)) {
+		t.Fatalf("big.bin node = %+v", bn)
+	}
+	got := make([]byte, len(bigContent))
+	n, err := gfs.Read(ctx, bn.Inode, 0, got)
+	if err != nil || n != len(bigContent) {
+		t.Fatalf("read big.bin: n=%d err=%v", n, err)
+	}
+	if !bytes.Equal(got, bigContent) {
+		t.Fatal("big.bin content mismatch through federation packs")
+	}
+	ln, err := gfs.Lookup(ctx, dn.Inode, "ln")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target, err := gfs.Readlink(ctx, ln.Inode); err != nil || target != "big.bin" {
+		t.Fatalf("readlink = %q err=%v", target, err)
+	}
+	sn, err := gfs.Lookup(ctx, dn.Inode, "small.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, err := gfs.GetXattr(ctx, sn.Inode, "user.k"); err != nil || string(v) != "v" {
+		t.Fatalf("xattr = %q err=%v", v, err)
+	}
 }

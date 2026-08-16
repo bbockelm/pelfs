@@ -775,3 +775,103 @@ func TestParentLookupPathAndAccessors(t *testing.T) {
 		t.Fatalf("Usage = %d bytes, %d inodes; want positive bytes and NextInode", bytes, inodes)
 	}
 }
+
+// A generation swap must invalidate exactly what changed and nothing
+// else: stable inodes are the reason an unchanged file's cached dentry
+// and attributes stay valid across a publish.
+func TestGenerationSwap(t *testing.T) {
+	ctx := context.Background()
+	inner, _ := newInner(t)
+	v := newTestVolume(t, "5eaf5eaf-0000-4000-8000-000000000055")
+	dir := v.mkdir(1, "d")
+	stableIno := v.create(dir, "stable.txt")
+	v.write(stableIno, []byte("unchanged across generations"))
+	changedIno := v.create(dir, "changed.txt")
+	v.write(changedIno, []byte("v1"))
+	doomedIno := v.create(dir, "doomed.txt")
+	v.write(doomedIno, []byte("deleted next generation"))
+	gen0 := publishVolume(t, v, inner, publish.Options{})
+
+	fs := openFS(t, inner, gen0.Superblock, genfs.Options{})
+	// The kernel walks the tree: everything below is now resident.
+	dirNode, err := fs.Lookup(ctx, genfs.RootInode, "d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"stable.txt", "changed.txt", "doomed.txt"} {
+		if _, err := fs.Lookup(ctx, dirNode.Inode, name); err != nil {
+			t.Fatalf("lookup %s: %v", name, err)
+		}
+	}
+
+	// Second generation: change one file, delete another, add a third.
+	v.write(changedIno, []byte("v2 is longer than v1"))
+	if st := v.m.Unlink(v.ctx(), meta.Ino(dir), "doomed.txt"); st != 0 {
+		t.Fatalf("unlink: %s", st)
+	}
+	addedIno := v.create(dir, "added.txt")
+	v.write(addedIno, []byte("new in generation 1"))
+	gen1 := publishVolume(t, v, inner, publish.Options{
+		Prev: gen0.Superblock, PrevRaw: gen0.Raw,
+	})
+
+	rep, err := fs.Swap(ctx, gen1.Superblock)
+	if err != nil {
+		t.Fatalf("Swap: %v", err)
+	}
+	if rep.From != 0 || rep.To != 1 {
+		t.Fatalf("swap %d->%d, want 0->1", rep.From, rep.To)
+	}
+
+	changed := map[uint64]genfs.Change{}
+	for _, c := range rep.Changes {
+		changed[c.Inode] = c
+	}
+	// The unchanged file must NOT be invalidated — this is the property
+	// the whole stable-inode design exists to provide.
+	if c, bad := changed[stableIno]; bad {
+		t.Fatalf("unchanged file was invalidated: %+v", c)
+	}
+	if c, ok := changed[changedIno]; !ok || !c.Content {
+		t.Fatalf("modified file change = %+v (present=%v), want Content", c, ok)
+	}
+	if c, ok := changed[doomedIno]; !ok || !c.Gone {
+		t.Fatalf("deleted file change = %+v (present=%v), want Gone", c, ok)
+	}
+
+	// Entry invalidations cover the addition and the removal.
+	var sawAdded, sawRemoved bool
+	for _, e := range rep.Entries {
+		if e.Parent == dirNode.Inode && e.Name == "added.txt" && !e.Gone {
+			sawAdded = true
+		}
+		if e.Parent == dirNode.Inode && e.Name == "doomed.txt" && e.Gone {
+			sawRemoved = true
+		}
+	}
+	if !sawAdded || !sawRemoved {
+		t.Fatalf("entry invalidations added=%v removed=%v; got %+v", sawAdded, sawRemoved, rep.Entries)
+	}
+
+	// The swapped filesystem serves the NEW generation.
+	if fs.Generation() != 1 {
+		t.Fatalf("Generation = %d after swap, want 1", fs.Generation())
+	}
+	got := make([]byte, 20)
+	n, err := fs.Read(ctx, changedIno, 0, got)
+	if err != nil || string(got[:n]) != "v2 is longer than v1" {
+		t.Fatalf("post-swap read = %q (%v), want the new content", got[:n], err)
+	}
+	if _, err := fs.Lookup(ctx, dirNode.Inode, "added.txt"); err != nil {
+		t.Fatalf("post-swap lookup of the added file: %v", err)
+	}
+	if _, err := fs.Lookup(ctx, dirNode.Inode, "doomed.txt"); !errors.Is(err, genfs.ErrNotExist) {
+		t.Fatalf("post-swap lookup of the deleted file = %v, want ErrNotExist", err)
+	}
+
+	// Swapping to the same generation is a no-op, not a rebuild.
+	rep2, err := fs.Swap(ctx, gen1.Superblock)
+	if err != nil || len(rep2.Changes) != 0 || len(rep2.Entries) != 0 {
+		t.Fatalf("idempotent swap reported %+v (%v)", rep2, err)
+	}
+}

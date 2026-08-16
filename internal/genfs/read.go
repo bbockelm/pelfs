@@ -240,3 +240,12 @@ func min64(a, b int64) int64 {
 	}
 	return b
 }
+
+// clear drops every cached extent map. A generation swap invalidates all
+// of them: the same inode may name different chunks now.
+func (e *extentCache) clear() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.byIn = make(map[uint64]*list.Element)
+	e.lru.Init()
+}

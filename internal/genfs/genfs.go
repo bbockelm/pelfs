@@ -116,6 +116,11 @@ type residency struct {
 	// hardlinked FILES the value is simply the most recent path used,
 	// which is all POSIX promises.
 	parent uint64
+	// name is the edge this inode was reached by. With parent it forms
+	// the descent step a generation swap replays to re-resolve the
+	// inode in the new generation (catalog identities change; inodes do
+	// not).
+	name string
 }
 
 // FS serves one verified generation read-only. Safe for concurrent use.
@@ -250,7 +255,7 @@ func (fs *FS) residencyOf(ino uint64) (string, error) {
 // retain records or bumps an inode's residency. Within a generation an
 // inode's rows are immutable, so a second path reaching the same inode
 // (hardlinks) keeps the first-recorded catalog — both carry the node row.
-func (fs *FS) retain(ino uint64, catHex string, parent uint64) {
+func (fs *FS) retain(ino uint64, catHex string, parent uint64, name string) {
 	if ino == RootInode {
 		return
 	}
@@ -258,10 +263,10 @@ func (fs *FS) retain(ino uint64, catHex string, parent uint64) {
 	defer fs.mu.Unlock()
 	if r := fs.res[ino]; r != nil {
 		r.nlookup++
-		r.parent = parent
+		r.parent, r.name = parent, name
 		return
 	}
-	fs.res[ino] = &residency{cat: catHex, nlookup: 1, parent: parent}
+	fs.res[ino] = &residency{cat: catHex, nlookup: 1, parent: parent, name: name}
 }
 
 // Lookup resolves name under parent, records the child's residency, and
@@ -296,7 +301,7 @@ func (fs *FS) Lookup(ctx context.Context, parent uint64, name string) (Node, err
 	if lr.NestedIdentity != nil {
 		childCat = hex.EncodeToString(lr.NestedIdentity)
 	}
-	fs.retain(uint64(lr.Dirent.Inode), childCat, parent)
+	fs.retain(uint64(lr.Dirent.Inode), childCat, parent, name)
 	return nodeOf(n), nil
 }
 

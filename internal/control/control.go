@@ -67,6 +67,20 @@ func Start(stateDir string, h Hooks) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("control socket: %w", err)
 	}
+	// Own the unlink explicitly. By default a unix listener removes its
+	// socket file when it closes, asynchronously enough that on Linux the
+	// removal landed AFTER a successor had created its own socket at the
+	// same path — the successor then chmod'd a file that no longer
+	// existed (CI caught exactly this). With unlink-on-close off, create
+	// and remove are strictly ordered by us: Start creates, Close
+	// removes.
+	if ul, ok := ln.(*net.UnixListener); ok {
+		ul.SetUnlinkOnClose(false)
+	}
+	// The socket is the auth boundary, so restrict it before serving. A
+	// concurrent process cannot be racing us here: one would have been
+	// caught by the liveness probe above, and Listen would have failed
+	// for a second live listener.
 	if err := os.Chmod(path, 0600); err != nil {
 		ln.Close() //nolint:errcheck
 		return nil, err
@@ -83,6 +97,9 @@ func (s *Server) Close() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	err := s.srv.Shutdown(ctx)
+	// We disabled the listener's own unlink, so removing the socket is
+	// ours to do — and doing it here, after Shutdown, means the path is
+	// free before this call returns.
 	_ = os.Remove(s.path)
 	return err
 }

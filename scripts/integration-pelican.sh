@@ -71,10 +71,37 @@ Origin:
 EOF
 
 echo "== launching federation-in-a-box on port $WEBPORT =="
+# Prove the binary runs at all before blaming the federation: a server
+# that dies in under a second with an empty log (seen in CI) is
+# indistinguishable from a broken build unless we check first.
+if ! "$PELICAN_BIN" --version > "$WORK/pelican-version.txt" 2>&1; then
+  echo "FAIL: the pelican binary does not run:"
+  sed 's/^/    /' "$WORK/pelican-version.txt"
+  exit 1
+fi
+sed 's/^/    /' "$WORK/pelican-version.txt" | head -3
+
 PELICAN_CONFIGDIR="$WORK/server-config" \
   "$PELICAN_BIN" serve --module director,registry,origin --config "$WORK/pelican.yaml" \
   > "$WORK/server.log" 2>&1 &
 SERVER_PID=$!
+
+# dumpServerLog reports everything a remote debugger needs: the exit
+# status, the log (even when empty, said explicitly), and the config the
+# server was given.
+dumpServerLog() {
+  echo "--- server exit status ---"
+  wait "$SERVER_PID" 2>/dev/null; echo "    exit=$?"
+  echo "--- $WORK/server.log ---"
+  if [ -s "$WORK/server.log" ]; then
+    tail -60 "$WORK/server.log" | sed 's/^/    /'
+  else
+    echo "    (empty or missing — the process wrote nothing)"
+    ls -la "$WORK" | sed 's/^/    /'
+  fi
+  echo "--- config ---"
+  sed 's/^/    /' "$WORK/pelican.yaml"
+}
 
 DISCOVERY="https://localhost:$WEBPORT/.well-known/pelican-configuration"
 for i in $(seq 1 120); do
@@ -83,10 +110,11 @@ for i in $(seq 1 120); do
   fi
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then
     echo "FAIL: pelican serve exited early"
-    tail -40 "$WORK/server.log" "$WORK/pelican-server.log" 2>/dev/null; exit 1
+    dumpServerLog
+    exit 1
   fi
   sleep 1
-  [ "$i" = 120 ] && { echo "FAIL: federation never became ready"; tail -40 "$WORK/server.log" "$WORK/pelican-server.log" 2>/dev/null; exit 1; }
+  [ "$i" = 120 ] && { echo "FAIL: federation never became ready"; dumpServerLog; exit 1; }
 done
 echo "   federation is up"
 

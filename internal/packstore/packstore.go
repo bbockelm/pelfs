@@ -46,6 +46,7 @@ import (
 
 	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/klauspost/compress/zstd"
+	"lukechampine.com/blake3"
 
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 )
@@ -298,9 +299,37 @@ func FetchTrailer(ctx context.Context, inner pelicanobj.Store, name string, size
 	return tr.Entries, nil
 }
 
+// FetchTrailerVerified is FetchTrailer plus location-map authentication:
+// the STORED trailer bytes must hash (BLAKE3-256) to wantHash — the value
+// the superblock pack list records — before any entry is trusted. Readers
+// resolving a signed generation use this; entry DATA integrity is
+// separately end-to-end via chunk identity.
+func FetchTrailerVerified(ctx context.Context, inner pelicanobj.Store, name string, size int64, wantHash [32]byte) ([]PackEntry, error) {
+	if size <= 0 {
+		ki, err := inner.StatKey(ctx, PackDirKey+"/"+name)
+		if err != nil {
+			return nil, fmt.Errorf("stat pack %s: %w", name, err)
+		}
+		size = ki.Size
+	}
+	tr, stored, _, err := fetchTrailerStored(ctx, inner, name, size)
+	if err != nil {
+		return nil, fmt.Errorf("pack %s: %w", name, err)
+	}
+	if got := blake3.Sum256(stored); got != wantHash {
+		return nil, fmt.Errorf("pack %s: trailer hash mismatch (got %x, pack list says %x) — the location map does not match the signed generation", name, got, wantHash)
+	}
+	return tr.Entries, nil
+}
+
 func fetchTrailer(ctx context.Context, inner pelicanobj.Store, name string, size int64) (*trailer, int64, error) {
+	tr, _, idxLen, err := fetchTrailerStored(ctx, inner, name, size)
+	return tr, idxLen, err
+}
+
+func fetchTrailerStored(ctx context.Context, inner pelicanobj.Store, name string, size int64) (*trailer, []byte, int64, error) {
 	if size < footerSize {
-		return nil, 0, fmt.Errorf("pack too small (%d bytes)", size)
+		return nil, nil, 0, fmt.Errorf("pack too small (%d bytes)", size)
 	}
 	probe := int64(tailProbe)
 	if probe > size {
@@ -308,11 +337,11 @@ func fetchTrailer(ctx context.Context, inner pelicanobj.Store, name string, size
 	}
 	tail, err := readRangeFrom(ctx, inner, PackDirKey+"/"+name, size-probe, probe)
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, 0, err
 	}
-	tr, idxLen, terr := parseTail(ctx, inner, name, size, tail)
+	tr, stored, idxLen, terr := parseTail(ctx, inner, name, size, tail)
 	if terr == nil {
-		return tr, idxLen, nil
+		return tr, stored, idxLen, nil
 	}
 	// Tail probe failed: fetch the entire pack and retry against its true
 	// end. Success here means the object is fine and the RANGE read lied
@@ -320,34 +349,36 @@ func fetchTrailer(ctx context.Context, inner pelicanobj.Store, name string, size
 	// chunk read depends on ranges working.
 	whole, werr := readRangeFrom(ctx, inner, PackDirKey+"/"+name, 0, size)
 	if werr == nil && int64(len(whole)) == size {
-		if tr, idxLen, ferr := parseTail(ctx, inner, name, size, whole); ferr == nil {
+		if tr, stored, idxLen, ferr := parseTail(ctx, inner, name, size, whole); ferr == nil {
 			fmt.Fprintf(os.Stderr,
 				"pelfs: WARNING: pack %s: tail range read returned invalid bytes (%v) but the full object is intact — a transport in the path is mishandling Range requests; reads may be unreliable\n",
 				name, terr)
-			return tr, idxLen, nil
+			return tr, stored, idxLen, nil
 		}
 	}
 	preview := tail
 	if len(preview) > 16 {
 		preview = preview[len(preview)-16:]
 	}
-	return nil, 0, fmt.Errorf("%w (listed size %d, tail read %d bytes, last bytes %x; full-object retry: %v)",
+	return nil, nil, 0, fmt.Errorf("%w (listed size %d, tail read %d bytes, last bytes %x; full-object retry: %v)",
 		terr, size, len(tail), preview, werr)
 }
 
 // parseTail validates and parses a trailer from buf, which is the final
-// portion of a pack of the given total size.
-func parseTail(ctx context.Context, inner pelicanobj.Store, name string, size int64, buf []byte) (*trailer, int64, error) {
+// portion of a pack of the given total size. It also returns the stored
+// (possibly compressed) trailer bytes, which the superblock pack list
+// hashes.
+func parseTail(ctx context.Context, inner pelicanobj.Store, name string, size int64, buf []byte) (*trailer, []byte, int64, error) {
 	if len(buf) < footerSize {
-		return nil, 0, fmt.Errorf("bad pack magic")
+		return nil, nil, 0, fmt.Errorf("bad pack magic")
 	}
 	m := string(buf[len(buf)-8:])
 	if m != magic && m != magicZ {
-		return nil, 0, fmt.Errorf("bad pack magic")
+		return nil, nil, 0, fmt.Errorf("bad pack magic")
 	}
 	idxLen := int64(binary.LittleEndian.Uint64(buf[len(buf)-16 : len(buf)-8]))
 	if idxLen <= 0 || idxLen+footerSize > size {
-		return nil, 0, fmt.Errorf("bad index length %d", idxLen)
+		return nil, nil, 0, fmt.Errorf("bad index length %d", idxLen)
 	}
 	var stored []byte
 	var err error
@@ -356,14 +387,14 @@ func parseTail(ctx context.Context, inner pelicanobj.Store, name string, size in
 	} else {
 		stored, err = readRangeFrom(ctx, inner, PackDirKey+"/"+name, size-footerSize-idxLen, idxLen)
 		if err != nil {
-			return nil, 0, err
+			return nil, nil, 0, err
 		}
 	}
 	tr, err := decodeTrailer(stored, m)
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, 0, err
 	}
-	return tr, idxLen, nil
+	return tr, stored, idxLen, nil
 }
 
 func (s *Store) readRange(ctx context.Context, key string, off, length int64) ([]byte, error) {

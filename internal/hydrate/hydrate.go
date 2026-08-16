@@ -235,16 +235,13 @@ func (h *hydrator) cleanup() {
 
 // buildIdentityIndex fetches every listed pack's trailer and maps identity
 // hex -> (pack, offset, length). The pack list is the generation's location
-// layer; a directory listing is never consulted.
-//
-// TODO(trailer verification): the pack list records the BLAKE3 of the
-// stored trailer bytes, but FetchTrailer does not expose them; verifying
-// needs a FetchTrailer variant that returns the raw trailer alongside the
-// parsed entries.
+// layer; a directory listing is never consulted, and no trailer's entries
+// are trusted until the stored bytes hash to the value the SIGNED pack
+// list records.
 func (h *hydrator) buildIdentityIndex() error {
 	h.idx = make(map[string]packLoc)
 	for _, pe := range h.o.SB.PackList {
-		entries, err := packstore.FetchTrailer(h.ctx, h.o.Inner, pe.Name, pe.Size)
+		entries, err := packstore.FetchTrailerVerified(h.ctx, h.o.Inner, pe.Name, pe.Size, pe.TrailerHash)
 		if err != nil {
 			return fmt.Errorf("hydrate: %w", err)
 		}

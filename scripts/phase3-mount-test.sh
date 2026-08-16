@@ -100,6 +100,35 @@ if touch "$WORK/mnt/should-fail" 2>/dev/null; then
 fi
 echo "read-only enforced"
 
+echo "== read-write round trip: mount --rw, modify, seal, verify =="
+fusermount3 -u "$WORK/mnt" 2>/dev/null || fusermount -u "$WORK/mnt" 2>/dev/null || umount "$WORK/mnt"
+wait "$MOUNT_PID" 2>/dev/null || true
+
+"$WORK/pelfs" mount-gen --rw --state-dir "$WORK/state3" "$PREFIX" "$WORK/mnt" &
+MOUNT_PID=$!
+for _ in $(seq 100); do [ -e "$WORK/mnt/dir/small.txt" ] && break; sleep 0.1; done
+[ -e "$WORK/mnt/dir/small.txt" ] || { echo "rw mount did not come up" >&2; exit 1; }
+
+echo "phase-3 write" > "$WORK/mnt/dir/written.txt"
+mkdir -p "$WORK/mnt/newdir"
+rm "$WORK/mnt/dir/small.txt"
+echo "appended" >> "$WORK/mnt/dir/sub/mid.bin"
+[ -f "$WORK/mnt/dir/written.txt" ] || { echo "write not visible in the mount" >&2; exit 1; }
+
+# Unmount seals the overlay into generation 1.
+fusermount3 -u "$WORK/mnt" 2>/dev/null || fusermount -u "$WORK/mnt" 2>/dev/null || umount "$WORK/mnt"
+wait "$MOUNT_PID" 2>/dev/null || true
+
+echo "== remounting the SEALED generation read-only =="
+"$WORK/pelfs" mount-gen --state-dir "$WORK/state4" "$PREFIX" "$WORK/mnt" &
+MOUNT_PID=$!
+for _ in $(seq 100); do [ -e "$WORK/mnt/dir/written.txt" ] && break; sleep 0.1; done
+grep -q "phase-3 write" "$WORK/mnt/dir/written.txt" || { echo "sealed write missing" >&2; exit 1; }
+[ -d "$WORK/mnt/newdir" ] || { echo "sealed mkdir missing" >&2; exit 1; }
+[ ! -e "$WORK/mnt/dir/small.txt" ] || { echo "sealed deletion did not stick" >&2; exit 1; }
+cmp <(cat "$WORK/src/dir/big.bin") <(cat "$WORK/mnt/dir/big.bin")
+echo "seal round trip verified: writes, mkdir, deletion, untouched content"
+
 if [ "$BENCH" = "--bench" ]; then
   echo "== end-to-end benchmarks against the phase-3 mount (read-only subset) =="
   time (find "$WORK/mnt" -type f -exec cat {} + > /dev/null)

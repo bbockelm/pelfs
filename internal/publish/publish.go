@@ -1,17 +1,22 @@
-// Package publish implements the v2 publish pipeline over an
-// already-created cut (docs/design-packfs.md, "Publish: the transactional
-// pipeline"). CUT and RECONCILE are the session's job — by the time this
-// package runs, the cut database exists and every block it references is
-// durable in the session's blob store. What remains is TRANSFORM (walk the
-// cut, chunk file content, build split path catalogs and inode shards,
-// append everything to packs), UPLOAD (pack seals), and FLIP (write the
-// signed superblock to refs/<branch>).
+// Package publish implements the v2 publish pipeline. It reads a Source —
+// a VACUUM'd JuiceFS cut, or a phase-3 write overlay under seal — and runs
+// TRANSFORM (walk the tree, chunk file content, build split path catalogs
+// and inode shards, append everything to packs), UPLOAD (pack seals), and
+// FLIP (write the signed superblock to refs/<branch>). See
+// docs/design-packfs.md, "Publish: the transactional pipeline" and "Phase 3
+// VFS architecture" (write path = overlay + seal).
+//
+// For the cut source, CUT and RECONCILE are the session's job — by the time
+// this package runs, the cut database exists and every block it references
+// is durable in the session's blob store. For the overlay source there is
+// no cut at all: publish IS the durability step for staged content, and
+// nothing downstream of the walk changes.
 //
 // Simplifications, deliberate and marked at their sites:
 //   - Full-tree TRANSFORM: every catalog and shard regenerates from the
-//     cut. Dirty-set tracking is a later optimization; content addressing
-//     already makes an unchanged subtree's catalog hash to the same bytes
-//     it did last generation.
+//     source. Dirty-set tracking is a later optimization; content
+//     addressing already makes an unchanged subtree's catalog hash to the
+//     same bytes it did last generation.
 //   - Chunk dedup is within-publish only (see packer). An unchanged file
 //     re-uploads its chunks under the same identities across generations —
 //     wasted bytes, never corruption.
@@ -39,13 +44,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/object"
 
 	"github.com/bbockelm/pelfs/internal/catalog"
 	"github.com/bbockelm/pelfs/internal/chunkid"
 	"github.com/bbockelm/pelfs/internal/cutdb"
 	"github.com/bbockelm/pelfs/internal/entrycodec"
+	"github.com/bbockelm/pelfs/internal/overlay"
 	"github.com/bbockelm/pelfs/internal/packstore"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/superblock"
@@ -79,10 +84,15 @@ const (
 // Options configures one Publish run.
 type Options struct {
 	// CutPath is the VACUUM'd JuiceFS meta snapshot that defines this
-	// generation's contents.
+	// generation's contents. Mutually exclusive with Overlay.
 	CutPath string
+	// Overlay seals a phase-3 write overlay instead of translating a cut:
+	// its merged base+dirty view defines this generation's contents. Prev
+	// is then required — the overlay sits over exactly that generation,
+	// which is where the volume identity comes from. See Seal.
+	Overlay *overlay.FS
 	// Blob is the session's data store, for reading file content the cut
-	// references.
+	// references. Unused by the overlay source.
 	Blob object.ObjectStorage
 	// CacheDir backs the cut reader's block cache (pass the session's
 	// cache dir so TRANSFORM hits blocks the writer just produced).
@@ -148,21 +158,32 @@ type Result struct {
 	Stats      Stats
 }
 
-// Publish runs TRANSFORM/UPLOAD/FLIP over the cut and returns the flipped
-// generation. On error nothing mutable has changed; any packs already
-// uploaded are unreferenced orphans for GC (crash analysis in the design
-// doc — publish is idempotent end to end).
+// Seal publishes a phase-3 write overlay directly into catalogs, packs,
+// and a signed superblock: the accumulate-mode session never needs JuiceFS
+// metadata to publish. Options.Overlay and Options.Prev are required;
+// everything downstream of the walk is the ordinary pipeline.
+func Seal(ctx context.Context, o Options) (*Result, error) {
+	if o.Overlay == nil {
+		return nil, errors.New("publish: Seal requires Options.Overlay")
+	}
+	return Publish(ctx, o)
+}
+
+// Publish runs TRANSFORM/UPLOAD/FLIP over the source and returns the
+// flipped generation. On error nothing mutable has changed; any packs
+// already uploaded are unreferenced orphans for GC (crash analysis in the
+// design doc — publish is idempotent end to end).
 func Publish(ctx context.Context, o Options) (*Result, error) {
 	if err := applyDefaults(&o); err != nil {
 		return nil, err
 	}
-	db, err := cutdb.Open(o.CutPath, cutdb.Options{Blob: o.Blob, CacheDir: o.CacheDir, Staging: o.ReadStaging})
+	src, volUUID, closeSrc, err := openSource(o)
 	if err != nil {
-		return nil, fmt.Errorf("publish: open cut: %w", err)
+		return nil, err
 	}
-	defer db.Close() //nolint:errcheck
+	defer closeSrc()
 
-	volID, err := parseVolumeID(db.Format().UUID)
+	volID, err := parseVolumeID(volUUID)
 	if err != nil {
 		return nil, err
 	}
@@ -170,7 +191,7 @@ func Publish(ctx context.Context, o Options) (*Result, error) {
 	if o.Prev != nil {
 		gen = o.Prev.Generation + 1
 		if o.Prev.VolumeID != volID {
-			return nil, fmt.Errorf("publish: cut volume %x does not match previous generation's %x",
+			return nil, fmt.Errorf("publish: source volume %x does not match previous generation's %x",
 				volID, o.Prev.VolumeID)
 		}
 	}
@@ -183,11 +204,11 @@ func Publish(ctx context.Context, o Options) (*Result, error) {
 
 	p := &pipeline{
 		o:           o,
-		db:          db,
+		src:         src,
 		pk:          newPacker(o.Inner, tmpDir, o.TargetPackSize),
 		hasher:      chunkid.NewHasher(o.IdentityKey),
 		gen:         gen,
-		volUUID:     db.Format().UUID,
+		volUUID:     volUUID,
 		volID:       volID,
 		tmpDir:      tmpDir,
 		dirs:        make(map[uint64][]edge),
@@ -252,9 +273,32 @@ func Publish(ctx context.Context, o Options) (*Result, error) {
 	return &Result{Superblock: sb, Raw: raw, NewPacks: newPacks, Stats: p.stats}, nil
 }
 
+// openSource opens the tree this publish reads and reports the volume UUID
+// every catalog is stamped with: the cut's own format record, or — for an
+// overlay, which does not carry the superblock it shadows — the previous
+// generation's volume id. The returned func releases source resources.
+func openSource(o Options) (Source, string, func(), error) {
+	if o.Overlay != nil {
+		return &overlaySource{fs: o.Overlay}, formatVolumeID(o.Prev.VolumeID), func() {}, nil
+	}
+	db, err := cutdb.Open(o.CutPath, cutdb.Options{Blob: o.Blob, CacheDir: o.CacheDir, Staging: o.ReadStaging})
+	if err != nil {
+		return nil, "", nil, fmt.Errorf("publish: open cut: %w", err)
+	}
+	closeFn := func() { db.Close() } //nolint:errcheck
+	return newCutSource(db), db.Format().UUID, closeFn, nil
+}
+
 func applyDefaults(o *Options) error {
-	if o.CutPath == "" {
-		return errors.New("publish: CutPath is required")
+	switch {
+	case o.CutPath == "" && o.Overlay == nil:
+		return errors.New("publish: CutPath or Overlay is required")
+	case o.CutPath != "" && o.Overlay != nil:
+		return errors.New("publish: CutPath and Overlay are mutually exclusive")
+	case o.Overlay != nil && o.Prev == nil:
+		// An overlay always shadows a base generation; that generation is
+		// the only place the volume identity and lineage come from.
+		return errors.New("publish: sealing an overlay requires Prev (its base generation)")
 	}
 	if o.Inner == nil {
 		return errors.New("publish: Inner store is required")
@@ -295,16 +339,16 @@ func applyDefaults(o *Options) error {
 	return nil
 }
 
-// edge is one directory entry from the cut walk.
+// edge is one directory entry from the source walk.
 type edge struct {
 	name  string
 	inode uint64
-	typ   uint8 // meta.Type*
+	typ   uint8 // catalog.Type*
 }
 
 // rec is everything the pipeline knows about one inode.
 type rec struct {
-	n        cutdb.Node
+	n        SrcNode
 	xattrs   []catalog.Xattr
 	symlink  []byte
 	inline   []byte
@@ -321,7 +365,7 @@ type chunkInfo struct {
 
 type pipeline struct {
 	o       Options
-	db      *cutdb.DB
+	src     Source
 	pk      *packer
 	hasher  chunkid.Hasher
 	gen     uint64
@@ -343,26 +387,49 @@ type pipeline struct {
 	stats Stats
 }
 
-// walk loads the cut's tree into memory: per-directory edges, per-inode
+// walk loads the source's tree into memory: per-directory edges, per-inode
 // attributes, xattrs, symlink targets, and the promoted (nlink > 1) set.
+// The descent is strictly parent-before-child (Readdir per directory) — the
+// order a residency-by-lookup source requires; edges are sorted afterwards,
+// so no source's own listing order is observable in the output.
 func (p *pipeline) walk(ctx context.Context) error {
-	root, err := p.db.Stat(ctx, cutdb.RootInode)
+	rootIno := p.src.Root()
+	root, err := p.src.Stat(ctx, rootIno)
 	if err != nil {
 		return fmt.Errorf("publish: stat root: %w", err)
 	}
-	p.recs[root.Inode] = &rec{n: root}
-	p.maxInode = root.Inode
-	if err := p.db.Walk(ctx, func(parent uint64, name string, n cutdb.Node) error {
-		p.dirs[parent] = append(p.dirs[parent], edge{name: name, inode: n.Inode, typ: n.Type})
-		if n.Inode > p.maxInode {
-			p.maxInode = n.Inode
+	p.recs[rootIno] = &rec{n: root}
+	p.maxInode = rootIno
+	expanded := make(map[uint64]bool)
+	var descend func(ino uint64) error
+	descend = func(ino uint64) error {
+		if expanded[ino] {
+			return nil
 		}
-		if _, ok := p.recs[n.Inode]; !ok {
-			p.recs[n.Inode] = &rec{n: n}
+		expanded[ino] = true
+		entries, err := p.src.Readdir(ctx, ino)
+		if err != nil {
+			return fmt.Errorf("publish: readdir inode %d: %w", ino, err)
+		}
+		for _, e := range entries {
+			n := e.Node
+			p.dirs[ino] = append(p.dirs[ino], edge{name: e.Name, inode: n.Inode, typ: n.Type})
+			if n.Inode > p.maxInode {
+				p.maxInode = n.Inode
+			}
+			if _, ok := p.recs[n.Inode]; !ok {
+				p.recs[n.Inode] = &rec{n: n}
+			}
+			if n.Type == catalog.TypeDir {
+				if err := descend(n.Inode); err != nil {
+					return err
+				}
+			}
 		}
 		return nil
-	}); err != nil {
-		return fmt.Errorf("publish: walk cut: %w", err)
+	}
+	if err := descend(rootIno); err != nil {
+		return err
 	}
 	// Sort edges by name so catalog row order — and therefore catalog
 	// bytes and identities — is deterministic for identical trees.
@@ -371,22 +438,35 @@ func (p *pipeline) walk(ctx context.Context) error {
 	}
 	for _, ino := range p.sortedInodes() {
 		r := p.recs[ino]
-		xa, err := p.db.Xattrs(ctx, ino)
+		xa, err := p.src.Xattrs(ctx, ino)
 		if err != nil {
 			return fmt.Errorf("publish: xattrs of inode %d: %w", ino, err)
 		}
 		r.xattrs = sortedXattrs(xa)
 		switch r.n.Type {
-		case meta.TypeDirectory:
+		case catalog.TypeDir:
+			// A directory's link count is a function of the namespace
+			// ("." and "..", plus one ".." per subdirectory), not a stored
+			// attribute. Recomputing it from surviving edges is what makes
+			// a sealed overlay — which deliberately does not maintain
+			// parent link counts (internal/overlay, Mkdir) — and a
+			// translated cut publish the same number.
+			subdirs := 0
+			for _, e := range p.dirs[ino] {
+				if e.typ == catalog.TypeDir {
+					subdirs++
+				}
+			}
+			r.n.Nlink = uint32(2 + subdirs)
 			p.stats.Dirs++
-		case meta.TypeSymlink:
-			target, err := p.db.Readlink(ctx, ino)
+		case catalog.TypeSymlink:
+			target, err := p.src.Readlink(ctx, ino)
 			if err != nil {
 				return fmt.Errorf("publish: readlink inode %d: %w", ino, err)
 			}
 			r.symlink = []byte(target)
 			p.stats.Symlinks++
-		case meta.TypeFile:
+		case catalog.TypeFile:
 			p.stats.Files++
 			if r.n.Nlink > 1 {
 				r.promoted = true
@@ -406,19 +486,20 @@ func (p *pipeline) walk(ctx context.Context) error {
 func (p *pipeline) transform(ctx context.Context) error {
 	for _, ino := range p.sortedInodes() {
 		r := p.recs[ino]
-		if r.n.Type != meta.TypeFile || r.n.Length == 0 {
+		if r.n.Type != catalog.TypeFile || r.n.Length == 0 {
 			continue
 		}
-		if int64(r.n.Length) <= p.o.InlineMax {
-			rd, err := p.db.FileReader(ctx, ino, r.n.Length)
+		if r.n.Length <= p.o.InlineMax {
+			rd, err := p.src.Open(ctx, ino, r.n.Length)
 			if err != nil {
 				return fmt.Errorf("publish: read inode %d: %w", ino, err)
 			}
 			data, err := io.ReadAll(rd)
+			rd.Close() //nolint:errcheck
 			if err != nil {
 				return fmt.Errorf("publish: read inode %d: %w", ino, err)
 			}
-			if uint64(len(data)) != r.n.Length {
+			if int64(len(data)) != r.n.Length {
 				return fmt.Errorf("publish: inode %d read %d bytes, want %d", ino, len(data), r.n.Length)
 			}
 			r.inline = data
@@ -435,14 +516,15 @@ func (p *pipeline) transform(ctx context.Context) error {
 	return nil
 }
 
-func (p *pipeline) chunkFile(ctx context.Context, ino, length uint64) ([]catalog.ChunkRef, error) {
-	rd, err := p.db.FileReader(ctx, ino, length)
+func (p *pipeline) chunkFile(ctx context.Context, ino uint64, length int64) ([]catalog.ChunkRef, error) {
+	rd, err := p.src.Open(ctx, ino, length)
 	if err != nil {
 		return nil, fmt.Errorf("publish: read inode %d: %w", ino, err)
 	}
+	defer rd.Close() //nolint:errcheck
 	ck := chunkid.NewChunker(rd, chunkid.Options{})
 	var refs []catalog.ChunkRef
-	var total uint64
+	var total int64
 	for {
 		c, err := ck.Next()
 		if err == io.EOF {
@@ -475,7 +557,7 @@ func (p *pipeline) chunkFile(ctx context.Context, ino, length uint64) ([]catalog
 			Alg:      int64(info.alg),
 			KeyID:    info.keyID,
 		})
-		total += uint64(len(c.Data))
+		total += int64(len(c.Data))
 	}
 	if total != length {
 		return nil, fmt.Errorf("publish: inode %d chunked %d bytes, want %d", ino, total, length)
@@ -538,7 +620,7 @@ func (p *pipeline) writeShards(ctx context.Context) ([]superblock.ShardEntry, er
 // child catalog before any parent that references it — with the tree root
 // last), returning the root catalog identity.
 func (p *pipeline) writeCatalogs(ctx context.Context) (chunkid.Identity, error) {
-	rootDN := p.buildDirNode(cutdb.RootInode, "/")
+	rootDN := p.buildDirNode(p.src.Root(), "/")
 	roots := catalog.Split(rootDN, p.o.SMax, catalog.SMin)
 	for _, dn := range roots {
 		p.isCatRoot[p.dnIno[dn]] = true
@@ -568,13 +650,13 @@ func (p *pipeline) buildDirNode(ino uint64, pth string) *catalog.DirNode {
 		d.OwnWeight += entryWeight
 		r := p.recs[e.inode]
 		switch e.typ {
-		case meta.TypeDirectory:
+		case catalog.TypeDir:
 			d.Children = append(d.Children, p.buildDirNode(e.inode, path.Join(pth, e.name)))
-		case meta.TypeFile:
+		case catalog.TypeFile:
 			if !r.promoted {
 				d.OwnWeight += int64(len(r.inline)) + xattrBytes(r.xattrs)
 			}
-		case meta.TypeSymlink:
+		case catalog.TypeSymlink:
 			d.OwnWeight += int64(len(r.symlink)) + xattrBytes(r.xattrs)
 		default:
 			d.OwnWeight += xattrBytes(r.xattrs)
@@ -601,7 +683,7 @@ func (p *pipeline) writeCatalog(ctx context.Context, rootIno uint64) (chunkid.Id
 			return err
 		}
 		for _, e := range p.dirs[ino] {
-			if e.typ == meta.TypeDirectory && p.isCatRoot[e.inode] {
+			if e.typ == catalog.TypeDir && p.isCatRoot[e.inode] {
 				id, ok := p.catIdentity[e.inode]
 				if !ok {
 					return fmt.Errorf("child catalog %s not yet written (split order bug)", p.pathOf[e.inode])
@@ -629,7 +711,7 @@ func (p *pipeline) writeCatalog(ctx context.Context, rootIno uint64) (chunkid.Id
 			if err := cw.AddEdge(int64(ino), []byte(e.name), int64(e.inode), ct); err != nil {
 				return err
 			}
-			if e.typ == meta.TypeDirectory {
+			if e.typ == catalog.TypeDir {
 				if err := emit(e.inode); err != nil {
 					return err
 				}
@@ -667,13 +749,13 @@ func (p *pipeline) emitInode(w *catalog.Writer, seen map[uint64]bool, ino uint64
 	if err := w.AddNode(catalog.Node{
 		Inode:   int64(ino),
 		Type:    typ,
-		Mode:    uint32(r.n.Mode),
-		UID:     r.n.Uid,
-		GID:     r.n.Gid,
-		MtimeNS: r.n.MtimeNs,
-		CtimeNS: r.n.CtimeNs,
+		Mode:    r.n.Mode,
+		UID:     r.n.UID,
+		GID:     r.n.GID,
+		MtimeNS: r.n.MtimeNS,
+		CtimeNS: r.n.CtimeNS,
 		Nlink:   r.n.Nlink,
-		Length:  int64(r.n.Length),
+		Length:  r.n.Length,
 		Rdev:    r.n.Rdev,
 	}); err != nil {
 		return err
@@ -687,9 +769,9 @@ func (p *pipeline) emitInode(w *catalog.Writer, seen map[uint64]bool, ino uint64
 		}
 	}
 	switch r.n.Type {
-	case meta.TypeSymlink:
+	case catalog.TypeSymlink:
 		return w.SetSymlink(int64(ino), r.symlink)
-	case meta.TypeFile:
+	case catalog.TypeFile:
 		if r.inline != nil {
 			return w.SetInline(int64(ino), r.inline)
 		}
@@ -733,14 +815,13 @@ func (p *pipeline) buildSuperblock(newPacks []packstore.SealedPack, shards []sup
 	for _, sp := range newPacks {
 		packList = append(packList, superblock.PackEntry{Name: sp.Name, TrailerHash: sp.TrailerHash, Size: sp.Size})
 	}
-	// The cut does not expose the allocator counter, so the high-water mark
-	// prefers the cut's real allocator counter; the max-inode-seen
-	// fallback covers only a counter table the engine has not written
-	// yet. Never regress below the previous generation's (crash-burned
-	// numbers stay burned).
+	// The high-water mark prefers the source's real allocator counter;
+	// max-inode-seen covers only sources that keep none (Source.NextInode
+	// reports 0). Never regress below the previous generation's
+	// (crash-burned numbers stay burned).
 	nextInode := p.maxInode + 1
-	if v, err := p.db.Counter("nextInode"); err == nil && uint64(v) > nextInode {
-		nextInode = uint64(v)
+	if v := p.src.NextInode(); v > nextInode {
+		nextInode = v
 	}
 	if p.o.Prev != nil && p.o.Prev.NextInode > nextInode {
 		nextInode = p.o.Prev.NextInode
@@ -873,22 +954,14 @@ func sortedXattrs(m map[string][]byte) []catalog.Xattr {
 	return out
 }
 
+// catType range-checks a node type on its way into a catalog row. Sources
+// already speak the catalog type space (see Source), so this is validation,
+// not translation.
 func catType(t uint8) (uint8, error) {
 	switch t {
-	case meta.TypeFile:
-		return catalog.TypeFile, nil
-	case meta.TypeDirectory:
-		return catalog.TypeDir, nil
-	case meta.TypeSymlink:
-		return catalog.TypeSymlink, nil
-	case meta.TypeFIFO:
-		return catalog.TypeFIFO, nil
-	case meta.TypeBlockDev:
-		return catalog.TypeBlockDev, nil
-	case meta.TypeCharDev:
-		return catalog.TypeCharDev, nil
-	case meta.TypeSocket:
-		return catalog.TypeSocket, nil
+	case catalog.TypeFile, catalog.TypeDir, catalog.TypeSymlink, catalog.TypeFIFO,
+		catalog.TypeBlockDev, catalog.TypeCharDev, catalog.TypeSocket:
+		return t, nil
 	}
 	return 0, fmt.Errorf("publish: unknown inode type %d", t)
 }
@@ -905,4 +978,11 @@ func parseVolumeID(uuid string) ([16]byte, error) {
 	}
 	copy(id[:], b)
 	return id, nil
+}
+
+// formatVolumeID renders a superblock volume id as the canonical dashed
+// UUID catalog_meta records (parseVolumeID's inverse).
+func formatVolumeID(id [16]byte) string {
+	h := hex.EncodeToString(id[:])
+	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
 }

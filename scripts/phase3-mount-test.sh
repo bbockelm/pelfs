@@ -141,6 +141,40 @@ grep -q "phase-3 write" "$WORK/mnt/dir/written.txt" || { echo "sealed write miss
 cmp "$WORK/src/dir/big.bin" "$WORK/mnt/dir/big.bin"
 echo "seal round trip verified: writes, mkdir, deletion, untouched content"
 
+echo "== live refresh: a read-only mount follows the branch =="
+fusermount3 -u "$WORK/mnt" 2>/dev/null || umount "$WORK/mnt"
+wait "$MOUNT_PID" 2>/dev/null || true
+
+"$WORK/pelfs" mount-gen --poll 1s --state-dir "$WORK/state6" "$PREFIX" "$WORK/mnt" &
+MOUNT_PID=$!
+for _ in $(seq 100); do [ -e "$WORK/mnt/dir/written.txt" ] && break; sleep 0.1; done
+[ -e "$WORK/mnt/dir/written.txt" ] || { echo "polling mount did not come up" >&2; exit 1; }
+# Read it once so the kernel caches the inode: the swap must invalidate it.
+cat "$WORK/mnt/dir/written.txt" > /dev/null
+[ ! -e "$WORK/mnt/live.txt" ] || { echo "live.txt exists before it was published" >&2; exit 1; }
+
+# A SECOND, independent writer publishes a new generation.
+"$WORK/pelfs" mount-gen --rw --state-dir "$WORK/state" "$PREFIX" "$WORK/writer" &
+WRITER_PID=$!
+mkdir -p "$WORK/writer"
+for _ in $(seq 100); do [ -d "$WORK/writer/dir" ] && break; sleep 0.1; done
+echo "published while mounted" > "$WORK/writer/live.txt"
+echo "changed by the other writer" > "$WORK/writer/dir/written.txt"
+fusermount3 -u "$WORK/writer" 2>/dev/null || umount "$WORK/writer"
+wait "$WRITER_PID" 2>/dev/null || true
+
+# The reader must pick it up WITHOUT remounting.
+found=0
+for _ in $(seq 60); do
+  if [ -e "$WORK/mnt/live.txt" ] && grep -q "changed by the other writer" "$WORK/mnt/dir/written.txt" 2>/dev/null; then
+    found=1; break
+  fi
+  sleep 0.5
+done
+[ "$found" = "1" ] || { echo "read-only mount did not pick up the new generation" >&2; ls "$WORK/mnt"; exit 1; }
+grep -q "published while mounted" "$WORK/mnt/live.txt"
+echo "live refresh verified: new file appeared and changed content updated, no remount"
+
 if [ "$BENCH" = "--bench" ]; then
   echo "== end-to-end benchmarks on a real kernel =="
   fusermount3 -u "$WORK/mnt" 2>/dev/null || fusermount -u "$WORK/mnt" 2>/dev/null || umount "$WORK/mnt"

@@ -183,6 +183,14 @@ type fixture struct {
 
 	dirIno, smallIno, linkIno, bigIno uint64
 	smallContent, bigContent          []byte
+
+	// Retained so tests can publish further generations against the same
+	// volume and swap the mount onto them.
+	inner pelicanobj.Store
+	vol   *testVolume
+	res   *publish.Result
+	gfs   *genfs.FS
+	priv  ed25519.PrivateKey
 }
 
 func newFixture(t *testing.T, uuid string) *fixture {
@@ -226,6 +234,7 @@ func newFixture(t *testing.T, uuid string) *fixture {
 	}
 	t.Cleanup(func() { _ = gfs.Close() })
 	f.raw = rawfuse.Bind(gfs)
+	f.inner, f.vol, f.res, f.gfs, f.priv = inner, v, res, gfs, priv
 	return f
 }
 

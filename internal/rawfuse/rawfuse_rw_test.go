@@ -14,6 +14,7 @@ import (
 	"github.com/bbockelm/pelfs/internal/overlay"
 	"github.com/bbockelm/pelfs/internal/publish"
 	"github.com/bbockelm/pelfs/internal/rawfuse"
+	"github.com/bbockelm/pelfs/internal/superblock"
 )
 
 // Statuses the fuse package does not name.
@@ -581,5 +582,53 @@ func TestRWMknodFifo(t *testing.T) {
 	}
 	if out.Attr.Mode != syscall.S_IFREG|0640 {
 		t.Fatalf("plain mode = %o", out.Attr.Mode)
+	}
+}
+
+// The refresher must swap generations and invalidate exactly what
+// changed. A nil server exercises swap and reporting without a kernel;
+// the mount gate covers the notification path for real.
+func TestRefresherSwapsGenerations(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, "9e9e9e9e-0000-4000-8000-0000000000ee")
+
+	// Descend as the kernel does — parent before child — so both inodes
+	// become resident; only what the kernel holds gets invalidated.
+	mustLookup(t, f.raw, rootIno, "dir")
+	mustLookup(t, f.raw, f.dirIno, "small.txt")
+
+	// Publish a second generation with that file changed.
+	f.vol.write(f.smallIno, []byte("second generation content"))
+	gen1, err := publish.Publish(ctx, publish.Options{
+		CutPath: f.vol.cut(), Blob: f.vol.blob, CacheDir: t.TempDir(),
+		Inner: f.inner, SpoolDir: t.TempDir(), SigningKey: f.priv,
+		Prev: f.res.Superblock, PrevRaw: f.res.Raw, TargetPackSize: 2 << 20,
+	})
+	if err != nil {
+		t.Fatalf("publish generation 1: %v", err)
+	}
+
+	var fetched int
+	r := rawfuse.NewRefresher(f.gfs, nil, func(context.Context) (*superblock.Superblock, error) {
+		fetched++
+		return gen1.Superblock, nil
+	}, 0)
+	if err := r.Refresh(ctx); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if fetched != 1 || f.gfs.Generation() != gen1.Superblock.Generation {
+		t.Fatalf("fetched=%d generation=%d, want 1 and %d",
+			fetched, f.gfs.Generation(), gen1.Superblock.Generation)
+	}
+
+	// The mount now serves the new content through the binding.
+	entry := mustLookup(t, f.raw, f.dirIno, "small.txt")
+	if entry.Attr.Size != uint64(len("second generation content")) {
+		t.Fatalf("post-refresh size = %d, want %d", entry.Attr.Size, len("second generation content"))
+	}
+
+	// Same head again: no swap, no error.
+	if err := r.Refresh(ctx); err != nil {
+		t.Fatalf("idempotent Refresh: %v", err)
 	}
 }

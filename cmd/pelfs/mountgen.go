@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 
@@ -31,12 +32,14 @@ func cmdMountGen(args []string) int {
 	var branch, tag, pubkeyHex string
 	var rw, noSeal bool
 	var signingKeyPath string
+	var poll time.Duration
 	o, pos, err := parseArgs("mount-gen", args, 2, 2, func(fs *flag.FlagSet, o *cmdOpts) {
 		fs.StringVar(&branch, "branch", "main", "branch to mount")
 		fs.StringVar(&tag, "tag", "", "mount a tag instead of a branch head (pinned exactly)")
 		fs.StringVar(&pubkeyHex, "volume-pubkey", "", "hex Ed25519 volume key to trust (default: pin on first use)")
 		fs.BoolVar(&rw, "rw", false, "mount read-write through a local overlay; unmount SEALS the changes into the next generation")
 		fs.BoolVar(&noSeal, "no-seal", false, "with --rw, keep the overlay at unmount instead of publishing it (resume by remounting)")
+		fs.DurationVar(&poll, "poll", 0, "read-only: re-check the branch head this often and swap generations live (0 = pinned, the reproducible-batch default)")
 		fs.StringVar(&signingKeyPath, "signing-key", "", "hex Ed25519 volume signing key file to seal with (default: <state-dir>/v2-signing.key; a volume's key is per-VOLUME, so a second machine must import it)")
 	})
 	if err != nil {
@@ -157,6 +160,25 @@ func cmdMountGen(args []string) int {
 	}
 	fmt.Fprintf(os.Stderr, "pelfs: generation %d mounted %s on %s (catalog-native)\n",
 		sb.Generation, mode, mountpoint)
+
+	// Live refresh: read-only mounts can follow the branch. Writable
+	// mounts never do — the overlay is pinned to the generation it
+	// shadows, and swapping underneath it would strand its dirty state.
+	refreshCtx, stopRefresh := context.WithCancel(ctx)
+	defer stopRefresh()
+	if poll > 0 && !rw && tag == "" {
+		r := rawfuse.NewRefresher(gfs, srv, func(c context.Context) (*superblock.Superblock, error) {
+			f, err := rstore.Fetch(c, branch)
+			if err != nil {
+				return nil, err
+			}
+			return f.Superblock, nil
+		}, poll)
+		go r.Run(refreshCtx)
+		fmt.Fprintf(os.Stderr, "pelfs: following %s, re-checking every %s\n", branch, poll)
+	} else if poll > 0 {
+		fmt.Fprintln(os.Stderr, "pelfs: --poll ignored (writable mounts and tags are pinned by design)")
+	}
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)

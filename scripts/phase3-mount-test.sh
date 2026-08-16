@@ -142,9 +142,70 @@ cmp "$WORK/src/dir/big.bin" "$WORK/mnt/dir/big.bin"
 echo "seal round trip verified: writes, mkdir, deletion, untouched content"
 
 if [ "$BENCH" = "--bench" ]; then
-  echo "== end-to-end benchmarks against the phase-3 mount (read-only subset) =="
-  time (find "$WORK/mnt" -type f -exec cat {} + > /dev/null)
-  time (tar -C "$WORK/mnt" -cf /dev/null .)
+  echo "== end-to-end benchmarks on a real kernel =="
+  fusermount3 -u "$WORK/mnt" 2>/dev/null || fusermount -u "$WORK/mnt" 2>/dev/null || umount "$WORK/mnt"
+  wait "$MOUNT_PID" 2>/dev/null || true
+
+  # Writable mount, so the workload can untar and delete like a real one.
+  "$WORK/pelfs" mount-gen --rw --no-seal --state-dir "$WORK/state" "$PREFIX" "$WORK/mnt" &
+  MOUNT_PID=$!
+  for _ in $(seq 100); do [ -d "$WORK/mnt/dir" ] && break; sleep 0.1; done
+  [ -d "$WORK/mnt/dir" ] || { echo "bench mount did not come up" >&2; exit 1; }
+
+  bench() { # bench <label> <cmd...>
+    local label="$1"; shift
+    local start end
+    start=$(date +%s.%N)
+    "$@" >/dev/null 2>&1 || true
+    end=$(date +%s.%N)
+    awk -v l="$label" -v s="$start" -v e="$end" 'BEGIN{printf "  %-22s %7.2fs\n", l, e-s}'
+  }
+
+  echo "  building a 2000-file corpus..."
+  mkdir -p "$WORK/corpus"
+  for d in $(seq 0 39); do
+    mkdir -p "$WORK/corpus/d$d"
+    for f in $(seq 0 49); do
+      head -c $(( (d * 50 + f) % 6000 + 300 )) /dev/urandom > "$WORK/corpus/d$d/f$f.bin"
+    done
+  done
+  tar -C "$WORK" -cf "$WORK/corpus.tar" corpus
+
+  echo "  A. WRITABLE mount (overlay; every inode dirty => zero TTLs):"
+  bench "untar 2000 files"   tar -C "$WORK/mnt" -xf "$WORK/corpus.tar"
+  bench "stat walk (cold)"   find "$WORK/mnt/corpus" -type f -exec stat -c%s {} +
+  bench "stat walk (again)"  find "$WORK/mnt/corpus" -type f -exec stat -c%s {} +
+  bench "read all"           tar -C "$WORK/mnt" -cf /dev/null corpus
+
+  # Seal the corpus, then serve it read-only: now every inode is CLEAN and
+  # immutable, so the binding hands the kernel infinite TTLs. The gap
+  # between these two stat walks IS the immutability dividend.
+  echo "  sealing the corpus into the next generation..."
+  fusermount3 -u "$WORK/mnt" 2>/dev/null || umount "$WORK/mnt"
+  wait "$MOUNT_PID" 2>/dev/null || true
+  "$WORK/pelfs" mount-gen --rw --state-dir "$WORK/state" "$PREFIX" "$WORK/mnt" >/dev/null 2>&1 &
+  MOUNT_PID=$!
+  for _ in $(seq 200); do [ -d "$WORK/mnt/corpus" ] && break; sleep 0.1; done
+  fusermount3 -u "$WORK/mnt" 2>/dev/null || umount "$WORK/mnt"
+  wait "$MOUNT_PID" 2>/dev/null || true
+
+  "$WORK/pelfs" mount-gen --state-dir "$WORK/state5" "$PREFIX" "$WORK/mnt" >/dev/null 2>&1 &
+  MOUNT_PID=$!
+  for _ in $(seq 200); do [ -d "$WORK/mnt/corpus" ] && break; sleep 0.1; done
+  [ -d "$WORK/mnt/corpus" ] || { echo "sealed corpus mount did not come up" >&2; exit 1; }
+
+  echo "  B. READ-ONLY mount of the sealed generation (clean => infinite TTLs):"
+  bench "stat walk (cold)"   find "$WORK/mnt/corpus" -type f -exec stat -c%s {} +
+  bench "stat walk (warm)"   find "$WORK/mnt/corpus" -type f -exec stat -c%s {} +
+  bench "read all"           tar -C "$WORK/mnt" -cf /dev/null corpus
+  bench "read all (warm)"    tar -C "$WORK/mnt" -cf /dev/null corpus
+
+  echo "  local disk baseline (same workload):"
+  mkdir -p "$WORK/baseline"
+  bench "untar 2000 files"   tar -C "$WORK/baseline" -xf "$WORK/corpus.tar"
+  bench "stat walk"          find "$WORK/baseline/corpus" -type f -exec stat -c%s {} +
+  bench "read all"           tar -C "$WORK/baseline" -cf /dev/null corpus
+  bench "rm -rf"             rm -rf "$WORK/baseline/corpus"
 fi
 
 echo "== PASS: phase-3 catalog-native mount verified =="

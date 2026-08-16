@@ -1078,6 +1078,28 @@ remount; live generation swap arrives with phase 3.
    phase-3 "usable in seconds" target, met by the resolver before the
    kernel's infinite-TTL caching is even counted.
 
+   **The immutability dividend, measured through a real Linux kernel**
+   (scripts/phase3-docker.sh --bench; 2000 files, stat walk):
+
+   | | writable mount (dirty -> 0 TTL) | read-only sealed (clean -> infinite TTL) |
+   |---|---|---|
+   | cold walk | 0.81 s | 0.38 s |
+   | repeat walk | 0.88 s (no gain) | **0.16 s** |
+   | read all | 0.40 s | 0.15 s (0.12 s warm) |
+
+   The repeat walk over DIRTY inodes gains nothing, because zero TTLs
+   force every stat back to userspace — which is the correct and
+   required behavior while the overlay owns those inodes. Over CLEAN
+   inodes the kernel answers from its own dentry/attr cache and the same
+   walk is 5.5x faster. That gap is the design's central claim,
+   confirmed end to end rather than argued.
+
+   It also names the next bottleneck: in writable mounts every operation
+   pays a userspace round trip into an overlay that serializes on one
+   mutex and commits a SQLite transaction per op (~0.4 ms/stat). Finer
+   overlay locking is the phase-3 tuning lever, exactly as the v0
+   simplification predicted.
+
 ## Phase 3 VFS architecture
 
 A full POSIX implementation — including kernel dentry caching done

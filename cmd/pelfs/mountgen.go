@@ -129,12 +129,13 @@ func cmdMountGen(args []string) int {
 
 	var srv *fuse.Server
 	var ov *overlay.FS
+	overlayDir := filepath.Join(stateDir, "overlay")
 	if rw {
 		// The write path: a crash-safe local overlay shadows the immutable
 		// generation, and unmount seals it into the next one. Nothing
 		// mutates the base, so an interrupted session loses at most the
 		// unsealed overlay — which survives on disk for a remount.
-		ov, err = overlay.Open(filepath.Join(stateDir, "overlay"), gfs, overlay.Options{
+		ov, err = overlay.Open(overlayDir, gfs, overlay.Options{
 			NextInode:      gfs.NextInode(),
 			BaseRoot:       gfs.RootCatalog(),
 			BaseGeneration: gfs.Generation(),
@@ -167,8 +168,7 @@ func cmdMountGen(args []string) int {
 
 	if !rw || noSeal {
 		if rw {
-			fmt.Fprintf(os.Stderr, "pelfs: overlay kept at %s (--no-seal); remount to resume or seal\n",
-				filepath.Join(stateDir, "overlay"))
+			fmt.Fprintf(os.Stderr, "pelfs: overlay kept at %s (--no-seal); remount to resume or seal\n", overlayDir)
 		}
 		return 0
 	}
@@ -202,10 +202,20 @@ func cmdMountGen(args []string) int {
 		DedupIndexPath: filepath.Join(stateDir, "v2-dedup.db"),
 	})
 	if err != nil {
-		return exitErr(fmt.Errorf("seal: %w (the overlay is intact at %s; remount to retry)",
-			err, filepath.Join(stateDir, "overlay")))
+		return exitErr(fmt.Errorf("seal: %w (the overlay is intact at %s; remount to retry)", err, overlayDir))
 	}
 	fmt.Fprintf(os.Stderr, "pelfs: sealed generation %d (%d chunks, %d catalogs, %d packs)\n",
 		res.Superblock.Generation, res.Stats.ChunksAdded, res.Stats.Catalogs, len(res.NewPacks))
+
+	// The overlay's contents are now published, and it is pinned to the
+	// generation it shadowed — which is no longer the head. Leaving it
+	// would make this state directory single-use: the next mount would
+	// refuse with a generation mismatch. Retire it now that its work is
+	// durable.
+	_ = ov.Close()
+	if err := os.RemoveAll(overlayDir); err != nil {
+		fmt.Fprintf(os.Stderr, "pelfs: sealed, but the spent overlay at %s could not be removed: %v\n",
+			overlayDir, err)
+	}
 	return 0
 }

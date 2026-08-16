@@ -78,6 +78,7 @@ func (fs *FS) createNodeLocked(ctx context.Context, parent uint64, name string, 
 	if err != nil {
 		return Node{}, err
 	}
+	fs.markDirtyLocked(parent, out.Inode)
 	return out, nil
 }
 
@@ -217,6 +218,7 @@ func (fs *FS) purgeNodeLocked(tx querier, ino uint64, removeStaging *string) err
 func (fs *FS) Unlink(ctx context.Context, parent uint64, name string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	fs.markDirtyLocked(parent)
 	r, err := fs.resolveLocked(ctx, parent, name)
 	if err != nil {
 		return err
@@ -260,14 +262,14 @@ func (fs *FS) removeEdgeLocked(ctx context.Context, tx querier, parent uint64, n
 // overlay edges, and every base entry covered by a whiteout.
 func (fs *FS) emptyDirLocked(ctx context.Context, ino uint64) error {
 	var live int64
-	if err := fs.db.QueryRow(`SELECT count(*) FROM oedge WHERE parent = ? AND inode <> 0`,
+	if err := fs.q.QueryRow(`SELECT count(*) FROM oedge WHERE parent = ? AND inode <> 0`,
 		int64(ino)).Scan(&live); err != nil {
 		return err
 	}
 	if live > 0 {
 		return ErrNotEmpty
 	}
-	backed, err := fs.baseBackedLocked(fs.db, ino)
+	backed, err := fs.baseBackedLocked(fs.q, ino)
 	if err != nil || !backed {
 		return err
 	}
@@ -280,7 +282,7 @@ func (fs *FS) emptyDirLocked(ctx context.Context, ino uint64) error {
 	}
 	for _, be := range bes {
 		var eIno int64
-		err := fs.db.QueryRow(`SELECT inode FROM oedge WHERE parent = ? AND name = ?`,
+		err := fs.q.QueryRow(`SELECT inode FROM oedge WHERE parent = ? AND name = ?`,
 			int64(ino), []byte(be.Name)).Scan(&eIno)
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotEmpty
@@ -307,6 +309,7 @@ func (fs *FS) removeDirLocked(tx querier, ino uint64) error {
 func (fs *FS) Rmdir(ctx context.Context, parent uint64, name string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	fs.markDirtyLocked(parent)
 	r, err := fs.resolveLocked(ctx, parent, name)
 	if err != nil {
 		return err
@@ -335,6 +338,7 @@ func (fs *FS) Rmdir(ctx context.Context, parent uint64, name string) error {
 func (fs *FS) Rename(ctx context.Context, srcParent uint64, srcName string, dstParent uint64, dstName string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	fs.markDirtyLocked(srcParent, dstParent)
 	src, err := fs.resolveLocked(ctx, srcParent, srcName)
 	if err != nil {
 		return err
@@ -495,6 +499,7 @@ func (fs *FS) Write(ctx context.Context, ino uint64, off int64, data []byte) (in
 	}
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	fs.markDirtyLocked(ino)
 	err := fs.withTx(func(tx *sql.Tx) error {
 		row, err := fs.materializeAttrsLocked(ctx, tx, ino)
 		if err != nil {
@@ -547,6 +552,7 @@ type SetAttrIn struct {
 func (fs *FS) SetAttr(ctx context.Context, ino uint64, in SetAttrIn) (Node, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	fs.markDirtyLocked(ino)
 	var out Node
 	err := fs.withTx(func(tx *sql.Tx) error {
 		row, err := fs.materializeAttrsLocked(ctx, tx, ino)
@@ -603,6 +609,7 @@ func (fs *FS) SetAttr(ctx context.Context, ino uint64, in SetAttrIn) (Node, erro
 func (fs *FS) Link(ctx context.Context, ino uint64, parent uint64, name string) (Node, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	fs.markDirtyLocked(ino, parent)
 	n, err := fs.attrsLocked(ctx, ino, nil)
 	if err != nil {
 		return Node{}, err
@@ -648,6 +655,7 @@ func (fs *FS) Link(ctx context.Context, ino uint64, parent uint64, name string) 
 func (fs *FS) SetXattr(ctx context.Context, ino uint64, name string, value []byte) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	fs.markDirtyLocked(ino)
 	if _, err := fs.attrsLocked(ctx, ino, nil); err != nil {
 		return err
 	}
@@ -664,7 +672,8 @@ func (fs *FS) SetXattr(ctx context.Context, ino uint64, name string, value []byt
 func (fs *FS) RemoveXattr(ctx context.Context, ino uint64, name string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
-	_, tomb, found, err := getOXattr(fs.db, ino, name)
+	fs.markDirtyLocked(ino)
+	_, tomb, found, err := getOXattr(fs.q, ino, name)
 	if err != nil {
 		return err
 	}
@@ -672,7 +681,7 @@ func (fs *FS) RemoveXattr(ctx context.Context, ino uint64, name string) error {
 		return ErrNotExist
 	}
 	baseHas := false
-	backed, err := fs.baseBackedLocked(fs.db, ino)
+	backed, err := fs.baseBackedLocked(fs.q, ino)
 	if err != nil {
 		return err
 	}

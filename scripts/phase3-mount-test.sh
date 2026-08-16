@@ -234,6 +234,20 @@ if [ "$BENCH" = "--bench" ]; then
   bench "read all"           tar -C "$WORK/mnt" -cf /dev/null corpus
   bench "read all (warm)"    tar -C "$WORK/mnt" -cf /dev/null corpus
 
+  # C is the common real case: a WRITABLE mount over a large tree whose
+  # content is almost entirely clean. Every lookup asks "is this inode
+  # dirty?" to pick a TTL, so this is where that answer's cost shows.
+  echo "  C. WRITABLE mount over the sealed (clean) corpus:"
+  fusermount3 -u "$WORK/mnt" 2>/dev/null || umount "$WORK/mnt"
+  wait "$MOUNT_PID" 2>/dev/null || true
+  "$WORK/pelfs" mount-gen --rw --no-seal --state-dir "$WORK/state7" "$PREFIX" "$WORK/mnt" >/dev/null 2>&1 &
+  MOUNT_PID=$!
+  for _ in $(seq 200); do [ -d "$WORK/mnt/corpus" ] && break; sleep 0.1; done
+  [ -d "$WORK/mnt/corpus" ] || { echo "clean-writable mount did not come up" >&2; exit 1; }
+  bench "stat walk (cold)"   find "$WORK/mnt/corpus" -type f -exec stat -c%s {} +
+  bench "stat walk (warm)"   find "$WORK/mnt/corpus" -type f -exec stat -c%s {} +
+  bench "read all"           tar -C "$WORK/mnt" -cf /dev/null corpus
+
   echo "  local disk baseline (same workload):"
   mkdir -p "$WORK/baseline"
   bench "untar 2000 files"   tar -C "$WORK/baseline" -xf "$WORK/corpus.tar"

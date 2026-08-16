@@ -1102,3 +1102,74 @@ func TestAccessors(t *testing.T) {
 		t.Fatalf("streamed %d bytes, want %d", len(got), len(want))
 	}
 }
+
+// The in-memory dirty set must never disagree with the tables: a fresh
+// reopen derives it from SQL, so comparing the two after a mixed batch of
+// mutations is the drift check that keeps IsDirty honest.
+func TestDirtySetMatchesReopen(t *testing.T) {
+	ctx := context.Background()
+	fx := newFixture(t, "d117d117-0000-4000-8000-00000000d001")
+	dir := t.TempDir()
+	ov := openOverlay(t, fx, dir)
+
+	// A batch touching every mutating path.
+	created, err := ov.Create(ctx, 1, "created.txt", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ov.Write(ctx, created.Inode, 0, []byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	sub, err := ov.Mkdir(ctx, 1, "subdir", 0755, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := lookupPath(t, ov, "base.txt")
+	if _, err := ov.Write(ctx, base.Inode, 0, []byte("modified base")); err != nil {
+		t.Fatal(err)
+	}
+	tagged := lookupPath(t, ov, "tagged.txt")
+	if err := ov.SetXattr(ctx, tagged.Inode, "user.k", []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	child := lookupPath(t, ov, "dir/child.txt")
+	if err := ov.Rename(ctx, lookupPath(t, ov, "dir").Inode, "child.txt", sub.Inode, "moved.txt"); err != nil {
+		t.Fatal(err)
+	}
+	bigIno := lookupPath(t, ov, "big.bin").Inode
+	if err := ov.Unlink(ctx, 1, "big.bin"); err != nil {
+		t.Fatal(err)
+	}
+
+	probe := []uint64{created.Inode, sub.Inode, base.Inode, tagged.Inode, child.Inode, bigIno, 1}
+	live := map[uint64]bool{}
+	for _, ino := range probe {
+		d, err := ov.IsDirty(ino)
+		if err != nil {
+			t.Fatal(err)
+		}
+		live[ino] = d
+	}
+	if err := ov.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopening derives the set from the tables alone.
+	ov2 := openOverlay(t, fx, dir)
+	for _, ino := range probe {
+		d, err := ov2.IsDirty(ino)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d != live[ino] {
+			t.Errorf("inode %d: in-memory dirty=%v, table-derived dirty=%v", ino, live[ino], d)
+		}
+	}
+	// Sanity: the mutations really did mark things dirty, so the
+	// comparison above is not vacuously true on an all-false set.
+	for _, ino := range []uint64{created.Inode, base.Inode, tagged.Inode} {
+		if !live[ino] {
+			t.Errorf("inode %d should be dirty after mutation", ino)
+		}
+	}
+}

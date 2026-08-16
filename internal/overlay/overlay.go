@@ -108,14 +108,20 @@ type provEdge struct {
 
 // FS is one open overlay over one base generation.
 type FS struct {
-	base       *genfs.FS
-	db         *sql.DB
+	base *genfs.FS
+	db   *sql.DB
+	// q is db behind a prepared-statement cache: every non-transactional
+	// read goes through it (see stmtcache.go).
+	q          *stmtCache
 	dir        string
 	stagingDir string
 
 	// mu serializes every operation: one writer, one transaction at a
 	// time (v0 simplicity; SQLite serializes writes anyway).
 	mu sync.Mutex
+	// dirtySet is the in-memory answer to IsDirty (see accessors.go);
+	// nil until first use, then maintained by every mutating path.
+	dirtySet map[uint64]struct{}
 	// prov caches this session's base residency: prov[ino] present means
 	// base.Lookup succeeded for ino via the recorded edge, and residency
 	// is pinned (Forget is never forwarded to the base).
@@ -213,8 +219,24 @@ func Open(dir string, base *genfs.FS, opts Options) (*FS, error) {
 			return nil, fmt.Errorf("overlay: state dir: %w", err)
 		}
 	}
+	// cache_size is negative = KiB. Without it the pager re-reads pages
+	// from the OS on nearly every query: profiling showed ~90% of a
+	// metadata operation's CPU in read syscalls, which is why IsDirty —
+	// the most frequent call in the FUSE TTL path — cost more than a
+	// whole Lookup. Dirty state is small (it is a session's changes, not
+	// a tree), so 32 MiB holds all of it.
 	dsn := "file:" + filepath.Join(dir, overlayDBName) +
-		"?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
+		"?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)" +
+		"&_pragma=cache_size(-32768)&_pragma=temp_store(MEMORY)" +
+		// locking_mode=EXCLUSIVE is the big one. Profiling found 60% of
+		// every metadata operation in fcntl(): SQLite acquires and
+		// releases POSIX file locks per query. An overlay belongs to
+		// exactly one session — single-writer scratch is the whole
+		// premise — so it can hold the lock for its lifetime instead of
+		// re-taking it thousands of times a second. A second process
+		// trying to open the same overlay now fails fast and loudly,
+		// which is the honest outcome: two writers would corrupt it.
+		"&_pragma=locking_mode(EXCLUSIVE)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("overlay: open db: %w", err)
@@ -258,6 +280,7 @@ func Open(dir string, base *genfs.FS, opts Options) (*FS, error) {
 	return &FS{
 		base:       base,
 		db:         db,
+		q:          newStmtCache(db),
 		dir:        dir,
 		stagingDir: stagingDir,
 		prov:       make(map[uint64]provEdge),
@@ -267,6 +290,9 @@ func Open(dir string, base *genfs.FS, opts Options) (*FS, error) {
 // Close releases the database. Staging files and all dirty state persist
 // for the next Open.
 func (fs *FS) Close() error {
+	if fs.q != nil {
+		fs.q.close()
+	}
 	return fs.db.Close()
 }
 

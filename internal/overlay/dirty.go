@@ -56,7 +56,7 @@ func (fs *FS) Dirty() (*DirtyReport, error) {
 	defer fs.mu.Unlock()
 	rep := &DirtyReport{}
 
-	rows, err := fs.db.Query(`SELECT inode, type, mode, uid, gid, mtime_ns, ctime_ns, nlink, length, rdev, flags, base
+	rows, err := fs.q.Query(`SELECT inode, type, mode, uid, gid, mtime_ns, ctime_ns, nlink, length, rdev, flags, base
 		FROM onode ORDER BY inode`)
 	if err != nil {
 		return nil, err
@@ -75,7 +75,7 @@ func (fs *FS) Dirty() (*DirtyReport, error) {
 		return nil, err
 	}
 
-	rows, err = fs.db.Query(`SELECT parent, name, inode, type FROM oedge ORDER BY parent, name`)
+	rows, err = fs.q.Query(`SELECT parent, name, inode, type FROM oedge ORDER BY parent, name`)
 	if err != nil {
 		return nil, err
 	}
@@ -93,7 +93,7 @@ func (fs *FS) Dirty() (*DirtyReport, error) {
 		return nil, err
 	}
 
-	rows, err = fs.db.Query(`SELECT inode, name, value, tombstone FROM oxattr ORDER BY inode, name`)
+	rows, err = fs.q.Query(`SELECT inode, name, value, tombstone FROM oxattr ORDER BY inode, name`)
 	if err != nil {
 		return nil, err
 	}
@@ -113,7 +113,7 @@ func (fs *FS) Dirty() (*DirtyReport, error) {
 		return nil, err
 	}
 
-	rows, err = fs.db.Query(`SELECT inode, target FROM osymlink ORDER BY inode`)
+	rows, err = fs.q.Query(`SELECT inode, target FROM osymlink ORDER BY inode`)
 	if err != nil {
 		return nil, err
 	}
@@ -131,7 +131,7 @@ func (fs *FS) Dirty() (*DirtyReport, error) {
 		return nil, err
 	}
 
-	rows, err = fs.db.Query(`SELECT inode FROM ocontent ORDER BY inode`)
+	rows, err = fs.q.Query(`SELECT inode FROM ocontent ORDER BY inode`)
 	if err != nil {
 		return nil, err
 	}
@@ -166,13 +166,13 @@ func (fs *FS) Stats() (Stats, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	var s Stats
-	if err := fs.db.QueryRow(`SELECT count(*) FROM onode`).Scan(&s.DirtyNodes); err != nil {
+	if err := fs.q.QueryRow(`SELECT count(*) FROM onode`).Scan(&s.DirtyNodes); err != nil {
 		return Stats{}, err
 	}
-	if err := fs.db.QueryRow(`SELECT count(*) FROM oedge`).Scan(&s.DirtyEdges); err != nil {
+	if err := fs.q.QueryRow(`SELECT count(*) FROM oedge`).Scan(&s.DirtyEdges); err != nil {
 		return Stats{}, err
 	}
-	rows, err := fs.db.Query(`SELECT inode FROM ocontent ORDER BY inode`)
+	rows, err := fs.q.Query(`SELECT inode FROM ocontent ORDER BY inode`)
 	if err != nil {
 		return Stats{}, err
 	}

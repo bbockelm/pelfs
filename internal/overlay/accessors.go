@@ -21,7 +21,7 @@ func (fs *FS) NextInode() (uint64, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	var v string
-	err := fs.db.QueryRow(`SELECT value FROM meta WHERE key = ?`, metaNextInode).Scan(&v)
+	err := fs.q.QueryRow(`SELECT value FROM meta WHERE key = ?`, metaNextInode).Scan(&v)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, errors.New("overlay: next_inode missing from meta")
 	}
@@ -36,22 +36,73 @@ func (fs *FS) NextInode() (uint64, error) {
 }
 
 // IsDirty reports whether this overlay has touched the inode: an attr
-// override, staged content, an xattr change, or an edge naming it. The
-// FUSE binding needs exactly this per Lookup to choose entry/attr
-// validity — infinite for clean inodes, zero for dirty ones — and a full
-// Dirty() dump is far too heavy for a per-lookup decision.
+// override, staged content, an xattr change, or an edge naming it.
+//
+// Answered from memory, not SQL. The FUSE binding calls this on every
+// lookup to choose entry/attr validity, and profiling showed the query
+// form costing more than a whole Lookup (60% of it in SQLite's per-query
+// fcntl locking). The overlay performs every mutation itself, so a set
+// maintained under the same lock is exactly as authoritative as the
+// tables — and it is small by construction: a session's changes, not a
+// tree.
 func (fs *FS) IsDirty(ino uint64) (bool, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
-	const q = `SELECT EXISTS(SELECT 1 FROM onode    WHERE inode  = ?1)
-	             OR EXISTS(SELECT 1 FROM ocontent WHERE inode  = ?1)
-	             OR EXISTS(SELECT 1 FROM oxattr   WHERE inode  = ?1)
-	             OR EXISTS(SELECT 1 FROM oedge    WHERE inode  = ?1 OR parent = ?1)`
-	var dirty bool
-	if err := fs.db.QueryRow(q, ino).Scan(&dirty); err != nil {
+	if err := fs.loadDirtyLocked(); err != nil {
 		return false, err
 	}
+	_, dirty := fs.dirtySet[ino]
 	return dirty, nil
+}
+
+// loadDirtyLocked seeds the in-memory set on first use, from the tables
+// this overlay reopened with (state a previous session left behind).
+func (fs *FS) loadDirtyLocked() error {
+	if fs.dirtySet != nil {
+		return nil
+	}
+	set := make(map[uint64]struct{})
+	for _, q := range []string{
+		`SELECT inode FROM onode`,
+		`SELECT inode FROM ocontent`,
+		`SELECT inode FROM oxattr`,
+		`SELECT inode FROM oedge WHERE inode != 0`,
+		`SELECT parent FROM oedge`,
+	} {
+		rows, err := fs.q.Query(q)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var ino uint64
+			if err := rows.Scan(&ino); err != nil {
+				rows.Close() //nolint:errcheck
+				return err
+			}
+			set[ino] = struct{}{}
+		}
+		if err := closeRows(rows); err != nil {
+			return err
+		}
+	}
+	fs.dirtySet = set
+	return nil
+}
+
+// markDirtyLocked records inodes as dirty. Every mutating path calls it
+// with the inodes it touched, under the filesystem lock, so the set never
+// disagrees with the tables.
+func (fs *FS) markDirtyLocked(inos ...uint64) {
+	if fs.dirtySet == nil {
+		// Not seeded yet; the first IsDirty will read the tables, which
+		// by then include this mutation.
+		return
+	}
+	for _, ino := range inos {
+		if ino != 0 {
+			fs.dirtySet[ino] = struct{}{}
+		}
+	}
 }
 
 // AllXattrs returns every visible xattr of an inode in one pass, honoring

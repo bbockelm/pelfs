@@ -1086,11 +1086,20 @@ remount; live generation swap arrives with phase 3.
    **The immutability dividend, measured through a real Linux kernel**
    (scripts/phase3-docker.sh --bench; 2000 files, stat walk):
 
-   | | writable mount (dirty -> 0 TTL) | read-only sealed (clean -> infinite TTL) |
-   |---|---|---|
-   | cold walk | 0.81 s | 0.38 s |
-   | repeat walk | 0.88 s (no gain) | **0.16 s** |
-   | read all | 0.40 s | 0.15 s (0.12 s warm) |
+   | stat walk, 2000 files | A: writable, all dirty | B: read-only, clean | C: writable over clean |
+   |---|---|---|---|
+   | cold | 0.87 s | 0.39 s | 0.42 s |
+   | repeat | 1.03 s (no gain) | **0.14 s** | **0.25 s** |
+   | read all | 0.37 s | 0.12 s | 0.18 s |
+
+   C is the case that matters in practice — a writable mount over a
+   large tree whose content is almost entirely untouched — and it
+   performs close to the read-only mount, because clean inodes keep
+   their infinite TTLs even when the mount is writable. Writability
+   costs almost nothing on the parts you did not write. That only holds
+   because the "is this inode dirty?" question, asked on every lookup,
+   is answered from memory in ~15 ns; as a SQL query it cost 24 us, more
+   than a whole Lookup.
 
    The repeat walk over DIRTY inodes gains nothing, because zero TTLs
    force every stat back to userspace — which is the correct and

@@ -104,7 +104,7 @@ type resolved struct {
 func (fs *FS) resolveLocked(ctx context.Context, parent uint64, name string) (resolved, error) {
 	var ino int64
 	var typ uint8
-	err := fs.db.QueryRow(`SELECT inode, type FROM oedge WHERE parent = ? AND name = ?`,
+	err := fs.q.QueryRow(`SELECT inode, type FROM oedge WHERE parent = ? AND name = ?`,
 		int64(parent), []byte(name)).Scan(&ino, &typ)
 	switch {
 	case err == nil:
@@ -115,7 +115,7 @@ func (fs *FS) resolveLocked(ctx context.Context, parent uint64, name string) (re
 	case !errors.Is(err, sql.ErrNoRows):
 		return resolved{}, err
 	}
-	backed, err := fs.baseBackedLocked(fs.db, parent)
+	backed, err := fs.baseBackedLocked(fs.q, parent)
 	if err != nil {
 		return resolved{}, err
 	}
@@ -136,7 +136,7 @@ func (fs *FS) resolveLocked(ctx context.Context, parent uint64, name string) (re
 // the hint from a just-done base lookup, then a base GetAttr (residency
 // replayed for detached inodes).
 func (fs *FS) attrsLocked(ctx context.Context, ino uint64, hint *Node) (Node, error) {
-	row, err := getONode(fs.db, ino)
+	row, err := getONode(fs.q, ino)
 	if err != nil {
 		return Node{}, err
 	}
@@ -181,7 +181,7 @@ func (fs *FS) Readdir(ctx context.Context, ino uint64) ([]DirEntry, error) {
 		ino uint64
 	}
 	over := make(map[string]oent)
-	rows, err := fs.db.Query(`SELECT name, inode FROM oedge WHERE parent = ?`, int64(ino))
+	rows, err := fs.q.Query(`SELECT name, inode FROM oedge WHERE parent = ?`, int64(ino))
 	if err != nil {
 		return nil, err
 	}
@@ -201,7 +201,7 @@ func (fs *FS) Readdir(ctx context.Context, ino uint64) ([]DirEntry, error) {
 	rows.Close() //nolint:errcheck
 
 	var out []DirEntry
-	backed, err := fs.baseBackedLocked(fs.db, ino)
+	backed, err := fs.baseBackedLocked(fs.q, ino)
 	if err != nil {
 		return nil, err
 	}
@@ -217,7 +217,7 @@ func (fs *FS) Readdir(ctx context.Context, ino uint64) ([]DirEntry, error) {
 			if _, shadowed := over[be.Name]; shadowed {
 				continue // whiteout or replacing oedge
 			}
-			row, err := getONode(fs.db, be.Node.Inode)
+			row, err := getONode(fs.q, be.Node.Inode)
 			if err != nil {
 				return nil, err
 			}
@@ -246,14 +246,14 @@ func (fs *FS) Readlink(ctx context.Context, ino uint64) (string, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	var target []byte
-	err := fs.db.QueryRow(`SELECT target FROM osymlink WHERE inode = ?`, int64(ino)).Scan(&target)
+	err := fs.q.QueryRow(`SELECT target FROM osymlink WHERE inode = ?`, int64(ino)).Scan(&target)
 	if err == nil {
 		return string(target), nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return "", err
 	}
-	backed, err := fs.baseBackedLocked(fs.db, ino)
+	backed, err := fs.baseBackedLocked(fs.q, ino)
 	if err != nil {
 		return "", err
 	}
@@ -286,7 +286,7 @@ func getOXattr(q querier, ino uint64, name string) ([]byte, bool, bool, error) {
 func (fs *FS) GetXattr(ctx context.Context, ino uint64, name string) ([]byte, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
-	value, tomb, found, err := getOXattr(fs.db, ino, name)
+	value, tomb, found, err := getOXattr(fs.q, ino, name)
 	if err != nil {
 		return nil, err
 	}
@@ -296,7 +296,7 @@ func (fs *FS) GetXattr(ctx context.Context, ino uint64, name string) ([]byte, er
 		}
 		return value, nil
 	}
-	backed, err := fs.baseBackedLocked(fs.db, ino)
+	backed, err := fs.baseBackedLocked(fs.q, ino)
 	if err != nil {
 		return nil, err
 	}
@@ -315,7 +315,7 @@ func (fs *FS) ListXattr(ctx context.Context, ino uint64) ([]string, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	names := make(map[string]bool) // name -> visible
-	backed, err := fs.baseBackedLocked(fs.db, ino)
+	backed, err := fs.baseBackedLocked(fs.q, ino)
 	if err != nil {
 		return nil, err
 	}
@@ -331,7 +331,7 @@ func (fs *FS) ListXattr(ctx context.Context, ino uint64) ([]string, error) {
 			names[n] = true
 		}
 	}
-	rows, err := fs.db.Query(`SELECT name, tombstone FROM oxattr WHERE inode = ?`, int64(ino))
+	rows, err := fs.q.Query(`SELECT name, tombstone FROM oxattr WHERE inode = ?`, int64(ino))
 	if err != nil {
 		return nil, err
 	}
@@ -365,7 +365,7 @@ func (fs *FS) Read(ctx context.Context, ino uint64, off int64, dst []byte) (int,
 	}
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
-	staged, err := hasContent(fs.db, ino)
+	staged, err := hasContent(fs.q, ino)
 	if err != nil {
 		return 0, err
 	}
@@ -375,7 +375,7 @@ func (fs *FS) Read(ctx context.Context, ino uint64, off int64, dst []byte) (int,
 		}
 		return fs.base.Read(ctx, ino, off, dst)
 	}
-	row, err := getONode(fs.db, ino)
+	row, err := getONode(fs.q, ino)
 	if err != nil {
 		return 0, err
 	}

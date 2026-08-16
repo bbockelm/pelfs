@@ -237,43 +237,51 @@ func cmdInit(args []string) int {
 	if err != nil {
 		return exitErr(err)
 	}
-	prefix := pos[0]
-	ctx := context.Background()
+	if err := initVolumeAt(o, pos[0], branch); err != nil {
+		return exitErr(err)
+	}
+	fmt.Printf("  mount it:    pelfs shell %s\n", pos[0])
+	return 0
+}
 
+// initVolumeAt creates a brand-new catalog-native volume: generation 0
+// with an empty root, its volume id and signing key minted locally. It
+// is what `pelfs init` runs, and what `pelfs shell` runs when it is
+// pointed at an empty prefix — a new volume is born in the current
+// format, never in v1.
+func initVolumeAt(o *cmdOpts, prefix, branch string) error {
+	ctx := context.Background()
 	stateDir := o.stateDir
 	if stateDir == "" {
 		stateDir = volDir(prefix)
 	}
 	if err := os.MkdirAll(stateDir, 0700); err != nil {
-		return exitErr(err)
+		return err
 	}
 	inner, err := pelicanobj.New(ctx, pelicanobj.Config{
 		PrefixURL: prefix, TokenPath: o.token, Insecure: o.insecure,
+		AcquireToken: !o.noAcquireToken,
 	})
 	if err != nil {
-		return exitErr(err)
+		return err
 	}
-
-	// Refuse to overwrite: a ref already here means a volume already
-	// exists, and generation 0 would orphan its whole history.
 	rstore, err := refs.New(inner, stateDir, nil)
 	if err != nil {
-		return exitErr(err)
+		return err
 	}
 	if f, err := rstore.Fetch(ctx, branch); err == nil {
-		return exitErr(fmt.Errorf("%s/%s already exists at generation %d; refusing to reinitialize",
-			refs.RefDirKey, branch, f.Superblock.Generation))
+		return fmt.Errorf("%s/%s already exists at generation %d; refusing to reinitialize",
+			refs.RefDirKey, branch, f.Superblock.Generation)
 	} else if !isNotFoundErr(err) {
-		return exitErr(fmt.Errorf("check for an existing volume: %w", err))
+		return fmt.Errorf("check for an existing volume: %w", err)
 	}
-
 	signingKey, err := loadOrCreateSigningKey(filepath.Join(stateDir, "v2-signing.key"), nil)
 	if err != nil {
-		return exitErr(err)
+		return err
 	}
 	var volID [16]byte
 	if _, err := rand.Read(volID[:]); err != nil {
-		return exitErr(err)
+		return err
 	}
 	popts := publish.Options{
 		Inner:      inner,
@@ -285,19 +293,15 @@ func cmdInit(args []string) int {
 	if o.encryptKeyPath != "" {
 		pem, err := os.ReadFile(o.encryptKeyPath)
 		if err != nil {
-			return exitErr(fmt.Errorf("read --encrypt-key: %w", err))
+			return fmt.Errorf("read --encrypt-key: %w", err)
 		}
 		if err := wireEncryption(&popts, string(pem), nil); err != nil {
-			return exitErr(err)
+			return err
 		}
 	}
-	res, err := publish.InitVolume(ctx, popts)
-	if err != nil {
-		return exitErr(err)
+	if _, err := publish.InitVolume(ctx, popts); err != nil {
+		return err
 	}
-	fmt.Printf("initialized volume %x on %s/%s (generation 0)\n", volID, refs.RefDirKey, branch)
-	fmt.Printf("  signing key: %s\n", filepath.Join(stateDir, "v2-signing.key"))
-	fmt.Printf("  mount it:    pelfs mount-gen --rw %s <mountpoint>\n", prefix)
-	_ = res
-	return 0
+	fmt.Fprintf(os.Stderr, "pelfs: created volume %x on %s/%s (generation 0)\n", volID, refs.RefDirKey, branch)
+	return nil
 }

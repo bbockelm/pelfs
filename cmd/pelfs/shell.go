@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,14 +14,20 @@ import (
 	"time"
 
 	"github.com/bbockelm/pelfs/internal/dockerrun"
+	"github.com/bbockelm/pelfs/internal/lease"
 	"github.com/bbockelm/pelfs/internal/mountfs"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
+	"github.com/bbockelm/pelfs/internal/refs"
 	"github.com/bbockelm/pelfs/internal/snapshot"
 	"github.com/bbockelm/pelfs/internal/stats"
 )
 
 func cmdShell(args []string) int {
-	o, pos, command, err := parseArgsWithCommand("shell", args, 1, 1, nil)
+	var engine, branch string
+	o, pos, command, err := parseArgsWithCommand("shell", args, 1, 1, func(fs *flag.FlagSet, o *cmdOpts) {
+		fs.StringVar(&engine, "engine", "auto", "which stack to mount with: auto (catalog-native when the volume has a published generation, else v1), native, or v1")
+		fs.StringVar(&branch, "branch", "main", "with the native engine, the branch to mount")
+	})
 	if err != nil {
 		return exitErr(err)
 	}
@@ -29,6 +36,61 @@ func cmdShell(args []string) int {
 	backend, err := resolveBackend(o)
 	if err != nil {
 		return exitErr(err)
+	}
+
+	// Engine selection. A v2 volume is served by the catalog-native stack
+	// — genfs + overlay + the raw FUSE or NFS binding, no JuiceFS — while
+	// a volume that has no published generation can only be served by v1,
+	// because there is no generation to resolve. `auto` asks the
+	// federation which kind this is; the flag forces either answer.
+	native, create := false, false
+	switch engine {
+	case "native":
+		native = true
+	case "v1":
+	case "", "auto":
+		if backend != "docker" {
+			kind, err := classifyVolume(o, prefix, branch)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "pelfs: could not classify %s (%v); using the v1 engine\n", prefix, err)
+			}
+			switch kind {
+			case volumeV2:
+				native = true
+			case volumeEmpty:
+				// A NEW volume is born catalog-native: v1 exists to serve
+				// what already exists, not to create anything more of it.
+				native, create = true, true
+			case volumeV1:
+				// An existing JuiceFS volume has no generation to resolve,
+				// so only the v1 engine can serve it. `pelfs publish`
+				// promotes it, after which this becomes a v2 volume.
+			}
+		}
+	default:
+		return exitErr(fmt.Errorf("unknown --engine %q (want auto, native, or v1)", engine))
+	}
+	if native {
+		if backend == "docker" {
+			return exitErr(errors.New("the Docker fallback runs the v1 engine; use --engine v1, or mount natively outside a container"))
+		}
+		if create {
+			if err := initVolumeAt(o, prefix, branch); err != nil {
+				return exitErr(fmt.Errorf("create volume: %w", err))
+			}
+		}
+		mountpoint, err := os.MkdirTemp("", "pelfs-mnt-*")
+		if err != nil {
+			return exitErr(err)
+		}
+		defer os.RemoveAll(mountpoint) //nolint:errcheck
+		fmt.Fprintf(os.Stderr, "pelfs: catalog-native engine (no JuiceFS); %s\n", prefix)
+		return runMountGen(o, prefix, mountpoint, command, genArgs{
+			branch:   branch,
+			rw:       !o.readOnly,
+			subshell: true,
+			backend:  backend,
+		})
 	}
 	if backend == "docker" {
 		// dockerrun appends the prefix after the forwarded flags, so there
@@ -386,4 +448,77 @@ func waitStatus(err error) int {
 	}
 	fmt.Fprintf(os.Stderr, "pelfs: wait: %v\n", err)
 	return 1
+}
+
+// volumeKind distinguishes the three things a prefix can be.
+type volumeKind int
+
+const (
+	volumeEmpty volumeKind = iota // nothing there yet
+	volumeV1                      // JuiceFS metadata snapshots, no generation
+	volumeV2                      // a published generation
+)
+
+// classifyVolume asks the federation what kind of volume a prefix holds.
+// A published ref means v2; otherwise v1 metadata under meta/ means an
+// existing JuiceFS volume; neither means the prefix is empty and a new
+// volume should be created in the current format.
+func classifyVolume(o *cmdOpts, prefix, branch string) (volumeKind, error) {
+	has, err := volumeHasGeneration(o, prefix, branch)
+	if err != nil {
+		return volumeV1, err // conservative: serve what may already exist
+	}
+	if has {
+		return volumeV2, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	inner, err := pelicanobj.New(ctx, pelicanobj.Config{
+		PrefixURL: prefix, TokenPath: o.token, Insecure: o.insecure,
+		AcquireToken: !o.noAcquireToken, DirectRead: true,
+	})
+	if err != nil {
+		return volumeV1, err
+	}
+	entries, err := inner.ListDir(ctx, snapshot.MetaDir)
+	if err != nil {
+		if isNotFoundErr(err) {
+			return volumeEmpty, nil
+		}
+		return volumeV1, err
+	}
+	// meta/ is not proof of a v1 volume: the advisory lease lives at
+	// meta/lease.json, so a writable CATALOG-NATIVE mount creates that
+	// directory too. Only a snapshot session directory means JuiceFS
+	// metadata is actually stored here.
+	for _, e := range entries {
+		if e.Name == filepath.Base(lease.Key) {
+			continue
+		}
+		return volumeV1, nil
+	}
+	return volumeEmpty, nil
+}
+
+// volumeHasGeneration reports whether the prefix already holds a
+// published v2 generation on the branch. It reads the ref through the
+// direct-read transport (the superblock is the one mutable object) and
+// treats a missing ref as "no": a v1 volume simply has none.
+func volumeHasGeneration(o *cmdOpts, prefix, branch string) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	inner, err := pelicanobj.New(ctx, pelicanobj.Config{
+		PrefixURL: prefix, TokenPath: o.token, Insecure: o.insecure,
+		AcquireToken: !o.noAcquireToken, DirectRead: true,
+	})
+	if err != nil {
+		return false, err
+	}
+	if _, err := inner.StatKey(ctx, refs.RefDirKey+"/"+branch); err != nil {
+		if isNotFoundErr(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }

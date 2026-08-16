@@ -105,32 +105,44 @@ func (s countedStore) StatKey(ctx context.Context, key string) (*pelicanobj.KeyI
 // phase-3 stack — genfs + the raw FUSE binding, no JuiceFS anywhere.
 // Linux/macFUSE only for --backend fuse; --backend nfs works anywhere the
 // OS has an NFS client. Experimental.
+// genArgs are the catalog-native mount knobs. `pelfs shell` fills them
+// in too, so the primary workflow runs on exactly this path rather than
+// a parallel copy of it.
+type genArgs struct {
+	branch, tag, pubkeyHex  string
+	rw, noSeal, subshell    bool
+	signingKeyPath, backend string
+	poll                    time.Duration
+}
+
 func cmdMountGen(args []string) int {
-	var branch, tag, pubkeyHex string
-	var rw, noSeal bool
-	var signingKeyPath, backend string
-	var subshell bool
-	var poll time.Duration
+	a := genArgs{branch: "main", backend: "fuse"}
 	o, pos, command, err := parseArgsWithCommand("mount-gen", args, 2, 2, func(fs *flag.FlagSet, o *cmdOpts) {
-		fs.StringVar(&branch, "branch", "main", "branch to mount")
-		fs.StringVar(&tag, "tag", "", "mount a tag instead of a branch head (pinned exactly)")
-		fs.StringVar(&pubkeyHex, "volume-pubkey", "", "hex Ed25519 volume key to trust (default: pin on first use)")
-		fs.BoolVar(&rw, "rw", false, "mount read-write through a local overlay; unmount SEALS the changes into the next generation")
-		fs.BoolVar(&noSeal, "no-seal", false, "with --rw, keep the overlay at unmount instead of publishing it (resume by remounting)")
-		fs.BoolVar(&subshell, "subshell", false, "run a subshell in the mount and unmount (sealing, with --rw) when it exits — the `pelfs shell` workflow on the catalog-native stack; a trailing `-- command [args...]` runs that instead of a shell and implies this flag")
-		fs.StringVar(&backend, "backend", "fuse", "how to attach: fuse (Linux/macFUSE) or nfs (loopback NFS server + the OS client; works on macOS with no kext)")
-		fs.DurationVar(&poll, "poll", 0, "read-only: re-check the branch head this often and swap generations live (0 = pinned, the reproducible-batch default)")
-		fs.StringVar(&signingKeyPath, "signing-key", "", "hex Ed25519 volume signing key file to seal with (default: <state-dir>/v2-signing.key; a volume's key is per-VOLUME, so a second machine must import it)")
+		fs.StringVar(&a.branch, "branch", "main", "branch to mount")
+		fs.StringVar(&a.tag, "tag", "", "mount a tag instead of a branch head (pinned exactly)")
+		fs.StringVar(&a.pubkeyHex, "volume-pubkey", "", "hex Ed25519 volume key to trust (default: pin on first use)")
+		fs.BoolVar(&a.rw, "rw", false, "mount read-write through a local overlay; unmount SEALS the changes into the next generation")
+		fs.BoolVar(&a.noSeal, "no-seal", false, "with --rw, keep the overlay at unmount instead of publishing it (resume by remounting)")
+		fs.BoolVar(&a.subshell, "subshell", false, "run a subshell in the mount and unmount (sealing, with --rw) when it exits; a trailing `-- command [args...]` runs that instead of a shell and implies this flag")
+		fs.StringVar(&a.backend, "backend", "fuse", "how to attach: fuse (Linux/macFUSE) or nfs (loopback NFS server + the OS client; works on macOS with no kext)")
+		fs.DurationVar(&a.poll, "poll", 0, "read-only: re-check the branch head this often and swap generations live (0 = pinned, the reproducible-batch default)")
+		fs.StringVar(&a.signingKeyPath, "signing-key", "", "hex Ed25519 volume signing key file to seal with (default: <state-dir>/v2-signing.key; a volume's key is per-VOLUME, so a second machine must import it)")
 	})
 	if err != nil {
 		return exitErr(err)
 	}
-	prefix, mountpoint := pos[0], pos[1]
-	// A `-- command` tail is the non-interactive form of --subshell: run it
-	// in the mount, then unmount and seal exactly as an exiting shell does.
 	if len(command) > 0 {
-		subshell = true
+		a.subshell = true
 	}
+	return runMountGen(o, pos[0], pos[1], command, a)
+}
+
+// runMountGen serves one generation. Reached from `pelfs mount-gen` and,
+// for a v2 volume, from `pelfs shell`.
+func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genArgs) int {
+	branch, tag, pubkeyHex := a.branch, a.tag, a.pubkeyHex
+	rw, noSeal, subshell := a.rw, a.noSeal, a.subshell
+	signingKeyPath, backend, poll := a.signingKeyPath, a.backend, a.poll
 	ctx := context.Background()
 
 	stateDir := o.stateDir

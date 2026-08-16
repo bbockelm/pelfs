@@ -241,6 +241,56 @@ echo "Ctrl+C verified: payload interrupted (130), pelfs completed its teardown"
 MOUNT_PID=$!
 for _ in $(seq 200); do [ -e "$WORK/mnt/cmd-made.txt" ] && break; sleep 0.1; done
 
+echo "== pelfs shell on an EMPTY prefix creates a v2 volume =="
+"$WORK/fakeorigin" -listen 127.0.0.1:18998 -root "$WORK/origin2" &
+ORIGIN2_PID=$!
+mkdir -p "$WORK/origin2"
+for _ in $(seq 50); do curl -fsS "http://127.0.0.1:18998/" >/dev/null 2>&1 && break; sleep 0.1; done
+NEWPREFIX="http://127.0.0.1:18998/fresh"
+"$WORK/pelfs" shell --state-dir "$WORK/state-fresh" "$NEWPREFIX" -- \
+  sh -c 'echo hello > greeting.txt; mkdir -p sub' > "$WORK/fresh.log" 2>&1
+fresh_status=$?
+[ "$fresh_status" = "0" ] || { echo "shell on empty prefix failed ($fresh_status):" >&2; sed 's/^/    /' "$WORK/fresh.log" | tail -8; exit 1; }
+grep -q "created volume" "$WORK/fresh.log" || { echo "shell did not CREATE a volume:" >&2; sed 's/^/    /' "$WORK/fresh.log" | tail -8; exit 1; }
+grep -q "catalog-native engine" "$WORK/fresh.log" || { echo "new volume was not native:" >&2; sed 's/^/    /' "$WORK/fresh.log" | tail -8; exit 1; }
+# The federation must hold a v2 volume: refs + packs, and NO JuiceFS meta/.
+[ -f "$WORK/origin2/fresh/refs/main" ] || { echo "no v2 ref created" >&2; ls -R "$WORK/origin2" | head; exit 1; }
+# meta/ may exist for the advisory lease (meta/lease.json); what must
+# NOT exist is a JuiceFS snapshot session directory.
+if [ -d "$WORK/origin2/fresh/meta" ]; then
+  extra=$(ls -A "$WORK/origin2/fresh/meta" | grep -v '^lease.json$' || true)
+  [ -z "$extra" ] || { echo "JuiceFS metadata appeared in a v2 volume: $extra" >&2; exit 1; }
+fi
+"$WORK/pelfs" mount-gen --state-dir "$WORK/state-fresh2" "$NEWPREFIX" "$WORK/mnt2" &
+FRESH_PID=$!
+mkdir -p "$WORK/mnt2"
+for _ in $(seq 200); do [ -e "$WORK/mnt2/greeting.txt" ] && break; sleep 0.1; done
+grep -q hello "$WORK/mnt2/greeting.txt" || { echo "fresh-volume write did not survive" >&2; exit 1; }
+unmount_at "$WORK/mnt2"; wait "$FRESH_PID" 2>/dev/null || true
+kill "$ORIGIN2_PID" 2>/dev/null || true
+echo "empty-prefix verified: v2 volume created, native engine, content sealed and re-readable"
+
+echo "== pelfs shell runs the catalog-native engine on a v2 volume =="
+unmount_at "$WORK/mnt"
+wait "$MOUNT_PID" 2>/dev/null || true
+"$WORK/pelfs" shell --state-dir "$WORK/state" "$PREFIX" -- \
+  sh -c 'echo "written by pelfs shell" > from-shell.txt; ls dir/big.bin >/dev/null' \
+  > "$WORK/shell-native.log" 2>&1
+shell_status=$?
+[ "$shell_status" = "0" ] || { echo "pelfs shell failed ($shell_status):" >&2; sed 's/^/    /' "$WORK/shell-native.log" | tail -8; exit 1; }
+grep -q "catalog-native engine" "$WORK/shell-native.log" || {
+  echo "pelfs shell did NOT select the catalog-native engine:" >&2
+  sed 's/^/    /' "$WORK/shell-native.log" | tail -8; exit 1; }
+grep -q "sealed generation" "$WORK/shell-native.log" || {
+  echo "pelfs shell did not seal on exit:" >&2; sed 's/^/    /' "$WORK/shell-native.log" | tail -8; exit 1; }
+
+# The write must be in the next generation, readable by a fresh mount.
+"$WORK/pelfs" mount-gen --state-dir "$WORK/state11" "$PREFIX" "$WORK/mnt" &
+MOUNT_PID=$!
+for _ in $(seq 200); do [ -e "$WORK/mnt/from-shell.txt" ] && break; sleep 0.1; done
+grep -q "written by pelfs shell" "$WORK/mnt/from-shell.txt" || { echo "shell write did not survive the seal" >&2; exit 1; }
+echo "pelfs shell verified: native engine, sealed on exit, write survives"
+
 echo "== strict prefetch: everything local before serving =="
 unmount_at "$WORK/mnt"
 wait "$MOUNT_PID" 2>/dev/null || true

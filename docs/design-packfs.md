@@ -320,11 +320,9 @@ list makes the sweep set arithmetic rather than tree traversal:
 - **First-mount trust**, in order of preference: an explicit
   `--volume-pubkey` (or fingerprint embedded in a shared tag reference);
   else trust-on-first-use with the key pinned in local state and loud
-  errors on change (the SSH model). The eventual right answer is
-  federation-issued: Pelican's registry already binds namespaces to
-  issuer keys, and registering the volume public key the same way would
-  give readers a trust root without out-of-band exchange — flagged as a
-  Pelican-integration item, not designed here.
+  errors on change (the SSH model). Registry-issued attestation was
+  considered and is explicitly out: pelfs stays a pure client of dumb
+  federation storage, with no registry integration.
 - **Rotation:** a superblock may introduce a successor public key, signed
   by the current key; readers follow the custody chain through lineage.
   Compromise recovery is out-of-band re-pinning (custody chains cannot
@@ -869,7 +867,7 @@ remount; live generation swap arrives with phase 3.
 | GC = set arithmetic on retained generations' pack lists | mark-sweep over catalog trees | pack lists ARE the closure at pack granularity; no walk, no marking state |
 | T_grace age guard makes GC lock-free | GC/writer/fork coordination via lease | new packs are always younger than the guard; fork sources are already retained |
 | separate Ed25519 signing key per volume | sign with the KEK | verification is public, decryption is not; unencrypted volumes still need authenticity |
-| TOFU + pinning for first-mount trust | mandatory pre-shared pubkey | SSH model works; registry attestation is the eventual upgrade, not a blocker |
+| TOFU + pinning for first-mount trust | mandatory pre-shared pubkey; registry attestation | SSH model works; pelfs stays a pure client, no registry integration (owner's call) |
 | time-ordered pack names, trailer hash in pack list | content-hash pack names | age guard + ordering come free; the list-recorded hash gives verification anyway |
 | no atime in catalogs | persisted atime | reads must never dirty metadata on a publish-what-changed filesystem |
 | migration = drain v1 read-only into fresh v2 prefix | in-place format conversion | dual-format readers forever, for volumes that are by charter scratch |
@@ -893,9 +891,6 @@ and the migration decision (drain-and-copy, never in-place).
 Deliberately deferred, not open — these need external partners or
 production mileage, not more design:
 
-- **Registry-issued volume-key attestation** (signing section): binding
-  the volume public key in Pelican's namespace registry, with the
-  registry/director team.
 - **POSIX ACLs** (schema section): out of scope for v2.0; xattrs carry
   them opaquely if a frontend ever needs them.
 - **`pelfs rescue` implementation.** Fully specified by the

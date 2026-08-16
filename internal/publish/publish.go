@@ -91,6 +91,11 @@ type Options struct {
 	// is then required — the overlay sits over exactly that generation,
 	// which is where the volume identity comes from. See Seal.
 	Overlay *overlay.FS
+	// OverlaySnapshot seals a frozen view instead of the live overlay.
+	// A checkpoint uses this so the published generation corresponds to
+	// an instant, which is the precondition for rebasing inodes back to
+	// clean afterwards. Mutually exclusive with Overlay.
+	OverlaySnapshot *overlay.Snapshot
 	// Blob is the session's data store, for reading file content the cut
 	// references. Unused by the overlay source.
 	Blob object.ObjectStorage
@@ -170,7 +175,7 @@ type Result struct {
 // metadata to publish. Options.Overlay and Options.Prev are required;
 // everything downstream of the walk is the ordinary pipeline.
 func Seal(ctx context.Context, o Options) (*Result, error) {
-	if o.Overlay == nil {
+	if o.Overlay == nil && o.OverlaySnapshot == nil {
 		return nil, errors.New("publish: Seal requires Options.Overlay")
 	}
 	return Publish(ctx, o)
@@ -288,6 +293,9 @@ func openSource(o Options) (Source, string, func(), error) {
 	if o.emptySource {
 		return &emptyRoot{nextInode: 2}, formatVolumeID(o.VolumeID), func() {}, nil
 	}
+	if o.OverlaySnapshot != nil {
+		return &overlaySource{fs: o.OverlaySnapshot}, formatVolumeID(o.Prev.VolumeID), func() {}, nil
+	}
 	if o.Overlay != nil {
 		return &overlaySource{fs: o.Overlay}, formatVolumeID(o.Prev.VolumeID), func() {}, nil
 	}
@@ -303,11 +311,13 @@ func applyDefaults(o *Options) error {
 	switch {
 	case o.emptySource:
 		// InitVolume supplies the tree itself.
-	case o.CutPath == "" && o.Overlay == nil:
-		return errors.New("publish: CutPath or Overlay is required")
-	case o.CutPath != "" && o.Overlay != nil:
-		return errors.New("publish: CutPath and Overlay are mutually exclusive")
-	case o.Overlay != nil && o.Prev == nil:
+	case o.CutPath == "" && o.Overlay == nil && o.OverlaySnapshot == nil:
+		return errors.New("publish: CutPath, Overlay, or OverlaySnapshot is required")
+	case o.CutPath != "" && (o.Overlay != nil || o.OverlaySnapshot != nil):
+		return errors.New("publish: CutPath and an overlay source are mutually exclusive")
+	case o.Overlay != nil && o.OverlaySnapshot != nil:
+		return errors.New("publish: Overlay and OverlaySnapshot are mutually exclusive")
+	case (o.Overlay != nil || o.OverlaySnapshot != nil) && o.Prev == nil:
 		// An overlay always shadows a base generation; that generation is
 		// the only place the volume identity and lineage come from.
 		return errors.New("publish: sealing an overlay requires Prev (its base generation)")

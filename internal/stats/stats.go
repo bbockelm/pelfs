@@ -98,6 +98,7 @@ type Summary struct {
 	// (control-socket checkpoints plus the one at unmount); the Sealed*
 	// fields describe the last of them. SealOK is nil when the session
 	// never needed to seal — read-only, --no-seal, or nothing changed.
+	RebasedClean     int64  `json:"rebased_clean,omitempty"`
 	Seals            int64  `json:"seals,omitempty"`
 	SealedGeneration uint64 `json:"sealed_generation,omitempty"`
 	SealedChunks     int64  `json:"sealed_chunks,omitempty"`

@@ -604,19 +604,36 @@ func (g *genSession) sealLocked(ctx context.Context) (*publish.Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Seal a FROZEN view, not the live overlay. A snapshot makes the
+	// published generation correspond to an instant, which is the
+	// precondition for handing those inodes back to the kernel as clean
+	// afterwards: without it a write landing mid-walk could be published
+	// half-observed, and an infinite TTL on that value would make the
+	// mismatch permanent.
+	snapDir, err := os.MkdirTemp(g.stateDir, "snapshot-*")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(snapDir) //nolint:errcheck
+	snap, err := g.ov.Snapshot(snapDir)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot the overlay: %w", err)
+	}
+	defer snap.Close() //nolint:errcheck
+
 	res, err := publish.Seal(ctx, publish.Options{
-		Overlay:        g.ov,
-		Inner:          g.inner,
-		SpoolDir:       g.stateDir,
-		Branch:         g.branch,
-		SigningKey:     signingKey,
-		Prev:           g.sb,
-		PrevRaw:        g.prevRaw,
-		DEK:            g.dek,
-		IdentityKey:    g.identityKey,
-		KeyID:          g.keyID,
-		KeyTable:       g.sb.KeyTable,
-		DedupIndexPath: filepath.Join(g.stateDir, "v2-dedup.db"),
+		OverlaySnapshot: snap,
+		Inner:           g.inner,
+		SpoolDir:        g.stateDir,
+		Branch:          g.branch,
+		SigningKey:      signingKey,
+		Prev:            g.sb,
+		PrevRaw:         g.prevRaw,
+		DEK:             g.dek,
+		IdentityKey:     g.identityKey,
+		KeyID:           g.keyID,
+		KeyTable:        g.sb.KeyTable,
+		DedupIndexPath:  filepath.Join(g.stateDir, "v2-dedup.db"),
 	})
 	if err != nil {
 		return nil, err
@@ -625,6 +642,31 @@ func (g *genSession) sealLocked(ctx context.Context) (*publish.Result, error) {
 	// lineage hash and its compare-and-swap against refs/<branch> both
 	// grow from what was just published, not from where the mount started.
 	g.sb, g.prevRaw = res.Superblock, res.Raw
+
+	// Return the published inodes to CLEAN so the kernel can cache them
+	// again. Order is dictated by the overlay: the base must already
+	// serve the sealed generation before its rows may be dropped, or the
+	// merged view would silently regress to the old base — Rebase
+	// refuses otherwise. Only inodes provably unmodified since the
+	// snapshot go clean; anything written during the seal stays dirty.
+	//
+	// A failure here costs performance, never correctness: the session
+	// simply keeps paying zero TTLs for state that is already durable.
+	if _, err := g.gfs.Swap(ctx, res.Superblock); err != nil {
+		fmt.Fprintf(os.Stderr, "pelfs: sealed generation %d, but the mount could not follow it (%v); inodes stay dirty\n",
+			res.Superblock.Generation, err)
+	} else if rep, err := g.ov.Rebase(ctx, snap.Seq(), overlay.Options{
+		BaseRoot:       res.Superblock.RootCatalog,
+		BaseGeneration: res.Superblock.Generation,
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "pelfs: sealed generation %d, but rebase failed (%v); inodes stay dirty\n",
+			res.Superblock.Generation, err)
+	} else {
+		fmt.Fprintf(os.Stderr, "pelfs: %d inode(s) returned to clean; %d still dirty\n",
+			len(rep.Clean), rep.Dirty)
+		g.stats.Update(func(sum *stats.Summary) { sum.RebasedClean += int64(len(rep.Clean)) })
+	}
+
 	g.stats.Update(func(sum *stats.Summary) {
 		sum.Seals++
 		sum.SealedGeneration = res.Superblock.Generation

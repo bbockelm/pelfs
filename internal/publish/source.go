@@ -189,11 +189,28 @@ func catTypeFromMeta(t uint8) (uint8, error) {
 // descent that reached it, and overlay.Readdir returns base entries
 // WITHOUT establishing residency for them. Every entry is therefore
 // re-resolved through Lookup before its inode is used for anything else.
-type overlaySource struct {
-	fs *overlay.FS
+// overlayView is the read surface a seal walks. Both *overlay.FS and
+// *overlay.Snapshot satisfy it, so a checkpoint can seal a FROZEN view
+// while the mount keeps taking writes — which is what makes rebasing
+// inodes back to clean safe (the published generation then corresponds
+// to an instant, not to whatever the walk happened to observe).
+type overlayView interface {
+	RootInode() uint64
+	NextInode() (uint64, error)
+	Lookup(ctx context.Context, parent uint64, name string) (overlay.Node, error)
+	GetAttr(ctx context.Context, ino uint64) (overlay.Node, error)
+	Readdir(ctx context.Context, ino uint64) ([]overlay.DirEntry, error)
+	Readlink(ctx context.Context, ino uint64) (string, error)
+	AllXattrs(ctx context.Context, ino uint64) (map[string][]byte, error)
+	Read(ctx context.Context, ino uint64, off int64, dst []byte) (int, error)
+	OpenFile(ctx context.Context, ino uint64, length int64) (io.ReadCloser, error)
 }
 
-func (s *overlaySource) Root() uint64 { return overlay.RootInode }
+type overlaySource struct {
+	fs overlayView
+}
+
+func (s *overlaySource) Root() uint64 { return s.fs.RootInode() }
 
 // NextInode reads the overlay's PERSISTED counter, which includes
 // numbers burned by inodes created and then deleted in this session — a
@@ -240,7 +257,9 @@ func (s *overlaySource) Xattrs(ctx context.Context, ino uint64) (map[string][]by
 	return s.fs.AllXattrs(ctx, ino)
 }
 func (s *overlaySource) Open(ctx context.Context, ino uint64, length int64) (io.ReadCloser, error) {
-	return &overlayReader{ctx: ctx, fs: s.fs, ino: ino, end: length}, nil
+	// Both the live overlay and a snapshot stream content themselves;
+	// this used to hand-roll positional reads.
+	return s.fs.OpenFile(ctx, ino, length)
 }
 
 func srcNodeFromOverlay(n overlay.Node) SrcNode {
@@ -260,30 +279,3 @@ func srcNodeFromOverlay(n overlay.Node) SrcNode {
 
 // overlayReader turns the overlay's positional Read into the sequential
 // stream the chunker consumes, bounded by the node's recorded length.
-type overlayReader struct {
-	ctx context.Context
-	fs  *overlay.FS
-	ino uint64
-	off int64
-	end int64
-}
-
-func (r *overlayReader) Read(p []byte) (int, error) {
-	if r.off >= r.end {
-		return 0, io.EOF
-	}
-	if int64(len(p)) > r.end-r.off {
-		p = p[:r.end-r.off]
-	}
-	n, err := r.fs.Read(r.ctx, r.ino, r.off, p)
-	if err != nil {
-		return 0, err
-	}
-	if n == 0 {
-		return 0, fmt.Errorf("publish: inode %d read 0 bytes at offset %d of %d", r.ino, r.off, r.end)
-	}
-	r.off += int64(n)
-	return n, nil
-}
-
-func (r *overlayReader) Close() error { return nil }

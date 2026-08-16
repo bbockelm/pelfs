@@ -119,6 +119,10 @@ type Options struct {
 	SMax int64
 	// CreatedUnixNano stamps the superblock; zero reads the clock.
 	CreatedUnixNano int64
+	// DedupIndexPath is the local cross-generation dedup sidecar (see
+	// dedup.go); empty disables it. Missing/stale/foreign indexes are
+	// ignored — re-uploads are harmless duplicates.
+	DedupIndexPath string
 }
 
 // Stats summarizes one publish.
@@ -127,6 +131,7 @@ type Stats struct {
 	InlineFiles, ChunkedFiles       int
 	PromotedInodes                  int
 	ChunksAdded, ChunksDeduped      int
+	DedupIndexChunks                int // identities preloaded from the sidecar
 	ChunkBytes                      int64
 	Catalogs, Shards                int
 }
@@ -194,6 +199,9 @@ func Publish(ctx context.Context, o Options) (*Result, error) {
 	if err := p.walk(ctx); err != nil {
 		return nil, err
 	}
+	if err := p.loadDedupIndex(); err != nil {
+		return nil, err
+	}
 	if err := p.transform(ctx); err != nil {
 		return nil, err
 	}
@@ -231,6 +239,11 @@ func Publish(ctx context.Context, o Options) (*Result, error) {
 	}
 	if err := flip(ctx, o, raw); err != nil {
 		return nil, err
+	}
+	// The flip already happened: a sidecar write failure must not fail
+	// the publish (the next run just re-uploads some chunks).
+	if err := p.saveDedupIndex(sb.Generation); err != nil {
+		fmt.Fprintf(os.Stderr, "pelfs: publish: dedup index not saved: %v\n", err)
 	}
 	return &Result{Superblock: sb, Raw: raw, NewPacks: newPacks, Stats: p.stats}, nil
 }
@@ -296,8 +309,10 @@ type rec struct {
 }
 
 type chunkInfo struct {
-	clen int64
-	alg  uint8
+	clen  int64
+	alg   uint8
+	keyID int64 // the key the STORED bytes were encrypted under — a
+	// chunk deduped across a DEK rotation keeps its original key id
 }
 
 type pipeline struct {
@@ -442,7 +457,7 @@ func (p *pipeline) chunkFile(ctx context.Context, ino, length uint64) ([]catalog
 			if err := p.pk.add(ctx, id.Hex(), packstore.EntryData, stored); err != nil {
 				return nil, fmt.Errorf("publish: pack chunk of inode %d: %w", ino, err)
 			}
-			info = chunkInfo{clen: int64(len(stored)), alg: alg}
+			info = chunkInfo{clen: int64(len(stored)), alg: alg, keyID: p.keyID()}
 			p.chunkSeen[id] = info
 			p.stats.ChunksAdded++
 			p.stats.ChunkBytes += int64(len(c.Data))
@@ -454,7 +469,7 @@ func (p *pipeline) chunkFile(ctx context.Context, ino, length uint64) ([]catalog
 			LLen:     int64(len(c.Data)),
 			CLen:     info.clen,
 			Alg:      int64(info.alg),
-			KeyID:    p.keyID(),
+			KeyID:    info.keyID,
 		})
 		total += uint64(len(c.Data))
 	}

@@ -765,3 +765,86 @@ func equalStrings(a, b []string) bool {
 // publishRootInode mirrors cutdb.RootInode for readability at call sites
 // that pass it as both uint64 and int64.
 const publishRootInode = 1
+
+func TestCrossGenerationDedupIndex(t *testing.T) {
+	ctx := context.Background()
+	inner := newInner(t)
+	v := newTestVolume(t, "99998888-7777-6666-5555-444433332222")
+
+	// A chunked (multi-MiB) file that stays identical across generations,
+	// and a small file that changes.
+	bigContent := pseudorandom(3<<20, 77)
+	dirIno := v.mkdir(publishRootInode, "d")
+	bigIno := v.create(dirIno, "big.bin")
+	v.write(bigIno, bigContent)
+	smallIno := v.create(dirIno, "small.txt")
+	v.write(smallIno, []byte("v1"))
+	cut1 := v.cut()
+
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index := filepath.Join(t.TempDir(), "dedup.db")
+	opts := publish.Options{
+		Blob:           v.blob,
+		Inner:          inner,
+		SigningKey:     priv,
+		DedupIndexPath: index,
+	}
+	opts.CutPath, opts.CacheDir, opts.SpoolDir = cut1, t.TempDir(), t.TempDir()
+	res1, err := publish.Publish(ctx, opts)
+	if err != nil {
+		t.Fatalf("first Publish: %v", err)
+	}
+	if res1.Stats.ChunksAdded == 0 {
+		t.Fatal("first publish added no chunks")
+	}
+
+	// Change only the small (inline) file; the big file's chunks must be
+	// satisfied from the dedup index — zero chunk uploads.
+	v.write(smallIno, []byte("v2 - changed"))
+	cut2 := v.cut()
+	opts.CutPath, opts.CacheDir, opts.SpoolDir = cut2, t.TempDir(), t.TempDir()
+	opts.Prev, opts.PrevRaw = res1.Superblock, res1.Raw
+	res2, err := publish.Publish(ctx, opts)
+	if err != nil {
+		t.Fatalf("second Publish: %v", err)
+	}
+	if res2.Stats.DedupIndexChunks != res1.Stats.ChunksAdded {
+		t.Fatalf("index preloaded %d chunks, want %d", res2.Stats.DedupIndexChunks, res1.Stats.ChunksAdded)
+	}
+	if res2.Stats.ChunksAdded != 0 {
+		t.Fatalf("second publish re-added %d chunks despite the index", res2.Stats.ChunksAdded)
+	}
+	if res2.Stats.ChunksDeduped != res1.Stats.ChunksAdded {
+		t.Fatalf("deduped %d, want %d", res2.Stats.ChunksDeduped, res1.Stats.ChunksAdded)
+	}
+
+	// The deduped references must still resolve: read big.bin back from
+	// generation 1's catalogs through real pack reads.
+	env := newReadEnv(t, inner, nil, nil)
+	root := env.openCatalog(res2.Superblock.RootCatalog[:])
+	lr, err := root.Lookup(publishRootInode, []byte("d"))
+	if err != nil || lr.Dirent == nil {
+		t.Fatalf("lookup d: %+v err=%v", lr, err)
+	}
+	if got := env.readChunks(root, int64(bigIno)); !bytes.Equal(got, bigContent) {
+		t.Fatalf("deduped big.bin content mismatch (%d bytes)", len(got))
+	}
+
+	// A THIRD publish built on gen 0 metadata (stale index generation)
+	// must ignore the index rather than trust it.
+	v.write(smallIno, []byte("v3"))
+	cut3 := v.cut()
+	opts.CutPath, opts.CacheDir, opts.SpoolDir = cut3, t.TempDir(), t.TempDir()
+	opts.Prev, opts.PrevRaw = res1.Superblock, res1.Raw // stale: index is stamped for gen 1
+	res3, err := publish.Publish(ctx, opts)
+	if err == nil {
+		// The flip guard may reject this stale publish outright (the ref
+		// moved); if it somehow proceeds, the index must NOT have been used.
+		if res3.Stats.DedupIndexChunks != 0 {
+			t.Fatalf("stale index was trusted: %d preloaded chunks", res3.Stats.DedupIndexChunks)
+		}
+	}
+}

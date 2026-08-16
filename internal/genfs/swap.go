@@ -157,6 +157,7 @@ func (fs *FS) Swap(ctx context.Context, sb *superblock.Superblock) (*SwapReport,
 	fs.sb = sb
 	fs.packIndex = newIndex
 	fs.res = make(map[uint64]*residency, len(order))
+	fs.resLRU.Init()
 	fs.mu.Unlock()
 	fs.ext.clear()
 

@@ -19,6 +19,7 @@
 package genfs
 
 import (
+	"container/list"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -71,6 +72,15 @@ type Options struct {
 	// MaxOpenCatalogs caps the LRU of open catalog handles (default 64).
 	// The pinned root catalog does not count against it.
 	MaxOpenCatalogs int
+	// MaxResident bounds the residency map, evicting least-recently-used
+	// entries past the cap. Zero means unbounded, which is correct for a
+	// FUSE binding: there the kernel owns the lifetime and tells us via
+	// FORGET, so evicting behind its back would answer ESTALE for an
+	// inode it still holds. Set it only for a PATH-based frontend (the
+	// NFS adapter), which re-descends from the root on every operation
+	// and therefore cannot be hurt by eviction — without it, residency
+	// grows for the life of a long-running mount over a large tree.
+	MaxResident int
 }
 
 // Node is one inode's attributes: catalog.Node with a kernel-shaped uint64
@@ -121,6 +131,9 @@ type residency struct {
 	// inode in the new generation (catalog identities change; inodes do
 	// not).
 	name string
+	// elem is this inode's position in the eviction order, when the
+	// residency map is bounded (MaxResident).
+	elem *list.Element
 }
 
 // FS serves one verified generation read-only. Safe for concurrent use.
@@ -143,6 +156,10 @@ type FS struct {
 
 	mu  sync.RWMutex
 	res map[uint64]*residency
+	// resLRU orders residency for eviction when maxResident is set;
+	// front is most recently used.
+	resLRU      *list.List
+	maxResident int
 
 	fillMu sync.Mutex
 	fills  map[string]*fillGate
@@ -172,15 +189,17 @@ func Open(ctx context.Context, o Options) (*FS, error) {
 		}
 	}
 	fs := &FS{
-		inner:     o.Inner,
-		sb:        o.SB,
-		dek:       o.DEK,
-		chunkDir:  chunkDir,
-		catDir:    catDir,
-		packIndex: make(map[string]packLoc),
-		ext:       newExtentCache(extentCacheCap),
-		res:       make(map[uint64]*residency),
-		fills:     make(map[string]*fillGate),
+		inner:       o.Inner,
+		sb:          o.SB,
+		dek:         o.DEK,
+		chunkDir:    chunkDir,
+		catDir:      catDir,
+		packIndex:   make(map[string]packLoc),
+		ext:         newExtentCache(extentCacheCap),
+		res:         make(map[uint64]*residency),
+		resLRU:      list.New(),
+		maxResident: o.MaxResident,
+		fills:       make(map[string]*fillGate),
 	}
 	// Identity index: every trailer in the generation's pack list, built
 	// once, and no trailer's entries trusted until the stored bytes hash
@@ -261,12 +280,32 @@ func (fs *FS) retain(ino uint64, catHex string, parent uint64, name string) {
 	}
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	// Touch the parent: descending through a directory means it is in
+	// active use, and evicting an ancestor would break the very descent
+	// that residency exists to serve.
+	if pr := fs.res[parent]; pr != nil && pr.elem != nil {
+		fs.resLRU.MoveToFront(pr.elem)
+	}
 	if r := fs.res[ino]; r != nil {
 		r.nlookup++
 		r.parent, r.name = parent, name
+		if r.elem != nil {
+			fs.resLRU.MoveToFront(r.elem)
+		}
 		return
 	}
-	fs.res[ino] = &residency{cat: catHex, nlookup: 1, parent: parent, name: name}
+	r := &residency{cat: catHex, nlookup: 1, parent: parent, name: name}
+	fs.res[ino] = r
+	if fs.maxResident > 0 {
+		r.elem = fs.resLRU.PushFront(ino)
+		for fs.resLRU.Len() > fs.maxResident {
+			back := fs.resLRU.Back()
+			evict := back.Value.(uint64)
+			fs.resLRU.Remove(back)
+			delete(fs.res, evict)
+			fs.ext.drop(evict)
+		}
+	}
 }
 
 // Lookup resolves name under parent, records the child's residency, and
@@ -489,6 +528,9 @@ func (fs *FS) Forget(ino uint64, nlookup uint64) {
 	dropped := false
 	if r := fs.res[ino]; r != nil {
 		if r.nlookup <= nlookup {
+			if r.elem != nil {
+				fs.resLRU.Remove(r.elem)
+			}
 			delete(fs.res, ino)
 			dropped = true
 		} else {

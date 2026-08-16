@@ -119,11 +119,19 @@ func cmdMountGen(args []string) int {
 		}
 	}
 
+	// A path-based frontend re-descends from the root on every operation,
+	// so its residency can be bounded; a FUSE binding's cannot, because
+	// the kernel owns those lifetimes and tells us when to drop them.
+	maxResident := 0
+	if backend == "nfs" {
+		maxResident = 100000
+	}
 	gfs, err := genfs.Open(ctx, genfs.Options{
-		Inner:    inner,
-		SB:       sb,
-		DEK:      dek,
-		CacheDir: filepath.Join(stateDir, "gencache"),
+		Inner:       inner,
+		SB:          sb,
+		DEK:         dek,
+		CacheDir:    filepath.Join(stateDir, "gencache"),
+		MaxResident: maxResident,
 	})
 	if err != nil {
 		return exitErr(err)

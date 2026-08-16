@@ -875,3 +875,61 @@ func TestGenerationSwap(t *testing.T) {
 		t.Fatalf("idempotent swap reported %+v (%v)", rep2, err)
 	}
 }
+
+// MaxResident bounds residency for path-based frontends, which
+// re-descend on every operation. A FUSE binding must NOT set it: the
+// kernel owns those lifetimes.
+func TestBoundedResidency(t *testing.T) {
+	ctx := context.Background()
+	inner, _ := newInner(t)
+	v := newTestVolume(t, "b0bdb0bd-0000-4000-8000-000000000042")
+	dir := v.mkdir(1, "d")
+	var inos []uint64
+	for i := 0; i < 20; i++ {
+		ino := v.create(dir, fmt.Sprintf("f%02d.txt", i))
+		v.write(ino, []byte("x"))
+		inos = append(inos, ino)
+	}
+	res := publishVolume(t, v, inner, publish.Options{})
+	fs := openFS(t, inner, res.Superblock, genfs.Options{MaxResident: 8})
+
+	dirNode, err := fs.Lookup(ctx, genfs.RootInode, "d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range inos {
+		if _, err := fs.Lookup(ctx, dirNode.Inode, fmt.Sprintf("f%02d.txt", i)); err != nil {
+			t.Fatalf("lookup %d: %v", i, err)
+		}
+	}
+	// The earliest entries were evicted; the most recent survive.
+	if _, err := fs.GetAttr(ctx, inos[0]); !errors.Is(err, genfs.ErrStale) {
+		t.Fatalf("oldest inode still resident under a cap of 8: %v", err)
+	}
+	if _, err := fs.GetAttr(ctx, inos[len(inos)-1]); err != nil {
+		t.Fatalf("newest inode was evicted: %v", err)
+	}
+	// Eviction is not loss: a path-based frontend re-descends and the
+	// inode resolves again, which is exactly why the cap is safe there.
+	if _, err := fs.Lookup(ctx, dirNode.Inode, "f00.txt"); err != nil {
+		t.Fatalf("re-descent after eviction failed: %v", err)
+	}
+	if _, err := fs.GetAttr(ctx, inos[0]); err != nil {
+		t.Fatalf("re-descended inode not resident: %v", err)
+	}
+
+	// Unbounded remains the default: nothing is evicted without the cap.
+	fs2 := openFS(t, inner, res.Superblock, genfs.Options{})
+	d2, err := fs2.Lookup(ctx, genfs.RootInode, "d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range inos {
+		if _, err := fs2.Lookup(ctx, d2.Inode, fmt.Sprintf("f%02d.txt", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := fs2.GetAttr(ctx, inos[0]); err != nil {
+		t.Fatalf("unbounded residency evicted an inode: %v", err)
+	}
+}

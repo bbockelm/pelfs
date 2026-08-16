@@ -227,11 +227,21 @@ func TestMountGenCheckpointSealsAndKeepsServing(t *testing.T) {
 	if !strings.Contains(string(body), "generation 1") {
 		t.Fatalf("first checkpoint: %s", body)
 	}
-	if got := g.gfs.Generation(); got != 0 {
-		t.Errorf("the served generation moved to %d; a checkpoint must not swap it", got)
+	// A checkpoint ADVANCES the served generation: the mount swaps onto
+	// what it just published so the overlay's now-redundant rows can be
+	// dropped and those inodes go back to clean (infinite kernel TTLs).
+	// Rebase refuses to drop rows against an older base, so this order is
+	// enforced, not merely conventional.
+	if got := g.gfs.Generation(); got != 1 {
+		t.Errorf("served generation is %d after the checkpoint; it must follow the seal to 1", got)
 	}
+	// Whatever the engine did underneath, the mount keeps serving the
+	// same tree — the write is still there, by the same name.
 	if _, err := g.ov.Lookup(ctx, overlay.RootInode, "first.txt"); err != nil {
-		t.Errorf("the overlay stopped serving its own write after the checkpoint: %v", err)
+		t.Errorf("the mount stopped serving its own write after the checkpoint: %v", err)
+	}
+	if dirty, err := g.ov.IsDirty(overlay.RootInode); err == nil && dirty {
+		t.Logf("root still dirty after checkpoint (acceptable: it may have been touched since the snapshot)")
 	}
 
 	// More work, then a second checkpoint. Without the anchor advancing,
@@ -312,8 +322,9 @@ func TestMountGenSealAtExitRetiresOverlay(t *testing.T) {
 	// what the seal consumed.
 	g.refresh()
 	g.stats.Update(func(s *stats.Summary) { sum = *s })
-	if sum.Generation != 0 {
-		t.Errorf("served generation drifted to %d", sum.Generation)
+	// The seal advanced the branch, and the mount followed it there.
+	if sum.Generation != 1 {
+		t.Errorf("served generation is %d; the exit seal should have advanced it to 1", sum.Generation)
 	}
 
 	// The document a supervisor reads after the session is gone.

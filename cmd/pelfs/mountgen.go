@@ -188,8 +188,24 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		return exitErr(err)
 	}
 
-	raw, err := pelicanobj.New(ctx, pelicanobj.Config{PrefixURL: prefix, TokenPath: o.token})
+	raw, err := pelicanobj.New(ctx, pelicanobj.Config{
+		PrefixURL: prefix,
+		TokenPath: o.token,
+		Insecure:  o.insecure,
+		// Without this the client never runs a token-acquisition flow, so
+		// a session with no cached credential fails at its first
+		// federation read instead of asking for one.
+		AcquireToken: !o.noAcquireToken,
+	})
 	if err != nil {
+		return fail(err)
+	}
+	// Probe access up front, exactly as a v1 session does. This is what
+	// triggers the interactive flow once, for the read+create+modify
+	// union a whole session needs, and it turns a missing or too-narrow
+	// credential into one clear message here rather than an opaque
+	// failure deep in the mount.
+	if err := pelicanobj.Preflight(ctx, raw, prefix, !rw); err != nil {
 		return fail(err)
 	}
 	// Every byte the phase-3 stack moves — pack range reads, catalog
@@ -449,9 +465,11 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 // the wrong volume key must still see that the prefix is busy.
 func (g *genSession) acquireLease(ctx context.Context, o *cmdOpts, prefix string) (*lease.Lease, error) {
 	metaStore, err := pelicanobj.New(ctx, pelicanobj.Config{
-		PrefixURL:  prefix,
-		TokenPath:  o.token,
-		DirectRead: true,
+		PrefixURL:    prefix,
+		TokenPath:    o.token,
+		Insecure:     o.insecure,
+		AcquireToken: !o.noAcquireToken,
+		DirectRead:   true,
 	})
 	if err != nil {
 		return nil, err

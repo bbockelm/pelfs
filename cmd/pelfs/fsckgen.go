@@ -48,6 +48,7 @@ func cmdFsckGen(args []string) int {
 	}
 	inner, err := pelicanobj.New(ctx, pelicanobj.Config{
 		PrefixURL: prefix, TokenPath: o.token, Insecure: o.insecure,
+		AcquireToken: !o.noAcquireToken,
 	})
 	if err != nil {
 		return exitErr(err)

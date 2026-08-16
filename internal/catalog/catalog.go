@@ -394,37 +394,43 @@ func (c *Catalog) loadMeta() error {
 // Meta returns the catalog's self-identification.
 func (c *Catalog) Meta() Meta { return c.meta }
 
-// LookupResult is the outcome of a name lookup: exactly one of Dirent
-// (ordinary entry, resolvable in this catalog) or NestedIdentity (transition
-// point — descend into the child catalog with that identity) is set.
+// LookupResult is the outcome of a name lookup. An ordinary entry sets
+// only Dirent. A transition point sets BOTH: publish writes the child
+// directory's dirent (and node row) into the parent catalog alongside the
+// nested locator, so lookup and stat of the transition directory never
+// fetch the child catalog — only descending into its entries does.
 type LookupResult struct {
 	Dirent         *Dirent
 	NestedIdentity []byte
 }
 
-// Lookup resolves one name under parent. Returns ErrNotExist when the name
-// is neither an edge nor a transition point.
+// Lookup resolves one name under parent. Returns ErrNotExist when the
+// name has neither an edge row nor a nested row.
 func (c *Catalog) Lookup(parent int64, name []byte) (LookupResult, error) {
+	var res LookupResult
 	var d Dirent
 	err := c.db.QueryRow(`SELECT inode, type FROM edge WHERE parent = ? AND name = ?`, parent, name).
 		Scan(&d.Inode, &d.Type)
-	if err == nil {
+	switch {
+	case err == nil:
 		d.Name = append([]byte(nil), name...)
-		return LookupResult{Dirent: &d}, nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
+		res.Dirent = &d
+	case !errors.Is(err, sql.ErrNoRows):
 		return LookupResult{}, err
 	}
 	var identity []byte
 	err = c.db.QueryRow(`SELECT catalog_identity FROM nested WHERE parent = ? AND name = ?`, parent, name).
 		Scan(&identity)
-	if errors.Is(err, sql.ErrNoRows) {
-		return LookupResult{}, ErrNotExist
-	}
-	if err != nil {
+	switch {
+	case err == nil:
+		res.NestedIdentity = identity
+	case !errors.Is(err, sql.ErrNoRows):
 		return LookupResult{}, err
 	}
-	return LookupResult{NestedIdentity: identity}, nil
+	if res.Dirent == nil && res.NestedIdentity == nil {
+		return LookupResult{}, ErrNotExist
+	}
+	return res, nil
 }
 
 // Readdir lists a directory: its ordinary entries and its transition

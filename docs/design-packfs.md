@@ -450,6 +450,14 @@ compression). All tables WITHOUT ROWID where the key is natural.
   frontend may refuse to expose some — recorded limitation.
 - `edge(parent, name BLOB, inode, type)` PK(parent, name).
 - `nested(parent, name BLOB, catalog_identity BLOB)` — transition points.
+  A transition directory carries BOTH halves in the parent catalog: its
+  edge and node rows (lookup and stat of the directory itself never
+  fetch the child catalog) plus the nested locator; only descending
+  into its entries opens the child. Catalog and shard pack entries are
+  always zstd-compressed and encrypted under the single key named by
+  the superblock's `catalog_key_id` (0 = plaintext) — unlike chunks,
+  their references carry no per-entry alg/keyid columns, so the
+  encoding is stated once, never sniffed.
 - `chunkref(inode, idx, identity BLOB[32], llen, clen, alg, keyid)` —
   logical offsets are prefix sums of llen at load (rows per file are few;
   saves 8 bytes/row); holes in sparse files are rows with NULL identity

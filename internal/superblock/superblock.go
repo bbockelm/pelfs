@@ -127,6 +127,13 @@ type Superblock struct {
 	// Condemned lists recently repacked-away packs still inside the GC
 	// grace window (omitempty per the evolution rule below).
 	Condemned []CondemnedPack `cbor:"condemned,omitempty"`
+	// CatalogKeyID names the key-table entry that encrypts catalog,
+	// shard, and superblock-backup pack entries this generation (0 =
+	// plaintext). Catalog references (nested rows, RootCatalog, shard
+	// identities) carry no per-entry alg/keyid the way chunkrefs do, so
+	// their encoding is fixed — always zstd, this one key — and stated
+	// here rather than sniffed.
+	CatalogKeyID uint32 `cbor:"catalog_key_id,omitempty"`
 
 	// SigningPub is informational — it names the key that produced
 	// Signature so tooling can report custody, but Verify never trusts it

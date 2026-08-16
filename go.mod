@@ -348,8 +348,8 @@ replace (
 // TEMPORARY fork replace: picks up the client fix that requests
 // storage.modify for uploads when Client.EnableOverwrites is set. The
 // fix is not upstream yet; it lives on branch pelfs-overwrite-scopes of
-// the fork https://github.com/bbockelm/pelican (commit 2736a3b92). A
+// the fork https://github.com/bbockelm/pelican (commit 991d3b616). A
 // fork replace — not a local path — so CI runners can fetch it.
 // DROP this replace and bump the pinned pelicanplatform/pelican version
 // as soon as the fixes land on pelican main.
-replace github.com/pelicanplatform/pelican => github.com/bbockelm/pelican v0.0.0-20260815190714-2736a3b927a9
+replace github.com/pelicanplatform/pelican => github.com/bbockelm/pelican v0.0.0-20260816185645-991d3b61662d

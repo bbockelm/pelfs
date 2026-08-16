@@ -70,6 +70,12 @@ mkdir -p "$WORK/origin-data" "$WORK/server-config" "$WORK/client-config" "$WORK/
 # tried to run a storage daemon. Any invocation other than the bare `-v` probe
 # fails loudly instead of silently degrading into "XRootD is required after
 # all" -- which is the whole point of keeping a stub rather than a real install.
+# XRootD regression guard. The pinned pelican no longer probes for the
+# binary unless a server will actually launch one (native origins and
+# the v2 cache never do), so this stub should record NOTHING. It stays
+# as an assertion: if a future pelican reintroduces an unconditional
+# probe — or genuinely tries to run the daemon — this test says so
+# instead of quietly re-acquiring an XRootD dependency.
 XROOTD_STUB_LOG="$WORK/xrootd-stub-invocations.log"
 cat > "$WORK/xrootd-stub/xrootd" <<EOF
 #!/bin/sh

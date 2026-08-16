@@ -151,8 +151,8 @@ github.com/baidubce/bce-sdk-go v0.9.263 h1:tSO+CMS9h+wm+itbyoVy1SUxKO2iNibXn4gtB
 github.com/baidubce/bce-sdk-go v0.9.263/go.mod h1:zbYJMQwE4IZuyrJiFO8tO8NbtYiKTFTbwh4eIsqjVdg=
 github.com/bbockelm/gosssd v0.0.1 h1:p9wJYl+GDn29W1it2ZE2RekriwUNs/1U16aUNNro5SM=
 github.com/bbockelm/gosssd v0.0.1/go.mod h1:Hz8jIcIkQnFmA/ekP2ZWpnPqmyIxftPPFsi+Y3wqRL0=
-github.com/bbockelm/pelican v0.0.0-20260815190714-2736a3b927a9 h1:rJ9eYW0V05SBDLAsv2cLtU1zLuHwZzlgusbfqC4PQD4=
-github.com/bbockelm/pelican v0.0.0-20260815190714-2736a3b927a9/go.mod h1:Ljw5Zelj3EdjTX7WJVvrV2UglKHESsWhQHbFk2QRVig=
+github.com/bbockelm/pelican v0.0.0-20260816185645-991d3b61662d h1:LSiwcchPkRN1lGc4w/xFZDfiDP8Z0hdJTf3UkJLcs1w=
+github.com/bbockelm/pelican v0.0.0-20260816185645-991d3b61662d/go.mod h1:Ljw5Zelj3EdjTX7WJVvrV2UglKHESsWhQHbFk2QRVig=
 github.com/bboreham/go-loser v0.0.0-20230920113527-fcc2c21820a3 h1:6df1vn4bBlDDo4tARvBm7l6KA9iVMnE3NWizDeWSrps=
 github.com/bboreham/go-loser v0.0.0-20230920113527-fcc2c21820a3/go.mod h1:CIWtjkly68+yqLPbvwwR/fjNJA/idrtULjZWh2v1ys0=
 github.com/benbjohnson/clock v1.1.0/go.mod h1:J11/hYXuz8f4ySSvYwY0FKfm+ezbsZBKZxNJlLklBHA=

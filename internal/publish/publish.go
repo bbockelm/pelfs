@@ -78,6 +78,12 @@ const (
 	DefaultInlineMax = 4096
 	// DefaultTargetPackSize matches the phase-1 middleware's pack target.
 	DefaultTargetPackSize = 64 << 20
+	// DefaultUploadConcurrency is how many packs may be in flight at once.
+	// Each upload is one long transfer, so this is about covering round
+	// trips rather than about CPU: on a bandwidth-bound uplink extra
+	// streams only divide the same pipe, while on a long-fat path a single
+	// stream is window-limited and cannot fill it alone.
+	DefaultUploadConcurrency = 4
 	// RefPrefix is the key-space directory of mutable branch heads.
 	RefPrefix = "refs/"
 
@@ -135,6 +141,12 @@ type Options struct {
 	InlineMax int64
 	// TargetPackSize cuts packs (default 64 MiB).
 	TargetPackSize int64
+	// UploadConcurrency bounds packs in flight; zero uses
+	// DefaultUploadConcurrency. It is settable because the right number is
+	// a property of the link, not of the code: a laptop on a home uplink
+	// is bandwidth-bound and gains nothing past one or two, while a node
+	// on a long-fat path needs several streams to fill the pipe.
+	UploadConcurrency int
 	// SMax overrides the catalog split threshold; zero selects
 	// catalog.SMax. Tests shrink it to force nested catalogs on small trees.
 	SMax int64
@@ -237,7 +249,7 @@ func Publish(ctx context.Context, o Options) (*Result, error) {
 	p := &pipeline{
 		o:           o,
 		src:         src,
-		pk:          newPacker(o.Inner, tmpDir, o.TargetPackSize),
+		pk:          newPacker(o.Inner, tmpDir, o.TargetPackSize, o.UploadConcurrency),
 		hasher:      chunkid.NewHasher(o.IdentityKey),
 		gen:         gen,
 		volUUID:     volUUID,

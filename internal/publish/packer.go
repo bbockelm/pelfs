@@ -36,18 +36,14 @@ type packer struct {
 	err error
 }
 
-// uploadConcurrency is how many packs may be in flight at once. Packs are
-// large and each upload is one long transfer, so this is about keeping a
-// high-bandwidth-delay link busy rather than about CPU: a few concurrent
-// streams cover the latency without turning a publish into a bandwidth
-// stampede that starves the mount still serving reads.
-const uploadConcurrency = 4
-
-func newPacker(inner pelicanobj.Store, dir string, target int64) *packer {
+func newPacker(inner pelicanobj.Store, dir string, target int64, conc int) *packer {
+	if conc <= 0 {
+		conc = DefaultUploadConcurrency
+	}
 	return &packer{
 		inner: inner, dir: dir, target: target,
 		added: make(map[string]struct{}),
-		sem:   make(chan struct{}, uploadConcurrency),
+		sem:   make(chan struct{}, conc),
 	}
 }
 

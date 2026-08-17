@@ -3,6 +3,7 @@ package publish
 import (
 	"context"
 	"io"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -12,12 +13,13 @@ import (
 )
 
 // gateStore counts concurrent Puts and blocks each one until it has seen
-// at least two at once. If uploads were serialized the first Put would
-// wait alone until its timeout, so this deadlock-with-a-deadline is what
+// `want` at once. If uploads were serialized the first Put would wait
+// alone until its timeout, so this deadlock-with-a-deadline is what
 // distinguishes real overlap from a test that merely passes.
 type gateStore struct {
 	pelicanobj.Store
 
+	want    int
 	mu      sync.Mutex
 	inFlnow int
 	maxSeen int
@@ -26,7 +28,7 @@ type gateStore struct {
 }
 
 func newGateStore() *gateStore {
-	return &gateStore{opened: make(chan struct{})}
+	return &gateStore{want: 2, opened: make(chan struct{})}
 }
 
 func (s *gateStore) Put(_ context.Context, _ string, in io.Reader) error {
@@ -35,7 +37,7 @@ func (s *gateStore) Put(_ context.Context, _ string, in io.Reader) error {
 	if s.inFlnow > s.maxSeen {
 		s.maxSeen = s.inFlnow
 	}
-	if s.inFlnow >= 2 {
+	if s.inFlnow >= s.want {
 		s.once.Do(func() { close(s.opened) })
 	}
 	s.mu.Unlock()
@@ -66,7 +68,7 @@ func TestPackerUploadsOverlap(t *testing.T) {
 	ctx := context.Background()
 	store := newGateStore()
 	// A tiny target so each entry seals its own pack.
-	p := newPacker(store, t.TempDir(), 1)
+	p := newPacker(store, t.TempDir(), 1, 0)
 
 	payload := make([]byte, 512)
 	for i := range payload {
@@ -100,7 +102,7 @@ func TestPackerUploadsOverlap(t *testing.T) {
 func TestPackerFinishReportsUploadFailure(t *testing.T) {
 	ctx := context.Background()
 	store := &failingStore{}
-	p := newPacker(store, t.TempDir(), 1)
+	p := newPacker(store, t.TempDir(), 1, 0)
 
 	payload := make([]byte, 256)
 	for _, key := range []string{"aa", "bb"} {
@@ -121,4 +123,30 @@ type failingStore struct {
 
 func (s *failingStore) Put(_ context.Context, _ string, _ io.Reader) error {
 	return io.ErrClosedPipe
+}
+
+// TestPackerHonorsUploadConcurrency pins the cap as a cap. The number is
+// a link property the caller sets, so the packer must both reach it (a
+// long-fat path needs every stream to fill the pipe) and never exceed it
+// (the mount is still serving reads through the same uplink).
+func TestPackerHonorsUploadConcurrency(t *testing.T) {
+	const conc = 3
+	ctx := context.Background()
+	store := newGateStore()
+	store.want = conc
+	// A tiny target so each entry seals its own pack.
+	p := newPacker(store, t.TempDir(), 1, conc)
+
+	payload := make([]byte, 512)
+	for i := range 8 {
+		if err := p.add(ctx, strconv.Itoa(i), packstore.EntryData, payload); err != nil {
+			t.Fatalf("add %d: %v", i, err)
+		}
+	}
+	if _, err := p.finish(ctx); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	if got := store.peak(); got != conc {
+		t.Errorf("peak concurrent uploads = %d, want exactly %d", got, conc)
+	}
 }

@@ -310,6 +310,11 @@ func (s *Snapshot) BaseContent(ctx context.Context, ino uint64) (genfs.Content, 
 // Dirty enumerates the frozen changed set — what the seal must publish.
 func (s *Snapshot) Dirty() (*DirtyReport, error) { return s.view.Dirty() }
 
+// DirtyInodes reports the frozen touched set, so "unchanged since the
+// base generation" means unchanged as of the instant that was frozen —
+// the tree being sealed, not whatever the mount has done since.
+func (s *Snapshot) DirtyInodes() (map[uint64]struct{}, error) { return s.view.DirtyInodes() }
+
 // breakSnapshotLinkLocked gives ino a private staging file when a live
 // snapshot froze bytes at or above below. Snapshots hold hardlinks, so
 // the copy replaces the LIVE name and every snapshot keeps the old inode;

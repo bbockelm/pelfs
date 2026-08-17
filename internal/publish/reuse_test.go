@@ -62,6 +62,10 @@ type reuseVol struct {
 	// sealGets is how many pack range reads the last checkpoint's SEAL
 	// issued: the number this whole change exists to drive to zero.
 	sealGets int64
+	// smax overrides the catalog split threshold, so a test can force a
+	// small fixture into a TREE of catalogs instead of one flat catalog.
+	// Zero takes the default.
+	smax int64
 }
 
 func newReuseVol(t *testing.T, volID [16]byte) *reuseVol {
@@ -123,7 +127,7 @@ func (v *reuseVol) sealOnly(prev *publish.Result) *publish.Result {
 	res, err := publish.Seal(context.Background(), publish.Options{
 		Overlay: v.ov, Inner: v.inner, SpoolDir: v.t.TempDir(),
 		SigningKey: v.priv, Prev: prev.Superblock, PrevRaw: prev.Raw,
-		TargetPackSize: 1 << 20, DedupIndexPath: v.index,
+		TargetPackSize: 1 << 20, DedupIndexPath: v.index, SMax: v.smax,
 	})
 	if err != nil {
 		v.t.Fatalf("seal: %v", err)
@@ -149,7 +153,7 @@ func (v *reuseVol) checkpoint() *publish.Result {
 	res, err := publish.Seal(ctx, publish.Options{
 		OverlaySnapshot: snap, Inner: v.inner, SpoolDir: v.t.TempDir(),
 		SigningKey: v.priv, Prev: v.head.Superblock, PrevRaw: v.head.Raw,
-		TargetPackSize: 1 << 20, DedupIndexPath: v.index,
+		TargetPackSize: 1 << 20, DedupIndexPath: v.index, SMax: v.smax,
 	})
 	if err != nil {
 		v.t.Fatalf("seal: %v", err)
@@ -274,13 +278,19 @@ func TestSealReusesUnchangedContent(t *testing.T) {
 	if second.Stats.ChunksDeduped != 0 {
 		t.Errorf("re-sealing an unchanged tree ran %d chunk(s) through the chunker", second.Stats.ChunksDeduped)
 	}
-	// Every file with content, inline and chunked alike.
-	if want := 5; second.Stats.ReusedFiles != want {
-		t.Errorf("reused %d files, want %d", second.Stats.ReusedFiles, want)
+	// Nothing changed, so nothing is rebuilt: the whole catalog tree is
+	// carried forward, which subsumes per-file content reuse — the files
+	// are never consulted because the catalogs describing them are never
+	// rewritten.
+	if second.Stats.Catalogs != 0 {
+		t.Errorf("re-sealing an unchanged tree wrote %d catalog(s), want 0", second.Stats.Catalogs)
 	}
-	if second.Stats.ReusedChunks != first.Stats.ChunksAdded {
-		t.Errorf("reused %d chunks, the base published %d",
-			second.Stats.ReusedChunks, first.Stats.ChunksAdded)
+	if second.Stats.CatalogsReused != first.Stats.Catalogs {
+		t.Errorf("carried %d catalogs forward, the base published %d",
+			second.Stats.CatalogsReused, first.Stats.Catalogs)
+	}
+	if second.Superblock.RootCatalog != first.Superblock.RootCatalog {
+		t.Errorf("root catalog changed though nothing in the tree did")
 	}
 	if second.Superblock.Generation != 2 {
 		t.Fatalf("generation = %d, want 2", second.Superblock.Generation)

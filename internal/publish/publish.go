@@ -225,6 +225,11 @@ func Publish(ctx context.Context, o Options) (*Result, error) {
 		pathOf:      make(map[uint64]string),
 		isCatRoot:   make(map[uint64]bool),
 		catIdentity: make(map[uint64]chunkid.Identity),
+
+		subtreeDirty: make(map[uint64]bool),
+		carried:      make(map[uint64]superblock.CatalogEntry),
+		catWeight:    make(map[uint64]int64),
+		catPromoted:  make(map[uint64]int),
 	}
 	defer p.pk.abort()
 
@@ -232,6 +237,11 @@ func Publish(ctx context.Context, o Options) (*Result, error) {
 		return nil, err
 	}
 	if err := p.loadDedupIndex(); err != nil {
+		return nil, err
+	}
+	// The plan runs before TRANSFORM so TRANSFORM can skip the content it
+	// is about to discard; see catalogreuse.go.
+	if err := p.plan(); err != nil {
 		return nil, err
 	}
 	if err := p.transform(ctx); err != nil {
@@ -392,6 +402,20 @@ type pipeline struct {
 	isCatRoot   map[uint64]bool
 	catIdentity map[uint64]chunkid.Identity
 
+	// The plan (catalogreuse.go): what this seal must build rather than
+	// carry forward. reuseArmed says the source and the previous
+	// generation agree on enough for any of it to be sound; with it false
+	// every inode reads as dirty and the whole tree is rebuilt.
+	reuseArmed   bool
+	dirty        map[uint64]struct{}
+	subtreeDirty map[uint64]bool
+	carried      map[uint64]superblock.CatalogEntry
+	carriedList  []superblock.CatalogEntry
+	writeOrder   []uint64
+	needContent  map[uint64]bool
+	catWeight    map[uint64]int64
+	catPromoted  map[uint64]int
+
 	stats Stats
 }
 
@@ -489,15 +513,25 @@ func (p *pipeline) walk(ctx context.Context) error {
 	return nil
 }
 
-// transform produces every file's content records: inline bytes at or
-// below the threshold, CDC chunk lists (with pack appends) above it.
-// Files the source can prove untouched keep the records the previous
-// generation already published, and are never opened at all.
+// transform produces the content records this seal will actually write:
+// inline bytes at or below the threshold, CDC chunk lists (with pack
+// appends) above it. Files the source can prove untouched keep the
+// records the previous generation already published, and are never opened
+// at all; files inside a catalog being carried forward are not consulted
+// at all, since the carried bytes already describe them (see the plan in
+// catalogreuse.go).
 func (p *pipeline) transform(ctx context.Context) error {
 	reuse := p.contentReuser()
 	for _, ino := range p.sortedInodes() {
 		r := p.recs[ino]
 		if r.n.Type != catalog.TypeFile || r.n.Length == 0 {
+			continue
+		}
+		if !p.needsContent(ino) {
+			// Every catalog that would hold this file's records is being
+			// carried forward, records and all. Deriving them again would
+			// mean proving the file untouched and fetching what the base
+			// generation already says — to throw the answer away.
 			continue
 		}
 		if reuse != nil {
@@ -715,46 +749,56 @@ func (p *pipeline) writeShards(ctx context.Context) ([]superblock.ShardEntry, er
 	return out, nil
 }
 
-// writeCatalogs weighs the tree, splits it into catalog roots, and writes
-// catalogs bottom-up (Split returns peeled roots in post-order — every
-// child catalog before any parent that references it — with the tree root
-// last), returning the root catalog identity.
+// writeCatalogs builds the catalogs the plan says are not being carried
+// forward, in the order it left them (descendants before ancestors — a
+// parent records its children's identities), and returns the root catalog
+// identity, which is a carried one when the whole tree is unchanged.
 func (p *pipeline) writeCatalogs(ctx context.Context) (chunkid.Identity, error) {
-	rootDN := p.buildDirNode(p.src.Root(), "/")
-	roots := catalog.Split(rootDN, p.o.SMax, catalog.SMin)
-	for _, dn := range roots {
-		p.isCatRoot[p.dnIno[dn]] = true
-	}
-	var rootID chunkid.Identity
-	for _, dn := range roots {
-		ino := p.dnIno[dn]
+	for _, ino := range p.writeOrder {
 		id, err := p.writeCatalog(ctx, ino)
 		if err != nil {
 			return chunkid.Identity{}, err
 		}
 		p.catIdentity[ino] = id
-		rootID = id // the tree root is last
+	}
+	rootID, ok := p.catIdentity[p.src.Root()]
+	if !ok {
+		return chunkid.Identity{}, errors.New("publish: no catalog was produced for the tree root")
 	}
 	return rootID, nil
 }
 
 // buildDirNode computes the catalog weight tree (W = 200·entries +
 // inline_bytes + xattr bytes; promoted inodes' content weight lives in
-// shards, so only their entry cost counts here).
+// shards, so only their entry cost counts here) and, on the same descent,
+// which subtrees hold anything the source changed.
+//
+// The inline contribution is read off the node's LENGTH rather than off
+// bytes TRANSFORM produced: a file at or below the threshold contributes
+// exactly its length by definition. That is what lets the split — and
+// therefore the reuse plan — run before TRANSFORM instead of after it,
+// which is the whole point of the plan.
 func (p *pipeline) buildDirNode(ino uint64, pth string) *catalog.DirNode {
 	d := &catalog.DirNode{}
 	p.dnIno[d] = ino
 	p.pathOf[ino] = pth
 	d.OwnWeight = xattrBytes(p.recs[ino].xattrs)
+	dirty := p.isDirty(ino)
 	for _, e := range p.dirs[ino] {
 		d.OwnWeight += entryWeight
 		r := p.recs[e.inode]
+		if p.isDirty(e.inode) {
+			dirty = true
+		}
 		switch e.typ {
 		case catalog.TypeDir:
 			d.Children = append(d.Children, p.buildDirNode(e.inode, path.Join(pth, e.name)))
+			if p.subtreeDirty[e.inode] {
+				dirty = true
+			}
 		case catalog.TypeFile:
 			if !r.promoted {
-				d.OwnWeight += int64(len(r.inline)) + xattrBytes(r.xattrs)
+				d.OwnWeight += p.inlineLen(r) + xattrBytes(r.xattrs)
 			}
 		case catalog.TypeSymlink:
 			d.OwnWeight += int64(len(r.symlink)) + xattrBytes(r.xattrs)
@@ -762,7 +806,18 @@ func (p *pipeline) buildDirNode(ino uint64, pth string) *catalog.DirNode {
 			d.OwnWeight += xattrBytes(r.xattrs)
 		}
 	}
+	p.subtreeDirty[ino] = dirty
 	return d
+}
+
+// inlineLen is the number of bytes a file will contribute to its
+// catalog's inline table: its whole length at or below the threshold,
+// nothing above it (those bytes go to packs as chunks).
+func (p *pipeline) inlineLen(r *rec) int64 {
+	if r.n.Type == catalog.TypeFile && r.n.Length <= p.o.InlineMax {
+		return r.n.Length
+	}
+	return 0
 }
 
 func (p *pipeline) writeCatalog(ctx context.Context, rootIno uint64) (chunkid.Identity, error) {
@@ -941,6 +996,7 @@ func (p *pipeline) buildSuperblock(newPacks []packstore.SealedPack, shards []sup
 		PackList:        packList,
 		Shards:          shards,
 		NextInode:       nextInode,
+		Catalogs:        p.catalogList(),
 		Params: superblock.Params{
 			SMaxBytes:     p.o.SMax,
 			SMinBytes:     catalog.SMin,

@@ -38,6 +38,55 @@ func (fs *FS) NextInode() (uint64, error) {
 	return n, nil
 }
 
+// DirtyInodes reports every inode this overlay has touched since the base
+// generation: attribute overrides, staged content, xattr changes, and
+// both halves of every changed name (the parent whose listing moved, and
+// the inode a name binds).
+//
+// A seal uses it for the converse of what the overlay usually answers: an
+// inode NOT in this set is what the base generation published, so a
+// catalog covering only such inodes is what the base generation published
+// too, and can be carried forward by reference instead of rebuilt. That
+// inference makes completeness load-bearing in a way IsDirty's use
+// (picking a FUSE attribute TTL) never was — so this reads the tables
+// instead of trusting the memoized set alone. Operations that REMOVE
+// state, such as an unlink decrementing a surviving hardlink's nlink,
+// write an onode row without adding to that set: harmless for a TTL, a
+// lost change here. The union of both is the answer that cannot miss.
+func (fs *FS) DirtyInodes() (map[uint64]struct{}, error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	set := make(map[uint64]struct{})
+	for _, q := range []string{
+		`SELECT inode FROM onode`,
+		`SELECT inode FROM ocontent`,
+		`SELECT inode FROM oxattr`,
+		`SELECT inode FROM osymlink`,
+		`SELECT inode FROM oedge WHERE inode != 0`,
+		`SELECT parent FROM oedge`,
+	} {
+		rows, err := fs.q.Query(q)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var ino uint64
+			if err := rows.Scan(&ino); err != nil {
+				rows.Close() //nolint:errcheck
+				return nil, err
+			}
+			set[ino] = struct{}{}
+		}
+		if err := closeRows(rows); err != nil {
+			return nil, err
+		}
+	}
+	for ino := range fs.dirtySet {
+		set[ino] = struct{}{}
+	}
+	return set, nil
+}
+
 // IsDirty reports whether this overlay has touched the inode: an attr
 // override, staged content, an xattr change, or an edge naming it.
 //

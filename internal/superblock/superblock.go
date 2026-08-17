@@ -78,6 +78,31 @@ type ShardEntry struct {
 	Identity   [32]byte `cbor:"identity"`
 }
 
+// CatalogEntry describes one catalog of the generation's catalog tree:
+// the directory inode it is rooted at, the identity of its bytes, the
+// path it covers, and the split weight of the subtree it stands for.
+//
+// The tree is already navigable by descent (nested rows), so this list
+// adds no reachability. What it adds is the ability to decide what NOT to
+// do without fetching anything: a publisher building the next generation
+// can see from the superblock alone that a subtree is unchanged, keep the
+// catalog named here — carried forward by reference, the way a git commit
+// keeps the tree objects it did not change — and still reach the same
+// split decision in the parent, which needs Weight, the one number that
+// stands in for a subtree nobody walked.
+//
+// Promoted counts nlink>1 files inside the catalog's span. Their content
+// records live in inode SHARDS, which are rebuilt whole from the walk
+// every generation; a span holding none can be skipped entirely, and one
+// holding some cannot.
+type CatalogEntry struct {
+	Inode    uint64   `cbor:"inode"`
+	Identity [32]byte `cbor:"identity"`
+	Path     string   `cbor:"path"`
+	Weight   int64    `cbor:"weight"`
+	Promoted uint32   `cbor:"promoted"`
+}
+
 // KeyEntry is one row of the key table: a 32-byte key wrapped by the user
 // KEK. Key-id 0 is reserved to mean plaintext and never appears here.
 type KeyEntry struct {
@@ -134,6 +159,11 @@ type Superblock struct {
 	// their encoding is fixed — always zstd, this one key — and stated
 	// here rather than sniffed.
 	CatalogKeyID uint32 `cbor:"catalog_key_id,omitempty"`
+	// Catalogs describes the generation's catalog tree so the NEXT publish
+	// can skip the parts of it that did not change. Omitted by writers
+	// that do not maintain it; a reader needs nothing from it, and a
+	// publisher that finds it absent simply rebuilds every catalog.
+	Catalogs []CatalogEntry `cbor:"catalogs,omitempty"`
 
 	// SigningPub is informational — it names the key that produced
 	// Signature so tooling can report custody, but Verify never trusts it

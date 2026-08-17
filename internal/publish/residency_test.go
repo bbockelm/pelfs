@@ -55,6 +55,16 @@ func TestSealTreeLargerThanResidency(t *testing.T) {
 	// clean now, so every inode's xattrs AND content resolve through the
 	// base generation, which is exactly what eviction had made
 	// unanswerable.
+	//
+	// One directory attribute is touched first, and it is load-bearing for
+	// this test rather than incidental: a seal that finds NOTHING dirty
+	// carries every catalog forward and never reaches the content path at
+	// all. Dirtying the root makes its catalog — the only one this small
+	// tree has — a rebuild, so all 48 files' records are resolved through
+	// the evicted base, which is the failure this test exists to pin.
+	if err := v.ov.SetXattr(context.Background(), v.ov.RootInode(), "user.touched", []byte("1")); err != nil {
+		t.Fatalf("setxattr: %v", err)
+	}
 	second := v.checkpoint()
 	if second.Stats.ReusedFiles != len(body) {
 		t.Errorf("reused %d files, want %d", second.Stats.ReusedFiles, len(body))

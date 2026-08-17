@@ -21,6 +21,16 @@ const (
 type DirNode struct {
 	OwnWeight int64
 	Children  []*DirNode
+	// Weight is what Split left this directory weighing: its own rows plus
+	// the child subtrees still attached after any peels — exactly the
+	// number its PARENT counted for it. Split fills it in.
+	//
+	// It is output rather than bookkeeping because a publisher that
+	// records a catalog root's weight can, next generation, stand in for
+	// that whole subtree with one number and never walk it: the parent's
+	// peel decisions are a function of its children's weights and nothing
+	// else.
+	Weight int64
 }
 
 // Split chooses catalog roots for the tree at root: bottom-up post-order, a
@@ -67,6 +77,7 @@ func Split(root *DirNode, smax, smin int64) []*DirNode {
 			roots = append(roots, d.Children[i])
 			attached = append(attached[:best], attached[best+1:]...)
 		}
+		d.Weight = w
 		return w
 	}
 	walk(root)

@@ -83,6 +83,31 @@ type ContentReuser interface {
 	ExistingContent(ctx context.Context, ino uint64) (genfs.Content, bool, error)
 }
 
+// CatalogReuser is the optional Source capability that spares TRANSFORM
+// from rebuilding catalogs whose subtree did not change.
+//
+// ContentReuser stops the seal re-reading file BYTES it already published;
+// this stops it re-deriving the STRUCTURE it already published. Without
+// it, one new file in an 80k-inode tree rewrites and re-uploads every
+// catalog in the volume — tens of megabytes, and the whole tree's worth of
+// SQLite, for one row. Catalogs are this format's tree objects, and the
+// git property is the target: a change writes the catalogs on the path
+// from the changed directory to the root, and nothing else.
+//
+// Sources that cannot enumerate what they changed simply do not implement
+// it.
+type CatalogReuser interface {
+	// BaseGeneration identifies the generation the answers are relative
+	// to, by root-catalog identity — the same gate ContentReuser uses, for
+	// the same reason (see pipeline.catalogReuser).
+	BaseGeneration() [32]byte
+	// DirtyInodes reports every inode the source has touched since
+	// BaseGeneration. Completeness is the safety property: an inode
+	// missing from this set is one the seal will publish exactly as the
+	// base generation did, so a missing entry is a lost change.
+	DirtyInodes() (map[uint64]struct{}, error)
+}
+
 // ---- overlay source ----
 
 // overlaySource seals a phase-3 write overlay: the merged base+dirty view
@@ -109,6 +134,7 @@ type overlayView interface {
 	OpenFile(ctx context.Context, ino uint64, length int64) (io.ReadCloser, error)
 	BaseRootCatalog() [32]byte
 	BaseContent(ctx context.Context, ino uint64) (genfs.Content, bool, error)
+	DirtyInodes() (map[uint64]struct{}, error)
 }
 
 type overlaySource struct {
@@ -116,8 +142,11 @@ type overlaySource struct {
 }
 
 // An overlay knows exactly which inodes it has touched, which is what
-// makes the reuse capability answerable at all.
-var _ ContentReuser = (*overlaySource)(nil)
+// makes the reuse capabilities answerable at all.
+var (
+	_ ContentReuser = (*overlaySource)(nil)
+	_ CatalogReuser = (*overlaySource)(nil)
+)
 
 func (s *overlaySource) Root() uint64 { return s.fs.RootInode() }
 
@@ -176,6 +205,8 @@ func (s *overlaySource) BaseGeneration() [32]byte { return s.fs.BaseRootCatalog(
 func (s *overlaySource) ExistingContent(ctx context.Context, ino uint64) (genfs.Content, bool, error) {
 	return s.fs.BaseContent(ctx, ino)
 }
+
+func (s *overlaySource) DirtyInodes() (map[uint64]struct{}, error) { return s.fs.DirtyInodes() }
 
 func srcNodeFromOverlay(n overlay.Node) SrcNode {
 	return SrcNode{

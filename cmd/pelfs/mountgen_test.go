@@ -344,3 +344,53 @@ func TestMountGenSealAtExitRetiresOverlay(t *testing.T) {
 		t.Errorf("finalized summary: %+v", final)
 	}
 }
+
+// TestMountGenCheckpointsOnACadence pins that a writable mount seals on
+// its own while serving. Without it every session defers all packing and
+// uploading to unmount, so `exit` blocks for as long as the session's
+// work takes -- minutes after a large extraction.
+//
+// It watches the published ref rather than the served generation: the
+// checkpoint swaps the mount under its own lock, and polling that state
+// from the test would race it.
+func TestMountGenCheckpointsOnACadence(t *testing.T) {
+	g := newGenSession(t, true)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rstore, err := refs.New(g.inner, t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, g.ov, "first.txt", "one")
+	go g.checkpointPeriodically(ctx, 10*time.Millisecond)
+
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		f, err := rstore.Fetch(ctx, "main")
+		if err == nil && f.Superblock.Generation >= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("a writable mount never checkpointed on its own; unmount would have to seal the whole session at once")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// A cadence must not manufacture empty generations once the session
+	// goes quiet: checkpoint skips a clean overlay, so the branch head
+	// has to stop advancing.
+	f, err := rstore.Fetch(ctx, "main")
+	if err != nil {
+		t.Fatalf("fetch after checkpoint: %v", err)
+	}
+	settled := f.Superblock.Generation
+	time.Sleep(200 * time.Millisecond) // many ticks at 10ms
+	if f, err = rstore.Fetch(ctx, "main"); err != nil {
+		t.Fatalf("fetch after idling: %v", err)
+	}
+	if f.Superblock.Generation != settled {
+		t.Errorf("idle mount kept publishing: generation went %d -> %d with nothing dirty",
+			settled, f.Superblock.Generation)
+	}
+}

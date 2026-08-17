@@ -93,6 +93,17 @@ type countedStore struct {
 	raw pelicanobj.Store
 }
 
+// The mount hands this store to refs and to the lease, both of which
+// probe for transport capabilities; losing Unwrap silently disables them.
+var _ pelicanobj.Unwrapper = countedStore{}
+
+// Unwrap exposes the transport underneath the counter. Without it this
+// decorator hides every capability the real store has beyond the Store
+// interface: the direct-read rule for mutable objects and the
+// unverified-read fallback both probe for such interfaces, and both were
+// silently inert on this path because the probe stopped here.
+func (s countedStore) Unwrap() pelicanobj.Store { return s.raw }
+
 func (s countedStore) ListDir(ctx context.Context, dir string) ([]pelicanobj.DirEntry, error) {
 	return s.raw.ListDir(ctx, dir)
 }
@@ -380,6 +391,19 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 
 	if ctl := g.startControl(); ctl != nil {
 		defer ctl.Close() //nolint:errcheck
+	}
+
+	// Seal on a cadence, not only at unmount. A session that sealed
+	// nothing until exit pays for everything it did in one lump at the
+	// end -- minutes of packing and uploading after the user has already
+	// typed `exit` -- where v1 exited promptly because it had been
+	// snapshotting all along. The checkpoint path is explicitly safe to
+	// run under a live mount (it seals a frozen snapshot while writes
+	// continue), so drive it on a timer and leave unmount to seal only
+	// the delta since the last one.
+	if rw && o.snapshotInterval > 0 {
+		go g.checkpointPeriodically(sessionCtx, o.snapshotInterval)
+		fmt.Fprintf(os.Stderr, "pelfs: checkpointing every %s (--snapshot-interval 0 disables)\n", o.snapshotInterval)
 	}
 	defer g.publishMountRecord()()
 
@@ -749,6 +773,42 @@ func (g *genSession) checkpoint(ctx context.Context) (string, error) {
 		res.Superblock.Generation)
 	return fmt.Sprintf("generation %d: %d chunks uploaded, %d catalogs, %d new packs",
 		res.Superblock.Generation, res.Stats.ChunksAdded, res.Stats.Catalogs, len(res.NewPacks)), nil
+}
+
+// slowCheckpoint is the duration past which a periodic checkpoint is
+// reported. Checkpoints run behind a live mount, so they are invisible
+// until they are slow enough to matter for the seal at exit.
+const slowCheckpoint = 10 * time.Second
+
+// checkpointPeriodically seals in the background for the life of the
+// session. Nothing here is load-bearing for correctness: every change is
+// already durable in the overlay, and the seal at unmount publishes
+// whatever the last checkpoint did not. That is what makes it safe to
+// swallow failures and keep going -- tearing a mount down over a
+// transient federation error would cost the user far more than a late
+// checkpoint does.
+func (g *genSession) checkpointPeriodically(ctx context.Context, every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			start := time.Now()
+			summary, err := g.checkpoint(ctx)
+			elapsed := time.Since(start)
+			switch {
+			case ctx.Err() != nil:
+				return
+			case err != nil:
+				fmt.Fprintf(os.Stderr,
+					"pelfs: periodic checkpoint failed, retrying next interval (your changes remain safe in the overlay): %v\n", err)
+			case elapsed > slowCheckpoint:
+				fmt.Fprintf(os.Stderr, "pelfs: checkpoint took %s (%s)\n", elapsed.Round(time.Second), summary)
+			}
+		}
+	}
 }
 
 // sealAtExit publishes a writable mount's changes as the next generation

@@ -43,10 +43,13 @@ type packIndex struct {
 	packs []superblock.PackEntry
 
 	// loadMu serializes the trailer work, so concurrent misses index a
-	// pack once between them rather than once each. localMerged is under
-	// it: the free sweep of already-local trailers is worth doing once.
+	// pack once between them rather than once each. localMerged and
+	// complete are under it: each sweep is worth doing once, and a read
+	// for content that genuinely is not here would otherwise re-walk the
+	// whole pack list to rediscover that on every attempt.
 	loadMu      sync.Mutex
 	localMerged bool
+	complete    bool
 
 	mu      sync.Mutex
 	byKey   map[string]packLoc
@@ -233,6 +236,9 @@ func (x *packIndex) all(ctx context.Context) error {
 }
 
 func (x *packIndex) allLocked(ctx context.Context) error {
+	if x.complete {
+		return nil
+	}
 	x.mergeLocal()
 	results := make([][]packstore.PackEntry, len(x.packs))
 	errs := make([]error, len(x.packs))
@@ -262,6 +268,7 @@ func (x *packIndex) allLocked(ctx context.Context) error {
 			x.merge(pe, results[i])
 		}
 	}
+	x.complete = true
 	return nil
 }
 

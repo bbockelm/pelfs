@@ -323,17 +323,24 @@ func runPackSizeSweep(t *testing.T, c *corpus, target, inlineMax int64,
 	t.Logf("FIRSTREAD[%s] one file in a pack nothing has touched: %s (%d GET, %s)",
 		human(target), first.wall.Round(time.Millisecond), first.gets, human(first.getBytes))
 
-	cold, warm := measurePackScattered(t, inner, sb, state, label, samples)
-	t.Logf("READ[%s] scattered %d files (%s wanted): cold %s (%d GET, %s) | warm %s (%d GET, %s)",
+	// Both readers, on the same sample: packs whole, and coalesced ranges.
+	// The ranged column is the floor on bytes, so the pair states the
+	// policy's cost rather than asserting it.
+	cold, warm := measurePackScattered(t, inner, sb, state, label, samples, 0)
+	rcold, _ := measurePackScattered(t, inner, sb, state, label+"-ranged", samples, -1)
+	t.Logf("READ[%s] scattered %d files (%s wanted): whole-pack cold %s (%d GET, %s), warm %s (%d GET, %s) | ranged cold %s (%d GET, %s)",
 		human(target), cold.files, human(cold.bytes),
 		cold.wall.Round(time.Millisecond), cold.gets, human(cold.getBytes),
-		warm.wall.Round(time.Millisecond), warm.gets, human(warm.getBytes))
+		warm.wall.Round(time.Millisecond), warm.gets, human(warm.getBytes),
+		rcold.wall.Round(time.Millisecond), rcold.gets, human(rcold.getBytes))
 
-	wcold, wwarm := measureDirWalk(t, inner, sb, state, walkDir, target>>20)
-	t.Logf("WALK[%s] %s (%d files, %s): cold %s (%d GET, %s) | warm %s (%d GET, %s)",
+	wcold, wwarm := measurePackWalk(t, inner, sb, state, label, walkDir, 0)
+	rwcold, _ := measurePackWalk(t, inner, sb, state, label+"-ranged", walkDir, -1)
+	t.Logf("WALK[%s] %s (%d files, %s): whole-pack cold %s (%d GET, %s), warm %s (%d GET, %s) | ranged cold %s (%d GET, %s)",
 		human(target), walkDir, wcold.files, human(wcold.bytes),
 		wcold.wall.Round(time.Millisecond), wcold.gets, human(wcold.getBytes),
-		wwarm.wall.Round(time.Millisecond), wwarm.gets, human(wwarm.getBytes))
+		wwarm.wall.Round(time.Millisecond), wwarm.gets, human(wwarm.getBytes),
+		rwcold.wall.Round(time.Millisecond), rwcold.gets, human(rwcold.getBytes))
 }
 
 // entryBytes sums every pack entry the generation lists, so the difference
@@ -420,12 +427,19 @@ func measureFirstRead(t *testing.T, inner *meterStore, sb *superblock.Superblock
 // across the whole tree, so consecutive reads rarely share a pack. This is
 // where a whole-pack policy is at its worst and where pack size decides how
 // bad that is.
+//
+// packCache is passed through so the same sample can be read both ways —
+// packs whole, and (negative) on coalesced ranges. Ranged reads are the
+// floor on bytes moved, so the difference between the two columns is
+// exactly what the whole-pack policy costs, with no heuristic in the way of
+// reading it.
 func measurePackScattered(t *testing.T, inner *meterStore, sb *superblock.Superblock,
-	state, label string, samples []corpusFile) (cold, warm readCost) {
+	state, label string, samples []corpusFile, packCache int64) (cold, warm readCost) {
 	t.Helper()
 	ctx := context.Background()
 	fs, err := genfs.Open(ctx, genfs.Options{
 		Inner: inner, SB: sb, CacheDir: filepath.Join(state, "scatter-"+label),
+		PackCacheBytes: packCache,
 	})
 	if err != nil {
 		t.Fatalf("genfs.Open: %v", err)
@@ -444,6 +458,60 @@ func measurePackScattered(t *testing.T, inner *meterStore, sb *superblock.Superb
 			rc.files++
 			rc.bytes += n.Length
 		}
+		rc.wall = time.Since(start)
+		rc.gets = inner.gets.Load() - mark.gets
+		rc.getBytes = inner.getB.Load() - mark.getB
+		return rc
+	}
+	return run(), run()
+}
+
+// measurePackWalk is the batch case — everything under one directory, in
+// the order publish laid it down — measured the same two ways.
+func measurePackWalk(t *testing.T, inner *meterStore, sb *superblock.Superblock,
+	state, label, dir string, packCache int64) (cold, warm readCost) {
+	t.Helper()
+	ctx := context.Background()
+	fs, err := genfs.Open(ctx, genfs.Options{
+		Inner: inner, SB: sb, CacheDir: filepath.Join(state, "walk-"+label),
+		PackCacheBytes: packCache,
+	})
+	if err != nil {
+		t.Fatalf("genfs.Open: %v", err)
+	}
+	defer fs.Close() //nolint:errcheck
+	top, err := fs.LookupPath(ctx, dir)
+	if err != nil {
+		t.Fatalf("lookup %s: %v", dir, err)
+	}
+	run := func() readCost {
+		mark := inner.snapshot()
+		start := time.Now()
+		var rc readCost
+		var walk func(ino uint64)
+		walk = func(ino uint64) {
+			ents, err := fs.Readdir(ctx, ino)
+			if err != nil {
+				t.Fatalf("readdir: %v", err)
+			}
+			for _, e := range ents {
+				n, err := fs.Lookup(ctx, ino, e.Name)
+				if err != nil {
+					t.Fatalf("lookup %s: %v", e.Name, err)
+				}
+				switch {
+				case n.Type == 2:
+					walk(n.Inode)
+				case n.Length > 0:
+					readWhole(t, fs, n.Inode, n.Length)
+					rc.files++
+					rc.bytes += n.Length
+				default:
+					rc.files++
+				}
+			}
+		}
+		walk(top.Inode)
 		rc.wall = time.Since(start)
 		rc.gets = inner.gets.Load() - mark.gets
 		rc.getBytes = inner.getB.Load() - mark.getB

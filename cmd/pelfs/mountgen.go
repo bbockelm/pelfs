@@ -349,7 +349,7 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		return fail(err)
 	}
 	defer g.down.timed("gencache", func() { g.gfs.Close() }) //nolint:errcheck
-	startup.mark("index")
+	startup.mark("root catalog")
 	g.stats.Update(func(sum *stats.Summary) { sum.Generation = sb.Generation })
 
 	if err := g.runPrefetch(ctx, o.prefetch); err != nil {
@@ -420,12 +420,12 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		return fail(fmt.Errorf("mount: %w (fuse needs Linux FUSE or macFUSE; try --backend nfs)", err))
 	}
 	startup.mark("mount")
-	// Reported after the mount, not after the pack index: "ready to serve"
-	// is not true until the kernel can reach the tree, and the steps in
-	// between (opening the overlay, standing up the frontend, the OS mount
-	// itself) are exactly the ones nobody could attribute before.
+	// Reported after the mount, not after the generation opens: "ready to
+	// serve" is not true until the kernel can reach the tree, and the steps
+	// in between (opening the overlay, standing up the frontend, the OS
+	// mount itself) are exactly the ones nobody could attribute before.
 	startup.report("ready to serve in {total} ({packs} packs; discovery {discovery}, "+
-		"access {access}, lease {lease}, head {head}, pack index {index}, "+
+		"access {access}, lease {lease}, head {head}, root catalog {root catalog}, "+
 		"prefetch {prefetch}, overlay {overlay}, mount {mount})",
 		"packs", len(sb.PackList))
 	mode := "read-only"

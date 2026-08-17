@@ -35,9 +35,15 @@ import (
 // immutable and content-addressed, so it is the natural cache object; the
 // cost of pulling one is bounded by the PUBLISHER's cut size, which is a
 // number a volume owner can actually choose, rather than by a heuristic a
-// reader has to get right. Granularity is a publish-side question:
-// scattered readers want small packs, and the transfer policy no longer
-// has an opinion about it.
+// reader has to get right. Granularity is a publish-side question now, and
+// publish.DefaultTargetPackSize carries the sweep that answers it.
+//
+// Where this LOSES, plainly: a reader taking single small files from all
+// over a tree moves several times the bytes ranged reads would (twice, at
+// the shipped cut size; seventeen times at the old 64 MiB). It is faster
+// even then, because it is fewer round trips — so the loss lands on a
+// bandwidth-bound link and not on a latency-bound one. A reader with less
+// disk than bandwidth turns it off.
 //
 // What survives from the old mechanism, and why:
 //

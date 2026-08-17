@@ -232,6 +232,8 @@ func appendField(b []byte, a slog.Attr) []byte {
 		return strconv.AppendInt(b, int64(v), 10)
 	case Plural:
 		return strconv.AppendInt(b, v.N, 10)
+	case Percent:
+		return strconv.AppendFloat(b, float64(v), 'f', -1, 64)
 	}
 	switch a.Value.Kind() {
 	case slog.KindInt64:
@@ -317,6 +319,13 @@ func (n ByteCount) String() string {
 		return fmt.Sprintf("%d B", n)
 	}
 }
+
+// Percent is a fraction in [0,1] that reads as a percentage in prose
+// ("94%") and stays the fraction in the structured field, where a
+// collector can average it across runs without parsing a suffix.
+type Percent float64
+
+func (p Percent) String() string { return fmt.Sprintf("%.0f%%", float64(p)*100) }
 
 // Plural is a count with its noun. "(s)" in an operator-facing message is
 // a refusal to decide; the structured field keeps the bare number.

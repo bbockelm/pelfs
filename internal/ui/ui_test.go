@@ -133,6 +133,20 @@ func TestValuesReadAsProseAndStoreAsNumbers(t *testing.T) {
 	}
 }
 
+// A share of something reads as a percentage and stores as the fraction:
+// a log that kept the "%" would make a collector parse a suffix off every
+// record before it could average anything.
+func TestPercentReadsAsProseAndStoresAsAFraction(t *testing.T) {
+	emit := func() { Info("uploading {uploading} of the seal", "uploading", Percent(0.9375)) }
+	if plain := say(t, false, emit); plain != "pelfs: uploading 94% of the seal\n" {
+		t.Errorf("plain: %q", plain)
+	}
+	if structured := say(t, true, emit); !strings.HasSuffix(structured,
+		"uploading {uploading} of the seal uploading=0.9375\n") {
+		t.Errorf("structured: %q", structured)
+	}
+}
+
 // Multi-line messages exist so a refusal can explain itself. Every line
 // must stay attributable on a terminal; the structured sink keeps one
 // record on one line.

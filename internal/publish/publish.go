@@ -213,6 +213,10 @@ type Result struct {
 	Raw        []byte // the wire bytes written to refs/<branch>
 	NewPacks   []packstore.SealedPack
 	Stats      Stats
+	// Upload says when the packs were on the wire, which is what turns
+	// "uploads overlap packing" from a claim into something the person
+	// who waited for the seal can check.
+	Upload UploadReport
 }
 
 // Seal publishes a write overlay into catalogs, packs, and a signed
@@ -283,6 +287,18 @@ func Publish(ctx context.Context, o Options) (*Result, error) {
 		catChildren:  make(map[uint64][]uint64),
 	}
 	defer p.pk.abort()
+	// The first pack on the wire is the moment publication starts, and
+	// until it was said out loud the only sign of upload activity was the
+	// cost line printed after everything had already finished. Announced
+	// once per publish, from the packer, so a seal that cuts a hundred
+	// packs still says it once. Creating a volume is exempt: it publishes
+	// one small pack of nothing, and announcing that a publication has
+	// begun would be noise on the one path where nobody is waiting.
+	if !o.emptySource {
+		p.pk.onFirstUpload = func(d time.Duration) {
+			ui.Info("publishing: the first pack is on the wire {elapsed} into this seal", "elapsed", d)
+		}
+	}
 
 	// Before the walk: the walk itself skips what this settles is
 	// unchanged (catalogreuse.go).
@@ -344,7 +360,10 @@ func Publish(ctx context.Context, o Options) (*Result, error) {
 	if err := p.saveDedupIndex(sb.Generation); err != nil {
 		ui.Warn("publish: dedup index not saved: {error}", "error", err)
 	}
-	return &Result{Superblock: sb, Raw: raw, NewPacks: newPacks, Stats: p.stats}, nil
+	return &Result{
+		Superblock: sb, Raw: raw, NewPacks: newPacks, Stats: p.stats,
+		Upload: p.pk.uploadReport(),
+	}, nil
 }
 
 // openSource opens the tree this publish reads and reports the volume

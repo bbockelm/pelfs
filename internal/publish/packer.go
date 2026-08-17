@@ -3,6 +3,7 @@ package publish
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/bbockelm/pelfs/internal/packstore"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
@@ -37,6 +38,37 @@ type packer struct {
 	wg  sync.WaitGroup
 	sem chan struct{}
 	err error
+
+	// onFirstUpload, if set, is called once, from the goroutine that puts
+	// the first pack's bytes on the wire. It is how a publish announces
+	// that it has stopped preparing and started sending; the caller sees
+	// one line per seal no matter how many packs follow.
+	onFirstUpload func(time.Duration)
+
+	// Occupancy accounting, all under mu. started is this publish's t0;
+	// inflight counts running uploads, since opens the current busy
+	// stretch, and busy accumulates the wall time with at least one
+	// upload running. Two extra lock acquisitions per pack, no sampling.
+	started  time.Time
+	uploads  int
+	inflight int
+	since    time.Time
+	busy     time.Duration
+	firstAt  time.Duration
+}
+
+// UploadReport is the evidence that a seal overlapped packing with
+// sending, rather than doing all of one and then all of the other. First
+// is how long after the publish began the first pack's bytes started
+// moving; Busy is the wall time with at least one upload in flight.
+//
+// A reader compares Busy against the seal they just waited out: a Busy
+// close to that wall time means the link was the constraint, and a small
+// one means the link sat idle while pelfs was doing something else.
+type UploadReport struct {
+	Packs int
+	First time.Duration
+	Busy  time.Duration
 }
 
 func newPacker(inner pelicanobj.Store, dir string, target, first int64, conc int) *packer {
@@ -48,9 +80,52 @@ func newPacker(inner pelicanobj.Store, dir string, target, first int64, conc int
 	}
 	return &packer{
 		inner: inner, dir: dir, target: target, cur: first,
-		added: make(map[string]struct{}),
-		sem:   make(chan struct{}, conc),
+		added:   make(map[string]struct{}),
+		sem:     make(chan struct{}, conc),
+		started: time.Now(),
 	}
+}
+
+// uploadBegan opens one upload's occupancy interval and fires the
+// first-upload hook, outside the lock so a slow sink cannot stall the
+// transfer it is reporting on.
+func (p *packer) uploadBegan() {
+	p.mu.Lock()
+	p.uploads++
+	if p.inflight == 0 {
+		p.since = time.Now()
+	}
+	p.inflight++
+	first := p.uploads == 1
+	if first {
+		p.firstAt = time.Since(p.started)
+	}
+	at := p.firstAt
+	p.mu.Unlock()
+	if first && p.onFirstUpload != nil {
+		p.onFirstUpload(at)
+	}
+}
+
+func (p *packer) uploadEnded() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.inflight--
+	if p.inflight == 0 {
+		p.busy += time.Since(p.since)
+	}
+}
+
+// uploadReport summarizes what the uploads did. Safe to call at any time;
+// an upload still running counts its time so far.
+func (p *packer) uploadReport() UploadReport {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	r := UploadReport{Packs: p.uploads, First: p.firstAt, Busy: p.busy}
+	if p.inflight > 0 {
+		r.Busy += time.Since(p.since)
+	}
+	return r
 }
 
 // has reports whether key was already added during this publish.
@@ -125,6 +200,11 @@ func (p *packer) cut(ctx context.Context) error {
 			p.setFailure(ctx.Err())
 			return
 		}
+		// Occupancy is measured from where the bytes actually start
+		// moving, i.e. after the concurrency gate, not from the cut: a
+		// pack queued behind three others is not on the wire.
+		p.uploadBegan()
+		defer p.uploadEnded()
 		if err := upload(ctx, p.inner); err != nil {
 			p.setFailure(err)
 		}

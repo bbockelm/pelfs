@@ -93,6 +93,70 @@ func TestPackerUploadsOverlap(t *testing.T) {
 	}
 }
 
+// slowStore holds every upload open for a fixed time, so occupancy is a
+// number the test can predict rather than a race with the scheduler.
+type slowStore struct {
+	pelicanobj.Store
+	dwell time.Duration
+}
+
+func (s *slowStore) Put(_ context.Context, _ string, in io.Reader) error {
+	time.Sleep(s.dwell)
+	_, err := io.Copy(io.Discard, in)
+	return err
+}
+
+// TestPackerReportsWhenTheUploadsRan pins the two numbers that let the
+// person who waited for a seal check the pipelining claim instead of
+// taking it on faith: when the first pack reached the wire, and how much
+// of the seal had something on it. The announcement must fire exactly
+// once however many packs follow — a per-pack line would drown the
+// terminal on a real seal.
+func TestPackerReportsWhenTheUploadsRan(t *testing.T) {
+	ctx := context.Background()
+	const dwell = 40 * time.Millisecond
+	p := newPacker(&slowStore{dwell: dwell}, t.TempDir(), 1, 1, 0)
+
+	var announced int
+	var firstAt time.Duration
+	p.onFirstUpload = func(d time.Duration) { announced++; firstAt = d }
+
+	start := time.Now()
+	payload := make([]byte, 512)
+	for _, key := range []string{"aa", "bb", "cc", "dd"} {
+		if err := p.add(ctx, key, packstore.EntryData, payload); err != nil {
+			t.Fatalf("add %s: %v", key, err)
+		}
+	}
+	packs, err := p.finish(ctx)
+	if err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	wall := time.Since(start)
+
+	if announced != 1 {
+		t.Errorf("the first-upload hook fired %d times; it must announce a seal once", announced)
+	}
+	r := p.uploadReport()
+	if r.Packs != len(packs) {
+		t.Errorf("report counts %d uploads for %d packs", r.Packs, len(packs))
+	}
+	if r.First != firstAt {
+		t.Errorf("report says the first upload began at %s, the hook said %s", r.First, firstAt)
+	}
+	if r.First <= 0 || r.First > wall {
+		t.Errorf("first upload at %s is outside the %s the packer ran", r.First, wall)
+	}
+	// Four packs at 40ms each, four at a time: the busy stretch cannot be
+	// shorter than one dwell, and cannot exceed the packer's own lifetime.
+	if r.Busy < dwell {
+		t.Errorf("occupancy is %s for %d uploads of %s each", r.Busy, r.Packs, dwell)
+	}
+	if r.Busy > wall {
+		t.Errorf("occupancy %s exceeds the %s the packer ran", r.Busy, wall)
+	}
+}
+
 // TestPackerFinishReportsUploadFailure pins that a failed upload fails the
 // publish. The ref flip happens after finish returns, so a swallowed
 // error here would publish a generation naming a pack that never landed.

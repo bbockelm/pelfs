@@ -33,7 +33,17 @@ type fedStore struct {
 	// federation caches — mandatory for mutable objects (lease, snapshots)
 	// whose read-after-write semantics a stale cache copy would break.
 	directRead bool
+	// rangeFS serves GetUnverified. It is a SECOND handle because the byte
+	// range is fixed when the handle is built, and it must not apply to
+	// ordinary reads, which stay checksum-verified.
+	rangeOnce sync.Once
+	rangeFS   *client.PelicanFS
 }
+
+// MaxMutableObject bounds an unverified read. Everything read that way is
+// a superblock or a lease — hundreds of bytes — so this is a sanity limit,
+// and hitting it is reported as an error rather than silently truncating.
+const MaxMutableObject = 1 << 20
 
 var _ Store = (*fedStore)(nil)
 
@@ -171,16 +181,49 @@ func (s *fedStore) Get(ctx context.Context, key string, off, limit int64, getter
 	return f.(io.ReadCloser), nil
 }
 
-// DirectVariant returns a copy that appends ?directread to every read.
-// The copy shares the PelicanFS handle and transfer options — only the
-// query suffix differs — so this costs nothing at the transport layer.
+// DirectVariant returns a store that appends ?directread to every read.
+// It shares the PelicanFS handle and transfer options — only the query
+// suffix differs — so this costs nothing at the transport layer. Fields
+// are named rather than copied wholesale because the range handle above
+// is guarded by a sync.Once, which must not be copied.
 func (s *fedStore) DirectVariant() Store {
 	if s.directRead {
 		return s
 	}
-	c := *s
-	c.directRead = true
-	return &c
+	return &fedStore{ctx: s.ctx, prefix: s.prefix, pfs: s.pfs, opts: s.opts, directRead: true}
+}
+
+// GetUnverified reads an object through a RANGED transfer, which the
+// Pelican client deliberately does not checksum: a server-advertised
+// digest covers a whole object and cannot be applied to a range, so
+// verification is skipped.
+//
+// It exists for ONE reason. An origin was observed answering for a
+// mutable object with a body and a digest taken from different versions
+// of it — in both directions, once with the digest a generation behind
+// the body and once with the body older than the digest. Only objects
+// pelfs overwrites in place can hit this; content-addressed packs and
+// catalogs are written once, and they keep full verification.
+//
+// This is not a claim that the bytes are trustworthy. The superblock
+// carries an Ed25519 signature, which is far stronger than a transport
+// md5, and refs.Fetch additionally refuses a generation older than one it
+// has already accepted. Those two checks — not this transfer — are what
+// make an unverified read safe to act on.
+//
+// TEMPORARY: delete this, and the fallback in ReadMutable, once origins
+// answer consistently for overwritten objects.
+func (s *fedStore) GetUnverified(_ context.Context, key string) (io.ReadCloser, error) {
+	s.rangeOnce.Do(func() {
+		opts := append(append([]client.TransferOption{}, s.opts...),
+			client.WithByteRange(0, MaxMutableObject-1))
+		s.rangeFS = client.NewPelicanFSWithPrefix(s.ctx, s.prefix, opts...)
+	})
+	f, err := s.rangeFS.OpenFile("/"+strings.TrimLeft(key, "/")+s.querySuffix(), os.O_RDONLY)
+	if err != nil {
+		return nil, mapNotFound(err)
+	}
+	return f.(io.ReadCloser), nil
 }
 
 func (s *fedStore) Put(ctx context.Context, key string, in io.Reader, getters ...object.AttrGetter) error {

@@ -19,7 +19,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 	"sync"
@@ -109,7 +108,7 @@ func Acquire(ctx context.Context, opts Options) (*Lease, error) {
 	// whole purpose is read-after-write: a cached copy would show a stale
 	// holder and hand two writers the same volume. Enforced here so no
 	// caller can forget it (see refs.New for the same guard).
-	if d, ok := opts.Store.(pelicanobj.DirectReader); ok {
+	if d, ok := pelicanobj.AsDirectReader(opts.Store); ok {
 		opts.Store = d.DirectVariant()
 	}
 
@@ -181,12 +180,12 @@ func read(ctx context.Context, store pelicanobj.Store) (*Info, *pelicanobj.KeyIn
 	if err != nil {
 		return nil, nil, err
 	}
-	rc, err := store.Get(ctx, Key, 0, -1)
-	if err != nil {
-		return nil, ki, err
-	}
-	defer rc.Close()
-	data, err := io.ReadAll(io.LimitReader(rc, 1<<16))
+	// The lease is rewritten on every renewal, so it is exposed to an
+	// origin that answers an overwritten object with a mismatched digest.
+	// Reading it through ReadMutable keeps such an origin from turning an
+	// ADVISORY lock into a hard failure; a bad lease body costs at most a
+	// spurious conflict, which callers already tolerate.
+	data, err := pelicanobj.ReadMutable(ctx, store, Key)
 	if err != nil {
 		return nil, ki, err
 	}

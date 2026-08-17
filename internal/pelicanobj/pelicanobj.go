@@ -16,13 +16,17 @@ package pelicanobj
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/object"
+	"github.com/pelicanplatform/pelican/error_codes"
+	log "github.com/sirupsen/logrus"
 )
 
 const userAgent = "pelfs/0.1"
@@ -104,6 +108,150 @@ type DirectReader interface {
 	// caches. Implementations may return the receiver when it already
 	// bypasses them.
 	DirectVariant() Store
+}
+
+// UnverifiedReader is implemented by transports that can read an object
+// without comparing it against a server-advertised checksum. See
+// ReadMutable for when that is appropriate, and fedStore.GetUnverified
+// for why it exists at all.
+type UnverifiedReader interface {
+	GetUnverified(ctx context.Context, key string) (io.ReadCloser, error)
+}
+
+// Unwrapper is implemented by stores that DECORATE another store —
+// statistics counters, the pack layer — and can hand back what they wrap.
+//
+// It exists because a decorator that embeds the Store interface silently
+// drops every capability outside it. Both optional interfaces here are
+// exactly that kind of capability, and both were quietly inert on the
+// mount path for precisely this reason: the direct-read rule never
+// applied, and the unverified-read fallback could not find a transport
+// able to perform it. Probing a decorator without unwrapping does not
+// fail loudly, it just does nothing, which is why these lookups go
+// through the helpers below rather than a bare type assertion.
+type Unwrapper interface {
+	Unwrap() Store
+}
+
+// AsDirectReader finds the nearest store that can bypass caches,
+// unwrapping decorators on the way down.
+func AsDirectReader(s Store) (DirectReader, bool) {
+	for s != nil {
+		if d, ok := s.(DirectReader); ok {
+			return d, true
+		}
+		u, ok := s.(Unwrapper)
+		if !ok {
+			return nil, false
+		}
+		s = u.Unwrap()
+	}
+	return nil, false
+}
+
+// AsUnverifiedReader finds the nearest store that can read without
+// transport checksum verification, unwrapping decorators on the way down.
+func AsUnverifiedReader(s Store) (UnverifiedReader, bool) {
+	for s != nil {
+		if u, ok := s.(UnverifiedReader); ok {
+			return u, true
+		}
+		w, ok := s.(Unwrapper)
+		if !ok {
+			return nil, false
+		}
+		s = w.Unwrap()
+	}
+	return nil, false
+}
+
+// ReadMutable reads one small mutable object whole.
+//
+// It reads normally first, so a healthy federation keeps full checksum
+// verification. Only when the server reports that its own advertised
+// digest disagrees with the body it just sent does it retry without
+// verification — a state no correct origin produces, and one the caller
+// cannot route around, since those are the only bytes on offer.
+//
+// The retry is safe only because every caller re-checks the result by
+// stronger means than a transport digest: refs verifies an Ed25519
+// signature and refuses a generation older than one already accepted,
+// and the lease is advisory, where the worst outcome is a spurious
+// conflict warning.
+func ReadMutable(ctx context.Context, s Store, key string) ([]byte, error) {
+	raw, err := readWhole(func() (io.ReadCloser, error) {
+		return s.Get(ctx, key, 0, -1)
+	})
+	if err == nil || !isChecksumMismatch(err) {
+		return raw, err
+	}
+	u, ok := AsUnverifiedReader(s)
+	if !ok {
+		log.WithField("key", key).Warn(
+			"pelfs: origin served a body its own checksum does not describe, and this transport " +
+				"cannot re-read without verification")
+		return nil, err
+	}
+	log.WithError(err).WithField("key", key).Warn(
+		"pelfs: origin's advertised checksum disagrees with the body it served; " +
+			"re-reading without transport verification (signature and generation checks still apply)")
+	raw, rerr := readWhole(func() (io.ReadCloser, error) {
+		return u.GetUnverified(ctx, key)
+	})
+	if rerr != nil {
+		// Say that the retry was tried and failed. Reporting only the
+		// original error made these two outcomes -- "never attempted"
+		// and "attempted, still refused" -- indistinguishable from the
+		// outside, which cost a debugging round trip against a real
+		// federation.
+		log.WithError(rerr).WithField("key", key).Warn(
+			"pelfs: unverified re-read also failed")
+		return nil, err
+	}
+	log.WithField("key", key).Warn("pelfs: unverified re-read succeeded; continuing on signature and generation checks")
+	return raw, nil
+}
+
+// readWhole reads an object with a hard ceiling, so a mutable object that
+// is unexpectedly enormous is an error rather than a silent truncation or
+// an unbounded allocation.
+func readWhole(open func() (io.ReadCloser, error)) ([]byte, error) {
+	rc, err := open()
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close() //nolint:errcheck
+	raw, err := io.ReadAll(io.LimitReader(rc, MaxMutableObject+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(raw)) > MaxMutableObject {
+		return nil, fmt.Errorf("mutable object exceeds %d bytes", int64(MaxMutableObject))
+	}
+	return raw, nil
+}
+
+// isChecksumMismatch reports the one condition the fallback answers:
+// Pelican's Transfer.ChecksumMismatch (6006).
+//
+// The typed check is the right one, but it is not sufficient on its own.
+// The error crosses the PelicanFS boundary, where a transfer failure can
+// be rebuilt as a plain error, and a lost type meant the fallback never
+// ran against the deployment it was written for -- the failure looked
+// exactly like having no fallback at all. So the code is matched
+// textually too. That is ugly, and it is deliberate: this whole path is
+// a temporary workaround for a misbehaving origin, and being unable to
+// recognize the very condition it exists for is the worse failure.
+func isChecksumMismatch(err error) bool {
+	if err == nil {
+		return false
+	}
+	var pe *error_codes.PelicanError
+	if errors.As(err, &pe) {
+		return pe.Code() == 6006
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "ChecksumMismatch") || strings.Contains(msg, "Error code 6006")
 }
 
 // New builds a Store for the given prefix URL, selecting the transport from

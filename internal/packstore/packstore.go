@@ -189,6 +189,13 @@ type Store struct {
 
 var _ pelicanobj.Store = (*Store)(nil)
 
+// Unwrap exposes the store this layer packs into, so capability probes
+// reach the transport. Embedding the Store interface hides everything
+// outside it, which silently disables optional behavior — the
+// direct-read rule for mutable objects, and the unverified-read fallback
+// — for anyone handed this layer instead of the transport.
+func (s *Store) Unwrap() pelicanobj.Store { return s.inner }
+
 // New builds the middleware and bootstraps the index from existing packs.
 func New(ctx context.Context, inner pelicanobj.Store, cfg Config) (*Store, error) {
 	if cfg.TargetSize <= 0 {

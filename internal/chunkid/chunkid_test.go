@@ -303,3 +303,69 @@ func TestIdentityHexRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+// A Chunker must not reserve MaxSize before it knows the stream needs it.
+// publish builds one per file, so a 16 MiB window per 8 KiB file was 84%
+// of the live heap at a seal's peak (see initialWindow).
+func TestChunkerWindowGrowsWithTheStream(t *testing.T) {
+	small := randStream(t, 11, 8000)
+	c := NewChunker(bytes.NewReader(small), Options{})
+	if _, err := c.Next(); err != nil && err != io.EOF {
+		t.Fatal(err)
+	}
+	if got := cap(c.buf); got > initialWindow {
+		t.Fatalf("chunking %d bytes reserved a %d-byte window", len(small), got)
+	}
+
+	// A stream that does reach MaxSize still gets the full window, or the
+	// cut search would not see far enough ahead for a forced cut.
+	big := randStream(t, 12, DefaultMaxSize*2)
+	c = NewChunker(bytes.NewReader(big), Options{})
+	if _, err := c.Next(); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(c.buf); got != DefaultMaxSize {
+		t.Fatalf("window grew to %d, want MaxSize %d", got, DefaultMaxSize)
+	}
+}
+
+// The growth loop must deliver the same window as a single ReadFull did,
+// however grudgingly the reader hands bytes over: cut points define the
+// volume's dedup domain and may not depend on read granularity.
+func TestChunkerCutsIndependentOfReadGranularity(t *testing.T) {
+	data := randStream(t, 13, 6<<20)
+	whole := chunkAll(t, data, Options{})
+
+	c := NewChunker(oneByteReader{bytes.NewReader(data)}, Options{})
+	var dribbled []Chunk
+	for {
+		ch, err := c.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		dribbled = append(dribbled, ch)
+	}
+	if len(whole) != len(dribbled) {
+		t.Fatalf("chunk counts differ: %d whole vs %d one byte at a time", len(whole), len(dribbled))
+	}
+	for i := range whole {
+		if whole[i].Offset != dribbled[i].Offset || len(whole[i].Data) != len(dribbled[i].Data) {
+			t.Fatalf("chunk %d: (%d,%d) vs (%d,%d)", i,
+				whole[i].Offset, len(whole[i].Data), dribbled[i].Offset, len(dribbled[i].Data))
+		}
+	}
+}
+
+// oneByteReader hands over one byte per Read, so every growth step of the
+// window is exercised.
+type oneByteReader struct{ r io.Reader }
+
+func (o oneByteReader) Read(p []byte) (int, error) {
+	if len(p) > 1 {
+		p = p[:1]
+	}
+	return o.r.Read(p)
+}

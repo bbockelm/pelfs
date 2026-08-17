@@ -94,13 +94,57 @@ func NewChunker(r io.Reader, opts Options) *Chunker {
 		// therefore select the top bits, not the bottom.
 		maskS: topMask(avgBits + normalization),
 		maskL: topMask(avgBits - normalization),
-		buf:   make([]byte, opts.MaxSize),
+		buf:   make([]byte, min(initialWindow, opts.MaxSize)),
 	}
 }
+
+// initialWindow is the buffer a Chunker starts with; it grows toward
+// MaxSize only for streams that actually reach it.
+//
+// The window used to be allocated at MaxSize (16 MiB by default) the
+// moment a Chunker was constructed, and publish constructs one PER FILE.
+// A seal of a tree of small files therefore reserved 16 MiB to chunk each
+// 8 KiB file: measured on a 60,000-file seal, chunkid.NewChunker held
+// 400 MB of the 477 MB live heap at the peak — 84% of it — and pushed
+// 16 MiB per file through the collector. The window must reach MaxSize
+// for a large file, so the size is not wrong; reserving it before a byte
+// has been read is.
+const initialWindow = 64 << 10
 
 // topMask returns a mask of the k highest bits of a uint64.
 func topMask(k int) uint64 {
 	return ^uint64(0) << (64 - k)
+}
+
+// fill tops the window up to max bytes, growing the buffer as it goes
+// rather than having reserved max up front.
+//
+// It delivers exactly what io.ReadFull(r, buf[n:max]) delivered before —
+// the window is filled to max, or the reader runs out and the error is
+// recorded — so the cut search sees the same bytes and chunk boundaries,
+// and therefore chunk identities and the volume's dedup domain, are
+// bit-for-bit unchanged.
+func (c *Chunker) fill() {
+	for c.n < c.max {
+		if c.n == len(c.buf) {
+			grown := len(c.buf) * 2
+			if grown > c.max {
+				grown = c.max
+			}
+			buf := make([]byte, grown)
+			copy(buf, c.buf[:c.n])
+			c.buf = buf
+		}
+		m, err := io.ReadFull(c.r, c.buf[c.n:])
+		c.n += m
+		if err != nil {
+			if err == io.ErrUnexpectedEOF {
+				err = io.EOF
+			}
+			c.err = err
+			return
+		}
+	}
 }
 
 // Next returns the next chunk, or io.EOF after the final chunk has been
@@ -111,17 +155,13 @@ func (c *Chunker) Next() (Chunk, error) {
 	// Keep the window full to MaxSize so the cut search always sees as
 	// far ahead as a forced cut could reach.
 	if c.err == nil && c.n < c.max {
-		m, err := io.ReadFull(c.r, c.buf[c.n:c.max])
-		c.n += m
-		if err == io.ErrUnexpectedEOF {
-			err = io.EOF
-		}
-		c.err = err
+		c.fill()
 	}
 	if c.n == 0 {
 		if c.err == nil {
-			// ReadFull filled the whole window with n starting at max=0;
-			// unreachable because max > 0, but keep the invariant honest.
+			// fill returns only with the window full or an error set, and
+			// max > 0, so n == 0 with no error is unreachable; keep the
+			// invariant honest.
 			return Chunk{}, io.ErrNoProgress
 		}
 		return Chunk{}, c.err

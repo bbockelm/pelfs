@@ -23,9 +23,9 @@ import (
 // switch lives inside go-nfs, one call site per RPC handler, and those
 // handlers recognize exactly three error shapes: os.IsNotExist,
 // os.IsExist, os.IsPermission (plus ENOSPC/EDQUOT/EFBIG on the write
-// path, via statusFromWriteError). Anything else becomes NFS3ERR_IO with
-// the cause discarded -- and NFS3ERR_IO is what a client reports as
-// "Input/output error".
+// path, via statusFromWriteError). Anything else is discarded in favor of
+// a fixed status the handler picked in advance -- usually NFS3ERR_IO,
+// which is what a client reports as "Input/output error".
 //
 // The worst offender is SetFileAttributes.Apply, which every CREATE,
 // MKDIR and SYMLINK runs to stamp the requested mode and times on the new
@@ -57,8 +57,8 @@ var (
 
 // translatable reports whether go-nfs can turn err into an NFS status
 // that says what actually happened. Everything outside this set reaches
-// the client as NFS3ERR_IO no matter which RPC produced it, which is why
-// it is the set worth reporting.
+// the client as whatever fixed status the handler settled on before it
+// looked, which is why it is the set worth reporting.
 //
 // io.EOF is here because the READ handler tests for it explicitly; it is
 // an end-of-file marker, not a failure.

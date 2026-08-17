@@ -413,6 +413,11 @@ func (s *Store) Stats() Stats {
 // flush: a caller that wants its bytes in the federation calls Flush
 // first, and one that is discarding a failed job should not pay for an
 // upload on the way out.
+//
+// Callers must have quiesced their readers. Close unmaps regardless of
+// pins, because the alternative is a lifecycle call that can block
+// forever on a stuck read, and a mount that has finished serving has
+// nobody left to protect.
 func (s *Store) Close() error {
 	s.mu.Lock()
 	s.closed = true

@@ -371,6 +371,50 @@ Corrections this document owes:
   staging absorbs at local-disk speed now throttles continuously. A
   product trade to make deliberately.
 
+## Should small files still be inlined?
+
+Today a file at or below `InlineMax` is stored **inline in the catalog**
+— its bytes live in a SQLite row rather than as a chunk in a pack. On a
+kernel tree that is 51% of files, and the argument for it is read
+latency: the catalog has already been fetched, so a small file costs zero
+additional round trips.
+
+The cost is paid at every seal, and it is now the largest one left.
+Profiling an 80k-file tree put `catalog.Inline` at ~1.0s, and it is
+**byte movement, not query overhead**: roughly 160 MB read out of base
+catalogs and written into new ones, because a catalog that must be
+rewritten carries its inline bytes with it. Batching queries cannot touch
+it; the pages have to move.
+
+That reframes the question as: *inline inside a packfile, or inline
+inside SQLite?* Small files no longer cost an inode either way — a pack
+entry is just an entry — so the choice is purely about where the bytes
+live and when they move.
+
+Packing them instead would:
+
+- move those 160 MB out of the synchronous exit and into the memtable
+  flush, where they upload during the session like everything else;
+- make catalogs small, which makes rewriting one cheap and makes
+  carry-forward more effective, since a catalog would hold references
+  rather than content;
+- cost a round trip on a **cold** read of a small file, where inline
+  costs none. The pack cache mitigates this — it promotes a whole pack
+  once enough distinct entries have been demanded — but the first reader
+  of a scattered small file pays.
+
+The likely answer is a much lower `InlineMax` rather than none at all:
+keep inlining where a chunk's own overhead would dominate the payload
+(hundreds of bytes), pack everything above it. That needs measuring, not
+guessing, and the measurement is specific: seal cost and catalog size as
+a function of `InlineMax`, against cold-read latency for a small file at
+each setting.
+
+Worth noting the interaction with generations: inline bytes are rewritten
+into a new catalog on *every* generation that touches that catalog, so
+the cost recurs for the life of the volume, while a packed chunk is
+written once and referenced thereafter.
+
 ## Settled
 
 - **Crash recovery** as described above. `fsync` flows through to the

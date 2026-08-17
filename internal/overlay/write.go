@@ -44,7 +44,7 @@ func (fs *FS) checkAbsentLocked(ctx context.Context, parent uint64, name string)
 // transaction that allocates the inode, writes the onode row and edge,
 // and runs the per-type extra rows.
 func (fs *FS) createNodeLocked(ctx context.Context, parent uint64, name string, tmpl Node,
-	extra func(tx *sql.Tx, ino uint64) error) (Node, error) {
+	extra func(tx querier, ino uint64) error) (Node, error) {
 	if err := fs.checkParentDirLocked(ctx, parent); err != nil {
 		return Node{}, err
 	}
@@ -52,7 +52,7 @@ func (fs *FS) createNodeLocked(ctx context.Context, parent uint64, name string, 
 		return Node{}, err
 	}
 	var out Node
-	err := fs.withTx(func(tx *sql.Tx) error {
+	err := fs.withTx(func(tx querier) error {
 		ino, err := fs.allocInodeLocked(tx)
 		if err != nil {
 			return err
@@ -90,7 +90,7 @@ func (fs *FS) Create(ctx context.Context, parent uint64, name string, mode, uid,
 	return fs.createNodeLocked(ctx, parent, name, Node{
 		Type: catalog.TypeFile, Mode: mode, UID: uid, GID: gid,
 		MtimeNS: now, CtimeNS: now, Nlink: 1,
-	}, func(tx *sql.Tx, ino uint64) error {
+	}, func(tx querier, ino uint64) error {
 		if _, err := tx.Exec(`INSERT INTO ocontent (inode) VALUES (?)`, int64(ino)); err != nil {
 			return err
 		}
@@ -126,7 +126,7 @@ func (fs *FS) Symlink(ctx context.Context, parent uint64, name, target string, u
 	return fs.createNodeLocked(ctx, parent, name, Node{
 		Type: catalog.TypeSymlink, Mode: 0777, UID: uid, GID: gid,
 		MtimeNS: now, CtimeNS: now, Nlink: 1, Length: int64(len(target)),
-	}, func(tx *sql.Tx, ino uint64) error {
+	}, func(tx querier, ino uint64) error {
 		_, err := tx.Exec(`INSERT INTO osymlink (inode, target) VALUES (?, ?)`, int64(ino), []byte(target))
 		return err
 	})
@@ -230,7 +230,7 @@ func (fs *FS) Unlink(ctx context.Context, parent uint64, name string) error {
 	// purge), which the dirty set cannot express once they are gone.
 	fs.bumpSeqLocked(r.ino)
 	var removeStaging string
-	err = fs.withTx(func(tx *sql.Tx) error {
+	err = fs.withTx(func(tx querier) error {
 		if err := fs.removeEdgeLocked(ctx, tx, parent, name, r.overlay); err != nil {
 			return err
 		}
@@ -324,7 +324,7 @@ func (fs *FS) Rmdir(ctx context.Context, parent uint64, name string) error {
 		return err
 	}
 	fs.bumpSeqLocked(r.ino)
-	return fs.withTx(func(tx *sql.Tx) error {
+	return fs.withTx(func(tx querier) error {
 		if err := fs.removeDirLocked(tx, r.ino); err != nil {
 			return err
 		}
@@ -378,7 +378,7 @@ func (fs *FS) Rename(ctx context.Context, srcParent uint64, srcName string, dstP
 		}
 	}
 	var removeStaging string
-	err = fs.withTx(func(tx *sql.Tx) error {
+	err = fs.withTx(func(tx querier) error {
 		if dstErr == nil {
 			// Replace the destination. No whiteout at the destination
 			// name: the incoming oedge shadows any base entry there.
@@ -508,7 +508,7 @@ func (fs *FS) Write(ctx context.Context, ino uint64, off int64, data []byte) (in
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	fs.markDirtyLocked(ino)
-	err := fs.withTx(func(tx *sql.Tx) error {
+	err := fs.withTx(func(tx querier) error {
 		row, err := fs.materializeAttrsLocked(ctx, tx, ino)
 		if err != nil {
 			return err
@@ -567,7 +567,7 @@ func (fs *FS) SetAttr(ctx context.Context, ino uint64, in SetAttrIn) (Node, erro
 	defer fs.mu.Unlock()
 	fs.markDirtyLocked(ino)
 	var out Node
-	err := fs.withTx(func(tx *sql.Tx) error {
+	err := fs.withTx(func(tx querier) error {
 		row, err := fs.materializeAttrsLocked(ctx, tx, ino)
 		if err != nil {
 			return err
@@ -642,7 +642,7 @@ func (fs *FS) Link(ctx context.Context, ino uint64, parent uint64, name string) 
 		return Node{}, err
 	}
 	var out Node
-	err = fs.withTx(func(tx *sql.Tx) error {
+	err = fs.withTx(func(tx querier) error {
 		row, err := fs.materializeAttrsLocked(ctx, tx, ino)
 		if err != nil {
 			return err
@@ -677,7 +677,7 @@ func (fs *FS) SetXattr(ctx context.Context, ino uint64, name string, value []byt
 	if _, err := fs.attrsLocked(ctx, ino, nil); err != nil {
 		return err
 	}
-	return fs.withTx(func(tx *sql.Tx) error {
+	return fs.withTx(func(tx querier) error {
 		_, err := tx.Exec(`INSERT OR REPLACE INTO oxattr (inode, name, value, tombstone) VALUES (?, ?, ?, 0)`,
 			int64(ino), []byte(name), value)
 		return err
@@ -717,7 +717,7 @@ func (fs *FS) RemoveXattr(ctx context.Context, ino uint64, name string) error {
 	if !found && !baseHas {
 		return ErrNotExist
 	}
-	return fs.withTx(func(tx *sql.Tx) error {
+	return fs.withTx(func(tx querier) error {
 		if baseHas {
 			_, err := tx.Exec(`INSERT OR REPLACE INTO oxattr (inode, name, value, tombstone) VALUES (?, ?, NULL, 1)`,
 				int64(ino), []byte(name))

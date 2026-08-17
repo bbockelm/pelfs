@@ -17,7 +17,7 @@ require (
 	github.com/willscott/go-nfs-client v0.0.0-20240104095149-b44639837b00
 	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78
 	lukechampine.com/blake3 v1.4.1
-	modernc.org/sqlite v1.39.0
+	modernc.org/sqlite v1.56.0
 )
 
 require (
@@ -184,7 +184,7 @@ require (
 	github.com/lestrrat-go/iter v1.0.2 // indirect
 	github.com/lestrrat-go/jwx/v2 v2.1.6 // indirect
 	github.com/lestrrat-go/option v1.0.1 // indirect
-	github.com/mattn/go-isatty v0.0.20 // indirect
+	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/mattn/go-runewidth v0.0.16 // indirect
 	github.com/mfridman/interpolate v0.0.2 // indirect
 	github.com/minio/sha256-simd v1.0.1 // indirect
@@ -193,7 +193,7 @@ require (
 	github.com/modern-go/reflect2 v1.0.3-0.20250322232337-35a7c28c31ee // indirect
 	github.com/mozillazg/go-httpheader v0.2.1 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
-	github.com/ncruces/go-strftime v0.1.9 // indirect
+	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/ncw/swift/v2 v2.0.3 // indirect
 	github.com/oklog/ulid v1.3.1 // indirect
 	github.com/oliverisaac/shellescape v0.0.0-20220131224704-1b6c6b87b668 // indirect
@@ -302,8 +302,8 @@ require (
 	k8s.io/client-go v0.36.3 // indirect
 	kernel.org/pub/linux/libs/security/libcap/cap v1.2.69 // indirect
 	kernel.org/pub/linux/libs/security/libcap/psx v1.2.69 // indirect
-	modernc.org/fileutil v1.3.8 // indirect
-	modernc.org/libc v1.66.3 // indirect
+	modernc.org/fileutil v1.4.0 // indirect
+	modernc.org/libc v1.74.4 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 	sigs.k8s.io/yaml v1.6.0 // indirect

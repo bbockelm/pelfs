@@ -15,23 +15,40 @@ import (
 // implementation slips underneath every read path without touching a
 // single call site.
 //
-// Only non-transactional reads use this. Statements belong to a
-// connection, and a *sql.Tx holds its own; write paths keep passing the
-// raw transaction, where the commit dominates anyway.
+// Transactions share the cache through txStmts (below), which is what
+// makes an untar — whose every mutation runs inside one — benefit too.
 type stmtCache struct {
 	db *sql.DB
 
 	mu sync.RWMutex
 	m  map[string]*sql.Stmt
+	// pending holds queries first seen INSIDE a transaction, which could
+	// not be compiled there (see lookup). withTx drains it before the
+	// next Begin, so a query is uncached at most once per session.
+	pending map[string]struct{}
+	// uncachable remembers queries db.Prepare refused, so a query that
+	// cannot be compiled costs one failed attempt rather than one per
+	// transaction forever.
+	uncachable map[string]struct{}
 }
 
 func newStmtCache(db *sql.DB) *stmtCache {
-	return &stmtCache{db: db, m: make(map[string]*sql.Stmt)}
+	return &stmtCache{
+		db:         db,
+		m:          make(map[string]*sql.Stmt),
+		pending:    make(map[string]struct{}),
+		uncachable: make(map[string]struct{}),
+	}
 }
 
 // prep returns the compiled statement for query, compiling it on first
 // use. A preparation failure returns nil and the caller falls back to the
 // uncached path, so a cache problem can never turn into a query failure.
+//
+// It must not be called while a transaction is open: preparing needs a
+// connection, the pool holds exactly one, and the transaction owns it —
+// db.Prepare would block on a connection that only the caller can
+// release. Transactional callers use lookup instead.
 func (c *stmtCache) prep(query string) *sql.Stmt {
 	c.mu.RLock()
 	st, ok := c.m[query]
@@ -41,6 +58,11 @@ func (c *stmtCache) prep(query string) *sql.Stmt {
 	}
 	st, err := c.db.Prepare(query)
 	if err != nil {
+		c.mu.Lock()
+		if c.uncachable != nil {
+			c.uncachable[query] = struct{}{}
+		}
+		c.mu.Unlock()
 		return nil
 	}
 	c.mu.Lock()
@@ -50,8 +72,49 @@ func (c *stmtCache) prep(query string) *sql.Stmt {
 		return existing
 	}
 	c.m[query] = st
+	delete(c.pending, query)
 	c.mu.Unlock()
 	return st
+}
+
+// lookup returns an already-compiled statement, or nil without compiling
+// one. A miss is recorded for warm to compile later, outside any
+// transaction.
+func (c *stmtCache) lookup(query string) *sql.Stmt {
+	c.mu.RLock()
+	st, ok := c.m[query]
+	_, bad := c.uncachable[query]
+	c.mu.RUnlock()
+	if ok || bad {
+		return st
+	}
+	c.mu.Lock()
+	if c.pending != nil {
+		c.pending[query] = struct{}{}
+	}
+	c.mu.Unlock()
+	return nil
+}
+
+// warm compiles the queries lookup could not. The caller must hold no
+// open transaction (see prep).
+func (c *stmtCache) warm() {
+	c.mu.RLock()
+	n := len(c.pending)
+	c.mu.RUnlock()
+	if n == 0 {
+		return
+	}
+	c.mu.Lock()
+	queries := make([]string, 0, len(c.pending))
+	for q := range c.pending {
+		queries = append(queries, q)
+	}
+	c.pending = make(map[string]struct{})
+	c.mu.Unlock()
+	for _, q := range queries {
+		c.prep(q)
+	}
 }
 
 func (c *stmtCache) QueryRow(query string, args ...any) *sql.Row {
@@ -82,4 +145,77 @@ func (c *stmtCache) close() {
 		st.Close() //nolint:errcheck
 	}
 	c.m = nil
+	c.pending = nil
+	c.uncachable = nil
+}
+
+// txStmts is the querier withTx hands to write paths: the transaction,
+// with the same compile-once treatment the read paths get.
+//
+// Every mutation the overlay performs runs inside a transaction, so
+// before this existed the cache above covered only reads and an untar
+// paid a full SQL parse per INSERT — Tx.Exec and Tx.QueryRow together
+// were 37% of mount CPU, roughly two thirds of that in the parser.
+//
+// tx.Stmt is what makes it legal: database/sql looks the statement up by
+// connection and reuses the driver handle when the transaction is on the
+// same connection, which it always is here — the pool is opened with
+// MaxOpenConns(1). Nothing about the transaction changes: same BEGIN,
+// same COMMIT, same durability.
+type txStmts struct {
+	tx *sql.Tx
+	c  *stmtCache
+	// m memoizes this transaction's handles. tx.Stmt allocates a wrapper
+	// per call and the transaction pins every one until commit, which a
+	// loop over thousands of inodes (Rebase) would otherwise turn into
+	// thousands of live wrappers. No lock: a transaction belongs to one
+	// operation, and operations are serialized by FS.mu.
+	m map[string]*sql.Stmt
+}
+
+func newTxStmts(tx *sql.Tx, c *stmtCache) *txStmts {
+	return &txStmts{tx: tx, c: c}
+}
+
+// stmt returns the transaction's handle on the cached statement, or nil
+// when the query is not compiled yet (its first execution this session
+// runs uncached, and warm compiles it before the next transaction).
+func (t *txStmts) stmt(query string) *sql.Stmt {
+	if st, ok := t.m[query]; ok {
+		return st
+	}
+	pooled := t.c.lookup(query)
+	if pooled == nil {
+		return nil
+	}
+	st := t.tx.Stmt(pooled)
+	if t.m == nil {
+		t.m = make(map[string]*sql.Stmt, 8)
+	}
+	t.m[query] = st
+	return st
+}
+
+func (t *txStmts) QueryRow(query string, args ...any) *sql.Row {
+	if st := t.stmt(query); st != nil {
+		return st.QueryRow(args...)
+	}
+	return t.tx.QueryRow(query, args...)
+}
+
+// Query is deliberately NOT cached. A cached statement is one driver
+// handle with one compiled sqlite3_stmt behind it, and Query hands the
+// caller a cursor it keeps open: two overlapping reads of the same query
+// would step on each other's cursor, where today each gets its own
+// statement. QueryRow is safe because Scan closes before returning, and
+// no write path streams rows inside its transaction anyway.
+func (t *txStmts) Query(query string, args ...any) (*sql.Rows, error) {
+	return t.tx.Query(query, args...)
+}
+
+func (t *txStmts) Exec(query string, args ...any) (sql.Result, error) {
+	if st := t.stmt(query); st != nil {
+		return st.Exec(args...)
+	}
+	return t.tx.Exec(query, args...)
 }

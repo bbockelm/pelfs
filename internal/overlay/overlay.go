@@ -378,12 +378,19 @@ func (fs *FS) allocInodeLocked(tx querier) (uint64, error) {
 }
 
 // withTx runs fn in one transaction: the per-operation crash-safety unit.
-func (fs *FS) withTx(fn func(tx *sql.Tx) error) error {
+//
+// fn gets a querier, not the raw *sql.Tx, so its statements go through
+// the same compile-once cache the read paths use (stmtcache.go). The warm
+// call is why it can: compiling needs the pool's one connection, which
+// the transaction is about to take, so any query a previous transaction
+// met for the first time is compiled here — before Begin, never inside.
+func (fs *FS) withTx(fn func(tx querier) error) error {
+	fs.q.warm()
 	tx, err := fs.db.Begin()
 	if err != nil {
 		return err
 	}
-	if err := fn(tx); err != nil {
+	if err := fn(newTxStmts(tx, fs.q)); err != nil {
 		tx.Rollback() //nolint:errcheck
 		return err
 	}

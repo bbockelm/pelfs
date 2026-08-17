@@ -63,12 +63,14 @@ func (h *handler) Handle(_ context.Context, r slog.Record) error {
 		lead = linePrefix(r.Level)
 	}
 	b = append(b, lead...)
-	b = expand(b, lead, r.Message, attrs, h.structured)
 	if h.structured {
+		b = flatten(b, r.Message, attrs)
 		for _, a := range attrs {
 			b = append(b, ' ')
 			b = appendField(b, a)
 		}
+	} else {
+		b = expand(b, lead, r.Message, attrs)
 	}
 	b = append(b, '\n')
 
@@ -99,16 +101,19 @@ func levelName(l slog.Level) string {
 	}
 }
 
-// expand writes msg, substituting {name} with the value of the attribute
-// of that name. A brace run that names no attribute is left alone, so a
-// message containing literal braces is harmless rather than mangled.
+// flatten writes msg for the structured sink: one record on one line,
+// with its {name} placeholders left standing rather than substituted.
 //
-// A newline in a message starts a continuation line, which is re-prefixed
-// with lead so that every line on the terminal is attributable and a
-// warning does not lose its warning after the first line. The structured
-// sink keeps one record on one line and joins the continuations with a
-// space.
-func expand(b []byte, lead, msg string, attrs []slog.Attr, structured bool) []byte {
+// Substituting here as well as emitting the fields printed every value
+// twice on the same line, which on the phase breakdowns -- sentences that
+// are nothing but values -- doubled the line and buried the content. The
+// template is also worth more to a reader of a log than the rendered
+// sentence is: it is constant, so a collector can group by it and count
+// occurrences across runs, and {name} says exactly which field below
+// carries the value. Grepping is unaffected, because the literal words
+// of a template are what greps match, and a value can no longer smuggle a
+// newline into the middle of a record.
+func flatten(b []byte, msg string, attrs []slog.Attr) []byte {
 	for len(msg) > 0 {
 		i := strings.IndexAny(msg, "{\n")
 		if i < 0 {
@@ -116,12 +121,48 @@ func expand(b []byte, lead, msg string, attrs []slog.Attr, structured bool) []by
 		}
 		b = append(b, msg[:i]...)
 		if msg[i] == '\n' {
-			if structured {
-				b = append(b, ' ')
-			} else {
-				b = append(b, '\n')
-				b = append(b, lead...)
-			}
+			b = append(b, ' ')
+			msg = msg[i+1:]
+			continue
+		}
+		rest := msg[i+1:]
+		j := strings.IndexByte(rest, '}')
+		if j < 0 {
+			return append(b, msg[i:]...)
+		}
+		// A placeholder naming no attribute is left exactly as written,
+		// for the same reason expand leaves it: the message is quoting a
+		// shell snippet or a JSON fragment, not naming a field.
+		if _, ok := lookup(attrs, rest[:j]); ok {
+			b = append(b, '{')
+			b = appendFieldKey(b, rest[:j])
+			b = append(b, '}')
+		} else {
+			b = append(b, msg[i:i+j+2]...)
+		}
+		msg = rest[j+1:]
+	}
+	return b
+}
+
+// expand writes msg for the terminal, substituting {name} with the value
+// of the attribute of that name. A brace run that names no attribute is
+// left alone, so a message containing literal braces is harmless rather
+// than mangled.
+//
+// A newline in a message starts a continuation line, which is re-prefixed
+// with lead so that every line on the terminal is attributable and a
+// warning does not lose its warning after the first line.
+func expand(b []byte, lead, msg string, attrs []slog.Attr) []byte {
+	for len(msg) > 0 {
+		i := strings.IndexAny(msg, "{\n")
+		if i < 0 {
+			return append(b, msg...)
+		}
+		b = append(b, msg[:i]...)
+		if msg[i] == '\n' {
+			b = append(b, '\n')
+			b = append(b, lead...)
 			msg = msg[i+1:]
 			continue
 		}
@@ -184,7 +225,7 @@ func appendValue(b []byte, v slog.Value) []byte {
 // out as bare numbers here even though the sentence humanized them: the
 // prose is for reading, the field is for arithmetic.
 func appendField(b []byte, a slog.Attr) []byte {
-	b = append(b, a.Key...)
+	b = appendFieldKey(b, a.Key)
 	b = append(b, '=')
 	switch v := a.Value.Any().(type) {
 	case ByteCount:
@@ -216,6 +257,24 @@ func appendField(b []byte, a slog.Attr) []byte {
 		s = fmt.Sprintf("%v", v)
 	}
 	return appendQuoted(b, s)
+}
+
+// appendFieldKey renders an attribute name as a logfmt key. A phase clock
+// names its attributes for the prose that reads them back ("lease
+// release", "pack index"), and logfmt has no way to quote a key, so a
+// space in one silently splits it into two keys -- and the fields are now
+// the whole of what a collector gets. The call site keeps writing the
+// label a person reads; the sink makes it parseable, which is where every
+// other formatting decision in this package lives too.
+func appendFieldKey(b []byte, name string) []byte {
+	for i := 0; i < len(name); i++ {
+		if c := name[i]; c == ' ' || c == '=' || c == '"' {
+			b = append(b, '_')
+		} else {
+			b = append(b, c)
+		}
+	}
+	return b
 }
 
 // appendQuoted quotes only when the value would otherwise be ambiguous

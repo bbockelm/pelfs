@@ -777,9 +777,10 @@ func (c *phaseClock) begin() {
 	c.start, c.last, c.running = now, now, true
 }
 
-// mark closes the phase that was running and names it. name is both the
-// prose label and the structured attribute key, so it must be a bare
-// identifier the ui template interpolator will accept.
+// mark closes the phase that was running and names it. name is the label
+// a reader sees in the sentence; ui derives the structured key from it, so
+// a two-word phase reads as one ("lease release") without costing the log
+// a key it cannot parse.
 func (c *phaseClock) mark(name string) {
 	if c == nil || !c.running {
 		return

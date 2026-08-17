@@ -53,12 +53,38 @@
 //	ui.Info("sealed generation {generation} ({chunks} chunks)",
 //	    "generation", gen, "chunks", n)
 //
-// The plain sink renders the sentence; the structured sink renders the
-// sentence AND emits generation=… chunks=… after it. Values live in
-// exactly one place at the call site, the prose stays a sentence written
-// for a human, and the machine-readable view comes for free. Attributes
-// carry the values worth extracting — generations, keys, durations, byte
-// counts; a message with nothing to extract simply passes no attributes.
+// The plain sink renders the sentence:
+//
+//	pelfs: sealed generation 7 (412 chunks)
+//
+// The structured sink renders the TEMPLATE and the fields:
+//
+//	…INFO pelfs: sealed generation {generation} ({chunks} chunks) generation=7 chunks=412
+//
+// Values live in exactly one place at the call site, the prose stays a
+// sentence written for a human, and the machine-readable view comes for
+// free. Attributes carry the values worth extracting — generations, keys,
+// durations, byte counts; a message with nothing to extract simply passes
+// no attributes.
+//
+// The structured sink does NOT also render the sentence. Every value pelfs
+// logs is named by its template — so a sink that interpolated as well as
+// emitted fields printed all of them twice on one line, and the two
+// breakdowns that are nothing but values ("torn down in …", "ready to
+// serve in …") came out at double length with the prose buried in front of
+// its own duplicate. Which of the two views to show is the sink's decision
+// to make, and each sink now makes it once, for its own reader: a person
+// watching gets the sentence, a log gets the fields it can do arithmetic
+// on plus a message that is CONSTANT — groupable, countable across runs,
+// and immune to a value that happens to contain a newline. An attribute
+// named for the prose that reads it back ("lease release") becomes a
+// logfmt-legal key, in the placeholder as well as in the field, so {name}
+// always names a key that is really there.
+//
+// Greps against a log are unaffected by that choice and must stay that
+// way: it is the literal words of a template that scripts match, so a
+// message must carry the words its readers look for OUTSIDE its
+// placeholders.
 package ui
 
 import (

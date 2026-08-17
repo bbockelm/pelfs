@@ -80,6 +80,15 @@ func (sp sessionSpec) bytes(plan []fileSpec) (live, written int64) {
 	return
 }
 
+// scratchFor sizes the one reusable content buffer both measurements use.
+func scratchFor(plan []fileSpec) []byte {
+	n := 0
+	for _, f := range plan {
+		n = max(n, f.size)
+	}
+	return make([]byte, n)
+}
+
 // versionBytes fills buf deterministically. Content is generated rather
 // than stored so a 900 MiB session does not need 900 MiB of test heap.
 func versionBytes(buf []byte, ino uint64, version int) []byte {
@@ -178,7 +187,7 @@ func measureStaging(t *testing.T, plan []fileSpec, latency time.Duration) result
 	obj := &countingStore{objs: map[string][]byte{}, discard: true, latency: latency}
 	res := result{uploadedAt: map[string]int64{}}
 
-	buf := make([]byte, 1<<20)
+	buf := scratchFor(plan)
 	t0 := time.Now()
 	for _, f := range plan {
 		for v := range f.versions {
@@ -267,7 +276,7 @@ func measureMemtable(t *testing.T, plan []fileSpec, latency time.Duration) resul
 	defer s.Close() //nolint:errcheck
 	res := result{uploadedAt: map[string]int64{}}
 
-	buf := make([]byte, 1<<20)
+	buf := scratchFor(plan)
 	t0 := time.Now()
 	for _, f := range plan {
 		for v := range f.versions {

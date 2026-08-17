@@ -134,8 +134,8 @@ func (fs *FS) DirtyScope() (map[uint64]struct{}, bool, error) {
 // rowDirtyLocked is the table half of DirtyInodes: inodes with a row that
 // makes them differ from the base generation.
 func (fs *FS) rowDirtyLocked() (map[uint64]struct{}, error) {
-	if set, err := fs.dirtyRowInodesLocked(); err != nil || set != nil {
-		return set, err
+	if set, ok := fs.dirtyRowInodesLocked(); ok {
+		return set, nil
 	}
 	set := make(map[uint64]struct{})
 	for _, q := range []string{

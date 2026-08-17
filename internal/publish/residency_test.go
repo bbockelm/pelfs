@@ -91,3 +91,43 @@ func TestSealAfterCheckpointWithBoundedResidency(t *testing.T) {
 	res := v.checkpoint()
 	v.verifyBodies(res, body)
 }
+
+// A namespace change interacts with the residency bound through the
+// listing itself: a directory read now makes its whole listing resident in
+// one pass, including base entries the overlay hides or replaces. Those
+// entries take slots in a bounded residency map, so a seal over a tree
+// past the bound must still resolve everything it does keep — after
+// unlinks (whiteouts), renames (a base name replaced), and a recreate over
+// a hidden name.
+func TestSealBeyondResidencyAfterNamespaceChanges(t *testing.T) {
+	ctx := context.Background()
+	v := newReuseVolResident(t, [16]byte{0x5e, 0xa1, 0x03}, residencyCap)
+	body := sealBeyondResidency(t, v)
+	first := v.checkpoint()
+	v.verifyBodies(first, body)
+
+	d0 := lookupPath(t, v.ov, "d0")
+	d1 := lookupPath(t, v.ov, "d1")
+	if err := v.ov.Unlink(ctx, d0.Inode, "f0"); err != nil {
+		t.Fatalf("unlink d0/f0: %v", err)
+	}
+	delete(body, "d0/f0")
+	if err := v.ov.Rename(ctx, d1.Inode, "f1", d0.Inode, "f1moved"); err != nil {
+		t.Fatalf("rename d1/f1: %v", err)
+	}
+	body["d0/f1moved"] = body["d1/f1"]
+	delete(body, "d1/f1")
+	// Recreating over a whiteout is the case where the base entry is both
+	// hidden and replaced, so the listing carries a name whose base inode
+	// must not be what the seal publishes.
+	body["d0/f0"] = []byte("a different body under a name the base still holds")
+	v.create(d0.Inode, "f0", body["d0/f0"])
+
+	second := v.checkpoint()
+	v.verifyBodies(second, body)
+	sealed := openGenfs(t, v.inner, second.Superblock, nil)
+	gone := lookupPath(t, sealed, "d1")
+	if _, err := sealed.Lookup(ctx, gone.Inode, "f1"); err == nil {
+		t.Fatal("a renamed-away name still resolves in the sealed generation")
+	}
+}

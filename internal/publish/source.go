@@ -135,12 +135,10 @@ type overlayView interface {
 	NextInode() (uint64, error)
 	PrepareSeal() error
 	ReleaseSeal()
-	Lookup(ctx context.Context, parent uint64, name string) (overlay.Node, error)
 	GetAttr(ctx context.Context, ino uint64) (overlay.Node, error)
 	ReaddirRetain(ctx context.Context, ino uint64) ([]overlay.DirEntry, error)
 	Readlink(ctx context.Context, ino uint64) (string, error)
 	AllXattrs(ctx context.Context, ino uint64) (map[string][]byte, error)
-	Read(ctx context.Context, ino uint64, off int64, dst []byte) (int, error)
 	OpenFile(ctx context.Context, ino uint64, length int64) (io.ReadCloser, error)
 	BaseRootCatalog() [32]byte
 	BaseContent(ctx context.Context, ino uint64) (genfs.Content, bool, error)

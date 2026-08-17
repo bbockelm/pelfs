@@ -219,6 +219,11 @@ func (fs *FS) loadRowCache() (*rowCache, error) {
 // The cache-aware row readers. Each falls through to its query when no
 // cache is armed — which includes every transactional caller, since a
 // transaction drops the cache before it begins.
+//
+// The slice-returning ones hand back the cache's own slice rather than a
+// copy, so callers read and never modify. Nothing else may: the rows are a
+// frozen answer, and a caller that wanted to change one would be writing,
+// which drops the cache anyway.
 
 func (fs *FS) onodeLocked(q querier, ino uint64) (*onodeRow, error) {
 	if fs.rows != nil {
@@ -381,11 +386,12 @@ func (fs *FS) obaseLocked(q querier, ino uint64) (provEdge, bool, error) {
 	return provEdge{parent: uint64(parent), name: string(name)}, true, nil
 }
 
-// dirtyRowInodesLocked is rowDirtyLocked's answer: every inode with a row
-// that makes it differ from the base generation.
-func (fs *FS) dirtyRowInodesLocked() (map[uint64]struct{}, error) {
+// dirtyRowInodesLocked is rowDirtyLocked's answer — every inode with a row
+// that makes it differ from the base generation — from the cache. ok is
+// false when no cache is armed and the caller must run the six queries.
+func (fs *FS) dirtyRowInodesLocked() (map[uint64]struct{}, bool) {
 	if fs.rows == nil {
-		return nil, nil
+		return nil, false
 	}
 	set := make(map[uint64]struct{}, len(fs.rows.node))
 	for ino := range fs.rows.node {
@@ -408,5 +414,5 @@ func (fs *FS) dirtyRowInodesLocked() (map[uint64]struct{}, error) {
 			}
 		}
 	}
-	return set, nil
+	return set, true
 }

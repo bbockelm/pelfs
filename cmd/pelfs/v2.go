@@ -17,6 +17,7 @@ import (
 	"github.com/bbockelm/pelfs/internal/publish"
 	"github.com/bbockelm/pelfs/internal/refs"
 	"github.com/bbockelm/pelfs/internal/superblock"
+	"github.com/bbockelm/pelfs/internal/ui"
 )
 
 // keyPassphrase is the optional passphrase protecting the PEM key file
@@ -56,8 +57,8 @@ func loadOrCreateSigningKey(path string, prev *superblock.Superblock) (ed25519.P
 	if err := os.WriteFile(path, []byte(hex.EncodeToString(priv)+"\n"), 0600); err != nil {
 		return nil, err
 	}
-	fmt.Fprintf(os.Stderr, "pelfs: generated volume signing key %s (public key %s)\n",
-		path, hex.EncodeToString(priv.Public().(ed25519.PublicKey)))
+	ui.Info("generated volume signing key {path} (public key {key})",
+		"path", path, "key", hex.EncodeToString(priv.Public().(ed25519.PublicKey)))
 	return priv, nil
 }
 
@@ -194,6 +195,7 @@ func initVolumeAt(o *cmdOpts, prefix, branch string) error {
 	if _, err := publish.InitVolume(ctx, popts); err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "pelfs: created volume %x on %s/%s (generation 0)\n", volID, refs.RefDirKey, branch)
+	ui.Info("created volume {volume} on {ref} (generation 0)",
+		"volume", fmt.Sprintf("%x", volID), "ref", refs.RefDirKey+"/"+branch)
 	return nil
 }

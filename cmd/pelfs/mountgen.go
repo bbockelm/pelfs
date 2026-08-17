@@ -30,6 +30,7 @@ import (
 	"github.com/bbockelm/pelfs/internal/refs"
 	"github.com/bbockelm/pelfs/internal/stats"
 	"github.com/bbockelm/pelfs/internal/superblock"
+	"github.com/bbockelm/pelfs/internal/ui"
 	"github.com/bbockelm/pelfs/internal/vfsbilly"
 )
 
@@ -350,8 +351,8 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 				// meaningful only over the generation they were recorded
 				// against, so it cannot be replayed onto the new head.
 				err = fmt.Errorf("%w\n"+
-					"pelfs: the unsealed overlay at %s was recorded over an older generation of %s.\n"+
-					"pelfs: its contents are intact but cannot be sealed onto the current head; move it aside to start a fresh overlay",
+					"the unsealed overlay at %s was recorded over an older generation of %s.\n"+
+					"its contents are intact but cannot be sealed onto the current head; move it aside to start a fresh overlay",
 					err, g.overlayDir, branch)
 			}
 			return fail(fmt.Errorf("open overlay: %w", err))
@@ -391,8 +392,8 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	if rw {
 		mode = "read-write (overlay; unmount seals)"
 	}
-	fmt.Fprintf(os.Stderr, "pelfs: generation %d mounted %s on %s (catalog-native)\n",
-		sb.Generation, mode, mountpoint)
+	ui.Info("generation {generation} mounted {mode} on {mountpoint} (catalog-native)",
+		"generation", sb.Generation, "mode", mode, "mountpoint", mountpoint)
 
 	sessionCtx, stopSession := context.WithCancel(ctx)
 	defer stopSession()
@@ -420,7 +421,8 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	// scales with the size of the namespace, not with the bytes in it.
 	if rw && o.snapshotInterval > 0 {
 		go g.checkpointPeriodically(sessionCtx, o.snapshotInterval)
-		fmt.Fprintf(os.Stderr, "pelfs: checkpointing every %s (--snapshot-interval 0 disables)\n", o.snapshotInterval)
+		ui.Info("checkpointing every {interval} (--snapshot-interval 0 disables)",
+			"interval", o.snapshotInterval)
 	}
 	defer g.publishMountRecord()()
 
@@ -428,7 +430,7 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	// mounts never do — the overlay is pinned to the generation it
 	// shadows, and swapping underneath it would strand its dirty state.
 	if poll > 0 && nfsSrv != nil {
-		fmt.Fprintln(os.Stderr, "pelfs: --poll ignored with --backend nfs (NFS caching is client-driven; there is no invalidation channel to push to)")
+		ui.Info("--poll ignored with --backend nfs (NFS caching is client-driven; there is no invalidation channel to push to)")
 	} else if poll > 0 && !rw && tag == "" {
 		r := rawfuse.NewRefresher(g.gfs, srv, func(c context.Context) (*superblock.Superblock, error) {
 			f, err := rstore.Fetch(c, branch)
@@ -438,9 +440,9 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 			return f.Superblock, nil
 		}, poll)
 		go g.follow(sessionCtx, r, poll)
-		fmt.Fprintf(os.Stderr, "pelfs: following %s, re-checking every %s\n", branch, poll)
+		ui.Info("following {branch}, re-checking every {interval}", "branch", branch, "interval", poll)
 	} else if poll > 0 {
-		fmt.Fprintln(os.Stderr, "pelfs: --poll ignored (writable mounts and tags are pinned by design)")
+		ui.Info("--poll ignored (writable mounts and tags are pinned by design)")
 	}
 
 	code := 0
@@ -454,11 +456,11 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		if nfsSrv != nil {
 			unmountErr = nfsmount.Unmount(mountpoint)
 			if unmountErr != nil {
-				fmt.Fprintf(os.Stderr, "pelfs: unmount: %v\n", unmountErr)
+				ui.Error("unmount: {error}", "error", unmountErr)
 			}
 		} else {
 			if unmountErr = srv.Unmount(); unmountErr != nil {
-				fmt.Fprintf(os.Stderr, "pelfs: unmount: %v\n", unmountErr)
+				ui.Error("unmount: {error}", "error", unmountErr)
 			}
 			srv.Wait()
 		}
@@ -468,7 +470,7 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		if nfsSrv != nil {
 			<-sigs
 			if unmountErr = nfsmount.Unmount(mountpoint); unmountErr != nil {
-				fmt.Fprintf(os.Stderr, "pelfs: unmount: %v\n", unmountErr)
+				ui.Error("unmount: {error}", "error", unmountErr)
 			}
 		} else {
 			go func() {
@@ -482,7 +484,7 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	stopSession()
 	sealErr := g.sealAtExit(ctx)
 	if sealErr != nil {
-		fmt.Fprintf(os.Stderr, "pelfs: %v\n", sealErr)
+		ui.Error("{error}", "error", sealErr)
 		// A failing payload already reported a status; keep it rather than
 		// flattening it to 1.
 		if code == 0 {
@@ -491,7 +493,7 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	}
 	g.refresh()
 	if err := g.stats.Finalize(code, unmountErr == nil && sealErr == nil); err != nil {
-		fmt.Fprintf(os.Stderr, "pelfs: write stats file: %v\n", err)
+		ui.Warn("write stats file: {error}", "error", err)
 	}
 	return code
 }
@@ -520,12 +522,11 @@ func (g *genSession) acquireLease(ctx context.Context, o *cmdOpts, prefix string
 		Steal:   o.stealLease,
 		OnConflict: func(holder *lease.Info) {
 			g.stats.Update(func(sum *stats.Summary) { sum.LeaseConflictObserved = true })
-			fmt.Fprintf(os.Stderr,
-				"pelfs: WARNING: another client took over this prefix: %s\n"+
-					"pelfs: WARNING: concurrent writers WILL corrupt each other; stop one of them.\n"+
-					"pelfs: WARNING: this session keeps running but no longer renews the lease;\n"+
-					"pelfs: WARNING: the seal at unmount will be REFUSED if that client advanced the branch.\n",
-				holder.Describe())
+			ui.Warn("another client took over this prefix: {holder}\n"+
+				"concurrent writers WILL corrupt each other; stop one of them.\n"+
+				"this session keeps running but no longer renews the lease;\n"+
+				"the seal at unmount will be REFUSED if that client advanced the branch.",
+				"holder", holder.Describe())
 		},
 	})
 	if err != nil {
@@ -545,7 +546,7 @@ func (g *genSession) releaseLease() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := g.lease.Release(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "pelfs: release lease: %v\n", err)
+		ui.Warn("release lease: {error}", "error", err)
 	}
 	g.lease = nil
 }
@@ -564,7 +565,7 @@ func (g *genSession) runPrefetch(ctx context.Context, mode string) error {
 	switch mode {
 	case "", "none":
 	case "all":
-		fmt.Fprintln(os.Stderr, "pelfs: prefetching the generation into the local cache...")
+		ui.Info("prefetching the generation into the local cache...")
 		rep, err := g.gfs.Prefetch(ctx, pelicanobj.TransferWorkers())
 		if err != nil {
 			return fmt.Errorf("prefetch: %w", err)
@@ -574,20 +575,21 @@ func (g *genSession) runPrefetch(ctx context.Context, mode string) error {
 			return fmt.Errorf("prefetch: %d chunk(s) could not be fetched (%v); refusing to mount",
 				rep.Failed, rep.Sample)
 		}
-		fmt.Fprintf(os.Stderr, "pelfs: prefetched %d chunks (%d already cached) across %d files, %.1f MB\n",
-			rep.Chunks, rep.Cached, rep.Files, float64(rep.Bytes)/1e6)
+		ui.Info("prefetched {chunks} chunks ({cached} already cached) across {files} files, {bytes}",
+			"chunks", rep.Chunks, "cached", rep.Cached, "files", rep.Files,
+			"bytes", ui.ByteCount(rep.Bytes))
 	case "background":
 		go func() {
 			// Half the transfer pool, so warming never starves the
 			// interactive I/O the mount is serving.
 			rep, err := g.gfs.Prefetch(ctx, max(1, pelicanobj.TransferWorkers()/2))
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "pelfs: background prefetch: %v\n", err)
+				ui.Warn("background prefetch: {error}", "error", err)
 				return
 			}
 			record(rep, rep.Failed == 0)
-			fmt.Fprintf(os.Stderr, "pelfs: background prefetch done: %d chunks, %d failed\n",
-				rep.Chunks, rep.Failed)
+			ui.Info("background prefetch done: {chunks} chunks, {failed} failed",
+				"chunks", rep.Chunks, "failed", rep.Failed)
 		}()
 	default:
 		return fmt.Errorf("unknown --prefetch %q (want none, all, or background)", mode)
@@ -610,8 +612,8 @@ func (g *genSession) follow(ctx context.Context, r *rawfuse.Refresher, every tim
 			if err := r.Refresh(ctx); err != nil {
 				// A federation hiccup must never take down a mount that is
 				// serving a perfectly good generation.
-				fmt.Fprintf(os.Stderr, "pelfs: refresh: %v (still serving generation %d)\n",
-					err, g.gfs.Generation())
+				ui.Warn("refresh: {error} (still serving generation {generation})",
+					"error", err, "generation", g.gfs.Generation())
 				continue
 			}
 			if after := g.gfs.Generation(); after != before {
@@ -691,9 +693,8 @@ func (g *genSession) reportSealCost(c sealCost) {
 	g.stats.Update(func(sum *stats.Summary) {
 		down, up = sum.Get.Bytes-c.get, sum.Put.Bytes-c.put
 	})
-	fmt.Fprintf(os.Stderr, "%s pelfs: seal took %s (%s CPU, %s downloaded, %s uploaded)\n",
-		time.Now().Format("15:04:05"), wall.Round(time.Second), cpu.Round(time.Second),
-		humanBytes(down), humanBytes(up))
+	ui.Info("seal took {wall} ({cpu} CPU, {downloaded} downloaded, {uploaded} uploaded)",
+		"wall", wall, "cpu", cpu, "downloaded", ui.ByteCount(down), "uploaded", ui.ByteCount(up))
 }
 
 // processCPU is this process's user+system time. Seals are mostly
@@ -708,19 +709,6 @@ func processCPU() time.Duration {
 		return time.Duration(t.Sec)*time.Second + time.Duration(t.Usec)*time.Microsecond
 	}
 	return tv(ru.Utime) + tv(ru.Stime)
-}
-
-func humanBytes(n int64) string {
-	switch {
-	case n >= 1<<30:
-		return fmt.Sprintf("%.1f GiB", float64(n)/(1<<30))
-	case n >= 1<<20:
-		return fmt.Sprintf("%.1f MiB", float64(n)/(1<<20))
-	case n >= 1<<10:
-		return fmt.Sprintf("%.1f KiB", float64(n)/(1<<10))
-	default:
-		return fmt.Sprintf("%d B", n)
-	}
 }
 
 func (g *genSession) sealLocked(ctx context.Context) (*publish.Result, error) {
@@ -783,17 +771,17 @@ func (g *genSession) sealLocked(ctx context.Context) (*publish.Result, error) {
 	// A failure here costs performance, never correctness: the session
 	// simply keeps paying zero TTLs for state that is already durable.
 	if _, err := g.gfs.Swap(ctx, res.Superblock); err != nil {
-		fmt.Fprintf(os.Stderr, "pelfs: sealed generation %d, but the mount could not follow it (%v); inodes stay dirty\n",
-			res.Superblock.Generation, err)
+		ui.Warn("sealed generation {generation}, but the mount could not follow it ({error}); inodes stay dirty",
+			"generation", res.Superblock.Generation, "error", err)
 	} else if rep, err := g.ov.Rebase(ctx, snap.Seq(), overlay.Options{
 		BaseRoot:       res.Superblock.RootCatalog,
 		BaseGeneration: res.Superblock.Generation,
 	}); err != nil {
-		fmt.Fprintf(os.Stderr, "pelfs: sealed generation %d, but rebase failed (%v); inodes stay dirty\n",
-			res.Superblock.Generation, err)
+		ui.Warn("sealed generation {generation}, but rebase failed ({error}); inodes stay dirty",
+			"generation", res.Superblock.Generation, "error", err)
 	} else {
-		fmt.Fprintf(os.Stderr, "pelfs: %d inode(s) returned to clean; %d still dirty\n",
-			len(rep.Clean), rep.Dirty)
+		ui.Info("{clean} returned to clean; {dirty} still dirty",
+			"clean", ui.Count(len(rep.Clean), "inode"), "dirty", rep.Dirty)
 		g.stats.Update(func(sum *stats.Summary) { sum.RebasedClean += int64(len(rep.Clean)) })
 	}
 
@@ -845,8 +833,8 @@ func (g *genSession) checkpoint(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	fmt.Fprintf(os.Stderr, "pelfs: checkpoint: sealed generation %d while mounted; the mount keeps serving\n",
-		res.Superblock.Generation)
+	ui.Info("checkpoint: sealed generation {generation} while mounted; the mount keeps serving",
+		"generation", res.Superblock.Generation)
 	return fmt.Sprintf("generation %d: %d chunks uploaded, %d catalogs, %d new packs",
 		res.Superblock.Generation, res.Stats.ChunksAdded, res.Stats.Catalogs, len(res.NewPacks)), nil
 }
@@ -878,10 +866,10 @@ func (g *genSession) checkpointPeriodically(ctx context.Context, every time.Dura
 			case ctx.Err() != nil:
 				return
 			case err != nil:
-				fmt.Fprintf(os.Stderr,
-					"pelfs: periodic checkpoint failed, retrying next interval (your changes remain safe in the overlay): %v\n", err)
+				ui.Warn("periodic checkpoint failed, retrying next interval "+
+					"(your changes remain safe in the overlay): {error}", "error", err)
 			case elapsed > slowCheckpoint:
-				fmt.Fprintf(os.Stderr, "pelfs: checkpoint took %s (%s)\n", elapsed.Round(time.Second), summary)
+				ui.Info("checkpoint took {duration} ({summary})", "duration", elapsed, "summary", summary)
 			}
 		}
 	}
@@ -893,7 +881,8 @@ func (g *genSession) checkpointPeriodically(ctx context.Context, every time.Dura
 func (g *genSession) sealAtExit(ctx context.Context) error {
 	if !g.rw || g.noSeal {
 		if g.rw {
-			fmt.Fprintf(os.Stderr, "pelfs: overlay kept at %s (--no-seal); remount to resume or seal\n", g.overlayDir)
+			ui.Info("overlay kept at {overlay} (--no-seal); remount to resume or seal",
+				"overlay", g.overlayDir)
 		}
 		return nil
 	}
@@ -904,10 +893,10 @@ func (g *genSession) sealAtExit(ctx context.Context) error {
 	}
 	st, err := g.ov.Stats()
 	if err == nil && st.DirtyNodes == 0 && st.DirtyEdges == 0 {
-		fmt.Fprintln(os.Stderr, "pelfs: nothing changed; no new generation")
+		ui.Info("nothing changed; no new generation")
 		return nil
 	}
-	fmt.Fprintln(os.Stderr, "pelfs: sealing the overlay into the next generation...")
+	ui.Info("sealing the overlay into the next generation...")
 	res, err := g.sealLocked(ctx)
 	if err != nil {
 		ok := false
@@ -916,8 +905,9 @@ func (g *genSession) sealAtExit(ctx context.Context) error {
 	}
 	ok := true
 	g.stats.Update(func(sum *stats.Summary) { sum.SealOK = &ok })
-	fmt.Fprintf(os.Stderr, "pelfs: sealed generation %d (%d chunks, %d catalogs, %d packs)\n",
-		res.Superblock.Generation, res.Stats.ChunksAdded, res.Stats.Catalogs, len(res.NewPacks))
+	ui.Info("sealed generation {generation} ({chunks} chunks, {catalogs} catalogs, {packs} packs)",
+		"generation", res.Superblock.Generation, "chunks", res.Stats.ChunksAdded,
+		"catalogs", res.Stats.Catalogs, "packs", len(res.NewPacks))
 
 	// The overlay's contents are now published, and it is pinned to the
 	// generation it shadowed — which is no longer the head. Leaving it
@@ -928,8 +918,8 @@ func (g *genSession) sealAtExit(ctx context.Context) error {
 	_ = g.ov.Close()
 	g.ovMu.Unlock()
 	if err := os.RemoveAll(g.overlayDir); err != nil {
-		fmt.Fprintf(os.Stderr, "pelfs: sealed, but the spent overlay at %s could not be removed: %v\n",
-			g.overlayDir, err)
+		ui.Warn("sealed, but the spent overlay at {overlay} could not be removed: {error}",
+			"overlay", g.overlayDir, "error", err)
 	}
 	return nil
 }
@@ -991,7 +981,7 @@ func (g *genSession) controlHooks() control.Hooks {
 func (g *genSession) startControl() *control.Server {
 	srv, err := control.Start(g.stateDir, g.controlHooks())
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "pelfs: control socket unavailable: %v\n", err)
+		ui.Warn("control socket unavailable: {error}", "error", err)
 		return nil
 	}
 	return srv
@@ -1013,8 +1003,8 @@ func (g *genSession) publishMountRecord() func() {
 	}
 	path := filepath.Join(dir, "mount.json")
 	if info, err := readMountInfo(path); err == nil && info.PID != os.Getpid() && pidAlive(info.PID) {
-		fmt.Fprintf(os.Stderr, "pelfs: %s already has a live mount record (pid %d); reach this session with `pelfs ctl %s`\n",
-			g.prefix, info.PID, g.stateDir)
+		ui.Warn("{prefix} already has a live mount record (pid {pid}); reach this session with `pelfs ctl {statedir}`",
+			"prefix", g.prefix, "pid", info.PID, "statedir", g.stateDir)
 		return noop
 	}
 	data, err := json.MarshalIndent(&mountInfo{

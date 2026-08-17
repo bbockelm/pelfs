@@ -4,11 +4,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"os"
 	"path/filepath"
 
 	"github.com/bbockelm/pelfs/internal/fsck"
 	"github.com/bbockelm/pelfs/internal/superblock"
+	"github.com/bbockelm/pelfs/internal/ui"
 )
 
 // cmdFsck checks one published generation: pack list, catalog and shard
@@ -81,7 +81,8 @@ func cmdFsck(args []string) int {
 		return exitErr(cerr)
 	}
 	if !rep.OK() {
-		fmt.Fprintf(os.Stderr, "pelfs: generation %d is damaged: %d problem(s)\n", sb.Generation, len(rep.Problems))
+		ui.Error("generation {generation} is damaged: {problems}",
+			"generation", sb.Generation, "problems", ui.Count(len(rep.Problems), "problem"))
 		return 1
 	}
 	fmt.Println("generation is consistent")

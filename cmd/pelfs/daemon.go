@@ -13,6 +13,8 @@ import (
 	"sort"
 	"syscall"
 	"time"
+
+	"github.com/bbockelm/pelfs/internal/ui"
 )
 
 const daemonEnv = "PELFS_MOUNT_DAEMON"
@@ -121,7 +123,8 @@ func cmdMount(args []string) int {
 	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
 		if info, err := readMountInfo(infoPath); err == nil && info.PID == pid {
-			fmt.Printf("pelfs: mounted %s on %s (pid %d, log %s)\n", prefix, info.MountPoint, pid, logPath)
+			ui.Info("mounted {prefix} on {mountpoint} (pid {pid}, log {log})",
+				"prefix", prefix, "mountpoint", info.MountPoint, "pid", pid, "log", logPath)
 			return 0
 		}
 		if !pidAlive(pid) {
@@ -146,18 +149,18 @@ func cmdUmount(args []string) int {
 			continue
 		}
 		if !pidAlive(e.info.PID) {
-			fmt.Fprintf(os.Stderr, "pelfs: mount daemon (pid %d) is gone; removing stale record\n", e.info.PID)
+			ui.Warn("mount daemon (pid {pid}) is gone; removing stale record", "pid", e.info.PID)
 			_ = os.Remove(e.path)
 			return 0
 		}
 		if err := syscall.Kill(e.info.PID, syscall.SIGTERM); err != nil {
 			return exitErr(fmt.Errorf("signal pid %d: %w", e.info.PID, err))
 		}
-		fmt.Fprintf(os.Stderr, "pelfs: waiting for %s to unmount and flush...\n", e.info.MountPoint)
+		ui.Info("waiting for {mountpoint} to unmount and flush...", "mountpoint", e.info.MountPoint)
 		deadline := time.Now().Add(120 * time.Second)
 		for time.Now().Before(deadline) {
 			if !pidAlive(e.info.PID) {
-				fmt.Printf("pelfs: unmounted %s\n", e.info.MountPoint)
+				ui.Info("unmounted {mountpoint}", "mountpoint", e.info.MountPoint)
 				return 0
 			}
 			time.Sleep(250 * time.Millisecond)

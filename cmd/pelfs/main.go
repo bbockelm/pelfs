@@ -18,6 +18,8 @@ import (
 	"os"
 	"runtime"
 	"time"
+
+	"github.com/bbockelm/pelfs/internal/ui"
 )
 
 func main() {
@@ -208,7 +210,7 @@ func exitErr(err error) int {
 	if err == nil {
 		return 0
 	}
-	fmt.Fprintf(os.Stderr, "pelfs: %v\n", err)
+	ui.Error("{error}", "error", err)
 	if errors.Is(err, flag.ErrHelp) {
 		return 2
 	}

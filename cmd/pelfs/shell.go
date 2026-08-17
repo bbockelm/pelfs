@@ -17,6 +17,7 @@ import (
 	"github.com/bbockelm/pelfs/internal/lease"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/refs"
+	"github.com/bbockelm/pelfs/internal/ui"
 )
 
 func cmdShell(args []string) int {
@@ -95,9 +96,11 @@ func runInMount(o *cmdOpts, prefix, mountPoint string, command []string) int {
 			shellPath = "/bin/sh"
 		}
 		argv = []string{shellPath}
-		fmt.Fprintf(os.Stderr, "pelfs: starting %s in %s (exit the shell to unmount)\n", shellPath, mountPoint)
+		ui.Info("starting {shell} in {mountpoint} (exit the shell to unmount)",
+			"shell", shellPath, "mountpoint", mountPoint)
 	} else {
-		fmt.Fprintf(os.Stderr, "pelfs: running %s in %s\n", strings.Join(argv, " "), mountPoint)
+		ui.Info("running {command} in {mountpoint}",
+			"command", strings.Join(argv, " "), "mountpoint", mountPoint)
 	}
 
 	cmd := exec.Command(argv[0], argv[1:]...)
@@ -133,7 +136,7 @@ func runInMount(o *cmdOpts, prefix, mountPoint string, command []string) int {
 	defer signal.Stop(sigs)
 
 	if err := cmd.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "pelfs: run %s: %v\n", argv[0], err)
+		ui.Error("run {command}: {error}", "command", argv[0], "error", err)
 		if errors.Is(err, exec.ErrNotFound) || errors.Is(err, os.ErrNotExist) {
 			return 127 // shell convention: command not found
 		}
@@ -175,7 +178,7 @@ func waitStatus(err error) int {
 		}
 		return ee.ExitCode()
 	}
-	fmt.Fprintf(os.Stderr, "pelfs: wait: %v\n", err)
+	ui.Error("wait: {error}", "error", err)
 	return 1
 }
 
@@ -198,9 +201,12 @@ var legacyMetaDir = path.Dir(lease.Key)
 // the whole point: the alternative — treating unrecognized metadata as an
 // empty prefix — would initialize a new volume on top of somebody's data.
 func legacyVolumeError(prefix string) error {
+	// The newlines survive into the message: ui re-prefixes every
+	// continuation line, so a three-line refusal stays attributable to
+	// pelfs on a terminal and collapses to one record in a log.
 	return fmt.Errorf("%s holds a retired block-and-snapshot volume, which this pelfs cannot read.\n"+
-		"pelfs: copy it out with a pelfs release that still had that engine, into a fresh prefix served by this one;\n"+
-		"pelfs: nothing here has been modified", prefix)
+		"copy it out with a pelfs release that still had that engine, into a fresh prefix served by this one;\n"+
+		"nothing here has been modified", prefix)
 }
 
 // classifyVolume asks the federation what kind of volume a prefix holds.

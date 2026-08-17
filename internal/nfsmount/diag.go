@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/go-git/go-billy/v5"
+	nfs "github.com/willscott/go-nfs"
 
 	"github.com/bbockelm/pelfs/internal/ui"
 )
@@ -61,7 +62,17 @@ var (
 //
 // io.EOF is here because the READ handler tests for it explicitly; it is
 // an end-of-file marker, not a failure.
+//
+// ENOTEMPTY is excluded FIRST because syscall.Errno.Is answers true for
+// errors.Is(ENOTEMPTY, os.ErrExist) -- an alias that is fair for a
+// caller asking "did this fail because something was already there" and
+// a trap here, since no go-nfs handler answers NFS3ERR_NOTEMPTY. An
+// rmdir of a non-empty directory reaches the client as EIO, and that is
+// worth a line.
 func translatable(err error) bool {
+	if errors.Is(err, syscall.ENOTEMPTY) {
+		return false
+	}
 	switch {
 	case err == nil,
 		errors.Is(err, os.ErrNotExist),
@@ -74,6 +85,62 @@ func translatable(err error) bool {
 		return true
 	}
 	return false
+}
+
+// statusOf is the NFS status that describes err. It is the mapping
+// go-nfs's handlers would make if they made one; NFSStatusIO is the
+// answer only when nothing else fits.
+func statusOf(err error) nfs.NFSStatus {
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return nfs.NFSStatusNoEnt
+	case errors.Is(err, syscall.ENOTEMPTY): // before ErrExist; see translatable
+		return nfs.NFSStatusNotEmpty
+	case errors.Is(err, os.ErrExist):
+		return nfs.NFSStatusExist
+	case errors.Is(err, os.ErrPermission):
+		return nfs.NFSStatusAccess
+	case errors.Is(err, syscall.ESTALE):
+		return nfs.NFSStatusStale
+	case errors.Is(err, syscall.ENOTDIR):
+		return nfs.NFSStatusNotDir
+	case errors.Is(err, syscall.EISDIR):
+		return nfs.NFSStatusIsDir
+	case errors.Is(err, syscall.EINVAL):
+		return nfs.NFSStatusInval
+	case errors.Is(err, syscall.ENOSPC):
+		return nfs.NFSStatusNoSPC
+	case errors.Is(err, syscall.EDQUOT):
+		return nfs.NFSStatusDQuot
+	case errors.Is(err, syscall.EFBIG):
+		return nfs.NFSStatusFBig
+	}
+	return nfs.NFSStatusIO
+}
+
+// attrErr is the return path for the attribute setters. Their errors have
+// exactly one consumer in go-nfs -- SetFileAttributes.Apply, which every
+// SETATTR, CREATE, MKDIR, SYMLINK and LINK runs -- and Apply recognizes
+// only os.ErrPermission, returning anything else RAW. What becomes of a
+// raw error there depends on the RPC, and neither outcome is acceptable:
+// onCreate, onMkdir and onSymlink wrap it in NFSStatusIO, while onSetAttr
+// returns it as though it were already an NFS status, whereupon the
+// response formatter finds a type it does not recognize and answers with
+// an RPC-LEVEL system error -- a malformed reply rather than a status,
+// which clients report as EIO with no status to explain it.
+//
+// Attaching a status here fixes the SETATTR case outright and reports the
+// others. Wrapping keeps the error chain intact, so Apply's
+// os.ErrPermission test still sees through it.
+func attrErr(op, path string, err error) error {
+	if err == nil {
+		return nil
+	}
+	st := statusOf(err)
+	if st == nfs.NFSStatusIO {
+		report(op, path, err)
+	}
+	return &nfs.NFSStatusError{NFSStatus: st, WrappedErr: err}
 }
 
 // explain returns err unchanged, reporting it first if go-nfs is about to
@@ -212,19 +279,19 @@ func (d *diagFS) Chroot(path string) (billy.Filesystem, error) {
 }
 
 func (d *diagChangeFS) Chmod(name string, mode os.FileMode) error {
-	return explain("chmod", name, d.ch.Chmod(name, mode))
+	return attrErr("chmod", name, d.ch.Chmod(name, mode))
 }
 
 func (d *diagChangeFS) Lchown(name string, uid, gid int) error {
-	return explain("lchown", name, d.ch.Lchown(name, uid, gid))
+	return attrErr("lchown", name, d.ch.Lchown(name, uid, gid))
 }
 
 func (d *diagChangeFS) Chown(name string, uid, gid int) error {
-	return explain("chown", name, d.ch.Chown(name, uid, gid))
+	return attrErr("chown", name, d.ch.Chown(name, uid, gid))
 }
 
 func (d *diagChangeFS) Chtimes(name string, atime, mtime time.Time) error {
-	return explain("chtimes", name, d.ch.Chtimes(name, atime, mtime))
+	return attrErr("chtimes", name, d.ch.Chtimes(name, atime, mtime))
 }
 
 // diagFile carries the same observation onto the handle. go-nfs turns a
@@ -264,8 +331,11 @@ func (f *diagFile) Seek(offset int64, whence int) (int64, error) {
 	return pos, explain("seek", f.File.Name(), err)
 }
 
+// Truncate takes the attribute path too: go-nfs calls it from exactly one
+// place, Apply's SetSize branch, and returns its error as raw as it
+// returns a Chmod's.
 func (f *diagFile) Truncate(size int64) error {
-	return explain("truncate", f.File.Name(), f.File.Truncate(size))
+	return attrErr("truncate", f.File.Name(), f.File.Truncate(size))
 }
 
 func (f *diagFile) Close() error {

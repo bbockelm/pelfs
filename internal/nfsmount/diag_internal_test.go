@@ -11,6 +11,7 @@ import (
 
 	"github.com/go-git/go-billy/v5"
 	"github.com/go-git/go-billy/v5/memfs"
+	nfs "github.com/willscott/go-nfs"
 
 	"github.com/bbockelm/pelfs/internal/ui"
 )
@@ -102,23 +103,23 @@ func TestReportIsRateLimitedAndFree(t *testing.T) {
 	}
 }
 
-// staleFS fails one named operation, so the wrapper can be checked
+// chmodFS fails Chmod with a chosen error, so the wrapper can be checked
 // against the shape go-nfs actually drives: Create then Chmod, which is
 // what SetFileAttributes.Apply does on every CREATE.
-type staleFS struct {
+type chmodFS struct {
 	billy.Filesystem
-	failChmod bool
+	fail error
 }
 
-func (f *staleFS) Chmod(name string, mode os.FileMode) error {
-	if f.failChmod {
-		return &os.PathError{Op: "chmod", Path: name, Err: syscall.ESTALE}
+func (f *chmodFS) Chmod(name string, mode os.FileMode) error {
+	if f.fail != nil {
+		return &os.PathError{Op: "chmod", Path: name, Err: f.fail}
 	}
 	return nil
 }
-func (f *staleFS) Lchown(string, int, int) error              { return nil }
-func (f *staleFS) Chown(string, int, int) error               { return nil }
-func (f *staleFS) Chtimes(string, time.Time, time.Time) error { return nil }
+func (f *chmodFS) Lchown(string, int, int) error              { return nil }
+func (f *chmodFS) Chown(string, int, int) error               { return nil }
+func (f *chmodFS) Chtimes(string, time.Time, time.Time) error { return nil }
 
 // The wrapper has to keep every property go-nfs tests for, or it changes
 // the server's behavior while explaining it: WriteCapability (absent, and
@@ -133,33 +134,56 @@ func TestDiagnosePreservesTheInterfacesGoNFSAsserts(t *testing.T) {
 		t.Error("wrapper dropped WriteCapability")
 	}
 
-	changeable := diagnose(&staleFS{Filesystem: memfs.New()})
+	changeable := diagnose(&chmodFS{Filesystem: memfs.New()})
 	if _, ok := changeable.(billy.Change); !ok {
 		t.Fatal("wrapper dropped billy.Change")
 	}
 }
 
-// The end-to-end shape: a chmod failing behind a wrapped filesystem is
-// reported with the operation and the path, exactly as it would be seen
-// on the create path.
-func TestDiagnoseReportsThroughTheWrapper(t *testing.T) {
+// SetFileAttributes.Apply returns an attribute setter's error raw, and
+// onSetAttr hands that straight to the response formatter -- which, for a
+// type it does not recognize, answers with an RPC-level system error
+// instead of an NFS status. Every error out of billy.Change must
+// therefore arrive as an *nfs.NFSStatusError carrying the status that
+// describes it, while still testing as the error it wraps, because that
+// is what Apply itself matches on.
+func TestChangeErrorsCarryAnNFSStatus(t *testing.T) {
 	var out bytes.Buffer
 	defer ui.SetOutput(&out, false)()
-	eioReportedAt.Store(0)
-	eioSuppressed.Store(0)
 
-	fs := diagnose(&staleFS{Filesystem: memfs.New(), failChmod: true})
-	f, err := fs.Create("/a.c")
-	if err != nil {
-		t.Fatalf("create: %v", err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
-	if err := fs.(billy.Change).Chmod("/a.c", 0o644); err == nil {
-		t.Fatal("chmod did not fail")
-	}
-	if line := out.String(); !strings.Contains(line, "chmod") || !strings.Contains(line, "/a.c") {
-		t.Errorf("wrapper did not report the failing chmod: %q", line)
+	for _, tc := range []struct {
+		name     string
+		err      error
+		want     nfs.NFSStatus
+		reported bool
+	}{
+		{"stale", syscall.ESTALE, nfs.NFSStatusStale, false},
+		{"missing", os.ErrNotExist, nfs.NFSStatusNoEnt, false},
+		{"denied", syscall.EPERM, nfs.NFSStatusAccess, false},
+		{"notempty", syscall.ENOTEMPTY, nfs.NFSStatusNotEmpty, false},
+		{"unknown", errors.New("the layer below came apart"), nfs.NFSStatusIO, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out.Reset()
+			eioReportedAt.Store(0)
+			eioSuppressed.Store(0)
+
+			fs := diagnose(&chmodFS{Filesystem: memfs.New(), fail: tc.err})
+			err := fs.(billy.Change).Chmod("/a.c", 0o644)
+			var st *nfs.NFSStatusError
+			if !errors.As(err, &st) {
+				t.Fatalf("chmod error is not an *nfs.NFSStatusError: %#v", err)
+			}
+			if st.NFSStatus != tc.want {
+				t.Errorf("status = %v, want %v", st.NFSStatus, tc.want)
+			}
+			// Apply matches on the wrapped error; the chain must survive.
+			if !errors.Is(err, tc.err) {
+				t.Errorf("wrapping hid the cause: %v", err)
+			}
+			if got := strings.Contains(out.String(), "chmod") && strings.Contains(out.String(), "/a.c"); got != tc.reported {
+				t.Errorf("reported = %v, want %v: %q", got, tc.reported, out.String())
+			}
+		})
 	}
 }

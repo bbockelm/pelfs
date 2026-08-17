@@ -507,21 +507,34 @@ func (b *billyFS) Capabilities() billy.Capability {
 }
 
 // Change — SETATTR support.
+//
+// NONE of these follow a terminal symlink, which is where they differ
+// from the os package functions billy names them after.
+//
+// The reason is that the only caller is an NFS server, and every
+// attribute change it makes names its object by FILE HANDLE: SETATTR
+// carries one, and CREATE/MKDIR/SYMLINK apply the request's sattr3 to the
+// object they just made (go-nfs does all four through
+// SetFileAttributes.Apply, which reaches a symlink by path only because
+// billy has no lchmod/lutimes to call). A handle for a symlink names the
+// symlink. Following one would be wrong in both directions:
+//
+//   - on a symlink whose target exists, the change lands on the TARGET —
+//     the wrong object, silently, with the operation reporting success;
+//   - on a dangling symlink, which is every forward reference in a tarball
+//     mid-extraction, it fails with ENOENT, and go-nfs turns that into
+//     NFS3ERR_IO on the create path and an RPC-level system error on
+//     SETATTR. Both reach the client as "Input/output error" on a file
+//     that was in fact created correctly.
 
-// setAttr resolves name and applies one attribute change. follow selects
-// chmod/chown semantics (through a terminal symlink) over lchown's.
-func (b *billyFS) setAttr(op, name string, follow bool, in overlay.SetAttrIn) error {
+// setAttr resolves name — the link itself, never its target — and applies
+// one attribute change.
+func (b *billyFS) setAttr(op, name string, in overlay.SetAttrIn) error {
 	if b.ov == nil {
 		return roErr(op, name)
 	}
 	c := ctx()
-	var n genfs.Node
-	var err error
-	if follow {
-		n, err = b.resolveFollow(c, name)
-	} else {
-		n, err = b.resolve(c, name)
-	}
+	n, err := b.resolve(c, name)
 	if err != nil {
 		return pe(op, name, err)
 	}
@@ -531,22 +544,22 @@ func (b *billyFS) setAttr(op, name string, follow bool, in overlay.SetAttrIn) er
 
 func (b *billyFS) Chmod(name string, mode os.FileMode) error {
 	m := unixMode(mode)
-	return b.setAttr("chmod", name, true, overlay.SetAttrIn{Mode: &m})
+	return b.setAttr("chmod", name, overlay.SetAttrIn{Mode: &m})
 }
 
 func (b *billyFS) Chown(name string, uid, gid int) error {
 	u, g := uint32(uid), uint32(gid)
-	return b.setAttr("chown", name, true, overlay.SetAttrIn{UID: &u, GID: &g})
+	return b.setAttr("chown", name, overlay.SetAttrIn{UID: &u, GID: &g})
 }
 
 func (b *billyFS) Lchown(name string, uid, gid int) error {
 	u, g := uint32(uid), uint32(gid)
-	return b.setAttr("lchown", name, false, overlay.SetAttrIn{UID: &u, GID: &g})
+	return b.setAttr("lchown", name, overlay.SetAttrIn{UID: &u, GID: &g})
 }
 
 // Chtimes sets mtime only: catalogs carry no atime by design, and mtime
 // stands in for it everywhere else in the stack.
 func (b *billyFS) Chtimes(name string, atime, mtime time.Time) error {
 	ns := mtime.UnixNano()
-	return b.setAttr("chtimes", name, true, overlay.SetAttrIn{MtimeNS: &ns})
+	return b.setAttr("chtimes", name, overlay.SetAttrIn{MtimeNS: &ns})
 }

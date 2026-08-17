@@ -318,6 +318,12 @@ func timedSeal(t *testing.T, label string, inner *meterStore, ov *overlay.FS, pr
 		Overlay: ov, Inner: inner, SpoolDir: t.TempDir(),
 		SigningKey: priv, Prev: prev.Superblock, PrevRaw: prev.Raw,
 		DedupIndexPath: index,
+		// Catalog building is the one step that scales with cores, and how
+		// far it is worth scaling is a measurement, not a guess: past some
+		// width the pure-Go SQLite's own allocator becomes the contended
+		// resource and the wall time stops improving while the CPU keeps
+		// climbing.
+		CatalogConcurrency: envInt("PELFS_BIGSEAL_CATCONC", 0),
 	})
 	if err != nil {
 		t.Fatalf("%s: %v", label, err)

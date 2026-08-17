@@ -918,13 +918,24 @@ func (p *pipeline) writeCatalogs(ctx context.Context) (chunkid.Identity, error) 
 	return rootID, nil
 }
 
-// catalogWorkers bounds catalog building. Zero in Options means "as many
-// as the machine has", which is the right default for a step that is
-// CPU-bound (SQLite page writes, BLAKE3, zstd) and shares nothing.
+// defaultCatalogWorkers is how wide catalog building goes when Options
+// does not say.
+//
+// Deliberately far below the core count, because the ceiling is not the
+// cores. Most of a catalog build is the pure-Go SQLite, and every
+// allocation it makes goes through one process-global mutex in
+// modernc.org/libc — so the SQLite half of N builds serializes no matter
+// how many goroutines run it, and past a handful the extra workers only
+// spin on that lock. What DOES overlap is the rest: BLAKE3 over the
+// finished file, zstd, and AES on an encrypted volume. Four covers that
+// without paying for contention nobody gets anything back from.
+const defaultCatalogWorkers = 4
+
+// catalogWorkers bounds catalog building.
 func (p *pipeline) catalogWorkers(catalogs int) int {
 	n := p.o.CatalogConcurrency
 	if n <= 0 {
-		n = runtime.GOMAXPROCS(0)
+		n = min(runtime.GOMAXPROCS(0), defaultCatalogWorkers)
 	}
 	if n > catalogs {
 		n = catalogs

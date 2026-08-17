@@ -138,3 +138,52 @@ func TestCountingAndSummary(t *testing.T) {
 		t.Fatalf("outcome fields: %+v", sum)
 	}
 }
+
+// TestPhaseSplitPartitionsTheCounters pins the property the split is only
+// useful if it has: work lands in the phase it happened in, and the two
+// phases add up to the totals. A byte that fell out of both would make
+// "nothing was uploaded while I was working" unsafe to believe.
+func TestPhaseSplitPartitionsTheCounters(t *testing.T) {
+	ctx := context.Background()
+	c := New("pelican://fed/pfx", "sess-1", filepath.Join(t.TempDir(), "stats.json"))
+	s := WrapStorage(newMemStore(), c)
+
+	during := strings.Repeat("x", 1000)
+	if err := s.Put(ctx, "while-running", strings.NewReader(during)); err != nil {
+		t.Fatal(err)
+	}
+	c.SetPhase(PhaseTeardown)
+	after := strings.Repeat("y", 3000)
+	if err := s.Put(ctx, "after-exit", strings.NewReader(after)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Head(ctx, "after-exit"); err != nil {
+		t.Fatal(err)
+	}
+
+	var sum Summary
+	c.Update(func(s *Summary) { sum = *s })
+	if sum.SessionPhase.Put.Bytes != 1000 || sum.SessionPhase.Put.Ops != 1 {
+		t.Errorf("session phase: %+v", sum.SessionPhase.Put)
+	}
+	if sum.TeardownPhase.Put.Bytes != 3000 || sum.TeardownPhase.Put.Ops != 1 {
+		t.Errorf("teardown phase: %+v", sum.TeardownPhase.Put)
+	}
+	if sum.SessionPhase.Other.Ops != 0 || sum.TeardownPhase.Other.Ops != 1 {
+		t.Errorf("the head after the boundary was charged to the session: %+v / %+v",
+			sum.SessionPhase.Other, sum.TeardownPhase.Other)
+	}
+	if got := sum.SessionPhase.Put.Bytes + sum.TeardownPhase.Put.Bytes; got != sum.Put.Bytes {
+		t.Errorf("phases hold %d put bytes, the total says %d", got, sum.Put.Bytes)
+	}
+	if sum.TeardownBegan.IsZero() {
+		t.Error("the boundary was not stamped")
+	}
+	// The boundary is drawn once; a second call must not move it.
+	was := sum.TeardownBegan
+	c.SetPhase(PhaseTeardown)
+	c.Update(func(s *Summary) { sum = *s })
+	if !sum.TeardownBegan.Equal(was) {
+		t.Errorf("the phase boundary moved from %s to %s", was, sum.TeardownBegan)
+	}
+}

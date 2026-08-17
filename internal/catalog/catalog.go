@@ -200,7 +200,21 @@ func Create(path string, meta Meta) (*Writer, error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=journal_mode(OFF)&_pragma=synchronous(OFF)")
+	// cache_size is negative = KiB, and 16 MiB is chosen against SMax: a
+	// catalog is bounded at 8 MiB by construction, so the whole B-tree fits
+	// in the pager and the build stops spilling. With the 2 MiB default,
+	// a full-size catalog's pages are written out and read back in as the
+	// WITHOUT ROWID indexes rebalance — profiling a whole-tree seal found
+	// pwrite and pread the single largest cost in the pipeline, most of it
+	// this churn rather than the one write the file actually needs.
+	//
+	// locking_mode=EXCLUSIVE for the same reason it is set on the write
+	// overlay: a build file is private to the writer that created it (Create
+	// refuses an existing path), so there is no one to coordinate with and
+	// no reason to take and drop a POSIX lock per statement.
+	db, err := sql.Open("sqlite", "file:"+path+
+		"?_pragma=journal_mode(OFF)&_pragma=synchronous(OFF)"+
+		"&_pragma=cache_size(-16384)&_pragma=locking_mode(EXCLUSIVE)")
 	if err != nil {
 		return nil, err
 	}

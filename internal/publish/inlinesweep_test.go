@@ -237,7 +237,10 @@ func runInlineSweep(t *testing.T, c *corpus, inlineMax int64, rtt time.Duration,
 	if _, err := ov.Write(ctx, n.Inode, 0, []byte("/* one changed file */\n")); err != nil {
 		t.Fatalf("write: %v", err)
 	}
+	beforeOneFile := head.Superblock
 	head, oneFile := sweepSeal(t, "one-file", inner, ov, head, opts)
+	touchedWeight, touchedCatalogs := rewrittenWeight(beforeOneFile, head.Superblock)
+	_, totalWeight, maxWeight := catalogShape(head.Superblock)
 
 	// Every inode dirty, no byte of content new: whatever this costs is
 	// catalog construction, which is where inline bytes are paid for.
@@ -264,12 +267,20 @@ func runInlineSweep(t *testing.T, c *corpus, inlineMax int64, rtt time.Duration,
 			p.c.catalogs, p.c.reused, p.c.catalogCount, p.c.pruned,
 			human(mean), human(p.c.catalogMax))
 	}
+	t.Logf("SPLIT[%d] namespace weight %s across %d catalogs (largest %s); one changed file rebuilt %d of them, %s of namespace (%.1f%%)",
+		inlineMax, human(totalWeight), len(head.Superblock.Catalogs), human(maxWeight),
+		touchedCatalogs, human(touchedWeight), 100*float64(touchedWeight)/float64(totalWeight))
 
 	// Reads run against the final generation with a modelled round trip.
 	// The store's own delay is what makes the pack cache's promotion rule
 	// visible: on a loopback origin an extra GET costs nothing.
 	inner.delay = rtt
 	defer func() { inner.delay = 0 }()
+
+	mountWall, mountGets, mountBytes := measureMount(t, inner, head.Superblock, state, inlineMax)
+	t.Logf("MOUNT[%d] open + first lookup %s (%d GET, %s), %d packs",
+		inlineMax, mountWall.Round(time.Millisecond), mountGets, human(mountBytes),
+		len(head.Superblock.PackList))
 
 	cold, neigh, warm := measureScatteredReads(t, inner, head.Superblock, state, samples, inlineMax)
 	t.Logf("READ[%d] scattered small files: cold %d files %s (%d GET, %s) | neighbours %d files %s (%d GET, %s) | warm %s (%d GET, %s)",
@@ -327,6 +338,67 @@ func sweepSeal(t *testing.T, label string, inner *meterStore, ov *overlay.FS, pr
 		}
 	}
 	return res, c
+}
+
+// catalogShape reports how finely a generation divides its namespace, read
+// off the superblock — which carries exactly this so the next publish can
+// decide what not to walk.
+func catalogShape(sb *superblock.Superblock) (n int, total, max int64) {
+	for _, c := range sb.Catalogs {
+		n++
+		total += c.Weight
+		if c.Weight > max {
+			max = c.Weight
+		}
+	}
+	return n, total, max
+}
+
+// rewrittenWeight is how much NAMESPACE a seal had to rebuild: the summed
+// split weight of the catalogs whose identity changed.
+//
+// It is the number carry-forward is really about. The byte cost of
+// rewriting one catalog is capped by SMax at every threshold, because
+// inline bytes count toward the same weight the split bounds — so what
+// InlineMax moves is how MANY catalogs a tree has, and therefore how much
+// unrelated namespace one changed file drags along with it.
+func rewrittenWeight(prev, cur *superblock.Superblock) (weight int64, n int) {
+	was := make(map[[32]byte]bool, len(prev.Catalogs))
+	for _, c := range prev.Catalogs {
+		was[c.Identity] = true
+	}
+	for _, c := range cur.Catalogs {
+		if !was[c.Identity] {
+			weight += c.Weight
+			n++
+		}
+	}
+	return weight, n
+}
+
+// measureMount is what a fresh mount pays before it can answer anything.
+// genfs.Open builds the identity index from every pack trailer in the
+// generation, so every small file moved out of a catalog and into a pack
+// adds one trailer entry, and this is where that shows up.
+func measureMount(t *testing.T, inner *meterStore, sb *superblock.Superblock,
+	state string, inlineMax int64) (wall time.Duration, gets, bytes int64) {
+	t.Helper()
+	ctx := context.Background()
+	mark := inner.snapshot()
+	start := time.Now()
+	fs, err := genfs.Open(ctx, genfs.Options{
+		Inner: inner, SB: sb,
+		CacheDir: filepath.Join(state, fmt.Sprintf("mountcache-%d", inlineMax)),
+	})
+	if err != nil {
+		t.Fatalf("genfs.Open: %v", err)
+	}
+	if _, err := fs.Readdir(ctx, 1); err != nil {
+		t.Fatalf("root readdir: %v", err)
+	}
+	wall = time.Since(start)
+	_ = fs.Close()
+	return wall, inner.gets.Load() - mark.gets, inner.getB.Load() - mark.getB
 }
 
 // ---------------------------------------------------------------------

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -1045,5 +1046,92 @@ func TestSwapIsAtomicForConcurrentOps(t *testing.T) {
 	case err := <-errs:
 		t.Fatalf("operation failed across a generation swap: %v", err)
 	default:
+	}
+}
+
+// The equivalence a bulk retain claims — same inodes, same catalogs, same
+// order as a Lookup per entry — only matters where residency is scarce,
+// so it is checked on a tree several times LARGER than the bound. What
+// must agree is not that everything survives (most of it cannot) but that
+// the SAME things survive: eviction is driven by the order residency was
+// established, and a bulk pass that established it in a different order
+// would leave a different tail of the tree reachable.
+func TestReaddirRetainEvictsLikeLookupPerEntry(t *testing.T) {
+	ctx := context.Background()
+	inner, _ := newInner(t)
+	v := newTestVolume(t, inner, "cafe0002-0000-4000-8000-00000000abcd")
+	for d := 0; d < 3; d++ {
+		dir := v.Mkdir(rootIno, fmt.Sprintf("d%d", d))
+		for i := 0; i < 40; i++ {
+			v.Write(v.Create(dir, fmt.Sprintf("f%02d.txt", i)), pseudorandom(300, int64(d*100+i)))
+		}
+	}
+	res := publishVolume(t, v, inner, publish.Options{SMax: 1000, TargetPackSize: 2 << 20})
+
+	// Below one directory's entry count, so a single listing overflows it
+	// and the eviction happens DURING the pass being compared.
+	const bound = 36
+	byLookup := openFS(t, inner, res.Superblock, genfs.Options{MaxResident: bound})
+	byRetain := openFS(t, inner, res.Superblock, genfs.Options{MaxResident: bound})
+
+	var all []uint64
+	list := func(parent uint64, at string) []genfs.DirEntry {
+		ents, err := byLookup.Readdir(ctx, parent)
+		if err != nil {
+			t.Fatalf("Readdir %s: %v", at, err)
+		}
+		for _, e := range ents {
+			if _, err := byLookup.Lookup(ctx, parent, e.Name); err != nil {
+				t.Fatalf("Lookup %s/%s: %v", at, e.Name, err)
+			}
+		}
+		got, err := byRetain.ReaddirRetain(ctx, parent)
+		if err != nil {
+			t.Fatalf("ReaddirRetain %s: %v", at, err)
+		}
+		if !reflect.DeepEqual(got, ents) {
+			t.Fatalf("listing of %s differs: %v vs %v", at, entryNames(got), entryNames(ents))
+		}
+		for _, e := range ents {
+			all = append(all, e.Node.Inode)
+		}
+		// After every pass, not only at the end: a divergence in retain
+		// ORDER shows up as a different survivor set one listing later,
+		// and the next listing would bury it.
+		for _, ino := range all {
+			l, r := byLookup.Resident(ino), byRetain.Resident(ino)
+			if l != r {
+				t.Fatalf("after %s, inode %d: resident=%v by Lookup per entry, %v by ReaddirRetain",
+					at, ino, l, r)
+			}
+		}
+		return ents
+	}
+
+	for _, e := range list(rootIno, "/") {
+		// Re-resolving the directory before descending is what a kernel
+		// does and what both walks must do alike: the listings above have
+		// already evicted it, and neither filesystem replays anything.
+		lk, err := byLookup.Lookup(ctx, rootIno, e.Name)
+		if err != nil {
+			t.Fatalf("re-lookup %s: %v", e.Name, err)
+		}
+		if _, err := byRetain.Lookup(ctx, rootIno, e.Name); err != nil {
+			t.Fatalf("re-lookup %s: %v", e.Name, err)
+		}
+		list(lk.Inode, e.Name)
+	}
+
+	if len(all) <= bound*2 {
+		t.Fatalf("tree has %d inodes against a bound of %d; eviction would barely engage", len(all), bound)
+	}
+	resident := 0
+	for _, ino := range all {
+		if byRetain.Resident(ino) {
+			resident++
+		}
+	}
+	if resident == 0 || resident > bound {
+		t.Fatalf("%d of %d inodes survived a bound of %d", resident, len(all), bound)
 	}
 }

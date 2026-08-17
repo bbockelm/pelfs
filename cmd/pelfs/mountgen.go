@@ -98,6 +98,12 @@ type genSession struct {
 	// down times everything between the payload exiting and the process
 	// exiting. It stays inert until the exit path calls begin().
 	down *phaseClock
+	// downOnce draws the teardown boundary exactly once, from whichever
+	// path first notices the session is over: the payload exiting, a
+	// signal, or an unmount performed from outside this process. The
+	// racing candidates are on different goroutines, so the Once is what
+	// makes the clock's fields safe as well as the boundary singular.
+	downOnce sync.Once
 
 	// reclaimFn overrides how a retired directory's bytes are freed; nil
 	// takes the background default. Only tests set it.
@@ -494,7 +500,7 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		code = runInMount(o, prefix, mountpoint, command)
 		// Everything from here on is teardown: the user has stopped
 		// working and is now waiting on us.
-		g.down.begin()
+		g.beginTeardown()
 		if nfsSrv != nil {
 			unmountErr = nfsmount.Unmount(mountpoint)
 			if unmountErr != nil {
@@ -511,19 +517,26 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
 		if nfsSrv != nil {
 			<-sigs
-			g.down.begin()
+			g.beginTeardown()
 			if unmountErr = nfsmount.Unmount(mountpoint); unmountErr != nil {
 				ui.Error("unmount: {error}", "error", unmountErr)
 			}
 		} else {
 			go func() {
 				<-sigs
-				g.down.begin()
+				g.beginTeardown()
 				_ = srv.Unmount()
 			}()
 			srv.Wait()
 		}
 	}
+	// A mount can also end without either of the paths above running it
+	// down: `fusermount -u` or `pelfs umount` detaches it from outside,
+	// and Wait simply returns. Without this the whole exit seal was
+	// charged to the session phase and reported as a checkpoint, which is
+	// the opposite of what happened. Idempotent, so the paths that
+	// already drew the boundary keep the earlier, truer instant.
+	g.beginTeardown()
 	g.down.mark("unmount")
 
 	stopSession()
@@ -542,6 +555,7 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	if err := g.stats.Finalize(code, unmountErr == nil && sealErr == nil); err != nil {
 		ui.Warn("write stats file: {error}", "error", err)
 	}
+	g.reportPhaseSplit()
 	g.down.mark("stats")
 	return code
 }
@@ -737,15 +751,33 @@ func (g *genSession) beginSealCost() sealCost {
 	return c
 }
 
-func (g *genSession) reportSealCost(c sealCost) {
+// reportSealCost prints what the seal spent and, from up, when it spent
+// it. The two upload numbers are what make "the pipe stayed full" a
+// checkable claim: how long the seal ran before anything was on the wire,
+// and what share of the seal had something on the wire. A seal that
+// uploaded nothing new (everything carried forward) says so instead,
+// because a 0s/0% pair on that line reads as a defect rather than as an
+// absence of work.
+func (g *genSession) reportSealCost(c sealCost, up publish.UploadReport) {
 	wall := time.Since(c.wall)
 	cpu := processCPU() - c.cpu
-	var down, up int64
+	var down, sent int64
 	g.stats.Update(func(sum *stats.Summary) {
-		down, up = sum.Get.Bytes-c.get, sum.Put.Bytes-c.put
+		down, sent = sum.Get.Bytes-c.get, sum.Put.Bytes-c.put
 	})
-	ui.Info("seal took {wall} ({cpu} CPU, {downloaded} downloaded, {uploaded} uploaded)",
-		"wall", wall, "cpu", cpu, "downloaded", ui.ByteCount(down), "uploaded", ui.ByteCount(up))
+	args := []any{"wall", wall, "cpu", cpu,
+		"downloaded", ui.ByteCount(down), "uploaded", ui.ByteCount(sent)}
+	if up.Packs == 0 {
+		ui.Info("seal took {wall} ({cpu} CPU, {downloaded} downloaded, {uploaded} uploaded; no packs to upload)", args...)
+		return
+	}
+	var busy ui.Percent
+	if wall > 0 {
+		busy = ui.Percent(min(float64(up.Busy)/float64(wall), 1))
+	}
+	ui.Info("seal took {wall} ({cpu} CPU, {downloaded} downloaded, {uploaded} uploaded; "+
+		"first pack on the wire {firstpack} in, uploading {uploading} of the seal)",
+		append(args, "firstpack", up.First, "uploading", busy)...)
 }
 
 // phaseClock times a sequence phase by phase, so "the mount took 15
@@ -773,6 +805,12 @@ func newPhaseClock() *phaseClock {
 }
 
 func (c *phaseClock) begin() {
+	// Already running means the boundary was drawn by an earlier, better
+	// informed caller; restarting here would discard the phases it has
+	// already timed.
+	if c == nil || c.running {
+		return
+	}
 	now := time.Now()
 	c.start, c.last, c.running = now, now, true
 }
@@ -828,6 +866,36 @@ func (c *phaseClock) sentence(lead string) string {
 	}
 	b.WriteString(")")
 	return b.String()
+}
+
+// beginTeardown draws the line the whole phase split rests on: the
+// payload has exited and everything after this point is the user waiting
+// on us. The teardown clock and the statistics phase move together
+// because they are two views of the same instant, and a split drawn a few
+// statements away from the clock would be a split nobody could defend.
+func (g *genSession) beginTeardown() {
+	g.downOnce.Do(func() {
+		g.down.begin()
+		g.stats.SetPhase(stats.PhaseTeardown)
+	})
+}
+
+// reportPhaseSplit is the answer to "was any of this published while I
+// was working?", stated as two numbers that add up to the session total.
+// It runs on every writable session, including the ones where the honest
+// answer is that the session phase uploaded nothing at all.
+func (g *genSession) reportPhaseSplit() {
+	if !g.rw {
+		return
+	}
+	var sum stats.Summary
+	g.stats.Update(func(s *stats.Summary) { sum = *s })
+	ui.Info("uploaded {session} during the session and {teardown} after it exited "+
+		"({checkpoints} while mounted, {exitseals} at exit)",
+		"session", ui.ByteCount(sum.SessionPhase.Put.Bytes),
+		"teardown", ui.ByteCount(sum.TeardownPhase.Put.Bytes),
+		"checkpoints", ui.Count(sum.SessionPhase.Seals, "seal"),
+		"exitseals", ui.Count(sum.TeardownPhase.Seals, "seal"))
 }
 
 // reportTeardown says where the time between the payload exiting and the
@@ -945,7 +1013,7 @@ func (g *genSession) sealLocked(ctx context.Context, follow bool) (*publish.Resu
 		return nil, err
 	}
 	phases.mark("publish")
-	g.reportSealCost(cost)
+	g.reportSealCost(cost, res.Upload)
 	// The anchor must advance with the branch head: the next seal's
 	// lineage hash and its compare-and-swap against refs/<branch> both
 	// grow from what was just published, not from where the mount started.
@@ -986,8 +1054,11 @@ func (g *genSession) sealLocked(ctx context.Context, follow bool) (*publish.Resu
 		phases.mark("follow")
 	}
 
-	g.stats.Update(func(sum *stats.Summary) {
+	// The seal counts against whichever phase it ran in, so "0 seals while
+	// mounted, 1 at exit" is readable straight off the summary.
+	g.stats.UpdatePhase(func(sum *stats.Summary, ph *stats.PhaseCounters) {
 		sum.Seals++
+		ph.Seals++
 		sum.SealedGeneration = res.Superblock.Generation
 		sum.SealedChunks = int64(res.Stats.ChunksAdded)
 		sum.SealedCatalogs = int64(res.Stats.Catalogs)
@@ -1030,6 +1101,14 @@ func (g *genSession) checkpoint(ctx context.Context) (string, error) {
 	if err == nil && st.DirtyNodes == 0 && st.DirtyEdges == 0 {
 		return fmt.Sprintf("nothing changed; still at generation %d", g.sb.Generation), nil
 	}
+	// Announced before the work, not after it: a checkpoint is the one
+	// thing that publishes while the user is still working, so "did any of
+	// this go out before I typed exit" has to be answerable from the
+	// terminal at the moment it happens. Printed only once the overlay is
+	// known dirty, so an idle cadence stays silent.
+	ui.Info("checkpoint started: publishing what this session has written so far "+
+		"({staged} staged, {dirty} dirty); the mount keeps serving",
+		"staged", ui.ByteCount(st.StagedBytes), "dirty", ui.Count(st.DirtyNodes, "inode"))
 	// A checkpoint keeps serving, so the mount must follow what it just
 	// published — that is what lets the redundant overlay rows go.
 	res, err := g.sealLocked(ctx, true)

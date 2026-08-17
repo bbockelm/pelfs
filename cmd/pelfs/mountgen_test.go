@@ -83,12 +83,15 @@ func newGenSession(t *testing.T, rw bool) *genSession {
 		started:    time.Now(),
 		rw:         rw,
 		overlayDir: filepath.Join(stateDir, "overlay"),
-		inner:      inner,
 		statsPath:  filepath.Join(stateDir, "pelfs-stats.json"),
 		sb:         f.Superblock,
 		prevRaw:    f.Raw,
 	}
 	g.stats = stats.New(prefix, g.sessionID, g.statsPath)
+	// The session's own traffic goes through the counter, exactly as it
+	// does in runMountGen; the volume setup above deliberately does not,
+	// so what the counters hold is what the session itself moved.
+	g.inner = countedStore{ObjectStore: stats.WrapStorage(inner, g.stats), raw: inner}
 	g.stats.Update(func(sum *stats.Summary) {
 		sum.MountPoint = g.mountpoint
 		sum.Branch = g.branch
@@ -646,4 +649,141 @@ func TestMountGenCheckpointsOnACadence(t *testing.T) {
 		t.Errorf("idle mount kept publishing: generation went %d -> %d with nothing dirty",
 			settled, f.Superblock.Generation)
 	}
+}
+
+// randomFile writes size bytes of incompressible content, so what the
+// seal uploads is bounded below by what was written rather than by how
+// well a pack compressed.
+func randomFile(t *testing.T, ov *overlay.FS, name string, size int) {
+	t.Helper()
+	buf := make([]byte, size)
+	if _, err := rand.Read(buf); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, ov, name, string(buf))
+}
+
+func phaseSnapshot(g *genSession) stats.Summary {
+	var sum stats.Summary
+	g.stats.Update(func(s *stats.Summary) { sum = *s })
+	return sum
+}
+
+// checkPhasesReconcile is the property that makes the split trustworthy:
+// every counted operation lands in exactly one phase, so a reader can
+// take "0 during the session" at face value instead of wondering what
+// fell between the two.
+func checkPhasesReconcile(t *testing.T, sum stats.Summary) {
+	t.Helper()
+	for _, c := range []struct {
+		name               string
+		agg, ses, teardown stats.OpCounters
+	}{
+		{"get", sum.Get, sum.SessionPhase.Get, sum.TeardownPhase.Get},
+		{"put", sum.Put, sum.SessionPhase.Put, sum.TeardownPhase.Put},
+		{"delete", sum.Delete, sum.SessionPhase.Delete, sum.TeardownPhase.Delete},
+		{"other", sum.Other, sum.SessionPhase.Other, sum.TeardownPhase.Other},
+	} {
+		if got := c.ses.Ops + c.teardown.Ops; got != c.agg.Ops {
+			t.Errorf("%s ops: %d session + %d teardown = %d, but the total is %d",
+				c.name, c.ses.Ops, c.teardown.Ops, got, c.agg.Ops)
+		}
+		if got := c.ses.Bytes + c.teardown.Bytes; got != c.agg.Bytes {
+			t.Errorf("%s bytes: %d session + %d teardown = %d, but the total is %d",
+				c.name, c.ses.Bytes, c.teardown.Bytes, got, c.agg.Bytes)
+		}
+		if got := c.ses.Errors + c.teardown.Errors; got != c.agg.Errors {
+			t.Errorf("%s errors: %d session + %d teardown = %d, but the total is %d",
+				c.name, c.ses.Errors, c.teardown.Errors, got, c.agg.Errors)
+		}
+	}
+	if got := sum.SessionPhase.Seals + sum.TeardownPhase.Seals; got != sum.Seals {
+		t.Errorf("seals: %d session + %d teardown = %d, but the total is %d",
+			sum.SessionPhase.Seals, sum.TeardownPhase.Seals, got, sum.Seals)
+	}
+}
+
+// TestPhaseSplitChargesAnExitSealToTeardown is half of the answer to
+// "was any of this published while I was working?". A session whose only
+// seal is at unmount must report zero uploaded bytes for the session
+// phase and the whole payload for teardown -- the unflattering answer,
+// stated plainly rather than hidden inside a session total.
+func TestPhaseSplitChargesAnExitSealToTeardown(t *testing.T) {
+	g := newGenSession(t, true)
+	ctx := context.Background()
+	const payload = 512 << 10
+	randomFile(t, g.ov, "vmlinux", payload)
+
+	// Writing into the overlay is local work: a writable mount puts
+	// nothing in the federation until something seals.
+	if s := phaseSnapshot(g); s.SessionPhase.Put.Bytes != 0 {
+		t.Fatalf("writing to the overlay uploaded %d bytes before any seal", s.SessionPhase.Put.Bytes)
+	}
+
+	g.beginTeardown()
+	if err := g.sealAtExit(ctx); err != nil {
+		t.Fatalf("sealAtExit: %v", err)
+	}
+
+	sum := phaseSnapshot(g)
+	t.Logf("session put %d bytes / %d seals, teardown put %d bytes / %d seals",
+		sum.SessionPhase.Put.Bytes, sum.SessionPhase.Seals,
+		sum.TeardownPhase.Put.Bytes, sum.TeardownPhase.Seals)
+	if sum.SessionPhase.Put.Bytes != 0 || sum.SessionPhase.Seals != 0 {
+		t.Errorf("the session phase shows %d bytes in %d seals; nothing was published before the payload exited",
+			sum.SessionPhase.Put.Bytes, sum.SessionPhase.Seals)
+	}
+	if sum.TeardownPhase.Put.Bytes < payload {
+		t.Errorf("teardown uploaded %d bytes for a %d-byte payload", sum.TeardownPhase.Put.Bytes, payload)
+	}
+	if sum.TeardownPhase.Seals != 1 {
+		t.Errorf("teardown recorded %d seals, want the one at exit", sum.TeardownPhase.Seals)
+	}
+	if sum.TeardownBegan.IsZero() {
+		t.Error("the summary does not say where the phase boundary was drawn")
+	}
+	checkPhasesReconcile(t, sum)
+}
+
+// TestPhaseSplitChargesACheckpointToTheSession is the other half: a
+// mid-session checkpoint is work that did NOT wait for the end, so it
+// belongs to the session phase, and the seal at exit is then left with
+// almost nothing to send.
+func TestPhaseSplitChargesACheckpointToTheSession(t *testing.T) {
+	g := newGenSession(t, true)
+	ctx := context.Background()
+	g.reclaimFn = func(string) {}
+	const payload = 512 << 10
+	randomFile(t, g.ov, "vmlinux", payload)
+
+	if _, err := g.checkpoint(ctx); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	mid := phaseSnapshot(g)
+	if mid.SessionPhase.Put.Bytes < payload {
+		t.Errorf("the checkpoint uploaded %d bytes for a %d-byte payload", mid.SessionPhase.Put.Bytes, payload)
+	}
+	if mid.SessionPhase.Seals != 1 {
+		t.Errorf("the session phase recorded %d seals, want the checkpoint", mid.SessionPhase.Seals)
+	}
+	if mid.TeardownPhase.Put.Bytes != 0 || mid.TeardownPhase.Seals != 0 {
+		t.Errorf("teardown counted %d bytes in %d seals while the payload was still running",
+			mid.TeardownPhase.Put.Bytes, mid.TeardownPhase.Seals)
+	}
+
+	g.beginTeardown()
+	if err := g.sealAtExit(ctx); err != nil {
+		t.Fatalf("sealAtExit: %v", err)
+	}
+	sum := phaseSnapshot(g)
+	t.Logf("session put %d bytes / %d seals, teardown put %d bytes / %d seals",
+		sum.SessionPhase.Put.Bytes, sum.SessionPhase.Seals,
+		sum.TeardownPhase.Put.Bytes, sum.TeardownPhase.Seals)
+	// The content is already in the federation, so whatever the exit seal
+	// still has to write is metadata carried forward, not the payload.
+	if sum.TeardownPhase.Put.Bytes >= sum.SessionPhase.Put.Bytes {
+		t.Errorf("teardown uploaded %d bytes against the session's %d; the checkpoint bought nothing",
+			sum.TeardownPhase.Put.Bytes, sum.SessionPhase.Put.Bytes)
+	}
+	checkPhasesReconcile(t, sum)
 }

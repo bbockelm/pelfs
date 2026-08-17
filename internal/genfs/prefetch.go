@@ -107,6 +107,30 @@ func (fs *FS) Prefetch(ctx context.Context, workers int) (*PrefetchReport, error
 		return rep, err
 	}
 
+	// Account for what is already local BEFORE fetching, or the bulk fill
+	// below would make every chunk look like it had been cached all along.
+	var missing []catalog.ChunkRef
+	var need []job
+	for _, j := range jobs {
+		fp := filepath.Join(fs.chunkDir, hex.EncodeToString(j.ref.Identity))
+		if fi, err := os.Stat(fp); err == nil && fi.Size() == j.ref.LLen {
+			rep.Cached++
+			rep.Bytes += fi.Size()
+			continue
+		}
+		need = append(need, j)
+		missing = append(missing, *j.ref)
+	}
+
+	// One bulk fill for the whole generation. Prefetch is the caller that
+	// has already declared it wants every byte, so it is exactly the case
+	// where fetching packs whole beats thousands of small ranged reads.
+	func() {
+		fs.swapMu.RLock()
+		defer fs.swapMu.RUnlock()
+		fs.fillChunks(ctx, missing, true)
+	}()
+
 	work := make(chan job)
 	var wg sync.WaitGroup
 	var cancelled atomic.Bool
@@ -119,20 +143,18 @@ func (fs *FS) Prefetch(ctx context.Context, workers int) (*PrefetchReport, error
 					cancelled.Store(true)
 					return
 				}
-				idHex := hex.EncodeToString(j.ref.Identity)
-				fp := filepath.Join(fs.chunkDir, idHex)
-				if fi, err := os.Stat(fp); err == nil {
-					mu.Lock()
-					rep.Cached++
-					rep.Bytes += fi.Size()
-					mu.Unlock()
-					continue
-				}
-				// A one-byte read at offset 0 forces the whole chunk
-				// through the same fill path a real read uses, so the
-				// cache ends up in exactly the state reads expect.
+				// A one-byte read at offset 0 forces the chunk through the
+				// same fill path a real read uses, so the cache ends up in
+				// exactly the state reads expect — and whatever the bulk
+				// fill could not produce is fetched here, with the error
+				// that the bulk path deliberately swallowed.
 				var one [1]byte
-				err := fs.readChunkAt(ctx, j.ref, 0, one[:])
+				idHex := hex.EncodeToString(j.ref.Identity)
+				err := func() error {
+					fs.swapMu.RLock()
+					defer fs.swapMu.RUnlock()
+					return fs.readChunkAt(ctx, j.ref, 0, one[:])
+				}()
 				mu.Lock()
 				if err != nil {
 					rep.Failed++
@@ -147,7 +169,7 @@ func (fs *FS) Prefetch(ctx context.Context, workers int) (*PrefetchReport, error
 			}
 		}()
 	}
-	for _, j := range jobs {
+	for _, j := range need {
 		select {
 		case work <- j:
 		case <-ctx.Done():

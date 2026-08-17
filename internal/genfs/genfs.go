@@ -157,8 +157,11 @@ type FS struct {
 
 	packIndex map[string]packLoc
 	// packSize is the SIGNED length of each listed pack — the only
-	// whole-object check a cached copy can be held to.
-	packSize map[string]int64
+	// whole-object check a cached copy can be held to. packEntries counts
+	// what each holds, which is how the whole-pack policy tells "many
+	// small files" from "a few large chunks" (packfetch.go).
+	packSize    map[string]int64
+	packEntries map[string]int
 
 	// packCacheCap bounds the whole-pack cache; packUses is the piecemeal
 	// consumption evidence that promotes a pack into it (packfetch.go).
@@ -238,6 +241,7 @@ func Open(ctx context.Context, o Options) (*FS, error) {
 		packDir:      packDir,
 		packIndex:    make(map[string]packLoc),
 		packSize:     make(map[string]int64),
+		packEntries:  make(map[string]int),
 		packCacheCap: o.PackCacheBytes,
 		packUses:     make(map[string]*packUse),
 		ext:          newExtentCache(extentCacheCap),
@@ -260,6 +264,7 @@ func Open(ctx context.Context, o Options) (*FS, error) {
 			return nil, fmt.Errorf("genfs: index pack %s: %w", pe.Name, err)
 		}
 		fs.packSize[pe.Name] = pe.Size
+		fs.packEntries[pe.Name] = len(entries)
 		for _, e := range entries {
 			fs.packIndex[e.Key] = packLoc{pack: pe.Name, off: e.Off, length: e.Length}
 		}
@@ -787,7 +792,7 @@ func (fs *FS) spillCatalog(ctx context.Context, idHex string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("genfs: catalog %s not present in any listed pack", idHex)
 	}
-	stored, err := fs.packRead(ctx, loc)
+	stored, err := fs.packRead(ctx, idHex, loc)
 	if err != nil {
 		return "", err
 	}

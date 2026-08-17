@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/bbockelm/pelfs/internal/genfs"
 )
 
 // Snapshot freezes the overlay at one instant so a seal can walk a view
@@ -287,6 +289,17 @@ func (s *Snapshot) Read(ctx context.Context, ino uint64, off int64, dst []byte) 
 // OpenFile streams an inode's frozen content.
 func (s *Snapshot) OpenFile(ctx context.Context, ino uint64, length int64) (io.ReadCloser, error) {
 	return s.view.OpenFile(ctx, ino, length)
+}
+
+// BaseRootCatalog is the generation the frozen view resolves clean inodes
+// through — the live base, which a snapshot may not outlive a swap of.
+func (s *Snapshot) BaseRootCatalog() [32]byte { return s.view.BaseRootCatalog() }
+
+// BaseContent answers from the FROZEN tables, so "unchanged" means
+// unchanged as of the instant the snapshot was taken — which is exactly
+// the tree being sealed, whatever the mount has done since.
+func (s *Snapshot) BaseContent(ctx context.Context, ino uint64) (genfs.Content, bool, error) {
+	return s.view.BaseContent(ctx, ino)
 }
 
 // Dirty enumerates the frozen changed set — what the seal must publish.

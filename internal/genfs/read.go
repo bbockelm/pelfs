@@ -260,11 +260,10 @@ func (fs *FS) readChunkAt(ctx context.Context, r *catalog.ChunkRef, chunkOff int
 	if !ok {
 		return fmt.Errorf("genfs: chunk %s not present in any listed pack", idHex)
 	}
-	stored, err := fs.packRead(ctx, loc)
+	stored, err := fs.packRead(ctx, idHex, loc)
 	if err != nil {
 		return err
 	}
-	fs.notePackFetch(loc.pack, []string{idHex}, []int64{loc.length})
 	plain, err := fs.decodeChunk(idHex, r, stored)
 	if err != nil {
 		return err

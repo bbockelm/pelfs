@@ -94,12 +94,14 @@ func (fs *FS) Swap(ctx context.Context, sb *superblock.Superblock) (*SwapReport,
 	// failure here leaves the mount on its current generation.
 	newIndex := make(map[string]packLoc)
 	newSizes := make(map[string]int64, len(sb.PackList))
+	newCounts := make(map[string]int, len(sb.PackList))
 	for _, pe := range sb.PackList {
 		entries, err := packstore.FetchTrailerVerified(ctx, fs.inner, pe.Name, pe.Size, pe.TrailerHash)
 		if err != nil {
 			return nil, fmt.Errorf("genfs: swap: index pack %s: %w", pe.Name, err)
 		}
 		newSizes[pe.Name] = pe.Size
+		newCounts[pe.Name] = len(entries)
 		for _, e := range entries {
 			newIndex[e.Key] = packLoc{pack: pe.Name, off: e.Off, length: e.Length}
 		}
@@ -168,6 +170,7 @@ func (fs *FS) Swap(ctx context.Context, sb *superblock.Superblock) (*SwapReport,
 	fs.sb = sb
 	fs.packIndex = newIndex
 	fs.packSize = newSizes
+	fs.packEntries = newCounts
 	fs.res = make(map[uint64]*residency, len(order))
 	fs.resLRU.Init()
 	fs.mu.Unlock()

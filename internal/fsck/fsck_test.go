@@ -51,6 +51,13 @@ func pseudorandom(n int, seed int64) []byte {
 // about: a nested catalog (SMax forces a split), inline and chunked files,
 // a symlink, and a hardlinked file whose content lives in an inode shard.
 func healthyFixture(t *testing.T, uuid string, opts publish.Options) (pelicanobj.Store, string, *publish.Result) {
+	inner, volDir, res, _ := healthyFixtureVol(t, uuid, opts)
+	return inner, volDir, res
+}
+
+// healthyFixtureVol is healthyFixture that also hands back the live
+// volume, for tests that publish a SECOND generation on top of it.
+func healthyFixtureVol(t *testing.T, uuid string, opts publish.Options) (pelicanobj.Store, string, *publish.Result, *testvol.Volume) {
 	t.Helper()
 	inner, volDir := newInner(t)
 	v := testvol.New(t, inner, testvol.Options{
@@ -78,7 +85,7 @@ func healthyFixture(t *testing.T, uuid string, opts publish.Options) (pelicanobj
 		t.Fatalf("fixture is not representative: %d catalogs, %d shards, %d packs",
 			res.Stats.Catalogs, res.Stats.Shards, len(res.Superblock.PackList))
 	}
-	return inner, volDir, res
+	return inner, volDir, res, v
 }
 
 func check(t *testing.T, inner pelicanobj.Store, sb *superblock.Superblock, o fsck.Options) *fsck.Report {
@@ -494,5 +501,34 @@ func TestUnreadableRootAborts(t *testing.T) {
 	// The partial report still carries what was learned about the packs.
 	if rep == nil || len(problemsOf(rep, fsck.KindMissingPack)) != 1 {
 		t.Fatalf("partial report = %+v", rep)
+	}
+}
+
+// A generation whose catalogs were mostly CARRIED FORWARD from its
+// predecessor must check out exactly like one built from scratch. Those
+// catalogs live in older packs and carry an older generation stamp in
+// their own metadata, which is the point of carrying them — nothing in
+// the structural check may depend on either.
+func TestHealthyGenerationWithCarriedCatalogs(t *testing.T) {
+	inner, _, first, v := healthyFixtureVol(t, "77777777-8888-9999-aaaa-bbbbbbbbbbbb", publish.Options{})
+
+	// One new file at the root: the root catalog is rebuilt, /dir's is
+	// carried out of the previous generation's packs.
+	v.WriteFile(rootIno, "late.txt", []byte("one new file in a whole volume"))
+	second := v.Publish(publish.Options{SMax: 1000, TargetPackSize: 2 << 20})
+	if second.Stats.CatalogsReused == 0 {
+		t.Fatalf("nothing was carried forward; the test would prove nothing")
+	}
+	if second.Stats.Catalogs >= first.Stats.Catalogs {
+		t.Fatalf("rebuilt %d catalogs of %d", second.Stats.Catalogs, first.Stats.Catalogs)
+	}
+
+	rep := check(t, inner, second.Superblock, fsck.Options{Deep: true, Workers: 4})
+	dumpProblems(t, rep)
+	if !rep.OK() {
+		t.Fatalf("a generation with carried catalogs reported %d problems", len(rep.Problems))
+	}
+	if rep.Catalogs != first.Stats.Catalogs {
+		t.Errorf("fsck reached %d catalogs; the tree has %d", rep.Catalogs, first.Stats.Catalogs)
 	}
 }

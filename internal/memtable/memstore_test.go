@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/bbockelm/pelfs/internal/chunkid"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
@@ -26,6 +27,12 @@ type countingStore struct {
 	// it is always at least the store's own UploadedBytes accounting.
 	bytesPut int64
 	failPut  error
+	// discard drops object bodies, for measurements whose working set
+	// would not fit in memory. latency models one federation round trip,
+	// without which an upload costs nothing and "the flush overlapped the
+	// writing" is unfalsifiable.
+	discard bool
+	latency time.Duration
 }
 
 func newCountingStore() *countingStore {
@@ -35,18 +42,33 @@ func newCountingStore() *countingStore {
 func (m *countingStore) String() string { return "counting://" }
 
 func (m *countingStore) Put(_ context.Context, key string, in io.Reader) error {
-	data, err := io.ReadAll(in)
+	var (
+		data []byte
+		n    int64
+		err  error
+	)
+	if m.discard {
+		n, err = io.Copy(io.Discard, in)
+	} else {
+		data, err = io.ReadAll(in)
+		n = int64(len(data))
+	}
 	if err != nil {
 		return err
+	}
+	if m.latency > 0 {
+		time.Sleep(m.latency)
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.failPut != nil {
 		return m.failPut
 	}
-	m.objs[key] = data
+	if !m.discard {
+		m.objs[key] = data
+	}
 	m.puts++
-	m.bytesPut += int64(len(data))
+	m.bytesPut += n
 	return nil
 }
 

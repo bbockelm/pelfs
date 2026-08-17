@@ -1,5 +1,5 @@
 // Package publish implements the v2 publish pipeline. It reads a Source —
-// a VACUUM'd JuiceFS cut, or a phase-3 write overlay under seal — and runs
+// a write overlay under seal, or the empty root of a new volume — and runs
 // TRANSFORM (walk the tree, chunk file content, build split path catalogs
 // and inode shards, append everything to packs), UPLOAD (pack seals), and
 // FLIP (write the signed superblock to refs/<branch>). See

@@ -39,8 +39,6 @@ func newInner(t *testing.T) pelicanobj.Store {
 	return inner
 }
 
-// testVolume is a live JuiceFS volume the tests mutate and cut (the cutdb
-// test pattern, extended with cut snapshots via VACUUM INTO).
 // newTestVolume creates an empty volume the test fills in and publishes.
 func newTestVolume(t *testing.T, inner pelicanobj.Store, uuid string) *testvol.Volume {
 	t.Helper()

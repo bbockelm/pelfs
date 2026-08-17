@@ -5,9 +5,6 @@ on:
     branches: [main]
   pull_request:
 
-env:
-  TAGS: nogspt,notikv
-
 jobs:
   unit:
     strategy:
@@ -21,23 +18,26 @@ jobs:
         with:
           go-version: "1.26.x"
       - name: Vet
-        run: CGO_ENABLED=0 go vet -tags "$TAGS" ./...
+        run: CGO_ENABLED=0 go vet ./...
       - name: Unit tests
-        run: CGO_ENABLED=0 go test -tags "$TAGS" -count=1 ./internal/...
+        run: CGO_ENABLED=0 go test -count=1 ./internal/...
       - name: Cross-builds (cgo-free)
         run: |
-          CGO_ENABLED=0 GOOS=linux  GOARCH=amd64 go build -tags "$TAGS" -o /dev/null ./cmd/pelfs
-          CGO_ENABLED=0 GOOS=linux  GOARCH=arm64 go build -tags "$TAGS" -o /dev/null ./cmd/pelfs
-          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -tags "$TAGS" -o /dev/null ./cmd/pelfs
+          CGO_ENABLED=0 GOOS=linux  GOARCH=amd64 go build -o /dev/null ./cmd/pelfs
+          CGO_ENABLED=0 GOOS=linux  GOARCH=arm64 go build -o /dev/null ./cmd/pelfs
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -o /dev/null ./cmd/pelfs
 
-  e2e-docker:
+  e2e:
+    # The whole user-facing workflow -- create, write, seal, read back,
+    # encrypt, prefetch, lease, gc, fsck -- in a container, because the
+    # gate mounts a real filesystem.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26.x"
-      - name: Full mount loop in Docker against fakeorigin
+      - name: Full workflow loop in a container against fakeorigin
         run: ./scripts/e2e-docker.sh
 
   integration:
@@ -99,7 +99,7 @@ jobs:
             "internal/chunkid FuzzChunker"; do
             set -- $t
             echo "== $2 =="
-            CGO_ENABLED=0 go test -tags "$TAGS" -run xxx -fuzz "^$2\$" -fuzztime 30s "./$1/"
+            CGO_ENABLED=0 go test -run xxx -fuzz "^$2\$" -fuzztime 30s "./$1/"
           done
 
   opfuzz:
@@ -118,11 +118,10 @@ jobs:
       - name: Concurrent op stress under -race (contained)
         run: ./scripts/opfuzz-docker.sh 0 ConcurrentOpsStress
 
-  phase3-mount:
-    # The phase-3 gate: a REAL kernel mount of a published generation
-    # through genfs+rawfuse (no JuiceFS in the stack), exercised by the
-    # end-to-end benchmark script. Linux only — this is the coverage a
-    # macFUSE-less dev machine cannot provide.
+  mount-gate:
+    # A REAL kernel mount of a published generation through
+    # genfs+rawfuse, exercised by the end-to-end mount script. Linux only
+    # — this is the coverage a macFUSE-less dev machine cannot provide.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -148,4 +147,4 @@ jobs:
         with:
           go-version: "1.26.x"
       - name: Microbenchmarks
-        run: CGO_ENABLED=0 go test -tags "$TAGS" -run xxx -bench . -benchtime 0.3s ./internal/genfs/
+        run: CGO_ENABLED=0 go test -run xxx -bench . -benchtime 0.3s ./internal/genfs/

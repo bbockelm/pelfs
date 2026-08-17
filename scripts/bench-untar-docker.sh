@@ -43,11 +43,11 @@ DOCKERFILE
 fi
 
 echo "== cross-compiling for linux/$ARCH =="
-(cd "$REPO" && CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" go build -tags nogspt,notikv -o "$STAGE/pelfs" ./cmd/pelfs)
-(cd "$REPO" && CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" go build -tags nogspt,notikv -o "$STAGE/fakeorigin" ./cmd/fakeorigin)
+(cd "$REPO" && CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" go build -o "$STAGE/pelfs" ./cmd/pelfs)
+(cd "$REPO" && CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" go build -o "$STAGE/fakeorigin" ./cmd/fakeorigin)
 # The overlay benchmarks run in the same container so layer 2 is measured
 # on the same kernel and the same tmpfs as layer 3.
-(cd "$REPO" && CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" go test -tags nogspt,notikv -c -o "$STAGE/overlay.test" ./internal/overlay)
+(cd "$REPO" && CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" go test -c -o "$STAGE/overlay.test" ./internal/overlay)
 
 cat > "$STAGE/bench.sh" <<'INNER'
 set -euo pipefail

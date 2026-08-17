@@ -49,9 +49,8 @@ func newSessionID() string {
 }
 
 // genSession is one `pelfs mount-gen` session: the served generation, the
-// optional write overlay, and the session-level facilities a v1 mount
-// already has — statistics, the advisory write lease, and the control
-// socket.
+// optional write overlay, and the session-level facilities around them:
+// statistics, the advisory write lease, and the control socket.
 //
 // It also owns the SEAL ANCHOR (sb/prevRaw): the generation this session's
 // next seal grows from. A mid-session checkpoint advances it, which is the
@@ -122,13 +121,9 @@ func (s countedStore) StatKey(ctx context.Context, key string) (*pelicanobj.KeyI
 	return s.raw.StatKey(ctx, key)
 }
 
-// cmdMountGen mounts a published v2 generation through the catalog-native
-// phase-3 stack — genfs + the raw FUSE binding, no JuiceFS anywhere.
-// Linux/macFUSE only for --backend fuse; --backend nfs works anywhere the
-// OS has an NFS client. Experimental.
-// genArgs are the catalog-native mount knobs. `pelfs shell` fills them
-// in too, so the primary workflow runs on exactly this path rather than
-// a parallel copy of it.
+// genArgs are the mount knobs. `pelfs shell` and `pelfs mount` fill them
+// in too, so the primary workflows run on exactly this path rather than
+// parallel copies of it.
 type genArgs struct {
 	branch, tag, pubkeyHex  string
 	rw, noSeal, subshell    bool
@@ -223,15 +218,15 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	if err != nil {
 		return fail(err)
 	}
-	// Probe access up front, exactly as a v1 session does. This is what
-	// triggers the interactive flow once, for the read+create+modify
+	// Probe access up front. This is what triggers the interactive flow
+	// once, for the read+create+modify
 	// union a whole session needs, and it turns a missing or too-narrow
 	// credential into one clear message here rather than an opaque
 	// failure deep in the mount.
 	if err := pelicanobj.Preflight(ctx, raw, prefix, !rw); err != nil {
 		return fail(err)
 	}
-	// Every byte the phase-3 stack moves — pack range reads, catalog
+	// Every byte the stack moves — pack range reads, catalog
 	// fetches, ref reads, seal uploads — goes through the counter.
 	g.inner = countedStore{ObjectStore: stats.WrapStorage(raw, g.stats), raw: raw}
 
@@ -501,8 +496,7 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	return code
 }
 
-// acquireLease takes the advisory mount lease for a writable session, the
-// same way a v1 write session does.
+// acquireLease takes the advisory mount lease for a writable session.
 //
 // The lease is read and written through a DIRECT-READ store: it is a
 // mutable object, and a federation cache serving a stale copy would either
@@ -829,8 +823,8 @@ func (g *genSession) sealLocked(ctx context.Context) (*publish.Result, error) {
 // Two properties a caller must know:
 //
 //   - The walk is not atomic against writers inside the mount. The overlay
-//     has no snapshot primitive (v1 gets one from VACUUM INTO), so a
-//     checkpoint of a live tree captures what the walk saw, exactly like
+//     has no snapshot primitive, so a checkpoint of a live tree captures
+//     what the walk saw, exactly like
 //     tar over a live directory. The generation is always self-consistent
 //     and signed; it just may not correspond to any instant.
 //   - The branch head now names a generation the ON-DISK overlay does not
@@ -940,10 +934,9 @@ func (g *genSession) sealAtExit(ctx context.Context) error {
 	return nil
 }
 
-// controlHooks exposes the session on the control socket. Flush stays nil
-// (404 on purpose): phase 3 has no staging tier to drain — writes land in
-// the overlay's WAL and staging files as they happen, and the only step
-// that moves them to the federation is the seal behind Publish.
+// controlHooks exposes the session on the control socket. Writes land in
+// the overlay's WAL and staging files as they happen; the only step that
+// moves them to the federation is the seal behind Publish.
 func (g *genSession) controlHooks() control.Hooks {
 	h := control.Hooks{
 		Status: func() map[string]any {
@@ -1005,8 +998,8 @@ func (g *genSession) startControl() *control.Server {
 }
 
 // publishMountRecord makes the session discoverable by prefix, so
-// `pelfs ctl`, `pelfs status`, and `pelfs umount` reach a phase-3 mount the
-// same way they reach a v1 one. It returns the retraction.
+// `pelfs ctl`, `pelfs status`, and `pelfs umount` all find the session by
+// prefix. It returns the retraction.
 //
 // A live record belonging to another session is never overwritten: two
 // mount-gen sessions on one prefix are legitimate (a reader and a writer),

@@ -1,10 +1,12 @@
 # pelfs v2 format: packed objects, split catalogs, signed superblock
 
-Status: **design complete** — every section is settled, with rejected
-alternatives recorded; the only deferred items (end of document) wait on
-external partners or production mileage, not on design. Phase 1 (the pack
-middleware) is implemented; v1 (JuiceFS-native storage) is what ships
-today.
+Status: **shipped** — this format is what pelfs is. Every section is
+settled, with rejected alternatives recorded; the only deferred items
+(end of document) wait on external partners or production mileage, not
+on design. The v1 engine described below as the thing being replaced has
+been deleted; its account is kept because the reasons it existed, and
+the reasons it stopped being enough, are the argument for everything
+here.
 
 ## Why change
 
@@ -1042,8 +1044,13 @@ remount; live generation swap arrives with phase 3.
 
 ## Migration phases
 
-1. **Pack store as ObjectStorage middleware.** — **IMPLEMENTED**
-   (internal/packstore). Writeback staging batches blocks locally;
+1. **Pack store as ObjectStorage middleware.** — **SUPERSEDED** (the
+   middleware is deleted; internal/packstore keeps the pack container
+   itself, which phase 2 and 3 write and read directly). It shipped as
+   described below and bought the small-object fix a full format ahead of
+   the catalogs; nothing bootstraps by listing packs/ any more, because a
+   generation's pack list is the closure.
+   Writeback staging batched blocks locally;
    drain-time packing plus indexed range-read GETs fixes small-object
    overhead and read RTTs with zero metadata format change. Packs carry a
    JSON index trailer (entries + tombstones); packs sort by name in
@@ -1057,25 +1064,20 @@ remount; live generation swap arrives with phase 3.
    (tombstoned entries remain in their packs until then); gc --delete of a
    packed entry from a read-only session is non-durable (the entry
    resurfaces at the next bootstrap — space, never correctness).
-2. **Cold format.** — **IMPLEMENTED** (internal/publish, internal/
-   hydrate, internal/refs, internal/retention; `pelfs publish`, the
-   control socket's publish verb, and --accumulate). Publish translates
-   a cut into catalogs/shards/packs and flips a signed ref; hydrate
-   rebuilds a mountable JuiceFS volume with exact inodes and serves
-   hydrated data from packs. JuiceFS remains the hot engine. Remaining
-   wiring: hydrate-backed restore in mounts (today restore is still v1
-   snapshots), production Storage config in the rebuilt Format.
-3. **Catalog-native runtime.** — **THE LOOP CLOSES**. Landed:
+2. **Cold format.** — **IMPLEMENTED** (internal/publish, internal/refs,
+   internal/retention). Publish turns a source tree into
+   catalogs/shards/packs and flips a signed ref. During this phase the
+   source was a cut of the v1 metadata and `internal/hydrate` rebuilt a
+   mountable v1 volume from a published generation; both are deleted now
+   that the runtime reads generations natively.
+3. **Catalog-native runtime.** — **THE LOOP IS CLOSED**. Landed:
    internal/genfs (generation resolver), internal/rawfuse (raw kernel
    binding, read and write), internal/overlay (crash-safe write path),
    and seal (internal/publish reads a Source, so an overlay becomes a
-   generation directly). `pelfs mount-gen [--rw]` mounts a published
-   generation with NO JuiceFS in the stack and, read-write, seals the
-   overlay into the next generation at unmount. Remaining before
-   JuiceFS can be ejected: generation swap with enumerated invalidation
-   (needs per-handle generation pinning), splice reads, and production
-   mileage — v1 still owns the default mount path. JuiceFS goes last;
-   what is battle-tested by then is our format, not their schema.
+   generation directly). Every pelfs command now runs on this stack, and
+   the v1 engine is gone. The order was deliberate: v1 owned the default
+   mount path until the format had run real workloads, so what is
+   battle-tested is our format, not somebody else'"'"'s schema.
 
    Measured on the phase-3 read path (M-series, 512-entry catalog,
    loopback origin) after the prepared-statement, pooling, and
@@ -1147,11 +1149,12 @@ remount; live generation swap arrives with phase 3.
 A full POSIX implementation — including kernel dentry caching done
 right — requires the RAW FUSE protocol layer, not a convenience
 wrapper: pelfs implements `fuse.RawFileSystem` (the go-fuse fork we
-already vendor has the complete raw surface: per-reply entry/attr
-validity, entry/inode/delete notification, NotifyStore, readdirplus;
-we start on the fork and move to upstream hanwen/go-fuse when JuiceFS
-is ejected). The high-level layers hide exactly the knobs this design
-exists to exploit.
+vendor has the complete raw surface: per-reply entry/attr validity,
+entry/inode/delete notification, NotifyStore, readdirplus — the one
+JuiceFS dependency that outlived the engine, because upstream
+hanwen/go-fuse at the pinned version lacks pieces the binding uses and
+adopting a modern release is a separate migration). The high-level
+layers hide exactly the knobs this design exists to exploit.
 
 **The immutability dividend.** Within a generation, clean inodes never
 change — so Lookup and GetAttr replies for them carry effectively
@@ -1200,40 +1203,48 @@ shard routing, chunk reads) is `internal/genfs`, built during phase 2 as
 independent groundwork; the raw FUSE binding and the overlay are the
 phase-3 work proper.
 
-## Ejecting JuiceFS: what is left
+## Ejecting JuiceFS: done
 
-Audited by import, not by impression. The phase-3 runtime — genfs,
-overlay, rawfuse, vfsbilly, catalog, chunkid, entrycodec, superblock,
-refs, retention — has ZERO JuiceFS imports in non-test code. What
-remains splits cleanly:
+Audited by import, not by impression, and then carried out. Nothing in
+the tree imports JuiceFS.
 
 **Tier A — the v1 engine itself. Deleted, not ported:**
 
-| package | uses | replaced by |
-|---|---|---|
-| `mountfs` | fs, fuse, vfs, meta, chunk | `rawfuse` + `mount-gen` |
-| `nfsmount/billyfs.go`, `handlecache.go` | fs, meta, vfs | `vfsbilly` |
-| `offline` (gc/fsck) | meta | `retention` (v2 GC); a v2 fsck is still owed |
-| `snapshot` | object | superblock generations |
-| `cutdb` | chunk, meta | `publish`'s overlay source (seal) |
-| `hydrate` | meta | OBSOLETE: it existed to mount a v2 generation with the v1 engine, which `mount-gen` now does natively |
+| package | replaced by |
+|---|---|
+| `mountfs` | `rawfuse` + `mount-gen` |
+| `nfsmount/billyfs.go`, `handlecache.go` | `vfsbilly` |
+| `offline` (gc/fsck) | `retention` (the sweep) and `fsck` (the checker) |
+| `snapshot` | superblock generations |
+| `cutdb` | the overlay source under seal |
+| `hydrate` | OBSOLETE: it existed to mount a generation with the v1 engine, which the mount path now does natively |
+| `packstore`'s ObjectStorage middleware | the pack list; a generation names its own packs, so nothing replays trailers to find one |
+| `dockerrun` | the NFS backend, which is what macOS-without-macFUSE actually needs |
 
-**Tier B — only the `object.ObjectStorage` INTERFACE** (`packstore`,
-`pelicanobj`, `stats`, `publish`, `cmd/pelfs`). Mechanical to replace
-with our own interface once Tier A is gone; it cannot go earlier
-because Tier A passes real JuiceFS stores across it.
+**Tier B — the `object.ObjectStorage` interface.** Replaced by
+`pelicanobj.ObjectStore`: String, Get, Put, Delete, Head, ListAll, and a
+plain `Object` struct. Everything in this format is immutable and
+content-addressed, so there is nothing for rename, copy, multipart, or
+storage classes to abstract over. The client-side object encryptor went
+with it — volume encryption is the key table plus per-entry AEAD.
 
-**Feature parity, now complete on the catalog-native path:** mount
-(`mount-gen`), read-write (`--rw`), subshell (`--subshell`), NFS
-frontend (`--backend nfs`, for macOS without macFUSE), prefetch
-(`--prefetch all|background`), live refresh (`--poll`), volume creation
-(`pelfs init`), publish (seal at unmount), and GC (`retention`).
+Consequences: one direct dependency and its whole transitive tree left
+`go.mod`, the three cgo-free shim modules that existed to keep that tree
+buildable are gone, and the build needs no tags at all. What remains is
+one replace directive for the go-fuse fork, whose raw surface the
+binding depends on; moving to a modern upstream release is its own piece
+of work.
 
-**What is genuinely still owed before deletion:** a v2 `fsck`, stats
-and lease wiring for `mount-gen`, and production mileage. The order
-matters — delete v1 only after the format has run real workloads,
-because what is battle-tested by then must be our format, not their
-schema.
+**Migration for existing v1 volumes: drain, never convert.** This was
+settled in the table below and it is what shipped. `pelfs publish`,
+which promoted a v1 volume in place, is gone: keeping it would have
+meant keeping the v1 metadata engine and block reader — the heaviest
+part of the dependency — to serve volumes that are by charter scratch.
+A prefix holding v1 metadata is still RECOGNIZED (`classifyVolume` probes
+for it) and refused with instructions, because the alternative failure
+mode is reading it as an empty prefix and initializing a new volume over
+somebody's data. To move one: read it with the last release that had the
+v1 engine, and copy the tree into a fresh prefix served by this one.
 
 ## Settled decisions (with rejected alternatives)
 
@@ -1286,8 +1297,8 @@ production mileage, not more design:
 
 ## Relationship to v1 components
 
-Survives unchanged: pelicanobj transports, preflight, token machinery,
-Docker/NFS/FUSE frontends, stats, prefetch (walks catalogs instead of
-ScanSlices), lease (degenerates to superblock ETag guard). Replaced: the
-block-per-object layout, whole-DB snapshots, and — in phase 3 — the JuiceFS
-runtime itself.
+Survived: the pelicanobj transports, preflight, the token machinery, the
+NFS and FUSE frontends, stats, prefetch (walks catalogs instead of
+ScanSlices), and the lease (a superblock ETag guard). Replaced and
+deleted: the block-per-object layout, whole-database snapshots, and the
+v1 runtime itself.

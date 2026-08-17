@@ -60,8 +60,8 @@ if [ -n "${PELFS_PREBUILT:-}" ]; then
 else
   cd "$REPO"
   echo "== building pelfs and fakeorigin =="
-  CGO_ENABLED=0 go build -tags nogspt,notikv -o "$WORK/pelfs" ./cmd/pelfs
-  CGO_ENABLED=0 go build -tags nogspt,notikv -o "$WORK/fakeorigin" ./cmd/fakeorigin
+  CGO_ENABLED=0 go build -o "$WORK/pelfs" ./cmd/pelfs
+  CGO_ENABLED=0 go build -o "$WORK/fakeorigin" ./cmd/fakeorigin
 fi
 
 echo "== starting fakeorigin =="

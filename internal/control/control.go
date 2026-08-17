@@ -1,7 +1,7 @@
 // Package control is the session control socket: plain HTTP over a
 // Unix-domain socket in the volume state directory (the Docker pattern —
 // curl-able, no custom framing), so a running mount can be told to
-// publish, flush, or explain itself without signals or restarts.
+// publish or explain itself without signals or restarts.
 //
 // The socket is 0600 inside the per-volume state dir; possession of that
 // directory is already possession of the volume's local keys, so the
@@ -34,9 +34,8 @@ type Hooks struct {
 	Status func() map[string]any
 	// StatsJSON returns the current session-statistics document.
 	StatsJSON func() ([]byte, error)
-	// Flush drains staging and packs to the federation.
-	Flush func(ctx context.Context) error
-	// Publish cuts and publishes a v2 generation, returning a summary.
+	// Publish seals the write overlay into the next generation and
+	// returns a summary.
 	Publish func(ctx context.Context) (string, error)
 	// BugreportExtra contributes additional named files to bug reports
 	// (config dumps, lineage info); may be nil.
@@ -124,17 +123,6 @@ func registerRoutes(mux *http.ServeMux, h Hooks) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(b)
-	})
-	mux.HandleFunc("POST /v1/flush", func(w http.ResponseWriter, r *http.Request) {
-		if h.Flush == nil {
-			http.NotFound(w, r)
-			return
-		}
-		if err := h.Flush(r.Context()); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		writeJSON(w, map[string]any{"flushed": true})
 	})
 	mux.HandleFunc("POST /v1/publish", func(w http.ResponseWriter, r *http.Request) {
 		if h.Publish == nil {

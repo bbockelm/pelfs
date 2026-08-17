@@ -20,7 +20,6 @@ func testHooks(published *int) Hooks {
 		StatsJSON: func() ([]byte, error) {
 			return []byte(`{"clean_shutdown":false}`), nil
 		},
-		Flush: func(ctx context.Context) error { return nil },
 		Publish: func(ctx context.Context) (string, error) {
 			*published++
 			return "generation 4", nil
@@ -53,9 +52,6 @@ func TestControlRoundTrip(t *testing.T) {
 
 	if body, err = c.Do(ctx, "GET", "/v1/stats"); err != nil || !strings.Contains(string(body), "clean_shutdown") {
 		t.Fatalf("stats: %s err=%v", body, err)
-	}
-	if _, err = c.Do(ctx, "POST", "/v1/flush"); err != nil {
-		t.Fatalf("flush: %v", err)
 	}
 	if body, err = c.Do(ctx, "POST", "/v1/publish"); err != nil || !strings.Contains(string(body), "generation 4") {
 		t.Fatalf("publish: %s err=%v", body, err)

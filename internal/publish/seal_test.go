@@ -717,8 +717,7 @@ func TestInitVolumeThenSeal(t *testing.T) {
 		t.Fatalf("fresh volume has %d entries, want 0: %+v", len(entries), entries)
 	}
 
-	// Write into it through the phase-3 path and seal: a complete volume
-	// lifecycle with no JuiceFS anywhere.
+	// Write into it and seal: a complete volume lifecycle.
 	ov, err := overlay.Open(t.TempDir(), base, overlay.Options{
 		NextInode:      base.NextInode(),
 		BaseRoot:       base.RootCatalog(),

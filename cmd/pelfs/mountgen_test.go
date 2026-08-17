@@ -186,16 +186,13 @@ func TestMountGenControlStatusAndStats(t *testing.T) {
 }
 
 // A read-only mount-gen session must expose no way to write: no lease is
-// taken and the publish verb is absent. Flush is absent for every phase-3
-// mount — there is no staging tier to drain.
+// taken and the publish verb is absent.
 func TestMountGenControlReadOnlyHasNoPublish(t *testing.T) {
 	g := newGenSession(t, false)
 	c := serve(t, g)
 	ctx := context.Background()
-	for _, ep := range []string{"/v1/publish", "/v1/flush"} {
-		if _, err := c.Do(ctx, "POST", ep); err == nil || !strings.Contains(err.Error(), "404") {
-			t.Errorf("POST %s: err=%v, want 404", ep, err)
-		}
+	if _, err := c.Do(ctx, "POST", "/v1/publish"); err == nil || !strings.Contains(err.Error(), "404") {
+		t.Errorf("POST /v1/publish: err=%v, want 404", err)
 	}
 	if g.lease != nil {
 		t.Error("a read-only session took the write lease")

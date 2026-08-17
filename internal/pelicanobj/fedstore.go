@@ -22,7 +22,7 @@ import (
 type fedStore struct {
 	// ctx is the long-lived context the PelicanFS (and its transfer engine)
 	// is bound to. The Pelican fs API does not take per-operation contexts;
-	// per-op cancellation is bounded by JuiceFS's chunk-store timeouts.
+	// per-op cancellation is bounded by the caller's own timeouts.
 	ctx    context.Context
 	prefix string // pelican://host/path, no trailing slash
 	pfs    *client.PelicanFS
@@ -59,9 +59,9 @@ func newFedStore(ctx context.Context, cfg Config) (*fedStore, error) {
 		if initClientErr = config.InitClient(); initClientErr != nil {
 			return
 		}
-		// Object-storage PUT semantics are upsert: JuiceFS re-uploads keys
-		// on retry and the snapshot manager overwrites its session object
-		// in place (guarded by ETag checks).
+		// Object-storage PUT semantics are upsert: uploads are retried by
+		// key, and the branch ref is overwritten in place on every flip
+		// (guarded by ETag checks).
 		if initClientErr = param.Client_EnableOverwrites.Set(true); initClientErr != nil {
 			return
 		}
@@ -115,7 +115,7 @@ func (s *fedStore) keyURL(key string) string {
 }
 
 // mapNotFound folds the client's various not-found signals into
-// os.ErrNotExist so JuiceFS's checks work.
+// os.ErrNotExist, the one thing callers test for.
 func mapNotFound(err error) error {
 	if err == nil {
 		return nil

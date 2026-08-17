@@ -46,8 +46,8 @@ DOCKERFILE
 fi
 
 echo "== cross-compiling for linux/$ARCH =="
-(cd "$REPO" && CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" go build -tags nogspt,notikv -o "$STAGE/pelfs" ./cmd/pelfs)
-(cd "$REPO" && CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" go build -tags nogspt,notikv -o "$STAGE/fakeorigin" ./cmd/fakeorigin)
+(cd "$REPO" && CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" go build -o "$STAGE/pelfs" ./cmd/pelfs)
+(cd "$REPO" && CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" go build -o "$STAGE/fakeorigin" ./cmd/fakeorigin)
 
 cat > "$STAGE/bench.sh" <<'INNER'
 set -euo pipefail

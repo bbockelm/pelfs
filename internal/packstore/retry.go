@@ -10,9 +10,8 @@ import (
 	"time"
 )
 
-// JuiceFS-style operational robustness for federation I/O (requested
-// explicitly: retry-with-backoff on failures, log every failed attempt
-// and every slow operation). The pelican client retries some transport
+// Operational robustness for federation I/O: retry with backoff on
+// failure, and log every failed attempt and every slow operation. The pelican client retries some transport
 // errors internally; this layer covers the failures that surface anyway —
 // origin restarts, token refresh races, cache 5xxs — with capped
 // exponential backoff plus jitter, honoring context cancellation.

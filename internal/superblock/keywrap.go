@@ -22,8 +22,8 @@ import (
 	"github.com/youmark/pkcs8"
 )
 
-// oaepLabel matches JuiceFS's RSA key encryptor so the v1 KEK is directly
-// usable. Changing it would silently orphan every wrapped key.
+// oaepLabel is part of the wrapping contract: changing it would silently
+// orphan every key already wrapped under it.
 var oaepLabel = []byte("keys")
 
 // WrappedKeySize is the size of every key the table wraps (BLAKE3 keys
@@ -59,9 +59,9 @@ func UnwrapKey(priv *rsa.PrivateKey, wrapped []byte) ([]byte, error) {
 // passphrase.
 var ErrKeyNeedsPassphrase = errors.New("passphrase is required for this private key")
 
-// LoadRSAPrivateKeyPEM parses an RSA private key from PEM bytes,
-// accepting the same shapes as v1's --encrypt-key parser (see the file
-// comment). passphrase may be nil for unencrypted keys.
+// LoadRSAPrivateKeyPEM parses an RSA private key from PEM bytes in any of
+// the shapes the file comment lists. passphrase may be nil for
+// unencrypted keys.
 func LoadRSAPrivateKeyPEM(pemBytes, passphrase []byte) (*rsa.PrivateKey, error) {
 	block, _ := pem.Decode(pemBytes)
 	if block == nil {
@@ -69,7 +69,7 @@ func LoadRSAPrivateKeyPEM(pemBytes, passphrase []byte) (*rsa.PrivateKey, error) 
 	}
 
 	der := block.Bytes
-	//nolint:staticcheck // legacy RFC 1423 encryption, kept for v1 key-file compat
+	//nolint:staticcheck // legacy RFC 1423 encryption; real key files still use it
 	if x509.IsEncryptedPEMBlock(block) {
 		if len(passphrase) == 0 {
 			return nil, fmt.Errorf("load KEK: %w", ErrKeyNeedsPassphrase)

@@ -36,7 +36,7 @@ command -v docker >/dev/null || { echo "docker is required (containment is manda
 if [[ "$PATTERN" == Fuzz* ]]; then
   echo "== cross-compiling fuzz binary (linux/$ARCH, static) =="
   (cd "$REPO" && CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" \
-    go test -c -tags "opfuzz,nogspt,notikv" -o "$BIN" ./internal/overlay/)
+    go test -c -tags opfuzz -o "$BIN" ./internal/overlay/)
   RUNARGS=(-test.run xxx -test.fuzz "^${PATTERN}\$" -test.fuzztime "$FUZZTIME" -test.fuzzcachedir /scratch/fuzzcache)
 else
   echo "== building the race binary inside the runner image =="
@@ -50,7 +50,7 @@ else
     -e GOMODCACHE=/gomod -e GOCACHE=/gocache -e GOFLAGS=-mod=readonly \
     -e CGO_ENABLED=1 -w /src \
     "$BUILDER" \
-    sh -c 'go test -c -race -tags "opfuzz,nogspt,notikv" -o /out/opfuzz.test ./internal/overlay/ && cp /out/opfuzz.test /dev/stdout' > "$BIN"
+    sh -c 'go test -c -race -tags opfuzz -o /out/opfuzz.test ./internal/overlay/ && cp /out/opfuzz.test /dev/stdout' > "$BIN"
   chmod +x "$BIN"
   IMAGE="$BUILDER" # run on the libc it was built against
   RUNARGS=(-test.run "$PATTERN" -test.count=1 -test.v)

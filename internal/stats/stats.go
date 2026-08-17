@@ -56,24 +56,15 @@ type Summary struct {
 	ErrorSamples      []ErrorSample `json:"error_samples,omitempty"`
 
 	// Component outcomes.
-	SnapshotsUploaded int64 `json:"snapshots_uploaded"`
-	SnapshotErrors    int64 `json:"snapshot_errors"`
-	FinalSnapshotOK   *bool `json:"final_snapshot_ok,omitempty"`
-
 	PrefetchMode          string `json:"prefetch_mode,omitempty"`
-	PrefetchSlices        int64  `json:"prefetch_slices,omitempty"`
 	PrefetchFailed        int64  `json:"prefetch_failed,omitempty"`
 	PrefetchComplete      bool   `json:"prefetch_complete,omitempty"`
-	StagingDrained        *bool  `json:"staging_drained,omitempty"` // writeback only
-	StagingBlocksLeft     int64  `json:"staging_blocks_left,omitempty"`
 	LeaseHeld             bool   `json:"lease_held,omitempty"`
 	LeaseConflictObserved bool   `json:"lease_conflict_observed,omitempty"`
 
-	// Catalog-native (phase 3) sessions: `pelfs mount-gen`. A v1 session
-	// leaves every field below zero, so one document shape serves both.
-	//
-	// Generation is what the mount serves NOW — with --poll it is the
-	// head the last live refresh swapped to, not the one it started on.
+	// What the mount is serving. Generation is what it serves NOW — with
+	// --poll it is the head the last live refresh swapped to, not the one
+	// it started on.
 	Generation      uint64 `json:"generation,omitempty"`
 	Branch          string `json:"branch,omitempty"`
 	Tag             string `json:"tag,omitempty"`
@@ -81,8 +72,7 @@ type Summary struct {
 	Writable        bool   `json:"writable,omitempty"` // --rw: an overlay shadows the generation
 	GenerationSwaps int64  `json:"generation_swaps,omitempty"`
 
-	// Prefetch on a catalog-native mount warms whole chunks, not the
-	// slices a JuiceFS mount counts.
+	// Prefetch warms whole content-defined chunks.
 	PrefetchChunks int64 `json:"prefetch_chunks,omitempty"`
 	PrefetchBytes  int64 `json:"prefetch_bytes,omitempty"`
 

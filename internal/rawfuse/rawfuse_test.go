@@ -283,6 +283,17 @@ func checkValidity(t *testing.T, what string, entrySec, attrSec uint64) {
 	}
 }
 
+// maxDirtyValiditySec: a dirty reply may be cached, but only briefly —
+// the kernel must come back on a human timescale, not a generational one.
+const maxDirtyValiditySec = uint64(5)
+
+func checkDirtyValidity(t *testing.T, what string, entrySec, attrSec uint64) {
+	t.Helper()
+	if entrySec > maxDirtyValiditySec || attrSec > maxDirtyValiditySec {
+		t.Fatalf("%s validity = %d/%d sec, want <= %d", what, entrySec, attrSec, maxDirtyValiditySec)
+	}
+}
+
 // --- DirEntryList wire parsing (test-only): the list's buffer is private,
 // so read it via reflect+unsafe and decode the kernel wire format go-fuse
 // serializes (EntryOut? + dirent + name + pad-to-8) ---

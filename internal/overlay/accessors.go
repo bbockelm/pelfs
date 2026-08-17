@@ -7,6 +7,8 @@ import (
 	"io"
 	"math"
 	"strconv"
+
+	"github.com/bbockelm/pelfs/internal/genfs"
 )
 
 // Accessors that exist because consumers were forced to reimplement them:
@@ -128,8 +130,8 @@ func (fs *FS) bumpSeqLocked(inos ...uint64) {
 // left behind, which no seal of THIS session's snapshots is known to have
 // published — so it reads as modified more recently than any snapshot and
 // is never rebased away. Conservative by construction: the cost is a
-// resumed session keeping its inherited dirt at zero TTLs until it
-// touches it again, never a dropped change.
+// resumed session keeping its inherited dirt at the short dirty TTL
+// until it touches it again, never a dropped change.
 func (fs *FS) modSeqOfLocked(ino uint64) uint64 {
 	if v, ok := fs.modSeq[ino]; ok {
 		return v
@@ -161,6 +163,58 @@ func (fs *FS) AllXattrs(ctx context.Context, ino uint64) (map[string][]byte, err
 		out[name] = v
 	}
 	return out, nil
+}
+
+// BaseRootCatalog is the root-catalog identity of the generation this
+// overlay shadows. A seal uses it to confirm that the generation it is
+// building on is the same one BaseContent answers from.
+func (fs *FS) BaseRootCatalog() [32]byte { return fs.base.RootCatalog() }
+
+// BaseContent returns the base generation's content records for ino when
+// this overlay has provably not changed the file's bytes; ok is false when
+// it has, or when the overlay cannot prove it hasn't. The caller then reads
+// and re-chunks, which is always correct and merely slower.
+//
+// The proof is structural, not a comparison of bytes:
+//
+//   - Every content mutation stages the file first (write.go,
+//     materializeContentLocked): a write, a truncate in either direction,
+//     and an overlay-created file all leave an ocontent row before the
+//     mutation commits. No ocontent row therefore means no byte of this
+//     inode has been written through this overlay.
+//   - An overlay-NEW inode has no records in the base at all, so a
+//     non-base onode row disqualifies it even though a fresh file always
+//     stages too.
+//
+// Attribute-only changes — chmod, chown, utimens, a link count moving —
+// materialize an onode row and no ocontent row, so they correctly do NOT
+// force a re-chunk. The new catalog still records them: they come from the
+// merged attributes the walk collected, not from here.
+func (fs *FS) BaseContent(ctx context.Context, ino uint64) (genfs.Content, bool, error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	staged, err := hasContent(fs.q, ino)
+	if err != nil || staged {
+		return genfs.Content{}, false, err
+	}
+	row, err := getONode(fs.q, ino)
+	if err != nil {
+		return genfs.Content{}, false, err
+	}
+	if row != nil && !row.base {
+		return genfs.Content{}, false, nil
+	}
+	if err := fs.ensureBaseLocked(ctx, fs.db, ino); err != nil {
+		return genfs.Content{}, false, err
+	}
+	c, err := fs.base.ContentOf(ctx, ino)
+	if err != nil {
+		// Not softened into "cannot prove it": the fallback path reads the
+		// same inode through the same base, so anything that fails here
+		// fails there too, only after a download's worth of latency.
+		return genfs.Content{}, false, err
+	}
+	return c, true, nil
 }
 
 // OpenFile returns a sequential reader over an inode's whole content,

@@ -18,8 +18,8 @@ import (
 // resolvable from the base, and eligible for the immutability dividend's
 // effectively infinite entry/attr TTLs (docs/design-packfs.md, "Phase 3
 // VFS architecture"). Without it a long session monotonically loses
-// caching, because every inode it ever touched keeps paying zero TTLs
-// long after its content was published.
+// caching, because every inode it ever touched keeps paying the short
+// dirty TTL long after its content was published.
 //
 // The caller's contract, in order, and none of it optional:
 //
@@ -116,7 +116,7 @@ func (fs *FS) Rebase(ctx context.Context, sealedSeq uint64, sealed Options) (*Re
 
 	rep := &RebaseReport{BaseGeneration: sealed.BaseGeneration, Unresolved: sortedInodes(unresolved)}
 	var drop []string
-	err = fs.withTx(func(tx *sql.Tx) error {
+	err = fs.withTx(func(tx querier) error {
 		for _, ino := range cleaned {
 			staged, err := hasContent(tx, ino)
 			if err != nil {

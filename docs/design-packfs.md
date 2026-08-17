@@ -1113,12 +1113,28 @@ remount; live generation swap arrives with phase 3.
    is answered from memory in ~15 ns; as a SQL query it cost 24 us, more
    than a whole Lookup.
 
-   The repeat walk over DIRTY inodes gains nothing, because zero TTLs
-   force every stat back to userspace — which is the correct and
-   required behavior while the overlay owns those inodes. Over CLEAN
-   inodes the kernel answers from its own dentry/attr cache and the same
-   walk is 5.5x faster. That gap is the design's central claim,
-   confirmed end to end rather than argued.
+   The repeat walk over DIRTY inodes gains far less, because their
+   replies carry only a short TTL and most stats go back to userspace.
+   Over CLEAN inodes the kernel answers from its own dentry/attr cache
+   and the same walk is 5.5x faster. That gap is the design's central
+   claim, confirmed end to end rather than argued.
+
+   The dirty TTL was originally ZERO, on the reasoning that an inode the
+   overlay owns can change at any moment. Measurement showed what that
+   cost: with no attribute cache the kernel re-asks about every change it
+   just made itself, and an untar traced at 14.1 FUSE operations per
+   created file, six of them existing only because of the zero TTL.
+   Raising it to one second cut the untar 1.57x (878 -> 1379 files/s) and
+   a walk over the dirty tree 1.87x.
+
+   The safety argument is exclusive ownership, not optimism: the overlay
+   is opened locking_mode EXCLUSIVE, so the only mutations are ones the
+   kernel itself issued, and the reply to each refreshes the very entry
+   in question. The kernel can hold its own most recent view, never
+   another writer's stale one. It stays SHORT rather than infinite
+   because one transition does move state out from under the kernel — a
+   mid-session checkpoint returning inodes to clean — and a bounded TTL
+   converges on its own if an invalidation is ever missed.
 
    It also names the next bottleneck: in writable mounts every operation
    pays a userspace round trip into an overlay that serializes on one

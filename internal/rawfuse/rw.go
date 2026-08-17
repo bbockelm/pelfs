@@ -34,8 +34,8 @@ func MountRW(mountpoint string, ov *overlay.FS, debug bool) (*fuse.Server, error
 
 // dirtySet answers the TTL question "has the overlay touched this inode".
 // Clean inodes get effectively infinite entry/attr validity (the kernel
-// becomes the dentry cache); dirty ones must get zero, or the kernel
-// serves stale metadata for a file the overlay is changing.
+// becomes the dentry cache); dirty ones get only dirtyValidity, so the
+// kernel re-asks about anything the overlay is changing.
 //
 // The overlay is the authority (IsDirty: one indexed EXISTS), consulted
 // lazily and cached positively. Dirt is sticky for an overlay's lifetime

@@ -39,6 +39,59 @@ func benchOverlay(b *testing.B, files int) (*overlay.FS, uint64, []string) {
 	return ov, dir.Inode, names
 }
 
+// BenchmarkOverlayCreate is the untar shape with the kernel and FUSE
+// removed: one create per iteration into a directory that keeps growing,
+// so the reported ns/op is the overlay's own cost for the operation an
+// unpack issues tens of thousands of times.
+func BenchmarkOverlayCreate(b *testing.B) {
+	fx := newFixture(b, "b0000000-0000-4000-8000-00000000b002")
+	ov := openOverlay(b, fx, b.TempDir())
+	ctx := context.Background()
+	dir, err := ov.Mkdir(ctx, 1, "bench", 0755, 0, 0)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	i := 0
+	for b.Loop() {
+		if _, err := ov.Create(ctx, dir.Inode, fmt.Sprintf("f%07d", i), 0644, 0, 0); err != nil {
+			b.Fatal(err)
+		}
+		i++
+	}
+}
+
+// BenchmarkOverlayCreateWrite adds the content write and the attribute
+// fixup an unpack performs per file (tar sets mode and mtime after
+// writing the body), so one iteration is one whole extracted file.
+func BenchmarkOverlayCreateWrite(b *testing.B) {
+	fx := newFixture(b, "b0000000-0000-4000-8000-00000000b003")
+	ov := openOverlay(b, fx, b.TempDir())
+	ctx := context.Background()
+	dir, err := ov.Mkdir(ctx, 1, "bench", 0755, 0, 0)
+	if err != nil {
+		b.Fatal(err)
+	}
+	body := make([]byte, 4096)
+	mode := uint32(0644)
+	mtime := int64(1700000000)
+	b.ReportAllocs()
+	i := 0
+	for b.Loop() {
+		n, err := ov.Create(ctx, dir.Inode, fmt.Sprintf("f%07d", i), 0644, 0, 0)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if _, err := ov.Write(ctx, n.Inode, 0, body); err != nil {
+			b.Fatal(err)
+		}
+		if _, err := ov.SetAttr(ctx, n.Inode, overlay.SetAttrIn{Mode: &mode, MtimeNS: &mtime}); err != nil {
+			b.Fatal(err)
+		}
+		i++
+	}
+}
+
 func BenchmarkOverlayLookup(b *testing.B) {
 	ov, dir, names := benchOverlay(b, 256)
 	ctx := context.Background()

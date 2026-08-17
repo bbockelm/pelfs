@@ -7,7 +7,7 @@
 // The immutability dividend: within a generation CLEAN inodes never change,
 // so their EntryOut/AttrOut carry an effectively infinite validity and the
 // kernel is the dentry/attr cache. DIRTY inodes — anything the overlay has
-// touched — carry ZERO validity so the kernel re-asks on every reference.
+// touched — carry only a short validity so the kernel comes back for them.
 // That split is the load-bearing correctness rule of the design.
 //
 // Residency is FORGET-driven: Lookup (and each entry a ReadDirPlus emits)
@@ -39,6 +39,25 @@ import (
 // generation; a generation swap invalidates by notification, not by TTL
 // expiry.
 const entryValidity = 10 * 365 * 24 * time.Hour
+
+// dirtyValidity is the entry/attr TTL stamped on a DIRTY reply. Zero is
+// the maximally conservative answer, and an unpack pays for it: with no
+// attribute cache the kernel re-asks about every change it made itself,
+// which traced at 5 GETATTRs and 2 LOOKUPs per created file — 14 FUSE
+// round trips for a file that needs 8.
+//
+// A short TTL is sound because the overlay has exactly one writer. The
+// mount owns it exclusively (the database is opened locking_mode
+// EXCLUSIVE), so nothing mutates an inode except an operation the kernel
+// itself issued, and the reply to that operation refreshes the very cache
+// entry in question. What the kernel can hold is therefore its own most
+// recent view, never someone else's stale one.
+//
+// It stays short rather than infinite so that the one transition which
+// does move state out from under the kernel — a mid-session checkpoint
+// returning inodes to clean — converges on its own even if a
+// notification is missed.
+const dirtyValidity = time.Second
 
 // errStale maps genfs.ErrStale: the kernel references an inode it never
 // looked up (or already forgot).
@@ -245,14 +264,20 @@ func fillAttr(n *genfs.Node, a *fuse.Attr) {
 }
 
 // validity is the TTL for one inode's reply: effectively infinite while
-// the inode is clean (immutable within the generation), ZERO once the
-// overlay has touched it so the kernel re-asks instead of trusting a
-// snapshot that can change under it.
+// the inode is clean (immutable within the generation), and briefly valid
+// once the overlay has touched it (see dirtyValidity).
 func (r *raw) validity(ino uint64) time.Duration {
-	if r.dirty != nil && r.dirty.has(ino) {
-		return 0
+	if r.isDirty(ino) {
+		return dirtyValidity
 	}
 	return entryValidity
+}
+
+// isDirty is the overlay-touched predicate on its own. Page-cache
+// retention keys off this rather than off a zero TTL: the two policies
+// answer different questions, and only one of them is a duration.
+func (r *raw) isDirty(ino uint64) bool {
+	return r.dirty != nil && r.dirty.has(ino)
 }
 
 // fillEntry completes an EntryOut: stable inode as NodeId (inodes NEVER
@@ -302,7 +327,7 @@ func (r *raw) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenOut
 		return fuse.EROFS
 	}
 	out.Fh = 0
-	if !writable && r.validity(input.NodeId) > 0 {
+	if !writable && !r.isDirty(input.NodeId) {
 		out.OpenFlags |= fuse.FOPEN_KEEP_CACHE
 	}
 	return fuse.OK

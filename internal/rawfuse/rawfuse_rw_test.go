@@ -190,13 +190,11 @@ func TestRWCreateWriteRead(t *testing.T) {
 		t.Fatalf("CreateOut attr = %+v", co.Attr)
 	}
 	// A file this mount is about to write is not immutable: no page-cache
-	// retention across open, and zero TTLs from the first reply on.
+	// retention across open, and short TTLs from the first reply on.
 	if co.OpenFlags&fuse.FOPEN_KEEP_CACHE != 0 {
 		t.Fatal("Create set FOPEN_KEEP_CACHE on a writable file")
 	}
-	if co.EntryValid != 0 || co.AttrValid != 0 {
-		t.Fatalf("Create validity = %d/%d, want 0/0", co.EntryValid, co.AttrValid)
-	}
+	checkDirtyValidity(t, "Create", co.EntryValid, co.AttrValid)
 	ino := co.NodeId
 
 	body := []byte("written through the raw binding")
@@ -241,7 +239,7 @@ func TestRWCreateWriteRead(t *testing.T) {
 }
 
 // TestRWDirtyTTLPolicy is the design rule itself: clean inodes reply with
-// effectively infinite validity, dirty ones with zero.
+// effectively infinite validity, dirty ones with a short one.
 func TestRWDirtyTTLPolicy(t *testing.T) {
 	f := newRWFixture(t, "20202020-3030-4040-5050-606060606060")
 
@@ -264,14 +262,12 @@ func TestRWDirtyTTLPolicy(t *testing.T) {
 	if dirty.NodeId != base.NodeId {
 		t.Fatalf("inode renumbered on write: %d -> %d", base.NodeId, dirty.NodeId)
 	}
-	if dirty.EntryValid != 0 || dirty.EntryValidNsec != 0 || dirty.AttrValid != 0 || dirty.AttrValidNsec != 0 {
-		t.Fatalf("dirty base.txt validity = %d.%d/%d.%d, want all zero",
-			dirty.EntryValid, dirty.EntryValidNsec, dirty.AttrValid, dirty.AttrValidNsec)
-	}
+	checkDirtyValidity(t, "dirty base.txt", dirty.EntryValid, dirty.AttrValid)
 	ao, st = getattr(f.raw, base.NodeId)
-	if st != fuse.OK || ao.AttrValid != 0 || ao.AttrValidNsec != 0 {
-		t.Fatalf("dirty GetAttr validity = %d.%d (%v), want 0", ao.AttrValid, ao.AttrValidNsec, st)
+	if st != fuse.OK {
+		t.Fatalf("dirty GetAttr = %v", st)
 	}
+	checkDirtyValidity(t, "dirty GetAttr", ao.AttrValid, ao.AttrValid)
 	if oo := (&fuse.OpenOut{}); f.raw.Open(nil, &fuse.OpenIn{InHeader: *header(base.NodeId)}, oo) == fuse.OK &&
 		oo.OpenFlags&fuse.FOPEN_KEEP_CACHE != 0 {
 		t.Fatal("Open(dirty, rdonly) kept the page cache")
@@ -285,8 +281,10 @@ func TestRWDirtyTTLPolicy(t *testing.T) {
 
 	// ReadDirPlus obeys the same rule per row.
 	es := listPlus(t, f.raw, rootIno)
-	if e := entryOf(es, "base.txt"); e == nil || e.entry.EntryValid != 0 || e.entry.AttrValid != 0 {
-		t.Fatalf("readdirplus base.txt = %+v, want zero validity", e)
+	if e := entryOf(es, "base.txt"); e == nil {
+		t.Fatal("readdirplus lost base.txt")
+	} else {
+		checkDirtyValidity(t, "readdirplus base.txt", e.entry.EntryValid, e.entry.AttrValid)
 	}
 	if e := entryOf(es, "dir"); e == nil {
 		t.Fatal("readdirplus lost dir")
@@ -297,9 +295,7 @@ func TestRWDirtyTTLPolicy(t *testing.T) {
 	// Mutating a directory's namespace dirties the directory as well.
 	mustMkdir(t, f.raw, dir.NodeId, "made")
 	dir = mustLookup(t, f.raw, rootIno, "dir")
-	if dir.EntryValid != 0 || dir.AttrValid != 0 {
-		t.Fatalf("dir validity after mkdir inside = %d/%d, want 0/0", dir.EntryValid, dir.AttrValid)
-	}
+	checkDirtyValidity(t, "dir after mkdir inside", dir.EntryValid, dir.AttrValid)
 }
 
 func TestRWNamespaceRoundTrips(t *testing.T) {
@@ -436,9 +432,7 @@ func TestRWSetAttr(t *testing.T) {
 	if st != fuse.OK || ao.Attr.Mode != syscall.S_IFREG|0600 {
 		t.Fatalf("SetAttr(chmod) = %o (%v), want %o", ao.Attr.Mode, st, syscall.S_IFREG|0600)
 	}
-	if ao.AttrValid != 0 {
-		t.Fatalf("SetAttr reply validity = %d, want 0", ao.AttrValid)
-	}
+	checkDirtyValidity(t, "SetAttr reply", ao.AttrValid, ao.AttrValid)
 	got, st := getattr(f.raw, base.NodeId)
 	if st != fuse.OK || got.Attr.Mode != syscall.S_IFREG|0600 {
 		t.Fatalf("GetAttr after chmod = %o (%v)", got.Attr.Mode, st)

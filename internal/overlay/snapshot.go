@@ -183,8 +183,13 @@ func readEdgeMap(q querier) (map[uint64]provEdge, error) {
 // inherits this session's base residency, but nothing else: its own lock,
 // its own connection, its own staging files.
 func openSnapshotView(fs *FS, dir, stagingDir string) (*FS, error) {
+	// immutable=1: the frozen copy is written once, by the VACUUM INTO
+	// above, and never touched again — so the pager can skip both the
+	// POSIX locking and the change-detection stat it would otherwise pay
+	// on every query. A seal queries this database several times per inode
+	// in the tree, which is where that per-query overhead became seconds.
 	dsn := "file:" + filepath.Join(dir, overlayDBName) +
-		"?mode=ro&_pragma=busy_timeout(10000)&_pragma=query_only(1)" +
+		"?mode=ro&immutable=1&_pragma=busy_timeout(10000)&_pragma=query_only(1)" +
 		"&_pragma=cache_size(-32768)&_pragma=temp_store(MEMORY)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {

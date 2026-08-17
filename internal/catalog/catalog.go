@@ -362,7 +362,21 @@ func Open(path string) (*Catalog, error) {
 	// cache_size is negative = KiB: catalogs are bounded by SMax (8 MiB)
 	// by construction, so the whole file fits in the pager and a cold
 	// readdir stops pread-storming (87% of Readdir CPU was syscalls).
-	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=query_only(1)&_pragma=cache_size(-16384)")
+	//
+	// immutable=1 is the other half of that story, and the bigger one. It
+	// tells SQLite the file cannot change underneath it, so the pager
+	// stops taking POSIX locks and stops re-stat'ing the file to detect
+	// foreign writes. Profiling a seal over an 80k-inode tree found 65% of
+	// the whole publish inside fcntl() and stat() from exactly that
+	// bookkeeping — more than the catalog building it was there to serve.
+	// A point lookup is ~4x cheaper without it.
+	//
+	// The precondition is structural, not a hope: a catalog is named by
+	// the hash of its own bytes, Create refuses to open an existing path,
+	// and the readers that materialize one (genfs's catalog spill) publish
+	// it by rename and never rewrite it. There is no writer that could
+	// change a catalog file under a reader.
+	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro&immutable=1&_pragma=query_only(1)&_pragma=cache_size(-16384)")
 	if err != nil {
 		return nil, err
 	}

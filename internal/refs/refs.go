@@ -27,7 +27,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -53,6 +52,18 @@ var ErrStaleFlip = errors.New("ref changed since fetch (concurrent publish)")
 // the last accepted generation.
 var ErrUntrusted = errors.New("superblock not signed by the trusted key")
 
+// ErrRollback reports a branch head OLDER than the newest generation this
+// client already accepted on it.
+//
+// Generations only ever move forward, so this means the read did not
+// return the current object: an origin or cache answering an overwritten
+// key with a superseded body. Refusing is not pedantry. A stale head
+// silently mounts an old tree, and anything published on top of it is
+// built on the wrong parent -- the CAS guard would then reject the flip,
+// stranding the session's work after the fact instead of at the read that
+// caused it.
+var ErrRollback = errors.New("branch head went backwards (stale read)")
+
 // Store reads and writes refs with trust enforcement and local pinning.
 type Store struct {
 	inner pelicanobj.Store
@@ -77,7 +88,11 @@ func New(inner pelicanobj.Store, stateDir string, trusted ed25519.PublicKey) (*S
 	// surfaces as a checksum mismatch, not as anything recognizably
 	// cache-shaped. Enforcing it here rather than at each call site is
 	// deliberate: three of four callers had already got it wrong.
-	if d, ok := inner.(pelicanobj.DirectReader); ok {
+	// Unwrap decorators to find the transport: a stats counter or the pack
+	// layer embeds the Store interface and hides this capability, which
+	// made this rule silently inert on the mount path even though it is
+	// enforced here rather than at the call sites.
+	if d, ok := pelicanobj.AsDirectReader(inner); ok {
 		inner = d.DirectVariant()
 	}
 	return &Store{inner: inner, stateDir: stateDir, trusted: trusted}, nil
@@ -127,6 +142,9 @@ func (s *Store) Fetch(ctx context.Context, branch string) (*Fetched, error) {
 	sb, err := superblock.Decode(raw)
 	if err != nil {
 		return nil, fmt.Errorf("ref %s: %w", branch, err)
+	}
+	if err := s.checkMonotonic(branch, sb); err != nil {
+		return nil, err
 	}
 
 	if s.trusted != nil {
@@ -252,19 +270,43 @@ func (s *Store) read(ctx context.Context, key string) ([]byte, string, error) {
 	if ki, err := s.inner.StatKey(ctx, key); err == nil {
 		etag = ki.ETag
 	}
-	rc, err := s.inner.Get(ctx, key, 0, -1)
+	// ReadMutable, not a plain Get: refs are overwritten in place, and an
+	// origin that answers one with a mismatched digest would otherwise
+	// make the volume unreadable. What makes accepting such a body safe
+	// is the signature check and the rollback check the caller applies to
+	// it, neither of which a transport md5 improves on.
+	raw, err := pelicanobj.ReadMutable(ctx, s.inner, key)
 	if err != nil {
 		return nil, "", fmt.Errorf("read %s: %w", key, err)
 	}
-	raw, rerr := io.ReadAll(rc)
-	cerr := rc.Close()
-	if rerr != nil {
-		return nil, "", fmt.Errorf("read %s: %w", key, rerr)
-	}
-	if cerr != nil {
-		return nil, "", fmt.Errorf("read %s: %w", key, cerr)
-	}
 	return raw, etag, nil
+}
+
+// checkMonotonic refuses a branch head older than the newest generation
+// this client has already accepted on that branch.
+//
+// The comparison is against local state, so it catches a stale read even
+// when the stale bytes are perfectly signed -- they were genuine once.
+// It cannot catch a client's FIRST read of a branch, which has nothing to
+// compare against; that is the unavoidable limit of a purely local check.
+//
+// A missing or unreadable record is not an error: a fresh client, or one
+// whose state was cleared, simply has nothing to check.
+func (s *Store) checkMonotonic(branch string, sb *superblock.Superblock) error {
+	prevRaw, err := os.ReadFile(s.lastPath(branch))
+	if err != nil {
+		return nil
+	}
+	prev, err := superblock.Decode(prevRaw)
+	if err != nil {
+		return nil
+	}
+	if sb.Generation < prev.Generation {
+		return fmt.Errorf("ref %s: %w: served generation %d, but this client already accepted %d "+
+			"(the origin answered with a superseded copy; retrying may clear it)",
+			branch, ErrRollback, sb.Generation, prev.Generation)
+	}
+	return nil
 }
 
 func (s *Store) readPin() (ed25519.PublicKey, error) {

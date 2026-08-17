@@ -230,3 +230,64 @@ func TestTagsAreImmutableAndVerified(t *testing.T) {
 		t.Fatalf("foreign tag: err=%v, want ErrUntrusted", err)
 	}
 }
+
+// TestFetchRefusesARolledBackHead pins the guard against an origin that
+// answers an overwritten key with a superseded body -- observed on a real
+// deployment, where refs/main returned an older generation than the one
+// already published. The stale bytes are perfectly signed, because they
+// were genuine once, so signature verification cannot catch this; only
+// the client's own record of how far the branch has come can.
+func TestFetchRefusesARolledBackHead(t *testing.T) {
+	inner := newInner(t)
+	ctx := context.Background()
+	_, priv := genKey(t)
+	s, err := New(inner, t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	raw0 := gen(t, 0, nil, priv, nil)
+	if err := s.Flip(ctx, "main", raw0, ""); err != nil {
+		t.Fatalf("first flip: %v", err)
+	}
+	f0, err := s.Fetch(ctx, "main")
+	if err != nil {
+		t.Fatalf("fetch generation 0: %v", err)
+	}
+	raw1 := gen(t, 1, raw0, priv, nil)
+	if err := s.Flip(ctx, "main", raw1, f0.ETag); err != nil {
+		t.Fatalf("second flip: %v", err)
+	}
+	if _, err := s.Fetch(ctx, "main"); err != nil {
+		t.Fatalf("fetch generation 1: %v", err)
+	}
+
+	// The origin now answers with the superseded generation 0 body.
+	f1, err := s.Fetch(ctx, "main")
+	if err != nil {
+		t.Fatalf("re-fetch: %v", err)
+	}
+	if err := s.Flip(ctx, "main", raw0, f1.ETag); err != nil {
+		t.Fatalf("staging the stale body: %v", err)
+	}
+	_, err = s.Fetch(ctx, "main")
+	if !errors.Is(err, ErrRollback) {
+		t.Fatalf("fetch of a superseded head: err=%v, want ErrRollback", err)
+	}
+
+	// The same generation re-read is NOT a rollback: an unchanged branch
+	// is the common case and must keep working.
+	if err := s.Flip(ctx, "main", raw1, ""); err != nil {
+		// Re-publishing over the stale head needs the current ETag.
+		ki, serr := inner.StatKey(ctx, "refs/main")
+		if serr != nil {
+			t.Fatal(serr)
+		}
+		if err := s.Flip(ctx, "main", raw1, ki.ETag); err != nil {
+			t.Fatalf("restoring generation 1: %v", err)
+		}
+	}
+	if _, err := s.Fetch(ctx, "main"); err != nil {
+		t.Fatalf("re-reading the current generation must succeed: %v", err)
+	}
+}

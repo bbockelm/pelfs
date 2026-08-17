@@ -33,7 +33,10 @@ func (c *content) punch(off int64, n int64, dropped map[Handle]int) {
 		return
 	}
 	end := off + n
-	out := c.refs[:0]
+	// A fresh slice, not an in-place filter: a write landing inside an
+	// extent turns one ref into two, so the write cursor can overtake the
+	// read cursor and clobber a ref that has not been examined yet.
+	out := make([]ExtentRef, 0, len(c.refs)+1)
 	for _, r := range c.refs {
 		if r.end() <= off || r.FileOff >= end {
 			out = append(out, r)

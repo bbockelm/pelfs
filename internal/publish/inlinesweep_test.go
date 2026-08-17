@@ -271,9 +271,11 @@ func runInlineSweep(t *testing.T, c *corpus, inlineMax int64, rtt time.Duration,
 	inner.delay = rtt
 	defer func() { inner.delay = 0 }()
 
-	cold, warm := measureScatteredReads(t, inner, head.Superblock, state, samples, inlineMax)
-	t.Logf("READ[%d] scattered %d small files: cold %s (%d GET, %s) | warm %s (%d GET, %s)",
-		inlineMax, len(samples), cold.wall.Round(time.Millisecond), cold.gets, human(cold.getBytes),
+	cold, neigh, warm := measureScatteredReads(t, inner, head.Superblock, state, samples, inlineMax)
+	t.Logf("READ[%d] scattered small files: cold %d files %s (%d GET, %s) | neighbours %d files %s (%d GET, %s) | warm %s (%d GET, %s)",
+		inlineMax,
+		cold.files, cold.wall.Round(time.Millisecond), cold.gets, human(cold.getBytes),
+		neigh.files, neigh.wall.Round(time.Millisecond), neigh.gets, human(neigh.getBytes),
 		warm.wall.Round(time.Millisecond), warm.gets, human(warm.getBytes))
 
 	if walkDir == "" {
@@ -469,10 +471,17 @@ type readCost struct {
 
 // measureScatteredReads is the interactive case: files picked at random
 // across the whole tree, so consecutive reads rarely share a pack and the
-// pack cache's promotion rule mostly refuses. Cold runs against an empty
-// cache directory; warm repeats the same reads on the same mount.
+// pack cache's promotion rule mostly refuses.
+//
+// Three passes, all on one mount over a fresh cache directory. COLD is
+// the sample against empty caches. NEIGHBOURS then reads a DIFFERENT
+// small file from each sampled file's directory — that is the pack
+// cache's actual claim under test, since publish lays a directory's files
+// down together, so a promoted pack should make the neighbour free while
+// an inline neighbour was never going to cost anything. WARM repeats the
+// cold sample, which by then is answered entirely from cache.
 func measureScatteredReads(t *testing.T, inner *meterStore, sb *superblock.Superblock,
-	state string, samples []corpusFile, inlineMax int64) (cold, warm readCost) {
+	state string, samples []corpusFile, inlineMax int64) (cold, neighbours, warm readCost) {
 	t.Helper()
 	ctx := context.Background()
 	fs, err := genfs.Open(ctx, genfs.Options{
@@ -484,11 +493,11 @@ func measureScatteredReads(t *testing.T, inner *meterStore, sb *superblock.Super
 	}
 	defer fs.Close() //nolint:errcheck
 
-	run := func() readCost {
+	run := func(set []corpusFile) readCost {
 		mark := inner.snapshot()
 		start := time.Now()
 		var rc readCost
-		for _, f := range samples {
+		for _, f := range set {
 			n, err := fs.LookupPath(ctx, f.path)
 			if err != nil {
 				t.Fatalf("lookup %s: %v", f.path, err)
@@ -502,7 +511,54 @@ func measureScatteredReads(t *testing.T, inner *meterStore, sb *superblock.Super
 		rc.getBytes = inner.getB.Load() - mark.getB
 		return rc
 	}
-	return run(), run()
+	cold = run(samples)
+	// Neighbours are named after the cold pass so the namespace lookups
+	// that find them are not charged to it; they read catalogs the cold
+	// pass already fetched and no pack bytes at all.
+	neighbours = run(neighboursOf(t, fs, samples))
+	warm = run(samples)
+	return cold, neighbours, warm
+}
+
+// neighboursOf names one other small file in each sampled file's
+// directory, read out of the sealed namespace rather than the corpus so
+// the walk itself is what a reader would do.
+func neighboursOf(t *testing.T, fs *genfs.FS, samples []corpusFile) []corpusFile {
+	t.Helper()
+	ctx := context.Background()
+	var out []corpusFile
+	seen := map[string]bool{}
+	for _, f := range samples {
+		dir, base := splitLast(f.path)
+		if dir == "" {
+			continue
+		}
+		d, err := fs.LookupPath(ctx, dir)
+		if err != nil {
+			t.Fatalf("lookup %s: %v", dir, err)
+		}
+		ents, err := fs.Readdir(ctx, d.Inode)
+		if err != nil {
+			t.Fatalf("readdir %s: %v", dir, err)
+		}
+		for _, e := range ents {
+			if e.Name == base {
+				continue
+			}
+			p := dir + "/" + e.Name
+			if seen[p] {
+				continue
+			}
+			n, err := fs.Lookup(ctx, d.Inode, e.Name)
+			if err != nil || n.Type == 2 || n.Length == 0 || n.Length > 16<<10 {
+				continue
+			}
+			seen[p] = true
+			out = append(out, corpusFile{path: p, size: n.Length})
+			break
+		}
+	}
+	return out
 }
 
 // measureDirWalk is the batch case: everything under one directory, read

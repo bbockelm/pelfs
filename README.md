@@ -156,6 +156,20 @@ volume's data keys — the same key must be supplied on every later mount;
 (read-only mounts follow the branch head live), `--no-seal`, and
 `--volume-pubkey`.
 
+## Messages
+
+Everything pelfs says goes to stderr, prefixed `pelfs:` so it stays
+distinguishable from the Pelican client's own logging (configured
+separately by `$PELICAN_LOGGING_LEVEL`) and from whatever your program
+prints inside `pelfs shell`.
+
+On a terminal those lines are plain prose. When stderr is not a terminal
+— a background `pelfs mount` writing to its log file, or CI — every line
+instead carries a timestamp, a level, and its values as `key=value`
+fields, because that output is read after the fact and usually by a
+machine. Set `$PELFS_LOG_FORMAT` to `plain` or `structured` to choose
+explicitly.
+
 ## Caveats (prototype)
 
 - **Single writer.** The advisory lease is detection, not mutual exclusion:

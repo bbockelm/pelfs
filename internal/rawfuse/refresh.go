@@ -30,10 +30,10 @@ type Fetcher func(ctx context.Context) (*superblock.Superblock, error)
 
 // Refresher polls a branch and keeps a mounted generation current.
 type Refresher struct {
-	fs     *genfs.FS
-	srv    *fuse.Server
-	fetch  Fetcher
-	every  time.Duration
+	fs    *genfs.FS
+	srv   *fuse.Server
+	fetch Fetcher
+	every time.Duration
 	// logger takes a ui message and its attributes; the seam exists so a
 	// test can watch what a swap reported without reading stderr.
 	logger func(msg string, attrs ...any)

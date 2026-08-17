@@ -8,9 +8,9 @@ require (
 	github.com/hanwen/go-fuse/v2 v2.1.1-0.20210611132105-24a1dfe6b4f8
 	github.com/klauspost/compress v1.19.1
 	github.com/pelicanplatform/pelican v0.0.0-20260813210837-7a5e7ab292c3
-	github.com/sirupsen/logrus v1.9.3
 	github.com/willscott/go-nfs v0.0.4
 	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78
+	golang.org/x/term v0.45.0
 	lukechampine.com/blake3 v1.4.1
 	modernc.org/sqlite v1.56.0
 )
@@ -88,6 +88,7 @@ require (
 	github.com/sagikazarmark/locafero v0.6.0 // indirect
 	github.com/segmentio/asm v1.2.0 // indirect
 	github.com/sethvargo/go-retry v0.2.4 // indirect
+	github.com/sirupsen/logrus v1.9.3 // indirect
 	github.com/sourcegraph/conc v0.3.0 // indirect
 	github.com/spf13/afero v1.12.0 // indirect
 	github.com/spf13/cast v1.7.1 // indirect
@@ -112,7 +113,6 @@ require (
 	golang.org/x/oauth2 v0.34.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/term v0.45.0 // indirect
 	golang.org/x/text v0.40.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260406210006-6f92a3bedf2d // indirect

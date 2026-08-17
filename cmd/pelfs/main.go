@@ -50,7 +50,10 @@ func main() {
 	case "-h", "--help", "help":
 		usage()
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", os.Args[1])
+		// The usage text below is a document and stays raw; the
+		// complaint about the command is a message like any other, and
+		// is attributed like one.
+		ui.Error("unknown command {command}", "command", os.Args[1])
 		usage()
 		code = 2
 	}

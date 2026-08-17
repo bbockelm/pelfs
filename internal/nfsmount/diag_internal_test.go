@@ -21,7 +21,7 @@ import (
 // translation and threw the cause away.
 func TestExplainReportsWhatGoNFSWouldDiscard(t *testing.T) {
 	var out bytes.Buffer
-	defer ui.SetOutput(&out, false)()
+	defer ui.SetOutput(&out, ui.Plain)()
 	eioReportedAt.Store(0)
 	eioSuppressed.Store(0)
 
@@ -45,7 +45,7 @@ func TestExplainReportsWhatGoNFSWouldDiscard(t *testing.T) {
 // every one of them is noise that buries the real thing.
 func TestExplainStaysQuietForTranslatableErrors(t *testing.T) {
 	var out bytes.Buffer
-	defer ui.SetOutput(&out, false)()
+	defer ui.SetOutput(&out, ui.Plain)()
 	eioReportedAt.Store(0)
 	eioSuppressed.Store(0)
 
@@ -73,7 +73,7 @@ func TestExplainStaysQuietForTranslatableErrors(t *testing.T) {
 // was in bulk.
 func TestReportIsRateLimitedAndFree(t *testing.T) {
 	var out bytes.Buffer
-	defer ui.SetOutput(&out, false)()
+	defer ui.SetOutput(&out, ui.Plain)()
 
 	eioReportedAt.Store(time.Now().UnixNano())
 	eioSuppressed.Store(0)
@@ -149,7 +149,7 @@ func TestDiagnosePreservesTheInterfacesGoNFSAsserts(t *testing.T) {
 // is what Apply itself matches on.
 func TestChangeErrorsCarryAnNFSStatus(t *testing.T) {
 	var out bytes.Buffer
-	defer ui.SetOutput(&out, false)()
+	defer ui.SetOutput(&out, ui.Plain)()
 
 	for _, tc := range []struct {
 		name     string

@@ -256,7 +256,9 @@ grep -q "publishing: the first pack is on the wire" "$WORK/phase-exit.log" || {
 grep -q "first pack on the wire" "$WORK/phase-exit.log" || {
   echo "the seal cost line does not say when the uploads began:" >&2
   sed 's/^/    /' "$WORK/phase-exit.log"; exit 1; }
-grep -Eq "session=0 teardown=[1-9][0-9]* checkpoints=0 exitseals=1" "$WORK/phase-exit.log" || {
+# The log this reads is redirected, so it is the stamped prose format: the
+# numbers are in the sentence, not in a tail of key=value fields.
+grep -Eq "uploaded 0 B during the session and [1-9][0-9.]* [KMG]iB after it exited \(0 seals while mounted, 1 seal at exit\)" "$WORK/phase-exit.log" || {
   echo "the phase split does not show an exit-only seal:" >&2
   grep "during the session and" "$WORK/phase-exit.log" | sed 's/^/    /'; exit 1; }
 # The same answer survives in the file a supervisor reads afterwards:
@@ -282,7 +284,7 @@ phase_status=0
 grep -q "checkpoint started: publishing what this session has written so far" "$WORK/phase-ckpt.log" || {
   echo "a mid-session checkpoint never announced itself:" >&2
   sed 's/^/    /' "$WORK/phase-ckpt.log"; exit 1; }
-grep -Eq "session=[1-9][0-9]* teardown=[0-9]+ checkpoints=[1-9]" "$WORK/phase-ckpt.log" || {
+grep -Eq "uploaded [1-9][0-9.]* [KMG]iB during the session and .*\([1-9][0-9]* seals? while mounted" "$WORK/phase-ckpt.log" || {
   echo "a checkpointed session did not credit its uploads to the session phase:" >&2
   grep "during the session and" "$WORK/phase-ckpt.log" | sed 's/^/    /'; exit 1; }
 # Print the lines a user would actually read. Half of what is being
@@ -290,6 +292,14 @@ grep -Eq "session=[1-9][0-9]* teardown=[0-9]+ checkpoints=[1-9]" "$WORK/phase-ck
 grep -h "publishing: the first pack\|checkpoint started\|during the session and" \
   "$WORK/phase-exit.log" "$WORK/phase-ckpt.log" | sed 's/^/    /'
 echo "phase split verified: exit-only seal reads 0 during the session; a checkpoint reads the reverse"
+
+# Every log in this gate is a redirected one, which is exactly the case a
+# person hits with `pelfs mount 2>>pelfs.log`. A {placeholder} reaching one
+# of them means the sentence was left for the reader to reassemble.
+leaked=$(grep -lE '\{[a-z][a-z_]*\}' "$WORK"/*.log 2>/dev/null || true)
+[ -z "$leaked" ] || {
+  echo "a redirected log carries an unexpanded placeholder:" >&2
+  grep -hE '\{[a-z][a-z_]*\}' $leaked | sed 's/^/    /' >&2; exit 1; }
 
 "$WORK/pelfs" mount-gen --state-dir "$WORK/state12" "$PREFIX" "$WORK/mnt" &
 MOUNT_PID=$!

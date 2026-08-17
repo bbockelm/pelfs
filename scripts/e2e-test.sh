@@ -112,6 +112,11 @@ grep -q "during the session and" "$WORK/run1.log" || {
   echo "FAIL: the session never said when it uploaded"; tail -5 "$WORK/run1.log"; exit 1; }
 grep -q "publishing: the first pack is on the wire" "$WORK/run1.log" || {
   echo "FAIL: the session never announced that publication had started"; tail -5 "$WORK/run1.log"; exit 1; }
+# This log is redirected, which is what a person gets from `2>>pelfs.log`.
+# A {placeholder} in it is a sentence the reader has to reassemble.
+! grep -qE '\{[a-z][a-z_]*\}' "$WORK/run1.log" || {
+  echo "FAIL: a redirected log carries an unexpanded placeholder"
+  grep -E '\{[a-z][a-z_]*\}' "$WORK/run1.log" | sed 's/^/    /'; exit 1; }
 
 echo "== federation state after session 1 =="
 PACKS=$( (find "$WORK/origin/e2e/ns/packs" -type f 2>/dev/null || true) | wc -l | tr -d ' ')

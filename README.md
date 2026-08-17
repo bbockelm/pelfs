@@ -164,11 +164,15 @@ separately by `$PELICAN_LOGGING_LEVEL`) and from whatever your program
 prints inside `pelfs shell`.
 
 On a terminal those lines are plain prose. When stderr is not a terminal
-— a background `pelfs mount` writing to its log file, or CI — every line
-instead carries a timestamp, a level, and its values as `key=value`
-fields, because that output is read after the fact and usually by a
-machine. Set `$PELFS_LOG_FORMAT` to `plain` or `structured` to choose
-explicitly.
+— a background `pelfs mount` writing to its log file, or CI — each line
+gets a timestamp and a level in front of the same prose, because whoever
+opens that file later was not there when it happened.
+
+Set `$PELFS_LOG_FORMAT` to `plain`, `text`, or `json` to choose
+explicitly. `json` is the format for a log collector, and the only one you
+have to ask for: one object per line, with the message TEMPLATE as a
+constant `msg` you can group by and the values as typed fields (a size is
+a count of bytes, a duration a count of nanoseconds).
 
 ## Caveats (prototype)
 

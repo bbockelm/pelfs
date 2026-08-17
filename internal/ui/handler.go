@@ -50,27 +50,23 @@ func (h *handler) Handle(_ context.Context, r slog.Record) error {
 
 	bp := bufs.Get().(*[]byte)
 	b := (*bp)[:0]
-	if h.structured {
+	switch h.format {
+	case JSON:
+		b = appendJSON(b, r, attrs)
+	case Text:
 		b = r.Time.AppendFormat(b, timeLayout)
 		b = append(b, ' ')
 		b = append(b, levelName(r.Level)...)
 		b = append(b, ' ')
-	}
-	// The structured header already carries the level, so only the
-	// terminal line needs it spelled out.
-	lead := prefix
-	if !h.structured {
-		lead = linePrefix(r.Level)
-	}
-	b = append(b, lead...)
-	if h.structured {
-		b = flatten(b, r.Message, attrs)
-		for _, a := range attrs {
-			b = append(b, ' ')
-			b = appendField(b, a)
-		}
-	} else {
-		b = expand(b, lead, r.Message, attrs)
+		// The stamped header already carries the level, so the lead does
+		// not repeat it; and a record stays on one line, so a continuation
+		// is folded rather than re-led.
+		b = append(b, prefix...)
+		b = expand(b, "", r.Message, attrs, true)
+	default:
+		lead := linePrefix(r.Level)
+		b = append(b, lead...)
+		b = expand(b, lead, r.Message, attrs, false)
 	}
 	b = append(b, '\n')
 
@@ -101,59 +97,18 @@ func levelName(l slog.Level) string {
 	}
 }
 
-// flatten writes msg for the structured sink: one record on one line,
-// with its {name} placeholders left standing rather than substituted.
-//
-// Substituting here as well as emitting the fields printed every value
-// twice on the same line, which on the phase breakdowns -- sentences that
-// are nothing but values -- doubled the line and buried the content. The
-// template is also worth more to a reader of a log than the rendered
-// sentence is: it is constant, so a collector can group by it and count
-// occurrences across runs, and {name} says exactly which field below
-// carries the value. Grepping is unaffected, because the literal words
-// of a template are what greps match, and a value can no longer smuggle a
-// newline into the middle of a record.
-func flatten(b []byte, msg string, attrs []slog.Attr) []byte {
-	for len(msg) > 0 {
-		i := strings.IndexAny(msg, "{\n")
-		if i < 0 {
-			return append(b, msg...)
-		}
-		b = append(b, msg[:i]...)
-		if msg[i] == '\n' {
-			b = append(b, ' ')
-			msg = msg[i+1:]
-			continue
-		}
-		rest := msg[i+1:]
-		j := strings.IndexByte(rest, '}')
-		if j < 0 {
-			return append(b, msg[i:]...)
-		}
-		// A placeholder naming no attribute is left exactly as written,
-		// for the same reason expand leaves it: the message is quoting a
-		// shell snippet or a JSON fragment, not naming a field.
-		if _, ok := lookup(attrs, rest[:j]); ok {
-			b = append(b, '{')
-			b = appendFieldKey(b, rest[:j])
-			b = append(b, '}')
-		} else {
-			b = append(b, msg[i:i+j+2]...)
-		}
-		msg = rest[j+1:]
-	}
-	return b
-}
-
-// expand writes msg for the terminal, substituting {name} with the value
-// of the attribute of that name. A brace run that names no attribute is
-// left alone, so a message containing literal braces is harmless rather
-// than mangled.
+// expand writes msg as prose, substituting {name} with the value of the
+// attribute of that name. A brace run that names no attribute is left
+// alone, so a message containing literal braces is harmless rather than
+// mangled.
 //
 // A newline in a message starts a continuation line, which is re-prefixed
 // with lead so that every line on the terminal is attributable and a
-// warning does not lose its warning after the first line.
-func expand(b []byte, lead, msg string, attrs []slog.Attr) []byte {
+// warning does not lose its warning after the first line. oneLine folds
+// those breaks -- and any break inside an interpolated value, which is how
+// a multi-line refusal arrives -- into spaces instead, because the stamped
+// format promises one record per line to whatever greps the file.
+func expand(b []byte, lead, msg string, attrs []slog.Attr, oneLine bool) []byte {
 	for len(msg) > 0 {
 		i := strings.IndexAny(msg, "{\n")
 		if i < 0 {
@@ -161,8 +116,12 @@ func expand(b []byte, lead, msg string, attrs []slog.Attr) []byte {
 		}
 		b = append(b, msg[:i]...)
 		if msg[i] == '\n' {
-			b = append(b, '\n')
-			b = append(b, lead...)
+			if oneLine {
+				b = append(b, ' ')
+			} else {
+				b = append(b, '\n')
+				b = append(b, lead...)
+			}
 			msg = msg[i+1:]
 			continue
 		}
@@ -173,13 +132,26 @@ func expand(b []byte, lead, msg string, attrs []slog.Attr) []byte {
 		}
 		name := rest[:j]
 		if v, ok := lookup(attrs, name); ok {
+			at := len(b)
 			b = appendValue(b, v)
+			if oneLine {
+				fold(b[at:])
+			}
 		} else {
 			b = append(b, msg[i:i+j+2]...)
 		}
 		msg = rest[j+1:]
 	}
 	return b
+}
+
+// fold turns the line breaks a value carries into spaces in place.
+func fold(b []byte) {
+	for i, c := range b {
+		if c == '\n' || c == '\r' {
+			b[i] = ' '
+		}
+	}
 }
 
 func lookup(attrs []slog.Attr, name string) (slog.Value, bool) {
@@ -220,54 +192,14 @@ func appendValue(b []byte, v slog.Value) []byte {
 	}
 }
 
-// appendField renders one attribute in logfmt, which is what the
-// non-terminal sink exists to produce. Byte counts and attempt counts go
-// out as bare numbers here even though the sentence humanized them: the
-// prose is for reading, the field is for arithmetic.
-func appendField(b []byte, a slog.Attr) []byte {
-	b = appendFieldKey(b, a.Key)
-	b = append(b, '=')
-	switch v := a.Value.Any().(type) {
-	case ByteCount:
-		return strconv.AppendInt(b, int64(v), 10)
-	case Plural:
-		return strconv.AppendInt(b, v.N, 10)
-	case Percent:
-		return strconv.AppendFloat(b, float64(v), 'f', -1, 64)
-	}
-	switch a.Value.Kind() {
-	case slog.KindInt64:
-		return strconv.AppendInt(b, a.Value.Int64(), 10)
-	case slog.KindUint64:
-		return strconv.AppendUint(b, a.Value.Uint64(), 10)
-	case slog.KindFloat64:
-		return strconv.AppendFloat(b, a.Value.Float64(), 'f', -1, 64)
-	case slog.KindBool:
-		return strconv.AppendBool(b, a.Value.Bool())
-	case slog.KindDuration:
-		return appendQuoted(b, a.Value.Duration().String())
-	}
-	var s string
-	switch v := a.Value.Any().(type) {
-	case error:
-		s = v.Error()
-	case fmt.Stringer:
-		s = v.String()
-	case string:
-		s = v
-	default:
-		s = fmt.Sprintf("%v", v)
-	}
-	return appendQuoted(b, s)
-}
-
-// appendFieldKey renders an attribute name as a logfmt key. A phase clock
+// appendFieldKey renders an attribute name as a field key. A phase clock
 // names its attributes for the prose that reads them back ("lease
-// release", "pack index"), and logfmt has no way to quote a key, so a
-// space in one silently splits it into two keys -- and the fields are now
-// the whole of what a collector gets. The call site keeps writing the
-// label a person reads; the sink makes it parseable, which is where every
-// other formatting decision in this package lives too.
+// release", "pack index"), and a key with a space in it is one no logfmt
+// reader can express and most query languages must quote -- so the sink
+// normalizes it, in the placeholder as well as in the field. The call site
+// keeps writing the label a person reads; the sink makes it parseable,
+// which is where every other formatting decision in this package lives
+// too.
 func appendFieldKey(b []byte, name string) []byte {
 	for i := 0; i < len(name); i++ {
 		if c := name[i]; c == ' ' || c == '=' || c == '"' {
@@ -279,19 +211,10 @@ func appendFieldKey(b []byte, name string) []byte {
 	return b
 }
 
-// appendQuoted quotes only when the value would otherwise be ambiguous
-// to a logfmt reader, so the common case stays readable to a human.
-func appendQuoted(b []byte, s string) []byte {
-	if s == "" || strings.ContainsAny(s, ` "=\`) {
-		return strconv.AppendQuote(b, s)
-	}
-	return append(b, s...)
-}
-
 // humanDuration keeps a duration to the precision a reader can act on:
 // milliseconds for something that felt instant, tenths for something they
 // noticed, whole seconds for something they waited out. Full precision
-// survives in the structured field.
+// survives in the json field.
 func humanDuration(d time.Duration) string {
 	switch {
 	case d < time.Second:
@@ -304,7 +227,7 @@ func humanDuration(d time.Duration) string {
 }
 
 // ByteCount is a size that reads as a size in prose ("22.5 MiB") and
-// stays a number in the structured field.
+// stays a number in the json field.
 type ByteCount int64
 
 func (n ByteCount) String() string {
@@ -321,14 +244,14 @@ func (n ByteCount) String() string {
 }
 
 // Percent is a fraction in [0,1] that reads as a percentage in prose
-// ("94%") and stays the fraction in the structured field, where a
+// ("94%") and stays the fraction in the json field, where a
 // collector can average it across runs without parsing a suffix.
 type Percent float64
 
 func (p Percent) String() string { return fmt.Sprintf("%.0f%%", float64(p)*100) }
 
 // Plural is a count with its noun. "(s)" in an operator-facing message is
-// a refusal to decide; the structured field keeps the bare number.
+// a refusal to decide; the json field keeps the bare number.
 type Plural struct {
 	N    int64
 	Noun string

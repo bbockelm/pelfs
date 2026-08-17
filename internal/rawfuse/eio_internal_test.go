@@ -17,7 +17,7 @@ import (
 // failure was in bulk.
 func TestEIOReportIsRateLimitedAndFree(t *testing.T) {
 	var out bytes.Buffer
-	defer ui.SetOutput(&out, false)()
+	defer ui.SetOutput(&out, ui.Plain)()
 
 	eioReportedAt.Store(time.Now().UnixNano())
 	eioSuppressed.Store(0)

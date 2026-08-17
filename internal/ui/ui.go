@@ -1,23 +1,43 @@
 // Package ui is pelfs's voice. Every line the program says to its user
 // goes through here, so "what does a pelfs message look like" is answered
 // in one place rather than at a hundred call sites — which is how the
-// output came to carry three different formats, one of them applied to
-// exactly two lines.
+// output came to carry a different shape every few messages, one of them
+// applied to exactly two lines.
 //
-// # Timestamps are a property of the sink, not of the message
+// # Format is a property of the sink; the reader is a human either way
 //
-// On an interactive terminal a line is printed bare, save for the level
-// when it is not routine:
+// There are three formats, and detection chooses between the two written
+// for a person:
 //
-//	pelfs: sealing the overlay into the next generation...
-//	pelfs: warning: another client took over this prefix
+//	plain  pelfs: sealed generation 7 (412 chunks)
+//	text   2026-08-17T15:51:29.584-05:00 INFO pelfs: sealed generation 7 (412 chunks)
+//	json   {"time":"…","level":"INFO","msg":"sealed generation {generation} ({chunks} chunks)","generation":7,"chunks":412}
 //
-// The reader is watching it happen; their terminal already knows the
-// time, and a stamp on every conversational line is noise. When stderr is
-// NOT a terminal — a detached `pelfs mount` writing to its log file, CI,
-// a log collector — every line carries a timestamp, a level, and its
-// structured attributes, because nobody was there when it happened and
-// the file is what gets grepped afterwards.
+// plain is the default on a terminal. The reader is watching it happen;
+// their terminal already knows the time, and a stamp on every
+// conversational line is noise.
+//
+// text is the default when stderr is NOT a terminal, because the
+// overwhelmingly common non-terminal reader is still a person: someone
+// who ran `pelfs mount 2>>pelfs.log` and will open that file later. What
+// they lost by not being present is WHEN, so every line is stamped and
+// levelled; what they did not lose is the ability to read English, so the
+// sentence is rendered in full and nothing is appended after it. Inferring
+// "a machine is reading this" from the absence of a tty was the mistake:
+// it made the common case read a template ("ready to serve in {total} …
+// total=2.587s") that a person has to reassemble in their head, which is
+// worse for them than either the prose or the fields alone.
+//
+// json is the machine format, and it is reached only by asking for it.
+// It is where the properties a collector needs live: msg is the message
+// TEMPLATE, so it is constant across runs and can be grouped and counted;
+// the attributes are typed JSON values, so a size is the number of bytes
+// rather than "22.5 MiB"; and no value is written twice.
+//
+// PELFS_LOG_FORMAT=plain|text|json overrides the detection, which is how a
+// collector asks for json, and also covers the two places detection is
+// wrong: a container with a pseudo-tty whose output is really going to a
+// CI log, and a human piping prose into a pager.
 //
 // There is deliberately no per-message exception and no --log-timestamps
 // flag. Both would put the decision back at the call site, and a rule
@@ -27,16 +47,9 @@
 // reaching for — a user waiting out a long seal or upload — is served
 // better by having those messages report their own DURATION ("seal took
 // 24s"), which answers "how long did that take" that a pair of wall-clock
-// stamps only implies; and the case where "when" genuinely cannot be
-// recovered, an unattended mount, is precisely the non-terminal sink
-// where everything is stamped.
+// stamps only implies.
 //
-// PELFS_LOG_FORMAT=plain|structured overrides the detection. That is not
-// a second policy — it is for the two places detection is wrong: a
-// container with a pseudo-tty whose output is really going to a CI log,
-// and a human piping prose into a pager.
-//
-// # The pelfs: prefix stays, in both modes
+// # The pelfs: prefix stays, in every format
 //
 // Three writers share one terminal during `pelfs shell`: pelfs, the
 // Pelican client (logging through logrus, configured by
@@ -53,36 +66,29 @@
 //	ui.Info("sealed generation {generation} ({chunks} chunks)",
 //	    "generation", gen, "chunks", n)
 //
-// The plain sink renders the sentence:
-//
-//	pelfs: sealed generation 7 (412 chunks)
-//
-// The structured sink renders the TEMPLATE and the fields:
-//
-//	…INFO pelfs: sealed generation {generation} ({chunks} chunks) generation=7 chunks=412
-//
 // Values live in exactly one place at the call site, the prose stays a
 // sentence written for a human, and the machine-readable view comes for
 // free. Attributes carry the values worth extracting — generations, keys,
 // durations, byte counts; a message with nothing to extract simply passes
 // no attributes.
 //
-// The structured sink does NOT also render the sentence. Every value pelfs
-// logs is named by its template — so a sink that interpolated as well as
-// emitted fields printed all of them twice on one line, and the two
-// breakdowns that are nothing but values ("torn down in …", "ready to
-// serve in …") came out at double length with the prose buried in front of
-// its own duplicate. Which of the two views to show is the sink's decision
-// to make, and each sink now makes it once, for its own reader: a person
-// watching gets the sentence, a log gets the fields it can do arithmetic
-// on plus a message that is CONSTANT — groupable, countable across runs,
-// and immune to a value that happens to contain a newline. An attribute
-// named for the prose that reads it back ("lease release") becomes a
-// logfmt-legal key, in the placeholder as well as in the field, so {name}
-// always names a key that is really there.
+// No format shows a value twice. Every value pelfs logs is named by its
+// template, so a sink that interpolated AND emitted fields printed all of
+// them twice on one line, and the breakdowns that are nothing but values
+// ("torn down in …", "ready to serve in …") came out at double length
+// with the prose buried in front of its own duplicate. Each sink picks one
+// view for its own reader: plain and text render the sentence and stop,
+// json emits the template and the fields. A value that happens to contain
+// a newline cannot split a record in either of the two log formats — text
+// folds it, json escapes it.
 //
-// Greps against a log are unaffected by that choice and must stay that
-// way: it is the literal words of a template that scripts match, so a
+// An attribute named for the prose that reads it back ("lease release")
+// becomes a key with no space in it, in the placeholder as well as in the
+// field, so a json {name} always names a key that is really there and no
+// query language has to quote it.
+//
+// Greps against a log are unaffected by the choice of format and must stay
+// that way: it is the literal words of a template that scripts match, so a
 // message must carry the words its readers look for OUTSIDE its
 // placeholders.
 package ui
@@ -103,7 +109,20 @@ import (
 // mutex-guarded variable.
 var current atomic.Pointer[slog.Logger]
 
-func init() { current.Store(newLogger(os.Stderr, structuredFor(os.Stderr))) }
+func init() { current.Store(newLogger(os.Stderr, FormatFor(os.Stderr))) }
+
+// Format is how a sink renders a record. See the package comment for what
+// each one is for and who reads it.
+type Format int
+
+const (
+	// Plain is bare prose for someone watching a command run.
+	Plain Format = iota
+	// Text is stamped, levelled prose for someone reading a log file.
+	Text
+	// JSON is one object per line for a collector.
+	JSON
+)
 
 // Info states what pelfs is doing. Most of what pelfs says is this:
 // progress a user asked for by running the command.
@@ -117,41 +136,48 @@ func Warn(msg string, args ...any) { current.Load().Warn(msg, args...) }
 // status.
 func Error(msg string, args ...any) { current.Load().Error(msg, args...) }
 
-// structuredFor reports whether w should get timestamped, attributed
-// output rather than bare prose. A background mount needs no special
-// case: its stderr IS the log file it was spawned with, so it answers
-// this question about the file and formats accordingly.
-func structuredFor(w io.Writer) bool {
+// FormatFor picks the format for w: whatever PELFS_LOG_FORMAT names, else
+// Plain for a terminal and Text for anything else. Only a human's two
+// formats are ever inferred — a machine reading this output says so, by
+// asking for json, because "not a terminal" describes a redirected log
+// file far more often than it describes a collector. A background mount
+// needs no special case: its stderr IS the log file it was spawned with,
+// so it answers this question about the file and formats accordingly.
+//
+// An unrecognized value falls back to detection rather than failing: a
+// typo in an environment variable must not cost a user their log.
+func FormatFor(w io.Writer) Format {
 	switch os.Getenv("PELFS_LOG_FORMAT") {
 	case "plain":
-		return false
-	case "structured":
-		return true
+		return Plain
+	case "text":
+		return Text
+	case "json":
+		return JSON
 	}
-	f, ok := w.(*os.File)
-	if !ok {
-		return true
+	if f, ok := w.(*os.File); ok && term.IsTerminal(int(f.Fd())) {
+		return Plain
 	}
-	return !term.IsTerminal(int(f.Fd()))
+	return Text
 }
 
 // SetOutput redirects every pelfs message to w in the given format and
 // returns a function restoring the previous destination. For tests.
-func SetOutput(w io.Writer, structured bool) func() {
-	prev := current.Swap(newLogger(w, structured))
+func SetOutput(w io.Writer, f Format) func() {
+	prev := current.Swap(newLogger(w, f))
 	return func() { current.Store(prev) }
 }
 
-func newLogger(w io.Writer, structured bool) *slog.Logger {
-	return slog.New(&handler{w: w, mu: new(sync.Mutex), structured: structured})
+func newLogger(w io.Writer, f Format) *slog.Logger {
+	return slog.New(&handler{w: w, mu: new(sync.Mutex), format: f})
 }
 
-// handler renders records in pelfs's two formats. It is the only place
-// either format is decided.
+// handler renders records in pelfs's three formats. It is the only place
+// any of them is decided.
 type handler struct {
-	w          io.Writer
-	mu         *sync.Mutex
-	structured bool
+	w      io.Writer
+	mu     *sync.Mutex
+	format Format
 	// with holds attributes bound by WithAttrs, which apply to every
 	// record this handler emits.
 	with []slog.Attr

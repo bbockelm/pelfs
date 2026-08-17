@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
+	"github.com/bbockelm/pelfs/internal/ui"
 )
 
 // Key is the lease object's location relative to the prefix.
@@ -282,12 +283,12 @@ func (l *Lease) renewOnce() bool {
 	case errors.Is(err, os.ErrNotExist):
 		// Someone deleted our lease; reclaim it below.
 	default:
-		fmt.Fprintf(os.Stderr, "pelfs: lease check failed (will retry): %v\n", err)
+		ui.Warn("lease check failed (will retry): {error}", "error", err)
 		return false
 	}
 
 	if err := l.write(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "pelfs: lease renewal failed (will retry): %v\n", err)
+		ui.Warn("lease renewal failed (will retry): {error}", "error", err)
 	}
 	return false
 }

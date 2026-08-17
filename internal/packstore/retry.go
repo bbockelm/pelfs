@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"math/rand"
-	"os"
 	"strings"
 	"time"
+
+	"github.com/bbockelm/pelfs/internal/ui"
 )
 
 // Operational robustness for federation I/O: retry with backoff on
@@ -42,28 +44,13 @@ func slowBudget(bytes int64) time.Duration {
 	return slowLatencyGrace + time.Duration(float64(bytes)/slowRateFloor*float64(time.Second))
 }
 
-// plural renders a count with its noun. "(s)" in an operator-facing log
-// is a refusal to decide.
-func plural(n int, noun string) string {
-	if n == 1 {
-		return fmt.Sprintf("%d %s", n, noun)
-	}
-	return fmt.Sprintf("%d %ss", n, noun)
-}
-
-// stamp prefixes operational lines with a wall-clock time. They report
-// things that take minutes and interleave with the user's own output, so
-// "when did that happen" is the first question asked of them.
-func stamp() string { return time.Now().Format("15:04:05") }
-
-// rate renders throughput for a sized transfer, and nothing when the
-// size is unknown.
-func rate(bytes int64, d time.Duration) string {
+// mibPerSecond is throughput in the unit an uplink is judged by, rounded
+// to the tenth that is worth reading.
+func mibPerSecond(bytes int64, d time.Duration) float64 {
 	if bytes <= 0 || d <= 0 {
-		return ""
+		return 0
 	}
-	mib := float64(bytes) / (1 << 20)
-	return fmt.Sprintf(", %.1f MiB at %.1f MiB/s", mib, mib/d.Seconds())
+	return math.Round(float64(bytes)/(1<<20)/d.Seconds()*10) / 10
 }
 
 // retryOn runs fn up to attempts times. Non-retryable failures (context
@@ -89,8 +76,14 @@ func retryOnSized(ctx context.Context, op string, bytes int64, attempts int, fn 
 		err = fn()
 		if err == nil {
 			if d := time.Since(start); d > budget {
-				fmt.Fprintf(os.Stderr, "%s pelfs: slow operation: %s took %.1fs%s (%s)\n",
-					stamp(), op, d.Seconds(), rate(bytes, d), plural(i, "attempt"))
+				if bytes > 0 {
+					ui.Warn("slow operation: {op} took {duration} for {bytes} at {rate} MiB/s ({attempts})",
+						"op", op, "duration", d, "bytes", ui.ByteCount(bytes),
+						"rate", mibPerSecond(bytes, d), "attempts", ui.Count(i, "attempt"))
+				} else {
+					ui.Warn("slow operation: {op} took {duration} ({attempts})",
+						"op", op, "duration", d, "attempts", ui.Count(i, "attempt"))
+				}
 			}
 			return nil
 		}
@@ -104,19 +97,19 @@ func retryOnSized(ctx context.Context, op string, bytes int64, attempts int, fn 
 			break
 		}
 		sleep := backoff + time.Duration(rand.Int63n(int64(backoff)/2+1))
-		fmt.Fprintf(os.Stderr, "%s pelfs: %s failed (attempt %d of %d, retrying in %.1fs): %v\n",
-			stamp(), op, i, attempts, sleep.Seconds(), err)
+		ui.Warn("{op} failed (attempt {attempt} of {attempts}, retrying in {backoff}): {error}",
+			"op", op, "attempt", i, "attempts", attempts, "backoff", sleep, "error", err)
 		select {
 		case <-time.After(sleep):
 		case <-ctx.Done():
-			return fmt.Errorf("%s: %w (after %s)", op, ctx.Err(), plural(i, "attempt"))
+			return fmt.Errorf("%s: %w (after %s)", op, ctx.Err(), ui.Count(i, "attempt"))
 		}
 		if backoff *= 2; backoff > backoffCap {
 			backoff = backoffCap
 		}
 	}
-	fmt.Fprintf(os.Stderr, "%s pelfs: %s FAILED after %.1fs and %s: %v\n",
-		stamp(), op, time.Since(start).Seconds(), plural(attempts, "attempt"), err)
+	ui.Error("{op} FAILED after {duration} and {attempts}: {error}",
+		"op", op, "duration", time.Since(start), "attempts", ui.Count(attempts, "attempt"), "error", err)
 	return err
 }
 

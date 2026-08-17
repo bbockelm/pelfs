@@ -6,9 +6,11 @@
 //
 // # Timestamps are a property of the sink, not of the message
 //
-// On an interactive terminal a line is printed bare:
+// On an interactive terminal a line is printed bare, save for the level
+// when it is not routine:
 //
 //	pelfs: sealing the overlay into the next generation...
+//	pelfs: warning: another client took over this prefix
 //
 // The reader is watching it happen; their terminal already knows the
 // time, and a stamp on every conversational line is noise. When stderr is

@@ -21,7 +21,6 @@ import (
 	"strings"
 
 	"errors"
-	log "github.com/sirupsen/logrus"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -32,6 +31,7 @@ import (
 	"github.com/bbockelm/pelfs/internal/catalog"
 	"github.com/bbockelm/pelfs/internal/genfs"
 	"github.com/bbockelm/pelfs/internal/overlay"
+	"github.com/bbockelm/pelfs/internal/ui"
 )
 
 // entryValidity is the entry/attr TTL stamped on every CLEAN reply: ~10
@@ -197,18 +197,37 @@ func errStatus(err error) fuse.Status {
 	// of what actually failed, is undebuggable -- and EIO is exactly the
 	// status we return when we do not understand our own failure, so it
 	// is the one that most needs explaining. These are meant to be rare;
-	// if a workload produces them in bulk, the volume of log lines is
-	// itself the signal.
+	// if a workload produces them in bulk, the count carried by the next
+	// report is the signal.
 	logUnexpected(err)
 	return fuse.EIO
 }
 
+// eioReportEvery bounds how often the EIO explainer speaks. One
+// untranslatable error is almost never one operation -- a broken file
+// answers every read a tar issues -- so this sits on a per-operation
+// path, where naming the caller's frame and formatting a line cost
+// orders of magnitude more than the reply itself. Suppressed
+// occurrences are counted and reported by the next line that gets
+// through, so bulk failure stays visible without being expensive.
+const eioReportEvery = 10 * time.Second
+
+var (
+	eioSuppressed atomic.Int64
+	eioReportedAt atomic.Int64 // unix nanos; zero reports the first one
+)
+
 // logUnexpected reports an error the binding could not translate,
 // attributing it to the FUSE operation that produced it. The op name
 // comes from the caller's frame rather than a parameter threaded through
-// twenty call sites -- this runs only on the error path, so its cost
-// does not matter.
+// twenty call sites -- it is paid only by the lines actually emitted.
 func logUnexpected(err error) {
+	now := time.Now().UnixNano()
+	last := eioReportedAt.Load()
+	if now-last < int64(eioReportEvery) || !eioReportedAt.CompareAndSwap(last, now) {
+		eioSuppressed.Add(1)
+		return
+	}
 	op := "fuse"
 	if pc, _, _, ok := runtime.Caller(2); ok {
 		if fn := runtime.FuncForPC(pc); fn != nil {
@@ -219,7 +238,12 @@ func logUnexpected(err error) {
 			op = name
 		}
 	}
-	log.WithError(err).WithField("op", op).Error("pelfs: returning EIO for an unrecognized error")
+	if n := eioSuppressed.Swap(0); n > 0 {
+		ui.Error("{op}: returning EIO for an unrecognized error: {error} (and {suppressed} more like it since the last report)",
+			"op", op, "error", err, "suppressed", n)
+		return
+	}
+	ui.Error("{op}: returning EIO for an unrecognized error: {error}", "op", op, "error", err)
 }
 
 // typeBits maps a catalog entry type to stat's S_IFMT bits.

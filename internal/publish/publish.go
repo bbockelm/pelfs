@@ -54,6 +54,7 @@ import (
 	"github.com/bbockelm/pelfs/internal/packstore"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/superblock"
+	"github.com/bbockelm/pelfs/internal/ui"
 )
 
 // Defaults and policy constants.
@@ -150,6 +151,11 @@ type Stats struct {
 	ReusedFiles, ReusedChunks int
 	ChunkBytes                int64
 	Catalogs, Shards          int
+	// CatalogsReused counts catalogs carried forward from the previous
+	// generation by reference instead of rebuilt: the subtree they cover
+	// did not change, so their bytes — already in a pack this generation
+	// still lists — are referenced, never rewritten.
+	CatalogsReused int
 }
 
 // Result is a successful publish.
@@ -269,7 +275,7 @@ func Publish(ctx context.Context, o Options) (*Result, error) {
 	// The flip already happened: a sidecar write failure must not fail
 	// the publish (the next run just re-uploads some chunks).
 	if err := p.saveDedupIndex(sb.Generation); err != nil {
-		fmt.Fprintf(os.Stderr, "pelfs: publish: dedup index not saved: %v\n", err)
+		ui.Warn("publish: dedup index not saved: {error}", "error", err)
 	}
 	return &Result{Superblock: sb, Raw: raw, NewPacks: newPacks, Stats: p.stats}, nil
 }

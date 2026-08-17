@@ -11,8 +11,26 @@ import (
 )
 
 // prefix identifies our lines on a terminal three programs are writing
-// to. See the package comment.
-const prefix = "pelfs: "
+// to. See the package comment. A warning or an error says so in the
+// prose lead as well, so that the level a collector reads as a field is
+// the same level a person reads on the terminal -- and so that call
+// sites stop shouting WARNING at each other in the message text.
+const (
+	prefix     = "pelfs: "
+	warnPrefix = "pelfs: warning: "
+	errPrefix  = "pelfs: error: "
+)
+
+func linePrefix(l slog.Level) string {
+	switch {
+	case l >= slog.LevelError:
+		return errPrefix
+	case l >= slog.LevelWarn:
+		return warnPrefix
+	default:
+		return prefix
+	}
+}
 
 // timeLayout is RFC3339 with milliseconds and a zone offset: sortable,
 // unambiguous across a daylight-saving boundary, and what every log
@@ -38,8 +56,14 @@ func (h *handler) Handle(_ context.Context, r slog.Record) error {
 		b = append(b, levelName(r.Level)...)
 		b = append(b, ' ')
 	}
-	b = append(b, prefix...)
-	b = expand(b, r.Message, attrs, h.structured)
+	// The structured header already carries the level, so only the
+	// terminal line needs it spelled out.
+	lead := prefix
+	if !h.structured {
+		lead = linePrefix(r.Level)
+	}
+	b = append(b, lead...)
+	b = expand(b, lead, r.Message, attrs, h.structured)
 	if h.structured {
 		for _, a := range attrs {
 			b = append(b, ' ')
@@ -76,9 +100,11 @@ func levelName(l slog.Level) string {
 // message containing literal braces is harmless rather than mangled.
 //
 // A newline in a message starts a continuation line, which is re-prefixed
-// so that every line on the terminal is attributable. The structured sink
-// keeps one record on one line and joins the continuations with a space.
-func expand(b []byte, msg string, attrs []slog.Attr, structured bool) []byte {
+// with lead so that every line on the terminal is attributable and a
+// warning does not lose its warning after the first line. The structured
+// sink keeps one record on one line and joins the continuations with a
+// space.
+func expand(b []byte, lead, msg string, attrs []slog.Attr, structured bool) []byte {
 	for len(msg) > 0 {
 		i := strings.IndexAny(msg, "{\n")
 		if i < 0 {
@@ -90,7 +116,7 @@ func expand(b []byte, msg string, attrs []slog.Attr, structured bool) []byte {
 				b = append(b, ' ')
 			} else {
 				b = append(b, '\n')
-				b = append(b, prefix...)
+				b = append(b, lead...)
 			}
 			msg = msg[i+1:]
 			continue

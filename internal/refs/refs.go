@@ -33,6 +33,7 @@ import (
 
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/superblock"
+	"github.com/bbockelm/pelfs/internal/ui"
 )
 
 // RefDirKey and TagDirKey are the key-space directories for branches and
@@ -161,9 +162,8 @@ func (s *Store) Fetch(ctx context.Context, branch string) (*Fetched, error) {
 	if pinned == nil {
 		// TOFU: nothing pinned yet. Loud, because this is the one moment
 		// an active attacker could substitute a key undetected.
-		fmt.Fprintf(os.Stderr,
-			"pelfs: pinning volume key %s on first use; verify the fingerprint out of band if this volume is shared\n",
-			hex.EncodeToString(sb.SigningPub[:]))
+		ui.Warn("pinning volume key {key} on first use; verify the fingerprint out of band "+
+			"if this volume is shared", "key", hex.EncodeToString(sb.SigningPub[:]))
 		if err := sb.Verify(ed25519.PublicKey(sb.SigningPub[:])); err != nil {
 			return nil, fmt.Errorf("ref %s: %w", branch, err)
 		}
@@ -188,8 +188,8 @@ func (s *Store) Fetch(ctx context.Context, branch string) (*Fetched, error) {
 	if err := superblock.VerifyChain(prevRaw, sb, pinned); err != nil {
 		return nil, fmt.Errorf("ref %s: %w: %w", branch, ErrUntrusted, err)
 	}
-	fmt.Fprintf(os.Stderr, "pelfs: volume signing key rotated to %s (announced by branch %q's previous generation)\n",
-		hex.EncodeToString(sb.SigningPub[:]), branch)
+	ui.Warn("volume signing key rotated to {key} (announced by branch {branch}'s previous generation)",
+		"key", hex.EncodeToString(sb.SigningPub[:]), "branch", branch)
 	if err := s.persist(branch, sb.SigningPub[:], raw); err != nil {
 		return nil, err
 	}

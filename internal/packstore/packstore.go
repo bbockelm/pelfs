@@ -30,6 +30,7 @@ import (
 	"lukechampine.com/blake3"
 
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
+	"github.com/bbockelm/pelfs/internal/ui"
 )
 
 const (
@@ -181,9 +182,9 @@ func fetchTrailerStored(ctx context.Context, inner pelicanobj.Store, name string
 	whole, werr := readRangeFrom(ctx, inner, PackDirKey+"/"+name, 0, size)
 	if werr == nil && int64(len(whole)) == size {
 		if tr, stored, idxLen, ferr := parseTail(ctx, inner, name, size, whole); ferr == nil {
-			fmt.Fprintf(os.Stderr,
-				"pelfs: WARNING: pack %s: tail range read returned invalid bytes (%v) but the full object is intact — a transport in the path is mishandling Range requests; reads may be unreliable\n",
-				name, terr)
+			ui.Warn("pack {pack}: tail range read returned invalid bytes ({error}) but the full "+
+				"object is intact — a transport in the path is mishandling Range requests; "+
+				"reads may be unreliable", "pack", name, "error", terr)
 			return tr, stored, idxLen, nil
 		}
 	}

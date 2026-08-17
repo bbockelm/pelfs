@@ -2,14 +2,13 @@ package rawfuse
 
 import (
 	"context"
-	"fmt"
-	"os"
 	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 
 	"github.com/bbockelm/pelfs/internal/genfs"
 	"github.com/bbockelm/pelfs/internal/superblock"
+	"github.com/bbockelm/pelfs/internal/ui"
 )
 
 // Live generation refresh for read-only mounts (docs/design-packfs.md,
@@ -35,22 +34,16 @@ type Refresher struct {
 	srv    *fuse.Server
 	fetch  Fetcher
 	every  time.Duration
-	logger func(string, ...any)
+	// logger takes a ui message and its attributes; the seam exists so a
+	// test can watch what a swap reported without reading stderr.
+	logger func(msg string, attrs ...any)
 }
 
 // NewRefresher wires a poller to a mounted filesystem. Interval zero
 // disables polling (the mount stays pinned to the generation it started
 // with, which is what a reproducible batch job wants).
 func NewRefresher(fs *genfs.FS, srv *fuse.Server, fetch Fetcher, every time.Duration) *Refresher {
-	return &Refresher{
-		fs:    fs,
-		srv:   srv,
-		fetch: fetch,
-		every: every,
-		logger: func(format string, args ...any) {
-			fmt.Fprintf(os.Stderr, "pelfs: "+format+"\n", args...)
-		},
-	}
+	return &Refresher{fs: fs, srv: srv, fetch: fetch, every: every, logger: ui.Info}
 }
 
 // Run polls until ctx ends. Fetch failures are logged and retried at the
@@ -68,7 +61,8 @@ func (r *Refresher) Run(ctx context.Context) {
 			return
 		case <-tick.C:
 			if err := r.Refresh(ctx); err != nil {
-				r.logger("refresh: %v (still serving generation %d)", err, r.fs.Generation())
+				r.logger("refresh: {error} (still serving generation {generation})",
+					"error", err, "generation", r.fs.Generation())
 			}
 		}
 	}
@@ -89,12 +83,16 @@ func (r *Refresher) Refresh(ctx context.Context) error {
 		return err
 	}
 	if len(rep.Changes) == 0 && len(rep.Entries) == 0 {
-		r.logger("generation %d -> %d: nothing this mount holds changed", rep.From, rep.To)
+		r.logger("generation {from} -> {to}: nothing this mount holds changed",
+			"from", rep.From, "to", rep.To)
 		return nil
 	}
 	r.notify(rep)
-	r.logger("generation %d -> %d: invalidated %d inode(s) and %d name(s) of %d resident",
-		rep.From, rep.To, len(rep.Changes), len(rep.Entries), rep.Resident)
+	r.logger("generation {from} -> {to}: invalidated {inodes} and {names} of {resident} resident",
+		"from", rep.From, "to", rep.To,
+		"inodes", ui.Count(len(rep.Changes), "inode"),
+		"names", ui.Count(len(rep.Entries), "name"),
+		"resident", rep.Resident)
 	return nil
 }
 

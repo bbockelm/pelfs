@@ -25,7 +25,8 @@ import (
 	"time"
 
 	"github.com/pelicanplatform/pelican/error_codes"
-	log "github.com/sirupsen/logrus"
+
+	"github.com/bbockelm/pelfs/internal/ui"
 )
 
 const userAgent = "pelfs/0.1"
@@ -215,14 +216,13 @@ func ReadMutable(ctx context.Context, s Store, key string) ([]byte, error) {
 	}
 	u, ok := AsUnverifiedReader(s)
 	if !ok {
-		log.WithField("key", key).Warn(
-			"pelfs: origin served a body its own checksum does not describe, and this transport " +
-				"cannot re-read without verification")
+		ui.Warn("origin served a body its own checksum does not describe ({key}), and this "+
+			"transport cannot re-read without verification", "key", key)
 		return nil, err
 	}
-	log.WithError(err).WithField("key", key).Warn(
-		"pelfs: origin's advertised checksum disagrees with the body it served; " +
-			"re-reading without transport verification (signature and generation checks still apply)")
+	ui.Warn("origin's advertised checksum disagrees with the body it served for {key}: {error}; "+
+		"re-reading without transport verification (signature and generation checks still apply)",
+		"key", key, "error", err)
 	raw, rerr := readWhole(func() (io.ReadCloser, error) {
 		return u.GetUnverified(ctx, key)
 	})
@@ -232,11 +232,11 @@ func ReadMutable(ctx context.Context, s Store, key string) ([]byte, error) {
 		// and "attempted, still refused" -- indistinguishable from the
 		// outside, which cost a debugging round trip against a real
 		// federation.
-		log.WithError(rerr).WithField("key", key).Warn(
-			"pelfs: unverified re-read also failed")
+		ui.Warn("unverified re-read of {key} also failed: {error}", "key", key, "error", rerr)
 		return nil, err
 	}
-	log.WithField("key", key).Warn("pelfs: unverified re-read succeeded; continuing on signature and generation checks")
+	ui.Warn("unverified re-read of {key} succeeded; continuing on signature and generation checks",
+		"key", key)
 	return raw, nil
 }
 

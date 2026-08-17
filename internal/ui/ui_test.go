@@ -30,7 +30,7 @@ func TestPlainIsBareProse(t *testing.T) {
 	})
 	want := "pelfs: sealing the overlay into the next generation...\n" +
 		"pelfs: sealed generation 7 (412 chunks)\n" +
-		"pelfs: lease renewal failed (will retry): 503\n"
+		"pelfs: warning: lease renewal failed (will retry): 503\n"
 	if out != want {
 		t.Fatalf("plain output:\n%q\nwant:\n%q", out, want)
 	}
@@ -85,8 +85,10 @@ func TestValuesReadAsProseAndStoreAsNumbers(t *testing.T) {
 func TestMultiLineMessages(t *testing.T) {
 	msg := "another client took over this prefix: {holder}\nstop one of them."
 	plain := say(t, false, func() { Warn(msg, "holder", "host2") })
-	if plain != "pelfs: another client took over this prefix: host2\npelfs: stop one of them.\n" {
-		t.Errorf("plain: %q", plain)
+	want := "pelfs: warning: another client took over this prefix: host2\n" +
+		"pelfs: warning: stop one of them.\n"
+	if plain != want {
+		t.Errorf("plain:\n%q\nwant:\n%q", plain, want)
 	}
 	structured := say(t, true, func() { Warn(msg, "holder", "host2") })
 	if n := strings.Count(structured, "\n"); n != 1 {

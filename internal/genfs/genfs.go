@@ -638,6 +638,66 @@ func (fs *FS) readdir(ctx context.Context, ino uint64) ([]DirEntry, error) {
 	return out, nil
 }
 
+// ReaddirRetain lists a directory AND establishes residency for every
+// entry, which Readdir deliberately does not. It answers the one caller
+// that descends a whole tree without a kernel to Lookup for it: a seal,
+// which needs every entry operable, not merely named.
+//
+// The point is the query count. A Lookup per entry costs three catalog
+// queries each — the edge, the nested probe, and the node row — to
+// recompute what one ReaddirPlus already returned; over an 85k-inode tree
+// that was the largest single item in the walk. This pays two queries per
+// DIRECTORY instead, and retains exactly what the per-entry loop retained:
+// same inodes, same catalogs, same order, so residency (including
+// MaxResident eviction, which is driven by that order) behaves identically.
+func (fs *FS) ReaddirRetain(ctx context.Context, ino uint64) ([]DirEntry, error) {
+	fs.swapMu.RLock()
+	defer fs.swapMu.RUnlock()
+	catHex, err := fs.residencyOf(ino)
+	if err != nil {
+		return nil, err
+	}
+	cat, release, err := fs.cats.acquire(ctx, catHex)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	plus, err := cat.ReaddirPlus(int64(ino))
+	if err != nil {
+		return nil, err
+	}
+	nested, err := cat.NestedOf(int64(ino))
+	if err != nil {
+		return nil, err
+	}
+	var childCats map[string]string
+	if len(nested) > 0 {
+		childCats = make(map[string]string, len(nested))
+		for _, n := range nested {
+			childCats[string(n.Name)] = hex.EncodeToString(n.CatalogIdentity)
+		}
+	}
+	out := make([]DirEntry, 0, len(plus))
+	for _, e := range plus {
+		name := string(e.Name)
+		// A transition point's residency is the CHILD catalog: its attrs
+		// come from the node row here, its entries resolve over there.
+		childCat := catHex
+		if h, ok := childCats[name]; ok {
+			childCat = h
+			delete(childCats, name)
+		}
+		fs.retain(uint64(e.Node.Inode), childCat, ino, name)
+		out = append(out, DirEntry{Name: name, Node: nodeOf(e.Node)})
+	}
+	for name := range childCats {
+		// Lookup rejects this shape rather than serving a directory with no
+		// attributes; a listing must not quietly drop the entry instead.
+		return nil, fmt.Errorf("genfs: transition %q under inode %d has no dirent half", name, ino)
+	}
+	return out, nil
+}
+
 // Readlink returns a symlink's target.
 func (fs *FS) Readlink(ctx context.Context, ino uint64) (string, error) {
 	fs.swapMu.RLock()

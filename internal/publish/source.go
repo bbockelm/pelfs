@@ -2,7 +2,6 @@ package publish
 
 import (
 	"context"
-	"fmt"
 	"io"
 
 	"github.com/bbockelm/pelfs/internal/genfs"
@@ -120,10 +119,12 @@ type CatalogReuser interface {
 // overlaySource seals a phase-3 write overlay: the merged base+dirty view
 // IS the generation's contents, so the seal walks it exactly like a cut.
 //
-// Residency comes from Lookup: genfs serves an inode only after the
-// descent that reached it, and overlay.Readdir returns base entries
-// WITHOUT establishing residency for them. Every entry is therefore
-// re-resolved through Lookup before its inode is used for anything else.
+// Residency is the one thing a listing does not carry: genfs serves an
+// inode only after the descent that reached it, and an ordinary Readdir
+// returns base entries without establishing it. The seal therefore reads
+// directories through ReaddirRetain, which lists and makes resident in the
+// same pass — the bulk form of the Lookup-per-entry loop this used to run.
+//
 // overlayView is the read surface a seal walks. Both *overlay.FS and
 // *overlay.Snapshot satisfy it, so a checkpoint can seal a FROZEN view
 // while the mount keeps taking writes — which is what makes rebasing
@@ -134,7 +135,7 @@ type overlayView interface {
 	NextInode() (uint64, error)
 	Lookup(ctx context.Context, parent uint64, name string) (overlay.Node, error)
 	GetAttr(ctx context.Context, ino uint64) (overlay.Node, error)
-	Readdir(ctx context.Context, ino uint64) ([]overlay.DirEntry, error)
+	ReaddirRetain(ctx context.Context, ino uint64) ([]overlay.DirEntry, error)
 	Readlink(ctx context.Context, ino uint64) (string, error)
 	AllXattrs(ctx context.Context, ino uint64) (map[string][]byte, error)
 	Read(ctx context.Context, ino uint64, off int64, dst []byte) (int, error)
@@ -172,17 +173,13 @@ func (s *overlaySource) NextInode() uint64 {
 }
 
 func (s *overlaySource) Readdir(ctx context.Context, ino uint64) ([]SrcEntry, error) {
-	des, err := s.fs.Readdir(ctx, ino)
+	des, err := s.fs.ReaddirRetain(ctx, ino)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]SrcEntry, 0, len(des))
 	for _, de := range des {
-		n, err := s.fs.Lookup(ctx, ino, de.Name)
-		if err != nil {
-			return nil, fmt.Errorf("publish: seal lookup %d/%q: %w", ino, de.Name, err)
-		}
-		out = append(out, SrcEntry{Name: de.Name, Node: srcNodeFromOverlay(n)})
+		out = append(out, SrcEntry{Name: de.Name, Node: srcNodeFromOverlay(de.Node)})
 	}
 	return out, nil
 }

@@ -352,6 +352,14 @@ type Catalog struct {
 	db   *sql.DB
 	meta Meta
 
+	// anyXattr is whether the xattr table holds a single row. Almost no
+	// tree uses extended attributes, and a seal asks every inode in the
+	// span for its xattrs — so the whole-catalog fact answers the whole
+	// span at once, and the per-inode query never runs. Read once at
+	// open, which is legal for the same reason immutable=1 is: a catalog
+	// file is named by the hash of its bytes and is never rewritten.
+	anyXattr bool
+
 	stLookupEdge    *sql.Stmt
 	stLookupNested  *sql.Stmt
 	stReaddirEdges  *sql.Stmt
@@ -404,6 +412,10 @@ func Open(path string) (*Catalog, error) {
 	if err := c.prepare(); err != nil {
 		db.Close()
 		return nil, err
+	}
+	if err := c.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM xattr)`).Scan(&c.anyXattr); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("catalog: probe xattr table: %w", err)
 	}
 	return c, nil
 }
@@ -539,20 +551,31 @@ func (c *Catalog) Readdir(parent int64) ([]Dirent, []Nested, error) {
 	if err := rows.Err(); err != nil {
 		return nil, nil, err
 	}
-	nrows, err := c.stReaddirNested.Query(parent)
+	nesteds, err := c.NestedOf(parent)
 	if err != nil {
 		return nil, nil, err
 	}
-	defer nrows.Close()
-	var nesteds []Nested
-	for nrows.Next() {
-		var n Nested
-		if err := nrows.Scan(&n.Name, &n.CatalogIdentity); err != nil {
-			return nil, nil, err
-		}
-		nesteds = append(nesteds, n)
+	return dirents, nesteds, nil
+}
+
+// NestedOf lists the transition points directly under parent, sorted by
+// name. It is the half of Readdir that says which entries resolve in a
+// CHILD catalog rather than this one.
+func (c *Catalog) NestedOf(parent int64) ([]Nested, error) {
+	rows, err := c.stReaddirNested.Query(parent)
+	if err != nil {
+		return nil, err
 	}
-	return dirents, nesteds, nrows.Err()
+	defer rows.Close() //nolint:errcheck
+	var out []Nested
+	for rows.Next() {
+		var n Nested
+		if err := rows.Scan(&n.Name, &n.CatalogIdentity); err != nil {
+			return nil, err
+		}
+		out = append(out, n)
+	}
+	return out, rows.Err()
 }
 
 // Stat returns one inode's attributes; ErrNotExist if absent.
@@ -615,9 +638,17 @@ func (c *Catalog) Inline(inode int64) ([]byte, error) {
 	return data, err
 }
 
+// HasXattrs reports whether this catalog holds any extended attribute at
+// all. A caller iterating a whole span uses it to answer "none" for every
+// inode in one fact instead of one query each.
+func (c *Catalog) HasXattrs() bool { return c.anyXattr }
+
 // Xattrs returns an inode's extended attributes sorted by name; empty when
 // there are none.
 func (c *Catalog) Xattrs(inode int64) ([]Xattr, error) {
+	if !c.anyXattr {
+		return nil, nil
+	}
 	rows, err := c.stXattrs.Query(inode)
 	if err != nil {
 		return nil, err

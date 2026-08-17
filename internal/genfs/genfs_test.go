@@ -788,6 +788,96 @@ func TestBoundedResidency(t *testing.T) {
 	}
 }
 
+// ReaddirRetain replaces a Lookup per entry, so it has to be
+// indistinguishable from one: same entries, same residency, and the same
+// eviction order when residency is bounded. The transition point is the
+// case worth pinning — a child catalog's entries are unreachable unless
+// the retain recorded the CHILD catalog, which only the nested rows say.
+func TestReaddirRetainMatchesLookupPerEntry(t *testing.T) {
+	ctx := context.Background()
+	inner, _ := newInner(t)
+	v := newTestVolume(t, inner, "cafe0001-0000-4000-8000-00000000abcd")
+	dirIno := v.Mkdir(rootIno, "dir")
+	deepIno := v.Mkdir(dirIno, "deep")
+	for _, d := range []uint64{rootIno, dirIno, deepIno} {
+		for i := 0; i < 8; i++ {
+			ino := v.Create(d, fmt.Sprintf("f%02d.txt", i))
+			v.Write(ino, pseudorandom(400, int64(d)+int64(i)))
+		}
+	}
+	v.Symlink(dirIno, "link", "deep")
+	// SMax 1000 splits /dir (and /dir/deep) into nested catalogs.
+	res := publishVolume(t, v, inner, publish.Options{SMax: 1000, TargetPackSize: 2 << 20})
+	if res.Stats.Catalogs < 3 {
+		t.Fatalf("fixture did not split: %d catalogs", res.Stats.Catalogs)
+	}
+
+	byLookup := openFS(t, inner, res.Superblock, genfs.Options{})
+	byRetain := openFS(t, inner, res.Superblock, genfs.Options{})
+
+	// Walk both the whole way down, one through Readdir+Lookup, one
+	// through ReaddirRetain alone, and compare listing by listing.
+	var walk func(ino uint64)
+	walk = func(ino uint64) {
+		want, err := byLookup.Readdir(ctx, ino)
+		if err != nil {
+			t.Fatalf("Readdir %d: %v", ino, err)
+		}
+		for _, e := range want {
+			if _, err := byLookup.Lookup(ctx, ino, e.Name); err != nil {
+				t.Fatalf("Lookup %d/%s: %v", ino, e.Name, err)
+			}
+		}
+		got, err := byRetain.ReaddirRetain(ctx, ino)
+		if err != nil {
+			t.Fatalf("ReaddirRetain %d: %v", ino, err)
+		}
+		if len(got) != len(want) {
+			t.Fatalf("ReaddirRetain %d = %v, want %v", ino, entryNames(got), entryNames(want))
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				t.Fatalf("entry %d of inode %d = %+v, want %+v", i, ino, got[i], want[i])
+			}
+		}
+		for _, e := range got {
+			// Residency, not just naming: every entry must now be operable
+			// without any further descent.
+			if _, err := byRetain.GetAttr(ctx, e.Node.Inode); err != nil {
+				t.Fatalf("entry %q (inode %d) not resident after ReaddirRetain: %v", e.Name, e.Node.Inode, err)
+			}
+			switch e.Node.Type {
+			case catalog.TypeDir:
+				walk(e.Node.Inode)
+			case catalog.TypeSymlink:
+				if _, err := byRetain.Readlink(ctx, e.Node.Inode); err != nil {
+					t.Fatalf("readlink %q: %v", e.Name, err)
+				}
+			default:
+				readAll(t, byRetain, e.Node.Inode, int(e.Node.Length), 64<<10)
+			}
+		}
+	}
+	walk(rootIno)
+
+	// Bounded residency: retaining a listing must evict exactly as the
+	// per-entry loop does, so the same inode falls off the end.
+	capped := openFS(t, inner, res.Superblock, genfs.Options{MaxResident: 2})
+	ents, err := capped.ReaddirRetain(ctx, rootIno)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ents) < 3 {
+		t.Fatalf("fixture root has %d entries, need at least 3 to overflow the cap", len(ents))
+	}
+	if _, err := capped.GetAttr(ctx, ents[0].Node.Inode); !errors.Is(err, genfs.ErrStale) {
+		t.Fatalf("first entry survived a cap of 2: %v", err)
+	}
+	if _, err := capped.GetAttr(ctx, ents[len(ents)-1].Node.Inode); err != nil {
+		t.Fatalf("last entry was evicted: %v", err)
+	}
+}
+
 // Prefetch warms the whole generation's chunk cache: the batch mode that
 // wants every byte local before a job starts.
 func TestPrefetchWarmsCache(t *testing.T) {

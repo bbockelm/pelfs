@@ -314,6 +314,12 @@ func (s *Snapshot) Readdir(ctx context.Context, ino uint64) ([]DirEntry, error) 
 	return s.view.Readdir(ctx, ino)
 }
 
+// ReaddirRetain lists the frozen merged view of a directory and makes its
+// base entries operable, which is what a seal walking this view needs.
+func (s *Snapshot) ReaddirRetain(ctx context.Context, ino uint64) ([]DirEntry, error) {
+	return s.view.ReaddirRetain(ctx, ino)
+}
+
 // Readlink returns a frozen symlink target.
 func (s *Snapshot) Readlink(ctx context.Context, ino uint64) (string, error) {
 	return s.view.Readlink(ctx, ino)

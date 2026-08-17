@@ -176,7 +176,27 @@ func (fs *FS) GetAttr(ctx context.Context, ino uint64) (Node, error) {
 func (fs *FS) Readdir(ctx context.Context, ino uint64) ([]DirEntry, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	return fs.readdirLocked(ctx, ino, false)
+}
 
+// ReaddirRetain lists the merged view exactly as Readdir does and, for
+// every entry that comes from the base, establishes base residency at the
+// same time.
+//
+// It exists for the seal, which descends the whole tree with no kernel
+// Lookup behind it. Readdir alone leaves base entries un-resident, so the
+// seal used to re-resolve every name it had just been handed — three
+// catalog queries and four overlay queries per entry, to learn nothing
+// Readdir had not already returned. The base does the retaining in bulk
+// (genfs.ReaddirRetain), which is where the equivalence lives: same
+// inodes, same catalogs, same order as the per-entry loop.
+func (fs *FS) ReaddirRetain(ctx context.Context, ino uint64) ([]DirEntry, error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	return fs.readdirLocked(ctx, ino, true)
+}
+
+func (fs *FS) readdirLocked(ctx context.Context, ino uint64, retain bool) ([]DirEntry, error) {
 	type oent struct {
 		ino uint64
 	}
@@ -209,7 +229,12 @@ func (fs *FS) Readdir(ctx context.Context, ino uint64) ([]DirEntry, error) {
 		if err := fs.ensureBaseLocked(ctx, fs.db, ino); err != nil {
 			return nil, err
 		}
-		bes, err := fs.base.Readdir(ctx, ino)
+		var bes []DirEntry
+		if retain {
+			bes, err = fs.base.ReaddirRetain(ctx, ino)
+		} else {
+			bes, err = fs.base.Readdir(ctx, ino)
+		}
 		if err != nil {
 			return nil, err
 		}

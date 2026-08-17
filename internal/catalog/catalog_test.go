@@ -270,6 +270,51 @@ func TestCreateRefusesExisting(t *testing.T) {
 
 // ReaddirPlus must agree with Readdir+Stat exactly — it exists only to
 // collapse those 1+N pager round trips into one join.
+// The empty-xattr-table shortcut has to be exactly that: a catalog that
+// HAS xattrs still answers per inode, and one that has none answers none
+// for every inode without consulting the table.
+func TestHasXattrs(t *testing.T) {
+	c, err := Open(buildTestCatalog(t))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer c.Close() //nolint:errcheck
+	if !c.HasXattrs() {
+		t.Fatal("HasXattrs = false on a catalog with xattr rows")
+	}
+	xs, err := c.Xattrs(2)
+	if err != nil || len(xs) != 2 {
+		t.Fatalf("Xattrs(2) = %v, %v; want two rows", xs, err)
+	}
+	if xs, err := c.Xattrs(3); err != nil || len(xs) != 0 {
+		t.Fatalf("Xattrs(3) = %v, %v; want none", xs, err)
+	}
+
+	// A catalog with no xattr row at all.
+	path := filepath.Join(t.TempDir(), "bare.sqlite")
+	w, err := Create(path, testMeta)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := w.AddNode(Node{Inode: 1, Type: TypeDir, Mode: 0o755, Nlink: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	bare, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer bare.Close() //nolint:errcheck
+	if bare.HasXattrs() {
+		t.Fatal("HasXattrs = true on a catalog with no xattr rows")
+	}
+	if xs, err := bare.Xattrs(1); err != nil || xs != nil {
+		t.Fatalf("Xattrs on an xattr-free catalog = %v, %v; want nil, nil", xs, err)
+	}
+}
+
 func TestReaddirPlusMatchesReaddirStat(t *testing.T) {
 	c, err := Open(buildTestCatalog(t))
 	if err != nil {

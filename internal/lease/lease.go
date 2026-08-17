@@ -137,21 +137,49 @@ func Acquire(ctx context.Context, opts Options) (*Lease, error) {
 		stop: make(chan struct{}),
 		done: make(chan struct{}),
 	}
-	if err := l.write(ctx); err != nil {
-		return nil, fmt.Errorf("write lease: %w", err)
+	// Write, then read back: with no compare-and-swap, a racing writer may
+	// have overwritten us in between — last writer wins, so if the record
+	// is not ours, we lost.
+	//
+	// A STEAL retries that, because the writer it races is not contesting
+	// the acquisition at all: the current holder rewrites the record every
+	// RenewInterval, so a single attempt loses to routine renewal and
+	// reports a conflict that is not one. Retrying converges quickly,
+	// since the holder's own verify sees our record and stops renewing.
+	//
+	// A plain acquisition does NOT retry. Losing means another client
+	// acquired the volume, and yielding is the point — two simultaneous
+	// starters must not fight over it.
+	attempts := 1
+	if opts.Steal {
+		attempts = 4
 	}
-
-	// Read back: with no compare-and-swap, a racing acquirer may have
-	// overwritten us between the write and now — last writer wins, so if
-	// the record is not ours, we lost.
-	after, ki2, err := read(ctx, opts.Store)
-	if err != nil {
-		return nil, fmt.Errorf("verify lease: %w", err)
+	var lost error
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			select {
+			case <-time.After(opts.RenewInterval / 2):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		if err := l.write(ctx); err != nil {
+			return nil, fmt.Errorf("write lease: %w", err)
+		}
+		after, ki2, err := read(ctx, opts.Store)
+		if err != nil {
+			return nil, fmt.Errorf("verify lease: %w", err)
+		}
+		if after != nil && after.Session == opts.Session {
+			l.lastETag = ki2.ETag
+			lost = nil
+			break
+		}
+		lost = fmt.Errorf("%w: lost acquisition race to %s", ErrHeld, after.Describe())
 	}
-	if after == nil || after.Session != opts.Session {
-		return nil, fmt.Errorf("%w: lost acquisition race to %s", ErrHeld, after.Describe())
+	if lost != nil {
+		return nil, lost
 	}
-	l.lastETag = ki2.ETag
 
 	go l.renewLoop()
 	return l, nil

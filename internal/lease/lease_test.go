@@ -182,3 +182,38 @@ func TestUnparseableLeaseStillLive(t *testing.T) {
 		t.Fatalf("acquire over fresh unparseable lease: err = %v, want ErrHeld", err)
 	}
 }
+
+// TestStealBeatsAnActiveRenewer drives the race that made
+// TestRenewalDetectsConflict flaky on slower CI runners. A steal writes
+// the record and reads it back to confirm it won, and the holder it is
+// stealing from rewrites that same record every RenewInterval -- so the
+// verify loses to routine renewal and reports a conflict that is not one.
+//
+// The holder here renews aggressively, making the collision near-certain
+// rather than occasional. --steal-lease means "take it from whoever holds
+// it", so losing to the holder's own heartbeat is never an acceptable
+// answer.
+func TestStealBeatsAnActiveRenewer(t *testing.T) {
+	ctx := context.Background()
+	for i := 0; i < 20; i++ {
+		store := newStore(t)
+		holder, err := Acquire(ctx, Options{
+			Store: store, Session: "sess-holder",
+			TTL: time.Hour, RenewInterval: 2 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatalf("holder acquire: %v", err)
+		}
+		steal := Options{
+			Store: store, Session: "sess-thief",
+			TTL: time.Hour, RenewInterval: time.Hour, Steal: true,
+		}
+		thief, err := Acquire(ctx, steal)
+		if err != nil {
+			holder.Release(ctx) //nolint:errcheck
+			t.Fatalf("iteration %d: steal lost to the holder's renewal loop: %v", i, err)
+		}
+		thief.Release(ctx)  //nolint:errcheck
+		holder.Release(ctx) //nolint:errcheck
+	}
+}

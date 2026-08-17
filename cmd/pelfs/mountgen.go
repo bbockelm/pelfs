@@ -649,6 +649,64 @@ func (g *genSession) sample(ctx context.Context, every time.Duration) {
 
 // sealLocked publishes the overlay's current merged view as the next
 // generation on the branch. Callers hold mu.
+// sealCost samples what a seal is about to spend. A seal is the
+// operation users actually wait on, and when it is slow the first
+// question is which resource it went to: re-chunking work looks nothing
+// like a slow uplink, and the remedies are opposite.
+type sealCost struct {
+	wall time.Time
+	cpu  time.Duration
+	get  int64
+	put  int64
+}
+
+func (g *genSession) beginSealCost() sealCost {
+	c := sealCost{wall: time.Now(), cpu: processCPU()}
+	g.stats.Update(func(sum *stats.Summary) {
+		c.get, c.put = sum.Get.Bytes, sum.Put.Bytes
+	})
+	return c
+}
+
+func (g *genSession) reportSealCost(c sealCost) {
+	wall := time.Since(c.wall)
+	cpu := processCPU() - c.cpu
+	var down, up int64
+	g.stats.Update(func(sum *stats.Summary) {
+		down, up = sum.Get.Bytes-c.get, sum.Put.Bytes-c.put
+	})
+	fmt.Fprintf(os.Stderr, "%s pelfs: seal took %s (%s CPU, %s downloaded, %s uploaded)\n",
+		time.Now().Format("15:04:05"), wall.Round(time.Second), cpu.Round(time.Second),
+		humanBytes(down), humanBytes(up))
+}
+
+// processCPU is this process's user+system time. Seals are mostly
+// chunking and SQLite, so CPU well below wall time points at the network
+// and CPU near wall time points at us.
+func processCPU() time.Duration {
+	var ru syscall.Rusage
+	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {
+		return 0
+	}
+	tv := func(t syscall.Timeval) time.Duration {
+		return time.Duration(t.Sec)*time.Second + time.Duration(t.Usec)*time.Microsecond
+	}
+	return tv(ru.Utime) + tv(ru.Stime)
+}
+
+func humanBytes(n int64) string {
+	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%.1f GiB", float64(n)/(1<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1f MiB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1f KiB", float64(n)/(1<<10))
+	default:
+		return fmt.Sprintf("%d B", n)
+	}
+}
+
 func (g *genSession) sealLocked(ctx context.Context) (*publish.Result, error) {
 	keyPath := g.signingKeyPath
 	if keyPath == "" {
@@ -675,6 +733,7 @@ func (g *genSession) sealLocked(ctx context.Context) (*publish.Result, error) {
 	}
 	defer snap.Close() //nolint:errcheck
 
+	cost := g.beginSealCost()
 	res, err := publish.Seal(ctx, publish.Options{
 		OverlaySnapshot: snap,
 		Inner:           g.inner,
@@ -692,6 +751,7 @@ func (g *genSession) sealLocked(ctx context.Context) (*publish.Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	g.reportSealCost(cost)
 	// The anchor must advance with the branch head: the next seal's
 	// lineage hash and its compare-and-swap against refs/<branch> both
 	// grow from what was just published, not from where the mount started.

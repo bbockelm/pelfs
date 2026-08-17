@@ -132,7 +132,7 @@ func (w *PackWriter) Finalize() (SealedPack, func(context.Context, pelicanobj.St
 	name := newPackName()
 	sp := SealedPack{Name: name, TrailerHash: blake3.Sum256(idx), Size: w.size + int64(len(idx)) + footerSize}
 	upload := func(ctx context.Context, inner pelicanobj.Store) error {
-		if err := retryOn(ctx, "upload pack "+name, defaultRetries, func() error {
+		if err := retryOnSized(ctx, "upload pack "+name, sp.Size, defaultRetries, func() error {
 			if _, err := w.f.Seek(0, io.SeekStart); err != nil {
 				return err
 			}

@@ -778,7 +778,8 @@ func (s *Store) Flush(ctx context.Context) error {
 		s.requeue(spool, pending, dead)
 		return fmt.Errorf("finalize pack: %w", err)
 	}
-	if err := retryOn(ctx, "upload pack "+name, defaultRetries, func() error {
+	uploadSize, _ := upload.Seek(0, io.SeekEnd)
+	if err := retryOnSized(ctx, "upload pack "+name, uploadSize, defaultRetries, func() error {
 		if _, err := upload.Seek(0, io.SeekStart); err != nil {
 			return err
 		}

@@ -1219,3 +1219,70 @@ func nameIndex(t *testing.T, ents []overlay.DirEntry, name string) int {
 	}
 	return -1
 }
+
+// A retaining listing is a DESCENT STEP, not a pin. Residency in the base
+// is temporary — a bounded residency map evicts it, and a swap drops it —
+// so a caller that descends a tree LARGER than the bound evicts, with its
+// own descent, the inodes it is about to read. Getting them back means
+// replaying the edge that reached them, which only works if the listing
+// recorded it.
+//
+// A residency bound of one makes every entry but the last non-resident the
+// moment the listing returns, which is the whole-tree case in miniature.
+func TestReaddirRetainSurvivesEvictionOfItsOwnEntries(t *testing.T) {
+	ctx := context.Background()
+	fx := newFixture(t, "0fff1111-2222-3333-4444-55556666aaaa")
+	base, err := genfs.Open(ctx, genfs.Options{
+		Inner: fx.inner, SB: fx.res.Superblock, CacheDir: t.TempDir(), MaxResident: 1,
+	})
+	if err != nil {
+		t.Fatalf("genfs.Open: %v", err)
+	}
+	defer base.Close() //nolint:errcheck
+	// A FRESH overlay: nothing in it has resolved a base name yet, which is
+	// what a new session over a published volume has.
+	ov, err := overlay.Open(t.TempDir(), base, fx.options())
+	if err != nil {
+		t.Fatalf("overlay.Open: %v", err)
+	}
+	defer ov.Close() //nolint:errcheck
+
+	var readAll func(ino uint64)
+	readAll = func(ino uint64) {
+		ents, err := ov.ReaddirRetain(ctx, ino)
+		if err != nil {
+			t.Fatalf("readdirretain %d: %v", ino, err)
+		}
+		// Every entry, in the order the listing gave them: the first is the
+		// one the rest of the listing has already evicted.
+		for _, e := range ents {
+			if _, err := ov.GetAttr(ctx, e.Node.Inode); err != nil {
+				t.Fatalf("getattr %q (inode %d): %v", e.Name, e.Node.Inode, err)
+			}
+			if _, err := ov.AllXattrs(ctx, e.Node.Inode); err != nil {
+				t.Fatalf("xattrs of %q (inode %d): %v", e.Name, e.Node.Inode, err)
+			}
+			if e.Node.Type == catalog.TypeDir {
+				readAll(e.Node.Inode)
+			}
+		}
+	}
+	readAll(rootIno)
+
+	// The attributes themselves, not merely the absence of an error: a
+	// replayed descent must land on the same inode the listing named.
+	xs, err := ov.AllXattrs(ctx, fx.ino["tagged.txt"])
+	if err != nil {
+		t.Fatalf("xattrs of tagged.txt: %v", err)
+	}
+	if string(xs["user.color"]) != "blue" || string(xs["user.keep"]) != "yes" {
+		t.Errorf("tagged.txt xattrs = %v after a replayed descent", xs)
+	}
+	body := make([]byte, len(fx.body["dir/inner/leaf.txt"]))
+	if _, err := ov.Read(ctx, fx.ino["dir/inner/leaf.txt"], 0, body); err != nil {
+		t.Fatalf("read dir/inner/leaf.txt: %v", err)
+	}
+	if !bytes.Equal(body, fx.body["dir/inner/leaf.txt"]) {
+		t.Errorf("leaf body = %q after a replayed descent", body)
+	}
+}

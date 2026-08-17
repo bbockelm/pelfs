@@ -66,6 +66,11 @@ type reuseVol struct {
 	// small fixture into a TREE of catalogs instead of one flat catalog.
 	// Zero takes the default.
 	smax int64
+	// maxRes is the residency bound every genfs this volume opens carries,
+	// so a remount reproduces the mount it replaces.
+	maxRes int
+	// remounts numbers the overlay directories a remount has opened.
+	remounts int
 }
 
 func newReuseVol(t *testing.T, volID [16]byte) *reuseVol {
@@ -83,11 +88,12 @@ func newReuseVolResident(t *testing.T, volID [16]byte, maxResident int) *reuseVo
 		t.Fatal(err)
 	}
 	v := &reuseVol{
-		t:     t,
-		inner: &countingStore{Store: newInner(t)},
-		pub:   pub,
-		priv:  priv,
-		state: t.TempDir(),
+		t:      t,
+		inner:  &countingStore{Store: newInner(t)},
+		pub:    pub,
+		priv:   priv,
+		state:  t.TempDir(),
+		maxRes: maxResident,
 	}
 	v.index = filepath.Join(v.state, "dedup.db")
 	v.head, err = publish.InitVolume(ctx, publish.Options{
@@ -170,6 +176,43 @@ func (v *reuseVol) checkpoint() *publish.Result {
 		v.t.Fatalf("rebase: %v", err)
 	}
 	return res
+}
+
+// remount reopens the volume the way starting a new session does: a fresh
+// genfs over the published head and a fresh overlay directory on top of
+// it. Nothing carries over — in particular no in-memory record of which
+// base inodes this process has already resolved — so every base inode the
+// next seal touches must be reachable from the walk alone.
+//
+// That distinction is what the same-session tests cannot make: a rebase
+// re-pins provenance for everything the session wrote, which hides a walk
+// that establishes none of its own.
+func (v *reuseVol) remount() {
+	v.t.Helper()
+	ctx := context.Background()
+	if err := v.ov.Close(); err != nil {
+		v.t.Fatalf("close overlay: %v", err)
+	}
+	if err := v.base.Close(); err != nil {
+		v.t.Fatalf("close base: %v", err)
+	}
+	v.remounts++
+	var err error
+	v.base, err = genfs.Open(ctx, genfs.Options{
+		Inner: v.inner, SB: v.head.Superblock, CacheDir: filepath.Join(v.state, "gencache"),
+		MaxResident: v.maxRes,
+	})
+	if err != nil {
+		v.t.Fatalf("genfs.Open on remount: %v", err)
+	}
+	v.ov, err = overlay.Open(filepath.Join(v.state, fmt.Sprintf("overlay-%d", v.remounts)), v.base, overlay.Options{
+		NextInode:      v.base.NextInode(),
+		BaseRoot:       v.base.RootCatalog(),
+		BaseGeneration: v.base.Generation(),
+	})
+	if err != nil {
+		v.t.Fatalf("overlay.Open on remount: %v", err)
+	}
 }
 
 func (v *reuseVol) create(parent uint64, name string, data []byte) uint64 {

@@ -177,8 +177,9 @@ func (fs *FS) Readdir(ctx context.Context, ino uint64) ([]DirEntry, error) {
 }
 
 // ReaddirRetain lists the merged view exactly as Readdir does and, for
-// every entry that comes from the base, establishes base residency at the
-// same time.
+// every entry that comes from the base, takes the descent step that
+// resolving the name would have taken: residency in the base, and the
+// provenance record that lets it be re-established after eviction.
 //
 // It exists for the seal, which descends the whole tree with no kernel
 // Lookup behind it. Readdir alone leaves base entries un-resident, so the
@@ -187,6 +188,10 @@ func (fs *FS) Readdir(ctx context.Context, ino uint64) ([]DirEntry, error) {
 // Readdir had not already returned. The base does the retaining in bulk
 // (genfs.ReaddirRetain), which is where the equivalence lives: same
 // inodes, same catalogs, same order as the per-entry loop.
+//
+// Both halves of that step are load-bearing on a tree past the residency
+// bound, and residency alone is the weaker half — it is what the descent
+// itself evicts.
 func (fs *FS) ReaddirRetain(ctx context.Context, ino uint64) ([]DirEntry, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -225,6 +230,21 @@ func (fs *FS) readdirLocked(ctx context.Context, ino uint64, retain bool) ([]Dir
 			return nil, err
 		}
 		for _, be := range bes {
+			if retain {
+				// The base has just made this entry resident, but residency
+				// is not durable: MaxResident evicts it and a swap drops
+				// it. The EDGE is — base edges are immutable within a
+				// generation — so the descent step is recorded here exactly
+				// as resolving the name through baseLookupLocked would have
+				// recorded it. Without it, a walk past the residency bound
+				// has no way back to an inode its own descent evicted, and
+				// every later read of one fails with ErrStale.
+				//
+				// Recorded before the shadow check, so provenance covers
+				// precisely what the base retained: a hidden or replaced
+				// name is still a real base edge.
+				fs.prov[be.Node.Inode] = provEdge{parent: ino, name: be.Name}
+			}
 			if _, shadowed := over[be.Name]; shadowed {
 				continue // whiteout or replacing oedge
 			}

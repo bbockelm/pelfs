@@ -88,8 +88,30 @@ assert s["seal_ok"] is True, s
 assert s["lease_held"] is True, s
 assert s["put"]["ops"] >= 2 and s["put"]["bytes"] > 8000000, s["put"]
 assert s["object_errors_total"] == 0, s
+
+# The phase split has to PARTITION the totals: a byte in neither phase, or
+# in both, would make "nothing was uploaded while I was working" unsafe to
+# believe. This session ran with --snapshot-interval 0, so the honest
+# answer is that every uploaded byte belongs to teardown.
+assert s["pelfs_stats_version"] == 2, s
+ses, tear = s["session_phase"], s["teardown_phase"]
+for kind in ("get", "put", "delete", "other"):
+    for field in ("ops", "errors", "bytes"):
+        got = ses[kind].get(field, 0) + tear[kind].get(field, 0)
+        assert got == s[kind].get(field, 0), (kind, field, got, s[kind])
+assert ses["put"].get("bytes", 0) == 0, ses["put"]
+assert tear["put"].get("bytes", 0) > 8000000, tear["put"]
+assert ses.get("seals", 0) == 0 and tear.get("seals", 0) == 1, (ses, tear)
+assert s["teardown_began"], s
 print(f"   stats OK: {s['put']['ops']} puts, {s['put']['bytes']} bytes up, sealed generation {s['sealed_generation']}")
+print(f"   phases OK: {ses['put'].get('bytes', 0)} bytes uploaded during the session, "
+      f"{tear['put'].get('bytes', 0)} after it exited")
 PY
+# The same answer on the console, live, for a user who never opens the file.
+grep -q "during the session and" "$WORK/run1.log" || {
+  echo "FAIL: the session never said when it uploaded"; tail -5 "$WORK/run1.log"; exit 1; }
+grep -q "publishing: the first pack is on the wire" "$WORK/run1.log" || {
+  echo "FAIL: the session never announced that publication had started"; tail -5 "$WORK/run1.log"; exit 1; }
 
 echo "== federation state after session 1 =="
 PACKS=$( (find "$WORK/origin/e2e/ns/packs" -type f 2>/dev/null || true) | wc -l | tr -d ' ')

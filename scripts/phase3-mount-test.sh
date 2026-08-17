@@ -237,6 +237,60 @@ grep -q "nothing changed\|sealed generation" "$WORK/sigint.log" || {
 if mountpoint -q "$WORK/mnt" 2>/dev/null; then echo "the mount survived teardown" >&2; exit 1; fi
 echo "Ctrl+C verified: payload interrupted (130), pelfs completed its teardown"
 
+echo "== when publication happened: the phase split, from a session's own output =="
+# The question this answers is the user's, not ours: "did any of my data
+# go out while I was working, or was it all saved for the exit?" Both
+# runs below have to answer it from the log and the stats file alone.
+#
+# Case 1: no cadence, so the ONLY seal is at unmount. The session phase
+# must show zero uploaded bytes and teardown must show the payload.
+phase_status=0
+"$WORK/pelfs" mount-gen --rw --snapshot-interval 0 \
+  --stats-file "$WORK/phase-exit.json" --state-dir "$WORK/state" "$PREFIX" "$WORK/mnt" \
+  -- /bin/sh -c 'head -c 4000000 /dev/urandom > exit-sealed.bin' \
+  > "$WORK/phase-exit.log" 2>&1 || phase_status=$?
+[ "$phase_status" = "0" ] || { echo "exit-seal session failed ($phase_status):" >&2; sed 's/^/    /' "$WORK/phase-exit.log"; exit 1; }
+grep -q "publishing: the first pack is on the wire" "$WORK/phase-exit.log" || {
+  echo "the session never announced that publication had started:" >&2
+  sed 's/^/    /' "$WORK/phase-exit.log"; exit 1; }
+grep -q "first pack on the wire" "$WORK/phase-exit.log" || {
+  echo "the seal cost line does not say when the uploads began:" >&2
+  sed 's/^/    /' "$WORK/phase-exit.log"; exit 1; }
+grep -Eq "session=0 teardown=[1-9][0-9]* checkpoints=0 exitseals=1" "$WORK/phase-exit.log" || {
+  echo "the phase split does not show an exit-only seal:" >&2
+  grep "during the session and" "$WORK/phase-exit.log" | sed 's/^/    /'; exit 1; }
+# The same answer survives in the file a supervisor reads afterwards:
+# session_phase carries no put bytes at all (the key is omitted when zero)
+# and teardown_phase carries them.
+flat=$(tr -d ' \n' < "$WORK/phase-exit.json")
+echo "$flat" | grep -q '"pelfs_stats_version":2' || { echo "stats file is not version 2" >&2; exit 1; }
+echo "$flat" | grep -Eq '"session_phase":\{"get":\{[^}]*\},"put":\{"ops":[0-9]+,"errors":0\},' || {
+  echo "session_phase reports uploaded bytes for a session that sealed only at exit:" >&2
+  echo "$flat" | sed 's/^/    /'; exit 1; }
+echo "$flat" | grep -Eq '"teardown_phase":\{"get":\{[^}]*\},"put":\{"ops":[0-9]+,"errors":0,"bytes":[1-9]' || {
+  echo "teardown_phase reports no uploaded bytes though the exit seal published:" >&2
+  echo "$flat" | sed 's/^/    /'; exit 1; }
+
+# Case 2: a cadence short enough to fire while the payload is still
+# running. The same two numbers must now come out the other way round.
+phase_status=0
+"$WORK/pelfs" mount-gen --rw --snapshot-interval 1s \
+  --stats-file "$WORK/phase-ckpt.json" --state-dir "$WORK/state" "$PREFIX" "$WORK/mnt" \
+  -- /bin/sh -c 'head -c 4000000 /dev/urandom > checkpointed.bin; sleep 6' \
+  > "$WORK/phase-ckpt.log" 2>&1 || phase_status=$?
+[ "$phase_status" = "0" ] || { echo "checkpointing session failed ($phase_status):" >&2; sed 's/^/    /' "$WORK/phase-ckpt.log"; exit 1; }
+grep -q "checkpoint started: publishing what this session has written so far" "$WORK/phase-ckpt.log" || {
+  echo "a mid-session checkpoint never announced itself:" >&2
+  sed 's/^/    /' "$WORK/phase-ckpt.log"; exit 1; }
+grep -Eq "session=[1-9][0-9]* teardown=[0-9]+ checkpoints=[1-9]" "$WORK/phase-ckpt.log" || {
+  echo "a checkpointed session did not credit its uploads to the session phase:" >&2
+  grep "during the session and" "$WORK/phase-ckpt.log" | sed 's/^/    /'; exit 1; }
+# Print the lines a user would actually read. Half of what is being
+# gated here is that they stay legible, which no grep can assert.
+grep -h "publishing: the first pack\|checkpoint started\|during the session and" \
+  "$WORK/phase-exit.log" "$WORK/phase-ckpt.log" | sed 's/^/    /'
+echo "phase split verified: exit-only seal reads 0 during the session; a checkpoint reads the reverse"
+
 "$WORK/pelfs" mount-gen --state-dir "$WORK/state12" "$PREFIX" "$WORK/mnt" &
 MOUNT_PID=$!
 for _ in $(seq 200); do [ -e "$WORK/mnt/cmd-made.txt" ] && break; sleep 0.1; done

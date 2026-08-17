@@ -28,13 +28,26 @@ type countingStore struct {
 }
 
 func (c *countingStore) Get(ctx context.Context, key string, off, limit int64) (io.ReadCloser, error) {
-	if strings.HasPrefix(key, packstore.PackDirKey+"/") {
-		c.gets.Add(1)
-		if limit > 0 {
-			c.bytes.Add(limit)
-		}
+	rc, err := c.Store.Get(ctx, key, off, limit)
+	if err != nil || !strings.HasPrefix(key, packstore.PackDirKey+"/") {
+		return rc, err
 	}
-	return c.Store.Get(ctx, key, off, limit)
+	c.gets.Add(1)
+	// Counted as delivered rather than as requested: a whole-pack fetch
+	// asks for no limit at all, and that is the request whose size this
+	// test file most needs to see.
+	return &tallyReader{ReadCloser: rc, n: &c.bytes}, nil
+}
+
+type tallyReader struct {
+	io.ReadCloser
+	n *atomic.Int64
+}
+
+func (t *tallyReader) Read(p []byte) (int, error) {
+	got, err := t.ReadCloser.Read(p)
+	t.n.Add(int64(got))
+	return got, err
 }
 
 func (c *countingStore) since(n int64) int64 { return c.gets.Load() - n }
@@ -119,6 +132,19 @@ func chunkFiles(t *testing.T, cache string) int {
 	return len(entries)
 }
 
+// dropChunks empties the decoded-chunk cache, so a re-read has to go back
+// to whatever holds the stored bytes and prove where that was.
+func dropChunks(t *testing.T, cache string) {
+	t.Helper()
+	dir := filepath.Join(cache, "chunks")
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func cachedPacks(t *testing.T, cache string) []string {
 	t.Helper()
 	entries, err := os.ReadDir(filepath.Join(cache, "packs"))
@@ -147,6 +173,13 @@ func TestMultiChunkReadIsOneRequest(t *testing.T) {
 	// Whole-pack caching off, so this measures coalescing alone.
 	fs := f.open(t, genfs.Options{PackCacheBytes: -1})
 
+	// One throwaway pass, then drop the decoded chunks. The location layer
+	// is resolved lazily now, so the FIRST read of a pack also pays a
+	// trailer probe; counting that as a chunk read would measure the index,
+	// not the coalescing this test is about.
+	readFile(t, fs, "a.bin", 16<<20)
+	dropChunks(t, f.cache)
+
 	before := f.inner.gets.Load()
 	got := readFile(t, fs, "a.bin", 16<<20)
 	gets := f.inner.since(before)
@@ -169,6 +202,11 @@ func TestKernelSizedSequentialReadCostsOnePerChunk(t *testing.T) {
 	f := newPackFixture(t, "9ac0de01-0008-4002-8003-a0b0c0d0e0f0", 64<<20)
 	fs := f.open(t, genfs.Options{PackCacheBytes: -1})
 
+	// See TestMultiChunkReadIsOneRequest: the first pass resolves the
+	// location layer, the measured one reads chunks.
+	readFile(t, fs, "a.bin", 128<<10)
+	dropChunks(t, f.cache)
+
 	before := f.inner.gets.Load()
 	got := readFile(t, fs, "a.bin", 128<<10)
 	gets := f.inner.since(before)
@@ -183,17 +221,23 @@ func TestKernelSizedSequentialReadCostsOnePerChunk(t *testing.T) {
 	t.Logf("12 MiB in 128 KiB windows: %d pack reads for %d chunks", gets, chunks)
 }
 
-// The reverse of the above, and the case an aggressive whole-pack policy
-// would ruin: one small read must not drag a whole pack down.
-func TestScatteredReadDoesNotFetchWholePacks(t *testing.T) {
-	f := newPackFixture(t, "9ac0de01-0002-4002-8003-a0b0c0d0e0f0", 64<<20)
+// The policy, stated as a test: the FIRST read of a pack fetches it whole.
+// No evidence is gathered and none is waited for, so what one small read
+// costs is a property of the generation — the publisher's cut size — and
+// not of what this mount happened to read earlier.
+//
+// The scattered case is where that is at its most expensive, which is
+// exactly why it is worth pinning: three reads in three different files
+// pull three packs and nothing else, and pulling them is bounded, not
+// open-ended.
+func TestScatteredReadFetchesEachPackWholeAndOnce(t *testing.T) {
+	const target = 4 << 20
+	f := newPackFixture(t, "9ac0de01-0002-4002-8003-a0b0c0d0e0f0", target)
 	fs := f.open(t, genfs.Options{})
 	ctx := context.Background()
 
 	before := f.inner.gets.Load()
-	var beforeBytes = f.inner.bytes.Load()
-	// A few kilobytes out of the middle of each big file: the interactive
-	// shape, and nowhere near a quarter of any pack.
+	beforeBytes := f.inner.bytes.Load()
 	for _, name := range []string{"a.bin", "b.bin", "c.bin"} {
 		n, err := fs.Lookup(ctx, rootIno, name)
 		if err != nil {
@@ -207,57 +251,70 @@ func TestScatteredReadDoesNotFetchWholePacks(t *testing.T) {
 			t.Errorf("%s: scattered read returned the wrong bytes", name)
 		}
 	}
-	if packs := cachedPacks(t, f.cache); len(packs) != 0 {
-		t.Errorf("scattered reads pulled whole packs down: %v", packs)
+	packs := cachedPacks(t, f.cache)
+	if len(packs) == 0 {
+		t.Fatal("three scattered reads cached no pack at all")
 	}
-	t.Logf("3 scattered 4 KiB reads: %d pack reads, %d bytes",
-		f.inner.since(before), f.inner.bytes.Load()-beforeBytes)
+	// Three files' chunks, plus the pack holding the catalog they were
+	// looked up through. Anything beyond that is a pack nobody asked for.
+	if len(packs) > 4 {
+		t.Errorf("three scattered reads pulled %d packs: %v", len(packs), packs)
+	}
+	t.Logf("3 scattered 4 KiB reads at a %d MiB cut size: %d pack request(s), %d bytes, %d pack(s) cached",
+		target>>20, f.inner.since(before), f.inner.bytes.Load()-beforeBytes, len(packs))
+
+	// A second read in the same files must not go out again: the pack it
+	// needs is already whole on disk, decoded chunks or not.
+	dropChunks(t, f.cache)
+	before = f.inner.gets.Load()
+	for _, name := range []string{"a.bin", "b.bin", "c.bin"} {
+		n, err := fs.Lookup(ctx, rootIno, name)
+		if err != nil {
+			t.Fatalf("lookup %s: %v", name, err)
+		}
+		buf := make([]byte, 4096)
+		if _, err := fs.Read(ctx, n.Inode, n.Length/2, buf); err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+	}
+	if again := f.inner.since(before); again != 0 {
+		t.Errorf("re-reading out of packs already on disk made %d federation request(s)", again)
+	}
 }
 
 // Walking a directory of one-chunk files is the case coalescing cannot
-// help with: each file is one entry and one round trip. Once enough of a
-// pack's entries have been pulled that way, the rest is worth a single
-// transfer — and from then on the reads are local.
-func TestManySmallReadsPromoteWholePack(t *testing.T) {
-	f := newPackFixture(t, "9ac0de01-0003-4002-8003-a0b0c0d0e0f0", 64<<20)
+// help with: each file is one entry, and under a ranged-read policy one
+// round trip apiece. Fetching the pack whole collapses the whole directory
+// into one transfer, from the first file rather than from the sixteenth.
+func TestManySmallReadsCostOneTransfer(t *testing.T) {
+	f := newPackFixture(t, "9ac0de01-0003-4002-8003-a0b0c0d0e0f0", 4<<20)
 	fs := f.open(t, genfs.Options{})
 
-	var promotedAfter int
-	for i := 0; i < smallFiles; i++ {
+	// The first small file must already have pulled its pack; nothing is
+	// waiting for a case to be made.
+	name := fmt.Sprintf("s%03d.c", 0)
+	if got := readFile(t, fs, name, 1<<20); !bytes.Equal(got, f.body[name]) {
+		t.Fatalf("%s did not read back byte-exact", name)
+	}
+	if len(cachedPacks(t, f.cache)) == 0 {
+		t.Fatal("the first read of a pack did not fetch it whole")
+	}
+
+	before := f.inner.gets.Load()
+	for i := 1; i < smallFiles; i++ {
 		name := fmt.Sprintf("s%03d.c", i)
 		if got := readFile(t, fs, name, 1<<20); !bytes.Equal(got, f.body[name]) {
 			t.Fatalf("%s did not read back byte-exact", name)
 		}
-		if promotedAfter == 0 && len(cachedPacks(t, f.cache)) > 0 {
-			promotedAfter = i + 1
-		}
 	}
-	if promotedAfter == 0 {
-		t.Fatalf("reading %d one-chunk files promoted no pack", smallFiles)
-	}
-	demand := f.inner.gets.Load()
-	t.Logf("whole pack promoted after %d of %d small files; %d pack reads total",
-		promotedAfter, smallFiles, demand)
-
-	// Everything the cached pack holds now comes off local disk. Dropping
-	// the decoded chunks forces the refill to prove where it came from.
-	if err := os.RemoveAll(filepath.Join(f.cache, "chunks")); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Join(f.cache, "chunks"), 0700); err != nil {
-		t.Fatal(err)
-	}
-	before := f.inner.gets.Load()
-	for i := 0; i < smallFiles; i++ {
-		name := fmt.Sprintf("s%03d.c", i)
-		if got := readFile(t, fs, name, 1<<20); !bytes.Equal(got, f.body[name]) {
-			t.Fatalf("%s did not read back byte-exact from the pack cache", name)
-		}
-	}
-	replay := f.inner.since(before)
-	t.Logf("re-reading all %d with a cold chunk cache: %d pack reads", smallFiles, replay)
-	if replay >= demand {
-		t.Errorf("replay took %d pack reads, no better than the %d the first pass cost", replay, demand)
+	rest := f.inner.since(before)
+	t.Logf("first small file pulled its pack; the other %d cost %d request(s) across %d cached pack(s)",
+		smallFiles-1, rest, len(cachedPacks(t, f.cache)))
+	// Far fewer requests than files: whatever is left is the packs the
+	// directory spills into, not one round trip per file.
+	if rest >= int64(smallFiles-1) {
+		t.Errorf("%d requests for %d small files: the directory is not being served from whole packs",
+			rest, smallFiles-1)
 	}
 }
 

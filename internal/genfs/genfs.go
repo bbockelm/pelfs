@@ -30,8 +30,6 @@ import (
 	"strings"
 	"sync"
 
-	"lukechampine.com/blake3"
-
 	"github.com/bbockelm/pelfs/internal/catalog"
 	"github.com/bbockelm/pelfs/internal/chunkid"
 	"github.com/bbockelm/pelfs/internal/entrycodec"
@@ -86,7 +84,8 @@ type Options struct {
 	// PackCacheBytes bounds the whole-pack cache under CacheDir; zero
 	// selects DefaultPackCacheBytes. A NEGATIVE value disables whole-pack
 	// caching entirely, leaving reads on coalesced ranges — the right
-	// setting where local space is scarcer than bandwidth.
+	// setting where local space is scarcer than bandwidth, and the only
+	// configuration in which a pack is read in pieces at all.
 	PackCacheBytes int64
 }
 
@@ -112,9 +111,8 @@ type DirEntry struct {
 	Node Node
 }
 
-// packLoc locates one pack entry: the identity index built at Open from the
-// generation's pack trailers (the location layer; identity lives in
-// catalogs).
+// packLoc locates one pack entry — which pack, and where inside it. It is
+// the location layer; identity lives in catalogs.
 type packLoc struct {
 	pack   string
 	off    int64
@@ -158,19 +156,12 @@ type FS struct {
 	verify bool
 	hasher chunkid.Hasher
 
-	packIndex map[string]packLoc
-	// packSize is the SIGNED length of each listed pack — the only
-	// whole-object check a cached copy can be held to. packEntries counts
-	// what each holds, which is how the whole-pack policy tells "many
-	// small files" from "a few large chunks" (packfetch.go).
-	packSize    map[string]int64
-	packEntries map[string]int
+	// packIndex resolves entry identities to (pack, offset, length),
+	// filling itself from pack trailers on demand (packindex.go).
+	packIndex *packIndex
 
-	// packCacheCap bounds the whole-pack cache; packUses is the piecemeal
-	// consumption evidence that promotes a pack into it (packfetch.go).
+	// packCacheCap bounds the whole-pack cache (packfetch.go).
 	packCacheCap int64
-	packMu       sync.Mutex
-	packUses     map[string]*packUse
 	evictMu      sync.Mutex
 
 	cats *catCache
@@ -204,9 +195,13 @@ type FS struct {
 	fills  map[string]*fillGate
 }
 
-// Open builds the identity index from the generation's pack trailers,
-// fetches and pins the root catalog, and returns a ready filesystem. A
+// Open fetches and pins the root catalog and returns a ready filesystem. A
 // wrong DEK fails here, at the root catalog's GCM open.
+//
+// That is the whole of a cold mount: locate the root catalog and read it.
+// The location layer fills in behind the reads that need it (packindex.go),
+// so mounting costs what the first question costs, not what the generation
+// is made of.
 func Open(ctx context.Context, o Options) (*FS, error) {
 	if o.Inner == nil || o.SB == nil {
 		return nil, errors.New("genfs: Inner and SB are required")
@@ -244,22 +239,16 @@ func Open(ctx context.Context, o Options) (*FS, error) {
 		catDir:       catDir,
 		packDir:      packDir,
 		trailerDir:   trailerDir,
-		packIndex:    make(map[string]packLoc),
-		packSize:     make(map[string]int64),
-		packEntries:  make(map[string]int),
 		packCacheCap: o.PackCacheBytes,
-		packUses:     make(map[string]*packUse),
 		ext:          newExtentCache(extentCacheCap),
 		res:          make(map[uint64]*residency),
 		resLRU:       list.New(),
 		maxResident:  o.MaxResident,
 		fills:        make(map[string]*fillGate),
 	}
+	fs.packIndex = newPackIndex(fs, o.SB.PackList)
 	if o.PackCacheBytes > 0 {
 		fs.sweepPackTmp()
-	}
-	if err := fs.buildPackIndex(ctx, o.SB.PackList); err != nil {
-		return nil, err
 	}
 
 	rootHex := hex.EncodeToString(o.SB.RootCatalog[:])
@@ -295,76 +284,6 @@ func Open(ctx context.Context, o Options) (*FS, error) {
 	}
 	fs.cats = newCatCache(fs, o.MaxOpenCatalogs, rootHex, root)
 	return fs, nil
-}
-
-// indexWorkers bounds concurrent trailer fetches at Open. A generation of
-// any size has one pack per 64 MiB, and the mount cannot serve a byte
-// until every one of them is indexed — which was one serial round trip
-// each.
-const indexWorkers = 8
-
-// buildPackIndex builds the identity index from every trailer in the
-// generation's pack list. No trailer's entries are trusted until the
-// stored bytes hash to the value the SIGNED pack list records; identical
-// content dedups at publish, so duplicate keys across packs reference the
-// same bytes and last writer wins harmlessly — the merge below stays in
-// pack-list order so which one that is does not depend on scheduling.
-//
-// Two things make this cheap that were not: trailers are fetched
-// CONCURRENTLY, since the packs are independent, and each one is kept
-// locally, since a pack is immutable and the hash that authenticates its
-// trailer is in the superblock. A remount of a volume it has seen before
-// therefore issues no requests here at all.
-func (fs *FS) buildPackIndex(ctx context.Context, packs []superblock.PackEntry) error {
-	results := make([][]packstore.PackEntry, len(packs))
-	errs := make([]error, len(packs))
-	sem := make(chan struct{}, indexWorkers)
-	var wg sync.WaitGroup
-	for i, pe := range packs {
-		wg.Add(1)
-		go func(i int, pe superblock.PackEntry) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			results[i], errs[i] = fs.trailerEntries(ctx, pe)
-		}(i, pe)
-	}
-	wg.Wait()
-	for i, pe := range packs {
-		if errs[i] != nil {
-			return fmt.Errorf("genfs: index pack %s: %w", pe.Name, errs[i])
-		}
-		fs.packSize[pe.Name] = pe.Size
-		fs.packEntries[pe.Name] = len(results[i])
-		for _, e := range results[i] {
-			fs.packIndex[e.Key] = packLoc{pack: pe.Name, off: e.Off, length: e.Length}
-		}
-	}
-	return nil
-}
-
-// trailerEntries returns one pack's entries, from the local copy when
-// there is one and the federation otherwise. The local copy is held to
-// exactly the standard a fetched one is — its bytes must hash to the
-// signed TrailerHash — so a corrupt or truncated file is not a hazard,
-// just a wasted read that falls through to the network.
-func (fs *FS) trailerEntries(ctx context.Context, pe superblock.PackEntry) ([]packstore.PackEntry, error) {
-	fp := filepath.Join(fs.trailerDir, pe.Name)
-	if stored, err := os.ReadFile(fp); err == nil {
-		if blake3.Sum256(stored) == pe.TrailerHash {
-			if entries, err := packstore.ParseStoredTrailer(stored); err == nil {
-				return entries, nil
-			}
-		}
-		os.Remove(fp) //nolint:errcheck
-	}
-	entries, stored, err := packstore.FetchTrailerStoredVerified(ctx, fs.inner, pe.Name, pe.Size, pe.TrailerHash)
-	if err != nil {
-		return nil, err
-	}
-	// Best effort: a mount that cannot write its cache still mounts.
-	_ = writeAtomic(fp, stored)
-	return entries, nil
 }
 
 // Close releases every open catalog handle. Spill and chunk cache files
@@ -946,9 +865,19 @@ func (fs *FS) catalogDEK() []byte {
 }
 
 // spillCatalog materializes a catalog/shard's decoded SQLite bytes under
-// CacheDir and returns the file path. Existing spill files are reused
-// (they were verified when written).
+// CacheDir and returns the file path, resolving it through the served
+// generation's location layer.
 func (fs *FS) spillCatalog(ctx context.Context, idHex string) (string, error) {
+	return fs.spillCatalogFrom(ctx, fs.packIndex, fs.catalogDEK(), idHex)
+}
+
+// spillCatalogFrom is spillCatalog against a stated generation's location
+// layer and catalog key rather than the served one. A swap uses it to prove
+// the incoming generation's root catalog resolves, decodes, and verifies
+// BEFORE anything served is replaced — the alternative is discovering it
+// afterwards, with a mount already pointed at a generation it cannot read.
+// Existing spill files are reused (they were verified when written).
+func (fs *FS) spillCatalogFrom(ctx context.Context, idx *packIndex, dek []byte, idHex string) (string, error) {
 	fp := filepath.Join(fs.catDir, idHex+".db")
 	if _, err := os.Stat(fp); err == nil {
 		return fp, nil
@@ -958,15 +887,15 @@ func (fs *FS) spillCatalog(ctx context.Context, idHex string) (string, error) {
 	if _, err := os.Stat(fp); err == nil {
 		return fp, nil
 	}
-	loc, ok := fs.packIndex[idHex]
-	if !ok {
-		return "", fmt.Errorf("genfs: catalog %s not present in any listed pack", idHex)
+	loc, err := idx.locate(ctx, idHex)
+	if err != nil {
+		return "", fmt.Errorf("genfs: catalog %s: %w", idHex, err)
 	}
-	stored, err := fs.packRead(ctx, idHex, loc)
+	stored, err := fs.packRead(ctx, idx, idHex, loc)
 	if err != nil {
 		return "", err
 	}
-	plain, err := entrycodec.Decode(stored, entrycodec.AlgZstd, fs.catalogDEK())
+	plain, err := entrycodec.Decode(stored, entrycodec.AlgZstd, dek)
 	if err != nil {
 		return "", fmt.Errorf("genfs: decode catalog %s: %w", idHex, err)
 	}

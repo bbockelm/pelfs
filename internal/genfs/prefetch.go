@@ -44,6 +44,17 @@ func (fs *FS) Prefetch(ctx context.Context, workers int) (*PrefetchReport, error
 	if workers <= 0 {
 		workers = 8
 	}
+	// Prefetch is one of the callers that must ask for the WHOLE location
+	// map. A read fills it in as it goes, one pack at a time; a pass that
+	// intends to make the entire generation local would then discover each
+	// pack serially, in whatever order the walk happened to reach it.
+	if err := func() error {
+		fs.swapMu.RLock()
+		defer fs.swapMu.RUnlock()
+		return fs.packIndex.all(ctx)
+	}(); err != nil {
+		return nil, err
+	}
 	rep := &PrefetchReport{}
 	var mu sync.Mutex
 
@@ -122,13 +133,12 @@ func (fs *FS) Prefetch(ctx context.Context, workers int) (*PrefetchReport, error
 		missing = append(missing, *j.ref)
 	}
 
-	// One bulk fill for the whole generation. Prefetch is the caller that
-	// has already declared it wants every byte, so it is exactly the case
-	// where fetching packs whole beats thousands of small ranged reads.
+	// One bulk fill for the whole generation, which under the whole-pack
+	// policy is one transfer per pack the tree actually references.
 	func() {
 		fs.swapMu.RLock()
 		defer fs.swapMu.RUnlock()
-		fs.fillChunks(ctx, missing, true)
+		fs.fillChunks(ctx, missing)
 	}()
 
 	work := make(chan job)

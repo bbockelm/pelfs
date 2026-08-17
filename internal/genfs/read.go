@@ -141,11 +141,21 @@ type Content struct {
 //
 // Every non-hole identity is checked against this generation's pack index
 // before it is handed out, so a caller carrying these records into a new
-// generation can only carry records some listed pack actually holds. The
-// check is a map lookup — no transfers, which is the entire point.
+// generation can only carry records some listed pack actually holds.
+//
+// That check is why this is one of the few callers that asks for the WHOLE
+// location map. A read only ever needs to find the pack it is about to
+// fetch, so the map fills in lazily; a check for ABSENCE needs every pack
+// indexed, or it would report content missing that has merely not been
+// probed for — and the caller's response to "missing" is to re-upload a
+// file it already has, or to refuse the seal. The map is built once per
+// mount and the trailers are cached across mounts, so a seal pays it once.
 func (fs *FS) ContentOf(ctx context.Context, ino uint64) (Content, error) {
 	fs.swapMu.RLock()
 	defer fs.swapMu.RUnlock()
+	if err := fs.packIndex.all(ctx); err != nil {
+		return Content{}, err
+	}
 	e, err := fs.extentsOf(ctx, ino)
 	if err != nil {
 		return Content{}, err
@@ -165,7 +175,7 @@ func (fs *FS) ContentOf(ctx context.Context, ino uint64) (Content, error) {
 		r := e.refs[i]
 		if r.Identity != nil {
 			idHex := hex.EncodeToString(r.Identity)
-			if _, ok := fs.packIndex[idHex]; !ok {
+			if _, ok := fs.packIndex.lookup(idHex); !ok {
 				return Content{}, fmt.Errorf("genfs: inode %d references chunk %s, present in no listed pack", ino, idHex)
 			}
 			r.Identity = append([]byte(nil), r.Identity...)
@@ -205,7 +215,7 @@ func (fs *FS) Read(ctx context.Context, ino uint64, off int64, dst []byte) (int,
 	// chunks of one file are laid out adjacently in their pack, so the
 	// whole span is usually one request.
 	if need := overlapping(e.refs, off, off+n); len(need) > 1 {
-		fs.fillChunks(ctx, need, false)
+		fs.fillChunks(ctx, need)
 	}
 	for i := range e.refs {
 		r := &e.refs[i]
@@ -256,11 +266,11 @@ func (fs *FS) readChunkAt(ctx context.Context, r *catalog.ChunkRef, chunkOff int
 	if readAtFile(fp, chunkOff, window) {
 		return nil
 	}
-	loc, ok := fs.packIndex[idHex]
-	if !ok {
-		return fmt.Errorf("genfs: chunk %s not present in any listed pack", idHex)
+	loc, err := fs.packIndex.locate(ctx, idHex)
+	if err != nil {
+		return fmt.Errorf("genfs: chunk %s: %w", idHex, err)
 	}
-	stored, err := fs.packRead(ctx, idHex, loc)
+	stored, err := fs.packRead(ctx, fs.packIndex, idHex, loc)
 	if err != nil {
 		return err
 	}

@@ -15,8 +15,8 @@ import (
 	"github.com/bbockelm/pelfs/internal/publish"
 )
 
-// packGetStore counts pack range reads, which is what a mount pays before
-// it can serve anything: one per pack in the generation's pack list.
+// packGetStore counts requests against pack objects, which is what a mount
+// pays before it can serve anything.
 type packGetStore struct {
 	pelicanobj.Store
 	gets atomic.Int64
@@ -29,10 +29,42 @@ func (p *packGetStore) Get(ctx context.Context, key string, off, limit int64) (i
 	return p.Store.Get(ctx, key, off, limit)
 }
 
-// A mount indexes every pack trailer in the generation before it serves a
-// byte. Packs are immutable and the superblock signs each trailer's hash,
-// so the second mount of a generation must not go back to the federation
-// for any of it — that cost was being paid on every single mount.
+// A cold mount must not index the generation. Serving the first question
+// takes the root catalog and the pack that holds it; the trailers of every
+// other pack answer questions nobody has asked, and there is one of them
+// per cut size however large the volume grows.
+func TestColdMountDoesNotIndexEveryPack(t *testing.T) {
+	ctx := context.Background()
+	base, _ := newInner(t)
+	inner := &packGetStore{Store: base}
+	v := newTestVolume(t, inner, "9efe7c40-0000-4000-8000-0000000000a3")
+	dir := v.Mkdir(1, "d")
+	for i := 0; i < 12; i++ {
+		f := v.Create(dir, string(rune('a'+i))+".bin")
+		v.Write(f, pseudorandom(600<<10, int64(i)+1))
+	}
+	res := publishVolume(t, v, inner, publish.Options{TargetPackSize: 512 << 10})
+	packs := len(res.Superblock.PackList)
+	if packs < 8 {
+		t.Fatalf("volume has %d packs; the test needs many", packs)
+	}
+
+	fs := openFS(t, inner, res.Superblock, genfs.Options{CacheDir: t.TempDir()})
+	if _, err := fs.Readdir(ctx, 1); err != nil {
+		t.Fatalf("root readdir: %v", err)
+	}
+	got := inner.gets.Load()
+	t.Logf("cold mount over %d packs: %d pack request(s) to first readdir", packs, got)
+	if got >= int64(packs) {
+		t.Errorf("mounting a %d-pack generation cost %d pack request(s): the index is still being built up front",
+			packs, got)
+	}
+}
+
+// Packs are immutable and the superblock signs each trailer's hash, so a
+// trailer this mount has already authenticated is the same bytes forever.
+// The second mount of a generation must not go back to the federation for
+// anything it resolved in the first.
 func TestPackIndexReusesCachedTrailers(t *testing.T) {
 	ctx := context.Background()
 	base, _ := newInner(t)
@@ -78,7 +110,8 @@ func TestPackIndexReusesCachedTrailers(t *testing.T) {
 	}
 }
 
-// A damaged local trailer must cost a round trip, never a mount.
+// A damaged local trailer must cost a round trip, never a mount — and it
+// must not survive being consulted, or every mount would re-reject it.
 func TestPackIndexFallsBackOnCorruptCachedTrailer(t *testing.T) {
 	ctx := context.Background()
 	base, _ := newInner(t)
@@ -90,6 +123,11 @@ func TestPackIndexFallsBackOnCorruptCachedTrailer(t *testing.T) {
 
 	cache := t.TempDir()
 	fs := openFS(t, inner, res.Superblock, genfs.Options{CacheDir: cache})
+	// Prefetch asks for the whole location map, so every pack's trailer is
+	// on disk to be corrupted.
+	if _, err := fs.Prefetch(ctx, 2); err != nil {
+		t.Fatalf("Prefetch: %v", err)
+	}
 	_ = fs.Close()
 
 	trailers, err := os.ReadDir(filepath.Join(cache, "trailers"))
@@ -106,11 +144,81 @@ func TestPackIndexFallsBackOnCorruptCachedTrailer(t *testing.T) {
 	if _, err := fs2.LookupPath(ctx, "one.bin"); err != nil {
 		t.Fatalf("mount over corrupt cached trailers: %v", err)
 	}
-	// And the bad copy is gone, not re-read forever.
+	if _, err := fs2.Prefetch(ctx, 2); err != nil {
+		t.Fatalf("Prefetch over corrupt cached trailers: %v", err)
+	}
+	// And the bad copies are gone, not re-read forever.
 	for _, e := range trailers {
 		b, err := os.ReadFile(filepath.Join(cache, "trailers", e.Name()))
 		if err == nil && string(b) == "not a trailer" {
 			t.Errorf("the corrupt trailer for %s survived the mount that rejected it", e.Name())
 		}
+	}
+}
+
+// A trailer read out of a locally cached pack has to clear the same bar a
+// fetched one does. The pack is a file in a cache directory: it can be
+// truncated, swapped, or scribbled on, and a location map built from it
+// would send every read to an arbitrary offset in an arbitrary object.
+func TestTrailerFromCachedPackIsVerified(t *testing.T) {
+	ctx := context.Background()
+	base, volDir := newInner(t)
+	inner := &packGetStore{Store: base}
+	v := newTestVolume(t, inner, "9efe7c40-0000-4000-8000-0000000000a4")
+	dir := v.Mkdir(1, "d")
+	for i := 0; i < 6; i++ {
+		f := v.Create(dir, string(rune('a'+i))+".bin")
+		v.Write(f, pseudorandom(600<<10, int64(i)+1))
+	}
+	res := publishVolume(t, v, inner, publish.Options{TargetPackSize: 512 << 10})
+
+	cache := t.TempDir()
+	fs := openFS(t, inner, res.Superblock, genfs.Options{CacheDir: cache})
+	if _, err := fs.Prefetch(ctx, 2); err != nil {
+		t.Fatalf("Prefetch: %v", err)
+	}
+	_ = fs.Close()
+
+	// Throw away the saved trailers so the next mount has to read them out
+	// of the cached packs, then corrupt the packs' trailer regions.
+	if err := os.RemoveAll(filepath.Join(cache, "trailers")); err != nil {
+		t.Fatal(err)
+	}
+	packs := cachedPacks(t, cache)
+	if len(packs) == 0 {
+		t.Fatal("prefetch cached no packs")
+	}
+	for _, name := range packs {
+		fp := filepath.Join(cache, "packs", name)
+		fi, err := os.Stat(fp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pf, err := os.OpenFile(fp, os.O_WRONLY, 0600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Inside the trailer, past the footer: the length and magic still
+		// parse, so nothing but the hash check can catch this.
+		if _, err := pf.WriteAt([]byte("wrongwrongwrong!"), fi.Size()-64); err != nil {
+			t.Fatal(err)
+		}
+		_ = pf.Close()
+	}
+	if err := os.RemoveAll(filepath.Join(cache, "chunks")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(cache, "catalogs")); err != nil {
+		t.Fatal(err)
+	}
+	_ = volDir
+
+	fs2 := openFS(t, inner, res.Superblock, genfs.Options{CacheDir: cache})
+	n, err := fs2.LookupPath(ctx, "d/a.bin")
+	if err != nil {
+		t.Fatalf("mount over packs with corrupt trailers: %v", err)
+	}
+	if got := readAll(t, fs2, n.Inode, int(n.Length), 64<<10); len(got) != int(n.Length) {
+		t.Fatalf("read %d bytes of a %d-byte file", len(got), n.Length)
 	}
 }

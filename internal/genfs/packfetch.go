@@ -16,51 +16,46 @@ import (
 	"github.com/bbockelm/pelfs/internal/packstore"
 )
 
-// Bulk chunk fetching.
+// Pack fetching: a pack is fetched WHOLE, or not at all.
 //
 // A chunk read used to be exactly one ranged GET. Measured on a real
 // federation session: 429 MB across 40,029 requests, about 10.7 KB each —
 // one full round trip per CDC chunk. Bandwidth was never the constraint;
 // latency was, one chunk at a time.
 //
-// Three mechanisms address that, in increasing order of aggression, and
-// the order matters because the last one can LOSE:
+// The policy that replaced it fetched packs whole only after gathering
+// evidence that a reader was consuming one — a byte ratio, an entry ratio,
+// a floor on distinct entries, and a bound on how far ahead of the reader
+// it was allowed to speculate. It worked, and it was unpredictable: the
+// same read cost a kilobyte or sixty-four megabytes depending on what the
+// mount happened to have asked for earlier. Tuning it meant tuning four
+// constants against a workload nobody can name in advance.
 //
-//  1. COALESCE. The chunks one read needs from a pack are usually
-//     adjacent — publish appends a file's chunks in order — and the pack
-//     trailer gives every entry's offset and length up front, so the
-//     spans are known before the first request instead of discovered one
-//     at a time. Swallowing a little unwanted payload to avoid a round
-//     trip is a good trade at any realistic bandwidth-delay product.
-//  2. PARALLELIZE. Spans are independent. A bounded pool keeps several in
-//     flight without turning one reader into a bandwidth stampede that
-//     starves the user I/O the same mount is serving.
-//  3. WHOLE PACK. Packs are immutable and content-addressed, which makes
-//     them ideal cache units — but fetching 64 MB to serve one 10 KB read
-//     is a serious regression for a mount doing scattered reads over a
-//     large volume, and that is the common interactive case. So it is
-//     never speculative: it waits for EVIDENCE, or for a bulk consumer's
-//     explicit declaration (Prefetch is asking for the whole generation by
-//     definition).
+// The unit of transfer is now the unit of storage instead. A pack is
+// immutable and content-addressed, so it is the natural cache object; the
+// cost of pulling one is bounded by the PUBLISHER's cut size, which is a
+// number a volume owner can actually choose, rather than by a heuristic a
+// reader has to get right. Granularity is a publish-side question:
+// scattered readers want small packs, and the transfer policy no longer
+// has an opinion about it.
 //
-// Coalescing alone does not cover the workload that produced those
-// numbers, and it is worth being precise about why. The chunker averages
-// 4 MiB, so a big file is a handful of chunks — but any file between the
-// inline threshold and the minimum chunk size is exactly ONE chunk, and a
-// source tree is tens of thousands of those. There is nothing to coalesce
-// within one file's read; the locality is ACROSS files, which arrive as
-// separate reads. Whole-pack caching is what captures it, because publish
-// lays a directory's files out next to each other in the same pack.
+// What survives from the old mechanism, and why:
 //
-// Integrity is unchanged by any of it. A cached pack is not trusted as a
-// unit: only its LENGTH is checked against the signed pack list, and every
-// entry taken out of it is decoded and verified exactly as one arriving
-// from a ranged read is. Nor may a cache problem become a read failure —
-// every path here falls back to the federation.
+//   - COALESCE and PARALLELIZE are still here, but only for the mount that
+//     has switched whole-pack caching OFF (PackCacheBytes negative — less
+//     disk than bandwidth) and for the fallback when a download fails.
+//     Neither may become a read error.
+//   - The pack cache is still bounded and still evicts, because a large
+//     volume does not fit on a client.
+//
+// Integrity is unchanged. A cached pack is not trusted as a unit: only its
+// LENGTH is checked against the signed pack list, and every entry taken out
+// of it — data chunk, catalog, or trailer — is verified exactly as one
+// arriving from a ranged read is.
 
 const (
 	// maxCoalesceGap is how much unwanted payload is worth reading to
-	// avoid a second round trip.
+	// avoid a second round trip, on the ranged-read path.
 	maxCoalesceGap = 1 << 20
 	// maxSpanBytes bounds one coalesced request, so a single reader
 	// neither buffers hundreds of megabytes nor holds a worker for the
@@ -69,37 +64,10 @@ const (
 	// fetchWorkers bounds concurrent range reads within one fill.
 	fetchWorkers = 8
 
-	// The whole-pack promotion policy. A pack is worth fetching whole once
-	// a reader has demonstrably started consuming it, by either measure:
-	//
-	//   - BYTES: a quarter of the pack already pulled piecemeal. This is
-	//     the multi-megabyte-chunk case, where a few requests already
-	//     represent most of the pack.
-	//   - ENTRIES: a sixteenth of the pack's entries already fetched, with
-	//     an absolute floor. This is the many-small-files case, where the
-	//     bytes stay small no matter how many round trips are spent.
-	//
-	// The entry rule is the aggressive one, so it carries a bound on how
-	// wrong it can be: the remaining bytes may not exceed
-	// maxSpeculationRatio times what the reader has already committed to
-	// this pack. A user who opens a dozen scattered small files therefore
-	// pays nothing extra — the ratio guard refuses — while a walk through
-	// a directory converges on one transfer.
-	packPromoteBytesNumer = 1
-	packPromoteBytesDenom = 4
-	packPromoteEntryNumer = 1
-	packPromoteEntryDenom = 16
-	minPromoteEntries     = 16
-	maxSpeculationRatio   = 32
-	// bulkPackNumer/bulkPackDenom is the test for a caller that has
-	// declared bulk intent: it already knows what it needs, so the only
-	// question is whether one transfer beats several.
-	bulkPackNumer = 1
-	bulkPackDenom = 2
-
-	// maxWholePackBytes refuses whole-pack caching for packs far larger
-	// than the 64 MiB publish target: an outsized pack is one long
-	// transfer that would stall everything behind it.
+	// maxWholePackBytes refuses whole-pack caching for an outsized pack:
+	// one long transfer that would stall every read queued behind it. A
+	// publisher cutting at a sane size never reaches it; a generation
+	// carrying one enormous entry does, and falls back to ranged reads.
 	maxWholePackBytes = 256 << 20
 
 	// DefaultPackCacheBytes bounds the whole-pack cache on disk. Packs are
@@ -141,44 +109,6 @@ func (fs *FS) sweepPackTmp() {
 	}
 }
 
-// packUse is the per-pack evidence whole-pack caching waits for: how many
-// stored bytes this mount has pulled out of the pack in pieces. Entries
-// are counted once, so re-reading a chunk the cache dropped does not
-// inflate the case for downloading the pack.
-type packUse struct {
-	fetched int64
-	counted map[string]struct{}
-}
-
-// notePackFetch records that entries were pulled out of pack piecemeal.
-func (fs *FS) notePackFetch(pack string, keys []string, lengths []int64) {
-	fs.packMu.Lock()
-	defer fs.packMu.Unlock()
-	u := fs.packUses[pack]
-	if u == nil {
-		u = &packUse{counted: make(map[string]struct{})}
-		fs.packUses[pack] = u
-	}
-	for i, k := range keys {
-		if _, dup := u.counted[k]; dup {
-			continue
-		}
-		u.counted[k] = struct{}{}
-		u.fetched += lengths[i]
-	}
-}
-
-// packConsumed reports the bytes and the distinct entries this mount has
-// pulled out of the pack one range at a time.
-func (fs *FS) packConsumed(pack string) (bytes int64, entries int) {
-	fs.packMu.Lock()
-	defer fs.packMu.Unlock()
-	if u := fs.packUses[pack]; u != nil {
-		return u.fetched, len(u.counted)
-	}
-	return 0, 0
-}
-
 // pendingChunk is one chunk a fill has to produce.
 type pendingChunk struct {
 	id  string
@@ -200,14 +130,12 @@ func (fs *FS) chunkResident(idHex string, llen int64) bool {
 }
 
 // fillChunks brings every missing chunk in refs into the decoded cache,
-// batched by pack. bulk declares that the caller wants all of this content
-// regardless of what it reads next, which lowers the bar for fetching a
-// pack whole.
+// batched by pack.
 //
 // Best effort by contract: anything it fails to produce is left to the
 // ordinary single-chunk path, which owns the error and the diagnostics.
 // Callers hold swapMu.
-func (fs *FS) fillChunks(ctx context.Context, refs []catalog.ChunkRef, bulk bool) {
+func (fs *FS) fillChunks(ctx context.Context, refs []catalog.ChunkRef) {
 	seen := make(map[string]struct{}, len(refs))
 	byPack := make(map[string][]pendingChunk)
 	for i := range refs {
@@ -223,8 +151,8 @@ func (fs *FS) fillChunks(ctx context.Context, refs []catalog.ChunkRef, bulk bool
 		if fs.chunkResident(id, r.LLen) {
 			continue
 		}
-		loc, ok := fs.packIndex[id]
-		if !ok {
+		loc, err := fs.packIndex.locate(ctx, id)
+		if err != nil {
 			continue // reported by the single-chunk path, in context
 		}
 		byPack[loc.pack] = append(byPack[loc.pack], pendingChunk{id: id, ref: r, loc: loc})
@@ -242,9 +170,9 @@ func (fs *FS) fillChunks(ctx context.Context, refs []catalog.ChunkRef, bulk bool
 	for _, pack := range packs {
 		want := byPack[pack]
 		sort.Slice(want, func(i, j int) bool { return want[i].loc.off < want[j].loc.off })
-		if fs.wholePackWanted(pack, neededBytes(want), len(want), bulk) {
+		if fs.wholePackWanted(fs.packIndex, pack) {
 			pack, want := pack, want
-			tasks = append(tasks, func() { fs.fillWholePack(ctx, pack, want) })
+			tasks = append(tasks, func() { fs.fillWholePack(ctx, fs.packIndex, pack, want) })
 			continue
 		}
 		for _, sp := range coalesce(want) {
@@ -253,14 +181,6 @@ func (fs *FS) fillChunks(ctx context.Context, refs []catalog.ChunkRef, bulk bool
 		}
 	}
 	runBounded(ctx, tasks, fetchWorkers)
-}
-
-func neededBytes(want []pendingChunk) int64 {
-	var n int64
-	for _, w := range want {
-		n += w.loc.length
-	}
-	return n
 }
 
 // coalesce merges offset-sorted entries into as few ranges as the gap and
@@ -289,22 +209,17 @@ func (fs *FS) fillSpan(ctx context.Context, pack string, sp span) {
 	if err != nil {
 		return
 	}
-	keys := make([]string, 0, len(sp.entries))
-	lengths := make([]int64, 0, len(sp.entries))
 	for _, w := range sp.entries {
 		lo := w.loc.off - sp.off
 		fs.storeChunk(w.id, &w.ref, buf[lo:lo+w.loc.length])
-		keys = append(keys, w.id)
-		lengths = append(lengths, w.loc.length)
 	}
-	fs.notePackFetch(pack, keys, lengths)
 }
 
 // fillWholePack serves the wanted entries out of a locally cached copy of
 // the pack, fetching it first. Any failure degrades to ranged reads rather
 // than to a read error.
-func (fs *FS) fillWholePack(ctx context.Context, pack string, want []pendingChunk) {
-	f, size, err := fs.openCachedPack(ctx, pack)
+func (fs *FS) fillWholePack(ctx context.Context, idx *packIndex, pack string, want []pendingChunk) {
+	f, size, err := fs.openCachedPack(ctx, idx, pack)
 	if err != nil {
 		for _, sp := range coalesce(want) {
 			fs.fillSpan(ctx, pack, sp)
@@ -330,45 +245,15 @@ func (fs *FS) fillWholePack(ctx context.Context, pack string, want []pendingChun
 	}
 }
 
-// wholePackWanted applies the promotion policy. need/needEntries describe
-// what the current fill is about to fetch from this pack, which counts
-// towards the evidence. Callers hold swapMu.
-func (fs *FS) wholePackWanted(pack string, need int64, needEntries int, bulk bool) bool {
+// wholePackWanted reports whether this pack may be fetched whole. There is
+// no per-read judgement left in it: the answer depends on the mount's
+// configuration and the pack's signed size, never on what has been read.
+func (fs *FS) wholePackWanted(idx *packIndex, pack string) bool {
 	if fs.packCacheCap <= 0 {
 		return false
 	}
-	size := fs.packSize[pack]
-	if size <= 0 || size > maxWholePackBytes || size > fs.packCacheCap {
-		return false
-	}
-	if fs.packCachedLocally(pack, size) {
-		return true // already paid for; reading it beats going out again
-	}
-	if bulk {
-		return need*bulkPackDenom >= size*bulkPackNumer
-	}
-	gotBytes, gotEntries := fs.packConsumed(pack)
-	gotBytes += need
-	gotEntries += needEntries
-	total := fs.packEntries[pack]
-	// A minimum number of DISTINCT entries is required whichever rule
-	// fires, and it is the load-bearing guard. Chunks average 4 MiB, so a
-	// couple of scattered 4 KiB reads already pull a quarter of a small
-	// pack — bytes alone would call that "bulk consumption" when the
-	// reader wanted twelve kilobytes. Distinct entries cannot be inflated
-	// that way: it takes many separate requests to reach the floor, and
-	// many separate requests to one pack is what bulk consumption is.
-	if total <= 0 || gotEntries < minPromoteEntries {
-		return false
-	}
-	byBytes := gotBytes*packPromoteBytesDenom >= size*packPromoteBytesNumer
-	byEntries := gotEntries*packPromoteEntryDenom >= total*packPromoteEntryNumer
-	if !byBytes && !byEntries {
-		return false
-	}
-	// The bound on being wrong: never speculate on more than
-	// maxSpeculationRatio times the bytes already committed to this pack.
-	return size-gotBytes <= maxSpeculationRatio*gotBytes
+	size := idx.size(pack)
+	return size > 0 && size <= maxWholePackBytes && size <= fs.packCacheCap
 }
 
 func (fs *FS) packPath(pack string) string { return filepath.Join(fs.packDir, pack) }
@@ -385,8 +270,8 @@ func (fs *FS) packCachedLocally(pack string, size int64) bool {
 
 // openCachedPack returns an open handle to the locally cached pack,
 // downloading it whole if it is not there yet.
-func (fs *FS) openCachedPack(ctx context.Context, pack string) (*os.File, int64, error) {
-	size := fs.packSize[pack]
+func (fs *FS) openCachedPack(ctx context.Context, idx *packIndex, pack string) (*os.File, int64, error) {
+	size := idx.size(pack)
 	if size <= 0 {
 		return nil, 0, fmt.Errorf("genfs: pack %s has no recorded size", pack)
 	}
@@ -515,48 +400,24 @@ func (fs *FS) evictPacks() {
 	}
 }
 
-// packRead returns one pack entry's stored bytes: from a locally cached
-// whole pack when there is one, otherwise by ranged read — promoting the
-// pack first if the evidence has piled up.
-//
-// The promotion check lives here, on the MISS path, rather than in the
-// batched fill. It has to: a file between the inline threshold and the
-// minimum chunk size is exactly one chunk, so a whole directory of small
-// files arrives here one entry at a time and never through a batch at
-// all. That is the workload whole-pack caching exists for, and checking
-// only in the batch path would mean never checking for it.
-func (fs *FS) packRead(ctx context.Context, key string, loc packLoc) ([]byte, error) {
-	if fs.packCacheCap > 0 {
-		if buf, ok := fs.readFromCachedPack(ctx, loc, false); ok {
+// packRead returns one pack entry's stored bytes, out of a local copy of
+// the whole pack — downloading it if this is the first entry anyone has
+// wanted from it. Ranged reads are the fallback, not the plan.
+func (fs *FS) packRead(ctx context.Context, idx *packIndex, key string, loc packLoc) ([]byte, error) {
+	if fs.wholePackWanted(idx, loc.pack) {
+		if buf, ok := fs.readFromCachedPack(ctx, idx, loc); ok {
 			return buf, nil
 		}
-		if fs.wholePackWanted(loc.pack, loc.length, 1, false) {
-			if buf, ok := fs.readFromCachedPack(ctx, loc, true); ok {
-				fs.notePackFetch(loc.pack, []string{key}, []int64{loc.length})
-				return buf, nil
-			}
-		}
 	}
-	buf, err := fs.readPackRange(ctx, loc)
-	if err == nil {
-		fs.notePackFetch(loc.pack, []string{key}, []int64{loc.length})
-	}
-	return buf, err
+	return fs.readPackRange(ctx, loc)
 }
 
-// readFromCachedPack serves one entry out of the whole-pack cache. With
-// fetch set it will download the pack first; without, it only uses a copy
-// already on disk. Any failure reports false — the caller goes to the
-// federation, because a cache must never turn into a read error.
-func (fs *FS) readFromCachedPack(ctx context.Context, loc packLoc, fetch bool) ([]byte, bool) {
-	size := fs.packSize[loc.pack]
-	if size <= 0 {
-		return nil, false
-	}
-	if !fetch && !fs.packCachedLocally(loc.pack, size) {
-		return nil, false
-	}
-	f, _, err := fs.openCachedPack(ctx, loc.pack)
+// readFromCachedPack serves one entry out of the whole-pack cache,
+// downloading the pack first if it is not there. Any failure reports false
+// — the caller goes to the federation, because a cache must never turn into
+// a read error.
+func (fs *FS) readFromCachedPack(ctx context.Context, idx *packIndex, loc packLoc) ([]byte, bool) {
+	f, _, err := fs.openCachedPack(ctx, idx, loc.pack)
 	if err != nil {
 		return nil, false
 	}

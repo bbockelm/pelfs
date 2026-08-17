@@ -189,6 +189,36 @@ func ParseStoredTrailer(stored []byte) ([]PackEntry, error) {
 	return tr.Entries, nil
 }
 
+// StoredTrailerFrom reads the stored trailer bytes out of a pack the
+// caller already holds whole — a local file rather than a range request.
+//
+// It returns the bytes rather than the entries because the caller must
+// still hash them against the signed pack list: a pack sitting in a cache
+// directory has had no less opportunity to go wrong than one arriving off
+// the wire, and a location map that came from an unverified trailer would
+// send reads to arbitrary offsets in an arbitrary object.
+func StoredTrailerFrom(r io.ReaderAt, size int64) ([]byte, error) {
+	if size < footerSize {
+		return nil, fmt.Errorf("pack too small (%d bytes)", size)
+	}
+	var footer [footerSize]byte
+	if _, err := r.ReadAt(footer[:], size-footerSize); err != nil {
+		return nil, err
+	}
+	if m := string(footer[8:]); m != magic && m != magicZ {
+		return nil, fmt.Errorf("bad pack magic")
+	}
+	idxLen := int64(binary.LittleEndian.Uint64(footer[:8]))
+	if idxLen <= 0 || idxLen+footerSize > size {
+		return nil, fmt.Errorf("bad index length %d", idxLen)
+	}
+	stored := make([]byte, idxLen)
+	if _, err := r.ReadAt(stored, size-footerSize-idxLen); err != nil {
+		return nil, err
+	}
+	return stored, nil
+}
+
 // zstdFrameMagic is the zstd frame header magic number (RFC 8878), which
 // is how stored trailer bytes announce their own encoding.
 const zstdFrameMagic = 0xFD2FB528

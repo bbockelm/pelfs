@@ -169,6 +169,14 @@ func (v *reuseVol) checkpoint() *publish.Result {
 	if _, err := v.base.Swap(ctx, res.Superblock); err != nil {
 		v.t.Fatalf("swap to the sealed generation: %v", err)
 	}
+	// Resolve the new generation's location map here, outside the measured
+	// window. A mount fills it in lazily, so otherwise the trailers of the
+	// packs THIS seal wrote get read by the NEXT seal's carry-forward check
+	// and counted against it — a location read the mount owes the reader,
+	// not a content read the seal owes its input.
+	if err := v.base.LoadPackIndex(ctx); err != nil {
+		v.t.Fatalf("load pack index: %v", err)
+	}
 	if _, err := v.ov.Rebase(ctx, snap.Seq(), overlay.Options{
 		BaseRoot:       res.Superblock.RootCatalog,
 		BaseGeneration: res.Superblock.Generation,

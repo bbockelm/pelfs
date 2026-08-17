@@ -9,7 +9,6 @@ import (
 
 	"github.com/bbockelm/pelfs/internal/catalog"
 	"github.com/bbockelm/pelfs/internal/chunkid"
-	"github.com/bbockelm/pelfs/internal/packstore"
 	"github.com/bbockelm/pelfs/internal/superblock"
 )
 
@@ -90,21 +89,34 @@ func (fs *FS) Swap(ctx context.Context, sb *superblock.Superblock) (*SwapReport,
 		return rep, nil // same tree; nothing to invalidate
 	}
 
-	// Build the new location layer before touching anything served: a
-	// failure here leaves the mount on its current generation.
-	newIndex := make(map[string]packLoc)
-	newSizes := make(map[string]int64, len(sb.PackList))
-	newCounts := make(map[string]int, len(sb.PackList))
-	for _, pe := range sb.PackList {
-		entries, err := packstore.FetchTrailerVerified(ctx, fs.inner, pe.Name, pe.Size, pe.TrailerHash)
+	// Resolve, decode, and verify the incoming root catalog against the
+	// incoming pack list BEFORE anything served is touched, so a generation
+	// this mount cannot read leaves it on the one it can. That used to be
+	// what indexing every new trailer up front bought; the root catalog is
+	// the part of it that actually proves the new generation is servable,
+	// and the rest of the map fills in behind the reads that need it.
+	newIndex := newPackIndex(fs, sb.PackList)
+	newDEK := []byte(nil)
+	if sb.CatalogKeyID != 0 {
+		newDEK = fs.dek
+	}
+	rootHex := hex.EncodeToString(sb.RootCatalog[:])
+	rootPath, err := fs.spillCatalogFrom(ctx, newIndex, newDEK, rootHex)
+	if err != nil {
+		return nil, fmt.Errorf("genfs: swap: root catalog: %w", err)
+	}
+	if fs.verify {
+		raw, err := os.ReadFile(rootPath)
 		if err != nil {
-			return nil, fmt.Errorf("genfs: swap: index pack %s: %w", pe.Name, err)
+			return nil, err
 		}
-		newSizes[pe.Name] = pe.Size
-		newCounts[pe.Name] = len(entries)
-		for _, e := range entries {
-			newIndex[e.Key] = packLoc{pack: pe.Name, off: e.Off, length: e.Length}
+		if id := fs.hasher.Sum(raw); id != chunkid.Identity(sb.RootCatalog) {
+			return nil, fmt.Errorf("genfs: swap: root catalog identity mismatch: got %s", id.Hex())
 		}
+	}
+	root, err := catalog.Open(rootPath)
+	if err != nil {
+		return nil, fmt.Errorf("genfs: swap: open root catalog: %w", err)
 	}
 
 	// Everything from here to the end of the re-descend replaces served
@@ -163,45 +175,17 @@ func (fs *FS) Swap(ctx context.Context, sb *superblock.Superblock) (*SwapReport,
 		beforeDirs[RootInode] = m
 	}
 
-	// Install the new generation.
-	rootHex := hex.EncodeToString(sb.RootCatalog[:])
+	// Install the new generation. Cached PACK FILES stay: packs are
+	// immutable and content-addressed by name, so a copy on disk is as
+	// valid for the new generation as for the old.
 	oldCats := fs.cats
 	fs.mu.Lock()
 	fs.sb = sb
 	fs.packIndex = newIndex
-	fs.packSize = newSizes
-	fs.packEntries = newCounts
 	fs.res = make(map[uint64]*residency, len(order))
 	fs.resLRU.Init()
 	fs.mu.Unlock()
 	fs.ext.clear()
-	// Cached PACK FILES stay: packs are immutable and content-addressed by
-	// name, so a copy on disk is as valid for the new generation as for
-	// the old. Only the piecemeal-consumption evidence resets — it is a
-	// statement about what this generation's readers have asked for.
-	fs.packMu.Lock()
-	fs.packUses = make(map[string]*packUse)
-	fs.packMu.Unlock()
-
-	rootPath, err := fs.spillCatalog(ctx, rootHex)
-	if err != nil {
-		return nil, fmt.Errorf("genfs: swap: root catalog: %w", err)
-	}
-	root, err := catalog.Open(rootPath)
-	if err != nil {
-		return nil, fmt.Errorf("genfs: swap: open root catalog: %w", err)
-	}
-	if fs.verify {
-		raw, err := os.ReadFile(rootPath)
-		if err != nil {
-			root.Close() //nolint:errcheck
-			return nil, err
-		}
-		if id := fs.hasher.Sum(raw); id != chunkid.Identity(sb.RootCatalog) {
-			root.Close() //nolint:errcheck
-			return nil, fmt.Errorf("genfs: swap: root catalog identity mismatch: got %s", id.Hex())
-		}
-	}
 	fs.cats = newCatCache(fs, oldCats.cap, rootHex, root)
 	oldCats.closeAll()
 

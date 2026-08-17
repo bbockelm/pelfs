@@ -92,6 +92,11 @@ type Store struct {
 	flushing *table
 	flushErr error
 
+	// recovered holds tables a crash left behind. They are already frozen,
+	// so the set only shrinks: Flush drains them one at a time before the
+	// active table rotates, and reads consult them last.
+	recovered []*table
+
 	nextHandle Handle
 	nextSeq    uint64
 
@@ -103,8 +108,8 @@ type Store struct {
 	// The two halves of the location map. A handle resolves to slices of
 	// chunks; a chunk resolves to a place in a pack. Both bind at flush,
 	// and neither touches a content row.
-	handleLoc map[Handle][]chunkSlice
-	chunkLoc  map[string]packLoc
+	handleLoc map[Handle][]ChunkSlice
+	chunkLoc  map[string]PackLoc
 	packs     []packstore.SealedPack
 
 	stats  Stats
@@ -112,19 +117,22 @@ type Store struct {
 	wg     sync.WaitGroup
 }
 
-// chunkSlice maps part of an extent to part of a chunk. An extent's
+// ChunkSlice maps part of an extent to part of a chunk. An extent's
 // slices are ordered and cover it exactly: CDC boundaries are chosen from
 // content, so they do not respect extent boundaries in either direction.
-type chunkSlice struct {
+type ChunkSlice struct {
 	ID       chunkid.Identity
 	ChunkOff int // where in the chunk the extent's bytes start
 	Length   int
 }
 
-type packLoc struct {
-	pack   string
-	off    int64
-	length int64
+// PackLoc is where a chunk landed: the second half of the location map,
+// and the half the format already has — a pack name and an offset,
+// reachable from the superblock's pack list through pack trailers.
+type PackLoc struct {
+	Pack   string
+	Off    int64
+	Length int64
 }
 
 func bufferName(seq uint64) string { return fmt.Sprintf("mem-%06d.buf", seq) }
@@ -160,8 +168,8 @@ func newStore(opts Options) (*Store, error) {
 		hasher:    opts.Hasher,
 		hooks:     opts.Hooks,
 		content:   make(map[uint64]*content),
-		handleLoc: make(map[Handle][]chunkSlice),
-		chunkLoc:  make(map[string]packLoc),
+		handleLoc: make(map[Handle][]ChunkSlice),
+		chunkLoc:  make(map[string]PackLoc),
 	}
 	s.cond = sync.NewCond(&s.mu)
 	return s, nil
@@ -268,18 +276,27 @@ func (s *Store) applyLocked(d map[Handle]int) {
 	}
 }
 
-// tableForLocked finds the table holding a handle. Handles are allocated
-// monotonically and a table's range is contiguous, so this is a
-// comparison rather than a map — and there are never more than two.
-func (s *Store) tableForLocked(h Handle) *table {
+// levelsLocked lists the memory levels in resolution order: the active
+// table, then the flushing one, then anything a recovery left behind. A
+// handle found at an earlier level is the same bytes as at a later one —
+// there is no shadowing here, only a search — so the order is about cost,
+// not correctness.
+func (s *Store) levelsLocked() []*table {
+	out := make([]*table, 0, 2+len(s.recovered))
 	if s.active != nil {
-		if _, ok := s.active.index[h]; ok {
-			return s.active
-		}
+		out = append(out, s.active)
 	}
 	if s.flushing != nil {
-		if _, ok := s.flushing.index[h]; ok {
-			return s.flushing
+		out = append(out, s.flushing)
+	}
+	return append(out, s.recovered...)
+}
+
+// tableForLocked finds the table holding a handle.
+func (s *Store) tableForLocked(h Handle) *table {
+	for _, t := range s.levelsLocked() {
+		if _, ok := t.index[h]; ok {
+			return t
 		}
 	}
 	return nil
@@ -336,13 +353,31 @@ func (s *Store) Flush(ctx context.Context) error {
 	// authoritative. Retrying it is the recovery, not discarding it.
 	if s.flushing != nil && s.flushErr != nil {
 		s.flushErr = nil
+		s.flushing.abandon.Store(false)
 		s.startFlushLocked(ctx, s.flushing)
+	}
+	// Tables a crash left behind go first: they are older than anything
+	// the active table holds, and leaving them behind a fresh flush would
+	// keep their buffer files pinned for no reason.
+	for len(s.recovered) > 0 {
+		if err := s.waitFlushLocked(); err != nil {
+			return err
+		}
+		t := s.recovered[0]
+		s.recovered = s.recovered[1:]
+		s.flushing = t
+		s.stats.Flushes++
+		s.startFlushLocked(ctx, t)
 	}
 	if s.active != nil && s.active.buf.Used() > 0 {
 		if err := s.rotateLocked(ctx); err != nil {
 			return err
 		}
 	}
+	return s.waitFlushLocked()
+}
+
+func (s *Store) waitFlushLocked() error {
 	for s.flushing != nil && s.flushErr == nil {
 		s.cond.Wait()
 	}
@@ -376,15 +411,12 @@ func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var err error
-	for _, t := range []*table{s.active, s.flushing} {
-		if t == nil {
-			continue
-		}
+	for _, t := range s.levelsLocked() {
 		if cerr := t.buf.Close(); err == nil {
 			err = cerr
 		}
 	}
-	s.active, s.flushing = nil, nil
+	s.active, s.flushing, s.recovered = nil, nil, nil
 	return err
 }
 
@@ -503,10 +535,7 @@ func (s *Store) plan(ino uint64, off int64, n int) ([]readPart, int, error) {
 
 // resolveLocked turns a handle plus an intra-extent range into a source.
 func (s *Store) resolveLocked(h Handle, skip, length int) (source, error) {
-	for _, t := range []*table{s.active, s.flushing} {
-		if t == nil {
-			continue
-		}
+	for _, t := range s.levelsLocked() {
 		if rec, ok := t.index[h]; ok {
 			t.pin()
 			return source{tab: t, off: rec.Off + skip, length: length}, nil
@@ -535,8 +564,8 @@ func (s *Store) resolveLocked(h Handle, skip, length int) (source, error) {
 			return source{}, fmt.Errorf("memtable: chunk %s has no location", cs.ID)
 		}
 		out = append(out, packSlice{
-			pack:   loc.pack,
-			off:    loc.off + int64(cs.ChunkOff+delta),
+			pack:   loc.Pack,
+			off:    loc.Off + int64(cs.ChunkOff+delta),
 			length: take,
 		})
 		want += take

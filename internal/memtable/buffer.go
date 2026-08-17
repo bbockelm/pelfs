@@ -80,6 +80,7 @@ type Buffer struct {
 	data []byte
 	end  int
 	seq  uint64
+	torn bool
 }
 
 // CreateBuffer makes a buffer file of exactly size bytes and maps it.
@@ -168,8 +169,24 @@ func (b *Buffer) scan() []Record {
 		off += recordHeader + n
 	}
 	b.end = off
+	// Distinguishing "the writer stopped here" from "a record was torn"
+	// is possible because the file was preallocated as a hole: a clean end
+	// is followed by zeros only. Nonzero bytes past the last valid record
+	// mean something was written and did not survive intact.
+	for _, c := range b.data[off:] {
+		if c != 0 {
+			b.torn = true
+			break
+		}
+	}
 	return recs
 }
+
+// Torn reports whether bytes were found past the last valid record. A
+// buffer cut short by a truncated file is NOT torn by this test — the
+// evidence went with the bytes — which is why the loud report has to come
+// from reconciling content rows, not from the buffer alone.
+func (b *Buffer) Torn() bool { return b.torn }
 
 // Append writes one extent. On success rec.Off is filled in with the
 // payload's position. The CRC is computed before the header is stored so

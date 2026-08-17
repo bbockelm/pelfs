@@ -21,8 +21,8 @@ type inodePlan struct {
 }
 
 type flushResult struct {
-	handleLoc      map[Handle][]chunkSlice
-	chunkLoc       map[string]packLoc
+	handleLoc      map[Handle][]ChunkSlice
+	chunkLoc       map[string]PackLoc
 	packs          []packstore.SealedPack
 	uploadedBytes  int64
 	uploadedChunks int64
@@ -59,8 +59,8 @@ func (s *Store) snapshot(t *table) ([]inodePlan, *flushResult) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	res := &flushResult{
-		handleLoc: make(map[Handle][]chunkSlice),
-		chunkLoc:  make(map[string]packLoc),
+		handleLoc: make(map[Handle][]ChunkSlice),
+		chunkLoc:  make(map[string]PackLoc),
 	}
 	inodes := make([]uint64, 0, len(t.inodes))
 	for ino := range t.inodes {
@@ -141,7 +141,7 @@ func (s *Store) chunkInode(ctx context.Context, t *table, exts []Record, pk *flu
 		for ; i < len(exts) && starts[i] < end; i++ {
 			lo := max(starts[i], streamOff)
 			hi := min(starts[i+1], end)
-			res.handleLoc[exts[i].Handle] = append(res.handleLoc[exts[i].Handle], chunkSlice{
+			res.handleLoc[exts[i].Handle] = append(res.handleLoc[exts[i].Handle], ChunkSlice{
 				ID:       id,
 				ChunkOff: int(lo - streamOff),
 				Length:   int(hi - lo),
@@ -241,7 +241,7 @@ type flushPacker struct {
 
 	w    *packstore.PackWriter
 	pend []pendingLoc
-	locs map[string]packLoc
+	locs map[string]PackLoc
 
 	sealed []packstore.SealedPack
 	bytes  int64
@@ -255,7 +255,7 @@ type pendingLoc struct {
 }
 
 func newFlushPacker(obj pelicanobj.Store, dir string, target int64) *flushPacker {
-	return &flushPacker{obj: obj, dir: dir, target: target, locs: make(map[string]packLoc)}
+	return &flushPacker{obj: obj, dir: dir, target: target, locs: make(map[string]PackLoc)}
 }
 
 func (p *flushPacker) add(ctx context.Context, id chunkid.Identity, data []byte) error {
@@ -308,7 +308,7 @@ func (p *flushPacker) cut(ctx context.Context) error {
 	p.w = nil
 	p.sealed = append(p.sealed, sp)
 	for _, pl := range p.pend {
-		p.locs[pl.key] = packLoc{pack: sp.Name, off: pl.off, length: pl.length}
+		p.locs[pl.key] = PackLoc{Pack: sp.Name, Off: pl.off, Length: pl.length}
 	}
 	p.pend = nil
 	return nil

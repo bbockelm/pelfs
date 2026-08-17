@@ -2,25 +2,25 @@ package memtable
 
 import "sort"
 
-// ref is one contiguous run of one extent's bytes placed at a file
+// ExtentRef is one contiguous run of one extent's bytes placed at a file
 // offset. It is the stand-in for what an ocontent row holds: a handle,
 // never a place. Skip exists because a later write can bite a piece out
 // of the middle of an earlier extent — the extent's bytes are still
 // wanted, just not all of them, and the extent is append-only so they
 // cannot be rewritten in place.
-type ref struct {
+type ExtentRef struct {
 	FileOff int64
 	Skip    int
 	Length  int
 	Handle  Handle
 }
 
-func (r ref) end() int64 { return r.FileOff + int64(r.Length) }
+func (r ExtentRef) end() int64 { return r.FileOff + int64(r.Length) }
 
 // content is one inode's byte map: refs sorted by file offset, never
 // overlapping. Gaps are holes and read as zeros.
 type content struct {
-	refs []ref
+	refs []ExtentRef
 	size int64
 }
 
@@ -71,7 +71,7 @@ func (c *content) punch(off int64, n int64, dropped map[Handle]int) {
 // insert places a whole extent at off, displacing whatever was there.
 func (c *content) insert(off int64, length int, h Handle, dropped map[Handle]int) {
 	c.punch(off, int64(length), dropped)
-	c.refs = append(c.refs, ref{FileOff: off, Length: length, Handle: h})
+	c.refs = append(c.refs, ExtentRef{FileOff: off, Length: length, Handle: h})
 	sort.Slice(c.refs, func(i, j int) bool { return c.refs[i].FileOff < c.refs[j].FileOff })
 	if end := off + int64(length); end > c.size {
 		c.size = end
@@ -88,10 +88,10 @@ func (c *content) truncate(size int64, dropped map[Handle]int) {
 }
 
 // overlapping returns the refs intersecting [off, off+n), in order.
-func (c *content) overlapping(off int64, n int64) []ref {
+func (c *content) overlapping(off int64, n int64) []ExtentRef {
 	end := off + n
 	i := sort.Search(len(c.refs), func(i int) bool { return c.refs[i].end() > off })
-	var out []ref
+	var out []ExtentRef
 	for ; i < len(c.refs) && c.refs[i].FileOff < end; i++ {
 		out = append(out, c.refs[i])
 	}

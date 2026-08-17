@@ -32,6 +32,12 @@ type Options struct {
 	Hasher chunkid.Hasher
 	// Hooks are test seams; all fields may be nil.
 	Hooks Hooks
+	// KeepCDCUnderPressure disables the release valve, so a flush finishes
+	// its chunking even while a writer waits on it. It exists to measure
+	// what the valve is worth: the design treats abandonment as an
+	// exception, and a measurement that cannot turn it off cannot say
+	// whether that is true.
+	KeepCDCUnderPressure bool
 }
 
 // Hooks let a test observe the inside of a flush, which is the only way
@@ -84,6 +90,7 @@ type Store struct {
 	chunkOpts chunkid.Options
 	hasher    chunkid.Hasher
 	hooks     Hooks
+	keepCDC   bool
 
 	mu   sync.Mutex
 	cond *sync.Cond
@@ -167,6 +174,7 @@ func newStore(opts Options) (*Store, error) {
 		chunkOpts: opts.Chunk,
 		hasher:    opts.Hasher,
 		hooks:     opts.Hooks,
+		keepCDC:   opts.KeepCDCUnderPressure,
 		content:   make(map[uint64]*content),
 		handleLoc: make(map[Handle][]ChunkSlice),
 		chunkLoc:  make(map[string]PackLoc),
@@ -315,7 +323,9 @@ func (s *Store) rotateLocked(ctx context.Context) error {
 		// The in-flight flush's remaining CDC is optional work standing
 		// between this writer and a free table. Tell it to stop before
 		// settling in to wait, not after.
-		s.flushing.abandon.Store(true)
+		if !s.keepCDC {
+			s.flushing.abandon.Store(true)
+		}
 		if !waited {
 			// Counted before the wait, not after: a caller watching for
 			// backpressure needs to see it while it is happening.

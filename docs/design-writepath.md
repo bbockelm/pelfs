@@ -77,12 +77,27 @@ A catalog row for a file already stores `[]catalog.ChunkRef`, and a
 name and offset. Resolution goes through `genfs.packIndex`, built from
 the pack list.
 
-So a chunk written to the memtable can be recorded in the catalog
-immediately, with its final identity, before anyone knows which pack it
-will land in. Flushing adds entries to the location map; it does not
-touch a single catalog row. This is the property that makes the whole
-design cheap, and it is already true of the format — no compatibility
-break, no new record type in the catalog.
+So a chunk can be recorded with its final identity before anyone knows
+which pack it will land in. Flushing adds entries to the location map; it
+does not touch a catalog row. That is the property that makes the design
+cheap.
+
+**But the format does NOT already support it, contrary to what this
+document originally claimed.** A prototype proved otherwise. `ChunkRef`
+carries `Identity` and `LogicalOffset`, and `genfs` reads a row as "chunk
+bytes [0,LLen) are file bytes [LogicalOffset, +LLen)". There is **no
+offset-into-the-chunk field**. So a file whose extent was partially
+overwritten has live bytes that do not tile onto whole chunks, and no
+catalog row can name them. The prototype pins the case as `ErrNotTiled`.
+
+Two ways out, and this is now the first thing to decide:
+
+1. **Grow `ChunkRef` a chunk-offset field.** A format change, though an
+   additive one under the evolution rule.
+2. **CDC only the live sub-ranges of each extent**, so every emitted
+   chunk is wholly live and tiles by construction. No format change; more
+   chunk boundaries, and boundaries that depend on overwrite history
+   rather than content alone, which weakens dedup.
 
 What must change is the resolver: `genfs` must consult live memtables
 before the pack index, and must treat "identity present in the location
@@ -155,15 +170,15 @@ by flush time the data has settled by construction: the memtable is
 frozen before the pass begins. The deferred-inode hatch below is then an
 optimization for pathological churn, not a correctness requirement.
 
-It also makes CDC a **backpressure release valve**. Chunking is CPU the
-flush does not strictly need — its purpose is dedup and incremental
-re-upload, not correctness. If the active table fills while a flush is
-still chunking, the flush abandons the rest of the CDC pass and emits the
-remaining extents as-is. The cost is duplication in the pack (worse
-dedup, more bytes) and the benefit is that a burst never stalls behind
-optional work. Measured evidence supports treating CDC as optional here:
-on a kernel tree, 99.89% of files are single-chunk anyway and sub-file
-dedup found *zero* matches, so a skipped pass costs little in practice.
+CDC was also going to be a **backpressure release valve** — abandon the
+pass under pressure, trade dedup for latency. **Measurement says do not
+build it.** With the valve a prototype session ran 10.31 s and abandoned
+38 of 39 flushes; with the valve disabled it ran **7.77 s** and abandoned
+none. Abandoning still has to hash every extent, because a pack key *is*
+the chunk identity — only the cut search is skipped — so it trades a
+cheap gear-hash scan for extra pack entries and comes out behind. It also
+fired on nearly every flush even at zero modelled latency, so it was
+never the exception this document imagined.
 
 Identity is therefore bound at flush, along with location. See the
 indirection note above: content rows name a stable extent handle, and one
@@ -308,6 +323,53 @@ Any repack built here should start with it.
   partly-full memtables, the volume accrues small packs. Coalescing them
   is repack's job, but the memtable size and the pack target should be
   the same number so the common case produces full packs.
+
+## What a prototype measured, and what it falsified
+
+`internal/memtable` is a working vertical slice beside the staging path.
+On 85k files (2442 MiB written, 1688 MiB live, 50 ms modelled pack round
+trip, APFS):
+
+| | staging | memtable |
+|---|---|---|
+| write | 31.90 s | 10.08 s |
+| freeze | 39.97 s link + 5.40 s unlink | **0** |
+| seal | 37.30 s, 1688 MiB | **0.23 s, 59 MiB** |
+| total | 114.56 s | **10.31 s** |
+| peak local content | 1688 MiB | **128 MiB** |
+
+Flush overlaps writing as intended: 1629 of 1688 MiB left during the
+write phase, and the seal moves one memtable's tail — 3.5% of the
+session. The freeze disappears. Those are the wins, and they hold.
+
+Corrections this document owes:
+
+- **"The live set is a value captured under a lock in constant time"** is
+  wrong. It is proportional to the content refs of the inodes the table
+  touched — proportional to the flush rather than to the tree, which is
+  the property that matters, but not constant.
+- **"Resolve to a source under the lock, then read outside it"** is
+  necessary and not sufficient. Immutable bytes still get *unmapped* when
+  a table is recycled, so an unpinned read is a segfault, not a stale
+  read. Tables need pin/unpin.
+- **The location map must be durable, and nothing in the format can
+  rebuild it.** Pack trailers know identities; nothing on the federation
+  has ever heard of an extent handle. So a flush owes one durable row per
+  surviving extent — a real write per extent per flush that "flushing
+  does not touch a catalog row" quietly omitted.
+- **"Dead data is written anyway"** overstates the case against staging.
+  Staging never *uploads* dead versions either; it overwrites in place.
+  The 754 MiB never sent is what keeps an append-only buffer from being
+  ~45% worse than staging, not a win over it.
+- **Memtable size must exceed the pack target, not equal it.** A 64 MiB
+  table holding ~31% dead bytes yields ~43 MiB packs against a 64 MiB
+  target — 39 packs where staging wrote 27. Either size the table above
+  the target or carry a partial pack across flushes.
+- **Backpressure binds structurally, not just under burst**: 38 of 39
+  rotations blocked. Two tables means session throughput equals flusher
+  throughput. That is the intent, but the consequence is that a burst
+  staging absorbs at local-disk speed now throttles continuously. A
+  product trade to make deliberately.
 
 ## Settled
 

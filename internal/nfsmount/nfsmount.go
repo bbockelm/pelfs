@@ -92,6 +92,13 @@ func Serve(bfs billy.Filesystem) (*Server, error) {
 		ln:       ln,
 		serveErr: make(chan error, 1),
 	}
+	// Said once per mount, because the failure it predicts cannot be
+	// explained where it happens: go-nfs's LINK handler misparses the
+	// request and writes a reply the client cannot decode (see
+	// docs/go-nfs-patches.md, gap 3), so the filesystem below is never
+	// asked and has nothing to report. The client calls that EIO, and
+	// this line is the only place the reason is written down.
+	ui.Info("hard links are not served over the NFS frontend; `ln` and hardlink entries in an archive fail with an I/O error")
 	go func() {
 		s.serveErr <- nfs.Serve(ln, cached)
 	}()

@@ -60,6 +60,62 @@ the flush at unmount, which is the one that actually bit us (see
 `internal/nfsmount/handlecache.go`). A crash mid-session loses the local
 cache regardless, and pelfs's durability promise is the final upload at exit.
 
+## Gap 3: LINK is broken at both ends of the wire
+
+`ln`, and every hardlink entry in a tarball, comes back as **EIO**. This is
+not our error translation; the RPC never reaches our filesystem intact.
+
+RFC 1813 defines `LINK3args` as `nfs_fh3 file` followed by
+`diropargs3 link`. `onLink` reads a `diropargs3` first — so it takes the
+source file's handle as `link.dir` and the target *directory's handle* as
+`link.name` — then reads a `sattr3` that is not in the message at all,
+which usually runs off the end of the body and yields `NFS3ERR_INVAL`. Even
+if it did not, the failure reply is 4 bytes short: `LINK3resfail` is
+`post_op_attr` + `wcc_data` (12 bytes), and the wcc error formatter writes 8.
+The client cannot decode the reply and reports EIO.
+
+Implementing `nfs.UnixChange` on the binding does NOT help: `onLink` would
+then hand `Link` a raw file handle where it expects a path.
+
+There is also no way to warn the client off. A client only issues LINK if
+FSINFO advertises `FSF3_LINK`, and `onFSInfo` sets that bit for any
+filesystem satisfying `billy.Symlink` — which every `billy.Filesystem` does
+by definition, since `Symlink` is one of its embedded interfaces. The bit is
+unconditionally on.
+
+**Why we tolerate it:** hard links are rare in the workloads a scratch
+volume sees, and the failure is loud rather than silent — nothing is
+written. `internal/nfsmount` says so once at mount time so that an EIO from
+`ln` has a findable explanation.
+
+Reproduced (Linux client, the `scripts/bench-untar-nfs-docker.sh` image):
+
+    tar: .../changes.rst: Cannot hard link to '.../changes-link.rst': Input/output error
+
+## Gap 4: an unrecognized error becomes NFS3ERR_IO
+
+`onCreate`, `onMkdir`, `onSymlink`, `onRemove`, `onRmdir`, `onRename` and
+`onRead` answer `NFSStatusIO` for any billy error they cannot place, and
+they place only three: `os.IsNotExist`, `os.IsExist`, `os.IsPermission`.
+`rmdir` of a non-empty directory is the case that shows up in practice —
+ENOTEMPTY has an NFS status (`NFS3ERR_NOTEMPTY`) that no handler ever
+returns.
+
+Worse, `onSetAttr` returns `SetFileAttributes.Apply`'s error verbatim,
+commented "Already an nfsstatuserror" — which it is not, for the Chmod,
+Lchown, Chtimes and Truncate branches, all of which return the backend's
+error raw. The response formatter then falls through to
+`ResponseCodeSystemError`: an RPC-level rejection rather than an NFS status,
+which is how a perfectly ordinary ENOENT reached a client as EIO.
+
+**What we do about it:** `internal/nfsmount/diag.go` wraps the served
+filesystem. Errors from the attribute setters come back as
+`*nfs.NFSStatusError` carrying the status that describes them, which fixes
+SETATTR outright and leaves Apply's own `os.ErrPermission` test working
+through the wrap. Everything else that is about to become NFS3ERR_IO is
+logged with its operation, path and cause, rate-limited, so a bare
+"Input/output error" on a client is always explained on the server.
+
 ## The patches, if we ever want them
 
 A branch implementing both is at `~/projects/go-nfs`, branch

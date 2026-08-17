@@ -532,8 +532,11 @@ func TestCatalogLRU(t *testing.T) {
 	fbIno := v.Create(bIno, "fb")
 	v.Write(fbIno, fbContent)
 
-	// SMax 1000 peels both /a and /b: a 3-catalog tree.
-	res := publishVolume(t, v, inner, publish.Options{SMax: 1000})
+	// SMax 1000 peels both /a and /b: a 3-catalog tree. The split weight
+	// this relies on is the files' INLINE bytes, so the threshold is stated
+	// rather than inherited — the shipped default has since moved below
+	// 2500, leaving the fixture one flat catalog and nothing to evict.
+	res := publishVolume(t, v, inner, publish.Options{SMax: 1000, InlineMax: 4096})
 	if res.Stats.Catalogs != 3 {
 		t.Fatalf("fixture built %d catalogs, want 3", res.Stats.Catalogs)
 	}

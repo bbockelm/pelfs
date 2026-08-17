@@ -246,6 +246,9 @@ func Open(ctx context.Context, o Options) (*FS, error) {
 		maxResident:  o.MaxResident,
 		fills:        make(map[string]*fillGate),
 	}
+	if o.PackCacheBytes > 0 {
+		fs.sweepPackTmp()
+	}
 	// Identity index: every trailer in the generation's pack list, built
 	// once, and no trailer's entries trusted until the stored bytes hash
 	// to the value the SIGNED pack list records. Identical content dedups
@@ -396,6 +399,26 @@ func (fs *FS) lookup(ctx context.Context, parent uint64, name string) (Node, err
 	}
 	fs.retain(uint64(lr.Dirent.Inode), childCat, parent, name)
 	return nodeOf(n), nil
+}
+
+// Resident reports whether ino can be operated on right now, i.e. whether
+// a descent has established its residency and nothing has retired it.
+//
+// It exists because "I looked it up, so it stays" is NOT true here. Two
+// things retire residency behind a caller's back: MaxResident eviction,
+// and a generation Swap, which rebuilds the table from what it could
+// re-descend. A layer that caches "I resolved this inode once" — the write
+// overlay does, to avoid re-descending the base on every operation — has
+// to be able to notice and redo the descent, and this is how it asks.
+func (fs *FS) Resident(ino uint64) bool {
+	if ino == RootInode {
+		return true
+	}
+	fs.swapMu.RLock()
+	defer fs.swapMu.RUnlock()
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+	return fs.res[ino] != nil
 }
 
 // Parent returns the inode this one was reached through, answering "..".

@@ -413,20 +413,56 @@ func (fs *FS) baseLookupLocked(ctx context.Context, parent uint64, name string) 
 	return n, nil
 }
 
-// ensureBaseLocked re-establishes base residency for a detached inode by
-// replaying its persisted original base edge chain. Inodes reached by
-// pass-through lookups this session are already resident (prov hit).
-// Inodes with neither provenance nor an obase row are left alone: either
-// the caller's own descent made them resident, or the base correctly
-// answers ErrStale (the kernel-contract violation, not ours). q is the
-// caller's active handle: the transaction when inside one — the pool
-// holds a single connection, so touching fs.db mid-transaction deadlocks.
+// ensureBaseLocked re-establishes base residency for an inode this
+// overlay needs to reach through the base generation. Inodes with neither
+// provenance nor an obase row are left alone: either the caller's own
+// descent made them resident, or the base correctly answers ErrStale (the
+// kernel-contract violation, not ours). q is the caller's active handle:
+// the transaction when inside one — the pool holds a single connection, so
+// touching fs.db mid-transaction deadlocks.
+//
+// A prov hit used to be taken as proof of residency, on the grounds that
+// this overlay owns the base exclusively and never forwards Forget. That
+// was wrong in two ways, and a SEAL — which walks the whole tree — hit
+// both: genfs evicts residency when MaxResident bounds it (the NFS backend
+// sets it), and a generation swap rebuilds the table from what it could
+// re-descend. Either leaves an inode this session resolved earlier
+// unreachable, and every base-facing operation on it then fails with
+// ErrStale — a whole volume that could no longer be published.
+//
+// So provenance is treated as what it actually is: a permanently valid
+// DESCENT STEP (base edges are immutable within a generation), replayed
+// whenever residency is missing rather than trusted to still be there. The
+// cost at the residency bound is one catalog lookup per ancestor of an
+// evicted inode, paid on the operation that needs it.
 func (fs *FS) ensureBaseLocked(ctx context.Context, q querier, ino uint64) error {
+	return fs.ensureBaseDepth(ctx, q, ino, 0)
+}
+
+// maxBaseChainDepth bounds the replay recursion. Real paths are nowhere
+// near it; a chain longer than this means a cycle, and recursing forever
+// on corrupt state is worse than reporting it.
+const maxBaseChainDepth = 4096
+
+func (fs *FS) ensureBaseDepth(ctx context.Context, q querier, ino uint64, depth int) error {
 	if ino == RootInode {
 		return nil
 	}
-	if _, ok := fs.prov[ino]; ok {
+	if depth > maxBaseChainDepth {
+		return fmt.Errorf("overlay: base edge chain for inode %d is deeper than %d levels", ino, maxBaseChainDepth)
+	}
+	if fs.base.Resident(ino) {
 		return nil
+	}
+	if pe, ok := fs.prov[ino]; ok {
+		if err := fs.ensureBaseDepth(ctx, q, pe.parent, depth+1); err != nil {
+			return err
+		}
+		if n, err := fs.baseLookupLocked(ctx, pe.parent, pe.name); err == nil && n.Inode == ino {
+			return nil
+		}
+		// The recorded edge is gone or now names something else — a swap
+		// moved the inode. The persisted chain below is then the authority.
 	}
 	var parent int64
 	var name []byte
@@ -437,7 +473,7 @@ func (fs *FS) ensureBaseLocked(ctx context.Context, q querier, ino uint64) error
 	if err != nil {
 		return err
 	}
-	if err := fs.ensureBaseLocked(ctx, q, uint64(parent)); err != nil {
+	if err := fs.ensureBaseDepth(ctx, q, uint64(parent), depth+1); err != nil {
 		return err
 	}
 	if _, err := fs.baseLookupLocked(ctx, uint64(parent), string(name)); err != nil {

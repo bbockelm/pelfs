@@ -32,7 +32,7 @@ func serveTestFS(t *testing.T) (dial func() *nfsc.Target, bfs *billyFS) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = ln.Close() })
-	handler := nfshelper.NewCachingHandler(nfshelper.NewNullAuthHandler(bfs), 1024)
+	handler := newHandles(nfshelper.NewNullAuthHandler(bfs), 1024)
 	go func() { _ = nfs.Serve(ln, handler) }()
 
 	addr := ln.Addr().(*net.TCPAddr).String()

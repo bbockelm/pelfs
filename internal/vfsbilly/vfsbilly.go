@@ -7,9 +7,11 @@
 //
 // Path resolution is by DESCENT. genfs serves an inode only once a Lookup
 // has established residency for it, so every path handed to this adapter
-// is walked from the root, parent before child. No path -> inode map
-// short-circuits that walk: an inode remembered from an earlier operation
-// is not on its own resident, and the layer below answers ErrStale for it.
+// is walked from the root, parent before child. The directory edges of
+// that walk are memoized (dircache.go) because the frontend re-walks the
+// same directories on every RPC, but the walk itself is never skipped:
+// an inode remembered from an earlier operation is not on its own
+// resident, so a memoized descent that hits ErrStale re-walks for real.
 //
 // Unlike the v1 adapter there is no handle cache. The overlay commits each
 // Write to its staging file before returning, so a handle carries no
@@ -56,10 +58,11 @@ type reader interface {
 // every mutating call is refused with a permission error, the op
 // understood and denied rather than unimplemented.
 type billyFS struct {
-	rd  reader
-	ov  *overlay.FS
-	uid uint32
-	gid uint32
+	rd   reader
+	ov   *overlay.FS
+	uid  uint32
+	gid  uint32
+	dirs *dirCache
 }
 
 var (
@@ -72,12 +75,12 @@ var (
 // creates are owned by the invoking user: the volume is a single-user
 // scratch space and the mount must be able to write what it made.
 func New(ov *overlay.FS) billy.Filesystem {
-	return &billyFS{rd: ov, ov: ov, uid: uint32(os.Getuid()), gid: uint32(os.Getgid())}
+	return &billyFS{rd: ov, ov: ov, uid: uint32(os.Getuid()), gid: uint32(os.Getgid()), dirs: newDirCache()}
 }
 
 // NewReadOnly returns a billy.Filesystem over an immutable generation.
 func NewReadOnly(fs *genfs.FS) billy.Filesystem {
-	return &billyFS{rd: fs, uid: uint32(os.Getuid()), gid: uint32(os.Getgid())}
+	return &billyFS{rd: fs, uid: uint32(os.Getuid()), gid: uint32(os.Getgid()), dirs: newDirCache()}
 }
 
 // ctx is the request context. billy carries none, and neither layer
@@ -98,24 +101,81 @@ func components(p string) []string {
 	return strings.Split(trimmed, "/")
 }
 
-// resolve walks p from the root, one Lookup per component. The descent IS
-// the residency contract — genfs answers ErrStale for an inode it was
-// never asked to look up — so no step may be skipped and no result may be
-// cached in its place.
+// resolve walks p from the root and returns its node, with the terminal
+// component always looked up for real so its attributes are current.
+//
+// The intermediate directories come from the edge cache when it has them
+// (see dircache.go). Skipping their Lookup also skips the residency it
+// establishes, and the layer below answers ErrStale for an inode whose
+// residency has since been evicted — so a stale-or-not-a-directory answer
+// falls back to the full descent, which both re-establishes residency and
+// refreshes the cache. Any other error is the namespace's real answer and
+// is returned as-is.
 func (b *billyFS) resolve(c context.Context, p string) (genfs.Node, error) {
-	n, err := b.rd.GetAttr(c, genfs.RootInode)
-	if err != nil {
+	parts := components(p)
+	if len(parts) == 0 {
+		return b.rd.GetAttr(c, genfs.RootInode)
+	}
+	dir, err := b.descend(c, parts[:len(parts)-1], true)
+	if err == nil {
+		var n genfs.Node
+		if n, err = b.rd.Lookup(c, dir, parts[len(parts)-1]); err == nil {
+			return n, nil
+		}
+	}
+	if !staleDescent(err) {
 		return genfs.Node{}, err
 	}
-	for _, part := range components(p) {
-		if n.Type != catalog.TypeDir {
-			return genfs.Node{}, overlay.ErrNotDir
-		}
-		if n, err = b.rd.Lookup(c, n.Inode, part); err != nil {
-			return genfs.Node{}, err
-		}
+	if dir, err = b.descend(c, parts[:len(parts)-1], false); err != nil {
+		return genfs.Node{}, err
 	}
-	return n, nil
+	return b.rd.Lookup(c, dir, parts[len(parts)-1])
+}
+
+// resolveDir walks p from the root and returns its inode, requiring every
+// component to be a directory. It is resolve without the terminal lookup:
+// callers that only need a directory's identity (the parent of a
+// namespace operation) get the whole path from the cache.
+func (b *billyFS) resolveDir(c context.Context, p string) (uint64, error) {
+	parts := components(p)
+	ino, err := b.descend(c, parts, true)
+	if err == nil || !staleDescent(err) {
+		return ino, err
+	}
+	return b.descend(c, parts, false)
+}
+
+// descend walks a chain of directory names from the root. With cached
+// set, an edge already known is taken without consulting the layer below.
+func (b *billyFS) descend(c context.Context, parts []string, cached bool) (uint64, error) {
+	ino := genfs.RootInode
+	for _, part := range parts {
+		if cached {
+			if child, ok := b.dirs.get(ino, part); ok {
+				ino = child
+				continue
+			}
+		}
+		n, err := b.rd.Lookup(c, ino, part)
+		if err != nil {
+			return 0, err
+		}
+		if n.Type != catalog.TypeDir {
+			return 0, overlay.ErrNotDir
+		}
+		b.dirs.put(ino, part, n.Inode)
+		ino = n.Inode
+	}
+	return ino, nil
+}
+
+// staleDescent reports whether an error is one a cached edge could have
+// caused, and is therefore worth retrying against the layer below.
+// ErrNotExist deliberately is not: an edge is only ever cached after a
+// real lookup and is dropped when the name is unbound, so a miss at the
+// end of a cached descent is the namespace's answer, not the cache's.
+func staleDescent(err error) bool {
+	return errors.Is(err, genfs.ErrStale) || errors.Is(err, overlay.ErrNotDir)
 }
 
 // resolveFollow resolves p and follows a terminal symlink chain: the
@@ -145,17 +205,14 @@ func (b *billyFS) resolveFollow(c context.Context, p string) (genfs.Node, error)
 // resolveParent descends to p's parent directory and returns it with p's
 // final component — the (parent inode, name) pair every namespace
 // operation on the layer below takes.
-func (b *billyFS) resolveParent(c context.Context, p string) (genfs.Node, string, error) {
+func (b *billyFS) resolveParent(c context.Context, p string) (uint64, string, error) {
 	parts := components(p)
 	if len(parts) == 0 {
-		return genfs.Node{}, "", syscall.EINVAL // the root has no parent edge
+		return 0, "", syscall.EINVAL // the root has no parent edge
 	}
-	dir, err := b.resolve(c, path.Dir(clean(p)))
+	dir, err := b.resolveDir(c, path.Dir(clean(p)))
 	if err != nil {
-		return genfs.Node{}, "", err
-	}
-	if dir.Type != catalog.TypeDir {
-		return genfs.Node{}, "", overlay.ErrNotDir
+		return 0, "", err
 	}
 	return dir, parts[len(parts)-1], nil
 }
@@ -232,7 +289,7 @@ func (b *billyFS) OpenFile(filename string, flag int, perm os.FileMode) (billy.F
 		if derr != nil {
 			return nil, pe("open", name, derr)
 		}
-		if n, err = b.ov.Create(c, dir.Inode, base, uint32(perm.Perm()), b.uid, b.gid); err != nil {
+		if n, err = b.ov.Create(c, dir, base, uint32(perm.Perm()), b.uid, b.gid); err != nil {
 			return nil, pe("open", name, err)
 		}
 	default:
@@ -288,7 +345,12 @@ func (b *billyFS) Rename(oldpath, newpath string) error {
 	if from != "/" && strings.HasPrefix(to+"/", from+"/") {
 		return pe("rename", newpath, syscall.EINVAL)
 	}
-	return pe("rename", oldpath, b.ov.Rename(c, src.Inode, srcName, dst.Inode, dstName))
+	// Both edges change identity; the subtree under a renamed directory
+	// does not, because the cache is keyed by parent INODE and the moved
+	// directory keeps its own.
+	b.dirs.forget(src, srcName)
+	b.dirs.forget(dst, dstName)
+	return pe("rename", oldpath, b.ov.Rename(c, src, srcName, dst, dstName))
 }
 
 func (b *billyFS) Remove(filename string) error {
@@ -300,14 +362,15 @@ func (b *billyFS) Remove(filename string) error {
 	if err != nil {
 		return pe("remove", filename, err)
 	}
-	n, err := b.rd.Lookup(c, dir.Inode, name)
+	n, err := b.rd.Lookup(c, dir, name)
 	if err != nil {
 		return pe("remove", filename, err)
 	}
+	b.dirs.forget(dir, name)
 	if n.Type == catalog.TypeDir {
-		return pe("remove", filename, b.ov.Rmdir(c, dir.Inode, name))
+		return pe("remove", filename, b.ov.Rmdir(c, dir, name))
 	}
-	return pe("remove", filename, b.ov.Unlink(c, dir.Inode, name))
+	return pe("remove", filename, b.ov.Unlink(c, dir, name))
 }
 
 func (b *billyFS) Join(elem ...string) string { return path.Join(elem...) }
@@ -335,14 +398,11 @@ func (b *billyFS) TempFile(dir, prefix string) (billy.File, error) {
 
 func (b *billyFS) ReadDir(p string) ([]os.FileInfo, error) {
 	c := ctx()
-	n, err := b.resolve(c, p)
+	ino, err := b.resolveDir(c, p)
 	if err != nil {
 		return nil, pe("readdir", p, err)
 	}
-	if n.Type != catalog.TypeDir {
-		return nil, pe("readdir", p, overlay.ErrNotDir)
-	}
-	entries, err := b.rd.Readdir(c, n.Inode)
+	entries, err := b.rd.Readdir(c, ino)
 	if err != nil {
 		return nil, pe("readdir", p, err)
 	}
@@ -360,27 +420,41 @@ func (b *billyFS) MkdirAll(filename string, perm os.FileMode) error {
 	}
 	c := ctx()
 	name := clean(filename)
-	dir, err := b.rd.GetAttr(c, genfs.RootInode)
-	if err != nil {
-		return pe("mkdir", name, err)
+	err := b.mkdirAll(c, components(name), perm, true)
+	if staleDescent(err) {
+		// Same self-healing retry resolve makes: a cached edge whose
+		// residency has aged out is re-established by walking for real.
+		err = b.mkdirAll(c, components(name), perm, false)
 	}
-	for _, part := range components(name) {
-		child, err := b.rd.Lookup(c, dir.Inode, part)
+	return pe("mkdir", name, err)
+}
+
+func (b *billyFS) mkdirAll(c context.Context, parts []string, perm os.FileMode, cached bool) error {
+	dir := genfs.RootInode
+	for _, part := range parts {
+		if cached {
+			if child, ok := b.dirs.get(dir, part); ok {
+				dir = child
+				continue
+			}
+		}
+		child, err := b.rd.Lookup(c, dir, part)
 		if errors.Is(err, genfs.ErrNotExist) {
-			child, err = b.ov.Mkdir(c, dir.Inode, part, uint32(perm.Perm()), b.uid, b.gid)
+			child, err = b.ov.Mkdir(c, dir, part, uint32(perm.Perm()), b.uid, b.gid)
 			if errors.Is(err, overlay.ErrExist) {
 				// Someone else created it in between; an existing name is
 				// all MkdirAll promises.
-				child, err = b.rd.Lookup(c, dir.Inode, part)
+				child, err = b.rd.Lookup(c, dir, part)
 			}
 		}
 		if err != nil {
-			return pe("mkdir", name, err)
+			return err
 		}
 		if child.Type != catalog.TypeDir {
-			return pe("mkdir", name, overlay.ErrNotDir)
+			return overlay.ErrNotDir
 		}
-		dir = child
+		b.dirs.put(dir, part, child.Inode)
+		dir = child.Inode
 	}
 	return nil
 }
@@ -396,7 +470,7 @@ func (b *billyFS) Symlink(target, link string) error {
 	if err != nil {
 		return pe("symlink", link, err)
 	}
-	_, err = b.ov.Symlink(c, dir.Inode, name, target, b.uid, b.gid)
+	_, err = b.ov.Symlink(c, dir, name, target, b.uid, b.gid)
 	return pe("symlink", link, err)
 }
 

@@ -33,7 +33,7 @@ func dialTestServer(t *testing.T) (*nfsc.Target, *billyFS) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = ln.Close() })
-	handler := nfshelper.NewCachingHandler(nfshelper.NewNullAuthHandler(bfs), 1024)
+	handler := newHandles(nfshelper.NewNullAuthHandler(bfs), 1024)
 	go func() { _ = nfs.Serve(ln, handler) }()
 
 	// go-nfs-client binds a local port explicitly, so repeated runs can

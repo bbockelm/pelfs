@@ -61,7 +61,7 @@ func Serve(bfs billy.Filesystem) (*Server, error) {
 		return nil, fmt.Errorf("nfs listen: %w", err)
 	}
 	handler := nfshelper.NewNullAuthHandler(bfs)
-	cached := nfshelper.NewCachingHandler(handler, handleCacheSize)
+	cached := newHandles(handler, handleCacheSize)
 	s := &Server{
 		Port:     ln.Addr().(*net.TCPAddr).Port,
 		ln:       ln,

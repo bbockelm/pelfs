@@ -43,8 +43,10 @@ type packIndex struct {
 	packs []superblock.PackEntry
 
 	// loadMu serializes the trailer work, so concurrent misses index a
-	// pack once between them rather than once each.
-	loadMu sync.Mutex
+	// pack once between them rather than once each. localMerged is under
+	// it: the free sweep of already-local trailers is worth doing once.
+	loadMu      sync.Mutex
+	localMerged bool
 
 	mu      sync.Mutex
 	byKey   map[string]packLoc
@@ -110,13 +112,25 @@ func (x *packIndex) isIndexed(pack string) bool {
 	return x.indexed[pack]
 }
 
-// locate resolves one entry identity, indexing packs newest-first until it
+// lazyProbeBudget is how many packs a miss probes one at a time before it
+// gives up on guessing and resolves the rest at once.
+//
+// Probing newest-first is a bet on recency, and it is a good bet for the
+// entries a mount asks for first — the root catalog, and anything the last
+// publish wrote. It is a bad bet for a chunk in an old pack, where a
+// serial walk backwards would cost a round trip per pack it passes. The
+// budget is what keeps the bet cheap when it is wrong: past it, the whole
+// map is resolved CONCURRENTLY, which is the same bytes the old eager
+// index moved and eight times less waiting than continuing to walk.
+const lazyProbeBudget = 4
+
+// locate resolves one entry identity, indexing packs on demand until it
 // finds one that holds it.
 //
 // A trailer that will not load is remembered as an ERROR, not as an
-// absence: if the scan runs out of packs having failed to read some, it
-// reports the failure rather than "not present", because those are
-// different facts and only one of them means the content is missing.
+// absence: reporting "not present" for a pack that could not be read would
+// confuse a transport failure with missing content, and only one of those
+// means anything is actually gone.
 func (x *packIndex) locate(ctx context.Context, key string) (packLoc, error) {
 	if loc, ok := x.lookup(key); ok {
 		return loc, nil
@@ -126,12 +140,21 @@ func (x *packIndex) locate(ctx context.Context, key string) (packLoc, error) {
 	if loc, ok := x.lookup(key); ok {
 		return loc, nil
 	}
+	// Trailers already on disk cost nothing to fold in, and a mount that
+	// has read this volume before has most of them. Doing it first means a
+	// remount resolves out of local state instead of guessing its way
+	// backwards through the pack list over the network.
+	x.mergeLocal()
+	if loc, ok := x.lookup(key); ok {
+		return loc, nil
+	}
 	var failed error
-	for i := len(x.packs) - 1; i >= 0; i-- {
+	for i, budget := len(x.packs)-1, lazyProbeBudget; i >= 0 && budget > 0; i-- {
 		pe := x.packs[i]
 		if x.isIndexed(pe.Name) {
 			continue
 		}
+		budget--
 		entries, err := x.fs.trailerEntries(ctx, pe)
 		if err != nil {
 			if failed == nil {
@@ -144,10 +167,34 @@ func (x *packIndex) locate(ctx context.Context, key string) (packLoc, error) {
 			return loc, nil
 		}
 	}
+	if err := x.allLocked(ctx); err != nil {
+		return packLoc{}, err
+	}
+	if loc, ok := x.lookup(key); ok {
+		return loc, nil
+	}
 	if failed != nil {
 		return packLoc{}, failed
 	}
 	return packLoc{}, fmt.Errorf("genfs: %s not present in any listed pack", key)
+}
+
+// mergeLocal folds in every pack whose trailer this mount can read without
+// a request — a saved copy, or a pack already cached whole. Callers hold
+// loadMu.
+func (x *packIndex) mergeLocal() {
+	if x.localMerged {
+		return
+	}
+	x.localMerged = true
+	for _, pe := range x.packs {
+		if x.isIndexed(pe.Name) {
+			continue
+		}
+		if entries, ok := x.fs.localTrailerEntries(pe); ok {
+			x.merge(pe, entries)
+		}
+	}
 }
 
 // LoadPackIndex resolves the location of every entry the generation holds,
@@ -182,6 +229,11 @@ const indexWorkers = 8
 func (x *packIndex) all(ctx context.Context) error {
 	x.loadMu.Lock()
 	defer x.loadMu.Unlock()
+	return x.allLocked(ctx)
+}
+
+func (x *packIndex) allLocked(ctx context.Context) error {
+	x.mergeLocal()
 	results := make([][]packstore.PackEntry, len(x.packs))
 	errs := make([]error, len(x.packs))
 	sem := make(chan struct{}, indexWorkers)
@@ -224,15 +276,7 @@ func (x *packIndex) all(ctx context.Context) error {
 // under the whole-pack policy, is the common case after the first touch. A
 // federation range read is last.
 func (fs *FS) trailerEntries(ctx context.Context, pe superblock.PackEntry) ([]packstore.PackEntry, error) {
-	fp := filepath.Join(fs.trailerDir, pe.Name)
-	if stored, err := os.ReadFile(fp); err == nil {
-		if entries, ok := verifiedTrailer(stored, pe.TrailerHash); ok {
-			return entries, nil
-		}
-		os.Remove(fp) //nolint:errcheck
-	}
-	if entries, stored, ok := fs.trailerFromCachedPack(pe); ok {
-		_ = writeAtomic(fp, stored)
+	if entries, ok := fs.localTrailerEntries(pe); ok {
 		return entries, nil
 	}
 	entries, stored, err := packstore.FetchTrailerStoredVerified(ctx, fs.inner, pe.Name, pe.Size, pe.TrailerHash)
@@ -240,8 +284,28 @@ func (fs *FS) trailerEntries(ctx context.Context, pe superblock.PackEntry) ([]pa
 		return nil, err
 	}
 	// Best effort: a mount that cannot write its cache still mounts.
-	_ = writeAtomic(fp, stored)
+	_ = writeAtomic(filepath.Join(fs.trailerDir, pe.Name), stored)
 	return entries, nil
+}
+
+// localTrailerEntries is trailerEntries without the federation: the two
+// sources this mount can read for free. Split out because folding in every
+// trailer that is ALREADY local is worth doing before guessing which
+// remote one to fetch — it costs no requests and often answers the
+// question outright.
+func (fs *FS) localTrailerEntries(pe superblock.PackEntry) ([]packstore.PackEntry, bool) {
+	fp := filepath.Join(fs.trailerDir, pe.Name)
+	if stored, err := os.ReadFile(fp); err == nil {
+		if entries, ok := verifiedTrailer(stored, pe.TrailerHash); ok {
+			return entries, true
+		}
+		os.Remove(fp) //nolint:errcheck
+	}
+	if entries, stored, ok := fs.trailerFromCachedPack(pe); ok {
+		_ = writeAtomic(fp, stored)
+		return entries, true
+	}
+	return nil, false
 }
 
 // trailerFromCachedPack reads a pack's trailer out of the local whole-pack

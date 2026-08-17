@@ -149,17 +149,23 @@ func measureMountAtPackCount(t *testing.T, packs int, rtt time.Duration) {
 	serveWall := time.Since(start)
 	serveGets, serveBytes := inner.gets.Load()-mark.gets, inner.getB.Load()-mark.getB
 
-	// The first read of content in a pack the mount has not touched.
-	mark = inner.snapshot()
-	start = time.Now()
-	last := names[len(names)-1]
-	n, err := fs.LookupPath(ctx, last)
-	if err != nil {
-		t.Fatalf("lookup %s: %v", last, err)
+	// The first read of content in a pack the mount has not touched, taken
+	// at both ends of the pack list. Locations resolve newest-first, so the
+	// last file staged is the cheap direction and the first is the
+	// expensive one — the case where the probe order is wrong and the index
+	// has to resolve itself.
+	readFirst := func(path string) (time.Duration, int64, int64) {
+		mark := inner.snapshot()
+		start := time.Now()
+		n, err := fs.LookupPath(ctx, path)
+		if err != nil {
+			t.Fatalf("lookup %s: %v", path, err)
+		}
+		readWhole(t, fs, n.Inode, n.Length)
+		return time.Since(start), inner.gets.Load() - mark.gets, inner.getB.Load() - mark.getB
 	}
-	readWhole(t, fs, n.Inode, n.Length)
-	readWall := time.Since(start)
-	readGets, readBytes := inner.gets.Load()-mark.gets, inner.getB.Load()-mark.getB
+	readWall, readGets, readBytes := readFirst(names[len(names)-1])
+	oldWall, oldGets, oldBytes := readFirst(names[0])
 	_ = fs.Close()
 
 	// Warm: same cache directory, second mount. Whatever this still costs
@@ -177,10 +183,11 @@ func measureMountAtPackCount(t *testing.T, packs int, rtt time.Duration) {
 	warmGets, warmBytes := inner.gets.Load()-mark.gets, inner.getB.Load()-mark.getB
 	_ = fs2.Close()
 
-	t.Logf("MOUNT[%d packs] cold serve %s (%d GET, %s) | first read %s (%d GET, %s) | warm serve %s (%d GET, %s)",
+	t.Logf("MOUNT[%d packs] cold serve %s (%d GET, %s) | newest read %s (%d GET, %s) | oldest read %s (%d GET, %s) | warm serve %s (%d GET, %s)",
 		len(sb.PackList),
 		serveWall.Round(time.Millisecond), serveGets, human(serveBytes),
 		readWall.Round(time.Millisecond), readGets, human(readBytes),
+		oldWall.Round(time.Millisecond), oldGets, human(oldBytes),
 		warmWall.Round(time.Millisecond), warmGets, human(warmBytes))
 }
 

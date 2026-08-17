@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -1002,5 +1003,94 @@ func TestPrefetchWarmsCache(t *testing.T) {
 	}
 	if rep2.Chunks != 0 || rep2.Cached == 0 {
 		t.Fatalf("second pass fetched %d chunks (cached %d); want all cached", rep2.Chunks, rep2.Cached)
+	}
+}
+
+// A generation swap must never be observable half-applied. Swap empties
+// the residency table, replaces the catalog cache, and closes the old
+// catalogs before it has re-descended anything; a concurrent operation
+// caught in that window used to fail. This is not a synthetic concern: a
+// writable mount checkpoints on a timer, and every checkpoint made a
+// burst of concurrent file creations fail — "Can't create ...:
+// Input/output error" from tar, ESTALE underneath — while the base
+// generation swapped out from under them.
+func TestSwapIsAtomicForConcurrentOps(t *testing.T) {
+	ctx := context.Background()
+	inner, _ := newInner(t)
+	v := newTestVolume(t, "5eaf5eaf-0000-4000-8000-000000000099")
+	dir := v.mkdir(1, "d")
+	// Enough residency that the re-descend takes long enough for a
+	// concurrent reader to land inside it. Too few and the race is real
+	// but unobserved, which is worse than no test at all.
+	const files = 600
+	inos := make([]uint64, 0, files)
+	for i := 0; i < files; i++ {
+		ino := v.create(dir, fmt.Sprintf("f%04d.txt", i))
+		v.write(ino, []byte(fmt.Sprintf("generation 0 body of file %d", i)))
+		inos = append(inos, ino)
+	}
+	gen0 := publishVolume(t, v, inner, publish.Options{})
+
+	fs := openFS(t, inner, gen0.Superblock, genfs.Options{})
+	dirNode, err := fs.Lookup(ctx, genfs.RootInode, "d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range inos {
+		if _, err := fs.Lookup(ctx, dirNode.Inode, fmt.Sprintf("f%04d.txt", i)); err != nil {
+			t.Fatalf("lookup f%04d.txt: %v", i, err)
+		}
+	}
+
+	added := v.create(dir, "added.txt")
+	v.write(added, []byte("new in generation 1"))
+	gen1 := publishVolume(t, v, inner, publish.Options{
+		Prev: gen0.Superblock, PrevRaw: gen0.Raw,
+	})
+
+	// Hammer the tree from several goroutines for the whole swap. Every
+	// inode below is resident and present in BOTH generations, so every
+	// one of these calls must succeed no matter when it lands.
+	stop := make(chan struct{})
+	errs := make(chan error, 8)
+	var wg sync.WaitGroup
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				name := fmt.Sprintf("f%04d.txt", (i*7+w*131)%files)
+				n, err := fs.Lookup(ctx, dirNode.Inode, name)
+				if err != nil {
+					errs <- fmt.Errorf("lookup %s during swap: %w", name, err)
+					return
+				}
+				if _, err := fs.GetAttr(ctx, n.Inode); err != nil {
+					errs <- fmt.Errorf("getattr %s (inode %d) during swap: %w", name, n.Inode, err)
+					return
+				}
+				if _, err := fs.Readdir(ctx, dirNode.Inode); err != nil {
+					errs <- fmt.Errorf("readdir during swap: %w", err)
+					return
+				}
+			}
+		}(w)
+	}
+	// Let the workers get going so the swap really does overlap them.
+	time.Sleep(20 * time.Millisecond)
+	if _, err := fs.Swap(ctx, gen1.Superblock); err != nil {
+		t.Fatalf("Swap: %v", err)
+	}
+	close(stop)
+	wg.Wait()
+	select {
+	case err := <-errs:
+		t.Fatalf("operation failed across a generation swap: %v", err)
+	default:
 	}
 }

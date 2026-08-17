@@ -78,7 +78,11 @@ func (fs *FS) Prefetch(ctx context.Context, workers int) (*PrefetchReport, error
 				}
 			case n.Type == catalog.TypeFile:
 				rep.Files++
-				ext, err := fs.extentsOf(ctx, n.Inode)
+				ext, err := func() (*extents, error) {
+					fs.swapMu.RLock()
+					defer fs.swapMu.RUnlock()
+					return fs.extentsOf(ctx, n.Inode)
+				}()
 				if err != nil {
 					return fmt.Errorf("prefetch: extents of %q: %w", e.Name, err)
 				}

@@ -81,6 +81,11 @@ type Options struct {
 	// and therefore cannot be hurt by eviction — without it, residency
 	// grows for the life of a long-running mount over a large tree.
 	MaxResident int
+	// PackCacheBytes bounds the whole-pack cache under CacheDir; zero
+	// selects DefaultPackCacheBytes. A NEGATIVE value disables whole-pack
+	// caching entirely, leaving reads on coalesced ranges — the right
+	// setting where local space is scarcer than bandwidth.
+	PackCacheBytes int64
 }
 
 // Node is one inode's attributes: catalog.Node with a kernel-shaped uint64
@@ -143,6 +148,7 @@ type FS struct {
 	dek      []byte
 	chunkDir string
 	catDir   string
+	packDir  string
 
 	// verify: recompute plain-BLAKE3 identities at cache fill (unencrypted
 	// volumes only; see the package comment).
@@ -150,9 +156,36 @@ type FS struct {
 	hasher chunkid.Hasher
 
 	packIndex map[string]packLoc
+	// packSize is the SIGNED length of each listed pack — the only
+	// whole-object check a cached copy can be held to.
+	packSize map[string]int64
+
+	// packCacheCap bounds the whole-pack cache; packUses is the piecemeal
+	// consumption evidence that promotes a pack into it (packfetch.go).
+	packCacheCap int64
+	packMu       sync.Mutex
+	packUses     map[string]*packUse
+	evictMu      sync.Mutex
 
 	cats *catCache
 	ext  *extentCache
+
+	// swapMu makes a generation swap atomic with respect to filesystem
+	// operations: every operation holds it for READ for its whole
+	// duration, Swap holds it for WRITE while it replaces the served
+	// generation. Without it a swap is visible half-applied — it empties
+	// the residency table before re-descending it, replaces the catalog
+	// cache, and closes the old catalogs — so an operation straddling it
+	// fails against state that belongs to neither generation. That is not
+	// theoretical: a writable mount checkpoints on a timer, and every
+	// checkpoint made a burst of concurrent creates fail with ESTALE (and,
+	// where a catalog handle was yanked mid-read, EIO) for the tens of
+	// milliseconds the swap took.
+	//
+	// Blocking is the right answer here rather than serving the old
+	// generation through the window: a swap is bounded by residency, and
+	// a paused operation is correct where a failed one is not.
+	swapMu sync.RWMutex
 
 	mu  sync.RWMutex
 	res map[uint64]*residency
@@ -181,25 +214,37 @@ func Open(ctx context.Context, o Options) (*FS, error) {
 	if o.SB.CatalogKeyID != 0 && len(o.DEK) == 0 {
 		return nil, errors.New("genfs: volume catalogs are encrypted but no DEK was provided")
 	}
+	if o.PackCacheBytes == 0 {
+		o.PackCacheBytes = DefaultPackCacheBytes
+	}
 	catDir := filepath.Join(o.CacheDir, "catalogs")
 	chunkDir := filepath.Join(o.CacheDir, "chunks")
-	for _, d := range []string{catDir, chunkDir} {
+	packDir := filepath.Join(o.CacheDir, "packs")
+	dirs := []string{catDir, chunkDir}
+	if o.PackCacheBytes > 0 {
+		dirs = append(dirs, packDir)
+	}
+	for _, d := range dirs {
 		if err := os.MkdirAll(d, 0700); err != nil {
 			return nil, fmt.Errorf("genfs: cache dir: %w", err)
 		}
 	}
 	fs := &FS{
-		inner:       o.Inner,
-		sb:          o.SB,
-		dek:         o.DEK,
-		chunkDir:    chunkDir,
-		catDir:      catDir,
-		packIndex:   make(map[string]packLoc),
-		ext:         newExtentCache(extentCacheCap),
-		res:         make(map[uint64]*residency),
-		resLRU:      list.New(),
-		maxResident: o.MaxResident,
-		fills:       make(map[string]*fillGate),
+		inner:        o.Inner,
+		sb:           o.SB,
+		dek:          o.DEK,
+		chunkDir:     chunkDir,
+		catDir:       catDir,
+		packDir:      packDir,
+		packIndex:    make(map[string]packLoc),
+		packSize:     make(map[string]int64),
+		packCacheCap: o.PackCacheBytes,
+		packUses:     make(map[string]*packUse),
+		ext:          newExtentCache(extentCacheCap),
+		res:          make(map[uint64]*residency),
+		resLRU:       list.New(),
+		maxResident:  o.MaxResident,
+		fills:        make(map[string]*fillGate),
 	}
 	// Identity index: every trailer in the generation's pack list, built
 	// once, and no trailer's entries trusted until the stored bytes hash
@@ -211,6 +256,7 @@ func Open(ctx context.Context, o Options) (*FS, error) {
 		if err != nil {
 			return nil, fmt.Errorf("genfs: index pack %s: %w", pe.Name, err)
 		}
+		fs.packSize[pe.Name] = pe.Size
 		for _, e := range entries {
 			fs.packIndex[e.Key] = packLoc{pack: pe.Name, off: e.Off, length: e.Length}
 		}
@@ -254,6 +300,8 @@ func Open(ctx context.Context, o Options) (*FS, error) {
 // Close releases every open catalog handle. Spill and chunk cache files
 // remain in CacheDir for the next Open.
 func (fs *FS) Close() error {
+	fs.swapMu.Lock()
+	defer fs.swapMu.Unlock()
 	return fs.cats.closeAll()
 }
 
@@ -313,6 +361,12 @@ func (fs *FS) retain(ino uint64, catHex string, parent uint64, name string) {
 // records the CHILD catalog as its residency: its attrs come from the
 // parent catalog's node row, its entries resolve in the child.
 func (fs *FS) Lookup(ctx context.Context, parent uint64, name string) (Node, error) {
+	fs.swapMu.RLock()
+	defer fs.swapMu.RUnlock()
+	return fs.lookup(ctx, parent, name)
+}
+
+func (fs *FS) lookup(ctx context.Context, parent uint64, name string) (Node, error) {
 	catHex, err := fs.residencyOf(parent)
 	if err != nil {
 		return Node{}, err
@@ -351,6 +405,8 @@ func (fs *FS) Parent(ino uint64) (uint64, error) {
 	if ino == RootInode {
 		return RootInode, nil
 	}
+	fs.swapMu.RLock()
+	defer fs.swapMu.RUnlock()
 	fs.mu.RLock()
 	defer fs.mu.RUnlock()
 	r, ok := fs.res[ino]
@@ -370,8 +426,12 @@ func (fs *FS) Parent(ino uint64) (uint64, error) {
 // handle — without genfs keeping a reverse index (the catalog is a
 // locator BY DESCENT; a registry would rebuild the CVMFS hotspot).
 func (fs *FS) LookupPath(ctx context.Context, p string) (Node, error) {
+	// One read lock for the whole descent: an intermediate step resolved
+	// in a different generation than its successor is not a path.
+	fs.swapMu.RLock()
+	defer fs.swapMu.RUnlock()
 	ino := RootInode
-	node, err := fs.GetAttr(ctx, ino)
+	node, err := fs.getAttr(ctx, ino)
 	if err != nil {
 		return Node{}, err
 	}
@@ -379,7 +439,7 @@ func (fs *FS) LookupPath(ctx context.Context, p string) (Node, error) {
 		if part == "" || part == "." {
 			continue
 		}
-		node, err = fs.Lookup(ctx, ino, part)
+		node, err = fs.lookup(ctx, ino, part)
 		if err != nil {
 			return Node{}, err
 		}
@@ -389,16 +449,28 @@ func (fs *FS) LookupPath(ctx context.Context, p string) (Node, error) {
 }
 
 // Generation reports the served generation number.
-func (fs *FS) Generation() uint64 { return fs.sb.Generation }
+func (fs *FS) Generation() uint64 {
+	fs.swapMu.RLock()
+	defer fs.swapMu.RUnlock()
+	return fs.sb.Generation
+}
 
 // RootCatalog reports the generation's root catalog identity — the value
 // an overlay pins to refuse reopening over a different generation.
-func (fs *FS) RootCatalog() [32]byte { return fs.sb.RootCatalog }
+func (fs *FS) RootCatalog() [32]byte {
+	fs.swapMu.RLock()
+	defer fs.swapMu.RUnlock()
+	return fs.sb.RootCatalog
+}
 
 // NextInode reports the generation's allocator high-water mark, so a
 // writer layered above allocates inodes that never collide with the
 // base's.
-func (fs *FS) NextInode() uint64 { return fs.sb.NextInode }
+func (fs *FS) NextInode() uint64 {
+	fs.swapMu.RLock()
+	defer fs.swapMu.RUnlock()
+	return fs.sb.NextInode
+}
 
 // Usage reports total stored bytes and the allocator high-water mark,
 // for synthesizing statfs. Bytes come from the generation's pack list
@@ -406,6 +478,8 @@ func (fs *FS) NextInode() uint64 { return fs.sb.NextInode }
 // NextInode, not counted — a true count would mean walking every
 // catalog.
 func (fs *FS) Usage() (bytes int64, inodes uint64) {
+	fs.swapMu.RLock()
+	defer fs.swapMu.RUnlock()
 	for _, pe := range fs.sb.PackList {
 		bytes += pe.Size
 	}
@@ -414,6 +488,12 @@ func (fs *FS) Usage() (bytes int64, inodes uint64) {
 
 // GetAttr returns an inode's attributes from its residency catalog.
 func (fs *FS) GetAttr(ctx context.Context, ino uint64) (Node, error) {
+	fs.swapMu.RLock()
+	defer fs.swapMu.RUnlock()
+	return fs.getAttr(ctx, ino)
+}
+
+func (fs *FS) getAttr(ctx context.Context, ino uint64) (Node, error) {
 	catHex, err := fs.residencyOf(ino)
 	if err != nil {
 		return Node{}, err
@@ -440,6 +520,12 @@ func (fs *FS) GetAttr(ctx context.Context, ino uint64) (Node, error) {
 // Readdir does not create residency — the kernel Lookups before operating
 // on an entry.
 func (fs *FS) Readdir(ctx context.Context, ino uint64) ([]DirEntry, error) {
+	fs.swapMu.RLock()
+	defer fs.swapMu.RUnlock()
+	return fs.readdir(ctx, ino)
+}
+
+func (fs *FS) readdir(ctx context.Context, ino uint64) ([]DirEntry, error) {
 	catHex, err := fs.residencyOf(ino)
 	if err != nil {
 		return nil, err
@@ -464,6 +550,8 @@ func (fs *FS) Readdir(ctx context.Context, ino uint64) ([]DirEntry, error) {
 
 // Readlink returns a symlink's target.
 func (fs *FS) Readlink(ctx context.Context, ino uint64) (string, error) {
+	fs.swapMu.RLock()
+	defer fs.swapMu.RUnlock()
 	cat, release, _, err := fs.acquireContent(ctx, ino)
 	if err != nil {
 		return "", err
@@ -482,6 +570,8 @@ func (fs *FS) Readlink(ctx context.Context, ino uint64) (string, error) {
 // GetXattr returns one extended attribute; ErrNotExist when the inode has
 // no attribute of that name.
 func (fs *FS) GetXattr(ctx context.Context, ino uint64, name string) ([]byte, error) {
+	fs.swapMu.RLock()
+	defer fs.swapMu.RUnlock()
 	cat, release, _, err := fs.acquireContent(ctx, ino)
 	if err != nil {
 		return nil, err
@@ -501,6 +591,8 @@ func (fs *FS) GetXattr(ctx context.Context, ino uint64, name string) ([]byte, er
 
 // ListXattr returns an inode's extended-attribute names, sorted.
 func (fs *FS) ListXattr(ctx context.Context, ino uint64) ([]string, error) {
+	fs.swapMu.RLock()
+	defer fs.swapMu.RUnlock()
 	cat, release, _, err := fs.acquireContent(ctx, ino)
 	if err != nil {
 		return nil, err
@@ -524,6 +616,8 @@ func (fs *FS) Forget(ino uint64, nlookup uint64) {
 	if ino == RootInode {
 		return
 	}
+	fs.swapMu.RLock()
+	defer fs.swapMu.RUnlock()
 	fs.mu.Lock()
 	dropped := false
 	if r := fs.res[ino]; r != nil {
@@ -670,7 +764,7 @@ func (fs *FS) spillCatalog(ctx context.Context, idHex string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("genfs: catalog %s not present in any listed pack", idHex)
 	}
-	stored, err := fs.readPackRange(ctx, loc)
+	stored, err := fs.packRead(ctx, loc)
 	if err != nil {
 		return "", err
 	}

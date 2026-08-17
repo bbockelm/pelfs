@@ -93,15 +93,26 @@ func (fs *FS) Swap(ctx context.Context, sb *superblock.Superblock) (*SwapReport,
 	// Build the new location layer before touching anything served: a
 	// failure here leaves the mount on its current generation.
 	newIndex := make(map[string]packLoc)
+	newSizes := make(map[string]int64, len(sb.PackList))
 	for _, pe := range sb.PackList {
 		entries, err := packstore.FetchTrailerVerified(ctx, fs.inner, pe.Name, pe.Size, pe.TrailerHash)
 		if err != nil {
 			return nil, fmt.Errorf("genfs: swap: index pack %s: %w", pe.Name, err)
 		}
+		newSizes[pe.Name] = pe.Size
 		for _, e := range entries {
 			newIndex[e.Key] = packLoc{pack: pe.Name, off: e.Off, length: e.Length}
 		}
 	}
+
+	// Everything from here to the end of the re-descend replaces served
+	// state, and none of it is atomic on its own: the residency table is
+	// emptied before it is rebuilt, the catalog cache is replaced, and the
+	// old catalogs are closed out from under whoever holds them. Hold the
+	// swap lock across the lot so an operation runs entirely in one
+	// generation or entirely in the other, never against the seam.
+	fs.swapMu.Lock()
+	defer fs.swapMu.Unlock()
 
 	// Snapshot what the kernel holds, parent-first: a child's new
 	// residency is resolved through its parent's, so order matters.
@@ -129,10 +140,10 @@ func (fs *FS) Swap(ctx context.Context, sb *superblock.Superblock) (*SwapReport,
 	before := make(map[uint64]Node, len(order))
 	beforeDirs := make(map[uint64]map[string]uint64)
 	for _, h := range order {
-		if n, err := fs.GetAttr(ctx, h.ino); err == nil {
+		if n, err := fs.getAttr(ctx, h.ino); err == nil {
 			before[h.ino] = n
 			if n.Type == catalog.TypeDir {
-				if entries, err := fs.Readdir(ctx, h.ino); err == nil {
+				if entries, err := fs.readdir(ctx, h.ino); err == nil {
 					m := make(map[string]uint64, len(entries))
 					for _, e := range entries {
 						m[e.Name] = e.Node.Inode
@@ -142,7 +153,7 @@ func (fs *FS) Swap(ctx context.Context, sb *superblock.Superblock) (*SwapReport,
 			}
 		}
 	}
-	if rootEntries, err := fs.Readdir(ctx, RootInode); err == nil {
+	if rootEntries, err := fs.readdir(ctx, RootInode); err == nil {
 		m := make(map[string]uint64, len(rootEntries))
 		for _, e := range rootEntries {
 			m[e.Name] = e.Node.Inode
@@ -156,10 +167,18 @@ func (fs *FS) Swap(ctx context.Context, sb *superblock.Superblock) (*SwapReport,
 	fs.mu.Lock()
 	fs.sb = sb
 	fs.packIndex = newIndex
+	fs.packSize = newSizes
 	fs.res = make(map[uint64]*residency, len(order))
 	fs.resLRU.Init()
 	fs.mu.Unlock()
 	fs.ext.clear()
+	// Cached PACK FILES stay: packs are immutable and content-addressed by
+	// name, so a copy on disk is as valid for the new generation as for
+	// the old. Only the piecemeal-consumption evidence resets — it is a
+	// statement about what this generation's readers have asked for.
+	fs.packMu.Lock()
+	fs.packUses = make(map[string]*packUse)
+	fs.packMu.Unlock()
 
 	rootPath, err := fs.spillCatalog(ctx, rootHex)
 	if err != nil {
@@ -185,7 +204,7 @@ func (fs *FS) Swap(ctx context.Context, sb *superblock.Superblock) (*SwapReport,
 
 	// Re-descend the held set and diff it against the pre-swap view.
 	for _, h := range order {
-		node, err := fs.Lookup(ctx, h.parent, h.name)
+		node, err := fs.lookup(ctx, h.parent, h.name)
 		if err != nil || node.Inode != h.ino {
 			// The edge is gone, or now names a different inode: either
 			// way the kernel's dentry for it is wrong.
@@ -214,7 +233,7 @@ func (fs *FS) Swap(ctx context.Context, sb *superblock.Superblock) (*SwapReport,
 	// Directory listings: announce added and removed names so cached
 	// dentries (including negative ones) do not outlive the swap.
 	for dir, oldEntries := range beforeDirs {
-		newEntries, err := fs.Readdir(ctx, dir)
+		newEntries, err := fs.readdir(ctx, dir)
 		if err != nil {
 			continue // the directory itself is gone; already reported above
 		}

@@ -15,14 +15,11 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/juicedata/juicefs/pkg/object"
 )
 
 // directStore talks to a single HTTP(S) server (an origin, or the fakeorigin
 // test server) with no federation discovery. Test/dev transport.
 type directStore struct {
-	object.DefaultObjectStorage
 	base *url.URL // endpoint + prefix path; object keys appended below this
 	tok  *tokenSource
 	hc   *http.Client
@@ -86,15 +83,6 @@ func (s *directStore) String() string {
 	return fmt.Sprintf("pelican+direct://%s%s/", s.base.Host, s.base.Path)
 }
 
-func (s *directStore) Limits() object.Limits {
-	return object.Limits{IsSupportMultipartUpload: false}
-}
-
-func (s *directStore) Create(ctx context.Context) error {
-	// Namespaces exist a priori; nothing to create.
-	return nil
-}
-
 func drainAndClose(resp *http.Response) {
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
 	resp.Body.Close()
@@ -108,7 +96,7 @@ func statusErr(op, key string, resp *http.Response) error {
 	return err
 }
 
-func (s *directStore) Get(ctx context.Context, key string, off, limit int64, getters ...object.AttrGetter) (io.ReadCloser, error) {
+func (s *directStore) Get(ctx context.Context, key string, off, limit int64) (io.ReadCloser, error) {
 	req, err := s.newReq(ctx, http.MethodGet, key, nil)
 	if err != nil {
 		return nil, err
@@ -148,7 +136,7 @@ func (s *directStore) Get(ctx context.Context, key string, off, limit int64, get
 	}
 }
 
-func (s *directStore) Put(ctx context.Context, key string, in io.Reader, getters ...object.AttrGetter) error {
+func (s *directStore) Put(ctx context.Context, key string, in io.Reader) error {
 	var body io.ReadSeeker
 	if rs, ok := in.(io.ReadSeeker); ok {
 		body = rs
@@ -191,7 +179,7 @@ func (s *directStore) Put(ctx context.Context, key string, in io.Reader, getters
 	return statusErr("put", key, resp)
 }
 
-func (s *directStore) Delete(ctx context.Context, key string, getters ...object.AttrGetter) error {
+func (s *directStore) Delete(ctx context.Context, key string) error {
 	req, err := s.newReq(ctx, http.MethodDelete, key, nil)
 	if err != nil {
 		return err
@@ -207,12 +195,12 @@ func (s *directStore) Delete(ctx context.Context, key string, getters ...object.
 	return statusErr("delete", key, resp)
 }
 
-func (s *directStore) Head(ctx context.Context, key string) (object.Object, error) {
+func (s *directStore) Head(ctx context.Context, key string) (*Object, error) {
 	ki, err := s.StatKey(ctx, key)
 	if err != nil {
 		return nil, err
 	}
-	return newObj(key, ki.Size, ki.Mtime, strings.HasSuffix(key, "/")), nil
+	return &Object{Key: key, Size: ki.Size, Mtime: ki.Mtime, IsDir: strings.HasSuffix(key, "/")}, nil
 }
 
 func (s *directStore) StatKey(ctx context.Context, key string) (*KeyInfo, error) {
@@ -267,7 +255,7 @@ func (s *directStore) ListDir(ctx context.Context, dir string) ([]DirEntry, erro
 	return res, nil
 }
 
-func (s *directStore) ListAll(ctx context.Context, prefix, marker string, followLink bool) (<-chan object.Object, error) {
+func (s *directStore) ListAll(ctx context.Context, prefix, marker string) (<-chan *Object, error) {
 	return listAll(ctx, s, prefix, marker)
 }
 

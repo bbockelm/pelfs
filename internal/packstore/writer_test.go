@@ -11,8 +11,6 @@ import (
 
 	"lukechampine.com/blake3"
 
-	"github.com/juicedata/juicefs/pkg/object"
-
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 )
 
@@ -168,20 +166,20 @@ func (f *flakyStore) trip() error {
 	return nil
 }
 
-func (f *flakyStore) Put(ctx context.Context, key string, in io.Reader, getters ...object.AttrGetter) error {
+func (f *flakyStore) Put(ctx context.Context, key string, in io.Reader) error {
 	if err := f.trip(); err != nil {
 		// Consume part of the body to prove retries rewind correctly.
 		_, _ = io.CopyN(io.Discard, in, 10)
 		return err
 	}
-	return f.Store.Put(ctx, key, in, getters...)
+	return f.Store.Put(ctx, key, in)
 }
 
-func (f *flakyStore) Get(ctx context.Context, key string, off, limit int64, getters ...object.AttrGetter) (io.ReadCloser, error) {
+func (f *flakyStore) Get(ctx context.Context, key string, off, limit int64) (io.ReadCloser, error) {
 	if err := f.trip(); err != nil {
 		return nil, err
 	}
-	return f.Store.Get(ctx, key, off, limit, getters...)
+	return f.Store.Get(ctx, key, off, limit)
 }
 
 func (f *flakyStore) ListDir(ctx context.Context, dir string) ([]pelicanobj.DirEntry, error) {

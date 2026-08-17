@@ -24,8 +24,6 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3" // the pure-Go shim driver
-
 	"github.com/bbockelm/pelfs/internal/genfs"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/publish"
@@ -91,8 +89,8 @@ func TestFederationCRUD(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Head: %v", err)
 	}
-	if obj.Size() != int64(len(payload)) {
-		t.Fatalf("Head size = %d, want %d", obj.Size(), len(payload))
+	if obj.Size != int64(len(payload)) {
+		t.Fatalf("Head size = %d, want %d", obj.Size, len(payload))
 	}
 
 	entries, err := s.ListDir(ctx, "crud/blocks/0")

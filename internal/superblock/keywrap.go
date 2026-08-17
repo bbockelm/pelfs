@@ -1,12 +1,10 @@
 // Key wrapping for the superblock key table: 32-byte DEKs and the
-// identity key are RSA-OAEP/SHA-256 encrypted under the user's KEK — the
-// same RSA private key file v1 takes as --encrypt-key. The OAEP label is
-// "keys", matching JuiceFS's key encryptor (object.NewRSAEncryptor), so a
-// v1 KEK wraps and unwraps v2 table entries with no re-keying. The PEM
-// loader accepts what v1's parser accepts, restricted to RSA: PKCS#1,
+// identity key are RSA-OAEP/SHA-256 encrypted under the user's KEK, the
+// RSA private key file --encrypt-key names. The OAEP label is "keys".
+// The PEM loader is deliberately permissive, restricted to RSA: PKCS#1,
 // PKCS#8, legacy-encrypted PEM blocks, and passphrase-protected PKCS#8.
-// Passphrase sourcing (v1 reads JFS_RSA_PASSPHRASE) is the caller's job —
-// this package never reads the environment.
+// Passphrase sourcing is the caller's job — this package never reads the
+// environment.
 
 package superblock
 

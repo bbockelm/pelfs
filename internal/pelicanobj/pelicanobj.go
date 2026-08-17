@@ -1,5 +1,5 @@
-// Package pelicanobj implements a JuiceFS object-storage backend that stores
-// objects in a Pelican federation beneath a fixed namespace prefix.
+// Package pelicanobj stores objects in a Pelican federation beneath a
+// fixed namespace prefix.
 //
 // Two transports are provided behind the Store interface:
 //
@@ -24,7 +24,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/pelicanplatform/pelican/error_codes"
 	log "github.com/sirupsen/logrus"
 )
@@ -85,10 +84,39 @@ type DirEntry struct {
 	Mtime time.Time
 }
 
-// Store is a JuiceFS object storage over a Pelican prefix, extended with the
-// directory/ETag operations the snapshot manager needs.
+// Object is one object as a listing or a Head reports it.
+type Object struct {
+	Key   string
+	Size  int64
+	Mtime time.Time
+	IsDir bool
+}
+
+// ObjectStore is the object surface a transport provides. It is
+// deliberately the smallest set pelfs actually calls: everything in the
+// format is immutable and content-addressed, so there is no rename, no
+// copy, and no multipart upload to abstract over.
+type ObjectStore interface {
+	// String names the transport, for logs and error messages.
+	String() string
+	// Get reads key. A negative limit reads to the end.
+	Get(ctx context.Context, key string, off, limit int64) (io.ReadCloser, error)
+	// Put writes key, replacing any previous object.
+	Put(ctx context.Context, key string, in io.Reader) error
+	// Delete removes key. A missing key is not an error.
+	Delete(ctx context.Context, key string) error
+	// Head reports one object's metadata.
+	Head(ctx context.Context, key string) (*Object, error)
+	// ListAll walks the prefix depth-first in sorted order, emitting every
+	// object whose key begins with prefix and sorts after marker. A nil
+	// value on the channel is the failure sentinel.
+	ListAll(ctx context.Context, prefix, marker string) (<-chan *Object, error)
+}
+
+// Store is an ObjectStore over a Pelican prefix, extended with the
+// directory and ETag operations the ref and pack layers need.
 type Store interface {
-	object.ObjectStorage
+	ObjectStore
 	// ListDir lists the immediate children of dir (a key-space directory
 	// relative to the prefix, "" for the prefix root).
 	ListDir(ctx context.Context, dir string) ([]DirEntry, error)
@@ -271,31 +299,11 @@ func New(ctx context.Context, cfg Config) (Store, error) {
 	}
 }
 
-type pobj struct {
-	key   string
-	size  int64
-	mtime time.Time
-	isDir bool
-}
-
-func newObj(key string, size int64, mtime time.Time, isDir bool) object.Object {
-	return &pobj{key: key, size: size, mtime: mtime, isDir: isDir}
-}
-
-func (o *pobj) Key() string          { return o.key }
-func (o *pobj) Size() int64          { return o.size }
-func (o *pobj) Mtime() time.Time     { return o.mtime }
-func (o *pobj) IsDir() bool          { return o.isDir }
-func (o *pobj) IsSymlink() bool      { return false }
-func (o *pobj) StorageClass() string { return "" }
-func (o *pobj) Status() string       { return "" }
-
-// listAll walks the prefix depth-first in sorted order, emitting every
-// object whose key begins with prefix and sorts after marker. Used by
-// snapshot restore and by JuiceFS offline tools (gc/fsck), not by the mount
-// data path.
-func listAll(ctx context.Context, s Store, prefix, marker string) (<-chan object.Object, error) {
-	ch := make(chan object.Object, 64)
+// listAll is the shared ObjectStore.ListAll implementation over ListDir.
+// It is an inventory operation — never the mount data path, which
+// resolves objects from a generation's pack list.
+func listAll(ctx context.Context, s Store, prefix, marker string) (<-chan *Object, error) {
+	ch := make(chan *Object, 64)
 	go func() {
 		defer close(ch)
 		walk(ctx, s, "", prefix, marker, ch)
@@ -303,7 +311,7 @@ func listAll(ctx context.Context, s Store, prefix, marker string) (<-chan object
 	return ch, nil
 }
 
-func walk(ctx context.Context, s Store, dir, prefix, marker string, ch chan<- object.Object) {
+func walk(ctx context.Context, s Store, dir, prefix, marker string, ch chan<- *Object) {
 	entries, err := s.ListDir(ctx, dir)
 	if err != nil {
 		return
@@ -331,7 +339,7 @@ func walk(ctx context.Context, s Store, dir, prefix, marker string, ch chan<- ob
 		select {
 		case <-ctx.Done():
 			return
-		case ch <- newObj(key, e.Size, e.Mtime, false):
+		case ch <- &Object{Key: key, Size: e.Size, Mtime: e.Mtime}:
 		}
 	}
 }

@@ -8,8 +8,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/juicedata/juicefs/pkg/object"
-
 	"github.com/bbockelm/pelfs/internal/fakeorigin"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 )
@@ -56,7 +54,7 @@ func readObj(t *testing.T, s pelicanobj.Store, key string, off, limit int64) []b
 // key -> size map.
 func listKeys(t *testing.T, s pelicanobj.Store, prefix string) ([]string, map[string]int64) {
 	t.Helper()
-	ch, err := s.ListAll(context.Background(), prefix, "", false)
+	ch, err := s.ListAll(context.Background(), prefix, "")
 	if err != nil {
 		t.Fatalf("ListAll(%q): %v", prefix, err)
 	}
@@ -66,8 +64,8 @@ func listKeys(t *testing.T, s pelicanobj.Store, prefix string) ([]string, map[st
 		if o == nil {
 			t.Fatalf("ListAll(%q) emitted the failure sentinel", prefix)
 		}
-		keys = append(keys, o.Key())
-		sizes[o.Key()] = o.Size()
+		keys = append(keys, o.Key)
+		sizes[o.Key] = o.Size
 	}
 	return keys, sizes
 }
@@ -79,7 +77,7 @@ type rangeLiar struct {
 	pelicanobj.Store
 }
 
-func (r rangeLiar) Get(ctx context.Context, key string, off, limit int64, getters ...object.AttrGetter) (io.ReadCloser, error) {
+func (r rangeLiar) Get(ctx context.Context, key string, off, limit int64) (io.ReadCloser, error) {
 	return r.Store.Get(ctx, key, 0, -1)
 }
 

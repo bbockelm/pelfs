@@ -69,8 +69,8 @@ func TestPutGetHeadDelete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Head: %v", err)
 	}
-	if obj.Size() != int64(len(data)) {
-		t.Fatalf("Head size = %d, want %d", obj.Size(), len(data))
+	if obj.Size != int64(len(data)) {
+		t.Fatalf("Head size = %d, want %d", obj.Size, len(data))
 	}
 
 	if _, err := s.Head(ctx, "no/such/key"); !errors.Is(err, os.ErrNotExist) {
@@ -115,13 +115,13 @@ func TestListDirAndListAll(t *testing.T) {
 		t.Fatalf("ListDir(meta/s1) = %+v", entries)
 	}
 
-	ch, err := s.ListAll(ctx, "chunks/", "", false)
+	ch, err := s.ListAll(ctx, "chunks/", "")
 	if err != nil {
 		t.Fatalf("ListAll: %v", err)
 	}
 	var keys []string
 	for o := range ch {
-		keys = append(keys, o.Key())
+		keys = append(keys, o.Key)
 	}
 	want := []string{"chunks/0/0/1_0_100", "chunks/0/0/2_0_100"}
 	if len(keys) != 2 || keys[0] != want[0] || keys[1] != want[1] {

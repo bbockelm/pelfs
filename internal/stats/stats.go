@@ -3,11 +3,10 @@
 // determine after the fact whether the filesystem encountered errors and
 // whether the session ended with all data safely in the federation.
 //
-// Object-storage operations are counted by wrapping the JuiceFS
-// object.ObjectStorage; note these counts include attempts that JuiceFS
-// retried successfully, so a nonzero error count means "something went
-// wrong at least transiently", while the *_ok booleans describe the final
-// session outcome.
+// Object-storage operations are counted by wrapping the transport; those
+// counts include attempts a lower layer retried successfully, so a
+// nonzero error count means "something went wrong at least transiently",
+// while the *_ok booleans describe the final session outcome.
 package stats
 
 import (
@@ -19,7 +18,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/juicedata/juicefs/pkg/object"
+	"github.com/bbockelm/pelfs/internal/pelicanobj"
 )
 
 // ErrorSample is one recorded failure.
@@ -193,18 +192,18 @@ func (c *Collector) Finalize(exitCode int, clean bool) error {
 	return c.Flush()
 }
 
-// WrapStorage returns an object storage that counts every operation into c.
-func WrapStorage(inner object.ObjectStorage, c *Collector) object.ObjectStorage {
-	return &countingStore{ObjectStorage: inner, c: c}
+// WrapStorage returns an object store that counts every operation into c.
+func WrapStorage(inner pelicanobj.ObjectStore, c *Collector) pelicanobj.ObjectStore {
+	return &countingStore{ObjectStore: inner, c: c}
 }
 
 type countingStore struct {
-	object.ObjectStorage
+	pelicanobj.ObjectStore
 	c *Collector
 }
 
-func (s *countingStore) Get(ctx context.Context, key string, off, limit int64, getters ...object.AttrGetter) (io.ReadCloser, error) {
-	rc, err := s.ObjectStorage.Get(ctx, key, off, limit, getters...)
+func (s *countingStore) Get(ctx context.Context, key string, off, limit int64) (io.ReadCloser, error) {
+	rc, err := s.ObjectStore.Get(ctx, key, off, limit)
 	s.c.Update(func(sum *Summary) { sum.Get.Ops++ })
 	if err != nil {
 		s.c.Update(func(sum *Summary) { sum.Get.Errors++ })
@@ -214,9 +213,9 @@ func (s *countingStore) Get(ctx context.Context, key string, off, limit int64, g
 	return &countingReader{ReadCloser: rc, c: s.c, key: key}, nil
 }
 
-func (s *countingStore) Put(ctx context.Context, key string, in io.Reader, getters ...object.AttrGetter) error {
+func (s *countingStore) Put(ctx context.Context, key string, in io.Reader) error {
 	cr := &countingInput{Reader: in}
-	err := s.ObjectStorage.Put(ctx, key, cr, getters...)
+	err := s.ObjectStore.Put(ctx, key, cr)
 	s.c.Update(func(sum *Summary) {
 		sum.Put.Ops++
 		sum.Put.Bytes += cr.n
@@ -228,8 +227,8 @@ func (s *countingStore) Put(ctx context.Context, key string, in io.Reader, gette
 	return err
 }
 
-func (s *countingStore) Delete(ctx context.Context, key string, getters ...object.AttrGetter) error {
-	err := s.ObjectStorage.Delete(ctx, key, getters...)
+func (s *countingStore) Delete(ctx context.Context, key string) error {
+	err := s.ObjectStore.Delete(ctx, key)
 	s.c.Update(func(sum *Summary) { sum.Delete.Ops++ })
 	if err != nil {
 		s.c.Update(func(sum *Summary) { sum.Delete.Errors++ })
@@ -238,8 +237,8 @@ func (s *countingStore) Delete(ctx context.Context, key string, getters ...objec
 	return err
 }
 
-func (s *countingStore) Head(ctx context.Context, key string) (object.Object, error) {
-	obj, err := s.ObjectStorage.Head(ctx, key)
+func (s *countingStore) Head(ctx context.Context, key string) (*pelicanobj.Object, error) {
+	obj, err := s.ObjectStore.Head(ctx, key)
 	s.c.Update(func(sum *Summary) { sum.Other.Ops++ })
 	if err != nil {
 		// Not-found is a routine answer for Head, not a failure.

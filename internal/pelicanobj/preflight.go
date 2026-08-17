@@ -8,8 +8,6 @@ import (
 	"fmt"
 	"os"
 	"strings"
-
-	"github.com/juicedata/juicefs/pkg/object"
 )
 
 // Preflight verifies, before anything mounts, that the prefix is reachable
@@ -68,23 +66,4 @@ func isPermission(err error) bool {
 	return strings.Contains(msg, "403") || strings.Contains(msg, "401") ||
 		strings.Contains(msg, "forbidden") || strings.Contains(msg, "permission denied") ||
 		strings.Contains(msg, "unauthorized") || strings.Contains(msg, "credential is required")
-}
-
-// WrapEncrypted wraps blob so every object is client-side encrypted
-// (aes256gcm with per-object keys wrapped by the given RSA/ECDSA private
-// key, JuiceFS's standard scheme). Both data chunks and metadata snapshots
-// are routed through this wrapper when encryption is enabled.
-func WrapEncrypted(blob object.ObjectStorage, keyPEM []byte) (object.ObjectStorage, error) {
-	privKey, err := object.ParsePrivateKeyFromPem(keyPEM, []byte(os.Getenv("JFS_RSA_PASSPHRASE")))
-	if err != nil {
-		if errors.Is(err, object.ErrKeyNeedPasswd) {
-			return nil, fmt.Errorf("%w: set the JFS_RSA_PASSPHRASE environment variable", err)
-		}
-		return nil, fmt.Errorf("parse encryption private key: %w", err)
-	}
-	encryptor, err := object.NewDataEncryptor(object.NewKeyEncryptor(privKey), "aes256gcm-rsa")
-	if err != nil {
-		return nil, err
-	}
-	return object.NewEncrypted(blob, encryptor), nil
 }

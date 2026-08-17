@@ -1,30 +1,85 @@
 package stats
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
-	"github.com/juicedata/juicefs/pkg/object"
+	"github.com/bbockelm/pelfs/internal/pelicanobj"
 )
 
-func newFileStore(t *testing.T) object.ObjectStorage {
-	t.Helper()
-	s, err := object.CreateStorage("file", t.TempDir()+"/", "", "", "")
+// memStore is the smallest thing the counter can wrap: a map. What is
+// under test is the counting, not any transport.
+type memStore struct {
+	mu   sync.Mutex
+	objs map[string][]byte
+}
+
+func newMemStore() *memStore { return &memStore{objs: map[string][]byte{}} }
+
+func (m *memStore) String() string { return "mem://" }
+
+func (m *memStore) Put(_ context.Context, key string, in io.Reader) error {
+	data, err := io.ReadAll(in)
 	if err != nil {
-		t.Fatal(err)
+		return err
 	}
-	return s
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.objs[key] = data
+	return nil
+}
+
+func (m *memStore) Get(_ context.Context, key string, off, limit int64) (io.ReadCloser, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	data, ok := m.objs[key]
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	if off > int64(len(data)) {
+		off = int64(len(data))
+	}
+	data = data[off:]
+	if limit >= 0 && limit < int64(len(data)) {
+		data = data[:limit]
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
+}
+
+func (m *memStore) Delete(_ context.Context, key string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.objs, key)
+	return nil
+}
+
+func (m *memStore) Head(_ context.Context, key string) (*pelicanobj.Object, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	data, ok := m.objs[key]
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	return &pelicanobj.Object{Key: key, Size: int64(len(data))}, nil
+}
+
+func (m *memStore) ListAll(context.Context, string, string) (<-chan *pelicanobj.Object, error) {
+	return nil, errors.New("not implemented")
 }
 
 func TestCountingAndSummary(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "stats.json")
 	c := New("pelican://fed/pfx", "sess-1", path)
-	s := WrapStorage(newFileStore(t), c)
+	s := WrapStorage(newMemStore(), c)
 
 	payload := strings.Repeat("x", 1000)
 	if err := s.Put(ctx, "a/b", strings.NewReader(payload)); err != nil {

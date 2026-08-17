@@ -7,7 +7,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/pelicanplatform/pelican/error_codes"
 )
 
@@ -21,7 +20,7 @@ type mismatchStore struct {
 	unverifieds int
 }
 
-func (s *mismatchStore) Get(_ context.Context, _ string, _, _ int64, _ ...object.AttrGetter) (io.ReadCloser, error) {
+func (s *mismatchStore) Get(_ context.Context, _ string, _, _ int64) (io.ReadCloser, error) {
 	if s.getErr != nil {
 		return nil, s.getErr
 	}
@@ -93,7 +92,7 @@ type plainStore struct {
 	getErr error
 }
 
-func (s *plainStore) Get(_ context.Context, _ string, _, _ int64, _ ...object.AttrGetter) (io.ReadCloser, error) {
+func (s *plainStore) Get(_ context.Context, _ string, _, _ int64) (io.ReadCloser, error) {
 	return nil, s.getErr
 }
 
@@ -143,7 +142,7 @@ type deferredMismatchStore struct {
 	unverifieds int
 }
 
-func (s *deferredMismatchStore) Get(_ context.Context, _ string, _, _ int64, _ ...object.AttrGetter) (io.ReadCloser, error) {
+func (s *deferredMismatchStore) Get(_ context.Context, _ string, _, _ int64) (io.ReadCloser, error) {
 	return io.NopCloser(&failingReader{
 		err: error_codes.NewTransfer_ChecksumMismatchError(errors.New("md5 differs")),
 	}), nil

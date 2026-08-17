@@ -18,7 +18,6 @@ import (
 
 	"github.com/go-git/go-billy/v5"
 	"github.com/hanwen/go-fuse/v2/fuse"
-	"github.com/juicedata/juicefs/pkg/object"
 
 	"github.com/bbockelm/pelfs/internal/control"
 	"github.com/bbockelm/pelfs/internal/genfs"
@@ -97,10 +96,10 @@ type genSession struct {
 }
 
 // countedStore re-forms a pelicanobj.Store around the statistics wrapper.
-// stats.WrapStorage speaks the JuiceFS object interface, and the phase-3
-// stack needs the two Pelican-specific methods back on top of it.
+// The counter speaks only the object surface; the stack needs the two
+// Pelican-specific methods back on top of it.
 type countedStore struct {
-	object.ObjectStorage
+	pelicanobj.ObjectStore
 	raw pelicanobj.Store
 }
 
@@ -234,7 +233,7 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	}
 	// Every byte the phase-3 stack moves — pack range reads, catalog
 	// fetches, ref reads, seal uploads — goes through the counter.
-	g.inner = countedStore{ObjectStorage: stats.WrapStorage(raw, g.stats), raw: raw}
+	g.inner = countedStore{ObjectStore: stats.WrapStorage(raw, g.stats), raw: raw}
 
 	var trusted ed25519.PublicKey
 	if pubkeyHex != "" {
@@ -417,8 +416,13 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	// typed `exit` -- where v1 exited promptly because it had been
 	// snapshotting all along. The checkpoint path is explicitly safe to
 	// run under a live mount (it seals a frozen snapshot while writes
-	// continue), so drive it on a timer and leave unmount to seal only
-	// the delta since the last one.
+	// continue), so drive it on a timer.
+	//
+	// What each seal after the first costs is the DELTA in content: files
+	// a previous generation already published are carried forward by
+	// identity and never read back (internal/publish, ContentReuser). The
+	// tree walk and the catalog rebuild are still whole-tree, so the cost
+	// scales with the size of the namespace, not with the bytes in it.
 	if rw && o.snapshotInterval > 0 {
 		go g.checkpointPeriodically(sessionCtx, o.snapshotInterval)
 		fmt.Fprintf(os.Stderr, "pelfs: checkpointing every %s (--snapshot-interval 0 disables)\n", o.snapshotInterval)

@@ -11,7 +11,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/pelicanplatform/pelican/client"
 	"github.com/pelicanplatform/pelican/config"
 	"github.com/pelicanplatform/pelican/param"
@@ -21,7 +20,6 @@ import (
 // library, getting its director handling, endpoint failover, retries, and
 // token acquisition for free.
 type fedStore struct {
-	object.DefaultObjectStorage
 	// ctx is the long-lived context the PelicanFS (and its transfer engine)
 	// is bound to. The Pelican fs API does not take per-operation contexts;
 	// per-op cancellation is bounded by JuiceFS's chunk-store timeouts.
@@ -152,16 +150,7 @@ func (s *fedStore) String() string {
 	return s.prefix + "/"
 }
 
-func (s *fedStore) Limits() object.Limits {
-	return object.Limits{IsSupportMultipartUpload: false}
-}
-
-func (s *fedStore) Create(ctx context.Context) error {
-	// The namespace exists a priori in the federation; nothing to create.
-	return nil
-}
-
-func (s *fedStore) Get(ctx context.Context, key string, off, limit int64, getters ...object.AttrGetter) (io.ReadCloser, error) {
+func (s *fedStore) Get(ctx context.Context, key string, off, limit int64) (io.ReadCloser, error) {
 	f, err := s.pfs.OpenFile("/"+strings.TrimLeft(key, "/")+s.querySuffix(), os.O_RDONLY)
 	if err != nil {
 		return nil, mapNotFound(err)
@@ -226,7 +215,7 @@ func (s *fedStore) GetUnverified(_ context.Context, key string) (io.ReadCloser, 
 	return f.(io.ReadCloser), nil
 }
 
-func (s *fedStore) Put(ctx context.Context, key string, in io.Reader, getters ...object.AttrGetter) error {
+func (s *fedStore) Put(ctx context.Context, key string, in io.Reader) error {
 	// Retry safety: the PelicanFS write path streams through a pipe the
 	// transfer engine cannot rewind — a mid-transfer retry re-reads a
 	// half-consumed pipe and corrupts the object (a failure the writing
@@ -259,7 +248,7 @@ func (s *fedStore) Put(ctx context.Context, key string, in io.Reader, getters ..
 	return nil
 }
 
-func (s *fedStore) Delete(ctx context.Context, key string, getters ...object.AttrGetter) error {
+func (s *fedStore) Delete(ctx context.Context, key string) error {
 	err := s.deleteKey(ctx, key)
 	if err != nil && errors.Is(mapNotFound(err), os.ErrNotExist) {
 		// Deletes are idempotent per the ObjectStorage contract.
@@ -268,12 +257,12 @@ func (s *fedStore) Delete(ctx context.Context, key string, getters ...object.Att
 	return err
 }
 
-func (s *fedStore) Head(ctx context.Context, key string) (object.Object, error) {
+func (s *fedStore) Head(ctx context.Context, key string) (*Object, error) {
 	fi, err := s.stat(ctx, key)
 	if err != nil {
 		return nil, mapNotFound(err)
 	}
-	return newObj(key, fi.Size, fi.ModTime, fi.IsCollection), nil
+	return &Object{Key: key, Size: fi.Size, Mtime: fi.ModTime, IsDir: fi.IsCollection}, nil
 }
 
 func (s *fedStore) StatKey(ctx context.Context, key string) (*KeyInfo, error) {
@@ -333,6 +322,6 @@ func (s *fedStore) ListDir(ctx context.Context, dir string) ([]DirEntry, error) 
 	return entries, nil
 }
 
-func (s *fedStore) ListAll(ctx context.Context, prefix, marker string, followLink bool) (<-chan object.Object, error) {
+func (s *fedStore) ListAll(ctx context.Context, prefix, marker string) (<-chan *Object, error) {
 	return listAll(ctx, s, prefix, marker)
 }

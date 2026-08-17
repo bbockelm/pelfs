@@ -9,7 +9,6 @@ import (
 
 	"github.com/bbockelm/pelfs/internal/packstore"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
-	"github.com/juicedata/juicefs/pkg/object"
 )
 
 // gateStore counts concurrent Puts and blocks each one until it has seen
@@ -30,7 +29,7 @@ func newGateStore() *gateStore {
 	return &gateStore{opened: make(chan struct{})}
 }
 
-func (s *gateStore) Put(_ context.Context, _ string, in io.Reader, _ ...object.AttrGetter) error {
+func (s *gateStore) Put(_ context.Context, _ string, in io.Reader) error {
 	s.mu.Lock()
 	s.inFlnow++
 	if s.inFlnow > s.maxSeen {
@@ -120,6 +119,6 @@ type failingStore struct {
 	pelicanobj.Store
 }
 
-func (s *failingStore) Put(_ context.Context, _ string, _ io.Reader, _ ...object.AttrGetter) error {
+func (s *failingStore) Put(_ context.Context, _ string, _ io.Reader) error {
 	return io.ErrClosedPipe
 }

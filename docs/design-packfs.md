@@ -52,7 +52,10 @@ namespace layout" below.)
 A pack is a concatenation of **independently compressed (and encrypted)
 chunks**, plus an index mapping `chunk-hash -> (offset, length)`. Any chunk
 is retrievable with a single HTTP range request — Pelican origins and
-caches serve ranges natively, so a pack never has to be fetched whole.
+caches serve ranges natively, so the FORMAT never requires a whole
+object to serve one entry. Whether a reader exercises that is its own
+policy; genfs takes packs whole and relies on a small cut size instead
+("Whole packs, not ranges").
 
 Explicitly rejected: the literal git packfile format. Git packs are zlib
 streams with delta chains optimized for whole-object reconstruction; a
@@ -64,22 +67,30 @@ ancestor via content addressing, at zero read-path cost. True deltas, if
 ever wanted, are confined to small objects and are not in this design.
 
 Packs hold everything: data chunks, whole small files, catalogs, inode
-shards. Target pack size is 64 MiB (matching the phase-1 middleware's
-TargetSize: large enough that a 10 GB write is ~160 uploads, small enough
-that repack passes and range-served cold reads stay granular); the
-open-pack append strategy is the spool-file design below.
+shards. Target pack size is **2 MiB**; the open-pack append strategy is
+the spool-file design below.
 
-**The first packs of a publish are cut smaller** — 8 MiB, doubling until
+That target was 64 MiB (the phase-1 middleware's) until the read path
+stopped reading packs in pieces. A reader now fetches a pack WHOLE or not
+at all, which makes the cut size the granularity of every transfer it
+makes — the publisher's answer to "what does one small file cost", which
+is not a question a reader can answer for itself. See "Whole packs, not
+ranges" below for the sweep behind the number.
+
+**The first packs of a publish are cut smaller** — 1 MiB, doubling until
 the cut size reaches the target — because nothing can be uploaded until a
-whole pack exists. Cutting only at 64 MiB leaves the uplink idle through
-the first 64 MiB of walking and then has to drain the remainder after the
-walk is over; starting small is the same trade as TCP slow start.
+whole pack exists. Cutting only at the target leaves the uplink idle
+through the first packful of walking and then has to drain the remainder
+after the walk is over; starting small is the same trade as TCP slow
+start.
 Measured against a modelled link on a 185 MiB seal, the ramp takes the
 share of the seal with nothing in flight from 2.0% to 0.5% at 20 Mb/s and
 from 18% to 3% at 1 Gb/s, and moves the first byte from 1.6 s into the
-seal to 0.3 s. It costs at most three extra packs however large the
-volume — and a pack is never free again, because every mount range-reads
-every trailer in the generation's pack list. In wall time the ramp is
+seal to 0.3 s. (Those figures were taken at a 64 MiB target with an
+8 MiB ramp; the shape of the argument is unchanged at 2 MiB from 1 MiB,
+the magnitude is smaller.) It costs at most three extra packs however
+large the volume — and a pack is never free again, because it is a row in
+every superblock from now on. In wall time the ramp is
 worth −1.6% at 20 Mb/s and −6.5% at 100 Mb/s against +6% on a 1 Gb/80 ms
 path, where the seal is limited by how fast the walk produces packs
 (link utilization there is ~17%) and the extra round trips are the whole
@@ -153,14 +164,111 @@ offset 0
 +------------------------------------------------------------+
 ```
 
-Reading a pack cold takes at most two range requests: (1) a fixed-size
-tail probe (128 KiB) — the magic and trailer length sit at the very end,
-and the trailer is usually inside the probe; (2) if the trailer is
-longer than the probe, one exact range read for the rest. After that the
-in-memory index maps key → (offset, length) and every entry is a single
-range-GET. There is no separate index object and no index at the front:
-the trailer IS the index, and putting it at the end is what lets the
-local spool file upload verbatim (zero-copy seal).
+Locating what a pack holds takes at most two range requests: (1) a
+fixed-size tail probe (128 KiB) — the magic and trailer length sit at the
+very end, and the trailer is usually inside the probe; (2) if the trailer
+is longer than the probe, one exact range read for the rest. There is no
+separate index object and no index at the front: the trailer IS the
+index, and putting it at the end is what lets the local spool file upload
+verbatim (zero-copy seal).
+
+What the reader does with that map is its own policy, not the
+container's. genfs asks it one question — WHICH pack holds this identity
+— and then fetches that pack whole.
+
+### Whole packs, not ranges
+
+A pack is immutable and content-addressed, so it is the natural unit for
+a reader's cache. It is now also the unit of transfer: a mount fetches a
+pack whole on the first entry anyone wants from it, and never reads one
+in pieces. (`PackCacheBytes` negative turns this off and leaves reads on
+coalesced ranges — the setting for a client with less disk than
+bandwidth.)
+
+This replaced a promotion heuristic that fetched a pack whole only after
+a reader had demonstrably started consuming it — a byte ratio, an entry
+ratio, a floor on distinct entries, and a bound on how far ahead of the
+reader it would speculate. It worked, and it was unpredictable: the same
+read cost a kilobyte or sixty-four megabytes depending on what the mount
+had happened to read earlier, and tuning it meant tuning four constants
+against a workload nobody can name in advance. Bounding the transfer is
+the publisher's job instead, through the cut size.
+
+Swept against a Linux 6.6 checkout (81,690 files, 255 MiB stored,
+`InlineMax` 2048) at a modelled 20 ms round trip, with each read measured
+both ways — packs whole, and on coalesced ranges, which is the floor on
+bytes moved:
+
+| cut | packs | pack list | cold mount | walk 2026 files | 100 scattered files |
+|-----|-------|-----------|------------|-----------------|---------------------|
+| 1 MiB | 256 | 21.7 KiB | 3 GET, 2.4 MiB | 1.3 s, 36.4 MiB (1.0x) | 2.2 s, 81.8 MiB (2.0x) |
+| 2 MiB | 131 | 11.1 KiB | 3 GET, 2.4 MiB | 0.9 s, 21.8 MiB (1.1x) | 1.7 s, 95.0 MiB (3.8x) |
+| 4 MiB | 65 | 5.5 KiB | 2 GET, 4.1 MiB | 0.8 s, 15.8 MiB (1.3x) | 1.2 s, 138.9 MiB (8.2x) |
+| 8 MiB | 33 | 2.8 KiB | 2 GET, 6.0 MiB | 0.8 s, 20.4 MiB (2.5x) | 1.0 s, 197.5 MiB (15x) |
+| 16 MiB | 17 | 1.4 KiB | 2 GET, 13.6 MiB | 0.7 s, 36.0 MiB (4.7x) | 1.0 s, 245.6 MiB (19x) |
+| 64 MiB | 5 | 433 B | 3 GET, 62.5 MiB | 0.7 s, 66.8 MiB (11x) | 0.6 s, 195.7 MiB (18x) |
+
+Multipliers are against the ranged floor. Read the two workload columns
+as the two halves of the trade:
+
+- **The walk wins outright.** Reading everything under one directory took
+  29–31 s on ranged reads at every cut size, because a source tree is
+  tens of thousands of files each stored as exactly one chunk and there
+  is nothing to coalesce across them. Whole packs answer it in 0.7–1.3 s
+  — about 40x — and at 1–4 MiB they move roughly the bytes the ranged
+  reader moved anyway. This is the workload the policy exists for.
+- **Scattered reads lose, and the cut size is the whole dial.** One
+  hundred small files picked at random across the tree wanted 368 KiB;
+  ranged reads moved 11–41 MiB (most of it locating packs), whole packs
+  moved 82–246 MiB. That is 2x the floor at 1 MiB and 17x at 64 MiB.
+  Wall time is nevertheless BETTER whole-pack at every size, because
+  there are fewer round trips — so the loss is real on a bandwidth-bound
+  link and invisible on a latency-bound one.
+
+2 MiB is the balance point and the shipped default: the walk costs 10%
+over the floor and the scattered penalty is under 4x. 4 MiB moves the
+fewest bytes on a walk and is the better setting for a volume read in
+bulk. Below 1 MiB the fixed 128 KiB tail probe starts to dominate what
+locating a pack costs at all.
+
+The cost that does not appear in the table: every pack is a row in this
+generation's pack list and in every superblock after it, since publish
+carries the list forward. The list grows as volume size over the cut
+size, so a volume two orders of magnitude larger than this corpus wants a
+proportionally larger cut.
+
+### The location layer is resolved on demand
+
+A catalog names an entry's identity; a trailer says which pack holds it.
+A mount needs exactly one of those answers to serve its first question —
+where the root catalog lives — so it no longer indexes the generation to
+start. Probing runs newest-pack-first, which is a good bet because
+publish appends this generation's packs after the ones it carried forward
+and writes the root catalog last.
+
+Measured at three pack counts, before and after (cold mount to first
+readdir, 20 ms modelled round trip):
+
+| packs | eager index | on demand |
+|-------|-------------|-----------|
+| 12 | 66 ms, 13 GET, 1.3 MiB | 44 ms, 2 GET, 6.3 KiB |
+| 102 | 302 ms, 103 GET, 12.5 MiB | 44 ms, 2 GET, 31 KiB |
+| 1002 | 2.9 s, 1003 GET, 125 MiB | 44 ms, 2 GET, 268 KiB |
+
+Two rules keep it honest. **Absence is only ever reported from a complete
+map**: "present in no listed pack" fails a read, and a seal's
+carry-forward check would read it as "this content is gone", so the probe
+resolves every listed pack before saying it. And the callers that reason
+about content they are not about to read — fsck, a seal's carry-forward
+check, a prefetch — ask for the whole map explicitly rather than relying
+on a mount having built it.
+
+The bet on recency loses for a chunk in an old pack. Past a handful of
+serial probes the rest of the map resolves at once: at 1002 packs that
+first old read costs 1001 GETs and 125 MiB — precisely what the eager
+index used to charge every mount — and never again, since verified
+trailers are kept on disk. Recording a location in the superblock would
+remove even that; see "Open format questions".
 
 The `"o"`/`"l"` offsets are relative to the pack start and locate the
 COMPRESSED+ENCRYPTED entry bytes; how to decode them (compression algo,
@@ -183,9 +291,11 @@ share and where they differ:
 
 Index cost: ~100 bytes of JSON per entry before compression; zstd takes
 the structural repetition out, leaving mostly the incompressible hash
-keys (~40-50 B/entry stored). The worst realistic case — a pack full of
-8 KiB small files, ~8000 entries — stores a few hundred KB of trailer
-per 64 MiB pack, well under 1%. JSON-inside-zstd is deliberate: one
+keys (~40-50 B/entry stored). Measured across the Linux 6.6 corpus,
+trailers are 0.84–0.86% of stored bytes at every cut size from 1 to
+64 MiB — the ratio is set by entry size, not by pack size, so cutting
+smaller costs objects and pack-list rows, not container overhead.
+JSON-inside-zstd is deliberate: one
 schema across both eras, and rescue tooling still gets human-legible
 structure for the cost of a zstd -d.
 
@@ -984,9 +1094,11 @@ dedup. Resolution — separate the *identity key* from the *data keys*:
 FastCDC with min/avg/max = 1/4/16 MiB, inline threshold 4 KiB (well below
 the CDC minimum). Rationale: scientific data dedups modestly, so the
 per-chunk costs — a catalog row and a range-GET per chunk — argue for
-large chunks; 4 MiB average preserves continuity with the v1 block size,
-and a 64 MiB pack holds ~16 chunks. Hash digests are 32 bytes (BLAKE3 in
-both modes).
+large chunks; 4 MiB average preserves continuity with the v1 block size.
+Hash digests are 32 bytes (BLAKE3 in both modes). Note the interaction
+with the 2 MiB cut size: a chunk larger than the target seals into a pack
+of its own, so a large file is roughly one pack per chunk and a whole-pack
+fetch of it costs what the chunk costs.
 
 ## Read path / write path / publish
 
@@ -1209,7 +1321,8 @@ authority — the CVMFS translation-machinery scar stays closed.
 
 **Read path.** ReaddirPlus fills entries and attributes in one pass
 from a catalog page. File reads resolve chunkrefs to the identity-keyed
-decoded-chunk cache, then to pack range reads; cache hits serve via
+decoded-chunk cache, then to the pack holding the chunk, fetched whole
+("Whole packs, not ranges"); cache hits serve via
 splice (ReadResultFd) for zero-copy. FOPEN_KEEP_CACHE holds page cache
 across open/close of immutable files; kernel writeback-cache mode
 batches dirty pages for the overlay.
@@ -1294,6 +1407,52 @@ v1 engine, and copy the tree into a fresh prefix served by this one.
 | time-ordered pack names, trailer hash in pack list | content-hash pack names | age guard + ordering come free; the list-recorded hash gives verification anyway |
 | no atime in catalogs | persisted atime | reads must never dirty metadata on a publish-what-changed filesystem |
 | migration = drain v1 read-only into fresh v2 prefix | in-place format conversion | dual-format readers forever, for volumes that are by charter scratch |
+| reader fetches whole packs, publisher cuts small (2 MiB) | promote a pack on consumption evidence (byte/entry ratios, speculation bound) | four constants tuned against an unnameable workload; the same read cost 10 KiB or 64 MiB depending on history |
+| locations resolved on demand, newest pack first | index every trailer at mount | one round trip per pack before serving a byte, scaling with volume rather than with the question |
+
+## Open format questions
+
+One question is open, it is additive, and it is the owner's to decide.
+
+**Nothing in the signed superblock says where any identity lives.**
+`PackEntry` carries a name, a trailer hash, and a size; `RootCatalog`,
+`CatalogEntry.Identity`, and `ShardEntry.Identity` carry identities. There
+is no mapping from identity to pack anywhere except a pack trailer, so a
+cold mount cannot find its own root catalog without fetching at least one.
+
+Three candidates, cheapest first, measured on the corpus above:
+
+1. **Record the root catalog's pack** (a `root_pack` string on the
+   superblock, omitempty per the evolution rule). Saves the one trailer
+   probe a cold mount pays today: 1–2 GETs and 128–256 KiB, ~20–40 ms.
+   Small on average. What it really buys is the tail: the probe order is
+   a heuristic — "the root catalog is in the newest pack, because publish
+   writes it last" — which held at every pack size measured, but if it
+   ever fails (a generation whose root catalog is carried forward
+   unchanged while later packs were appended, or a repack that reorders
+   the list) the probe budget runs out and the mount resolves the whole
+   map instead. At 1002 packs that is 1001 GETs and 125 MiB, at mount.
+   This converts a 1-GET mount with a rare four-figure tail into a 1-GET
+   mount with no tail.
+2. **Record each catalog's pack** (a `pack` field on `CatalogEntry`,
+   which already exists and is already maintained by publish). Makes the
+   whole namespace descent location-free. Measured value is LOW on top of
+   (1), because publish already writes catalogs at the end of a seal, so
+   newest-first already finds them in one or two probes. It buys
+   determinism rather than requests.
+3. **A per-generation location index**: one object holding every
+   trailer's entries merged, named from the superblock by identity and
+   size. This is the one that addresses the real cost. What forces a
+   mount into resolving the whole map is a CHUNK in an old pack, and no
+   amount of catalog metadata helps with that. On this corpus the merged
+   trailers are about 2.2 MiB — one GET — against 251 GETs and 32.1 MiB
+   of tail probes at 1 MiB packs, or 63 GETs and 7.9 MiB at 4 MiB. It is
+   also what would let the cut size go below 1 MiB, where the fixed
+   128 KiB probe currently dominates. Backward compatible in both
+   directions: a reader that finds no such field falls back to trailers,
+   and a reader that does not understand the field ignores it.
+
+None of these has been implemented; the format is unchanged.
 
 ## Open design work
 

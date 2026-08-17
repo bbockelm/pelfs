@@ -190,7 +190,10 @@ func (x *packIndex) mergeLocal() {
 		return
 	}
 	x.localMerged = true
-	for _, pe := range x.packs {
+	// Newest-first, like every other merge here, so a key in several packs
+	// resolves the same way whichever path found it.
+	for i := len(x.packs) - 1; i >= 0; i-- {
+		pe := x.packs[i]
 		if x.isIndexed(pe.Name) {
 			continue
 		}

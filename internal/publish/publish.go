@@ -85,16 +85,49 @@ const (
 	// rebuilds only 41% of the namespace. Raising it trades exit latency
 	// for read locality; lowering it trades incremental seal cost for it.
 	DefaultInlineMax = 2048
-	// DefaultTargetPackSize matches the phase-1 middleware's pack target.
-	DefaultTargetPackSize = 64 << 20
+	// DefaultTargetPackSize is the cut size, and since a reader fetches
+	// packs WHOLE it is also the granularity of every transfer that reader
+	// makes. It is the publisher's answer to "what does one small file
+	// cost", which is not a question the reader can answer for itself.
+	//
+	// Swept against a Linux 6.6 checkout (81,690 files, 255 MiB stored) at
+	// a modelled 20 ms round trip, against the same reads on coalesced
+	// ranges — the floor on bytes moved:
+	//
+	//	cut     packs  cold mount    walk 2026 files    100 scattered files
+	//	 1 MiB    256   3 GET  2.4M  1.3s 36.4M (1.0x)  2.2s  81.8M ( 2.0x)
+	//	 2 MiB    131   3 GET  2.4M  0.9s 21.8M (1.1x)  1.7s  95.0M ( 3.8x)
+	//	 4 MiB     65   2 GET  4.1M  0.8s 15.8M (1.3x)  1.2s 138.9M ( 8.2x)
+	//	 8 MiB     33   2 GET  6.0M  0.8s 20.4M (2.5x)  1.0s 197.5M (15.0x)
+	//	16 MiB     17   2 GET 13.6M  0.7s 36.0M (4.7x)  1.0s 245.6M (19.3x)
+	//	64 MiB      5   3 GET 62.5M  0.7s 66.8M (11.0x) 0.6s 195.7M (17.5x)
+	//
+	// The multipliers are against that floor. The walk — the workload the
+	// whole-pack policy exists for — runs about 40x faster than ranged
+	// reads at every cut size, so the only open question is what those
+	// bytes cost, and at 2 MiB it is 10%. The scattered case is where the
+	// policy loses, and the cut size is the whole dial: a factor of two at
+	// 1 MiB against a factor of seventeen at 64.
+	//
+	// 2 MiB is the balance point. 4 MiB moves the fewest bytes on a walk
+	// and suits a volume read in bulk; 1 MiB halves the scattered penalty
+	// again for four times the objects, and below it the fixed 128 KiB
+	// trailer probe starts to dominate what locating a pack costs at all.
+	//
+	// The cost that does not appear above: every pack is a row in this
+	// generation's pack list and in every superblock after it, because
+	// publish carries the list forward. 131 packs is 11 KiB of superblock;
+	// the list grows as volume size over this number, so a volume orders of
+	// magnitude larger wants a proportionally larger cut.
+	DefaultTargetPackSize = 2 << 20
 	// DefaultFirstPackSize is the size the FIRST pack is cut at; the cut
 	// size then doubles until it reaches TargetPackSize. Nothing can be
 	// uploaded until a whole pack exists, so a seal that only ever cuts at
-	// 64 MiB leaves the uplink idle through its first 64 MiB of walking and
-	// then has to drain the remainder after the walk has finished. Starting
-	// small is the same trade as TCP slow start: pay a handful of extra
-	// objects to stop waiting for the window to fill.
-	DefaultFirstPackSize = 8 << 20
+	// the target leaves the uplink idle through its first packful of
+	// walking and then has to drain the remainder after the walk has
+	// finished. Starting small is the same trade as TCP slow start: pay a
+	// handful of extra objects to stop waiting for the window to fill.
+	DefaultFirstPackSize = 1 << 20
 	// DefaultUploadConcurrency is how many packs may be in flight at once.
 	// Each upload is one long transfer, so this is about covering round
 	// trips rather than about CPU: on a bandwidth-bound uplink extra

@@ -1,7 +1,10 @@
 package nfsmount
 
 import (
+	"fmt"
+	"io/fs"
 	"testing"
+	"time"
 
 	"github.com/go-git/go-billy/v5/memfs"
 	nfshelper "github.com/willscott/go-nfs/helpers"
@@ -152,3 +155,54 @@ func TestHandlesVerifierRoundTrip(t *testing.T) {
 		t.Fatal("an unknown verifier returned data")
 	}
 }
+
+// A verifier retains a whole directory listing, so the cache has to be
+// bounded by the entries it holds and not only by how many listings it
+// holds — otherwise a handful of large directories pin an unbounded
+// amount for the life of the mount.
+func TestVerifiersBoundedByEntries(t *testing.T) {
+	tbl := newTestHandles(1 << 20)
+	big := make([]fs.FileInfo, 8192)
+	for i := range big {
+		big[i] = dummyInfo(fmt.Sprintf("f%06d", i))
+	}
+	for i := 0; i < 200; i++ {
+		tbl.VerifierFor(fmt.Sprintf("/d%d", i), big)
+	}
+	tbl.mu.Lock()
+	entries, listings := tbl.verifyEntries, len(tbl.verifiers)
+	tbl.mu.Unlock()
+	// 200 listings of 8192 is 1.6M entries; the budget must have capped it.
+	if entries > verifyEntryLimit+len(big) {
+		t.Fatalf("verifier cache holds %d entries, budget %d", entries, verifyEntryLimit)
+	}
+	if listings > verifyLimit {
+		t.Fatalf("verifier cache holds %d listings, limit %d", listings, verifyLimit)
+	}
+	// The most recent listing must survive: the caller is about to serve it.
+	if entries < len(big) {
+		t.Fatalf("the listing just cached was evicted (%d entries held)", entries)
+	}
+}
+
+// A directory larger than the whole budget must still be listable.
+func TestVerifierLargerThanBudgetSurvives(t *testing.T) {
+	tbl := newTestHandles(16)
+	huge := make([]fs.FileInfo, verifyEntryLimit*2)
+	for i := range huge {
+		huge[i] = dummyInfo("f")
+	}
+	v := tbl.VerifierFor("/huge", huge)
+	if got := tbl.DataForVerifier("/huge", v); len(got) != len(huge) {
+		t.Fatalf("oversized listing returned %d entries, want %d", len(got), len(huge))
+	}
+}
+
+type dummyInfo string
+
+func (d dummyInfo) Name() string       { return string(d) }
+func (d dummyInfo) Size() int64        { return 0 }
+func (d dummyInfo) Mode() fs.FileMode  { return 0644 }
+func (d dummyInfo) ModTime() time.Time { return time.Time{} }
+func (d dummyInfo) IsDir() bool        { return false }
+func (d dummyInfo) Sys() any           { return nil }

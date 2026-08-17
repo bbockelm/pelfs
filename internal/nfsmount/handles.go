@@ -47,7 +47,35 @@ type handles struct {
 	verifyOrder *list.List // uint64, most recently used at the front
 	verifyElem  map[uint64]*list.Element
 	verifyLimit int
+	// verifyEntries is the number of fs.FileInfo values the cache
+	// currently retains, across every listing (see verifyEntryLimit).
+	verifyEntries int
 }
+
+// The verifier cache is bounded separately from the handle table, and by
+// BYTES as much as by count.
+//
+// A handle retains a path; a verifier retains a whole directory LISTING —
+// one fs.FileInfo per entry, measured at ~85 bytes each. Sizing the two
+// alike (which they were: verifyLimit = the handle limit = 1<<20) puts no
+// useful ceiling on the second: a million cached listings of a thousand
+// entries is 84 GB. Measured on a 100k-file / 2000-directory tree, one
+// `find` left 11 MB of listings pinned for the life of the mount.
+//
+// Nothing needs them for that long. A verifier exists to keep ONE client's
+// READDIR continuation self-consistent while the directory changes under
+// it, which lasts milliseconds; and losing one is not an error — go-nfs
+// re-reads the directory and recomputes the verifier, which still matches
+// whenever the directory has not changed, and yields NFS3ERR_BAD_COOKIE
+// (a restarted scan) only when it has.
+const (
+	// verifyLimit bounds concurrent in-flight directory scans.
+	verifyLimit = 1024
+	// verifyEntryLimit bounds the total retained listing entries, so one
+	// scan of a huge directory cannot pin an unbounded amount on its own.
+	// At ~85 bytes per entry this is roughly 22 MB.
+	verifyEntryLimit = 256 << 10
+)
 
 type handleEntry struct {
 	id   uint64
@@ -71,7 +99,7 @@ func newHandles(h nfs.Handler, limit int) *handles {
 		verifiers:   make(map[uint64][]fs.FileInfo),
 		verifyOrder: list.New(),
 		verifyElem:  make(map[uint64]*list.Element),
-		verifyLimit: limit,
+		verifyLimit: verifyLimit,
 	}
 	if _, err := rand.Read(t.boot[:]); err != nil {
 		// A predictable boot value only weakens the staleness check for
@@ -201,16 +229,24 @@ func (t *handles) VerifierFor(path string, contents []fs.FileInfo) uint64 {
 	defer t.mu.Unlock()
 	if elem, ok := t.verifyElem[id]; ok {
 		t.verifyOrder.MoveToFront(elem)
+		t.verifyEntries += len(contents) - len(t.verifiers[id])
 		t.verifiers[id] = contents
 		return id
 	}
 	t.verifiers[id] = contents
+	t.verifyEntries += len(contents)
 	t.verifyElem[id] = t.verifyOrder.PushFront(id)
-	for t.verifyOrder.Len() > t.verifyLimit {
+	// Evict least-recently-used listings until BOTH bounds hold, but
+	// never the one just cached: the caller is about to serve from it,
+	// and a single directory larger than the entry budget must still be
+	// listable.
+	for t.verifyOrder.Len() > 1 &&
+		(t.verifyOrder.Len() > t.verifyLimit || t.verifyEntries > verifyEntryLimit) {
 		back := t.verifyOrder.Back()
 		old := back.Value.(uint64)
 		t.verifyOrder.Remove(back)
 		delete(t.verifyElem, old)
+		t.verifyEntries -= len(t.verifiers[old])
 		delete(t.verifiers, old)
 	}
 	return id

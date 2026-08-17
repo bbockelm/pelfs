@@ -31,6 +31,18 @@ type DirNode struct {
 	// peel decisions are a function of its children's weights and nothing
 	// else.
 	Weight int64
+	// Pinned marks a directory that must come out as a catalog root
+	// whatever the weights say, because the caller is standing in for its
+	// subtree with a recorded Weight and holds none of its contents.
+	// Split peels it unconditionally and never looks inside it.
+	//
+	// Pinning cannot make a parent oversized: it replaces a child's weight
+	// with a transition row, which is the least a child can cost. It can
+	// leave a catalog SMALLER than the policy would choose — a subtree
+	// that shrank stays its own catalog instead of merging back — and that
+	// is the trade, since merging (ShouldMerge) needs the contents the
+	// caller deliberately did not read.
+	Pinned bool
 }
 
 // Split chooses catalog roots for the tree at root: bottom-up post-order, a
@@ -54,6 +66,12 @@ func Split(root *DirNode, smax, smin int64) []*DirNode {
 	var roots []*DirNode
 	var walk func(d *DirNode) int64
 	walk = func(d *DirNode) int64 {
+		if d.Pinned {
+			// Its subtree is not here to be walked; OwnWeight is what the
+			// generation that DID walk it recorded.
+			d.Weight = d.OwnWeight
+			return d.Weight
+		}
 		w := d.OwnWeight
 		weights := make([]int64, len(d.Children))
 		attached := make([]int, 0, len(d.Children))
@@ -61,6 +79,18 @@ func Split(root *DirNode, smax, smin int64) []*DirNode {
 			weights[i] = walk(c)
 			w += weights[i]
 			attached = append(attached, i)
+		}
+		// Pinned children are peeled before anything is weighed against
+		// smax: they are roots by the caller's decision, not by weight.
+		for pos := 0; pos < len(attached); {
+			i := attached[pos]
+			if !d.Children[i].Pinned {
+				pos++
+				continue
+			}
+			w += TransitionWeight - weights[i]
+			roots = append(roots, d.Children[i])
+			attached = append(attached[:pos], attached[pos+1:]...)
 		}
 		for w > smax && len(attached) > 0 {
 			best := 0

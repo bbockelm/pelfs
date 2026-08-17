@@ -361,3 +361,74 @@ func TestCatalogListCoversTheWholeTree(t *testing.T) {
 	}
 }
 
+
+// Carrying a catalog forward is only half the saving; the other half is
+// never reading the subtree it covers. A seal that still walks 85k inodes
+// to conclude it has nothing to do is still a seal that takes seconds.
+func TestSealPrunesUnchangedSubtrees(t *testing.T) {
+	v := newReuseVol(t, [16]byte{0xca, 0x7a, 0x10, 0x08})
+	v.smax = splitTreeSMax
+	body := v.splitTree()
+	first := v.checkpoint()
+	allDirs := first.Stats.Dirs
+	if allDirs < 10 {
+		t.Fatalf("fixture has %d directories; too few to prove anything", allDirs)
+	}
+
+	sub := lookupPath(t, v.ov, "a/s0")
+	body["a/s0/new.txt"] = []byte("one new file")
+	v.create(sub.Inode, "new.txt", body["a/s0/new.txt"])
+	second := v.checkpoint()
+
+	if second.Stats.SubtreesPruned == 0 {
+		t.Errorf("the walk descended the whole tree for one new file")
+	}
+	if second.Stats.Dirs >= allDirs {
+		t.Errorf("walked %d directories of %d for one new file", second.Stats.Dirs, allDirs)
+	}
+	v.verifyBodies(second, body)
+	compareViews(t, snapshot(t, v.ov), snapshot(t, openGenfs(t, v.inner, second.Superblock, nil)))
+}
+
+// A promoted (nlink > 1) inode's content records live in an inode shard,
+// and shards are rebuilt whole from the walk. A subtree holding one may
+// therefore never be skipped — the rebuilt shard would simply not contain
+// it, and the file would read as empty from a generation that still names
+// it. The recorded promoted count per catalog is what prevents that, and
+// this is the test that it does.
+func TestSealNeverPrunesPromotedInodes(t *testing.T) {
+	ctx := context.Background()
+	v := newReuseVol(t, [16]byte{0xca, 0x7a, 0x10, 0x09})
+	v.smax = splitTreeSMax
+	body := v.splitTree()
+
+	// A hardlinked file, both names inside subtrees that are otherwise
+	// untouched from here on.
+	target := lookupPath(t, v.ov, "b/s0/f0")
+	if _, err := v.ov.Link(ctx, target.Inode, lookupPath(t, v.ov, "b/s1").Inode, "hard"); err != nil {
+		t.Fatalf("link: %v", err)
+	}
+	body["b/s1/hard"] = body["b/s0/f0"]
+	first := v.checkpoint()
+	if first.Stats.PromotedInodes == 0 {
+		t.Fatal("the fixture promoted nothing; the test would prove nothing")
+	}
+	if first.Stats.Shards == 0 {
+		t.Fatal("the fixture wrote no shard")
+	}
+
+	// Change something far away, so everything the hardlink lives in looks
+	// skippable to a seal that is not counting promoted inodes.
+	sub := lookupPath(t, v.ov, "a/s0")
+	body["a/s0/elsewhere.txt"] = []byte("nowhere near the hardlink")
+	v.create(sub.Inode, "elsewhere.txt", body["a/s0/elsewhere.txt"])
+	second := v.checkpoint()
+
+	if second.Stats.PromotedInodes != first.Stats.PromotedInodes {
+		t.Errorf("the second seal saw %d promoted inodes, the first saw %d: the shard lost records",
+			second.Stats.PromotedInodes, first.Stats.PromotedInodes)
+	}
+	// Both names still read, out of a cold cache, from the new generation.
+	v.verifyBodies(second, body)
+	compareViews(t, snapshot(t, v.ov), snapshot(t, openGenfs(t, v.inner, second.Superblock, nil)))
+}

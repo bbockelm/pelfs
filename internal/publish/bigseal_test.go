@@ -273,14 +273,12 @@ func timedSeal(t *testing.T, label string, inner *meterStore, ov *overlay.FS, pr
 		t.Fatalf("%s: %v", label, err)
 	}
 	wall := time.Since(start)
-	t.Logf("SEAL %s: %s wall, %s CPU, %s, %d catalogs (%d reused), %d shards, %d packs, %d chunks added, %d files reused",
+	t.Logf("SEAL %s: %s wall, %s CPU, %s, %d catalogs (%d reused), %d dirs walked, %d subtrees pruned, %d packs, %d chunks added",
 		label, wall.Round(time.Millisecond), (processCPU() - cpu0).Round(time.Millisecond),
-		inner.since(mark), res.Stats.Catalogs, catalogsReused(res.Stats), res.Stats.Shards,
-		len(res.NewPacks), res.Stats.ChunksAdded, res.Stats.ReusedFiles)
+		inner.since(mark), res.Stats.Catalogs, res.Stats.CatalogsReused, res.Stats.Dirs,
+		res.Stats.SubtreesPruned, len(res.NewPacks), res.Stats.ChunksAdded)
 	return res
 }
-
-func catalogsReused(s publish.Stats) int { return s.CatalogsReused }
 
 // processCPU is user+system CPU for the whole process, which is what the
 // owner's `20s CPU` number measures.

@@ -106,6 +106,13 @@ type CatalogReuser interface {
 	// missing from this set is one the seal will publish exactly as the
 	// base generation did, so a missing entry is a lost change.
 	DirtyInodes() (map[uint64]struct{}, error)
+	// DirtyScope places those inodes in the namespace: every changed inode
+	// plus every ancestor of one. A directory outside it has an unchanged
+	// subtree, so the walk can stop there instead of reading it. ok is
+	// false when the source cannot place some changed inode, and the seal
+	// must then walk everything — a scope with a hole in it would publish
+	// a stale subtree silently.
+	DirtyScope() (map[uint64]struct{}, bool, error)
 }
 
 // ---- overlay source ----
@@ -135,6 +142,7 @@ type overlayView interface {
 	BaseRootCatalog() [32]byte
 	BaseContent(ctx context.Context, ino uint64) (genfs.Content, bool, error)
 	DirtyInodes() (map[uint64]struct{}, error)
+	DirtyScope() (map[uint64]struct{}, bool, error)
 }
 
 type overlaySource struct {
@@ -207,6 +215,8 @@ func (s *overlaySource) ExistingContent(ctx context.Context, ino uint64) (genfs.
 }
 
 func (s *overlaySource) DirtyInodes() (map[uint64]struct{}, error) { return s.fs.DirtyInodes() }
+
+func (s *overlaySource) DirtyScope() (map[uint64]struct{}, bool, error) { return s.fs.DirtyScope() }
 
 func srcNodeFromOverlay(n overlay.Node) SrcNode {
 	return SrcNode{

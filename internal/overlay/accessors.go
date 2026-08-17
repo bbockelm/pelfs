@@ -56,6 +56,84 @@ func (fs *FS) NextInode() (uint64, error) {
 func (fs *FS) DirtyInodes() (map[uint64]struct{}, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
+	set, err := fs.rowDirtyLocked()
+	if err != nil {
+		return nil, err
+	}
+	for ino := range fs.dirtySet {
+		set[ino] = struct{}{}
+	}
+	return set, nil
+}
+
+// DirtyScope reports the part of the namespace a seal has to descend
+// into: every inode with a changed row, plus every ancestor of one. A
+// directory outside it has nothing changed anywhere beneath it, so the
+// seal can decline to read it at all.
+//
+// This is DirtyInodes turned into a shape a walk can use. It is built
+// from the TABLES only, not from the memoized set: an inode that appears
+// there with no row left is one whose overlay state was removed, which
+// means it either left the namespace entirely or reverted to what the
+// base holds — neither can change a catalog, and neither can be placed in
+// the tree. Placement runs from each changed inode upward, through
+// overlay edges first (the authority when a name moved), then the base
+// edge this session descended, then the persisted base chain, then base
+// residency.
+//
+// ok is false when some changed inode cannot be placed at all — an
+// overlay reopened in a later session may have forgotten the descent that
+// reached it. The caller must then walk everything; a scope with a hole
+// in it would silently publish a stale subtree, which is the one outcome
+// worth any amount of extra walking to avoid.
+func (fs *FS) DirtyScope() (map[uint64]struct{}, bool, error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	changed, err := fs.rowDirtyLocked()
+	if err != nil {
+		return nil, false, err
+	}
+	scope := make(map[uint64]struct{}, 4*len(changed))
+	scope[RootInode] = struct{}{}
+	var place func(ino uint64, depth int) (bool, error)
+	place = func(ino uint64, depth int) (bool, error) {
+		if _, seen := scope[ino]; seen {
+			return true, nil
+		}
+		if depth > maxBaseChainDepth {
+			return false, nil
+		}
+		parents, err := fs.parentsOfLocked(ino)
+		if err != nil {
+			return false, err
+		}
+		if len(parents) == 0 {
+			return false, nil
+		}
+		scope[ino] = struct{}{}
+		for _, parent := range parents {
+			ok, err := place(parent, depth+1)
+			if err != nil || !ok {
+				return false, err
+			}
+		}
+		return true, nil
+	}
+	for ino := range changed {
+		ok, err := place(ino, 0)
+		if err != nil {
+			return nil, false, err
+		}
+		if !ok {
+			return nil, false, nil
+		}
+	}
+	return scope, true, nil
+}
+
+// rowDirtyLocked is the table half of DirtyInodes: inodes with a row that
+// makes them differ from the base generation.
+func (fs *FS) rowDirtyLocked() (map[uint64]struct{}, error) {
 	set := make(map[uint64]struct{})
 	for _, q := range []string{
 		`SELECT inode FROM onode`,
@@ -81,10 +159,60 @@ func (fs *FS) DirtyInodes() (map[uint64]struct{}, error) {
 			return nil, err
 		}
 	}
-	for ino := range fs.dirtySet {
-		set[ino] = struct{}{}
-	}
 	return set, nil
+}
+
+// parentsOfLocked lists the directories that name ino in the merged view.
+// Empty means "cannot say", never "none": the root answers itself.
+//
+// Every source is consulted, not the first that answers, because they can
+// disagree legitimately — a hardlinked inode has several names, and an
+// inode renamed away from its base path has both an overlay edge and a
+// base chain. Over-reporting a parent only widens the scope.
+func (fs *FS) parentsOfLocked(ino uint64) ([]uint64, error) {
+	if ino == RootInode {
+		return []uint64{RootInode}, nil
+	}
+	var out []uint64
+	seen := make(map[uint64]bool)
+	add := func(p uint64) {
+		if p != 0 && !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	rows, err := fs.q.Query(`SELECT parent FROM oedge WHERE inode = ?`, int64(ino))
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var parent uint64
+		if err := rows.Scan(&parent); err != nil {
+			rows.Close() //nolint:errcheck
+			return nil, err
+		}
+		add(parent)
+	}
+	if err := closeRows(rows); err != nil {
+		return nil, err
+	}
+	if pe, ok := fs.prov[ino]; ok {
+		add(pe.parent)
+	}
+	var parent int64
+	err = fs.q.QueryRow(`SELECT parent FROM obase WHERE inode = ?`, int64(ino)).Scan(&parent)
+	switch {
+	case err == nil:
+		add(uint64(parent))
+	case !errors.Is(err, sql.ErrNoRows):
+		return nil, err
+	}
+	if len(out) == 0 {
+		if p, err := fs.base.Parent(ino); err == nil {
+			add(p)
+		}
+	}
+	return out, nil
 }
 
 // IsDirty reports whether this overlay has touched the inode: an attr

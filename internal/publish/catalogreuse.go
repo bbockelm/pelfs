@@ -89,6 +89,74 @@ func (p *pipeline) catalogKeyID() uint32 {
 	return 0
 }
 
+// armReuse settles, before the walk starts, whether anything may be
+// carried forward — and if so, what the walk is allowed to skip.
+//
+// It runs first because pruning is a decision about where NOT to go, and
+// a walk cannot un-read a directory. The two inputs are different shapes
+// of the same fact: DirtyInodes says which inodes changed, which decides
+// per catalog rebuild-or-carry; DirtyScope places those inodes in the
+// namespace, which decides per directory descend-or-stop. A source that
+// cannot place them all leaves the scope nil and the walk complete —
+// catalogs are still carried where the tree proves them unchanged, just
+// after reading it.
+func (p *pipeline) armReuse() error {
+	reuser, baseCats := p.catalogReuser()
+	if reuser == nil {
+		return nil
+	}
+	dirty, err := reuser.DirtyInodes()
+	if err != nil {
+		return err
+	}
+	p.dirty = dirty
+	p.baseCats = baseCats
+	p.reuseArmed = true
+
+	scope, ok, err := reuser.DirtyScope()
+	if err != nil {
+		return err
+	}
+	if ok {
+		p.scope = scope
+	}
+	return nil
+}
+
+// pruneSubtree reports whether the walk may stop at a directory, and
+// records the catalog it will be replaced by when it may.
+//
+// Three conditions, each covering a different way a skipped subtree could
+// go wrong:
+//
+//   - Nothing changed anywhere below it (the dirty scope). The scope
+//     contains every changed inode and every ancestor of one, so a
+//     directory outside it has an unchanged subtree.
+//   - The previous generation rooted a catalog exactly here, under this
+//     path. That catalog is what stands in for the subtree — its bytes,
+//     its recorded weight, and the nested tree inside it.
+//   - The span holds no promoted (nlink > 1) inodes. Their content
+//     records live in inode SHARDS, which are rebuilt whole from the walk
+//     every generation; skipping one would drop its record from the new
+//     shards and make the file unreadable. The same condition covers the
+//     other multi-parent hazard: only hardlinked files have more than one
+//     parent, so within a prunable span every inode is reachable by
+//     exactly the path the scope reasoned about.
+func (p *pipeline) pruneSubtree(ino uint64, pth string) bool {
+	if p.scope == nil {
+		return false
+	}
+	if _, inScope := p.scope[ino]; inScope {
+		return false
+	}
+	ce, ok := p.baseCats[ino]
+	if !ok || ce.Path != pth || ce.Promoted != 0 {
+		return false
+	}
+	p.pruned[ino] = ce
+	return true
+}
+
 // plan decides what this seal actually has to build: it weighs the tree,
 // splits it into catalog roots, works out which of those catalogs the
 // previous generation already published unchanged, and marks the inodes
@@ -104,15 +172,6 @@ func (p *pipeline) catalogKeyID() uint32 {
 // threshold contributes exactly its length, whether or not anyone has
 // read it yet.
 func (p *pipeline) plan() error {
-	reuser, baseCats := p.catalogReuser()
-	if reuser != nil {
-		dirty, err := reuser.DirtyInodes()
-		if err != nil {
-			return err
-		}
-		p.dirty = dirty
-		p.reuseArmed = true
-	}
 	rootDN := p.buildDirNode(p.src.Root(), "/")
 	roots := catalog.Split(rootDN, p.o.SMax, catalog.SMin)
 	for _, dn := range roots {
@@ -120,7 +179,7 @@ func (p *pipeline) plan() error {
 		p.isCatRoot[ino] = true
 		p.catWeight[ino] = dn.Weight
 	}
-	p.planReuse(baseCats)
+	p.planReuse(p.baseCats)
 	p.planContent()
 	p.countPromoted()
 	return nil

@@ -315,6 +315,10 @@ func (s *Snapshot) Dirty() (*DirtyReport, error) { return s.view.Dirty() }
 // the tree being sealed, not whatever the mount has done since.
 func (s *Snapshot) DirtyInodes() (map[uint64]struct{}, error) { return s.view.DirtyInodes() }
 
+// DirtyScope reports the frozen changed set placed in the namespace: the
+// directories a seal of this snapshot must descend into.
+func (s *Snapshot) DirtyScope() (map[uint64]struct{}, bool, error) { return s.view.DirtyScope() }
+
 // breakSnapshotLinkLocked gives ino a private staging file when a live
 // snapshot froze bytes at or above below. Snapshots hold hardlinks, so
 // the copy replaces the LIVE name and every snapshot keeps the old inode;

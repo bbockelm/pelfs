@@ -156,6 +156,11 @@ type Stats struct {
 	// did not change, so their bytes — already in a pack this generation
 	// still lists — are referenced, never rewritten.
 	CatalogsReused int
+	// SubtreesPruned counts directories the walk stopped at: subtrees this
+	// seal never read at all, because the catalog covering them is being
+	// carried forward whole. It is the difference between "did not rewrite
+	// the tree" and "did not look at the tree".
+	SubtreesPruned int
 }
 
 // Result is a successful publish.
@@ -227,15 +232,22 @@ func Publish(ctx context.Context, o Options) (*Result, error) {
 		catIdentity: make(map[uint64]chunkid.Identity),
 
 		subtreeDirty: make(map[uint64]bool),
+		pruned:       make(map[uint64]superblock.CatalogEntry),
 		carried:      make(map[uint64]superblock.CatalogEntry),
 		catWeight:    make(map[uint64]int64),
 		catPromoted:  make(map[uint64]int),
 	}
 	defer p.pk.abort()
 
+	// Before the walk: the walk itself skips what this settles is
+	// unchanged (catalogreuse.go).
+	if err := p.armReuse(); err != nil {
+		return nil, err
+	}
 	if err := p.walk(ctx); err != nil {
 		return nil, err
 	}
+	p.stats.SubtreesPruned = len(p.pruned)
 	if err := p.loadDedupIndex(); err != nil {
 		return nil, err
 	}
@@ -408,6 +420,9 @@ type pipeline struct {
 	// every inode reads as dirty and the whole tree is rebuilt.
 	reuseArmed   bool
 	dirty        map[uint64]struct{}
+	scope        map[uint64]struct{}
+	baseCats     map[uint64]superblock.CatalogEntry
+	pruned       map[uint64]superblock.CatalogEntry
 	subtreeDirty map[uint64]bool
 	carried      map[uint64]superblock.CatalogEntry
 	carriedList  []superblock.CatalogEntry
@@ -424,6 +439,11 @@ type pipeline struct {
 // The descent is strictly parent-before-child (Readdir per directory) — the
 // order a residency-by-lookup source requires; edges are sorted afterwards,
 // so no source's own listing order is observable in the output.
+//
+// It stops at directories the plan says are being carried forward whole
+// (see prunable): their contents are already published, already
+// described, and reading them back only to hash them into the identical
+// catalog is the whole-tree cost this pipeline exists to stop paying.
 func (p *pipeline) walk(ctx context.Context) error {
 	rootIno := p.src.Root()
 	root, err := p.src.Stat(ctx, rootIno)
@@ -431,10 +451,11 @@ func (p *pipeline) walk(ctx context.Context) error {
 		return fmt.Errorf("publish: stat root: %w", err)
 	}
 	p.recs[rootIno] = &rec{n: root}
+	p.pathOf[rootIno] = "/"
 	p.maxInode = rootIno
 	expanded := make(map[uint64]bool)
-	var descend func(ino uint64) error
-	descend = func(ino uint64) error {
+	var descend func(ino uint64, pth string) error
+	descend = func(ino uint64, pth string) error {
 		if expanded[ino] {
 			return nil
 		}
@@ -453,14 +474,19 @@ func (p *pipeline) walk(ctx context.Context) error {
 				p.recs[n.Inode] = &rec{n: n}
 			}
 			if n.Type == catalog.TypeDir {
-				if err := descend(n.Inode); err != nil {
+				childPath := path.Join(pth, e.Name)
+				p.pathOf[n.Inode] = childPath
+				if p.pruneSubtree(n.Inode, childPath) {
+					continue
+				}
+				if err := descend(n.Inode, childPath); err != nil {
 					return err
 				}
 			}
 		}
 		return nil
 	}
-	if err := descend(rootIno); err != nil {
+	if err := descend(rootIno, "/"); err != nil {
 		return err
 	}
 	// Sort edges by name so catalog row order — and therefore catalog
@@ -483,13 +509,21 @@ func (p *pipeline) walk(ctx context.Context) error {
 			// a sealed overlay — which deliberately does not maintain
 			// parent link counts (internal/overlay, Mkdir) — and a
 			// translated cut publish the same number.
-			subdirs := 0
-			for _, e := range p.dirs[ino] {
-				if e.typ == catalog.TypeDir {
-					subdirs++
+			//
+			// A pruned directory is the exception: its entries were never
+			// read, so there is nothing to recompute from. The value the
+			// source reported is the base generation's own node row, which
+			// the base publish computed the same way over the same entries
+			// — the subtree is unchanged, which is why it was pruned.
+			if _, pruned := p.pruned[ino]; !pruned {
+				subdirs := 0
+				for _, e := range p.dirs[ino] {
+					if e.typ == catalog.TypeDir {
+						subdirs++
+					}
 				}
+				r.n.Nlink = uint32(2 + subdirs)
 			}
-			r.n.Nlink = uint32(2 + subdirs)
 			p.stats.Dirs++
 		case catalog.TypeSymlink:
 			target, err := p.src.Readlink(ctx, ino)
@@ -782,6 +816,16 @@ func (p *pipeline) buildDirNode(ino uint64, pth string) *catalog.DirNode {
 	d := &catalog.DirNode{}
 	p.dnIno[d] = ino
 	p.pathOf[ino] = pth
+	if ce, ok := p.pruned[ino]; ok {
+		// The walk stopped here, so there is no subtree to weigh: stand in
+		// for it with the weight the generation that DID walk it recorded,
+		// and pin it as a catalog root, since its contents are not present
+		// to be merged into anything.
+		d.OwnWeight = ce.Weight
+		d.Pinned = true
+		p.subtreeDirty[ino] = false
+		return d
+	}
 	d.OwnWeight = xattrBytes(p.recs[ino].xattrs)
 	dirty := p.isDirty(ino)
 	for _, e := range p.dirs[ino] {

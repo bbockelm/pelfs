@@ -2,6 +2,7 @@ package publish
 
 import (
 	"context"
+	"sync"
 
 	"github.com/bbockelm/pelfs/internal/packstore"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
@@ -25,10 +26,29 @@ type packer struct {
 	w      *packstore.PackWriter
 	sealed []packstore.SealedPack
 	added  map[string]struct{}
+
+	// Uploads run in the background so building the next pack overlaps
+	// the current one's round trip. mu guards sealed and err against the
+	// upload goroutines; sem bounds how many are in flight at once.
+	mu  sync.Mutex
+	wg  sync.WaitGroup
+	sem chan struct{}
+	err error
 }
 
+// uploadConcurrency is how many packs may be in flight at once. Packs are
+// large and each upload is one long transfer, so this is about keeping a
+// high-bandwidth-delay link busy rather than about CPU: a few concurrent
+// streams cover the latency without turning a publish into a bandwidth
+// stampede that starves the mount still serving reads.
+const uploadConcurrency = 4
+
 func newPacker(inner pelicanobj.Store, dir string, target int64) *packer {
-	return &packer{inner: inner, dir: dir, target: target, added: make(map[string]struct{})}
+	return &packer{
+		inner: inner, dir: dir, target: target,
+		added: make(map[string]struct{}),
+		sem:   make(chan struct{}, uploadConcurrency),
+	}
 }
 
 // has reports whether key was already added during this publish.
@@ -62,30 +82,81 @@ func (p *packer) add(ctx context.Context, key, typ string, data []byte) error {
 	return nil
 }
 
-// cut seals the open pack (if any) and uploads it. On error the writer is
-// kept for abort.
+// cut finalizes the open pack (if any) and starts its upload in the
+// background. It returns as soon as the pack has an identity, which is
+// all the walk needs to keep going; the bytes land before finish
+// returns. On error the writer is kept for abort.
 func (p *packer) cut(ctx context.Context) error {
 	if p.w == nil {
 		return nil
 	}
-	sp, err := p.w.Seal(ctx, p.inner)
+	// An upload that already failed makes every later one wasted work,
+	// and the publish is going to abort regardless.
+	if err := p.failure(); err != nil {
+		return err
+	}
+	w := p.w
+	sp, upload, err := w.Finalize()
 	if err != nil {
 		return err
 	}
 	p.w = nil
+	p.mu.Lock()
 	p.sealed = append(p.sealed, sp)
+	p.mu.Unlock()
+
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		select {
+		case p.sem <- struct{}{}:
+			defer func() { <-p.sem }()
+		case <-ctx.Done():
+			p.setFailure(ctx.Err())
+			return
+		}
+		if err := upload(ctx, p.inner); err != nil {
+			p.setFailure(err)
+		}
+	}()
 	return nil
+}
+
+// setFailure records the first upload failure; later ones are noise from
+// a publish that is already doomed.
+func (p *packer) setFailure(err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.err == nil {
+		p.err = err
+	}
+}
+
+func (p *packer) failure() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.err
 }
 
 // sealedSoFar returns a copy of the packs sealed so far (the open pack, if
 // any, is not included).
 func (p *packer) sealedSoFar() []packstore.SealedPack {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	return append([]packstore.SealedPack(nil), p.sealed...)
 }
 
 // finish seals the open pack and returns every pack this publish uploaded.
+// finish cuts the open pack and waits for every upload to land. The
+// caller flips the ref only after this returns, so a published
+// generation never names a pack that is still in flight.
 func (p *packer) finish(ctx context.Context) ([]packstore.SealedPack, error) {
 	if err := p.cut(ctx); err != nil {
+		p.wg.Wait()
+		return nil, err
+	}
+	p.wg.Wait()
+	if err := p.failure(); err != nil {
 		return nil, err
 	}
 	return p.sealedSoFar(), nil
@@ -93,6 +164,9 @@ func (p *packer) finish(ctx context.Context) ([]packstore.SealedPack, error) {
 
 // abort discards the open spool. Safe to call repeatedly and after finish.
 func (p *packer) abort() {
+	// Wait for in-flight uploads before discarding anything: they own
+	// spool files and are reading them right now.
+	p.wg.Wait()
 	if p.w != nil {
 		p.w.Abort()
 		p.w = nil

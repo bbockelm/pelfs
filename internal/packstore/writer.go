@@ -97,28 +97,53 @@ func (w *PackWriter) Count() int { return len(w.tr.Entries) }
 // The spool is removed on success; on error the writer remains usable
 // only for Abort. An empty writer refuses to seal.
 func (w *PackWriter) Seal(ctx context.Context, inner pelicanobj.Store) (SealedPack, error) {
-	if len(w.tr.Entries) == 0 {
-		return SealedPack{}, fmt.Errorf("pack writer: refusing to seal an empty pack")
-	}
-	idx, footer, err := encodeTrailer(&w.tr)
+	sp, upload, err := w.Finalize()
 	if err != nil {
 		return SealedPack{}, err
 	}
+	if err := upload(ctx, inner); err != nil {
+		return SealedPack{}, err
+	}
+	return sp, nil
+}
+
+// Finalize writes the trailer and footer and names the pack without
+// sending it, returning the pack's identity and a function that performs
+// the upload.
+//
+// The split exists because a pack's identity -- name, trailer hash, size
+// -- is fully determined once the trailer is written, while the upload
+// is a long round trip that has nothing left to learn from the caller.
+// Sealing them together forced a publish to stall its walk on every
+// pack: on a high-latency link that measured ~25s per pack, paid
+// strictly one after another. The upload function may be called from
+// another goroutine; it removes the spool once the bytes are durable.
+func (w *PackWriter) Finalize() (SealedPack, func(context.Context, pelicanobj.Store) error, error) {
+	if len(w.tr.Entries) == 0 {
+		return SealedPack{}, nil, fmt.Errorf("pack writer: refusing to seal an empty pack")
+	}
+	idx, footer, err := encodeTrailer(&w.tr)
+	if err != nil {
+		return SealedPack{}, nil, err
+	}
 	if _, err := w.f.WriteAt(append(idx, footer...), w.size); err != nil {
-		return SealedPack{}, fmt.Errorf("pack writer: finalize: %w", err)
+		return SealedPack{}, nil, fmt.Errorf("pack writer: finalize: %w", err)
 	}
 	name := newPackName()
-	if err := retryOn(ctx, "upload pack "+name, defaultRetries, func() error {
-		if _, err := w.f.Seek(0, io.SeekStart); err != nil {
-			return err
-		}
-		return inner.Put(ctx, PackDirKey+"/"+name, w.f)
-	}); err != nil {
-		return SealedPack{}, fmt.Errorf("pack writer: upload %s: %w", name, err)
-	}
 	sp := SealedPack{Name: name, TrailerHash: blake3.Sum256(idx), Size: w.size + int64(len(idx)) + footerSize}
-	w.Abort()
-	return sp, nil
+	upload := func(ctx context.Context, inner pelicanobj.Store) error {
+		if err := retryOn(ctx, "upload pack "+name, defaultRetries, func() error {
+			if _, err := w.f.Seek(0, io.SeekStart); err != nil {
+				return err
+			}
+			return inner.Put(ctx, PackDirKey+"/"+name, w.f)
+		}); err != nil {
+			return fmt.Errorf("pack writer: upload %s: %w", name, err)
+		}
+		w.Abort()
+		return nil
+	}
+	return sp, upload, nil
 }
 
 // Abort discards the spool. Safe to call after Seal or repeatedly.

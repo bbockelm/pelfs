@@ -55,6 +55,21 @@ The three levels are:
 3. **Packs.** Immutable, in the federation, exactly as `design-packfs.md`
    describes. The pack index resolves identity to a location.
 
+### The indirection: content rows name a handle, not a place
+
+A file's content row names a list of **extent handles**. One side table
+resolves a handle, and only that table changes as data moves:
+
+| stage | a handle resolves to |
+|---|---|
+| in the active or flushing memtable | buffer id + offset + length |
+| after flush | one or more chunk identities |
+| reading a chunk | pack + offset, via the pack index |
+
+So neither binding — identity at flush, location within a pack — ever
+rewrites a catalog row. That is what keeps a flush proportional to the
+data it moves rather than to the size of the tree.
+
 ### Why late-bound location falls out of the existing format
 
 A catalog row for a file already stores `[]catalog.ChunkRef`, and a
@@ -117,18 +132,43 @@ lock in constant time.
 
 ## The parts that are not obvious
 
-### Chunk boundaries need a settled stream
+### Chunking happens at flush, not at write
 
-CDC decides boundaries from the content itself, over a rolling window.
-That works when bytes arrive in order and stop arriving: an append, a
-sequential write, a file copied in. It does **not** work for a file being
-randomly rewritten, where an early offset can change after a later one
-has been chunked.
+CDC decides boundaries from the content itself, over a rolling window, so
+it needs a settled byte stream. A file still being randomly rewritten has
+no such stream: an early offset can change after a later one was already
+chunked.
 
-So the memtable path applies to sequential and append-mostly writes, and
-random rewrites need the escape hatch below. This is the one real
-limitation of the design and it should be stated plainly rather than
-discovered later.
+Chunking therefore runs as a **second pass at flush time**, not as bytes
+arrive:
+
+1. Writes append raw extents to the memtable. No hashing, no boundary
+   decisions, nothing that a subsequent write can invalidate.
+2. At flush, collapse trivially dead extents — anything wholly superseded
+   by a later write to the same inode is dropped without being examined.
+3. Run CDC over what survives, producing identities.
+4. Assemble the pack and upload.
+
+This removes the limitation entirely rather than working around it.
+Random rewrites collapse in step 2 exactly like sequential ones, because
+by flush time the data has settled by construction: the memtable is
+frozen before the pass begins. The deferred-inode hatch below is then an
+optimization for pathological churn, not a correctness requirement.
+
+It also makes CDC a **backpressure release valve**. Chunking is CPU the
+flush does not strictly need — its purpose is dedup and incremental
+re-upload, not correctness. If the active table fills while a flush is
+still chunking, the flush abandons the rest of the CDC pass and emits the
+remaining extents as-is. The cost is duplication in the pack (worse
+dedup, more bytes) and the benefit is that a burst never stalls behind
+optional work. Measured evidence supports treating CDC as optional here:
+on a kernel tree, 99.89% of files are single-chunk anyway and sub-file
+dedup found *zero* matches, so a skipped pass costs little in practice.
+
+Identity is therefore bound at flush, along with location. See the
+indirection note above: content rows name a stable extent handle, and one
+side table resolves that handle to a memtable offset before the flush and
+to chunk identities after it. Neither binding rewrites a catalog row.
 
 ### The deferred-inode escape hatch
 
@@ -196,6 +236,63 @@ this inode" and start meaning "this inode's content is this list of
 identities". The `materializeContentLocked` path and the staging
 directory go away for every inode that is not deferred.
 
+## Repack: cheap liveness, and running it when nobody is waiting
+
+Packing as you go writes more packs and strands more dead bytes, so this
+design raises the pressure for a repack that v2 currently does not have
+at all. Two questions decide it: how to know a repack is needed without
+paying to find out, and when to run it.
+
+### Liveness is nearly free if the seal records it
+
+A pack's exact live fraction requires walking every retained generation's
+catalogs — far too expensive to ask casually. But a seal is already
+walking the whole changed tree and already resolves identities through
+the location map, so it can attribute bytes to packs as it goes at
+essentially no marginal cost.
+
+Proposal: record per-pack **live bytes for the generation being
+published** in the superblock's pack list, beside the fields already
+there. Liveness is then `live / stored`, available to any client that
+reads the superblock, with no extra I/O — and shared, so a repack
+decision does not depend on which client happens to hold local state.
+
+Two honest caveats:
+
+- It is liveness *for the newest generation*, and older retained
+  generations may still reference chunks the newest one dropped. So the
+  figure over-estimates garbage, by an amount the retention policy
+  bounds. Treat it as a trigger, not as an accounting of reclaimable
+  space; the repack itself must confirm against the retention set before
+  deleting anything.
+- It costs a field per pack per generation. The pack list already grows
+  per generation, and this makes each entry slightly larger. Worth
+  measuring against a volume with thousands of packs before committing.
+
+### Run it when the mount is quiet
+
+Repack is I/O the user did not ask for, so it should not compete with
+work they did.
+
+- **Detect** from the recorded liveness at seal, against a threshold that
+  measurement should set — earlier work found 0.50 the most expensive
+  useful setting and recommended 0.25–0.30, with a garbage floor that
+  scales with volume size rather than a fixed 256 MiB.
+- **Wait for quiescence**: no write activity for about a second.
+- **Work in small units, re-checking quiet between them**, so the first
+  write after a repack starts stalls at most one unit rather than the
+  whole job. Bound the unit in round trips, not bytes: measurement showed
+  a byte budget means ~16 requests on a big-file volume and ~2,500 on a
+  source tree.
+- **Never block on it** except when liveness is dire, and even then treat
+  a blocking implicit repack as an optimization to be justified rather
+  than assumed — a mount that stalls to tidy itself is worse than a
+  volume that is temporarily fat.
+
+Coalescing adjacent live entries is the single biggest lever measured on
+the old implementation: 9,000 requests down to 132 for 1.7x the bytes.
+Any repack built here should start with it.
+
 ## What this does not solve
 
 - **The walk and transform still dominate a seal.** Profiling puts them
@@ -212,22 +309,36 @@ directory go away for every inode that is not deferred.
   is repack's job, but the memtable size and the pack target should be
   the same number so the common case produces full packs.
 
+## Settled
+
+- **Crash recovery** as described above. `fsync` flows through to the
+  mmap'd buffer, and torn tails are detected by a **CRC per record**. The
+  expected deployment ties a mount to a job, so the common recovery is
+  discarding the state along with the failed job — recovery must be
+  correct and loud, but it is not the path to optimize.
+- **Memtable size**: deferred until there is operating experience. Start
+  at the pack target and revisit with numbers.
+- **One flushing table**, not a list. Revisit only if bursts prove it too
+  coarse.
+- **Identity binds at flush**, not at write, which the second-pass
+  chunking above requires anyway.
+- **`--no-seal` goes away.** It exists so a session can keep an overlay
+  and resume it later; with memtables that promise grows to recovering a
+  buffer file, and the feature has no remaining user.
+
 ## Open questions
 
-1. Memtable size. The pack target is 64 MiB; matching it makes flushes
-   produce full packs, but it also sets the backpressure granularity and
-   the crash-loss window. Is one number right for both?
-2. Whether the flushing memtable should be a *list* rather than a single
-   table, trading memory for smoother backpressure under bursts.
-3. Whether identities should be recorded in the catalog at write time or
-   at flush time. Write time is simpler and is assumed above; flush time
-   would let a rewritten file avoid ever having a catalog row for the
-   dead version, at the cost of a second pass.
-4. What `--no-seal` means here. Today it keeps the overlay for a later
-   session to resume. With memtables, resuming means recovering a buffer
-   file, which is a strictly larger promise than resuming a directory of
-   staging files.
-5. Whether a flush should upload one pack or several concurrently. The
-   packer already uploads up to four packs at once; a flusher that
-   inherits that gets throughput but complicates the ordering of location
-   map updates.
+1. Does the per-pack live-byte field belong in the superblock's pack list
+   at all, given it grows per generation on volumes that may hold
+   thousands of packs? A local sidecar is cheaper but unshared, so a
+   second client cannot act on it.
+2. When CDC is skipped under backpressure, should the extents be emitted
+   as one chunk per extent, or split at a fixed size so a later repack
+   has boundaries to work with? Fixed splitting costs nothing now and may
+   make a future repack cheaper.
+3. Should a flush upload one pack or several concurrently? The packer
+   already runs four uploads at once, but a flusher that inherits that
+   has to order location-map updates against partial failures.
+4. Is there a case for flushing on idle — no writes for some interval —
+   rather than only on a full table? It would shorten the crash-loss
+   window and smooth uploads, at the cost of smaller packs.

@@ -5,9 +5,12 @@
 //
 // A pack is self-describing: a zstd-compressed JSON trailer maps entry
 // keys to (offset, length, type), and a fixed footer records the trailer's
-// length and magic. Readers fetch the trailer with a single tail range
-// request and then read entries as ranges into the pack — Pelican origins
-// and caches serve ranges natively, so a pack is never fetched whole.
+// length and magic. A reader fetches the trailer with a single tail range
+// request — Pelican origins and caches serve ranges natively — and that
+// tells it which pack holds what. Whether it then reads entries as ranges
+// or takes the object whole is the reader's policy, not the container's;
+// genfs takes it whole, and the trailer is what tells it which one to
+// take.
 //
 // Pack names embed their creation time, which is what makes the retention
 // sweep's age guard work without any coordination between writers and GC.

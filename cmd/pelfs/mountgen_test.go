@@ -319,9 +319,17 @@ func TestMountGenSealAtExitRetiresOverlay(t *testing.T) {
 	// what the seal consumed.
 	g.refresh()
 	g.stats.Update(func(s *stats.Summary) { sum = *s })
-	// The seal advanced the branch, and the mount followed it there.
-	if sum.Generation != 1 {
-		t.Errorf("served generation is %d; the exit seal should have advanced it to 1", sum.Generation)
+	// The seal advanced the BRANCH, and the mount deliberately did not
+	// follow it there. Following means re-descending the resident tree and
+	// rewriting overlay rows so future reads are cheap, and an unmount has
+	// no future reads — the overlay is retired above. Pinned because it
+	// was minutes of latency on the exit path of a large tree.
+	if sum.SealedGeneration != 1 {
+		t.Errorf("sealed generation is %d; the exit seal should have published 1", sum.SealedGeneration)
+	}
+	if sum.GenerationSwaps != 0 {
+		t.Errorf("the exit seal swapped the served generation %d times; nothing reads it after unmount",
+			sum.GenerationSwaps)
 	}
 
 	// The document a supervisor reads after the session is gone.

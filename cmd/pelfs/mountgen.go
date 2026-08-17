@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -93,6 +94,10 @@ type genSession struct {
 	// overlay.FS serializes its own operations anyway.
 	ovMu  sync.RWMutex
 	spent bool // the overlay was sealed and retired; no further seal
+
+	// down times everything between the payload exiting and the process
+	// exiting. It stays inert until the exit path calls begin().
+	down *phaseClock
 }
 
 // countedStore re-forms a pelicanobj.Store around the statistics wrapper.
@@ -185,7 +190,11 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		noSeal:         noSeal,
 		overlayDir:     filepath.Join(stateDir, "overlay"),
 		signingKeyPath: signingKeyPath,
+		down:           &phaseClock{},
 	}
+	// Deferred FIRST so it runs LAST: every other deferred teardown step
+	// must have marked itself before the breakdown is printed.
+	defer g.reportTeardown()
 	g.statsPath = o.statsFile
 	if g.statsPath == "" {
 		g.statsPath = filepath.Join(stateDir, "pelfs-stats.json")
@@ -258,7 +267,7 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 			return fail(err)
 		}
 		g.lease = l
-		defer g.releaseLease()
+		defer g.down.timed("lease", g.releaseLease)
 	}
 	startup.mark("lease")
 
@@ -329,14 +338,14 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	if err != nil {
 		return fail(err)
 	}
-	defer g.gfs.Close() //nolint:errcheck
+	defer g.down.timed("gencache", func() { g.gfs.Close() }) //nolint:errcheck
 	startup.mark("index")
-	startup.report(len(sb.PackList))
 	g.stats.Update(func(sum *stats.Summary) { sum.Generation = sb.Generation })
 
 	if err := g.runPrefetch(ctx, o.prefetch); err != nil {
 		return fail(err)
 	}
+	startup.mark("prefetch")
 
 	if err := os.MkdirAll(mountpoint, 0755); err != nil {
 		return fail(err)
@@ -368,8 +377,9 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 			}
 			return fail(fmt.Errorf("open overlay: %w", err))
 		}
-		defer g.ov.Close() //nolint:errcheck
+		defer g.down.timed("overlay", func() { g.ov.Close() }) //nolint:errcheck
 	}
+	startup.mark("overlay")
 	switch backend {
 	case "nfs":
 		// A loopback NFS server over the same stack: the only way to
@@ -384,7 +394,7 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		}
 		nfsSrv, err = nfsmount.Serve(bfs)
 		if err == nil {
-			defer nfsSrv.Close() //nolint:errcheck
+			defer g.down.timed("server", func() { nfsSrv.Close() }) //nolint:errcheck
 			err = nfsSrv.Mount(mountpoint, "pelfs")
 		}
 	case "fuse", "":
@@ -399,6 +409,15 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	if err != nil {
 		return fail(fmt.Errorf("mount: %w (fuse needs Linux FUSE or macFUSE; try --backend nfs)", err))
 	}
+	startup.mark("mount")
+	// Reported after the mount, not after the pack index: "ready to serve"
+	// is not true until the kernel can reach the tree, and the steps in
+	// between (opening the overlay, standing up the frontend, the OS mount
+	// itself) are exactly the ones nobody could attribute before.
+	startup.report("ready to serve in {total} ({packs} packs; discovery {discovery}, "+
+		"access {access}, lease {lease}, head {head}, pack index {index}, "+
+		"prefetch {prefetch}, overlay {overlay}, mount {mount})",
+		"packs", len(sb.PackList))
 	mode := "read-only"
 	if rw {
 		mode = "read-write (overlay; unmount seals)"
@@ -414,7 +433,7 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	go g.sample(sessionCtx, statsInterval)
 
 	if ctl := g.startControl(); ctl != nil {
-		defer ctl.Close() //nolint:errcheck
+		defer g.down.timed("control", func() { ctl.Close() }) //nolint:errcheck
 	}
 
 	// Seal on a cadence, not only at unmount. A session that sealed
@@ -435,7 +454,8 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		ui.Info("checkpointing every {interval} (--snapshot-interval 0 disables)",
 			"interval", o.snapshotInterval)
 	}
-	defer g.publishMountRecord()()
+	retractRecord := g.publishMountRecord()
+	defer g.down.timed("record", retractRecord)
 
 	// Live refresh: read-only mounts can follow the branch. Writable
 	// mounts never do — the overlay is pinned to the generation it
@@ -464,6 +484,9 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		// signalled mount — a failing command still gets its teardown, and
 		// still carries its status out.
 		code = runInMount(o, prefix, mountpoint, command)
+		// Everything from here on is teardown: the user has stopped
+		// working and is now waiting on us.
+		g.down.begin()
 		if nfsSrv != nil {
 			unmountErr = nfsmount.Unmount(mountpoint)
 			if unmountErr != nil {
@@ -480,20 +503,25 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
 		if nfsSrv != nil {
 			<-sigs
+			g.down.begin()
 			if unmountErr = nfsmount.Unmount(mountpoint); unmountErr != nil {
 				ui.Error("unmount: {error}", "error", unmountErr)
 			}
 		} else {
 			go func() {
 				<-sigs
+				g.down.begin()
 				_ = srv.Unmount()
 			}()
 			srv.Wait()
 		}
 	}
+	g.down.mark("unmount")
 
 	stopSession()
+	g.down.mark("session stop")
 	sealErr := g.sealAtExit(ctx)
+	g.down.mark("seal")
 	if sealErr != nil {
 		ui.Error("{error}", "error", sealErr)
 		// A failing payload already reported a status; keep it rather than
@@ -506,6 +534,7 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	if err := g.stats.Finalize(code, unmountErr == nil && sealErr == nil); err != nil {
 		ui.Warn("write stats file: {error}", "error", err)
 	}
+	g.down.mark("stats")
 	return code
 }
 
@@ -560,6 +589,9 @@ func (g *genSession) releaseLease() {
 		ui.Warn("release lease: {error}", "error", err)
 	}
 	g.lease = nil
+	// A federation round trip on the exit path, so it belongs in the
+	// teardown breakdown rather than in whatever phase it lands next to.
+	g.down.mark("lease release")
 }
 
 // runPrefetch honors the shared --prefetch flag's three modes.
@@ -708,32 +740,92 @@ func (g *genSession) reportSealCost(c sealCost) {
 		"wall", wall, "cpu", cpu, "downloaded", ui.ByteCount(down), "uploaded", ui.ByteCount(up))
 }
 
-// phaseClock times the startup sequence phase by phase, so "the mount
-// took 15 seconds" can be answered with which part did.
+// phaseClock times a sequence phase by phase, so "the mount took 15
+// seconds" can be answered with which part did. Startup and teardown both
+// use one: each is a chain of federation round trips and OS calls, and the
+// owner of a slow one cannot otherwise tell which they waited on.
+//
+// A clock is inert until begin() — the teardown clock is built with the
+// session but must not start counting until the payload has exited, and
+// marks that arrive before then (there are none today, but the exit path
+// is deferred and reordering it is easy) are dropped rather than folded
+// into the first phase.
 type phaseClock struct {
-	start time.Time
-	last  time.Time
-	parts []any
+	start   time.Time
+	last    time.Time
+	running bool
+	names   []string
+	parts   []any
 }
 
 func newPhaseClock() *phaseClock {
-	now := time.Now()
-	return &phaseClock{start: now, last: now}
+	c := &phaseClock{}
+	c.begin()
+	return c
 }
 
-func (c *phaseClock) mark(name string) {
+func (c *phaseClock) begin() {
 	now := time.Now()
+	c.start, c.last, c.running = now, now, true
+}
+
+// mark closes the phase that was running and names it. name is both the
+// prose label and the structured attribute key, so it must be a bare
+// identifier the ui template interpolator will accept.
+func (c *phaseClock) mark(name string) {
+	if c == nil || !c.running {
+		return
+	}
+	now := time.Now()
+	c.names = append(c.names, name)
 	c.parts = append(c.parts, name, now.Sub(c.last).Round(time.Millisecond))
 	c.last = now
 }
 
-// report prints the breakdown. The pack count rides along because the
-// index phase is proportional to it, and a reader comparing two mounts
-// needs to know whether the volume grew.
-func (c *phaseClock) report(packs int) {
-	args := append([]any{"total", time.Since(c.start).Round(time.Millisecond), "packs", packs}, c.parts...)
-	ui.Info("ready to serve in {total} ({packs} packs; discovery {discovery}, access {access}, "+
-		"lease {lease}, head {head}, pack index {index})", args...)
+// timed runs fn as one phase.
+func (c *phaseClock) timed(name string, fn func()) {
+	fn()
+	c.mark(name)
+}
+
+// report emits the breakdown as one line. The sentence is the caller's,
+// because the lead-in worth printing differs (a mount reports its pack
+// count, a teardown does not); the clock supplies {total} and one
+// attribute per phase.
+func (c *phaseClock) report(sentence string, extra ...any) {
+	if c == nil || !c.running || len(c.names) == 0 {
+		return
+	}
+	args := append([]any{"total", time.Since(c.start).Round(time.Millisecond)}, extra...)
+	ui.Info(sentence, append(args, c.parts...)...)
+}
+
+// sentence builds "<lead> in {total} (a {a}, b {b})" over the phases that
+// actually ran. Teardown's shape varies — backend, whether a seal
+// happened, whether a lease was held — and a fixed sentence would either
+// name phases that never ran or quietly omit ones that did.
+func (c *phaseClock) sentence(lead string) string {
+	var b strings.Builder
+	b.WriteString(lead)
+	b.WriteString(" in {total} (")
+	for i, n := range c.names {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(n)
+		b.WriteString(" {")
+		b.WriteString(n)
+		b.WriteString("}")
+	}
+	b.WriteString(")")
+	return b.String()
+}
+
+// reportTeardown says where the time between the payload exiting and the
+// process exiting went. It is deferred FIRST in runMountGen so it runs
+// last, after every other deferred step has marked itself.
+func (g *genSession) reportTeardown() {
+	g.down.report(g.down.sentence("torn down"))
 }
 
 // processCPU is this process's user+system time. Seals are mostly
@@ -750,7 +842,11 @@ func processCPU() time.Duration {
 	return tv(ru.Utime) + tv(ru.Stime)
 }
 
-func (g *genSession) sealLocked(ctx context.Context) (*publish.Result, error) {
+// sealLocked publishes the overlay as the next generation. follow says
+// whether the MOUNT should then be moved onto what was published: true
+// for a mid-session checkpoint, which keeps serving afterwards, and false
+// at unmount, where nothing will read the result.
+func (g *genSession) sealLocked(ctx context.Context, follow bool) (*publish.Result, error) {
 	keyPath := g.signingKeyPath
 	if keyPath == "" {
 		keyPath = filepath.Join(g.stateDir, "v2-signing.key")
@@ -809,19 +905,29 @@ func (g *genSession) sealLocked(ctx context.Context) (*publish.Result, error) {
 	//
 	// A failure here costs performance, never correctness: the session
 	// simply keeps paying zero TTLs for state that is already durable.
-	if _, err := g.gfs.Swap(ctx, res.Superblock); err != nil {
-		ui.Warn("sealed generation {generation}, but the mount could not follow it ({error}); inodes stay dirty",
-			"generation", res.Superblock.Generation, "error", err)
-	} else if rep, err := g.ov.Rebase(ctx, snap.Seq(), overlay.Options{
-		BaseRoot:       res.Superblock.RootCatalog,
-		BaseGeneration: res.Superblock.Generation,
-	}); err != nil {
-		ui.Warn("sealed generation {generation}, but rebase failed ({error}); inodes stay dirty",
-			"generation", res.Superblock.Generation, "error", err)
-	} else {
-		ui.Info("{clean} returned to clean; {dirty} still dirty",
-			"clean", ui.Count(len(rep.Clean), "inode"), "dirty", rep.Dirty)
-		g.stats.Update(func(sum *stats.Summary) { sum.RebasedClean += int64(len(rep.Clean)) })
+	//
+	// All of it is skipped at unmount. Swap re-descends the whole resident
+	// tree and Rebase rewrites overlay rows, both to hand a LIVE mount a
+	// cheaper future — and the seal at unmount has no future: the overlay
+	// is closed and deleted a few statements later, and the kernel has
+	// already dropped the mount. Doing it there is pure latency on the
+	// exit path, paid by someone who has stopped working and is waiting
+	// to get their shell back.
+	if follow {
+		if _, err := g.gfs.Swap(ctx, res.Superblock); err != nil {
+			ui.Warn("sealed generation {generation}, but the mount could not follow it ({error}); inodes stay dirty",
+				"generation", res.Superblock.Generation, "error", err)
+		} else if rep, err := g.ov.Rebase(ctx, snap.Seq(), overlay.Options{
+			BaseRoot:       res.Superblock.RootCatalog,
+			BaseGeneration: res.Superblock.Generation,
+		}); err != nil {
+			ui.Warn("sealed generation {generation}, but rebase failed ({error}); inodes stay dirty",
+				"generation", res.Superblock.Generation, "error", err)
+		} else {
+			ui.Info("{clean} returned to clean; {dirty} still dirty",
+				"clean", ui.Count(len(rep.Clean), "inode"), "dirty", rep.Dirty)
+			g.stats.Update(func(sum *stats.Summary) { sum.RebasedClean += int64(len(rep.Clean)) })
+		}
 	}
 
 	g.stats.Update(func(sum *stats.Summary) {
@@ -868,7 +974,9 @@ func (g *genSession) checkpoint(ctx context.Context) (string, error) {
 	if err == nil && st.DirtyNodes == 0 && st.DirtyEdges == 0 {
 		return fmt.Sprintf("nothing changed; still at generation %d", g.sb.Generation), nil
 	}
-	res, err := g.sealLocked(ctx)
+	// A checkpoint keeps serving, so the mount must follow what it just
+	// published — that is what lets the redundant overlay rows go.
+	res, err := g.sealLocked(ctx, true)
 	if err != nil {
 		return "", err
 	}
@@ -937,7 +1045,8 @@ func (g *genSession) sealAtExit(ctx context.Context) error {
 		return nil
 	}
 	ui.Info("sealing the overlay into the next generation...")
-	res, err := g.sealLocked(ctx)
+	// Nothing reads the overlay after this, so the mount does not follow.
+	res, err := g.sealLocked(ctx, false)
 	if err != nil {
 		ok := false
 		g.stats.Update(func(sum *stats.Summary) { sum.SealOK = &ok })

@@ -360,23 +360,120 @@ func TestRetireOverlayRenamesInsteadOfDeleting(t *testing.T) {
 		t.Fatalf("close overlay: %v", err)
 	}
 
-	spent, err := g.retireOverlay()
-	if err != nil {
-		t.Fatalf("retireOverlay: %v", err)
+	// Hold the reclaim back so the state right after retirement is
+	// observable: the point of the change is that retirement itself does
+	// not delete anything.
+	var reclaimed []string
+	g.reclaimFn = func(dir string) { reclaimed = append(reclaimed, dir) }
+	if err := g.retireDir(g.overlayDir); err != nil {
+		t.Fatalf("retireDir: %v", err)
 	}
 	if _, err := os.Stat(g.overlayDir); !os.IsNotExist(err) {
 		t.Errorf("the spent overlay is still at %s (err %v)", g.overlayDir, err)
 	}
 	trash := filepath.Join(g.stateDir, trashDirName)
-	if filepath.Dir(spent) != trash {
-		t.Fatalf("retired to %s, want a child of %s", spent, trash)
+	ents, err := os.ReadDir(trash)
+	if err != nil {
+		t.Fatalf("read trash: %v", err)
 	}
-	ents, err := os.ReadDir(spent)
+	if len(ents) != 1 || !strings.HasPrefix(ents[0].Name(), g.sessionID+"-") {
+		t.Fatalf("trash holds %v, want one entry named for this session", ents)
+	}
+	spent := filepath.Join(trash, ents[0].Name())
+	if len(reclaimed) != 1 || reclaimed[0] != spent {
+		t.Errorf("reclaim was handed %v, want [%s]", reclaimed, spent)
+	}
+	inside, err := os.ReadDir(spent)
 	if err != nil {
 		t.Fatalf("read the retired overlay: %v", err)
 	}
-	if len(ents) == 0 {
-		t.Error("retireOverlay deleted the overlay's contents; the whole point is that it does not")
+	if len(inside) == 0 {
+		t.Error("retirement deleted the overlay's contents; the whole point is that it does not")
+	}
+}
+
+// The seal at unmount runs after the mountpoint is gone, so there is no
+// writer to freeze the overlay against — and freezing it anyway cost one
+// hardlink per staged inode in and one unlink out. It must publish the
+// live overlay, and it must publish the same bytes.
+func TestSealAtExitDoesNotFreezeTheOverlay(t *testing.T) {
+	g := newGenSession(t, true)
+	ctx := context.Background()
+	g.reclaimFn = func(string) {} // keep retired scratch observable
+	writeFile(t, g.ov, "final.txt", "sealed at unmount")
+	if err := g.sealAtExit(ctx); err != nil {
+		t.Fatalf("sealAtExit: %v", err)
+	}
+	ents, err := os.ReadDir(g.stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range ents {
+		if strings.HasPrefix(e.Name(), "snapshot-") {
+			t.Errorf("the exit seal left a snapshot at %s", e.Name())
+		}
+	}
+	trashed, err := os.ReadDir(filepath.Join(g.stateDir, trashDirName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range trashed {
+		if strings.Contains(e.Name(), "snapshot-") {
+			t.Errorf("the exit seal froze the overlay into %s", e.Name())
+		}
+	}
+
+	// Same bytes, read back through a fresh reader over what was published.
+	rstore, err := refs.New(g.inner, t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := rstore.Fetch(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, err := genfs.Open(ctx, genfs.Options{
+		Inner: g.inner, SB: f.Superblock, CacheDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer head.Close() //nolint:errcheck
+	n, err := head.Lookup(ctx, genfs.RootInode, "final.txt")
+	if err != nil {
+		t.Fatalf("lookup the sealed file: %v", err)
+	}
+	buf := make([]byte, n.Length)
+	if _, err := head.Read(ctx, n.Inode, 0, buf); err != nil {
+		t.Fatalf("read the sealed file: %v", err)
+	}
+	if string(buf) != "sealed at unmount" {
+		t.Errorf("sealed content is %q", buf)
+	}
+}
+
+// A checkpoint DOES freeze: it publishes while writers keep working, and
+// the frozen sequence is what lets the rebase mark inodes clean.
+func TestCheckpointStillFreezesTheOverlay(t *testing.T) {
+	g := newGenSession(t, true)
+	ctx := context.Background()
+	g.reclaimFn = func(string) {}
+	writeFile(t, g.ov, "first.txt", "one")
+	if _, err := g.checkpoint(ctx); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	trashed, err := os.ReadDir(filepath.Join(g.stateDir, trashDirName))
+	if err != nil {
+		t.Fatalf("a checkpoint did not freeze the overlay: %v", err)
+	}
+	found := false
+	for _, e := range trashed {
+		if strings.Contains(e.Name(), "snapshot-") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("a checkpoint did not freeze the overlay; trash holds %v", trashed)
 	}
 }
 

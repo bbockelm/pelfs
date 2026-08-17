@@ -98,6 +98,10 @@ type genSession struct {
 	// down times everything between the payload exiting and the process
 	// exiting. It stays inert until the exit path calls begin().
 	down *phaseClock
+
+	// reclaimFn overrides how a retired directory's bytes are freed; nil
+	// takes the background default. Only tests set it.
+	reclaimFn func(string)
 }
 
 // countedStore re-forms a pelicanobj.Store around the statistics wrapper.
@@ -859,41 +863,87 @@ func (g *genSession) sealLocked(ctx context.Context, follow bool) (*publish.Resu
 	if err != nil {
 		return nil, err
 	}
-	// Seal a FROZEN view, not the live overlay. A snapshot makes the
-	// published generation correspond to an instant, which is the
-	// precondition for handing those inodes back to the kernel as clean
-	// afterwards: without it a write landing mid-walk could be published
-	// half-observed, and an infinite TTL on that value would make the
-	// mismatch permanent.
-	snapDir, err := os.MkdirTemp(g.stateDir, "snapshot-*")
-	if err != nil {
-		return nil, err
-	}
-	defer os.RemoveAll(snapDir) //nolint:errcheck
-	snap, err := g.ov.Snapshot(snapDir)
-	if err != nil {
-		return nil, fmt.Errorf("snapshot the overlay: %w", err)
-	}
-	defer snap.Close() //nolint:errcheck
+	// A seal is three jobs, not one — freeze, publish, release — and the
+	// two that are not the publish were invisible until they were measured:
+	// on a session that had touched a large tree the freeze alone rivalled
+	// the publish it precedes.
+	phases := newPhaseClock()
+	defer func() { phases.report(phases.sentence("sealed")) }()
 
+	// A CHECKPOINT seals a FROZEN view, not the live overlay: it publishes
+	// while writers keep working, so it needs its input to correspond to an
+	// instant — the precondition for handing those inodes back to the
+	// kernel as clean afterwards. Without it a write landing mid-walk could
+	// be published half-observed, and an infinite TTL on that value would
+	// make the mismatch permanent.
+	//
+	// The seal at UNMOUNT has neither the need nor anything to gain. It
+	// runs after the mountpoint is gone and the server has stopped, so
+	// there is no writer left to race: the live overlay IS an instant.
+	// Nothing rebases afterwards either (follow is false), which is the
+	// only consumer of a snapshot's sequence number. Freezing it anyway
+	// cost one hardlink per staged inode on the way in and one unlink on
+	// the way out — measured at ~32s and ~6s for 85k staged files, both
+	// paid by someone waiting to get their shell back — to produce a view
+	// byte-for-byte identical to the one already on disk.
+	var snap *overlay.Snapshot
+	if follow {
+		snapDir, err := os.MkdirTemp(g.stateDir, "snapshot-*")
+		if err != nil {
+			return nil, err
+		}
+		snap, err = g.ov.Snapshot(snapDir)
+		if err != nil {
+			os.RemoveAll(snapDir) //nolint:errcheck
+			return nil, fmt.Errorf("snapshot the overlay: %w", err)
+		}
+		// Releasing is deferred so it also covers the error returns below,
+		// and it is the LAST thing the clock sees: the scratch a snapshot
+		// leaves is one file per staged inode, and deleting those in place
+		// is the same unlink storm the spent overlay used to be.
+		defer func() {
+			// Discard, not Close: the scratch is retired by rename below
+			// rather than unlinked file by file here.
+			_ = snap.Discard()
+			if err := g.retireDir(snapDir); err != nil {
+				ui.Warn("the seal's snapshot scratch at {dir} could not be retired: {error}",
+					"dir", snapDir, "error", err)
+			}
+			phases.mark("release")
+		}()
+		sc := snap.Cost()
+		ui.Info("froze the overlay in {total} (vacuum {vacuum}, {staged} staged files pinned in {pin}, "+
+			"namespace {namespace}, open {open})",
+			"total", sc.Total().Round(time.Millisecond), "vacuum", sc.Vacuum.Round(time.Millisecond),
+			"staged", sc.Staged, "pin", sc.Freeze.Round(time.Millisecond),
+			"namespace", sc.Edges.Round(time.Millisecond), "open", sc.Open.Round(time.Millisecond))
+	}
+	phases.mark("freeze")
+
+	opts := publish.Options{
+		Inner:          g.inner,
+		SpoolDir:       g.stateDir,
+		Branch:         g.branch,
+		SigningKey:     signingKey,
+		Prev:           g.sb,
+		PrevRaw:        g.prevRaw,
+		DEK:            g.dek,
+		IdentityKey:    g.identityKey,
+		KeyID:          g.keyID,
+		KeyTable:       g.sb.KeyTable,
+		DedupIndexPath: filepath.Join(g.stateDir, "v2-dedup.db"),
+	}
+	if snap != nil {
+		opts.OverlaySnapshot = snap
+	} else {
+		opts.Overlay = g.ov
+	}
 	cost := g.beginSealCost()
-	res, err := publish.Seal(ctx, publish.Options{
-		OverlaySnapshot: snap,
-		Inner:           g.inner,
-		SpoolDir:        g.stateDir,
-		Branch:          g.branch,
-		SigningKey:      signingKey,
-		Prev:            g.sb,
-		PrevRaw:         g.prevRaw,
-		DEK:             g.dek,
-		IdentityKey:     g.identityKey,
-		KeyID:           g.keyID,
-		KeyTable:        g.sb.KeyTable,
-		DedupIndexPath:  filepath.Join(g.stateDir, "v2-dedup.db"),
-	})
+	res, err := publish.Seal(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
+	phases.mark("publish")
 	g.reportSealCost(cost)
 	// The anchor must advance with the branch head: the next seal's
 	// lineage hash and its compare-and-swap against refs/<branch> both
@@ -932,6 +982,7 @@ func (g *genSession) sealLocked(ctx context.Context, follow bool) (*publish.Resu
 				"clean", ui.Count(len(rep.Clean), "inode"), "dirty", rep.Dirty)
 			g.stats.Update(func(sum *stats.Summary) { sum.RebasedClean += int64(len(rep.Clean)) })
 		}
+		phases.mark("follow")
 	}
 
 	g.stats.Update(func(sum *stats.Summary) {
@@ -1084,17 +1135,9 @@ func (g *genSession) sealAtExit(ctx context.Context) error {
 	_ = g.ov.Close()
 	g.ovMu.Unlock()
 	exit.mark("overlay close")
-	spent, err := g.retireOverlay()
-	if err != nil {
+	if err := g.retireDir(g.overlayDir); err != nil {
 		ui.Warn("sealed, but the spent overlay at {overlay} could not be retired: {error}",
 			"overlay", g.overlayDir, "error", err)
-	}
-	if spent != "" {
-		// Best effort, and deliberately unwaited: whatever this finishes
-		// before the process exits is that much less for the next mount to
-		// sweep, and whatever it does not finish costs nothing but disk
-		// until then.
-		go os.RemoveAll(spent) //nolint:errcheck
 	}
 	exit.mark("retire")
 	exit.report(exit.sentence("sealed and retired the overlay"))
@@ -1106,15 +1149,16 @@ func (g *genSession) sealAtExit(ctx context.Context) error {
 // overlay a session ever resumes is <state-dir>/overlay.
 const trashDirName = "trash"
 
-// retireOverlay makes the spent overlay unreusable and hands its bytes to
-// whoever can afford to delete them, which is anyone but the user waiting
-// on their shell.
+// retireDir gets a spent scratch directory out of the way now and hands
+// its bytes to whoever can afford to delete them, which is anyone but the
+// user waiting on their shell.
 //
-// Deleting in place was tens of thousands of unlinks — one per staging
-// file — on the exit path, and it dominated teardown for a session that
-// had touched a large tree. Correctness needs only that the directory is
-// never RESUMED, and a rename within the state directory (one atomic
-// syscall, same filesystem) settles that immediately.
+// Two directories on the exit path are shaped alike: the spent overlay and
+// the snapshot the seal froze it into. Both hold one file per dirty inode,
+// so deleting either in place is tens of thousands of unlinks — and both
+// were being deleted while the user waited. Correctness needs only that
+// neither is ever REUSED, and a rename within the state directory (one
+// atomic syscall, same filesystem) settles that immediately.
 //
 // The crash-safety argument, window by window:
 //
@@ -1128,7 +1172,8 @@ const trashDirName = "trash"
 //     RemoveAll deletes in directory order, so a crash that took the
 //     database but left the staging files would leave a directory that
 //     overlay.Open happily initializes as EMPTY, silently inheriting a
-//     tree of orphan staging files.
+//     tree of orphan staging files. (A snapshot directory has no such
+//     hazard in either shape: nothing ever opens one by name.)
 //   - After the rename: nothing named <state-dir>/overlay exists, so there
 //     is nothing to resume at all; the next mount starts a fresh overlay.
 //     The trash entry is inert data no code path opens.
@@ -1136,28 +1181,43 @@ const trashDirName = "trash"
 //     a half-deleted trash entry is still just inert data, and RemoveAll
 //     is idempotent, so the next sweep finishes the job.
 //
-// Names cannot collide: the session id is a timestamp, the hostname, and
-// four random bytes, and one session retires at most one overlay. Garbage
-// cannot accumulate without bound either — every mount over this state
-// directory sweeps the trash (see sweepRetiredOverlays), so the standing
-// worst case is one spent overlay per session since the last mount.
+// Names cannot collide: the trash name carries the session id (a
+// timestamp, the hostname, and four random bytes) and the source
+// directory's own name, which is unique within one session — snapshot
+// scratch comes from MkdirTemp, and there is one overlay. A name that
+// somehow did collide fails the rename onto a non-empty directory and
+// takes the delete-in-place fallback, which is slow, never wrong.
 //
-// It returns the trash path now holding the spent overlay, for the caller
-// to delete on its own schedule; an empty path means there is nothing left
-// to delete.
-func (g *genSession) retireOverlay() (string, error) {
+// Garbage cannot accumulate without bound either: every mount over this
+// state directory sweeps the trash (see sweepRetiredOverlays), so the
+// standing worst case is what the sessions since the last mount left.
+func (g *genSession) retireDir(dir string) error {
 	trash := filepath.Join(g.stateDir, trashDirName)
 	if err := os.MkdirAll(trash, 0700); err != nil {
-		return "", err
+		return err
 	}
-	spent := filepath.Join(trash, g.sessionID)
-	if err := os.Rename(g.overlayDir, spent); err != nil {
+	spent := filepath.Join(trash, g.sessionID+"-"+filepath.Base(dir))
+	if err := os.Rename(dir, spent); err != nil {
 		// No rename means no cheap retirement, and leaving a spent overlay
 		// in place would make the state directory single-use. Pay for the
 		// slow path rather than break the next mount.
-		return "", os.RemoveAll(g.overlayDir)
+		return os.RemoveAll(dir)
 	}
-	return spent, nil
+	g.reclaim(spent)
+	return nil
+}
+
+// reclaim frees a retired directory's bytes without anyone waiting on it.
+// Deliberately unwaited: whatever it finishes before the process exits is
+// that much less for the next mount to sweep, and whatever it does not
+// finish costs nothing but disk until then. Tests replace it to inspect
+// what retirement left behind.
+func (g *genSession) reclaim(dir string) {
+	if g.reclaimFn != nil {
+		g.reclaimFn(dir)
+		return
+	}
+	go os.RemoveAll(dir) //nolint:errcheck
 }
 
 // sweepRetiredOverlays deletes the overlays previous sessions retired. It

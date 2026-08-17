@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/bbockelm/pelfs/internal/catalog"
 	"github.com/bbockelm/pelfs/internal/overlay"
@@ -956,4 +957,69 @@ func TestSnapshotOfEmptyOverlay(t *testing.T) {
 	if err := snap.Close(); err != nil {
 		t.Fatalf("second Close: %v", err)
 	}
+}
+
+// TestSnapshotCostAtScale measures what freezing costs on the shape that
+// made it visible: an untar's worth of small staged files. The snapshot
+// runs with the overlay lock held, so its cost is stall time for the mount
+// as well as latency for the seal, and the two halves scale with different
+// things — the VACUUM with dirty metadata, the pin with staged file COUNT.
+//
+//	PELFS_BIGSNAP=1 PELFS_BIGSNAP_FILES=85000 go test ./internal/overlay -run SnapshotCostAtScale -v -timeout 30m
+func TestSnapshotCostAtScale(t *testing.T) {
+	if os.Getenv("PELFS_BIGSNAP") == "" {
+		t.Skip("set PELFS_BIGSNAP=1 to run the snapshot-cost measurement")
+	}
+	files := 20000
+	if v := os.Getenv("PELFS_BIGSNAP_FILES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files = n
+	}
+	ctx := context.Background()
+	fx := newFixture(t, "b0000000-0000-4000-8000-00000000c001")
+	ov := openOverlay(t, fx, t.TempDir())
+
+	body := []byte("a small source file, the shape an unpack writes\n")
+	start := time.Now()
+	perDir := 16
+	var dir uint64
+	for i := 0; i < files; i++ {
+		if i%perDir == 0 {
+			d, err := ov.Mkdir(ctx, 1, fmt.Sprintf("d%06d", i/perDir), 0755, 0, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dir = d.Inode
+		}
+		n, err := ov.Create(ctx, dir, fmt.Sprintf("f%04d.c", i%perDir), 0644, 0, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ov.Write(ctx, n.Inode, 0, body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Logf("staged %d files in %s", files, time.Since(start).Round(time.Millisecond))
+
+	snapDir := filepath.Join(t.TempDir(), "snap")
+	start = time.Now()
+	snap, err := ov.Snapshot(snapDir)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	wall := time.Since(start)
+	c := snap.Cost()
+	t.Logf("SNAPSHOT %s wall: vacuum %s, pin %s (%d staged), namespace %s, open %s",
+		wall.Round(time.Millisecond), c.Vacuum.Round(time.Millisecond),
+		c.Freeze.Round(time.Millisecond), c.Staged,
+		c.Edges.Round(time.Millisecond), c.Open.Round(time.Millisecond))
+
+	start = time.Now()
+	if err := snap.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	t.Logf("SNAPSHOT release %s", time.Since(start).Round(time.Millisecond))
 }

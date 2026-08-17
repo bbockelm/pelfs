@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/bbockelm/pelfs/internal/genfs"
 )
@@ -59,10 +60,32 @@ type Snapshot struct {
 	seq   uint64
 	dir   string
 	pin   *snapPin
+	cost  SnapshotCost
 
 	closeOnce sync.Once
 	closeErr  error
 }
+
+// SnapshotCost is where taking one snapshot went. Freezing runs with the
+// overlay's lock held, so a slow one stalls the mount as well as the seal
+// that asked for it — and the two halves scale with completely different
+// things (dirty metadata versus staged FILE COUNT), so a single duration
+// cannot say which to go after.
+type SnapshotCost struct {
+	Vacuum time.Duration // VACUUM INTO: the frozen copy of the dirty tables
+	Freeze time.Duration // pinning staged content
+	Edges  time.Duration // reading the namespace map Rebase replays against
+	Open   time.Duration // opening the frozen view
+	Staged int           // staged files the snapshot pinned
+}
+
+// Total is the whole time the overlay lock was held.
+func (c SnapshotCost) Total() time.Duration {
+	return c.Vacuum + c.Freeze + c.Edges + c.Open
+}
+
+// Cost reports where taking this snapshot went.
+func (s *Snapshot) Cost() SnapshotCost { return s.cost }
 
 // Snapshot freezes the overlay into dir, which must be empty or absent
 // and belongs to the snapshot until Close removes it.
@@ -105,12 +128,14 @@ func (fs *FS) freezeLocked(snap *Snapshot, dir, stagingDir string) error {
 	if err := os.Remove(dbPath); err != nil && !os.IsNotExist(err) {
 		return err
 	}
+	start := time.Now()
 	// VACUUM's destination is a literal, not a bindable parameter, and
 	// the live connection is the only one that may read the live database
 	// (locking_mode=EXCLUSIVE).
 	if _, err := fs.db.Exec("VACUUM INTO '" + strings.ReplaceAll(dbPath, "'", "''") + "'"); err != nil {
 		return fmt.Errorf("overlay: snapshot vacuum: %w", err)
 	}
+	snap.cost.Vacuum = time.Since(start)
 
 	type staged struct {
 		ino    uint64
@@ -133,6 +158,7 @@ func (fs *FS) freezeLocked(snap *Snapshot, dir, stagingDir string) error {
 	if err := closeRows(rows); err != nil {
 		return err
 	}
+	start = time.Now()
 	for _, s := range content {
 		dst := filepath.Join(stagingDir, strconv.FormatUint(s.ino, 10))
 		if err := linkOrCopy(fs.stagingPath(s.ino), dst); err != nil {
@@ -140,15 +166,22 @@ func (fs *FS) freezeLocked(snap *Snapshot, dir, stagingDir string) error {
 		}
 		snap.pin.lens[s.ino] = s.length
 	}
+	snap.cost.Staged = len(content)
+	snap.cost.Freeze = time.Since(start)
 
+	start = time.Now()
 	edges, err := readEdgeMap(fs.q)
 	if err != nil {
 		return err
 	}
+	snap.cost.Edges = time.Since(start)
+
+	start = time.Now()
 	view, err := openSnapshotView(fs, dir, stagingDir)
 	if err != nil {
 		return err
 	}
+	snap.cost.Open = time.Since(start)
 	snap.view = view
 	fs.snapEdges[snap.seq] = edges
 	return nil
@@ -220,9 +253,21 @@ func openSnapshotView(fs *FS, dir, stagingDir string) (*FS, error) {
 // takes it back after the snapshot has been sealed and published.
 func (s *Snapshot) Seq() uint64 { return s.seq }
 
-// Close releases the snapshot's scratch space. The FS may then modify
-// staged files in place again without copying them out.
-func (s *Snapshot) Close() error {
+// Close releases the snapshot and deletes its scratch space. The FS may
+// then modify staged files in place again without copying them out.
+func (s *Snapshot) Close() error { return s.release(true) }
+
+// Discard releases the snapshot exactly as Close does but LEAVES its
+// scratch directory on disk, handing ownership of it to the caller.
+//
+// The scratch holds one hardlink per staged inode, so deleting it is an
+// unlink per file in the session's dirty set — measured in seconds for an
+// unpacked source tree, and paid wherever the release happens to fall. A
+// caller that can move the directory aside and reclaim it when nobody is
+// waiting should do that instead, and this is how it takes it over.
+func (s *Snapshot) Discard() error { return s.release(false) }
+
+func (s *Snapshot) release(deleteScratch bool) error {
 	s.closeOnce.Do(func() {
 		s.owner.mu.Lock()
 		for i, p := range s.owner.snapPins {
@@ -234,6 +279,9 @@ func (s *Snapshot) Close() error {
 		s.owner.mu.Unlock()
 		if s.view != nil {
 			s.closeErr = s.view.Close()
+		}
+		if !deleteScratch {
+			return
 		}
 		os.RemoveAll(filepath.Join(s.dir, stagingDirName)) //nolint:errcheck
 		os.Remove(filepath.Join(s.dir, overlayDBName))     //nolint:errcheck

@@ -239,9 +239,10 @@ type flushPacker struct {
 	dir    string
 	target int64
 
-	w    *packstore.PackWriter
-	pend []pendingLoc
-	locs map[string]PackLoc
+	w       *packstore.PackWriter
+	pend    []pendingLoc
+	pending map[string]struct{}
+	locs    map[string]PackLoc
 
 	sealed []packstore.SealedPack
 	bytes  int64
@@ -255,7 +256,11 @@ type pendingLoc struct {
 }
 
 func newFlushPacker(obj pelicanobj.Store, dir string, target int64) *flushPacker {
-	return &flushPacker{obj: obj, dir: dir, target: target, locs: make(map[string]PackLoc)}
+	return &flushPacker{
+		obj: obj, dir: dir, target: target,
+		pending: make(map[string]struct{}),
+		locs:    make(map[string]PackLoc),
+	}
 }
 
 func (p *flushPacker) add(ctx context.Context, id chunkid.Identity, data []byte) error {
@@ -263,10 +268,12 @@ func (p *flushPacker) add(ctx context.Context, id chunkid.Identity, data []byte)
 	if _, done := p.locs[key]; done {
 		return nil
 	}
-	for _, pl := range p.pend {
-		if pl.key == key {
-			return nil
-		}
+	// The open pack's entries need their own lookup, not a scan of pend: an
+	// abandoned CDC pass emits one chunk per extent, so a pack can hold
+	// thousands of small entries rather than the sixteen a 4 MiB average
+	// would give.
+	if _, open := p.pending[key]; open {
+		return nil
 	}
 	if p.w != nil && p.w.Size() > 0 && p.w.Size()+int64(len(data)) > p.target {
 		if err := p.cut(ctx); err != nil {
@@ -285,6 +292,7 @@ func (p *flushPacker) add(ctx context.Context, id chunkid.Identity, data []byte)
 		return err
 	}
 	p.pend = append(p.pend, pendingLoc{key: key, off: off, length: int64(len(data))})
+	p.pending[key] = struct{}{}
 	p.bytes += int64(len(data))
 	p.count++
 	return nil
@@ -311,6 +319,7 @@ func (p *flushPacker) cut(ctx context.Context) error {
 		p.locs[pl.key] = PackLoc{Pack: sp.Name, Off: pl.off, Length: pl.length}
 	}
 	p.pend = nil
+	clear(p.pending)
 	return nil
 }
 

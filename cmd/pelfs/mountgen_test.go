@@ -350,6 +350,157 @@ func TestMountGenSealAtExitRetiresOverlay(t *testing.T) {
 	}
 }
 
+// Retirement must not pay for deletion: the spent overlay moves aside in
+// constant time and its bytes are still on disk afterwards, for a sweep
+// nobody is waiting on to reclaim.
+func TestRetireOverlayRenamesInsteadOfDeleting(t *testing.T) {
+	g := newGenSession(t, true)
+	writeFile(t, g.ov, "final.txt", "sealed at unmount")
+	if err := g.ov.Close(); err != nil {
+		t.Fatalf("close overlay: %v", err)
+	}
+
+	spent, err := g.retireOverlay()
+	if err != nil {
+		t.Fatalf("retireOverlay: %v", err)
+	}
+	if _, err := os.Stat(g.overlayDir); !os.IsNotExist(err) {
+		t.Errorf("the spent overlay is still at %s (err %v)", g.overlayDir, err)
+	}
+	trash := filepath.Join(g.stateDir, trashDirName)
+	if filepath.Dir(spent) != trash {
+		t.Fatalf("retired to %s, want a child of %s", spent, trash)
+	}
+	ents, err := os.ReadDir(spent)
+	if err != nil {
+		t.Fatalf("read the retired overlay: %v", err)
+	}
+	if len(ents) == 0 {
+		t.Error("retireOverlay deleted the overlay's contents; the whole point is that it does not")
+	}
+}
+
+// The crash window that matters: killed after the rename, before the
+// bytes are gone. A later mount must start a FRESH overlay and must never
+// see the retired one, and the sweep must then reclaim it.
+func TestRetiredOverlayIsNotResumedByALaterMount(t *testing.T) {
+	g := newGenSession(t, true)
+	ctx := context.Background()
+	writeFile(t, g.ov, "final.txt", "sealed at unmount")
+	if err := g.sealAtExit(ctx); err != nil {
+		t.Fatalf("sealAtExit: %v", err)
+	}
+
+	// A later mount of the same state directory, over the head the seal
+	// published.
+	rstore, err := refs.New(g.inner, t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := rstore.Fetch(ctx, "main")
+	if err != nil {
+		t.Fatalf("fetch after the exit seal: %v", err)
+	}
+	next, err := genfs.Open(ctx, genfs.Options{
+		Inner: g.inner, SB: f.Superblock, CacheDir: filepath.Join(g.stateDir, "gencache2"),
+	})
+	if err != nil {
+		t.Fatalf("genfs.Open on the sealed head: %v", err)
+	}
+	defer next.Close() //nolint:errcheck
+	ov2, err := overlay.Open(g.overlayDir, next, overlay.Options{
+		NextInode:      next.NextInode(),
+		BaseRoot:       next.RootCatalog(),
+		BaseGeneration: next.Generation(),
+	})
+	if err != nil {
+		t.Fatalf("the state directory was not reusable after a seal: %v", err)
+	}
+	defer ov2.Close() //nolint:errcheck
+	st, err := ov2.Stats()
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if st.DirtyNodes != 0 || st.DirtyEdges != 0 {
+		t.Errorf("the new overlay inherited state from the retired one: %+v", st)
+	}
+	// And it serves the sealed tree, so nothing was lost on the way.
+	if _, err := ov2.Lookup(ctx, overlay.RootInode, "final.txt"); err != nil {
+		t.Errorf("the sealed file is not visible through the new mount: %v", err)
+	}
+
+	// Whatever the exit path's background delete did or did not finish,
+	// the sweep leaves the trash empty and touches nothing else.
+	sweepRetiredOverlays(g.stateDir)
+	ents, err := os.ReadDir(filepath.Join(g.stateDir, trashDirName))
+	if err != nil {
+		t.Fatalf("read trash after the sweep: %v", err)
+	}
+	if len(ents) != 0 {
+		t.Errorf("the sweep left %d retired overlays behind", len(ents))
+	}
+	if _, err := os.Stat(g.overlayDir); err != nil {
+		t.Errorf("the sweep took the LIVE overlay: %v", err)
+	}
+}
+
+// sweepRetiredOverlays must survive being pointed at a state directory
+// that never retired anything, and must clear what a killed session left.
+func TestSweepRetiredOverlaysReclaimsWhatACrashLeft(t *testing.T) {
+	dir := t.TempDir()
+	sweepRetiredOverlays(dir) // no trash directory at all
+	spent := filepath.Join(dir, trashDirName, "20260101T000000Z-host-deadbeef", "staging")
+	if err := os.MkdirAll(spent, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(spent, "42"), []byte("orphan"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	sweepRetiredOverlays(dir)
+	ents, err := os.ReadDir(filepath.Join(dir, trashDirName))
+	if err != nil {
+		t.Fatalf("read trash: %v", err)
+	}
+	if len(ents) != 0 {
+		t.Errorf("sweep left %d entries", len(ents))
+	}
+}
+
+// --no-seal is the resumable path and must stay one: the overlay is kept
+// where the next mount looks for it, with its dirty state intact.
+func TestSealAtExitKeepsTheOverlayWithNoSeal(t *testing.T) {
+	g := newGenSession(t, true)
+	ctx := context.Background()
+	g.noSeal = true
+	writeFile(t, g.ov, "unsealed.txt", "still mine")
+	if err := g.sealAtExit(ctx); err != nil {
+		t.Fatalf("sealAtExit: %v", err)
+	}
+	if _, err := os.Stat(g.overlayDir); err != nil {
+		t.Fatalf("--no-seal retired the overlay anyway: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(g.stateDir, trashDirName)); !os.IsNotExist(err) {
+		t.Errorf("--no-seal created a trash directory (err %v)", err)
+	}
+	// Resumable means the next mount reads the dirty state back, not just
+	// that the directory survived.
+	if err := g.ov.Close(); err != nil {
+		t.Fatalf("close overlay: %v", err)
+	}
+	ov2, err := overlay.Open(g.overlayDir, g.gfs, overlay.Options{
+		NextInode:      g.gfs.NextInode(),
+		BaseRoot:       g.gfs.RootCatalog(),
+		BaseGeneration: g.gfs.Generation(),
+	})
+	if err != nil {
+		t.Fatalf("reopen the kept overlay: %v", err)
+	}
+	defer ov2.Close() //nolint:errcheck
+	if _, err := ov2.Lookup(ctx, overlay.RootInode, "unsealed.txt"); err != nil {
+		t.Errorf("the kept overlay lost its unsealed write: %v", err)
+	}
+}
+
 // TestMountGenCheckpointsOnACadence pins that a writable mount seals on
 // its own while serving. Without it every session defers all packing and
 // uploading to unmount, so `exit` blocks for as long as the session's

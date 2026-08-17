@@ -428,6 +428,10 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	sessionCtx, stopSession := context.WithCancel(ctx)
 	defer stopSession()
 	go g.stats.RunPeriodic(sessionCtx, statsInterval)
+	// Reclaiming what earlier sessions retired belongs here, behind a live
+	// mount, and not on either the startup path or the exit path: it is
+	// pure unlinking, and both of those are times a user is waiting.
+	go sweepRetiredOverlays(stateDir)
 	// Nothing in the write path calls back, so overlay pressure and the
 	// served generation are sampled on the same cadence.
 	go g.sample(sessionCtx, statsInterval)
@@ -1045,6 +1049,12 @@ func (g *genSession) sealAtExit(ctx context.Context) error {
 		return nil
 	}
 	ui.Info("sealing the overlay into the next generation...")
+	// The exit path's "seal" phase is three separable pieces of work —
+	// publishing, closing the overlay database, and retiring the spent
+	// directory — and only the first is the seal. Reporting them as one
+	// number hid tens of seconds of unlink storm behind a name that
+	// implied federation work.
+	exit := newPhaseClock()
 	// Nothing reads the overlay after this, so the mount does not follow.
 	res, err := g.sealLocked(ctx, false)
 	if err != nil {
@@ -1052,6 +1062,7 @@ func (g *genSession) sealAtExit(ctx context.Context) error {
 		g.stats.Update(func(sum *stats.Summary) { sum.SealOK = &ok })
 		return fmt.Errorf("seal: %w (the overlay is intact at %s; remount to retry)", err, g.overlayDir)
 	}
+	exit.mark("publish")
 	ok := true
 	g.stats.Update(func(sum *stats.Summary) { sum.SealOK = &ok })
 	// Carried and pruned are reported next to written, because the number
@@ -1072,11 +1083,100 @@ func (g *genSession) sealAtExit(ctx context.Context) error {
 	g.spent = true
 	_ = g.ov.Close()
 	g.ovMu.Unlock()
-	if err := os.RemoveAll(g.overlayDir); err != nil {
-		ui.Warn("sealed, but the spent overlay at {overlay} could not be removed: {error}",
+	exit.mark("overlay close")
+	spent, err := g.retireOverlay()
+	if err != nil {
+		ui.Warn("sealed, but the spent overlay at {overlay} could not be retired: {error}",
 			"overlay", g.overlayDir, "error", err)
 	}
+	if spent != "" {
+		// Best effort, and deliberately unwaited: whatever this finishes
+		// before the process exits is that much less for the next mount to
+		// sweep, and whatever it does not finish costs nothing but disk
+		// until then.
+		go os.RemoveAll(spent) //nolint:errcheck
+	}
+	exit.mark("retire")
+	exit.report(exit.sentence("sealed and retired the overlay"))
 	return nil
+}
+
+// trashDirName is the state-directory subdirectory spent overlays are
+// renamed into. It is deliberately NOT a name any mount opens: the only
+// overlay a session ever resumes is <state-dir>/overlay.
+const trashDirName = "trash"
+
+// retireOverlay makes the spent overlay unreusable and hands its bytes to
+// whoever can afford to delete them, which is anyone but the user waiting
+// on their shell.
+//
+// Deleting in place was tens of thousands of unlinks — one per staging
+// file — on the exit path, and it dominated teardown for a session that
+// had touched a large tree. Correctness needs only that the directory is
+// never RESUMED, and a rename within the state directory (one atomic
+// syscall, same filesystem) settles that immediately.
+//
+// The crash-safety argument, window by window:
+//
+//   - Before the rename: <state-dir>/overlay is intact and complete, but
+//     pinned to a generation that is no longer the head. A later mount
+//     opens it, finds the recorded base root does not match, and refuses
+//     with overlay.ErrGeneration. It fails loudly; it never resumes stale
+//     state. This window is one syscall wide, where the in-place delete
+//     held it open for the whole unlink storm — and held it open around a
+//     PARTIALLY deleted overlay, which is the genuinely dangerous state:
+//     RemoveAll deletes in directory order, so a crash that took the
+//     database but left the staging files would leave a directory that
+//     overlay.Open happily initializes as EMPTY, silently inheriting a
+//     tree of orphan staging files.
+//   - After the rename: nothing named <state-dir>/overlay exists, so there
+//     is nothing to resume at all; the next mount starts a fresh overlay.
+//     The trash entry is inert data no code path opens.
+//   - During the background delete, and after a crash in the middle of it:
+//     a half-deleted trash entry is still just inert data, and RemoveAll
+//     is idempotent, so the next sweep finishes the job.
+//
+// Names cannot collide: the session id is a timestamp, the hostname, and
+// four random bytes, and one session retires at most one overlay. Garbage
+// cannot accumulate without bound either — every mount over this state
+// directory sweeps the trash (see sweepRetiredOverlays), so the standing
+// worst case is one spent overlay per session since the last mount.
+//
+// It returns the trash path now holding the spent overlay, for the caller
+// to delete on its own schedule; an empty path means there is nothing left
+// to delete.
+func (g *genSession) retireOverlay() (string, error) {
+	trash := filepath.Join(g.stateDir, trashDirName)
+	if err := os.MkdirAll(trash, 0700); err != nil {
+		return "", err
+	}
+	spent := filepath.Join(trash, g.sessionID)
+	if err := os.Rename(g.overlayDir, spent); err != nil {
+		// No rename means no cheap retirement, and leaving a spent overlay
+		// in place would make the state directory single-use. Pay for the
+		// slow path rather than break the next mount.
+		return "", os.RemoveAll(g.overlayDir)
+	}
+	return spent, nil
+}
+
+// sweepRetiredOverlays deletes the overlays previous sessions retired. It
+// is the other half of retireOverlay: that side renames in constant time
+// and exits, this side does the unlinking while a mount is up and nobody
+// is waiting on it.
+//
+// It runs for read-only mounts too. A writable session that was killed
+// leaves its trash behind, and the next mount of that state directory is
+// the next chance to reclaim it whatever mode it is in.
+func sweepRetiredOverlays(stateDir string) {
+	trash := filepath.Join(stateDir, trashDirName)
+	ents, err := os.ReadDir(trash)
+	if err != nil {
+		return
+	}
+	for _, e := range ents {
+		_ = os.RemoveAll(filepath.Join(trash, e.Name()))
+	}
 }
 
 // controlHooks exposes the session on the control socket. Writes land in

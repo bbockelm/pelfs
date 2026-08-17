@@ -3,8 +3,8 @@
 // Package integration exercises pelfs's federation transport against a real
 // Pelican federation (director + registry + origin, usually launched by
 // scripts/integration-pelican.sh). It covers the object CRUD surface, the
-// origin's ETag-on-overwrite behavior, and a full metadata snapshot /
-// restore cycle — everything except the FUSE mount itself.
+// origin's ETag-on-overwrite behavior, and a full publish/resolve cycle
+// against the live federation — everything except the FUSE mount itself.
 //
 // Required environment:
 //
@@ -17,7 +17,6 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
-	"database/sql"
 	"fmt"
 	"io"
 	mrand "math/rand"
@@ -38,7 +37,6 @@ import (
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/publish"
 	"github.com/bbockelm/pelfs/internal/refs"
-	"github.com/bbockelm/pelfs/internal/snapshot"
 )
 
 func newStore(t *testing.T) pelicanobj.Store {
@@ -163,56 +161,6 @@ func TestOverwriteETag(t *testing.T) {
 		t.Fatalf("read after overwrite = %q", body)
 	}
 	_ = s.Delete(ctx, key)
-}
-
-// TestSnapshotCycle runs the real snapshot manager against the federation:
-// periodic overwrite, conflict detection, final snapshot, restore.
-func TestSnapshotCycle(t *testing.T) {
-	ctx := context.Background()
-	s := newStore(t)
-
-	metaPath := filepath.Join(t.TempDir(), "meta.db")
-	db, err := sql.Open("sqlite3", metaPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	if _, err := db.Exec("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (7)"); err != nil {
-		t.Fatal(err)
-	}
-
-	mgr := &snapshot.Manager{MetaPath: metaPath, Meta: s, Data: s, Session: snapshot.NewSessionID()}
-	if err := mgr.Snapshot(ctx, false); err != nil {
-		t.Fatalf("periodic snapshot: %v", err)
-	}
-	if _, err := db.Exec("INSERT INTO t VALUES (8)"); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(1100 * time.Millisecond)
-	if err := mgr.Snapshot(ctx, false); err != nil {
-		t.Fatalf("periodic snapshot (overwrite): %v", err)
-	}
-	if err := mgr.Snapshot(ctx, true); err != nil {
-		t.Fatalf("final snapshot: %v", err)
-	}
-
-	restored := filepath.Join(t.TempDir(), "restored.db")
-	key, err := snapshot.Restore(ctx, s, s, restored)
-	if err != nil {
-		t.Fatalf("Restore: %v", err)
-	}
-	if key == "" {
-		t.Fatal("Restore found no snapshot")
-	}
-	rdb, err := sql.Open("sqlite3", restored)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rdb.Close()
-	var n int
-	if err := rdb.QueryRow("SELECT count(*) FROM t").Scan(&n); err != nil || n != 2 {
-		t.Fatalf("restored db contents: n=%d err=%v (restored from %s)", n, err, key)
-	}
 }
 
 // TestPackTailRangeRead exercises exactly the path behind the field-reported

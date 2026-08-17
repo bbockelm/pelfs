@@ -207,6 +207,11 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		return exitErr(err)
 	}
 
+	// Startup is a sequence of federation round trips, and the owner of a
+	// slow mount cannot tell which one they waited on. Each phase is timed
+	// and reported together at the end, in the same spirit as the seal
+	// cost line.
+	startup := newPhaseClock()
 	raw, err := pelicanobj.New(ctx, pelicanobj.Config{
 		PrefixURL: prefix,
 		TokenPath: o.token,
@@ -224,9 +229,11 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	// union a whole session needs, and it turns a missing or too-narrow
 	// credential into one clear message here rather than an opaque
 	// failure deep in the mount.
+	startup.mark("discovery")
 	if err := pelicanobj.Preflight(ctx, raw, prefix, !rw); err != nil {
 		return fail(err)
 	}
+	startup.mark("access")
 	// Every byte the stack moves — pack range reads, catalog
 	// fetches, ref reads, seal uploads — goes through the counter.
 	g.inner = countedStore{ObjectStore: stats.WrapStorage(raw, g.stats), raw: raw}
@@ -253,6 +260,7 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		g.lease = l
 		defer g.releaseLease()
 	}
+	startup.mark("lease")
 
 	rstore, err := refs.New(g.inner, stateDir, trusted)
 	if err != nil {
@@ -276,6 +284,7 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		g.sb, g.prevRaw = f.Superblock, f.Raw
 	}
 	sb := g.sb
+	startup.mark("head")
 
 	if o.encryptKeyPath != "" {
 		kek, err := superblock.LoadRSAPrivateKeyFile(o.encryptKeyPath, keyPassphrase())
@@ -321,6 +330,8 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		return fail(err)
 	}
 	defer g.gfs.Close() //nolint:errcheck
+	startup.mark("index")
+	startup.report(len(sb.PackList))
 	g.stats.Update(func(sum *stats.Summary) { sum.Generation = sb.Generation })
 
 	if err := g.runPrefetch(ctx, o.prefetch); err != nil {
@@ -697,6 +708,34 @@ func (g *genSession) reportSealCost(c sealCost) {
 		"wall", wall, "cpu", cpu, "downloaded", ui.ByteCount(down), "uploaded", ui.ByteCount(up))
 }
 
+// phaseClock times the startup sequence phase by phase, so "the mount
+// took 15 seconds" can be answered with which part did.
+type phaseClock struct {
+	start time.Time
+	last  time.Time
+	parts []any
+}
+
+func newPhaseClock() *phaseClock {
+	now := time.Now()
+	return &phaseClock{start: now, last: now}
+}
+
+func (c *phaseClock) mark(name string) {
+	now := time.Now()
+	c.parts = append(c.parts, name, now.Sub(c.last).Round(time.Millisecond))
+	c.last = now
+}
+
+// report prints the breakdown. The pack count rides along because the
+// index phase is proportional to it, and a reader comparing two mounts
+// needs to know whether the volume grew.
+func (c *phaseClock) report(packs int) {
+	args := append([]any{"total", time.Since(c.start).Round(time.Millisecond), "packs", packs}, c.parts...)
+	ui.Info("ready to serve in {total} ({packs} packs; discovery {discovery}, access {access}, "+
+		"lease {lease}, head {head}, pack index {index})", args...)
+}
+
 // processCPU is this process's user+system time. Seals are mostly
 // chunking and SQLite, so CPU well below wall time points at the network
 // and CPU near wall time points at us.
@@ -835,8 +874,9 @@ func (g *genSession) checkpoint(ctx context.Context) (string, error) {
 	}
 	ui.Info("checkpoint: sealed generation {generation} while mounted; the mount keeps serving",
 		"generation", res.Superblock.Generation)
-	return fmt.Sprintf("generation %d: %d chunks uploaded, %d catalogs, %d new packs",
-		res.Superblock.Generation, res.Stats.ChunksAdded, res.Stats.Catalogs, len(res.NewPacks)), nil
+	return fmt.Sprintf("generation %d: %d chunks uploaded, %d catalogs written (%d carried), %d new packs",
+		res.Superblock.Generation, res.Stats.ChunksAdded, res.Stats.Catalogs,
+		res.Stats.CatalogsReused, len(res.NewPacks)), nil
 }
 
 // slowCheckpoint is the duration past which a periodic checkpoint is
@@ -905,9 +945,15 @@ func (g *genSession) sealAtExit(ctx context.Context) error {
 	}
 	ok := true
 	g.stats.Update(func(sum *stats.Summary) { sum.SealOK = &ok })
-	ui.Info("sealed generation {generation} ({chunks} chunks, {catalogs} catalogs, {packs} packs)",
+	// Carried and pruned are reported next to written, because the number
+	// that matters is the RATIO: a one-file change that writes one catalog
+	// and carries thirty is the intended behavior, and the same line
+	// showing thirty-one written is the defect.
+	ui.Info("sealed generation {generation} ({chunks} chunks, {catalogs} catalogs written, "+
+		"{carried} carried, {pruned} subtrees untouched, {packs} packs)",
 		"generation", res.Superblock.Generation, "chunks", res.Stats.ChunksAdded,
-		"catalogs", res.Stats.Catalogs, "packs", len(res.NewPacks))
+		"catalogs", res.Stats.Catalogs, "carried", res.Stats.CatalogsReused,
+		"pruned", res.Stats.SubtreesPruned, "packs", len(res.NewPacks))
 
 	// The overlay's contents are now published, and it is pinned to the
 	// generation it shadowed — which is no longer the head. Leaving it

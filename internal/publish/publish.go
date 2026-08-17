@@ -73,9 +73,18 @@ import (
 
 // Defaults and policy constants.
 const (
-	// DefaultInlineMax is the inline threshold (one SQLite page; the design
-	// doc's measured sweet spot).
-	DefaultInlineMax = 4096
+	// DefaultInlineMax is the inline threshold. Measured across a real
+	// kernel tree (docs/design-writepath.md): inlining is what makes
+	// catalogs NUMEROUS rather than large, and catalog count is what makes
+	// an incremental seal cheap — at 4096 one changed file rebuilds 23% of
+	// the namespace, at 1024 it rebuilds 63%.
+	//
+	// 2048 is the deliberate middle. Catalog bytes are the part of a seal
+	// that cannot move before exit, and this halves them against 4096
+	// (11.2 MiB against 19.9 on that tree) while a one-file change still
+	// rebuilds only 41% of the namespace. Raising it trades exit latency
+	// for read locality; lowering it trades incremental seal cost for it.
+	DefaultInlineMax = 2048
 	// DefaultTargetPackSize matches the phase-1 middleware's pack target.
 	DefaultTargetPackSize = 64 << 20
 	// DefaultFirstPackSize is the size the FIRST pack is cut at; the cut

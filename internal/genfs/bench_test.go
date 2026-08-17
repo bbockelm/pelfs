@@ -144,17 +144,17 @@ type benchEnv struct {
 func newBenchEnv(b *testing.B, files int) *benchEnv {
 	b.Helper()
 	inner, _ := newInner(b)
-	v := newTestVolume(b, "beefbeef-0000-4000-8000-000000000001")
-	dir := v.mkdir(1, "many")
+	v := newTestVolume(b, inner, "beefbeef-0000-4000-8000-000000000001")
+	dir := v.Mkdir(1, "many")
 	names := make([]string, files)
 	for i := range names {
 		names[i] = fmt.Sprintf("f%04d.txt", i)
-		ino := v.create(dir, names[i])
-		v.write(ino, []byte(fmt.Sprintf("inline content %04d", i)))
+		ino := v.Create(dir, names[i])
+		v.Write(ino, []byte(fmt.Sprintf("inline content %04d", i)))
 	}
 	bigContent := pseudorandom(8<<20, 7)
-	big := v.create(1, "big.bin")
-	v.write(big, bigContent)
+	big := v.Create(1, "big.bin")
+	v.Write(big, bigContent)
 
 	res := publishVolume(b, v, inner, publish.Options{})
 	fs := openFS(b, inner, res.Superblock, genfs.Options{})

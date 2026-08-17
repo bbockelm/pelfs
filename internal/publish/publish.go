@@ -16,10 +16,13 @@
 //   - Full-tree TRANSFORM: every catalog and shard regenerates from the
 //     source. Dirty-set tracking is a later optimization; content
 //     addressing already makes an unchanged subtree's catalog hash to the
-//     same bytes it did last generation.
-//   - Chunk dedup is within-publish only (see packer). An unchanged file
-//     re-uploads its chunks under the same identities across generations —
-//     wasted bytes, never corruption.
+//     same bytes it did last generation. File CONTENT is the exception —
+//     a source that can prove a file's bytes untouched hands back the
+//     records the previous generation published (see ContentReuser), so
+//     the walk never opens it.
+//   - Chunk dedup is within-publish only (see packer) plus the local
+//     sidecar index (dedup.go). A re-uploaded chunk is wasted bytes under
+//     the same identity, never corruption.
 //   - Holes materialize as zero bytes through the chunker instead of NULL
 //     chunkref rows: content stays byte-exact, sparseness is not preserved.
 //   - Promoted (nlink > 1) inodes keep their node row in every referencing
@@ -44,11 +47,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/juicedata/juicefs/pkg/object"
-
 	"github.com/bbockelm/pelfs/internal/catalog"
 	"github.com/bbockelm/pelfs/internal/chunkid"
-	"github.com/bbockelm/pelfs/internal/cutdb"
 	"github.com/bbockelm/pelfs/internal/entrycodec"
 	"github.com/bbockelm/pelfs/internal/overlay"
 	"github.com/bbockelm/pelfs/internal/packstore"
@@ -83,25 +83,16 @@ const (
 
 // Options configures one Publish run.
 type Options struct {
-	// CutPath is the VACUUM'd JuiceFS meta snapshot that defines this
-	// generation's contents. Mutually exclusive with Overlay.
-	CutPath string
-	// Overlay seals a phase-3 write overlay instead of translating a cut:
-	// its merged base+dirty view defines this generation's contents. Prev
-	// is then required — the overlay sits over exactly that generation,
-	// which is where the volume identity comes from. See Seal.
+	// Overlay is the write overlay this generation publishes: its merged
+	// base+dirty view defines the contents. Prev is required — the
+	// overlay sits over exactly that generation, which is where the
+	// volume identity comes from. See Seal.
 	Overlay *overlay.FS
 	// OverlaySnapshot seals a frozen view instead of the live overlay.
 	// A checkpoint uses this so the published generation corresponds to
 	// an instant, which is the precondition for rebasing inodes back to
 	// clean afterwards. Mutually exclusive with Overlay.
 	OverlaySnapshot *overlay.Snapshot
-	// Blob is the session's data store, for reading file content the cut
-	// references. Unused by the overlay source.
-	Blob object.ObjectStorage
-	// CacheDir backs the cut reader's block cache (pass the session's
-	// cache dir so TRANSFORM hits blocks the writer just produced).
-	CacheDir string
 	// Inner is the raw transport: pack uploads and the ref write.
 	Inner pelicanobj.Store
 	// SpoolDir holds pack spools and catalog build files.
@@ -138,13 +129,8 @@ type Options struct {
 	// dedup.go); empty disables it. Missing/stale/foreign indexes are
 	// ignored — re-uploads are harmless duplicates.
 	DedupIndexPath string
-	// ReadStaging serves cut content from the session's writeback staging
-	// area (accumulate mode, where staged blocks never uploaded and the
-	// publish IS the durability step).
-	ReadStaging bool
 	// VolumeID identifies a volume being created by InitVolume. Every
-	// other path takes identity from the source (a cut's format UUID) or
-	// the previous generation.
+	// other path takes identity from the previous generation.
 	VolumeID [16]byte
 
 	// emptySource selects the empty-root source (InitVolume).
@@ -158,8 +144,12 @@ type Stats struct {
 	PromotedInodes                  int
 	ChunksAdded, ChunksDeduped      int
 	DedupIndexChunks                int // identities preloaded from the sidecar
-	ChunkBytes                      int64
-	Catalogs, Shards                int
+	// ReusedFiles/ReusedChunks count content carried forward from the
+	// previous generation instead of read and re-chunked — the files this
+	// seal never opened.
+	ReusedFiles, ReusedChunks int
+	ChunkBytes                int64
+	Catalogs, Shards          int
 }
 
 // Result is a successful publish.
@@ -170,10 +160,9 @@ type Result struct {
 	Stats      Stats
 }
 
-// Seal publishes a phase-3 write overlay directly into catalogs, packs,
-// and a signed superblock: the accumulate-mode session never needs JuiceFS
-// metadata to publish. Options.Overlay and Options.Prev are required;
-// everything downstream of the walk is the ordinary pipeline.
+// Seal publishes a write overlay into catalogs, packs, and a signed
+// superblock. Options.Overlay and Options.Prev are required; everything
+// downstream of the walk is the ordinary pipeline.
 func Seal(ctx context.Context, o Options) (*Result, error) {
 	if o.Overlay == nil && o.OverlaySnapshot == nil {
 		return nil, errors.New("publish: Seal requires Options.Overlay")
@@ -285,39 +274,30 @@ func Publish(ctx context.Context, o Options) (*Result, error) {
 	return &Result{Superblock: sb, Raw: raw, NewPacks: newPacks, Stats: p.stats}, nil
 }
 
-// openSource opens the tree this publish reads and reports the volume UUID
-// every catalog is stamped with: the cut's own format record, or — for an
-// overlay, which does not carry the superblock it shadows — the previous
-// generation's volume id. The returned func releases source resources.
+// openSource opens the tree this publish reads and reports the volume
+// UUID every catalog is stamped with. An overlay does not carry the
+// superblock it shadows, so its identity comes from the previous
+// generation. The returned func releases source resources.
 func openSource(o Options) (Source, string, func(), error) {
-	if o.emptySource {
+	switch {
+	case o.emptySource:
 		return &emptyRoot{nextInode: 2}, formatVolumeID(o.VolumeID), func() {}, nil
-	}
-	if o.OverlaySnapshot != nil {
+	case o.OverlaySnapshot != nil:
 		return &overlaySource{fs: o.OverlaySnapshot}, formatVolumeID(o.Prev.VolumeID), func() {}, nil
-	}
-	if o.Overlay != nil {
+	default:
 		return &overlaySource{fs: o.Overlay}, formatVolumeID(o.Prev.VolumeID), func() {}, nil
 	}
-	db, err := cutdb.Open(o.CutPath, cutdb.Options{Blob: o.Blob, CacheDir: o.CacheDir, Staging: o.ReadStaging})
-	if err != nil {
-		return nil, "", nil, fmt.Errorf("publish: open cut: %w", err)
-	}
-	closeFn := func() { db.Close() } //nolint:errcheck
-	return newCutSource(db), db.Format().UUID, closeFn, nil
 }
 
 func applyDefaults(o *Options) error {
 	switch {
 	case o.emptySource:
 		// InitVolume supplies the tree itself.
-	case o.CutPath == "" && o.Overlay == nil && o.OverlaySnapshot == nil:
-		return errors.New("publish: CutPath, Overlay, or OverlaySnapshot is required")
-	case o.CutPath != "" && (o.Overlay != nil || o.OverlaySnapshot != nil):
-		return errors.New("publish: CutPath and an overlay source are mutually exclusive")
+	case o.Overlay == nil && o.OverlaySnapshot == nil:
+		return errors.New("publish: Overlay or OverlaySnapshot is required")
 	case o.Overlay != nil && o.OverlaySnapshot != nil:
 		return errors.New("publish: Overlay and OverlaySnapshot are mutually exclusive")
-	case (o.Overlay != nil || o.OverlaySnapshot != nil) && o.Prev == nil:
+	case o.Prev == nil:
 		// An overlay always shadows a base generation; that generation is
 		// the only place the volume identity and lineage come from.
 		return errors.New("publish: sealing an overlay requires Prev (its base generation)")
@@ -505,11 +485,23 @@ func (p *pipeline) walk(ctx context.Context) error {
 
 // transform produces every file's content records: inline bytes at or
 // below the threshold, CDC chunk lists (with pack appends) above it.
+// Files the source can prove untouched keep the records the previous
+// generation already published, and are never opened at all.
 func (p *pipeline) transform(ctx context.Context) error {
+	reuse := p.contentReuser()
 	for _, ino := range p.sortedInodes() {
 		r := p.recs[ino]
 		if r.n.Type != catalog.TypeFile || r.n.Length == 0 {
 			continue
+		}
+		if reuse != nil {
+			reused, err := p.reuseContent(ctx, reuse, r)
+			if err != nil {
+				return err
+			}
+			if reused {
+				continue
+			}
 		}
 		if r.n.Length <= p.o.InlineMax {
 			rd, err := p.src.Open(ctx, ino, r.n.Length)
@@ -536,6 +528,86 @@ func (p *pipeline) transform(ctx context.Context) error {
 		p.stats.ChunkedFiles++
 	}
 	return nil
+}
+
+// contentReuser reports the source's reuse capability, but only when the
+// source answers from the EXACT generation this publish grows from.
+//
+// That equality is the whole safety argument for carrying content records
+// forward. A chunkref names bytes by identity and nothing else; the bytes
+// are locatable only through the pack list of a generation that holds
+// them, and buildSuperblock carries Prev's pack list forward verbatim, so
+// records reused from Prev are always locatable in what is being built.
+// Records from any OTHER generation could name a pack this one does not
+// list — and retention (internal/retention) deletes any pack no live
+// superblock names, so the result would be a signed generation that
+// becomes unreadable at the next sweep, discovered by a reader long after
+// the seal that caused it.
+func (p *pipeline) contentReuser() ContentReuser {
+	if p.o.Prev == nil {
+		return nil
+	}
+	cr, ok := p.src.(ContentReuser)
+	if !ok {
+		return nil
+	}
+	if cr.BaseGeneration() != p.o.Prev.RootCatalog {
+		return nil
+	}
+	return cr
+}
+
+// reuseContent installs the previous generation's records for r when the
+// source vouches for them, reporting whether it did. Anything unproven
+// returns false and is chunked the ordinary way: a redundant re-chunk
+// costs time, a wrong content record costs the file.
+func (p *pipeline) reuseContent(ctx context.Context, cr ContentReuser, r *rec) (bool, error) {
+	c, ok, err := cr.ExistingContent(ctx, r.n.Inode)
+	if err != nil || !ok {
+		return false, err
+	}
+	// Length is the one fact the source's proof does not itself compare.
+	// It should never disagree — every overlay path that changes a length
+	// also stages content — so this is a cheap standing check that the two
+	// halves of the merged view describe the same file.
+	if c.Length != r.n.Length {
+		return false, nil
+	}
+	switch inlineNow := r.n.Length <= p.o.InlineMax; {
+	case c.Inline != nil && inlineNow:
+		r.inline = c.Inline
+		p.stats.InlineFiles++
+	case c.Refs != nil && !inlineNow:
+		r.chunks = c.Refs
+		p.rememberReusedChunks(c.Refs)
+		p.stats.ChunkedFiles++
+		p.stats.ReusedChunks += len(c.Refs)
+	default:
+		// The inline threshold moved since the base generation, so the
+		// record on hand has the wrong shape for the catalog being built.
+		// Rare enough to be worth re-reading rather than special-casing.
+		return false, nil
+	}
+	p.stats.ReusedFiles++
+	return true, nil
+}
+
+// rememberReusedChunks folds carried-forward identities into the
+// within-publish dedup set. They live in packs this generation lists, so a
+// NEWLY written file that happens to share one must not upload it again —
+// and the sidecar index saved at the end is exactly this set, so dropping
+// them would shrink the dedup domain a little more with every seal.
+func (p *pipeline) rememberReusedChunks(refs []catalog.ChunkRef) {
+	for _, ref := range refs {
+		if len(ref.Identity) != chunkid.IdentitySize {
+			continue // a hole, which stores nothing
+		}
+		id := chunkid.Identity(ref.Identity)
+		if _, seen := p.chunkSeen[id]; seen {
+			continue
+		}
+		p.chunkSeen[id] = chunkInfo{clen: ref.CLen, alg: uint8(ref.Alg), keyID: ref.KeyID}
+	}
 }
 
 func (p *pipeline) chunkFile(ctx context.Context, ino uint64, length int64) ([]catalog.ChunkRef, error) {
@@ -832,6 +904,12 @@ func (p *pipeline) buildSuperblock(newPacks []packstore.SealedPack, shards []sup
 	if p.o.Prev != nil {
 		// Carry the previous generation's whole pack set forward; trimming
 		// dead packs is repack's job, not publish's.
+		//
+		// Unconditional, and TRANSFORM's content reuse depends on it: a
+		// carried-forward chunkref names bytes that live in one of Prev's
+		// packs, and retention deletes any pack no live superblock lists.
+		// If this ever grows a filter, reuse must be gated on the surviving
+		// set (or dropped) in the same change.
 		packList = append(packList, p.o.Prev.PackList...)
 	}
 	for _, sp := range newPacks {

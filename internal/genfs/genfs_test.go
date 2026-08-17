@@ -3,9 +3,6 @@ package genfs_test
 import (
 	"bytes"
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
-	"database/sql"
 	"errors"
 	"fmt"
 	mrand "math/rand"
@@ -16,17 +13,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/juicedata/juicefs/pkg/chunk"
-	"github.com/juicedata/juicefs/pkg/meta"
-	"github.com/juicedata/juicefs/pkg/object"
-	"github.com/prometheus/client_golang/prometheus"
-
 	"github.com/bbockelm/pelfs/internal/catalog"
 	"github.com/bbockelm/pelfs/internal/fakeorigin"
 	"github.com/bbockelm/pelfs/internal/genfs"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/publish"
 	"github.com/bbockelm/pelfs/internal/superblock"
+	"github.com/bbockelm/pelfs/internal/testvol"
 )
 
 const rootIno = genfs.RootInode
@@ -46,133 +39,10 @@ func newInner(t testing.TB) (pelicanobj.Store, string) {
 	return inner, filepath.Join(root, "vol")
 }
 
-// testVolume is a live JuiceFS volume the tests mutate and cut (the
-// publish test pattern).
-type testVolume struct {
-	t        testing.TB
-	metaPath string
-	m        meta.Meta
-	blob     object.ObjectStorage
-	store    chunk.ChunkStore
-	cuts     int
-}
-
-func newTestVolume(t testing.TB, uuid string) *testVolume {
+// newTestVolume creates an empty volume the tests fill in and publish.
+func newTestVolume(t testing.TB, inner pelicanobj.Store, uuid string) *testvol.Volume {
 	t.Helper()
-	metaPath := filepath.Join(t.TempDir(), "meta.db")
-	conf := meta.DefaultConf()
-	conf.NoBGJob = true
-	m := meta.NewClient("sqlite3://"+metaPath, conf)
-	format := &meta.Format{
-		Name:      "genfs-test",
-		UUID:      uuid,
-		Storage:   "mem",
-		BlockSize: 4096, // KiB
-	}
-	if err := m.Init(format, false); err != nil {
-		t.Fatalf("init meta: %v", err)
-	}
-	if err := m.NewSession(true); err != nil {
-		t.Fatalf("session: %v", err)
-	}
-	t.Cleanup(func() { _ = m.CloseSession() })
-
-	blob, err := object.CreateStorage("mem", "", "", "", "")
-	if err != nil {
-		t.Fatalf("mem store: %v", err)
-	}
-	store := chunk.NewCachedStore(blob, chunk.Config{
-		BlockSize:  format.BlockSize * 1024,
-		CacheDir:   "memory",
-		CacheSize:  64 << 20,
-		GetTimeout: 10 * time.Second, PutTimeout: 10 * time.Second,
-		MaxUpload: 2, MaxDownload: 2, MaxRetries: 1, BufferSize: 32 << 20,
-	}, prometheus.NewRegistry())
-	return &testVolume{t: t, metaPath: metaPath, m: m, blob: blob, store: store}
-}
-
-func (v *testVolume) ctx() meta.Context { return meta.WrapContext(context.Background()) }
-
-func (v *testVolume) mkdir(parent uint64, name string) uint64 {
-	v.t.Helper()
-	var ino meta.Ino
-	var attr meta.Attr
-	if st := v.m.Mkdir(v.ctx(), meta.Ino(parent), name, 0755, 0, 0, &ino, &attr); st != 0 {
-		v.t.Fatalf("mkdir %s: %s", name, st)
-	}
-	return uint64(ino)
-}
-
-func (v *testVolume) create(parent uint64, name string) uint64 {
-	v.t.Helper()
-	var ino meta.Ino
-	var attr meta.Attr
-	if st := v.m.Create(v.ctx(), meta.Ino(parent), name, 0644, 0, 0, &ino, &attr); st != 0 {
-		v.t.Fatalf("create %s: %s", name, st)
-	}
-	return uint64(ino)
-}
-
-// write stores data as one slice at offset 0 of chunk 0 (data must fit one
-// 64 MiB chunk).
-func (v *testVolume) write(ino uint64, data []byte) {
-	v.t.Helper()
-	var sliceID uint64
-	if st := v.m.NewSlice(v.ctx(), &sliceID); st != 0 {
-		v.t.Fatalf("new slice: %s", st)
-	}
-	w := v.store.NewWriter(sliceID, 0)
-	if _, err := w.WriteAt(data, 0); err != nil {
-		v.t.Fatalf("write slice: %v", err)
-	}
-	if err := w.Finish(len(data)); err != nil {
-		v.t.Fatalf("finish slice: %v", err)
-	}
-	s := meta.Slice{Id: sliceID, Size: uint32(len(data)), Len: uint32(len(data))}
-	if st := v.m.Write(v.ctx(), meta.Ino(ino), 0, 0, s, time.Now()); st != 0 {
-		v.t.Fatalf("meta write: %s", st)
-	}
-}
-
-func (v *testVolume) symlink(parent uint64, name, target string) uint64 {
-	v.t.Helper()
-	var ino meta.Ino
-	var attr meta.Attr
-	if st := v.m.Symlink(v.ctx(), meta.Ino(parent), name, target, &ino, &attr); st != 0 {
-		v.t.Fatalf("symlink %s: %s", name, st)
-	}
-	return uint64(ino)
-}
-
-func (v *testVolume) link(ino, parent uint64, name string) {
-	v.t.Helper()
-	var attr meta.Attr
-	if st := v.m.Link(v.ctx(), meta.Ino(ino), meta.Ino(parent), name, &attr); st != 0 {
-		v.t.Fatalf("link %s: %s", name, st)
-	}
-}
-
-func (v *testVolume) setxattr(ino uint64, name string, value []byte) {
-	v.t.Helper()
-	if st := v.m.SetXattr(v.ctx(), meta.Ino(ino), name, value, 0); st != 0 {
-		v.t.Fatalf("setxattr %s: %s", name, st)
-	}
-}
-
-// cut takes the publish-time metadata snapshot: VACUUM INTO a fresh file.
-func (v *testVolume) cut() string {
-	v.t.Helper()
-	v.cuts++
-	dst := filepath.Join(v.t.TempDir(), fmt.Sprintf("cut-%d.db", v.cuts))
-	db, err := sql.Open("sqlite", "file:"+v.metaPath+"?mode=ro&_pragma=busy_timeout(10000)")
-	if err != nil {
-		v.t.Fatalf("open meta for cut: %v", err)
-	}
-	defer db.Close() //nolint:errcheck
-	if _, err := db.Exec(fmt.Sprintf("VACUUM INTO '%s'", dst)); err != nil {
-		v.t.Fatalf("vacuum into: %v", err)
-	}
-	return dst
+	return testvol.New(t, inner, testvol.Options{VolumeID: testvol.ParseUUID(t, uuid)})
 }
 
 // pseudorandom returns deterministic incompressible content.
@@ -182,27 +52,10 @@ func pseudorandom(n int, seed int64) []byte {
 	return b
 }
 
-// publishVolume cuts v and publishes it through inner, filling in the
-// boilerplate options.
-func publishVolume(t testing.TB, v *testVolume, inner pelicanobj.Store, opts publish.Options) *publish.Result {
+// publishVolume seals everything written into v since the last publish.
+func publishVolume(t testing.TB, v *testvol.Volume, _ pelicanobj.Store, opts publish.Options) *publish.Result {
 	t.Helper()
-	opts.CutPath = v.cut()
-	opts.Blob = v.blob
-	opts.CacheDir = t.TempDir()
-	opts.Inner = inner
-	opts.SpoolDir = t.TempDir()
-	if opts.SigningKey == nil {
-		_, priv, err := ed25519.GenerateKey(rand.Reader)
-		if err != nil {
-			t.Fatal(err)
-		}
-		opts.SigningKey = priv
-	}
-	res, err := publish.Publish(context.Background(), opts)
-	if err != nil {
-		t.Fatalf("Publish: %v", err)
-	}
-	return res
+	return v.Publish(opts)
 }
 
 // openFS opens a genfs over the published superblock with a fresh cache dir.
@@ -263,22 +116,22 @@ func readAll(t *testing.T, fs *genfs.FS, ino uint64, length int, bufSize int) []
 func TestDescentReaddir(t *testing.T) {
 	ctx := context.Background()
 	inner, _ := newInner(t)
-	v := newTestVolume(t, "3f2c8a1e-5b4d-4e6f-9a0b-1c2d3e4f5a6b")
+	v := newTestVolume(t, inner, "3f2c8a1e-5b4d-4e6f-9a0b-1c2d3e4f5a6b")
 
 	bigContent := pseudorandom(8<<20, 42)
 	smallContent := []byte("hello inline world, generation zero")
 	hardContent := pseudorandom(100, 7)
 
-	dirIno := v.mkdir(rootIno, "dir")
-	smallIno := v.create(dirIno, "small.txt")
-	v.write(smallIno, smallContent)
-	v.setxattr(smallIno, "user.color", []byte("blue"))
-	v.symlink(dirIno, "link", "small.txt")
-	bigIno := v.create(rootIno, "big.bin")
-	v.write(bigIno, bigContent)
-	hardIno := v.create(rootIno, "hard1")
-	v.write(hardIno, hardContent)
-	v.link(hardIno, dirIno, "hard2")
+	dirIno := v.Mkdir(rootIno, "dir")
+	smallIno := v.Create(dirIno, "small.txt")
+	v.Write(smallIno, smallContent)
+	v.SetXattr(smallIno, "user.color", []byte("blue"))
+	v.Symlink(dirIno, "link", "small.txt")
+	bigIno := v.Create(rootIno, "big.bin")
+	v.Write(bigIno, bigContent)
+	hardIno := v.Create(rootIno, "hard1")
+	v.Write(hardIno, hardContent)
+	v.Link(hardIno, dirIno, "hard2")
 
 	// SMax 1000 forces /dir into a nested catalog: the descent crosses a
 	// transition point.
@@ -358,10 +211,10 @@ func TestDescentReaddir(t *testing.T) {
 func TestErrStale(t *testing.T) {
 	ctx := context.Background()
 	inner, _ := newInner(t)
-	v := newTestVolume(t, "11112222-3333-4444-5555-666677778888")
-	dirIno := v.mkdir(rootIno, "d")
-	fIno := v.create(dirIno, "f")
-	v.write(fIno, []byte("payload"))
+	v := newTestVolume(t, inner, "11112222-3333-4444-5555-666677778888")
+	dirIno := v.Mkdir(rootIno, "d")
+	fIno := v.Create(dirIno, "f")
+	v.Write(fIno, []byte("payload"))
 
 	res := publishVolume(t, v, inner, publish.Options{})
 	fs := openFS(t, inner, res.Superblock, genfs.Options{})
@@ -423,14 +276,14 @@ func TestErrStale(t *testing.T) {
 func TestReadAndChunkCache(t *testing.T) {
 	ctx := context.Background()
 	inner, volDir := newInner(t)
-	v := newTestVolume(t, "aaaa1111-2222-3333-4444-555566667777")
+	v := newTestVolume(t, inner, "aaaa1111-2222-3333-4444-555566667777")
 
 	bigContent := pseudorandom(8<<20, 99)
 	smallContent := []byte("tiny inline body")
-	bigIno := v.create(rootIno, "big.bin")
-	v.write(bigIno, bigContent)
-	smallIno := v.create(rootIno, "small.txt")
-	v.write(smallIno, smallContent)
+	bigIno := v.Create(rootIno, "big.bin")
+	v.Write(bigIno, bigContent)
+	smallIno := v.Create(rootIno, "small.txt")
+	v.Write(smallIno, smallContent)
 
 	res := publishVolume(t, v, inner, publish.Options{TargetPackSize: 2 << 20})
 	fs := openFS(t, inner, res.Superblock, genfs.Options{})
@@ -500,18 +353,18 @@ func TestReadAndChunkCache(t *testing.T) {
 func TestHardlinks(t *testing.T) {
 	ctx := context.Background()
 	inner, _ := newInner(t)
-	v := newTestVolume(t, "bbbb1111-2222-3333-4444-555566667777")
+	v := newTestVolume(t, inner, "bbbb1111-2222-3333-4444-555566667777")
 
 	bigContent := pseudorandom(3<<20, 21)
 	smallContent := []byte("small hardlinked body")
-	dirIno := v.mkdir(rootIno, "d")
-	bigIno := v.create(rootIno, "hardbig")
-	v.write(bigIno, bigContent)
-	v.link(bigIno, dirIno, "hardbig2")
-	smallIno := v.create(rootIno, "hardsmall")
-	v.write(smallIno, smallContent)
-	v.setxattr(smallIno, "user.tag", []byte("shared"))
-	v.link(smallIno, dirIno, "hardsmall2")
+	dirIno := v.Mkdir(rootIno, "d")
+	bigIno := v.Create(rootIno, "hardbig")
+	v.Write(bigIno, bigContent)
+	v.Link(bigIno, dirIno, "hardbig2")
+	smallIno := v.Create(rootIno, "hardsmall")
+	v.Write(smallIno, smallContent)
+	v.SetXattr(smallIno, "user.tag", []byte("shared"))
+	v.Link(smallIno, dirIno, "hardsmall2")
 
 	res := publishVolume(t, v, inner, publish.Options{})
 	if res.Stats.PromotedInodes != 2 {
@@ -556,13 +409,13 @@ func TestHardlinks(t *testing.T) {
 func TestSymlinkXattr(t *testing.T) {
 	ctx := context.Background()
 	inner, _ := newInner(t)
-	v := newTestVolume(t, "cccc1111-2222-3333-4444-555566667777")
+	v := newTestVolume(t, inner, "cccc1111-2222-3333-4444-555566667777")
 
-	dirIno := v.mkdir(rootIno, "d")
-	smallIno := v.create(dirIno, "small.txt")
-	v.write(smallIno, []byte("body"))
-	v.setxattr(smallIno, "user.color", []byte("blue"))
-	linkIno := v.symlink(dirIno, "link", "small.txt")
+	dirIno := v.Mkdir(rootIno, "d")
+	smallIno := v.Create(dirIno, "small.txt")
+	v.Write(smallIno, []byte("body"))
+	v.SetXattr(smallIno, "user.color", []byte("blue"))
+	linkIno := v.Symlink(dirIno, "link", "small.txt")
 
 	res := publishVolume(t, v, inner, publish.Options{})
 	fs := openFS(t, inner, res.Superblock, genfs.Options{})
@@ -601,27 +454,25 @@ func TestSymlinkXattr(t *testing.T) {
 func TestEncrypted(t *testing.T) {
 	ctx := context.Background()
 	inner, _ := newInner(t)
-	v := newTestVolume(t, "dddd1111-2222-3333-4444-555566667777")
-
-	secret := []byte("the inline secret")
-	blob := pseudorandom(3<<20, 33)
-	dirIno := v.mkdir(rootIno, "enc")
-	secretIno := v.create(dirIno, "secret.txt")
-	v.write(secretIno, secret)
-	blobIno := v.create(rootIno, "blob.bin")
-	v.write(blobIno, blob)
-
 	dek := pseudorandom(32, 1)
-	idKey := pseudorandom(32, 2)
-	res := publishVolume(t, v, inner, publish.Options{
-		IdentityKey: idKey,
+	v := testvol.New(t, inner, testvol.Options{
+		VolumeID:    testvol.ParseUUID(t, "dddd1111-2222-3333-4444-555566667777"),
 		DEK:         dek,
+		IdentityKey: pseudorandom(32, 2),
 		KeyID:       7,
 		KeyTable: []superblock.KeyEntry{
 			{ID: 7, Kind: superblock.KeyKindDEK, Alg: superblock.KeyAlgRSAOAEPSHA256, Wrapped: []byte("wrapped-dek")},
 			{ID: 8, Kind: superblock.KeyKindIdentity, Alg: superblock.KeyAlgRSAOAEPSHA256, Wrapped: []byte("wrapped-idkey")},
 		},
 	})
+
+	secret := []byte("the inline secret")
+	blob := pseudorandom(3<<20, 33)
+	dirIno := v.Mkdir(rootIno, "enc")
+	secretIno := v.WriteFile(dirIno, "secret.txt", secret)
+	blobIno := v.WriteFile(rootIno, "blob.bin", blob)
+
+	res := publishVolume(t, v, inner, publish.Options{})
 
 	// The right DEK decodes the whole tree.
 	fs := openFS(t, inner, res.Superblock, genfs.Options{DEK: dek})
@@ -658,16 +509,16 @@ func TestEncrypted(t *testing.T) {
 func TestCatalogLRU(t *testing.T) {
 	ctx := context.Background()
 	inner, _ := newInner(t)
-	v := newTestVolume(t, "eeee1111-2222-3333-4444-555566667777")
+	v := newTestVolume(t, inner, "eeee1111-2222-3333-4444-555566667777")
 
 	faContent := pseudorandom(2500, 11)
 	fbContent := pseudorandom(2500, 12)
-	aIno := v.mkdir(rootIno, "a")
-	bIno := v.mkdir(rootIno, "b")
-	faIno := v.create(aIno, "fa")
-	v.write(faIno, faContent)
-	fbIno := v.create(bIno, "fb")
-	v.write(fbIno, fbContent)
+	aIno := v.Mkdir(rootIno, "a")
+	bIno := v.Mkdir(rootIno, "b")
+	faIno := v.Create(aIno, "fa")
+	v.Write(faIno, faContent)
+	fbIno := v.Create(bIno, "fb")
+	v.Write(fbIno, fbContent)
 
 	// SMax 1000 peels both /a and /b: a 3-catalog tree.
 	res := publishVolume(t, v, inner, publish.Options{SMax: 1000})
@@ -723,11 +574,11 @@ func TestCatalogLRU(t *testing.T) {
 func TestParentLookupPathAndAccessors(t *testing.T) {
 	ctx := context.Background()
 	inner, _ := newInner(t)
-	v := newTestVolume(t, "abcdabcd-0000-4000-8000-0000000000aa")
-	dir := v.mkdir(1, "d")
-	sub := v.mkdir(dir, "sub")
-	fileIno := v.create(sub, "f.txt")
-	v.write(fileIno, []byte("hello"))
+	v := newTestVolume(t, inner, "abcdabcd-0000-4000-8000-0000000000aa")
+	dir := v.Mkdir(1, "d")
+	sub := v.Mkdir(dir, "sub")
+	fileIno := v.Create(sub, "f.txt")
+	v.Write(fileIno, []byte("hello"))
 	res := publishVolume(t, v, inner, publish.Options{})
 	fs := openFS(t, inner, res.Superblock, genfs.Options{})
 
@@ -783,14 +634,14 @@ func TestParentLookupPathAndAccessors(t *testing.T) {
 func TestGenerationSwap(t *testing.T) {
 	ctx := context.Background()
 	inner, _ := newInner(t)
-	v := newTestVolume(t, "5eaf5eaf-0000-4000-8000-000000000055")
-	dir := v.mkdir(1, "d")
-	stableIno := v.create(dir, "stable.txt")
-	v.write(stableIno, []byte("unchanged across generations"))
-	changedIno := v.create(dir, "changed.txt")
-	v.write(changedIno, []byte("v1"))
-	doomedIno := v.create(dir, "doomed.txt")
-	v.write(doomedIno, []byte("deleted next generation"))
+	v := newTestVolume(t, inner, "5eaf5eaf-0000-4000-8000-000000000055")
+	dir := v.Mkdir(1, "d")
+	stableIno := v.Create(dir, "stable.txt")
+	v.Write(stableIno, []byte("unchanged across generations"))
+	changedIno := v.Create(dir, "changed.txt")
+	v.Write(changedIno, []byte("v1"))
+	doomedIno := v.Create(dir, "doomed.txt")
+	v.Write(doomedIno, []byte("deleted next generation"))
 	gen0 := publishVolume(t, v, inner, publish.Options{})
 
 	fs := openFS(t, inner, gen0.Superblock, genfs.Options{})
@@ -805,23 +656,25 @@ func TestGenerationSwap(t *testing.T) {
 		}
 	}
 
-	// Second generation: change one file, delete another, add a third.
-	v.write(changedIno, []byte("v2 is longer than v1"))
-	if st := v.m.Unlink(v.ctx(), meta.Ino(dir), "doomed.txt"); st != 0 {
-		t.Fatalf("unlink: %s", st)
-	}
-	addedIno := v.create(dir, "added.txt")
-	v.write(addedIno, []byte("new in generation 1"))
-	gen1 := publishVolume(t, v, inner, publish.Options{
-		Prev: gen0.Superblock, PrevRaw: gen0.Raw,
-	})
+	// Next generation: change one file, delete another, add a third. The
+	// overlay establishes residency by descent, so each inode carried over
+	// from the published generation is looked up before it is touched.
+	v.Lookup(genfs.RootInode, "d")
+	v.Lookup(dir, "changed.txt")
+	v.Truncate(changedIno, 0)
+	v.Write(changedIno, []byte("v2 is longer than v1"))
+	v.Unlink(dir, "doomed.txt")
+	addedIno := v.Create(dir, "added.txt")
+	v.Write(addedIno, []byte("new in generation 1"))
+	gen1 := publishVolume(t, v, inner, publish.Options{})
 
 	rep, err := fs.Swap(ctx, gen1.Superblock)
 	if err != nil {
 		t.Fatalf("Swap: %v", err)
 	}
-	if rep.From != 0 || rep.To != 1 {
-		t.Fatalf("swap %d->%d, want 0->1", rep.From, rep.To)
+	if rep.From != gen0.Superblock.Generation || rep.To != gen1.Superblock.Generation {
+		t.Fatalf("swap %d->%d, want %d->%d", rep.From, rep.To,
+			gen0.Superblock.Generation, gen1.Superblock.Generation)
 	}
 
 	changed := map[uint64]genfs.Change{}
@@ -855,8 +708,8 @@ func TestGenerationSwap(t *testing.T) {
 	}
 
 	// The swapped filesystem serves the NEW generation.
-	if fs.Generation() != 1 {
-		t.Fatalf("Generation = %d after swap, want 1", fs.Generation())
+	if fs.Generation() != gen1.Superblock.Generation {
+		t.Fatalf("Generation = %d after swap, want %d", fs.Generation(), gen1.Superblock.Generation)
 	}
 	got := make([]byte, 20)
 	n, err := fs.Read(ctx, changedIno, 0, got)
@@ -883,12 +736,12 @@ func TestGenerationSwap(t *testing.T) {
 func TestBoundedResidency(t *testing.T) {
 	ctx := context.Background()
 	inner, _ := newInner(t)
-	v := newTestVolume(t, "b0bdb0bd-0000-4000-8000-000000000042")
-	dir := v.mkdir(1, "d")
+	v := newTestVolume(t, inner, "b0bdb0bd-0000-4000-8000-000000000042")
+	dir := v.Mkdir(1, "d")
 	var inos []uint64
 	for i := 0; i < 20; i++ {
-		ino := v.create(dir, fmt.Sprintf("f%02d.txt", i))
-		v.write(ino, []byte("x"))
+		ino := v.Create(dir, fmt.Sprintf("f%02d.txt", i))
+		v.Write(ino, []byte("x"))
 		inos = append(inos, ino)
 	}
 	res := publishVolume(t, v, inner, publish.Options{})
@@ -940,15 +793,15 @@ func TestBoundedResidency(t *testing.T) {
 func TestPrefetchWarmsCache(t *testing.T) {
 	ctx := context.Background()
 	inner, originDir := newInner(t)
-	v := newTestVolume(t, "9efe7c40-0000-4000-8000-000000000077")
-	dir := v.mkdir(1, "d")
-	big := v.create(dir, "big.bin")
+	v := newTestVolume(t, inner, "9efe7c40-0000-4000-8000-000000000077")
+	dir := v.Mkdir(1, "d")
+	big := v.Create(dir, "big.bin")
 	bigContent := pseudorandom(6<<20, 99)
-	v.write(big, bigContent)
-	twin := v.create(dir, "twin.bin") // identical content: one chunk set
-	v.write(twin, bigContent)
-	small := v.create(dir, "small.txt")
-	v.write(small, []byte("inline, nothing to fetch"))
+	v.Write(big, bigContent)
+	twin := v.Create(dir, "twin.bin") // identical content: one chunk set
+	v.Write(twin, bigContent)
+	small := v.Create(dir, "small.txt")
+	v.Write(small, []byte("inline, nothing to fetch"))
 	res := publishVolume(t, v, inner, publish.Options{})
 
 	cache := t.TempDir()
@@ -1017,16 +870,16 @@ func TestPrefetchWarmsCache(t *testing.T) {
 func TestSwapIsAtomicForConcurrentOps(t *testing.T) {
 	ctx := context.Background()
 	inner, _ := newInner(t)
-	v := newTestVolume(t, "5eaf5eaf-0000-4000-8000-000000000099")
-	dir := v.mkdir(1, "d")
+	v := newTestVolume(t, inner, "5eaf5eaf-0000-4000-8000-000000000099")
+	dir := v.Mkdir(1, "d")
 	// Enough residency that the re-descend takes long enough for a
 	// concurrent reader to land inside it. Too few and the race is real
 	// but unobserved, which is worse than no test at all.
 	const files = 600
 	inos := make([]uint64, 0, files)
 	for i := 0; i < files; i++ {
-		ino := v.create(dir, fmt.Sprintf("f%04d.txt", i))
-		v.write(ino, []byte(fmt.Sprintf("generation 0 body of file %d", i)))
+		ino := v.Create(dir, fmt.Sprintf("f%04d.txt", i))
+		v.Write(ino, []byte(fmt.Sprintf("generation 0 body of file %d", i)))
 		inos = append(inos, ino)
 	}
 	gen0 := publishVolume(t, v, inner, publish.Options{})
@@ -1042,11 +895,10 @@ func TestSwapIsAtomicForConcurrentOps(t *testing.T) {
 		}
 	}
 
-	added := v.create(dir, "added.txt")
-	v.write(added, []byte("new in generation 1"))
-	gen1 := publishVolume(t, v, inner, publish.Options{
-		Prev: gen0.Superblock, PrevRaw: gen0.Raw,
-	})
+	v.Lookup(genfs.RootInode, "d")
+	added := v.Create(dir, "added.txt")
+	v.Write(added, []byte("new in generation 1"))
+	gen1 := publishVolume(t, v, inner, publish.Options{})
 
 	// Hammer the tree from several goroutines for the whole swap. Every
 	// inode below is resident and present in BOTH generations, so every

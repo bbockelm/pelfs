@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
-	"crypto/rand"
-	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -16,12 +14,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
-
-	"github.com/juicedata/juicefs/pkg/chunk"
-	"github.com/juicedata/juicefs/pkg/meta"
-	"github.com/juicedata/juicefs/pkg/object"
-	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/bbockelm/pelfs/internal/catalog"
 	"github.com/bbockelm/pelfs/internal/chunkid"
@@ -31,6 +23,7 @@ import (
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/publish"
 	"github.com/bbockelm/pelfs/internal/superblock"
+	"github.com/bbockelm/pelfs/internal/testvol"
 )
 
 // newInner starts a fakeorigin-backed pelicanobj store rooted at /vol (the
@@ -48,134 +41,12 @@ func newInner(t *testing.T) pelicanobj.Store {
 
 // testVolume is a live JuiceFS volume the tests mutate and cut (the cutdb
 // test pattern, extended with cut snapshots via VACUUM INTO).
-type testVolume struct {
-	t        *testing.T
-	metaPath string
-	m        meta.Meta
-	blob     object.ObjectStorage
-	store    chunk.ChunkStore
-	cuts     int
-}
-
-func newTestVolume(t *testing.T, uuid string) *testVolume {
+// newTestVolume creates an empty volume the test fills in and publishes.
+func newTestVolume(t *testing.T, inner pelicanobj.Store, uuid string) *testvol.Volume {
 	t.Helper()
-	metaPath := filepath.Join(t.TempDir(), "meta.db")
-	conf := meta.DefaultConf()
-	conf.NoBGJob = true
-	m := meta.NewClient("sqlite3://"+metaPath, conf)
-	format := &meta.Format{
-		Name:      "publish-test",
-		UUID:      uuid,
-		Storage:   "mem",
-		BlockSize: 4096, // KiB
-	}
-	if err := m.Init(format, false); err != nil {
-		t.Fatalf("init meta: %v", err)
-	}
-	if err := m.NewSession(true); err != nil {
-		t.Fatalf("session: %v", err)
-	}
-	t.Cleanup(func() { _ = m.CloseSession() })
-
-	blob, err := object.CreateStorage("mem", "", "", "", "")
-	if err != nil {
-		t.Fatalf("mem store: %v", err)
-	}
-	store := chunk.NewCachedStore(blob, chunk.Config{
-		BlockSize:  format.BlockSize * 1024,
-		CacheDir:   "memory",
-		CacheSize:  64 << 20,
-		GetTimeout: 10 * time.Second, PutTimeout: 10 * time.Second,
-		MaxUpload: 2, MaxDownload: 2, MaxRetries: 1, BufferSize: 32 << 20,
-	}, prometheus.NewRegistry())
-	return &testVolume{t: t, metaPath: metaPath, m: m, blob: blob, store: store}
+	return testvol.New(t, inner, testvol.Options{VolumeID: testvol.ParseUUID(t, uuid)})
 }
 
-func (v *testVolume) ctx() meta.Context { return meta.WrapContext(context.Background()) }
-
-func (v *testVolume) mkdir(parent uint64, name string) uint64 {
-	v.t.Helper()
-	var ino meta.Ino
-	var attr meta.Attr
-	if st := v.m.Mkdir(v.ctx(), meta.Ino(parent), name, 0755, 0, 0, &ino, &attr); st != 0 {
-		v.t.Fatalf("mkdir %s: %s", name, st)
-	}
-	return uint64(ino)
-}
-
-func (v *testVolume) create(parent uint64, name string) uint64 {
-	v.t.Helper()
-	var ino meta.Ino
-	var attr meta.Attr
-	if st := v.m.Create(v.ctx(), meta.Ino(parent), name, 0644, 0, 0, &ino, &attr); st != 0 {
-		v.t.Fatalf("create %s: %s", name, st)
-	}
-	return uint64(ino)
-}
-
-// write stores data as one slice at offset 0 of chunk 0 (data must fit one
-// 64 MiB chunk).
-func (v *testVolume) write(ino uint64, data []byte) {
-	v.t.Helper()
-	var sliceID uint64
-	if st := v.m.NewSlice(v.ctx(), &sliceID); st != 0 {
-		v.t.Fatalf("new slice: %s", st)
-	}
-	w := v.store.NewWriter(sliceID, 0)
-	if _, err := w.WriteAt(data, 0); err != nil {
-		v.t.Fatalf("write slice: %v", err)
-	}
-	if err := w.Finish(len(data)); err != nil {
-		v.t.Fatalf("finish slice: %v", err)
-	}
-	s := meta.Slice{Id: sliceID, Size: uint32(len(data)), Len: uint32(len(data))}
-	if st := v.m.Write(v.ctx(), meta.Ino(ino), 0, 0, s, time.Now()); st != 0 {
-		v.t.Fatalf("meta write: %s", st)
-	}
-}
-
-func (v *testVolume) symlink(parent uint64, name, target string) {
-	v.t.Helper()
-	var ino meta.Ino
-	var attr meta.Attr
-	if st := v.m.Symlink(v.ctx(), meta.Ino(parent), name, target, &ino, &attr); st != 0 {
-		v.t.Fatalf("symlink %s: %s", name, st)
-	}
-}
-
-func (v *testVolume) link(ino, parent uint64, name string) {
-	v.t.Helper()
-	var attr meta.Attr
-	if st := v.m.Link(v.ctx(), meta.Ino(ino), meta.Ino(parent), name, &attr); st != 0 {
-		v.t.Fatalf("link %s: %s", name, st)
-	}
-}
-
-func (v *testVolume) setxattr(ino uint64, name string, value []byte) {
-	v.t.Helper()
-	if st := v.m.SetXattr(v.ctx(), meta.Ino(ino), name, value, 0); st != 0 {
-		v.t.Fatalf("setxattr %s: %s", name, st)
-	}
-}
-
-// cut takes the publish-time metadata snapshot: VACUUM INTO a fresh file,
-// exactly what the session's CUT stage produces.
-func (v *testVolume) cut() string {
-	v.t.Helper()
-	v.cuts++
-	dst := filepath.Join(v.t.TempDir(), fmt.Sprintf("cut-%d.db", v.cuts))
-	db, err := sql.Open("sqlite", "file:"+v.metaPath+"?mode=ro&_pragma=busy_timeout(10000)")
-	if err != nil {
-		v.t.Fatalf("open meta for cut: %v", err)
-	}
-	defer db.Close() //nolint:errcheck
-	if _, err := db.Exec(fmt.Sprintf("VACUUM INTO '%s'", dst)); err != nil {
-		v.t.Fatalf("vacuum into: %v", err)
-	}
-	return dst
-}
-
-// pseudorandom returns deterministic incompressible content.
 func pseudorandom(n int, seed int64) []byte {
 	b := make([]byte, n)
 	mrand.New(mrand.NewSource(seed)).Read(b)
@@ -325,52 +196,39 @@ func direntNames(ds []catalog.Dirent) []string {
 func TestPublishEndToEnd(t *testing.T) {
 	ctx := context.Background()
 	inner := newInner(t)
-	v := newTestVolume(t, "3f2c8a1e-5b4d-4e6f-9a0b-1c2d3e4f5a6b")
+	v := newTestVolume(t, inner, "3f2c8a1e-5b4d-4e6f-9a0b-1c2d3e4f5a6b")
 
 	bigContent := pseudorandom(6<<20, 42)
 	smallContent := []byte("hello inline world, generation zero")
 	hardContent := pseudorandom(100, 7)
 
-	dirIno := v.mkdir(publishRootInode, "dir")
-	smallIno := v.create(dirIno, "small.txt")
-	v.write(smallIno, smallContent)
-	v.setxattr(smallIno, "user.color", []byte("blue"))
-	v.symlink(dirIno, "link", "small.txt")
-	big1Ino := v.create(publishRootInode, "big.bin")
-	v.write(big1Ino, bigContent)
-	big2Ino := v.create(publishRootInode, "big2.bin")
-	v.write(big2Ino, bigContent) // identical content: within-publish dedup
-	hardIno := v.create(publishRootInode, "hard1")
-	v.write(hardIno, hardContent)
-	v.link(hardIno, dirIno, "hard2")
-	cut := v.cut()
-
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	res, err := publish.Publish(ctx, publish.Options{
-		CutPath:         cut,
-		Blob:            v.blob,
-		CacheDir:        t.TempDir(),
-		Inner:           inner,
-		SpoolDir:        t.TempDir(),
-		SigningKey:      priv,
+	dirIno := v.Mkdir(publishRootInode, "dir")
+	smallIno := v.Create(dirIno, "small.txt")
+	v.Write(smallIno, smallContent)
+	v.SetXattr(smallIno, "user.color", []byte("blue"))
+	v.Symlink(dirIno, "link", "small.txt")
+	big1Ino := v.Create(publishRootInode, "big.bin")
+	v.Write(big1Ino, bigContent)
+	big2Ino := v.Create(publishRootInode, "big2.bin")
+	v.Write(big2Ino, bigContent) // identical content: within-publish dedup
+	hardIno := v.Create(publishRootInode, "hard1")
+	v.Write(hardIno, hardContent)
+	v.Link(hardIno, dirIno, "hard2")
+	gen0 := v.Superblock()
+	pub := v.SigningKey().Public().(ed25519.PublicKey)
+	res := v.Publish(publish.Options{
 		TargetPackSize:  2 << 20, // force multiple packs from 6 MiB of chunks
 		SMax:            1000,    // force /dir into a nested catalog
 		CreatedUnixNano: 424242,
 	})
-	if err != nil {
-		t.Fatalf("Publish: %v", err)
-	}
 
 	// The flipped superblock.
 	sb := res.Superblock
-	if sb.Generation != 0 {
-		t.Fatalf("generation = %d, want 0", sb.Generation)
+	if sb.Generation != gen0.Generation+1 {
+		t.Fatalf("generation = %d, want %d", sb.Generation, gen0.Generation+1)
 	}
-	if sb.PrevHash != [32]byte{} {
-		t.Fatalf("first generation has a nonzero PrevHash")
+	if sb.PrevHash == [32]byte{} {
+		t.Fatalf("a successor generation has no PrevHash")
 	}
 	if sb.CreatedUnixNano != 424242 {
 		t.Fatalf("CreatedUnixNano = %d", sb.CreatedUnixNano)
@@ -397,8 +255,9 @@ func TestPublishEndToEnd(t *testing.T) {
 	if len(res.NewPacks) < 2 {
 		t.Fatalf("expected multiple packs at a 2 MiB target, got %d", len(res.NewPacks))
 	}
-	if len(sb.PackList) != len(res.NewPacks) {
-		t.Fatalf("pack list has %d entries, new packs %d", len(sb.PackList), len(res.NewPacks))
+	if len(sb.PackList) != len(res.NewPacks)+len(gen0.PackList) {
+		t.Fatalf("pack list has %d entries, new packs %d plus %d carried",
+			len(sb.PackList), len(res.NewPacks), len(gen0.PackList))
 	}
 	var packBytes int64
 	for _, pe := range sb.PackList {
@@ -423,7 +282,7 @@ func TestPublishEndToEnd(t *testing.T) {
 	// node row (lookup/stat without the child catalog) plus the nested
 	// locator (SMax forced the split).
 	root := env.openCatalog(sb.RootCatalog[:])
-	if m := root.Meta(); m.CoveredPath != "/" || m.Generation != 0 || m.VolumeUUID != "3f2c8a1e-5b4d-4e6f-9a0b-1c2d3e4f5a6b" {
+	if m := root.Meta(); m.CoveredPath != "/" || m.Generation != sb.Generation || m.VolumeUUID != "3f2c8a1e-5b4d-4e6f-9a0b-1c2d3e4f5a6b" {
 		t.Fatalf("root catalog meta = %+v", m)
 	}
 	dirents, nesteds, err := root.Readdir(publishRootInode)
@@ -565,54 +424,35 @@ func TestPublishEndToEnd(t *testing.T) {
 func TestPublishSecondGeneration(t *testing.T) {
 	ctx := context.Background()
 	inner := newInner(t)
-	v := newTestVolume(t, "11112222-3333-4444-5555-666677778888")
+	v := newTestVolume(t, inner, "11112222-3333-4444-5555-666677778888")
 
 	aContent := []byte("alpha file, stable across generations")
 	bContent := []byte("beta file, first version")
-	dirIno := v.mkdir(publishRootInode, "d")
-	aIno := v.create(dirIno, "a.txt")
-	v.write(aIno, aContent)
-	bIno := v.create(dirIno, "b.txt")
-	v.write(bIno, bContent)
-	cut1 := v.cut()
+	dirIno := v.Mkdir(publishRootInode, "d")
+	aIno := v.Create(dirIno, "a.txt")
+	v.Write(aIno, aContent)
+	bIno := v.Create(dirIno, "b.txt")
+	v.Write(bIno, bContent)
+	pub := v.SigningKey().Public().(ed25519.PublicKey)
+	res1 := v.Publish(publish.Options{})
 
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	opts := publish.Options{
-		Blob:       v.blob,
-		Inner:      inner,
-		SigningKey: priv,
-	}
-	opts.CutPath, opts.CacheDir, opts.SpoolDir = cut1, t.TempDir(), t.TempDir()
-	res1, err := publish.Publish(ctx, opts)
-	if err != nil {
-		t.Fatalf("first Publish: %v", err)
-	}
-	if res1.Superblock.Generation != 0 {
-		t.Fatalf("generation = %d, want 0", res1.Superblock.Generation)
+	// Claiming a branch that already has a head must trip the flip guard.
+	if _, err := publish.InitVolume(ctx, publish.Options{
+		Inner: inner, SpoolDir: t.TempDir(), Branch: "main",
+		SigningKey: v.SigningKey(), VolumeID: testvol.ParseUUID(t, "11112222-3333-4444-5555-666677778888"),
+	}); err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("initializing over an existing branch head should fail the flip guard, got %v", err)
 	}
 
-	// Re-publishing as a first generation must trip the flip guard.
-	opts.CutPath, opts.CacheDir, opts.SpoolDir = cut1, t.TempDir(), t.TempDir()
-	if _, err := publish.Publish(ctx, opts); err == nil || !strings.Contains(err.Error(), "already exists") {
-		t.Fatalf("second first-generation publish should fail the flip guard, got %v", err)
-	}
-
-	// Modify one file, cut again, publish generation 1.
+	// Modify one file and publish the next generation.
 	bContent2 := []byte("beta file, second version, longer")
-	v.write(bIno, bContent2)
-	cut2 := v.cut()
-	opts.CutPath, opts.CacheDir, opts.SpoolDir = cut2, t.TempDir(), t.TempDir()
-	opts.Prev, opts.PrevRaw = res1.Superblock, res1.Raw
-	res2, err := publish.Publish(ctx, opts)
-	if err != nil {
-		t.Fatalf("second Publish: %v", err)
-	}
+	v.Lookup(v.Lookup(publishRootInode, "d"), "b.txt")
+	v.Truncate(bIno, 0)
+	v.Write(bIno, bContent2)
+	res2 := v.Publish(publish.Options{})
 	sb2 := res2.Superblock
-	if sb2.Generation != 1 {
-		t.Fatalf("generation = %d, want 1", sb2.Generation)
+	if sb2.Generation != res1.Superblock.Generation+1 {
+		t.Fatalf("generation = %d, want %d", sb2.Generation, res1.Superblock.Generation+1)
 	}
 	if want := superblock.Hash(res1.Raw); sb2.PrevHash != want {
 		t.Fatalf("PrevHash does not match generation 0's wire bytes")
@@ -621,22 +461,22 @@ func TestPublishSecondGeneration(t *testing.T) {
 		t.Fatalf("VerifyChain: %v", err)
 	}
 	if !bytes.Equal(fetchRef(t, inner, "refs/main"), res2.Raw) {
-		t.Fatalf("refs/main was not advanced to generation 1")
+		t.Fatalf("refs/main was not advanced to the new generation")
 	}
 
-	// Generation 0's packs carry forward; the new packs join them.
+	// The predecessor's packs carry forward; the new packs join them.
 	names := make(map[string]bool)
 	for _, pe := range sb2.PackList {
 		names[pe.Name] = true
 	}
 	for _, pe := range res1.Superblock.PackList {
 		if !names[pe.Name] {
-			t.Fatalf("generation 0 pack %s dropped from generation 1's list", pe.Name)
+			t.Fatalf("pack %s dropped from the successor's list", pe.Name)
 		}
 	}
 	for _, sp := range res2.NewPacks {
 		if !names[sp.Name] {
-			t.Fatalf("new pack %s missing from generation 1's list", sp.Name)
+			t.Fatalf("new pack %s missing from the successor's list", sp.Name)
 		}
 	}
 	if sb2.RootCatalog == res1.Superblock.RootCatalog {
@@ -646,8 +486,8 @@ func TestPublishSecondGeneration(t *testing.T) {
 	// The changed content round-trips; the unchanged file is intact.
 	env := newReadEnv(t, inner, nil, nil)
 	root := env.openCatalog(sb2.RootCatalog[:])
-	if root.Meta().Generation != 1 {
-		t.Fatalf("root catalog generation = %d", root.Meta().Generation)
+	if root.Meta().Generation != sb2.Generation {
+		t.Fatalf("root catalog generation = %d, want %d", root.Meta().Generation, sb2.Generation)
 	}
 	_, nesteds, err := root.Readdir(publishRootInode)
 	if err != nil {
@@ -666,43 +506,28 @@ func TestPublishSecondGeneration(t *testing.T) {
 }
 
 func TestPublishEncrypted(t *testing.T) {
-	ctx := context.Background()
 	inner := newInner(t)
-	v := newTestVolume(t, "aaaabbbb-cccc-dddd-eeee-ffff00001111")
-
-	secret := []byte("the inline secret")
-	blob := pseudorandom(5<<20/2, 99) // 2.5 MiB, chunked
-	dirIno := v.mkdir(publishRootInode, "enc")
-	secretIno := v.create(dirIno, "secret.txt")
-	v.write(secretIno, secret)
-	blobIno := v.create(publishRootInode, "blob.bin")
-	v.write(blobIno, blob)
-	cut := v.cut()
-
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
 	dek := pseudorandom(32, 1)
 	idKey := pseudorandom(32, 2)
-	res, err := publish.Publish(ctx, publish.Options{
-		CutPath:     cut,
-		Blob:        v.blob,
-		CacheDir:    t.TempDir(),
-		Inner:       inner,
-		SpoolDir:    t.TempDir(),
-		SigningKey:  priv,
-		IdentityKey: idKey,
+	v := testvol.New(t, inner, testvol.Options{
+		VolumeID:    testvol.ParseUUID(t, "aaaabbbb-cccc-dddd-eeee-ffff00001111"),
 		DEK:         dek,
+		IdentityKey: idKey,
 		KeyID:       7,
 		KeyTable: []superblock.KeyEntry{
 			{ID: 7, Kind: superblock.KeyKindDEK, Alg: superblock.KeyAlgRSAOAEPSHA256, Wrapped: []byte("wrapped-dek")},
 			{ID: 8, Kind: superblock.KeyKindIdentity, Alg: superblock.KeyAlgRSAOAEPSHA256, Wrapped: []byte("wrapped-idkey")},
 		},
 	})
-	if err != nil {
-		t.Fatalf("Publish: %v", err)
-	}
+	pub := v.SigningKey().Public().(ed25519.PublicKey)
+
+	secret := []byte("the inline secret")
+	blob := pseudorandom(5<<20/2, 99) // 2.5 MiB, chunked
+	dirIno := v.Mkdir(publishRootInode, "enc")
+	secretIno := v.WriteFile(dirIno, "secret.txt", secret)
+	blobIno := v.WriteFile(publishRootInode, "blob.bin", blob)
+
+	res := v.Publish(publish.Options{})
 	sb := res.Superblock
 	if err := sb.Verify(pub); err != nil {
 		t.Fatalf("verify: %v", err)
@@ -784,62 +609,43 @@ func equalStrings(a, b []string) bool {
 const publishRootInode = 1
 
 func TestCrossGenerationDedupIndex(t *testing.T) {
-	ctx := context.Background()
 	inner := newInner(t)
-	v := newTestVolume(t, "99998888-7777-6666-5555-444433332222")
+	v := newTestVolume(t, inner, "99998888-7777-6666-5555-444433332222")
 
-	// A chunked (multi-MiB) file that stays identical across generations,
-	// and a small file that changes.
+	// A chunked (multi-MiB) file, published once.
 	bigContent := pseudorandom(3<<20, 77)
-	dirIno := v.mkdir(publishRootInode, "d")
-	bigIno := v.create(dirIno, "big.bin")
-	v.write(bigIno, bigContent)
-	smallIno := v.create(dirIno, "small.txt")
-	v.write(smallIno, []byte("v1"))
-	cut1 := v.cut()
+	dirIno := v.Mkdir(publishRootInode, "d")
+	bigIno := v.WriteFile(dirIno, "big.bin", bigContent)
+	v.WriteFile(dirIno, "small.txt", []byte("v1"))
 
-	_, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
 	index := filepath.Join(t.TempDir(), "dedup.db")
-	opts := publish.Options{
-		Blob:           v.blob,
-		Inner:          inner,
-		SigningKey:     priv,
-		DedupIndexPath: index,
-	}
-	opts.CutPath, opts.CacheDir, opts.SpoolDir = cut1, t.TempDir(), t.TempDir()
-	res1, err := publish.Publish(ctx, opts)
-	if err != nil {
-		t.Fatalf("first Publish: %v", err)
-	}
+	res1 := v.Publish(publish.Options{DedupIndexPath: index})
 	if res1.Stats.ChunksAdded == 0 {
 		t.Fatal("first publish added no chunks")
 	}
-
-	// Change only the small (inline) file; the big file's chunks must be
-	// satisfied from the dedup index — zero chunk uploads.
-	v.write(smallIno, []byte("v2 - changed"))
-	cut2 := v.cut()
-	opts.CutPath, opts.CacheDir, opts.SpoolDir = cut2, t.TempDir(), t.TempDir()
-	opts.Prev, opts.PrevRaw = res1.Superblock, res1.Raw
-	res2, err := publish.Publish(ctx, opts)
+	stale, err := os.ReadFile(index)
 	if err != nil {
-		t.Fatalf("second Publish: %v", err)
+		t.Fatalf("read the index the first publish wrote: %v", err)
 	}
+
+	// A brand-new file whose content the PREVIOUS generation already
+	// published. Nothing carries forward — this inode did not exist — so
+	// the index is the only thing that can spare the upload.
+	v.Lookup(publishRootInode, "d")
+	copyIno := v.WriteFile(dirIno, "copy.bin", bigContent)
+	res2 := v.Publish(publish.Options{DedupIndexPath: index})
 	if res2.Stats.DedupIndexChunks != res1.Stats.ChunksAdded {
 		t.Fatalf("index preloaded %d chunks, want %d", res2.Stats.DedupIndexChunks, res1.Stats.ChunksAdded)
 	}
 	if res2.Stats.ChunksAdded != 0 {
 		t.Fatalf("second publish re-added %d chunks despite the index", res2.Stats.ChunksAdded)
 	}
-	if res2.Stats.ChunksDeduped != res1.Stats.ChunksAdded {
-		t.Fatalf("deduped %d, want %d", res2.Stats.ChunksDeduped, res1.Stats.ChunksAdded)
+	if res2.Stats.ChunksDeduped == 0 {
+		t.Fatal("the copy's chunks were not deduped against the index")
 	}
 
-	// The deduped references must still resolve: read big.bin back from
-	// generation 1's catalogs through real pack reads.
+	// The deduped references must still resolve: read both files back
+	// from the new generation's catalogs through real pack reads.
 	env := newReadEnv(t, inner, nil, nil)
 	root := env.openCatalog(res2.Superblock.RootCatalog[:])
 	lr, err := root.Lookup(publishRootInode, []byte("d"))
@@ -847,21 +653,21 @@ func TestCrossGenerationDedupIndex(t *testing.T) {
 		t.Fatalf("lookup d: %+v err=%v", lr, err)
 	}
 	if got := env.readChunks(root, int64(bigIno)); !bytes.Equal(got, bigContent) {
-		t.Fatalf("deduped big.bin content mismatch (%d bytes)", len(got))
+		t.Fatalf("big.bin content mismatch (%d bytes)", len(got))
+	}
+	if got := env.readChunks(root, int64(copyIno)); !bytes.Equal(got, bigContent) {
+		t.Fatalf("deduped copy.bin content mismatch (%d bytes)", len(got))
 	}
 
-	// A THIRD publish built on gen 0 metadata (stale index generation)
-	// must ignore the index rather than trust it.
-	v.write(smallIno, []byte("v3"))
-	cut3 := v.cut()
-	opts.CutPath, opts.CacheDir, opts.SpoolDir = cut3, t.TempDir(), t.TempDir()
-	opts.Prev, opts.PrevRaw = res1.Superblock, res1.Raw // stale: index is stamped for gen 1
-	res3, err := publish.Publish(ctx, opts)
-	if err == nil {
-		// The flip guard may reject this stale publish outright (the ref
-		// moved); if it somehow proceeds, the index must NOT have been used.
-		if res3.Stats.DedupIndexChunks != 0 {
-			t.Fatalf("stale index was trusted: %d preloaded chunks", res3.Stats.DedupIndexChunks)
-		}
+	// An index stamped for an older generation must be ignored, not
+	// trusted: it is an optimization, never an authority.
+	if err := os.WriteFile(index, stale, 0600); err != nil {
+		t.Fatal(err)
+	}
+	v.Lookup(publishRootInode, "d")
+	v.WriteFile(dirIno, "third.txt", []byte("v3"))
+	res3 := v.Publish(publish.Options{DedupIndexPath: index})
+	if res3.Stats.DedupIndexChunks != 0 {
+		t.Fatalf("stale index was trusted: %d preloaded chunks", res3.Stats.DedupIndexChunks)
 	}
 }

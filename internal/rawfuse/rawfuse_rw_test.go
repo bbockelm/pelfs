@@ -3,8 +3,6 @@ package rawfuse_test
 import (
 	"bytes"
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
 	"syscall"
 	"testing"
 
@@ -15,6 +13,7 @@ import (
 	"github.com/bbockelm/pelfs/internal/publish"
 	"github.com/bbockelm/pelfs/internal/rawfuse"
 	"github.com/bbockelm/pelfs/internal/superblock"
+	"github.com/bbockelm/pelfs/internal/testvol"
 )
 
 // Statuses the fuse package does not name.
@@ -43,38 +42,20 @@ type rwFixture struct {
 func newRWFixture(t *testing.T, uuid string) *rwFixture {
 	t.Helper()
 	inner := newInner(t)
-	v := newTestVolume(t, uuid)
+	v := testvol.New(t, inner, testvol.Options{VolumeID: testvol.ParseUUID(t, uuid)})
 
 	f := &rwFixture{ino: map[string]uint64{}, body: map[string][]byte{}}
 	f.body["base.txt"] = []byte("the base file body, generation zero")
 	f.body["dir/child.txt"] = []byte("child body")
 	f.body["dir/inner/leaf.txt"] = []byte("leaf body")
 
-	f.ino["base.txt"] = v.create(rootIno, "base.txt")
-	f.ino["dir"] = v.mkdir(rootIno, "dir")
-	f.ino["dir/child.txt"] = v.create(f.ino["dir"], "child.txt")
-	f.ino["dir/inner"] = v.mkdir(f.ino["dir"], "inner")
-	f.ino["dir/inner/leaf.txt"] = v.create(f.ino["dir/inner"], "leaf.txt")
-	for p, b := range f.body {
-		v.write(f.ino[p], b)
-	}
+	f.ino["base.txt"] = v.WriteFile(rootIno, "base.txt", f.body["base.txt"])
+	f.ino["dir"] = v.Mkdir(rootIno, "dir")
+	f.ino["dir/child.txt"] = v.WriteFile(f.ino["dir"], "child.txt", f.body["dir/child.txt"])
+	f.ino["dir/inner"] = v.Mkdir(f.ino["dir"], "inner")
+	f.ino["dir/inner/leaf.txt"] = v.WriteFile(f.ino["dir/inner"], "leaf.txt", f.body["dir/inner/leaf.txt"])
 
-	_, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	res, err := publish.Publish(context.Background(), publish.Options{
-		CutPath:        v.cut(),
-		Blob:           v.blob,
-		CacheDir:       t.TempDir(),
-		Inner:          inner,
-		SpoolDir:       t.TempDir(),
-		SigningKey:     priv,
-		TargetPackSize: 1 << 20,
-	})
-	if err != nil {
-		t.Fatalf("Publish: %v", err)
-	}
+	res := v.Publish(publish.Options{TargetPackSize: 1 << 20})
 	base, err := genfs.Open(context.Background(), genfs.Options{
 		Inner: inner, SB: res.Superblock, CacheDir: t.TempDir(),
 	})
@@ -592,15 +573,10 @@ func TestRefresherSwapsGenerations(t *testing.T) {
 	mustLookup(t, f.raw, f.dirIno, "small.txt")
 
 	// Publish a second generation with that file changed.
-	f.vol.write(f.smallIno, []byte("second generation content"))
-	gen1, err := publish.Publish(ctx, publish.Options{
-		CutPath: f.vol.cut(), Blob: f.vol.blob, CacheDir: t.TempDir(),
-		Inner: f.inner, SpoolDir: t.TempDir(), SigningKey: f.priv,
-		Prev: f.res.Superblock, PrevRaw: f.res.Raw, TargetPackSize: 2 << 20,
-	})
-	if err != nil {
-		t.Fatalf("publish generation 1: %v", err)
-	}
+	f.vol.Lookup(f.vol.Lookup(rootIno, "dir"), "small.txt")
+	f.vol.Truncate(f.smallIno, 0)
+	f.vol.Write(f.smallIno, []byte("second generation content"))
+	gen1 := f.vol.Publish(publish.Options{TargetPackSize: 2 << 20})
 
 	var fetched int
 	r := rawfuse.NewRefresher(f.gfs, nil, func(context.Context) (*superblock.Superblock, error) {

@@ -15,28 +15,22 @@ package integration
 import (
 	"bytes"
 	"context"
-	"crypto/ed25519"
 	"crypto/rand"
 	"fmt"
 	"io"
 	mrand "math/rand"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3" // the pure-Go shim driver
 
-	"github.com/juicedata/juicefs/pkg/chunk"
-	"github.com/juicedata/juicefs/pkg/meta"
-	"github.com/juicedata/juicefs/pkg/object"
-	"github.com/prometheus/client_golang/prometheus"
-
 	"github.com/bbockelm/pelfs/internal/genfs"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/publish"
 	"github.com/bbockelm/pelfs/internal/refs"
+	"github.com/bbockelm/pelfs/internal/testvol"
 )
 
 func newStore(t *testing.T) pelicanobj.Store {
@@ -225,13 +219,11 @@ func TestPackTailRangeRead(t *testing.T) {
 	_ = s.Delete(ctx, key)
 }
 
-// TestV2PublishGenfsRoundTrip is the phase-2/3 federation e2e: publish a
-// generation into the REAL federation (packs, superblock backup, signed
-// ref — exercising trailer range reads, ETag stat, and the pinning store
-// over pelican-server), then resolve it back with genfs and verify every
-// byte. The source volume content is local (mem blob): publish reads
-// sources locally and uploads packs, exactly the accumulate-mode shape.
-func TestV2PublishGenfsRoundTrip(t *testing.T) {
+// TestPublishGenfsRoundTrip is the federation e2e: publish a generation
+// into the REAL federation (packs, superblock backup, signed ref —
+// exercising trailer range reads, ETag stat, and the pinning store over
+// pelican-server), then resolve it back with genfs and verify every byte.
+func TestPublishGenfsRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	base := os.Getenv("PELFS_TEST_PREFIX")
 	if base == "" {
@@ -247,76 +239,21 @@ func TestV2PublishGenfsRoundTrip(t *testing.T) {
 		t.Fatalf("construct store: %v", err)
 	}
 
-	// Local source volume: a chunked multi-MiB file, an inline file, a
-	// symlink, an xattr, and a hardlink pair.
-	metaPath := filepath.Join(t.TempDir(), "src.db")
-	conf := meta.DefaultConf()
-	conf.NoBGJob = true
-	m := meta.NewClient("sqlite3://"+metaPath, conf)
-	if err := m.Init(&meta.Format{Name: "e2e", UUID: "0f0e0d0c-0b0a-0908-0706-050403020100",
-		Storage: "mem", BlockSize: 4096}, false); err != nil {
-		t.Fatalf("init: %v", err)
-	}
-	if err := m.NewSession(true); err != nil {
-		t.Fatal(err)
-	}
-	blob, _ := object.CreateStorage("mem", "", "", "", "")
-	store := chunk.NewCachedStore(blob, chunk.Config{
-		BlockSize: 4096 * 1024, CacheDir: "memory", CacheSize: 64 << 20,
-		GetTimeout: 10 * time.Second, PutTimeout: 10 * time.Second,
-		MaxUpload: 2, MaxDownload: 2, MaxRetries: 1, BufferSize: 32 << 20,
-	}, prometheus.NewRegistry())
-	mctx := meta.WrapContext(ctx)
-	var dir, big, small, link meta.Ino
-	var attr meta.Attr
-	if st := m.Mkdir(mctx, meta.RootInode, "d", 0755, 0, 0, &dir, &attr); st != 0 {
-		t.Fatal(st)
-	}
-	if st := m.Create(mctx, dir, "big.bin", 0644, 0, 0, &big, &attr); st != 0 {
-		t.Fatal(st)
-	}
+	// Source volume: a chunked multi-MiB file, an inline file, a symlink,
+	// an xattr, and a hardlink pair, written through a write overlay.
+	v := testvol.New(t, inner, testvol.Options{
+		VolumeID: testvol.ParseUUID(t, "0f0e0d0c-0b0a-0908-0706-050403020100"),
+	})
 	bigContent := make([]byte, 3<<20)
 	mrand.New(mrand.NewSource(42)).Read(bigContent)
-	var sid uint64
-	if st := m.NewSlice(mctx, &sid); st != 0 {
-		t.Fatal(st)
-	}
-	w := store.NewWriter(sid, 0)
-	if _, err := w.WriteAt(bigContent, 0); err != nil {
-		t.Fatal(err)
-	}
-	if err := w.Finish(len(bigContent)); err != nil {
-		t.Fatal(err)
-	}
-	if st := m.Write(mctx, big, 0, 0, meta.Slice{Id: sid, Size: uint32(len(bigContent)), Len: uint32(len(bigContent))}, time.Now()); st != 0 {
-		t.Fatal(st)
-	}
-	if st := m.Create(mctx, dir, "small.txt", 0644, 0, 0, &small, &attr); st != 0 {
-		t.Fatal(st)
-	}
-	if st := m.SetXattr(mctx, small, "user.k", []byte("v"), 0); st != 0 {
-		t.Fatal(st)
-	}
-	if st := m.Symlink(mctx, dir, "ln", "big.bin", &link, &attr); st != 0 {
-		t.Fatal(st)
-	}
-	if st := m.Link(mctx, big, dir, "big2", &attr); st != 0 {
-		t.Fatal(st)
-	}
-	_ = m.CloseSession()
+	dirIno := v.Mkdir(testvol.RootInode, "d")
+	bigIno := v.WriteFile(dirIno, "big.bin", bigContent)
+	smallIno := v.WriteFile(dirIno, "small.txt", []byte("inline"))
+	v.SetXattr(smallIno, "user.k", []byte("v"))
+	v.Symlink(dirIno, "ln", "big.bin")
+	v.Link(bigIno, dirIno, "big2")
 
-	_, priv, _ := ed25519.GenerateKey(nil)
-	res, err := publish.Publish(ctx, publish.Options{
-		CutPath:    metaPath,
-		Blob:       blob,
-		CacheDir:   t.TempDir(),
-		Inner:      inner,
-		SpoolDir:   t.TempDir(),
-		SigningKey: priv,
-	})
-	if err != nil {
-		t.Fatalf("publish into federation: %v", err)
-	}
+	res := v.Publish(publish.Options{})
 	t.Logf("published generation %d: %d chunks, %d catalogs, %d packs",
 		res.Superblock.Generation, res.Stats.ChunksAdded, res.Stats.Catalogs, len(res.NewPacks))
 

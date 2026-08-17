@@ -5,17 +5,14 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/juicedata/juicefs/pkg/meta"
-
-	"github.com/bbockelm/pelfs/internal/catalog"
-	"github.com/bbockelm/pelfs/internal/cutdb"
+	"github.com/bbockelm/pelfs/internal/genfs"
 	"github.com/bbockelm/pelfs/internal/overlay"
 )
 
-// SrcNode is one inode as TRANSFORM needs it: the v2 catalog's attribute
+// SrcNode is one inode as TRANSFORM needs it: the catalog's attribute
 // set, no more. Type is in the catalog.Type* space — the space the
 // persisted schema, genfs, and the overlay all speak — so a source over a
-// foreign type space (JuiceFS meta.Type*) converts at its own edge.
+// foreign type space converts at its own edge.
 type SrcNode struct {
 	Inode   uint64
 	Type    uint8
@@ -35,8 +32,9 @@ type SrcEntry struct {
 	Node SrcNode
 }
 
-// Source is the tree publish reads: a JuiceFS cut today, a phase-3
-// overlay under seal. Implementations are walked strictly by descent —
+// Source is the tree publish reads: the write overlay under seal, or the
+// empty root of a brand-new volume. Implementations are walked strictly
+// by descent —
 // Root, then Readdir per directory — so a source whose residency comes
 // from lookup order (the overlay over genfs) can establish it on the way
 // down.
@@ -61,123 +59,28 @@ type Source interface {
 	NextInode() uint64
 }
 
-// ---- cut source ----
-
-// cutSource reads a VACUUM'd JuiceFS metadata cut. cutdb exposes only a
-// whole-tree BFS Walk, so the edge map is materialized once, on first
-// Readdir, and served per directory afterwards; the pipeline sorts every
-// directory by name, so BFS-vs-descent ordering is not observable.
-type cutSource struct {
-	db   *cutdb.DB
-	dirs map[uint64][]SrcEntry
-	next uint64
-}
-
-func newCutSource(db *cutdb.DB) *cutSource {
-	s := &cutSource{db: db}
-	// The cut's real allocator counter: reconstructing it as max-inode-seen
-	// loses numbers burned by files deleted before the cut, and inode reuse
-	// across generations would break the stable-inode contract. A counter
-	// table the engine has not written yet leaves 0 (the fallback).
-	if v, err := db.Counter("nextInode"); err == nil && v > 0 {
-		s.next = uint64(v)
-	}
-	return s
-}
-
-func (s *cutSource) Root() uint64 { return cutdb.RootInode }
-
-func (s *cutSource) NextInode() uint64 { return s.next }
-
-func (s *cutSource) load(ctx context.Context) error {
-	if s.dirs != nil {
-		return nil
-	}
-	dirs := make(map[uint64][]SrcEntry)
-	if err := s.db.Walk(ctx, func(parent uint64, name string, n cutdb.Node) error {
-		sn, err := srcNodeFromCut(n)
-		if err != nil {
-			return err
-		}
-		dirs[parent] = append(dirs[parent], SrcEntry{Name: name, Node: sn})
-		return nil
-	}); err != nil {
-		return err
-	}
-	s.dirs = dirs
-	return nil
-}
-
-func (s *cutSource) Readdir(ctx context.Context, ino uint64) ([]SrcEntry, error) {
-	if err := s.load(ctx); err != nil {
-		return nil, err
-	}
-	return s.dirs[ino], nil
-}
-
-func (s *cutSource) Stat(ctx context.Context, ino uint64) (SrcNode, error) {
-	n, err := s.db.Stat(ctx, ino)
-	if err != nil {
-		return SrcNode{}, err
-	}
-	return srcNodeFromCut(n)
-}
-
-func (s *cutSource) Readlink(ctx context.Context, ino uint64) (string, error) {
-	return s.db.Readlink(ctx, ino)
-}
-
-func (s *cutSource) Xattrs(ctx context.Context, ino uint64) (map[string][]byte, error) {
-	return s.db.Xattrs(ctx, ino)
-}
-
-func (s *cutSource) Open(ctx context.Context, ino uint64, length int64) (io.ReadCloser, error) {
-	rd, err := s.db.FileReader(ctx, ino, uint64(length))
-	if err != nil {
-		return nil, err
-	}
-	return io.NopCloser(rd), nil
-}
-
-func srcNodeFromCut(n cutdb.Node) (SrcNode, error) {
-	typ, err := catTypeFromMeta(n.Type)
-	if err != nil {
-		return SrcNode{}, err
-	}
-	return SrcNode{
-		Inode:   n.Inode,
-		Type:    typ,
-		Mode:    uint32(n.Mode),
-		UID:     n.Uid,
-		GID:     n.Gid,
-		MtimeNS: n.MtimeNs,
-		CtimeNS: n.CtimeNs,
-		Nlink:   n.Nlink,
-		Length:  int64(n.Length),
-		Rdev:    n.Rdev,
-	}, nil
-}
-
-// catTypeFromMeta maps the JuiceFS type space onto the catalog's. The
-// values coincide today; the switch is the contract, not an optimization.
-func catTypeFromMeta(t uint8) (uint8, error) {
-	switch t {
-	case meta.TypeFile:
-		return catalog.TypeFile, nil
-	case meta.TypeDirectory:
-		return catalog.TypeDir, nil
-	case meta.TypeSymlink:
-		return catalog.TypeSymlink, nil
-	case meta.TypeFIFO:
-		return catalog.TypeFIFO, nil
-	case meta.TypeBlockDev:
-		return catalog.TypeBlockDev, nil
-	case meta.TypeCharDev:
-		return catalog.TypeCharDev, nil
-	case meta.TypeSocket:
-		return catalog.TypeSocket, nil
-	}
-	return 0, fmt.Errorf("publish: unknown inode type %d", t)
+// ContentReuser is the optional Source capability that spares TRANSFORM
+// from re-deriving content it already published. Without it, every file in
+// the tree is opened and pushed through the CDC chunker on every seal —
+// and for a source layered over a published generation, "opened" means
+// downloading the file back from the federation to rediscover chunk
+// identities that generation already records. A timer-driven checkpoint
+// then pays that for the whole tree every interval.
+//
+// Sources that cannot prove a file is untouched simply do not implement
+// it.
+type ContentReuser interface {
+	// BaseGeneration identifies the generation ExistingContent answers
+	// from, by root-catalog identity. Publish reuses records only from the
+	// generation it is building on; see pipeline.contentReuser for why
+	// that restriction is load-bearing rather than tidy.
+	BaseGeneration() [32]byte
+	// ExistingContent returns ino's already-published content records when
+	// the source can prove the file's BYTES are unchanged since
+	// BaseGeneration. ok is false when it cannot prove it — attribute
+	// changes do not count, a write or truncate does — and the caller
+	// reads and re-chunks instead.
+	ExistingContent(ctx context.Context, ino uint64) (genfs.Content, bool, error)
 }
 
 // ---- overlay source ----
@@ -204,11 +107,17 @@ type overlayView interface {
 	AllXattrs(ctx context.Context, ino uint64) (map[string][]byte, error)
 	Read(ctx context.Context, ino uint64, off int64, dst []byte) (int, error)
 	OpenFile(ctx context.Context, ino uint64, length int64) (io.ReadCloser, error)
+	BaseRootCatalog() [32]byte
+	BaseContent(ctx context.Context, ino uint64) (genfs.Content, bool, error)
 }
 
 type overlaySource struct {
 	fs overlayView
 }
+
+// An overlay knows exactly which inodes it has touched, which is what
+// makes the reuse capability answerable at all.
+var _ ContentReuser = (*overlaySource)(nil)
 
 func (s *overlaySource) Root() uint64 { return s.fs.RootInode() }
 
@@ -260,6 +169,12 @@ func (s *overlaySource) Open(ctx context.Context, ino uint64, length int64) (io.
 	// Both the live overlay and a snapshot stream content themselves;
 	// this used to hand-roll positional reads.
 	return s.fs.OpenFile(ctx, ino, length)
+}
+
+func (s *overlaySource) BaseGeneration() [32]byte { return s.fs.BaseRootCatalog() }
+
+func (s *overlaySource) ExistingContent(ctx context.Context, ino uint64) (genfs.Content, bool, error) {
+	return s.fs.BaseContent(ctx, ino)
 }
 
 func srcNodeFromOverlay(n overlay.Node) SrcNode {

@@ -11,19 +11,14 @@ import (
 )
 
 // InitVolume creates generation 0 of a brand-new volume: an empty root
-// directory, one catalog, one pack, a signed ref. It exists so a volume
-// can be BORN catalog-native — until now the only way to start one was
-// to format a JuiceFS volume and publish a cut of it, which made the v1
-// engine a hard dependency of even a pure phase-3 workflow.
-//
-// Everything after this is ordinary: mount the generation read-write and
-// seal, or publish cuts into it. Options.VolumeID must be set (the
-// caller owns volume identity); CutPath and Overlay must not be.
+// directory, one catalog, one pack, a signed ref. Everything after it is
+// ordinary — mount the generation read-write and seal. Options.VolumeID
+// must be set (the caller owns volume identity); Overlay must not be.
 func InitVolume(ctx context.Context, o Options) (*Result, error) {
 	if o.Prev != nil {
 		return nil, errors.New("publish: InitVolume creates generation 0; a volume with generations already exists")
 	}
-	if o.CutPath != "" || o.Overlay != nil {
+	if o.Overlay != nil || o.OverlaySnapshot != nil {
 		return nil, errors.New("publish: InitVolume takes no source (it creates an empty root)")
 	}
 	if o.VolumeID == ([16]byte{}) {

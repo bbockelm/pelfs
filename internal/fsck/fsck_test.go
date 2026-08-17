@@ -2,9 +2,6 @@ package fsck_test
 
 import (
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
-	"database/sql"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -14,13 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/juicedata/juicefs/pkg/chunk"
-	"github.com/juicedata/juicefs/pkg/meta"
-	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/klauspost/compress/zstd"
-	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/bbockelm/pelfs/internal/fakeorigin"
 	"github.com/bbockelm/pelfs/internal/fsck"
@@ -28,6 +20,7 @@ import (
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/publish"
 	"github.com/bbockelm/pelfs/internal/superblock"
+	"github.com/bbockelm/pelfs/internal/testvol"
 )
 
 const rootIno uint64 = 1
@@ -47,145 +40,11 @@ func newInner(t testing.TB) (pelicanobj.Store, string) {
 	return inner, filepath.Join(root, "vol")
 }
 
-// testVolume is a live JuiceFS volume the tests mutate and cut.
-type testVolume struct {
-	t        testing.TB
-	metaPath string
-	m        meta.Meta
-	blob     object.ObjectStorage
-	store    chunk.ChunkStore
-	cuts     int
-}
-
-func newTestVolume(t testing.TB, uuid string) *testVolume {
-	t.Helper()
-	metaPath := filepath.Join(t.TempDir(), "meta.db")
-	conf := meta.DefaultConf()
-	conf.NoBGJob = true
-	m := meta.NewClient("sqlite3://"+metaPath, conf)
-	format := &meta.Format{Name: "fsck-test", UUID: uuid, Storage: "mem", BlockSize: 4096}
-	if err := m.Init(format, false); err != nil {
-		t.Fatalf("init meta: %v", err)
-	}
-	if err := m.NewSession(true); err != nil {
-		t.Fatalf("session: %v", err)
-	}
-	t.Cleanup(func() { _ = m.CloseSession() })
-
-	blob, err := object.CreateStorage("mem", "", "", "", "")
-	if err != nil {
-		t.Fatalf("mem store: %v", err)
-	}
-	store := chunk.NewCachedStore(blob, chunk.Config{
-		BlockSize:  format.BlockSize * 1024,
-		CacheDir:   "memory",
-		CacheSize:  64 << 20,
-		GetTimeout: 10 * time.Second, PutTimeout: 10 * time.Second,
-		MaxUpload: 2, MaxDownload: 2, MaxRetries: 1, BufferSize: 32 << 20,
-	}, prometheus.NewRegistry())
-	return &testVolume{t: t, metaPath: metaPath, m: m, blob: blob, store: store}
-}
-
-func (v *testVolume) ctx() meta.Context { return meta.WrapContext(context.Background()) }
-
-func (v *testVolume) mkdir(parent uint64, name string) uint64 {
-	v.t.Helper()
-	var ino meta.Ino
-	var attr meta.Attr
-	if st := v.m.Mkdir(v.ctx(), meta.Ino(parent), name, 0755, 0, 0, &ino, &attr); st != 0 {
-		v.t.Fatalf("mkdir %s: %s", name, st)
-	}
-	return uint64(ino)
-}
-
-func (v *testVolume) create(parent uint64, name string) uint64 {
-	v.t.Helper()
-	var ino meta.Ino
-	var attr meta.Attr
-	if st := v.m.Create(v.ctx(), meta.Ino(parent), name, 0644, 0, 0, &ino, &attr); st != 0 {
-		v.t.Fatalf("create %s: %s", name, st)
-	}
-	return uint64(ino)
-}
-
-func (v *testVolume) write(ino uint64, data []byte) {
-	v.t.Helper()
-	var sliceID uint64
-	if st := v.m.NewSlice(v.ctx(), &sliceID); st != 0 {
-		v.t.Fatalf("new slice: %s", st)
-	}
-	w := v.store.NewWriter(sliceID, 0)
-	if _, err := w.WriteAt(data, 0); err != nil {
-		v.t.Fatalf("write slice: %v", err)
-	}
-	if err := w.Finish(len(data)); err != nil {
-		v.t.Fatalf("finish slice: %v", err)
-	}
-	s := meta.Slice{Id: sliceID, Size: uint32(len(data)), Len: uint32(len(data))}
-	if st := v.m.Write(v.ctx(), meta.Ino(ino), 0, 0, s, time.Now()); st != 0 {
-		v.t.Fatalf("meta write: %s", st)
-	}
-}
-
-func (v *testVolume) symlink(parent uint64, name, target string) uint64 {
-	v.t.Helper()
-	var ino meta.Ino
-	var attr meta.Attr
-	if st := v.m.Symlink(v.ctx(), meta.Ino(parent), name, target, &ino, &attr); st != 0 {
-		v.t.Fatalf("symlink %s: %s", name, st)
-	}
-	return uint64(ino)
-}
-
-func (v *testVolume) link(ino, parent uint64, name string) {
-	v.t.Helper()
-	var attr meta.Attr
-	if st := v.m.Link(v.ctx(), meta.Ino(ino), meta.Ino(parent), name, &attr); st != 0 {
-		v.t.Fatalf("link %s: %s", name, st)
-	}
-}
-
-func (v *testVolume) cut() string {
-	v.t.Helper()
-	v.cuts++
-	dst := filepath.Join(v.t.TempDir(), fmt.Sprintf("cut-%d.db", v.cuts))
-	db, err := sql.Open("sqlite", "file:"+v.metaPath+"?mode=ro&_pragma=busy_timeout(10000)")
-	if err != nil {
-		v.t.Fatalf("open meta for cut: %v", err)
-	}
-	defer db.Close() //nolint:errcheck
-	if _, err := db.Exec(fmt.Sprintf("VACUUM INTO '%s'", dst)); err != nil {
-		v.t.Fatalf("vacuum into: %v", err)
-	}
-	return dst
-}
-
 // pseudorandom returns deterministic incompressible content.
 func pseudorandom(n int, seed int64) []byte {
 	b := make([]byte, n)
 	mrand.New(mrand.NewSource(seed)).Read(b)
 	return b
-}
-
-func publishVolume(t testing.TB, v *testVolume, inner pelicanobj.Store, opts publish.Options) *publish.Result {
-	t.Helper()
-	opts.CutPath = v.cut()
-	opts.Blob = v.blob
-	opts.CacheDir = t.TempDir()
-	opts.Inner = inner
-	opts.SpoolDir = t.TempDir()
-	if opts.SigningKey == nil {
-		_, priv, err := ed25519.GenerateKey(rand.Reader)
-		if err != nil {
-			t.Fatal(err)
-		}
-		opts.SigningKey = priv
-	}
-	res, err := publish.Publish(context.Background(), opts)
-	if err != nil {
-		t.Fatalf("Publish: %v", err)
-	}
-	return res
 }
 
 // healthyFixture publishes a tree exercising every structure fsck knows
@@ -194,25 +53,27 @@ func publishVolume(t testing.TB, v *testVolume, inner pelicanobj.Store, opts pub
 func healthyFixture(t *testing.T, uuid string, opts publish.Options) (pelicanobj.Store, string, *publish.Result) {
 	t.Helper()
 	inner, volDir := newInner(t)
-	v := newTestVolume(t, uuid)
+	v := testvol.New(t, inner, testvol.Options{
+		VolumeID:    testvol.ParseUUID(t, uuid),
+		DEK:         opts.DEK,
+		IdentityKey: opts.IdentityKey,
+		KeyID:       opts.KeyID,
+		KeyTable:    opts.KeyTable,
+	})
 
-	dir := v.mkdir(rootIno, "dir")
-	small := v.create(dir, "small.txt")
-	v.write(small, []byte("inline body, well under the threshold"))
-	v.symlink(dir, "link", "small.txt")
-	big := v.create(rootIno, "big.bin")
-	v.write(big, pseudorandom(6<<20, 42))
-	mid := v.create(dir, "mid.bin")
-	v.write(mid, pseudorandom(2<<20, 43))
-	hard := v.create(rootIno, "hard1")
-	v.write(hard, pseudorandom(3<<20, 44))
-	v.link(hard, dir, "hard2")
+	dir := v.Mkdir(rootIno, "dir")
+	v.WriteFile(dir, "small.txt", []byte("inline body, well under the threshold"))
+	v.Symlink(dir, "link", "small.txt")
+	v.WriteFile(rootIno, "big.bin", pseudorandom(6<<20, 42))
+	v.WriteFile(dir, "mid.bin", pseudorandom(2<<20, 43))
+	hard := v.WriteFile(rootIno, "hard1", pseudorandom(3<<20, 44))
+	v.Link(hard, dir, "hard2")
 
 	opts.SMax = 1000 // force /dir into a nested catalog
 	if opts.TargetPackSize == 0 {
 		opts.TargetPackSize = 2 << 20
 	}
-	res := publishVolume(t, v, inner, opts)
+	res := v.Publish(publish.Options{SMax: opts.SMax, TargetPackSize: opts.TargetPackSize})
 	if res.Stats.Catalogs < 2 || res.Stats.Shards < 1 || len(res.Superblock.PackList) < 2 {
 		t.Fatalf("fixture is not representative: %d catalogs, %d shards, %d packs",
 			res.Stats.Catalogs, res.Stats.Shards, len(res.Superblock.PackList))

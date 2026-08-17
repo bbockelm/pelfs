@@ -19,6 +19,7 @@ import (
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/publish"
 	"github.com/bbockelm/pelfs/internal/superblock"
+	"github.com/bbockelm/pelfs/internal/testvol"
 )
 
 // viewFS is the read surface genfs and overlay share (overlay.Node and
@@ -279,12 +280,27 @@ type sealBase struct {
 	body  map[string][]byte
 }
 
-// newSealBase publishes a fixed tree from a cut, then opens genfs and an
-// overlay over it. dek/idKey empty publishes plaintext.
+// newSealBase publishes a fixed tree, then opens genfs and an overlay
+// over it. dek/idKey empty publishes plaintext.
 func newSealBase(t *testing.T, uuid string, dek, idKey []byte) *sealBase {
 	t.Helper()
 	inner := newInner(t)
-	v := newTestVolume(t, uuid)
+	var keyTable []superblock.KeyEntry
+	keyID := uint32(0)
+	if len(dek) != 0 {
+		keyID = 7
+		keyTable = []superblock.KeyEntry{
+			{ID: 7, Kind: superblock.KeyKindDEK, Alg: superblock.KeyAlgRSAOAEPSHA256, Wrapped: []byte("wrapped-dek")},
+			{ID: 8, Kind: superblock.KeyKindIdentity, Alg: superblock.KeyAlgRSAOAEPSHA256, Wrapped: []byte("wrapped-idkey")},
+		}
+	}
+	v := testvol.New(t, inner, testvol.Options{
+		VolumeID:    testvol.ParseUUID(t, uuid),
+		DEK:         dek,
+		IdentityKey: idKey,
+		KeyID:       keyID,
+		KeyTable:    keyTable,
+	})
 	s := &sealBase{
 		inner: inner, index: filepath.Join(t.TempDir(), "dedup.db"),
 		ino: map[string]uint64{}, body: map[string][]byte{},
@@ -298,48 +314,16 @@ func newSealBase(t *testing.T, uuid string, dek, idKey []byte) *sealBase {
 	s.body["hard1"] = []byte("hardlink target body")
 
 	for _, name := range []string{"keep.txt", "big.bin", "mod.txt", "gone.txt", "tagged.txt", "hard1"} {
-		s.ino[name] = v.create(publishRootInode, name)
+		s.ino[name] = v.WriteFile(publishRootInode, name, s.body[name])
 	}
-	s.ino["olddir"] = v.mkdir(publishRootInode, "olddir")
-	s.ino["olddir/inner.txt"] = v.create(s.ino["olddir"], "inner.txt")
-	for p, b := range s.body {
-		v.write(s.ino[p], b)
-	}
-	v.setxattr(s.ino["tagged.txt"], "user.color", []byte("blue"))
-	v.symlink(publishRootInode, "link", "keep.txt")
+	s.ino["olddir"] = v.Mkdir(publishRootInode, "olddir")
+	s.ino["olddir/inner.txt"] = v.WriteFile(s.ino["olddir"], "inner.txt", s.body["olddir/inner.txt"])
+	v.SetXattr(s.ino["tagged.txt"], "user.color", []byte("blue"))
+	v.Symlink(publishRootInode, "link", "keep.txt")
 
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s.pub, s.priv = pub, priv
-
-	var keyTable []superblock.KeyEntry
-	keyID := uint32(0)
-	if len(dek) != 0 {
-		keyID = 7
-		keyTable = []superblock.KeyEntry{
-			{ID: 7, Kind: superblock.KeyKindDEK, Alg: superblock.KeyAlgRSAOAEPSHA256, Wrapped: []byte("wrapped-dek")},
-			{ID: 8, Kind: superblock.KeyKindIdentity, Alg: superblock.KeyAlgRSAOAEPSHA256, Wrapped: []byte("wrapped-idkey")},
-		}
-	}
-	s.res, err = publish.Publish(context.Background(), publish.Options{
-		CutPath:        v.cut(),
-		Blob:           v.blob,
-		CacheDir:       t.TempDir(),
-		Inner:          inner,
-		SpoolDir:       t.TempDir(),
-		SigningKey:     priv,
-		IdentityKey:    idKey,
-		DEK:            dek,
-		KeyID:          keyID,
-		KeyTable:       keyTable,
-		TargetPackSize: 1 << 20,
-		DedupIndexPath: s.index,
-	})
-	if err != nil {
-		t.Fatalf("base Publish: %v", err)
-	}
+	s.priv = v.SigningKey()
+	s.pub = s.priv.Public().(ed25519.PublicKey)
+	s.res = v.Publish(publish.Options{TargetPackSize: 1 << 20, DedupIndexPath: s.index})
 	s.base = openGenfs(t, inner, s.res.Superblock, dek)
 	s.ov = openOverlay(t, s.base, s.res.Superblock)
 	return s
@@ -441,8 +425,8 @@ func TestSealOverlayIntoGeneration(t *testing.T) {
 		t.Fatalf("Seal: %v", err)
 	}
 	sb := res.Superblock
-	if sb.Generation != 1 {
-		t.Fatalf("generation = %d, want 1", sb.Generation)
+	if want := s.res.Superblock.Generation + 1; sb.Generation != want {
+		t.Fatalf("generation = %d, want %d", sb.Generation, want)
 	}
 	if err := sb.Verify(s.pub); err != nil {
 		t.Fatalf("verify sealed superblock: %v", err)
@@ -516,15 +500,19 @@ func TestSealOverlayIntoGeneration(t *testing.T) {
 		t.Errorf("symlink target = %q", got["/link"].target)
 	}
 
-	// Unchanged base content is never re-uploaded: the whole base chunk
-	// set arrives from the dedup index, and only the new file's chunks are
-	// added.
+	// Unchanged base content is never re-read, let alone re-uploaded: the
+	// seal carries forward the records the base generation published, so
+	// none of it reaches the chunker at all.
 	if res.Stats.DedupIndexChunks != s.res.Stats.ChunksAdded {
 		t.Errorf("dedup index preloaded %d chunks, base published %d",
 			res.Stats.DedupIndexChunks, s.res.Stats.ChunksAdded)
 	}
-	if res.Stats.ChunksDeduped != s.res.Stats.ChunksAdded {
-		t.Errorf("deduped %d chunks, want the base's %d", res.Stats.ChunksDeduped, s.res.Stats.ChunksAdded)
+	if res.Stats.ReusedChunks != s.res.Stats.ChunksAdded {
+		t.Errorf("carried forward %d chunks, the base published %d",
+			res.Stats.ReusedChunks, s.res.Stats.ChunksAdded)
+	}
+	if res.Stats.ChunksDeduped != 0 {
+		t.Errorf("%d unchanged chunk(s) still went through the chunker", res.Stats.ChunksDeduped)
 	}
 	if want := chunkCount(t, freshContent); res.Stats.ChunksAdded != want {
 		t.Errorf("added %d chunks, want %d (the new file's content alone)", res.Stats.ChunksAdded, want)
@@ -572,8 +560,8 @@ func TestSealTwiceWithoutChanges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second Seal: %v", err)
 	}
-	if second.Superblock.Generation != 2 {
-		t.Fatalf("generation = %d, want 2", second.Superblock.Generation)
+	if want := first.Superblock.Generation + 1; second.Superblock.Generation != want {
+		t.Fatalf("generation = %d, want %d", second.Superblock.Generation, want)
 	}
 	if second.Superblock.PrevHash != superblock.Hash(first.Raw) {
 		t.Errorf("lineage does not chain to the first seal")
@@ -653,9 +641,15 @@ func TestSealEncrypted(t *testing.T) {
 	if got["/keep.txt"].inode != s.ino["keep.txt"] {
 		t.Errorf("keep.txt inode %d, base had %d", got["/keep.txt"].inode, s.ino["keep.txt"])
 	}
-	// Nothing from the base was re-chunked into new packs.
-	if res.Stats.ChunksDeduped != s.res.Stats.ChunksAdded {
-		t.Errorf("deduped %d chunks, want the base's %d", res.Stats.ChunksDeduped, s.res.Stats.ChunksAdded)
+	// Nothing from the base was re-read or re-chunked. The reused records
+	// keep the key id the stored bytes were written under, so an encrypted
+	// volume carries content forward exactly like a plaintext one.
+	if res.Stats.ReusedChunks != s.res.Stats.ChunksAdded {
+		t.Errorf("carried forward %d chunks, the base published %d",
+			res.Stats.ReusedChunks, s.res.Stats.ChunksAdded)
+	}
+	if res.Stats.ChunksDeduped != 0 {
+		t.Errorf("%d unchanged chunk(s) still went through the chunker", res.Stats.ChunksDeduped)
 	}
 	if want := chunkCount(t, blob); res.Stats.ChunksAdded != want {
 		t.Errorf("added %d chunks, want %d", res.Stats.ChunksAdded, want)
@@ -679,15 +673,15 @@ func TestSealRequiresOverlayAndPrev(t *testing.T) {
 		t.Fatalf("Seal without Prev succeeded")
 	}
 	_, err = publish.Publish(ctx, publish.Options{
-		CutPath: "cut.db", Overlay: s.ov, Inner: s.inner, SpoolDir: t.TempDir(), SigningKey: s.priv,
+		Overlay: s.ov, OverlaySnapshot: &overlay.Snapshot{}, Inner: s.inner,
+		SpoolDir: t.TempDir(), SigningKey: s.priv, Prev: s.res.Superblock, PrevRaw: s.res.Raw,
 	})
 	if err == nil {
-		t.Fatalf("Publish with both CutPath and Overlay succeeded")
+		t.Fatalf("Publish with both a live overlay and a snapshot succeeded")
 	}
 }
 
-// A volume must be creatable without JuiceFS: InitVolume writes
-// generation 0 with an empty root, and the catalog-native write path
+// InitVolume writes generation 0 with an empty root, and the write path
 // takes it from there.
 func TestInitVolumeThenSeal(t *testing.T) {
 	ctx := context.Background()

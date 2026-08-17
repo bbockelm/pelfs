@@ -182,12 +182,20 @@ func pseudorandom(n int, seed int64) []byte {
 	return b
 }
 
-// readEnv reads published artifacts back: a read-side packstore over the
-// same inner store (Packable always true, so every pack trailer key
-// resolves), entry decode, and catalog reopening from pack bytes.
+// entryLoc is where one entry lives: which pack, and the byte range.
+type entryLoc struct {
+	pack   string
+	off    int64
+	length int64
+}
+
+// readEnv reads published artifacts back the way any reader does: build
+// the entry index from every pack's trailer, fetch entries as ranges,
+// decode them, and reopen catalogs from the resulting bytes.
 type readEnv struct {
 	t      *testing.T
-	rs     pelicanobj.Store
+	inner  pelicanobj.Store
+	index  map[string]entryLoc
 	dek    []byte
 	hasher chunkid.Hasher
 	dir    string
@@ -196,23 +204,40 @@ type readEnv struct {
 
 func newReadEnv(t *testing.T, inner pelicanobj.Store, dek, identityKey []byte) *readEnv {
 	t.Helper()
-	rs, err := packstore.New(context.Background(), inner, packstore.Config{
-		Packable: func(string) bool { return true },
-	})
+	ctx := context.Background()
+	index := make(map[string]entryLoc)
+	packs, err := inner.ListDir(ctx, packstore.PackDirKey)
 	if err != nil {
-		t.Fatalf("read-side packstore: %v", err)
+		t.Fatalf("list packs: %v", err)
 	}
-	return &readEnv{t: t, rs: rs, dek: dek, hasher: chunkid.NewHasher(identityKey), dir: t.TempDir()}
+	for _, p := range packs {
+		if p.IsDir || !strings.HasPrefix(p.Name, "p-") {
+			continue
+		}
+		entries, err := packstore.FetchTrailer(ctx, inner, p.Name, p.Size)
+		if err != nil {
+			t.Fatalf("trailer of %s: %v", p.Name, err)
+		}
+		for _, pe := range entries {
+			index[pe.Key] = entryLoc{pack: p.Name, off: pe.Off, length: pe.Length}
+		}
+	}
+	return &readEnv{t: t, inner: inner, index: index, dek: dek,
+		hasher: chunkid.NewHasher(identityKey), dir: t.TempDir()}
 }
 
 func (e *readEnv) entry(key string) []byte {
 	e.t.Helper()
-	rc, err := e.rs.Get(context.Background(), key, 0, -1)
+	loc, ok := e.index[key]
+	if !ok {
+		e.t.Fatalf("no pack holds entry %s", key)
+	}
+	rc, err := e.inner.Get(context.Background(), packstore.PackDirKey+"/"+loc.pack, loc.off, loc.length)
 	if err != nil {
 		e.t.Fatalf("read entry %s: %v", key, err)
 	}
 	defer rc.Close() //nolint:errcheck
-	data, err := io.ReadAll(rc)
+	data, err := io.ReadAll(io.LimitReader(rc, loc.length))
 	if err != nil {
 		e.t.Fatalf("read entry %s: %v", key, err)
 	}
@@ -726,16 +751,8 @@ func TestPublishEncrypted(t *testing.T) {
 // chunk and catalog entries fail the decode.
 func findBackup(t *testing.T, env *readEnv, wantGen uint64, pub ed25519.PublicKey) bool {
 	t.Helper()
-	ch, err := env.rs.ListAll(context.Background(), "", "", false)
-	if err != nil {
-		t.Fatalf("ListAll: %v", err)
-	}
 	found := false
-	for o := range ch {
-		if o == nil {
-			t.Fatalf("ListAll emitted the failure sentinel")
-		}
-		key := o.Key()
+	for key := range env.index {
 		if len(key) != 64 { // pack entry keys are 32-byte identities in hex
 			continue
 		}

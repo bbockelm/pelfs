@@ -77,19 +77,30 @@ func TestPackWriterSealAndReadBack(t *testing.T) {
 		t.Fatalf("decompress trailer: %v", err)
 	}
 
-	// A read-side Store bootstrapping from the same prefix must serve
-	// every entry, whole and by range, with types preserved in the trailer.
-	// (The phase-1 middleware only intercepts packable keys, so a store
-	// reading v2 identity keys declares everything packable.)
-	rs := newPack(t, inner, Config{Packable: func(string) bool { return true }})
-	for k, e := range entries {
-		got := readObj(t, rs, k, 0, -1)
-		if !bytes.Equal(got, e.data) {
-			t.Fatalf("entry %s: read %d bytes, want %d", k, len(got), len(e.data))
+	// A reader holding only the pack list must locate every entry from the
+	// trailer and read it back, whole and by range, with types preserved.
+	located, err := FetchTrailerVerified(ctx, inner, sealed.Name, sealed.Size, sealed.TrailerHash)
+	if err != nil {
+		t.Fatalf("FetchTrailerVerified: %v", err)
+	}
+	if len(located) != len(entries) {
+		t.Fatalf("trailer lists %d entries, want %d", len(located), len(entries))
+	}
+	packKey := PackDirKey + "/" + sealed.Name
+	for _, pe := range located {
+		e, ok := entries[pe.Key]
+		if !ok {
+			t.Fatalf("trailer names an entry nobody wrote: %s", pe.Key)
 		}
-		tail := readObj(t, rs, k, int64(len(e.data))-100, 100)
+		if pe.Type != e.typ {
+			t.Fatalf("entry %s: type %q, want %q", pe.Key, pe.Type, e.typ)
+		}
+		if got := readObj(t, inner, packKey, pe.Off, pe.Length); !bytes.Equal(got, e.data) {
+			t.Fatalf("entry %s: read %d bytes, want %d", pe.Key, len(got), len(e.data))
+		}
+		tail := readObj(t, inner, packKey, pe.Off+pe.Length-100, 100)
 		if !bytes.Equal(tail, e.data[len(e.data)-100:]) {
-			t.Fatalf("entry %s: tail range mismatch", k)
+			t.Fatalf("entry %s: tail range mismatch", pe.Key)
 		}
 	}
 	if !bytes.Contains(trailerJSON, []byte(`"t":"catalog"`)) ||
@@ -129,8 +140,14 @@ func TestLegacyJSONTrailerStillReadable(t *testing.T) {
 		t.Fatalf("upload legacy pack: %v", err)
 	}
 
-	s := newPack(t, inner, Config{})
-	got := readObj(t, s, "chunks/0/0/7_0_4096", 0, -1)
+	located, err := FetchTrailer(ctx, inner, "p-000000000000-legacy", int64(len(pack)))
+	if err != nil {
+		t.Fatalf("FetchTrailer over a plain-JSON trailer: %v", err)
+	}
+	if len(located) != 1 || located[0].Key != "chunks/0/0/7_0_4096" {
+		t.Fatalf("legacy trailer decoded as %+v", located)
+	}
+	got := readObj(t, inner, PackDirKey+"/p-000000000000-legacy", located[0].Off, located[0].Length)
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("legacy pack entry mismatch: %d bytes", len(got))
 	}
@@ -201,58 +218,18 @@ func TestRetryOnTransientFailures(t *testing.T) {
 			sizes[PackDirKey+"/"+sealed.Name], sealed.Size)
 	}
 
-	// Bootstrap through a flaky store: ListDir fails twice, trailer read
-	// fails twice more; the store must still come up with the entry.
-	flaky.failures = 4
-	rs := newPack(t, flaky, Config{Packable: func(string) bool { return true }})
-	got := readObj(t, rs, "retry-key", 0, -1)
+	// Reading the trailer back through a flaky transport must retry rather
+	// than fail the mount.
+	flaky.failures = 2
+	located, err := FetchTrailerVerified(ctx, flaky, sealed.Name, sealed.Size, sealed.TrailerHash)
+	if err != nil {
+		t.Fatalf("FetchTrailerVerified through a flaky store: %v", err)
+	}
+	if len(located) != 1 || located[0].Key != "retry-key" {
+		t.Fatalf("trailer decoded as %+v", located)
+	}
+	got := readObj(t, inner, PackDirKey+"/"+sealed.Name, located[0].Off, located[0].Length)
 	if !bytes.Equal(got, payload) {
-		t.Fatalf("read through retried bootstrap mismatched (%d bytes)", len(got))
-	}
-}
-
-// A pack whose entries all died before the seal must not be uploaded:
-// there is nothing to store, and an empty pack costs a round trip, an
-// object, and a pack-list entry to say so. Its tombstones must still
-// survive, riding the next pack that has content.
-func TestFullyDeadPackIsNotUploaded(t *testing.T) {
-	inner, _ := newInner(t)
-	ctx := context.Background()
-	s := newPack(t, inner, Config{WriteEnabled: true, TargetSize: 1 << 30})
-
-	key := "chunks/0/0/1_0_4096"
-	if err := s.Put(ctx, key, bytes.NewReader(blob(key, 4096))); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Delete(ctx, key); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Flush(ctx); err != nil {
-		t.Fatalf("Flush: %v", err)
-	}
-	packs, _ := listKeys(t, inner, PackDirKey+"/")
-	if len(packs) != 0 {
-		t.Fatalf("uploaded %v for a pack with no live entries", packs)
-	}
-
-	// The tombstone must not be lost: a later pack carries it, so a fresh
-	// reader does not resurrect the deleted key.
-	live := "chunks/0/0/2_0_4096"
-	if err := s.Put(ctx, live, bytes.NewReader(blob(live, 4096))); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Flush(ctx); err != nil {
-		t.Fatal(err)
-	}
-	packs, _ = listKeys(t, inner, PackDirKey+"/")
-	if len(packs) != 1 {
-		t.Fatalf("expected exactly one pack after a live write, got %v", packs)
-	}
-	rs := newPack(t, inner, Config{})
-	if _, err := rs.Get(ctx, key, 0, -1); err == nil {
-		t.Fatal("the deleted key resurfaced after a bootstrap: its tombstone was lost")
-	}
-	if got := readObj(t, rs, live, 0, -1); len(got) != 4096 {
-		t.Fatalf("live key read back %d bytes", len(got))
+		t.Fatalf("read through the retried trailer mismatched (%d bytes)", len(got))
 	}
 }

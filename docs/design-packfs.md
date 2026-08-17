@@ -69,6 +69,34 @@ TargetSize: large enough that a 10 GB write is ~160 uploads, small enough
 that repack passes and range-served cold reads stay granular); the
 open-pack append strategy is the spool-file design below.
 
+**The first packs of a publish are cut smaller** — 8 MiB, doubling until
+the cut size reaches the target — because nothing can be uploaded until a
+whole pack exists. Cutting only at 64 MiB leaves the uplink idle through
+the first 64 MiB of walking and then has to drain the remainder after the
+walk is over; starting small is the same trade as TCP slow start.
+Measured against a modelled link on a 185 MiB seal, the ramp takes the
+share of the seal with nothing in flight from 2.0% to 0.5% at 20 Mb/s and
+from 18% to 3% at 1 Gb/s, and moves the first byte from 1.6 s into the
+seal to 0.3 s. It costs at most three extra packs however large the
+volume — and a pack is never free again, because every mount range-reads
+every trailer in the generation's pack list. In wall time the ramp is
+worth −1.6% at 20 Mb/s and −6.5% at 100 Mb/s against +6% on a 1 Gb/80 ms
+path, where the seal is limited by how fast the walk produces packs
+(link utilization there is ~17%) and the extra round trips are the whole
+cost. The trade is taken toward the slow link deliberately: that is where
+a seal is 80 s rather than 9 s.
+
+**Pack uploads run concurrently, four at a time.** The number is a
+property of the link, not of the format. On a bandwidth-bound uplink the
+streams only divide the same pipe — measured seal wall time at 20 Mb/s is
+flat from one stream to eight — while on a long-fat path a single stream
+is window-limited and cannot fill the pipe alone: at 1 Gb/s and 80 ms RTT
+the same seal takes 17.1 s with one stream, 11.7 s with two, 9.0 s with
+four, and nothing more with eight. Four is where that curve flattens. It
+stays settable (`publish.Options.UploadConcurrency`) because a
+data-centre node and a laptop sharing its uplink with a mount that is
+still serving reads do not want the same answer.
+
 **Write path (the "memtable"):** the accumulating structure is a local
 spool file — an append-only file whose byte layout is already the final
 pack layout, plus an in-memory key -> (offset, length) table. There is no

@@ -78,6 +78,14 @@ const (
 	DefaultInlineMax = 4096
 	// DefaultTargetPackSize matches the phase-1 middleware's pack target.
 	DefaultTargetPackSize = 64 << 20
+	// DefaultFirstPackSize is the size the FIRST pack is cut at; the cut
+	// size then doubles until it reaches TargetPackSize. Nothing can be
+	// uploaded until a whole pack exists, so a seal that only ever cuts at
+	// 64 MiB leaves the uplink idle through its first 64 MiB of walking and
+	// then has to drain the remainder after the walk has finished. Starting
+	// small is the same trade as TCP slow start: pay a handful of extra
+	// objects to stop waiting for the window to fill.
+	DefaultFirstPackSize = 8 << 20
 	// DefaultUploadConcurrency is how many packs may be in flight at once.
 	// Each upload is one long transfer, so this is about covering round
 	// trips rather than about CPU: on a bandwidth-bound uplink extra
@@ -141,6 +149,10 @@ type Options struct {
 	InlineMax int64
 	// TargetPackSize cuts packs (default 64 MiB).
 	TargetPackSize int64
+	// FirstPackSize cuts the first pack, after which the cut size doubles
+	// toward TargetPackSize (default DefaultFirstPackSize). Setting it to
+	// TargetPackSize disables the ramp.
+	FirstPackSize int64
 	// UploadConcurrency bounds packs in flight; zero uses
 	// DefaultUploadConcurrency. It is settable because the right number is
 	// a property of the link, not of the code: a laptop on a home uplink
@@ -249,7 +261,7 @@ func Publish(ctx context.Context, o Options) (*Result, error) {
 	p := &pipeline{
 		o:           o,
 		src:         src,
-		pk:          newPacker(o.Inner, tmpDir, o.TargetPackSize, o.UploadConcurrency),
+		pk:          newPacker(o.Inner, tmpDir, o.TargetPackSize, o.FirstPackSize, o.UploadConcurrency),
 		hasher:      chunkid.NewHasher(o.IdentityKey),
 		gen:         gen,
 		volUUID:     volUUID,
@@ -400,6 +412,9 @@ func applyDefaults(o *Options) error {
 	}
 	if o.TargetPackSize <= 0 {
 		o.TargetPackSize = DefaultTargetPackSize
+	}
+	if o.FirstPackSize <= 0 {
+		o.FirstPackSize = DefaultFirstPackSize
 	}
 	if o.SMax <= 0 {
 		o.SMax = catalog.SMax

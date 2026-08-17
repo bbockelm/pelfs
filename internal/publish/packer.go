@@ -19,9 +19,12 @@ import (
 // re-uploads are harmless duplicates — content addressing makes them dead
 // weight, never corruption.
 type packer struct {
-	inner  pelicanobj.Store
-	dir    string
+	inner pelicanobj.Store
+	dir   string
+	// target is the steady-state cut size; cur is what the pack being
+	// built is cut at, which starts smaller and doubles toward target.
 	target int64
+	cur    int64
 
 	w      *packstore.PackWriter
 	sealed []packstore.SealedPack
@@ -36,12 +39,15 @@ type packer struct {
 	err error
 }
 
-func newPacker(inner pelicanobj.Store, dir string, target int64, conc int) *packer {
+func newPacker(inner pelicanobj.Store, dir string, target, first int64, conc int) *packer {
+	if first <= 0 || first > target {
+		first = target
+	}
 	if conc <= 0 {
 		conc = DefaultUploadConcurrency
 	}
 	return &packer{
-		inner: inner, dir: dir, target: target,
+		inner: inner, dir: dir, target: target, cur: first,
 		added: make(map[string]struct{}),
 		sem:   make(chan struct{}, conc),
 	}
@@ -59,7 +65,7 @@ func (p *packer) add(ctx context.Context, key, typ string, data []byte) error {
 	if p.has(key) {
 		return nil
 	}
-	if p.w != nil && p.w.Size() > 0 && p.w.Size()+int64(len(data)) > p.target {
+	if p.w != nil && p.w.Size() > 0 && p.w.Size()+int64(len(data)) > p.cur {
 		if err := p.cut(ctx); err != nil {
 			return err
 		}
@@ -97,6 +103,14 @@ func (p *packer) cut(ctx context.Context) error {
 		return err
 	}
 	p.w = nil
+	// Ramp toward the steady-state target. The early packs exist to get
+	// bytes onto the wire while the walk is still running; once the pipe
+	// is full there is nothing left to buy and per-object overhead —
+	// another trailer, another entry in the pack list every mount reads —
+	// argues for the larger size.
+	if p.cur < p.target {
+		p.cur = min(p.cur*2, p.target)
+	}
 	p.mu.Lock()
 	p.sealed = append(p.sealed, sp)
 	p.mu.Unlock()

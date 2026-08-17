@@ -160,6 +160,31 @@ E=$(t0)
 rate "seal + publish at unmount" "$S" "$E" "$NFILES"
 tail -3 "$W/out/mount.log" || true
 
+# The incremental shape, which is what an interactive session actually
+# does: remount the volume just published, touch ONE file, unmount. A seal
+# that costs the same here as the one above is a seal doing whole-tree
+# work for a one-row change.
+echo
+echo "== remount, touch one file, unmount (the incremental shape) =="
+S=$(t0)
+/stage/pelfs mount-gen --rw --no-lease --state-dir "$W/state" "$PREFIX" "$W/mnt2" \
+  > "$W/out/mount2.log" 2>&1 &
+MOUNT2_PID=$!
+mkdir -p "$W/mnt2"
+for _ in $(seq 300); do mountpoint -q "$W/mnt2" && break; sleep 0.1; done
+mountpoint -q "$W/mnt2" || { echo "second mount did not come up" >&2; cat "$W/out/mount2.log"; exit 1; }
+E=$(t0)
+awk -v s="$S" -v e="$E" 'BEGIN{printf "%-28s %8.2fs\n", "mount to serving", e-s}'
+grep -h "ready to serve" "$W/out/mount2.log" || true
+
+touch "$W/mnt2/no.txt"
+S=$(t0)
+fusermount3 -u "$W/mnt2" 2>/dev/null || fusermount -u "$W/mnt2" 2>/dev/null || umount "$W/mnt2"
+wait "$MOUNT2_PID" 2>/dev/null || true
+E=$(t0)
+awk -v s="$S" -v e="$E" 'BEGIN{printf "%-28s %8.2fs\n", "one-file seal at unmount", e-s}'
+grep -hE "seal took|sealed generation" "$W/out/mount2.log" || true
+
 kill "$ORIGIN_PID" 2>/dev/null || true
 cp -a "$W/out/." /out/ 2>/dev/null || true
 INNER

@@ -361,7 +361,6 @@ func TestCatalogListCoversTheWholeTree(t *testing.T) {
 	}
 }
 
-
 // Carrying a catalog forward is only half the saving; the other half is
 // never reading the subtree it covers. A seal that still walks 85k inodes
 // to conclude it has nothing to do is still a seal that takes seconds.

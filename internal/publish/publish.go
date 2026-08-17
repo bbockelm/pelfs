@@ -12,19 +12,32 @@
 // no cut at all: publish IS the durability step for staged content, and
 // nothing downstream of the walk changes.
 //
-// Simplifications, deliberate and marked at their sites:
-//   - Full-tree TRANSFORM: every catalog and shard regenerates from the
-//     source. Dirty-set tracking is a later optimization; content
-//     addressing already makes an unchanged subtree's catalog hash to the
-//     same bytes it did last generation. File CONTENT is the exception —
-//     a source that can prove a file's bytes untouched hands back the
-//     records the previous generation published (see ContentReuser), so
-//     the walk never opens it.
+// How much of the tree a publish touches, and the deliberate
+// simplifications, each marked at its site:
+//
+//   - INCREMENTAL TRANSFORM, on three levels, each needing the source to
+//     say what it changed. A file whose bytes are untouched keeps the
+//     content records the previous generation published (ContentReuser).
+//     A catalog whose whole subtree is untouched is carried forward by
+//     reference rather than rebuilt (CatalogReuser), the way a git commit
+//     keeps the tree objects it did not change. And a subtree whose
+//     catalog is being carried is not walked at all. What remains is
+//     proportional to the change: the catalogs from the changed directory
+//     to the root, and nothing else. See catalogreuse.go for the safety
+//     argument, which is mostly about retention.
+//
+//     SHARDS are the exception and still regenerate whole: they are keyed
+//     by inode range across the volume, so one promoted inode changing
+//     rewrites a shard, and a shard rebuild needs every promoted inode's
+//     records. A subtree holding one is therefore never skipped.
+//
 //   - Chunk dedup is within-publish only (see packer) plus the local
 //     sidecar index (dedup.go). A re-uploaded chunk is wasted bytes under
 //     the same identity, never corruption.
+//
 //   - Holes materialize as zero bytes through the chunker instead of NULL
 //     chunkref rows: content stays byte-exact, sparseness is not preserved.
+//
 //   - Promoted (nlink > 1) inodes keep their node row in every referencing
 //     path catalog AND in their inode shard; only the content records
 //     (chunkrefs, inline, xattrs) are shard-exclusive. Stat from a path

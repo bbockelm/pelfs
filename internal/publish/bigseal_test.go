@@ -300,6 +300,10 @@ type meterStore struct {
 	gets, puts   atomic.Int64
 	getB, putB   atomic.Int64
 	listRequests atomic.Int64
+	// delay models a federation round trip. A local fakeorigin answers in
+	// microseconds, which hides the cost that actually dominates a mount:
+	// the NUMBER of requests it makes before it can serve anything.
+	delay time.Duration
 }
 
 type meterMark struct{ gets, puts, getB, putB, lists int64 }
@@ -326,6 +330,9 @@ func human(n int64) string {
 }
 
 func (m *meterStore) Get(ctx context.Context, key string, off, limit int64) (io.ReadCloser, error) {
+	if m.delay > 0 {
+		time.Sleep(m.delay)
+	}
 	rc, err := m.Store.Get(ctx, key, off, limit)
 	if err != nil {
 		return nil, err
@@ -365,4 +372,67 @@ func (c *countingReader) Close() error {
 		return c.rc.Close()
 	}
 	return nil
+}
+
+// TestMountOpenCost measures what a mount pays before it can serve its
+// first byte, against a store with a round-trip delay — because that is
+// what the cost is made of. genfs.Open builds the identity index from
+// every pack trailer in the generation's pack list, and a volume of any
+// size has a lot of packs.
+//
+//	PELFS_BIGSEAL=1 PELFS_MOUNT_RTT_MS=20 go test ./internal/publish -run MountOpenCost -v -timeout 30m
+func TestMountOpenCost(t *testing.T) {
+	if os.Getenv("PELFS_BIGSEAL") == "" {
+		t.Skip("set PELFS_BIGSEAL=1 to run the mount-cost measurement")
+	}
+	ctx := context.Background()
+	files := envInt("PELFS_MOUNT_FILES", 20000)
+	rtt := time.Duration(envInt("PELFS_MOUNT_RTT_MS", 20)) * time.Millisecond
+
+	inner := &meterStore{Store: newInner(t)}
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := t.TempDir()
+	head, err := publish.InitVolume(ctx, publish.Options{
+		Inner: inner, SpoolDir: t.TempDir(), SigningKey: priv,
+		VolumeID: [16]byte{0x60, 0x0d, 0xca, 0xfe}, TargetPackSize: 4 << 20,
+	})
+	if err != nil {
+		t.Fatalf("InitVolume: %v", err)
+	}
+	gfs, ov := openBigLayers(t, inner, head.Superblock, state, 1)
+	buildBigTree(t, ov, files, 16)
+	res, err := publish.Seal(ctx, publish.Options{
+		Overlay: ov, Inner: inner, SpoolDir: t.TempDir(), SigningKey: priv,
+		Prev: head.Superblock, PrevRaw: head.Raw, TargetPackSize: 4 << 20,
+	})
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	_ = ov.Close()
+	_ = gfs.Close()
+	t.Logf("volume: %d packs, %d catalogs", len(res.Superblock.PackList), res.Stats.Catalogs)
+
+	inner.delay = rtt
+	for _, phase := range []string{"cold cache", "warm cache"} {
+		mark := inner.snapshot()
+		start := time.Now()
+		fs, err := genfs.Open(ctx, genfs.Options{
+			Inner: inner, SB: res.Superblock, CacheDir: filepath.Join(state, "mountcache"),
+		})
+		if err != nil {
+			t.Fatalf("genfs.Open: %v", err)
+		}
+		open := time.Since(start)
+		lookStart := time.Now()
+		if _, err := fs.LookupPath(ctx, "top000/sub000"); err != nil {
+			t.Fatalf("first lookup: %v", err)
+		}
+		t.Logf("MOUNT (%s, %s RTT): genfs.Open %s, first lookup %s, %s",
+			phase, rtt, open.Round(time.Millisecond),
+			time.Since(lookStart).Round(time.Millisecond), inner.since(mark))
+		_ = fs.Close()
+	}
 }

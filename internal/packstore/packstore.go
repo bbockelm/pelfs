@@ -137,22 +137,61 @@ func FetchTrailer(ctx context.Context, inner pelicanobj.Store, name string, size
 // resolving a signed generation use this; entry DATA integrity is
 // separately end-to-end via chunk identity.
 func FetchTrailerVerified(ctx context.Context, inner pelicanobj.Store, name string, size int64, wantHash [32]byte) ([]PackEntry, error) {
+	entries, _, err := FetchTrailerStoredVerified(ctx, inner, name, size, wantHash)
+	return entries, err
+}
+
+// FetchTrailerStoredVerified is FetchTrailerVerified that also hands back
+// the STORED trailer bytes the hash was checked against.
+//
+// It exists so a reader can keep them. Packs are immutable and the hash
+// comes from the signed superblock, so a saved copy is not a cache that
+// has to be invalidated — it is the same bytes, authenticated the same
+// way, and re-reading it locally is exactly as sound as re-fetching it.
+// That matters because a mount indexes EVERY pack in the generation
+// before it serves anything, which is one federation round trip per pack
+// per mount for bytes that can never have changed.
+func FetchTrailerStoredVerified(ctx context.Context, inner pelicanobj.Store, name string, size int64, wantHash [32]byte) ([]PackEntry, []byte, error) {
 	if size <= 0 {
 		ki, err := inner.StatKey(ctx, PackDirKey+"/"+name)
 		if err != nil {
-			return nil, fmt.Errorf("stat pack %s: %w", name, err)
+			return nil, nil, fmt.Errorf("stat pack %s: %w", name, err)
 		}
 		size = ki.Size
 	}
 	tr, stored, _, err := fetchTrailerStored(ctx, inner, name, size)
 	if err != nil {
-		return nil, fmt.Errorf("pack %s: %w", name, err)
+		return nil, nil, fmt.Errorf("pack %s: %w", name, err)
 	}
 	if got := blake3.Sum256(stored); got != wantHash {
-		return nil, fmt.Errorf("pack %s: trailer hash mismatch (got %x, pack list says %x) — the location map does not match the signed generation", name, got, wantHash)
+		return nil, nil, fmt.Errorf("pack %s: trailer hash mismatch (got %x, pack list says %x) — the location map does not match the signed generation", name, got, wantHash)
+	}
+	return tr.Entries, stored, nil
+}
+
+// ParseStoredTrailer parses stored trailer bytes on their own, without the
+// footer that normally says how they are encoded. A saved copy has no
+// footer, and needs none: the two encodings are distinguishable from the
+// bytes themselves — a zstd frame opens with its own magic number, and the
+// legacy form is a JSON object.
+//
+// The caller is responsible for having authenticated the bytes (the
+// superblock's TrailerHash); this only decodes them.
+func ParseStoredTrailer(stored []byte) ([]PackEntry, error) {
+	m := magic
+	if len(stored) >= 4 && binary.LittleEndian.Uint32(stored[:4]) == zstdFrameMagic {
+		m = magicZ
+	}
+	tr, err := decodeTrailer(stored, m)
+	if err != nil {
+		return nil, err
 	}
 	return tr.Entries, nil
 }
+
+// zstdFrameMagic is the zstd frame header magic number (RFC 8878), which
+// is how stored trailer bytes announce their own encoding.
+const zstdFrameMagic = 0xFD2FB528
 
 func fetchTrailer(ctx context.Context, inner pelicanobj.Store, name string, size int64) (*trailer, int64, error) {
 	tr, _, idxLen, err := fetchTrailerStored(ctx, inner, name, size)

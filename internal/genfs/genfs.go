@@ -30,6 +30,8 @@ import (
 	"strings"
 	"sync"
 
+	"lukechampine.com/blake3"
+
 	"github.com/bbockelm/pelfs/internal/catalog"
 	"github.com/bbockelm/pelfs/internal/chunkid"
 	"github.com/bbockelm/pelfs/internal/entrycodec"
@@ -143,12 +145,13 @@ type residency struct {
 
 // FS serves one verified generation read-only. Safe for concurrent use.
 type FS struct {
-	inner    pelicanobj.Store
-	sb       *superblock.Superblock
-	dek      []byte
-	chunkDir string
-	catDir   string
-	packDir  string
+	inner      pelicanobj.Store
+	sb         *superblock.Superblock
+	dek        []byte
+	chunkDir   string
+	catDir     string
+	packDir    string
+	trailerDir string
 
 	// verify: recompute plain-BLAKE3 identities at cache fill (unencrypted
 	// volumes only; see the package comment).
@@ -223,7 +226,8 @@ func Open(ctx context.Context, o Options) (*FS, error) {
 	catDir := filepath.Join(o.CacheDir, "catalogs")
 	chunkDir := filepath.Join(o.CacheDir, "chunks")
 	packDir := filepath.Join(o.CacheDir, "packs")
-	dirs := []string{catDir, chunkDir}
+	trailerDir := filepath.Join(o.CacheDir, "trailers")
+	dirs := []string{catDir, chunkDir, trailerDir}
 	if o.PackCacheBytes > 0 {
 		dirs = append(dirs, packDir)
 	}
@@ -239,6 +243,7 @@ func Open(ctx context.Context, o Options) (*FS, error) {
 		chunkDir:     chunkDir,
 		catDir:       catDir,
 		packDir:      packDir,
+		trailerDir:   trailerDir,
 		packIndex:    make(map[string]packLoc),
 		packSize:     make(map[string]int64),
 		packEntries:  make(map[string]int),
@@ -253,21 +258,8 @@ func Open(ctx context.Context, o Options) (*FS, error) {
 	if o.PackCacheBytes > 0 {
 		fs.sweepPackTmp()
 	}
-	// Identity index: every trailer in the generation's pack list, built
-	// once, and no trailer's entries trusted until the stored bytes hash
-	// to the value the SIGNED pack list records. Identical content dedups
-	// at publish, so duplicate keys across packs reference the same
-	// bytes; last writer wins harmlessly.
-	for _, pe := range o.SB.PackList {
-		entries, err := packstore.FetchTrailerVerified(ctx, o.Inner, pe.Name, pe.Size, pe.TrailerHash)
-		if err != nil {
-			return nil, fmt.Errorf("genfs: index pack %s: %w", pe.Name, err)
-		}
-		fs.packSize[pe.Name] = pe.Size
-		fs.packEntries[pe.Name] = len(entries)
-		for _, e := range entries {
-			fs.packIndex[e.Key] = packLoc{pack: pe.Name, off: e.Off, length: e.Length}
-		}
+	if err := fs.buildPackIndex(ctx, o.SB.PackList); err != nil {
+		return nil, err
 	}
 
 	rootHex := hex.EncodeToString(o.SB.RootCatalog[:])
@@ -303,6 +295,76 @@ func Open(ctx context.Context, o Options) (*FS, error) {
 	}
 	fs.cats = newCatCache(fs, o.MaxOpenCatalogs, rootHex, root)
 	return fs, nil
+}
+
+// indexWorkers bounds concurrent trailer fetches at Open. A generation of
+// any size has one pack per 64 MiB, and the mount cannot serve a byte
+// until every one of them is indexed — which was one serial round trip
+// each.
+const indexWorkers = 8
+
+// buildPackIndex builds the identity index from every trailer in the
+// generation's pack list. No trailer's entries are trusted until the
+// stored bytes hash to the value the SIGNED pack list records; identical
+// content dedups at publish, so duplicate keys across packs reference the
+// same bytes and last writer wins harmlessly — the merge below stays in
+// pack-list order so which one that is does not depend on scheduling.
+//
+// Two things make this cheap that were not: trailers are fetched
+// CONCURRENTLY, since the packs are independent, and each one is kept
+// locally, since a pack is immutable and the hash that authenticates its
+// trailer is in the superblock. A remount of a volume it has seen before
+// therefore issues no requests here at all.
+func (fs *FS) buildPackIndex(ctx context.Context, packs []superblock.PackEntry) error {
+	results := make([][]packstore.PackEntry, len(packs))
+	errs := make([]error, len(packs))
+	sem := make(chan struct{}, indexWorkers)
+	var wg sync.WaitGroup
+	for i, pe := range packs {
+		wg.Add(1)
+		go func(i int, pe superblock.PackEntry) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			results[i], errs[i] = fs.trailerEntries(ctx, pe)
+		}(i, pe)
+	}
+	wg.Wait()
+	for i, pe := range packs {
+		if errs[i] != nil {
+			return fmt.Errorf("genfs: index pack %s: %w", pe.Name, errs[i])
+		}
+		fs.packSize[pe.Name] = pe.Size
+		fs.packEntries[pe.Name] = len(results[i])
+		for _, e := range results[i] {
+			fs.packIndex[e.Key] = packLoc{pack: pe.Name, off: e.Off, length: e.Length}
+		}
+	}
+	return nil
+}
+
+// trailerEntries returns one pack's entries, from the local copy when
+// there is one and the federation otherwise. The local copy is held to
+// exactly the standard a fetched one is — its bytes must hash to the
+// signed TrailerHash — so a corrupt or truncated file is not a hazard,
+// just a wasted read that falls through to the network.
+func (fs *FS) trailerEntries(ctx context.Context, pe superblock.PackEntry) ([]packstore.PackEntry, error) {
+	fp := filepath.Join(fs.trailerDir, pe.Name)
+	if stored, err := os.ReadFile(fp); err == nil {
+		if blake3.Sum256(stored) == pe.TrailerHash {
+			if entries, err := packstore.ParseStoredTrailer(stored); err == nil {
+				return entries, nil
+			}
+		}
+		os.Remove(fp) //nolint:errcheck
+	}
+	entries, stored, err := packstore.FetchTrailerStoredVerified(ctx, fs.inner, pe.Name, pe.Size, pe.TrailerHash)
+	if err != nil {
+		return nil, err
+	}
+	// Best effort: a mount that cannot write its cache still mounts.
+	_ = writeAtomic(fp, stored)
+	return entries, nil
 }
 
 // Close releases every open catalog handle. Spill and chunk cache files

@@ -8,25 +8,21 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
-	"github.com/bbockelm/pelfs/internal/dockerrun"
 	"github.com/bbockelm/pelfs/internal/lease"
-	"github.com/bbockelm/pelfs/internal/mountfs"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/refs"
-	"github.com/bbockelm/pelfs/internal/snapshot"
-	"github.com/bbockelm/pelfs/internal/stats"
 )
 
 func cmdShell(args []string) int {
-	var engine, branch string
+	var branch string
 	o, pos, command, err := parseArgsWithCommand("shell", args, 1, 1, func(fs *flag.FlagSet, o *cmdOpts) {
-		fs.StringVar(&engine, "engine", "auto", "which stack to mount with: auto (catalog-native when the volume has a published generation, else v1), native, or v1")
-		fs.StringVar(&branch, "branch", "main", "with the native engine, the branch to mount")
+		fs.StringVar(&branch, "branch", "main", "branch to mount")
 	})
 	if err != nil {
 		return exitErr(err)
@@ -38,320 +34,30 @@ func cmdShell(args []string) int {
 		return exitErr(err)
 	}
 
-	// Engine selection. A v2 volume is served by the catalog-native stack
-	// — genfs + overlay + the raw FUSE or NFS binding, no JuiceFS — while
-	// a volume that has no published generation can only be served by v1,
-	// because there is no generation to resolve. `auto` asks the
-	// federation which kind this is; the flag forces either answer.
-	native, create := false, false
-	switch engine {
-	case "native":
-		native = true
-	case "v1":
-	case "", "auto":
-		if backend != "docker" {
-			kind, err := classifyVolume(o, prefix, branch)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "pelfs: could not classify %s (%v); using the v1 engine\n", prefix, err)
-			}
-			switch kind {
-			case volumeV2:
-				native = true
-			case volumeEmpty:
-				// A NEW volume is born catalog-native: v1 exists to serve
-				// what already exists, not to create anything more of it.
-				native, create = true, true
-			case volumeV1:
-				// An existing JuiceFS volume has no generation to resolve,
-				// so only the v1 engine can serve it. `pelfs publish`
-				// promotes it, after which this becomes a v2 volume.
-			}
-		}
-	default:
-		return exitErr(fmt.Errorf("unknown --engine %q (want auto, native, or v1)", engine))
-	}
-	if native {
-		if backend == "docker" {
-			return exitErr(errors.New("the Docker fallback runs the v1 engine; use --engine v1, or mount natively outside a container"))
-		}
-		if create {
-			if err := initVolumeAt(o, prefix, branch); err != nil {
-				return exitErr(fmt.Errorf("create volume: %w", err))
-			}
-		}
-		mountpoint, err := os.MkdirTemp("", "pelfs-mnt-*")
-		if err != nil {
-			return exitErr(err)
-		}
-		defer os.RemoveAll(mountpoint) //nolint:errcheck
-		fmt.Fprintf(os.Stderr, "pelfs: catalog-native engine (no JuiceFS); %s\n", prefix)
-		return runMountGen(o, prefix, mountpoint, command, genArgs{
-			branch:   branch,
-			rw:       !o.readOnly,
-			subshell: true,
-			backend:  backend,
-		})
-	}
-	if backend == "docker" {
-		// dockerrun appends the prefix after the forwarded flags, so there
-		// is no position left in the container's argv where a `--` tail
-		// could not be mistaken for the prefix.
-		if len(command) > 0 {
-			return exitErr(errors.New("the Docker fallback cannot run a `-- command`; start the container shell and run it there"))
-		}
-		return runInDocker(o, prefix, engine, branch)
-	}
-	o.mountBackend = backend
-	code, err := runShellNative(o, prefix, command)
+	kind, err := classifyVolume(o, prefix, branch)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "pelfs: %v\n", err)
+		return exitErr(fmt.Errorf("classify %s: %w", prefix, err))
 	}
-	return code
-}
+	switch kind {
+	case volumeLegacy:
+		return exitErr(legacyVolumeError(prefix))
+	case volumeEmpty:
+		if err := initVolumeAt(o, prefix, branch); err != nil {
+			return exitErr(fmt.Errorf("create volume: %w", err))
+		}
+	}
 
-// runShellNative mounts the prefix and runs the session's payload in it: an
-// interactive subshell, or `command` when the caller gave a `-- ...` tail.
-// Teardown — unmount, drain, final snapshot — runs whatever the payload's
-// exit status was; only the status is carried out.
-func runShellNative(o *cmdOpts, prefix string, command []string) (int, error) {
-	ctx := context.Background()
-	s, err := newSession(ctx, o, prefix, !o.readOnly)
+	mountpoint, err := os.MkdirTemp("", "pelfs-mnt-*")
 	if err != nil {
-		return 1, err
+		return exitErr(err)
 	}
-
-	fmt.Fprintf(os.Stderr, "pelfs: mounting %s on %s\n", prefix, s.mountPoint)
-	mnt, err := mountfs.Mount(mountOptions(s))
-	if err != nil {
-		_ = s.stats.Finalize(1, false)
-		s.cleanupTemp()
-		return 1, fmt.Errorf("mount: %w", err)
-	}
-
-	// Strict prefetch runs before the subshell: refuse to start when any
-	// block could not be downloaded.
-	if err := s.runPrefetch(ctx, mnt); err != nil {
-		_ = mnt.Close()
-		_ = s.stats.Finalize(1, false)
-		s.cleanupTemp()
-		return 1, err
-	}
-
-	statsCtx, stopStats := context.WithCancel(ctx)
-	go s.stats.RunPeriodic(statsCtx, 30*time.Second)
-
-	if ctl := s.startControl(time.Now(), o.readOnly, s.mountPoint); ctl != nil {
-		defer ctl.Close() //nolint:errcheck
-	}
-
-	var mgr *snapshot.Manager
-	snapCtx, stopSnaps := context.WithCancel(ctx)
-	snapsDone := make(chan struct{})
-	// Accumulate sessions never take v1 snapshots: a snapshot would
-	// reference staged blocks that exist nowhere in the federation. The
-	// v2 publish at exit is the durability step.
-	if !o.readOnly && !o.accumulate {
-		mgr = s.newSnapshotManager()
-		go func() {
-			defer close(snapsDone)
-			if o.snapshotInterval > 0 {
-				mgr.Run(snapCtx, o.snapshotInterval)
-			}
-		}()
-	} else {
-		close(snapsDone)
-	}
-
-	code := runInMount(o, prefix, s.mountPoint, command)
-
-	stopSnaps()
-	<-snapsDone
-	fmt.Fprintln(os.Stderr, "pelfs: unmounting and flushing data to the federation...")
-	// Close unmounts, flushes delayed writes, and (with --writeback) waits
-	// for staged blocks to finish uploading: the "final upload at exit".
-	closeErr := mnt.Close()
-	if closeErr != nil {
-		fmt.Fprintf(os.Stderr, "pelfs: unmount: %v\n", closeErr)
-		if code == 0 {
-			code = 1
-		}
-	}
-	if o.writeback {
-		drained := closeErr == nil
-		s.stats.Update(func(sum *stats.Summary) {
-			sum.StagingDrained = &drained
-			if !drained {
-				sum.StagingBlocksLeft = mnt.StagingBlocks()
-			}
-		})
-	}
-	finalOK := true
-	if o.accumulate {
-		fmt.Fprintln(os.Stderr, "pelfs: accumulate mode: publishing the session as a v2 generation...")
-		if res, err := publishCore(ctx, s, "main", ""); err != nil {
-			fmt.Fprintf(os.Stderr, "pelfs: MANDATORY final publish FAILED — session output is only in %s: %v\n", s.stateDir, err)
-			finalOK = false
-			if code == 0 {
-				code = 1
-			}
-		} else {
-			fmt.Fprintf(os.Stderr, "pelfs: published generation %d (%d chunks, %d catalogs)\n",
-				res.Superblock.Generation, res.Stats.ChunksAdded, res.Stats.Catalogs)
-		}
-		s.stats.Update(func(sum *stats.Summary) { sum.FinalSnapshotOK = &finalOK })
-	}
-	if mgr != nil {
-		if err := mgr.Snapshot(ctx, true); err != nil {
-			fmt.Fprintf(os.Stderr, "pelfs: final metadata snapshot failed: %v\n", err)
-			finalOK = false
-			if code == 0 {
-				code = 1
-			}
-		} else {
-			fmt.Fprintf(os.Stderr, "pelfs: final metadata snapshot uploaded (session %s)\n", mgr.Session)
-			if err := mgr.PruneSessions(ctx, o.keepSessions); err != nil {
-				fmt.Fprintf(os.Stderr, "pelfs: prune old snapshots: %v\n", err)
-			}
-		}
-		s.stats.Update(func(sum *stats.Summary) { sum.FinalSnapshotOK = &finalOK })
-	}
-	stopStats()
-	if err := s.stats.Finalize(code, closeErr == nil && finalOK); err != nil {
-		fmt.Fprintf(os.Stderr, "pelfs: write stats file: %v\n", err)
-	}
-	s.cleanupTemp()
-	return code, nil
-}
-
-func mountOptions(s *session) mountfs.Options {
-	return mountfs.Options{
-		VolumeName:     s.o.volume,
-		MetaPath:       s.metaPath,
-		MountPoint:     s.mountPoint,
-		CacheDir:       s.cacheDir,
-		PrefixURL:      s.prefix,
-		Blob:           s.data,
-		BlockSizeKiB:   s.o.blockSizeKiB,
-		CacheSizeMiB:   s.o.cacheSizeMiB,
-		Writeback:      s.o.writeback,
-		Accumulate:     s.o.accumulate,
-		IORetries:      s.o.ioRetries,
-		ReadOnly:       s.o.readOnly,
-		Debug:          s.o.debug,
-		Compression:    s.o.compress,
-		EncryptKeyPEM:  s.encryptPEM,
-		FlushTimeout:   s.o.flushTimeout,
-		FlushPacks:     s.packs.Flush,
-		CacheFreeRatio: s.o.cacheFreeRatio,
-		Backend:        s.o.mountBackend,
-	}
-}
-
-func runInDocker(o *cmdOpts, prefix, engine, branch string) int {
-	// Run the access preflight on the HOST before launching the container:
-	// any interactive token acquisition (device flow, wallet password)
-	// happens where the user's browser and existing credential store live,
-	// and the resulting credentials are shared into the container via the
-	// ~/.pelican bind mount. This also surfaces scope problems immediately
-	// instead of from inside the container. Direct http(s) test prefixes
-	// are skipped: they may only resolve inside the container (e.g.
-	// host.docker.internal).
-	if strings.HasPrefix(prefix, "pelican://") || strings.HasPrefix(prefix, "osdf://") {
-		ctx := context.Background()
-		store, err := pelicanobj.New(ctx, pelicanobj.Config{
-			PrefixURL:    prefix,
-			TokenPath:    o.token,
-			AcquireToken: !o.noAcquireToken,
-			Insecure:     o.insecure,
-		})
-		if err != nil {
-			return exitErr(err)
-		}
-		if err := pelicanobj.Preflight(ctx, store, prefix, o.readOnly); err != nil {
-			return exitErr(err)
-		}
-	}
-
-	// The engine choice must travel with the invocation. Without it the
-	// in-container pelfs re-decided from scratch, and on an empty prefix
-	// that meant creating a v2 volume and then failing to mount it --
-	// the fallback image has no fusermount. The fallback runs v1, so an
-	// `auto` here resolves to v1 explicitly rather than being re-guessed
-	// inside; but v1 must never be pointed at a v2 volume, where it
-	// would write JuiceFS metadata into a catalog-native namespace.
-	innerEngine := engine
-	if innerEngine == "" || innerEngine == "auto" {
-		switch kind, err := classifyVolume(o, prefix, branch); {
-		case err != nil:
-			fmt.Fprintf(os.Stderr, "pelfs: could not classify %s (%v); using the v1 engine\n", prefix, err)
-			innerEngine = "v1"
-		case kind == volumeV2:
-			return exitErr(fmt.Errorf("%s holds a v2 volume, which only the catalog-native engine can serve, "+
-				"and the Docker fallback image has no FUSE; install macFUSE to mount natively, or use --backend nfs", prefix))
-		default:
-			innerEngine = "v1"
-		}
-	}
-
-	extra := []string{
-		"--engine", innerEngine,
-		"--branch", branch,
-		"--snapshot-interval", o.snapshotInterval.String(),
-		"--keep-sessions", fmt.Sprint(o.keepSessions),
-		"--cache-size", fmt.Sprint(o.cacheSizeMiB),
-		"--block-size", fmt.Sprint(o.blockSizeKiB),
-		"--volume", o.volume,
-		"--io-retries", fmt.Sprint(o.ioRetries),
-		"--compress", o.compress,
-		"--prefetch", o.prefetch,
-		"--flush-timeout", o.flushTimeout.String(),
-		"--cache-free-ratio", fmt.Sprint(o.cacheFreeRatio),
-		"--pack-size", fmt.Sprint(o.packSizeMiB),
-		"--no-docker", // never recurse
-	}
-	if o.encryptKeyPath != "" {
-		// dockerrun bind-mounts the key at this fixed path.
-		extra = append(extra, "--encrypt-key", "/run/pelfs/encrypt-key")
-	}
-	// The stats file must survive the container: resolve a host path
-	// (default: ./pelfs-stats.json), bind-mount its directory, and point
-	// the in-container pelfs at the mounted location.
-	hostStats := o.statsFile
-	if hostStats == "" {
-		if cwd, err := os.Getwd(); err == nil {
-			hostStats = filepath.Join(cwd, "pelfs-stats.json")
-		}
-	}
-	if hostStats != "" {
-		extra = append(extra, "--stats-file", "/run/pelfs/stats/"+filepath.Base(hostStats))
-	}
-	for flagName, set := range map[string]bool{
-		"--writeback":        o.writeback,
-		"--ro":               o.readOnly,
-		"--no-restore":       o.noRestore,
-		"--no-lease":         o.noLease,
-		"--no-pack":          o.noPack,
-		"--steal-lease":      o.stealLease,
-		"--no-acquire-token": o.noAcquireToken,
-		"--insecure":         o.insecure,
-		"--debug":            o.debug,
-	} {
-		if set {
-			extra = append(extra, flagName)
-		}
-	}
-	code, err := dockerrun.Run(dockerrun.Options{
-		PrefixURL:      prefix,
-		TokenPath:      resolveTokenPath(o.token),
-		EncryptKeyPath: o.encryptKeyPath,
-		StatsPath:      hostStats,
-		Image:          o.dockerImage,
-		ExtraArgs:      extra,
+	defer os.RemoveAll(mountpoint) //nolint:errcheck
+	return runMountGen(o, prefix, mountpoint, command, genArgs{
+		branch:   branch,
+		rw:       !o.readOnly,
+		subshell: true,
+		backend:  backend,
 	})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "pelfs: %v\n", err)
-	}
-	return code
 }
 
 // mountEnv is the environment the payload runs with: the caller's, plus the
@@ -477,22 +183,37 @@ func waitStatus(err error) int {
 type volumeKind int
 
 const (
-	volumeEmpty volumeKind = iota // nothing there yet
-	volumeV1                      // JuiceFS metadata snapshots, no generation
-	volumeV2                      // a published generation
+	volumeEmpty  volumeKind = iota // nothing there yet
+	volumeLegacy                   // block-and-snapshot metadata, no generation
+	volumeOK                       // a published generation
 )
 
+// legacyMetaDir is the key-space directory a retired block-and-snapshot
+// volume kept its metadata in. It is still probed so such a volume is
+// recognized and reported instead of being mistaken for an empty prefix
+// and overwritten with a new one.
+var legacyMetaDir = path.Dir(lease.Key)
+
+// legacyVolumeError explains a prefix this pelfs cannot serve. Refusing is
+// the whole point: the alternative — treating unrecognized metadata as an
+// empty prefix — would initialize a new volume on top of somebody's data.
+func legacyVolumeError(prefix string) error {
+	return fmt.Errorf("%s holds a retired block-and-snapshot volume, which this pelfs cannot read.\n"+
+		"pelfs: copy it out with a pelfs release that still had that engine, into a fresh prefix served by this one;\n"+
+		"pelfs: nothing here has been modified", prefix)
+}
+
 // classifyVolume asks the federation what kind of volume a prefix holds.
-// A published ref means v2; otherwise v1 metadata under meta/ means an
-// existing JuiceFS volume; neither means the prefix is empty and a new
-// volume should be created in the current format.
+// A published ref means a volume this pelfs serves; otherwise retired
+// metadata under meta/ means a volume it must refuse; neither means the
+// prefix is empty and a new volume should be created.
 func classifyVolume(o *cmdOpts, prefix, branch string) (volumeKind, error) {
 	has, err := volumeHasGeneration(o, prefix, branch)
 	if err != nil {
-		return volumeV1, err // conservative: serve what may already exist
+		return volumeLegacy, err // conservative: never overwrite what may exist
 	}
 	if has {
-		return volumeV2, nil
+		return volumeOK, nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -501,32 +222,31 @@ func classifyVolume(o *cmdOpts, prefix, branch string) (volumeKind, error) {
 		AcquireToken: !o.noAcquireToken, DirectRead: true,
 	})
 	if err != nil {
-		return volumeV1, err
+		return volumeLegacy, err
 	}
-	entries, err := inner.ListDir(ctx, snapshot.MetaDir)
+	entries, err := inner.ListDir(ctx, legacyMetaDir)
 	if err != nil {
 		if isNotFoundErr(err) {
 			return volumeEmpty, nil
 		}
-		return volumeV1, err
+		return volumeLegacy, err
 	}
-	// meta/ is not proof of a v1 volume: the advisory lease lives at
-	// meta/lease.json, so a writable CATALOG-NATIVE mount creates that
-	// directory too. Only a snapshot session directory means JuiceFS
-	// metadata is actually stored here.
+	// meta/ alone is not proof: the advisory lease lives at
+	// meta/lease.json, so a writable mount of a current volume creates that
+	// directory too. Anything else under it is a snapshot session directory.
 	for _, e := range entries {
 		if e.Name == filepath.Base(lease.Key) {
 			continue
 		}
-		return volumeV1, nil
+		return volumeLegacy, nil
 	}
 	return volumeEmpty, nil
 }
 
 // volumeHasGeneration reports whether the prefix already holds a
-// published v2 generation on the branch. It reads the ref through the
+// published generation on the branch. It reads the ref through the
 // direct-read transport (the superblock is the one mutable object) and
-// treats a missing ref as "no": a v1 volume simply has none.
+// treats a missing ref as "no".
 func volumeHasGeneration(o *cmdOpts, prefix, branch string) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

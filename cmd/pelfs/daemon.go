@@ -1,22 +1,18 @@
 package main
 
 import (
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"sort"
 	"syscall"
 	"time"
-
-	"github.com/bbockelm/pelfs/internal/mountfs"
-	"github.com/bbockelm/pelfs/internal/stats"
 )
 
 const daemonEnv = "PELFS_MOUNT_DAEMON"
@@ -32,14 +28,9 @@ type mountInfo struct {
 	// live. It is NOT always the directory holding this record: a mount
 	// started with --state-dir puts state elsewhere, and `pelfs ctl`
 	// must follow the session, not the record.
-	StateDir     string    `json:"state_dir,omitempty"`
-	ReadOnly     bool      `json:"read_only,omitempty"`
-	Started      time.Time `json:"started"`
-	LastSnapshot time.Time `json:"last_snapshot,omitempty"`
-	LastSnapKey  string    `json:"last_snapshot_key,omitempty"`
-	// LeaseConflict is set when another client overwrote our mount lease:
-	// a second writer is (or was) active on the same prefix.
-	LeaseConflict bool `json:"lease_conflict,omitempty"`
+	StateDir string    `json:"state_dir,omitempty"`
+	ReadOnly bool      `json:"read_only,omitempty"`
+	Started  time.Time `json:"started"`
 }
 
 func stateRoot() string {
@@ -61,19 +52,23 @@ func volDir(prefix string) string {
 // cmdMount mounts in the background: the parent re-execs itself as a
 // detached daemon child, waits for the mount to become visible, and returns.
 func cmdMount(args []string) int {
-	o, pos, err := parseArgs("mount", args, 1, 2, nil)
+	a := genArgs{branch: "main"}
+	o, pos, err := parseArgs("mount", args, 1, 2, func(fs *flag.FlagSet, o *cmdOpts) {
+		fs.StringVar(&a.branch, "branch", "main", "branch to mount")
+		fs.StringVar(&a.tag, "tag", "", "mount a tag instead of a branch head (pinned exactly)")
+		fs.StringVar(&a.pubkeyHex, "volume-pubkey", "", "hex Ed25519 volume key to trust (default: pin on first use)")
+		fs.BoolVar(&a.rw, "rw", false, "mount read-write through a local overlay; `pelfs umount` SEALS the changes into the next generation")
+		fs.BoolVar(&a.noSeal, "no-seal", false, "with --rw, keep the overlay at unmount instead of publishing it (resume by remounting)")
+		fs.DurationVar(&a.poll, "poll", 0, "read-only: re-check the branch head this often and swap generations live (0 = pinned)")
+		fs.StringVar(&a.signingKeyPath, "signing-key", "", "hex Ed25519 volume signing key file to seal with (default: <state-dir>/v2-signing.key)")
+	})
 	if err != nil {
 		return exitErr(err)
 	}
 	prefix := pos[0]
-	backend, err := resolveBackend(o)
-	if err != nil {
+	if a.backend, err = resolveBackend(o); err != nil {
 		return exitErr(err)
 	}
-	if backend == "docker" {
-		return exitErr(errors.New("pelfs mount requires a native backend (fuse or nfs); the Docker fallback only applies to `pelfs shell`"))
-	}
-	o.mountBackend = backend
 
 	dir := volDir(prefix)
 	if o.stateDir == "" {
@@ -85,7 +80,14 @@ func cmdMount(args []string) int {
 	infoPath := filepath.Join(dir, "mount.json")
 
 	if os.Getenv(daemonEnv) == "1" {
-		return runMountDaemon(o, prefix, pos, infoPath)
+		mountpoint := filepath.Join(o.stateDir, "mnt")
+		if len(pos) > 1 {
+			mountpoint = pos[1]
+		}
+		// The daemon child IS the mount: runMountGen publishes the record
+		// this command's parent is waiting on, serves until SIGTERM, and
+		// seals on the way out.
+		return runMountGen(o, prefix, mountpoint, nil, a)
 	}
 
 	if info, err := readMountInfo(infoPath); err == nil && pidAlive(info.PID) {
@@ -128,149 +130,6 @@ func cmdMount(args []string) int {
 		time.Sleep(200 * time.Millisecond)
 	}
 	return exitErr(fmt.Errorf("timed out waiting for the mount daemon; see %s", logPath))
-}
-
-// runMountDaemon is the detached child: mount, publish state, snapshot
-// until signaled, then unmount and finalize.
-func runMountDaemon(o *cmdOpts, prefix string, pos []string, infoPath string) int {
-	ctx := context.Background()
-	s, err := newSession(ctx, o, prefix, !o.readOnly)
-	if err != nil {
-		return exitErr(err)
-	}
-	if len(pos) > 1 {
-		s.mountPoint = pos[1]
-		if err := os.MkdirAll(s.mountPoint, 0700); err != nil {
-			return exitErr(err)
-		}
-	}
-
-	mnt, err := mountfs.Mount(mountOptions(s))
-	if err != nil {
-		_ = s.stats.Finalize(1, false)
-		s.cleanupTemp()
-		return exitErr(fmt.Errorf("mount: %w", err))
-	}
-
-	// Strict prefetch refuses to publish the mount when incomplete.
-	if err := s.runPrefetch(ctx, mnt); err != nil {
-		_ = mnt.Close()
-		_ = s.stats.Finalize(1, false)
-		s.cleanupTemp()
-		return exitErr(err)
-	}
-
-	statsCtx, stopStats := context.WithCancel(ctx)
-	go s.stats.RunPeriodic(statsCtx, 30*time.Second)
-
-	if ctl := s.startControl(time.Now(), o.readOnly, s.mountPoint); ctl != nil {
-		defer ctl.Close() //nolint:errcheck
-	}
-
-	info := &mountInfo{
-		PID:        os.Getpid(),
-		Prefix:     prefix,
-		MountPoint: s.mountPoint,
-		StateDir:   s.stateDir,
-		ReadOnly:   o.readOnly,
-		Started:    time.Now(),
-	}
-	writeInfo := func() {
-		data, _ := json.MarshalIndent(info, "", "  ")
-		_ = os.WriteFile(infoPath, data, 0600)
-	}
-
-	snapCtx, stopSnaps := context.WithCancel(ctx)
-	snapsDone := make(chan struct{})
-	mgr := s.newSnapshotManager()
-	if o.readOnly || o.accumulate {
-		// Accumulate sessions never take v1 snapshots: they would
-		// reference staged blocks that exist nowhere in the federation.
-		mgr = nil
-		close(snapsDone)
-	} else {
-		info.Session = mgr.Session
-		prevOnSnapshot := mgr.OnSnapshot // keep the stats-counting hook
-		mgr.OnSnapshot = func(key string, when time.Time) {
-			if prevOnSnapshot != nil {
-				prevOnSnapshot(key, when)
-			}
-			info.LastSnapshot = when
-			info.LastSnapKey = key
-			writeInfo()
-		}
-		go func() {
-			defer close(snapsDone)
-			if o.snapshotInterval > 0 {
-				mgr.Run(snapCtx, o.snapshotInterval)
-			}
-		}()
-	}
-	writeInfo()
-
-	// Surface lease conflicts in mount.json even when snapshots are off.
-	leaseWatch := time.NewTicker(30 * time.Second)
-	defer leaseWatch.Stop()
-	go func() {
-		for range leaseWatch.C {
-			if s.lease != nil && s.lease.Conflicted() && !info.LeaseConflict {
-				info.LeaseConflict = true
-				writeInfo()
-			}
-		}
-	}()
-
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
-	sig := <-sigs
-	fmt.Fprintf(os.Stderr, "pelfs: received %s, unmounting %s\n", sig, s.mountPoint)
-
-	stopSnaps()
-	<-snapsDone
-	code := 0
-	closeErr := mnt.Close()
-	if closeErr != nil {
-		fmt.Fprintf(os.Stderr, "pelfs: unmount: %v\n", closeErr)
-		code = 1
-	}
-	if o.writeback {
-		drained := closeErr == nil
-		s.stats.Update(func(sum *stats.Summary) {
-			sum.StagingDrained = &drained
-			if !drained {
-				sum.StagingBlocksLeft = mnt.StagingBlocks()
-			}
-		})
-	}
-	finalOK := true
-	if o.accumulate {
-		fmt.Fprintln(os.Stderr, "pelfs: accumulate mode: publishing the session as a v2 generation...")
-		if res, err := publishCore(ctx, s, "main", ""); err != nil {
-			fmt.Fprintf(os.Stderr, "pelfs: MANDATORY final publish FAILED — session output is only in %s: %v\n", s.stateDir, err)
-			finalOK = false
-			code = 1
-		} else {
-			fmt.Fprintf(os.Stderr, "pelfs: published generation %d (%d chunks, %d catalogs)\n",
-				res.Superblock.Generation, res.Stats.ChunksAdded, res.Stats.Catalogs)
-		}
-		s.stats.Update(func(sum *stats.Summary) { sum.FinalSnapshotOK = &finalOK })
-	}
-	if mgr != nil {
-		if err := mgr.Snapshot(ctx, true); err != nil {
-			fmt.Fprintf(os.Stderr, "pelfs: final metadata snapshot failed: %v\n", err)
-			finalOK = false
-			code = 1
-		} else if err := mgr.PruneSessions(ctx, o.keepSessions); err != nil {
-			fmt.Fprintf(os.Stderr, "pelfs: prune old snapshots: %v\n", err)
-		}
-		s.stats.Update(func(sum *stats.Summary) { sum.FinalSnapshotOK = &finalOK })
-	}
-	stopStats()
-	if err := s.stats.Finalize(code, closeErr == nil && finalOK); err != nil {
-		fmt.Fprintf(os.Stderr, "pelfs: write stats file: %v\n", err)
-	}
-	_ = os.Remove(infoPath)
-	return code
 }
 
 func cmdUmount(args []string) int {
@@ -332,13 +191,6 @@ func cmdStatus(args []string) int {
 		fmt.Printf("%s\n  mountpoint: %s (%s)\n  pid: %d (%s), up since %s\n",
 			e.info.Prefix, e.info.MountPoint, mode, e.info.PID, state,
 			e.info.Started.Format(time.RFC3339))
-		if !e.info.LastSnapshot.IsZero() {
-			fmt.Printf("  last snapshot: %s (%s)\n",
-				e.info.LastSnapshot.Format(time.RFC3339), e.info.LastSnapKey)
-		}
-		if e.info.LeaseConflict {
-			fmt.Printf("  LEASE CONFLICT: another client took over this prefix; concurrent writers corrupt each other\n")
-		}
 	}
 	return 0
 }

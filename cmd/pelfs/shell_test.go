@@ -54,12 +54,12 @@ func TestSplitCommandTail(t *testing.T) {
 // positional-count check must still count only real positionals, and the
 // command must arrive intact.
 func TestParseArgsWithCommand(t *testing.T) {
-	o, pos, cmd, err := parseArgsWithCommand("shell", []string{"--writeback", "pfx", "--", "ls", "-la"}, 1, 1, nil)
+	o, pos, cmd, err := parseArgsWithCommand("shell", []string{"--ro", "pfx", "--", "ls", "-la"}, 1, 1, nil)
 	if err != nil {
 		t.Fatalf("shell with a command tail: %v", err)
 	}
-	if !o.writeback {
-		t.Error("--writeback before the tail was not parsed")
+	if !o.readOnly {
+		t.Error("--ro before the tail was not parsed")
 	}
 	if !slices.Equal(pos, []string{"pfx"}) {
 		t.Errorf("positional = %q, want [pfx]", pos)

@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
-	"database/sql"
 	"encoding/hex"
 	"errors"
 	"flag"
@@ -20,113 +19,10 @@ import (
 	"github.com/bbockelm/pelfs/internal/superblock"
 )
 
-// cmdPublish translates the volume's local metadata + blocks into a v2
-// generation: cut (VACUUM INTO), transform into catalogs/packs, sign, and
-// flip refs/<branch>. Experimental while phase 2 stabilizes; reading the
-// published generation back is `internal/hydrate`'s job and is not yet
-// wired into mounts.
-func cmdPublish(args []string) int {
-	var branch, pubkeyHex string
-	o, pos, err := parseArgs("publish", args, 1, 1, func(fs *flag.FlagSet, o *cmdOpts) {
-		fs.StringVar(&branch, "branch", "main", "ref name to publish to")
-		fs.StringVar(&pubkeyHex, "volume-pubkey", "", "hex Ed25519 volume key to trust (default: pin on first use)")
-	})
-	if err != nil {
-		return exitErr(err)
-	}
-	ctx := context.Background()
-	s, err := toolSession(ctx, o, pos[0], true)
-	if err != nil {
-		return exitErr(err)
-	}
-	defer s.cleanupTemp()
-
-	res, err := publishCore(ctx, s, branch, pubkeyHex)
-	if err != nil {
-		return exitErr(err)
-	}
-	st := res.Stats
-	fmt.Printf("published generation %d to %s/%s\n", res.Superblock.Generation, refs.RefDirKey, branch)
-	fmt.Printf("  tree: %d dirs, %d files (%d inline, %d chunked), %d symlinks; %d hardlinked inodes promoted\n",
-		st.Dirs, st.Files, st.InlineFiles, st.ChunkedFiles, st.Symlinks, st.PromotedInodes)
-	fmt.Printf("  data: %d chunks uploaded (%.1f MB), %d deduped (%d via index)\n",
-		st.ChunksAdded, float64(st.ChunkBytes)/1e6, st.ChunksDeduped, st.DedupIndexChunks)
-	fmt.Printf("  meta: %d catalogs, %d shards, %d new packs\n", st.Catalogs, st.Shards, len(res.NewPacks))
-	return 0
-}
-
-// publishCore runs the full v2 publish for a session: cut, trust-verified
-// predecessor fetch, key wiring, publish. Shared by the CLI command and
-// the control socket's POST /v1/publish.
-func publishCore(ctx context.Context, s *session, branch, pubkeyHex string) (*publish.Result, error) {
-	// The cut: an instant snapshot of the local metadata. Publish reads
-	// only this copy; the live database is never touched again.
-	cutPath := filepath.Join(s.stateDir, "v2-cut.db")
-	_ = os.Remove(cutPath)
-	if err := vacuumInto(s.metaPath, cutPath); err != nil {
-		return nil, fmt.Errorf("cut: %w", err)
-	}
-	defer os.Remove(cutPath) //nolint:errcheck
-
-	// Trust: refs go through the pinning store over the direct-read
-	// transport (the superblock is the one mutable object; it must never
-	// be read through federation caches).
-	var trusted ed25519.PublicKey
-	if pubkeyHex != "" {
-		k, err := hex.DecodeString(pubkeyHex)
-		if err != nil || len(k) != ed25519.PublicKeySize {
-			return nil, errors.New("--volume-pubkey must be 64 hex characters")
-		}
-		trusted = k
-	}
-	rstore, err := refs.New(s.metaStore, s.stateDir, trusted)
-	if err != nil {
-		return nil, err
-	}
-	var prev *superblock.Superblock
-	var prevRaw []byte
-	if f, err := rstore.Fetch(ctx, branch); err == nil {
-		prev, prevRaw = f.Superblock, f.Raw
-	} else if !isNotFoundErr(err) {
-		return nil, fmt.Errorf("fetch ref %s: %w", branch, err)
-	}
-
-	signingKey, err := loadOrCreateSigningKey(filepath.Join(s.stateDir, "v2-signing.key"), prev)
-	if err != nil {
-		return nil, err
-	}
-
-	popts := publish.Options{
-		CutPath:        cutPath,
-		Blob:           s.data,
-		CacheDir:       s.cacheDir,
-		Inner:          s.store,
-		SpoolDir:       s.stateDir,
-		Branch:         branch,
-		SigningKey:     signingKey,
-		Prev:           prev,
-		PrevRaw:        prevRaw,
-		DedupIndexPath: filepath.Join(s.stateDir, "v2-dedup.db"),
-		ReadStaging:    s.o.accumulate,
-	}
-	if s.encryptPEM != "" {
-		if err := wireEncryption(&popts, s.encryptPEM, prev); err != nil {
-			return nil, err
-		}
-	}
-	return publish.Publish(ctx, popts)
-}
-
-// vacuumInto snapshots src into dst (the CUT primitive).
-func vacuumInto(src, dst string) error {
-	db, err := sql.Open("sqlite", "file:"+src+"?mode=ro&_pragma=busy_timeout(10000)")
-	if err != nil {
-		return err
-	}
-	defer db.Close() //nolint:errcheck
-	_, err = db.Exec(fmt.Sprintf("VACUUM INTO '%s'", dst))
-	return err
-}
+// keyPassphrase is the optional passphrase protecting the PEM key file
+// given to --encrypt-key. An empty result means "unencrypted PEM", which
+// is what the key loaders expect.
+func keyPassphrase() []byte { return []byte(os.Getenv("PELFS_KEY_PASSPHRASE")) }
 
 // loadOrCreateSigningKey reads the volume signing key (64-byte Ed25519
 // private key, hex) or generates one for a brand-new volume. Publishing a
@@ -170,7 +66,7 @@ func loadOrCreateSigningKey(path string, prev *superblock.Superblock) (ed25519.P
 // unwrap the keys the previous generation recorded (the SAME identity key
 // must be used forever — it is the volume's dedup identity domain).
 func wireEncryption(popts *publish.Options, kekPEM string, prev *superblock.Superblock) error {
-	kek, err := superblock.LoadRSAPrivateKeyPEM([]byte(kekPEM), []byte(os.Getenv("JFS_RSA_PASSPHRASE")))
+	kek, err := superblock.LoadRSAPrivateKeyPEM([]byte(kekPEM), keyPassphrase())
 	if err != nil {
 		return fmt.Errorf("load --encrypt-key: %w", err)
 	}
@@ -225,10 +121,7 @@ func isNotFoundErr(err error) bool {
 		strings.Contains(msg, "not found") || strings.Contains(msg, "no such")
 }
 
-// cmdInit creates a brand-new catalog-native volume: generation 0 with
-// an empty root. Until this existed, starting a volume required
-// formatting a JuiceFS volume and publishing a cut of it — so even a
-// pure phase-3 workflow depended on the v1 engine.
+// cmdInit creates a brand-new volume: generation 0 with an empty root.
 func cmdInit(args []string) int {
 	var branch string
 	o, pos, err := parseArgs("init", args, 1, 1, func(fs *flag.FlagSet, o *cmdOpts) {
@@ -244,11 +137,10 @@ func cmdInit(args []string) int {
 	return 0
 }
 
-// initVolumeAt creates a brand-new catalog-native volume: generation 0
-// with an empty root, its volume id and signing key minted locally. It
-// is what `pelfs init` runs, and what `pelfs shell` runs when it is
-// pointed at an empty prefix — a new volume is born in the current
-// format, never in v1.
+// initVolumeAt creates a brand-new volume: generation 0 with an empty
+// root, its volume id and signing key minted locally. It is what
+// `pelfs init` runs, and what `pelfs shell` runs when it is pointed at an
+// empty prefix.
 func initVolumeAt(o *cmdOpts, prefix, branch string) error {
 	ctx := context.Background()
 	stateDir := o.stateDir

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -28,15 +29,25 @@ import (
 	"github.com/bbockelm/pelfs/internal/publish"
 	"github.com/bbockelm/pelfs/internal/rawfuse"
 	"github.com/bbockelm/pelfs/internal/refs"
-	"github.com/bbockelm/pelfs/internal/snapshot"
 	"github.com/bbockelm/pelfs/internal/stats"
 	"github.com/bbockelm/pelfs/internal/superblock"
 	"github.com/bbockelm/pelfs/internal/vfsbilly"
 )
 
-// statsInterval is how often a live session rewrites its statistics file;
-// the same cadence v1 sessions use.
+// statsInterval is how often a live session rewrites its statistics file.
 const statsInterval = 30 * time.Second
+
+// newSessionID names one mount session uniquely; it identifies the lease
+// holder to any other client that finds the prefix busy.
+func newSessionID() string {
+	host, _ := os.Hostname()
+	if host == "" {
+		host = "unknown"
+	}
+	var b [4]byte
+	_, _ = rand.Read(b[:])
+	return fmt.Sprintf("%s-%s-%s", time.Now().UTC().Format("20060102T150405Z"), host, hex.EncodeToString(b[:]))
+}
 
 // genSession is one `pelfs mount-gen` session: the served generation, the
 // optional write overlay, and the session-level facilities a v1 mount
@@ -127,7 +138,7 @@ type genArgs struct {
 }
 
 func cmdMountGen(args []string) int {
-	a := genArgs{branch: "main", backend: "fuse"}
+	a := genArgs{branch: "main"}
 	o, pos, command, err := parseArgsWithCommand("mount-gen", args, 2, 2, func(fs *flag.FlagSet, o *cmdOpts) {
 		fs.StringVar(&a.branch, "branch", "main", "branch to mount")
 		fs.StringVar(&a.tag, "tag", "", "mount a tag instead of a branch head (pinned exactly)")
@@ -135,7 +146,6 @@ func cmdMountGen(args []string) int {
 		fs.BoolVar(&a.rw, "rw", false, "mount read-write through a local overlay; unmount SEALS the changes into the next generation")
 		fs.BoolVar(&a.noSeal, "no-seal", false, "with --rw, keep the overlay at unmount instead of publishing it (resume by remounting)")
 		fs.BoolVar(&a.subshell, "subshell", false, "run a subshell in the mount and unmount (sealing, with --rw) when it exits; a trailing `-- command [args...]` runs that instead of a shell and implies this flag")
-		fs.StringVar(&a.backend, "backend", "fuse", "how to attach: fuse (Linux/macFUSE) or nfs (loopback NFS server + the OS client; works on macOS with no kext)")
 		fs.DurationVar(&a.poll, "poll", 0, "read-only: re-check the branch head this often and swap generations live (0 = pinned, the reproducible-batch default)")
 		fs.StringVar(&a.signingKeyPath, "signing-key", "", "hex Ed25519 volume signing key file to seal with (default: <state-dir>/v2-signing.key; a volume's key is per-VOLUME, so a second machine must import it)")
 	})
@@ -144,6 +154,9 @@ func cmdMountGen(args []string) int {
 	}
 	if len(command) > 0 {
 		a.subshell = true
+	}
+	if a.backend, err = resolveBackend(o); err != nil {
+		return exitErr(err)
 	}
 	return runMountGen(o, pos[0], pos[1], command, a)
 }
@@ -171,7 +184,7 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		stateDir:       stateDir,
 		mountpoint:     mountpoint,
 		backend:        backend,
-		sessionID:      snapshot.NewSessionID(),
+		sessionID:      newSessionID(),
 		started:        time.Now(),
 		rw:             rw,
 		noSeal:         noSeal,
@@ -270,7 +283,7 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	sb := g.sb
 
 	if o.encryptKeyPath != "" {
-		kek, err := superblock.LoadRSAPrivateKeyFile(o.encryptKeyPath, []byte(os.Getenv("JFS_RSA_PASSPHRASE")))
+		kek, err := superblock.LoadRSAPrivateKeyFile(o.encryptKeyPath, keyPassphrase())
 		if err != nil {
 			return fail(fmt.Errorf("load --encrypt-key: %w", err))
 		}
@@ -303,6 +316,11 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		DEK:         g.dek,
 		CacheDir:    filepath.Join(stateDir, "gencache"),
 		MaxResident: maxResident,
+		// PackCacheBytes is left at its default: the whole-pack cache lives
+		// under the state directory's gencache and outlives the session
+		// deliberately, because packs are immutable and content-addressed —
+		// remounting a volume must not re-fetch what the last mount already
+		// pulled down.
 	})
 	if err != nil {
 		return fail(err)

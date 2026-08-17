@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# The phase-3 gate: publish a generation, mount it with `pelfs mount-gen`
-# through the catalog-native stack (genfs + raw FUSE, NO JuiceFS), verify
-# the mounted tree byte-for-byte against the source, and time the
-# end-to-end benchmarks against it.
+# The mount gate: publish a generation, mount it with `pelfs mount-gen`
+# through the catalog-native stack (genfs + raw FUSE), verify the mounted
+# tree byte-for-byte against the source, and time the end-to-end
+# benchmarks against it.
 #
 # Linux (or macFUSE) only — this is the coverage a macFUSE-less dev
 # machine cannot provide, so CI owns it.
@@ -82,18 +82,19 @@ head -c 100000 /dev/urandom > "$WORK/src/dir/sub/mid.bin"
 ln -s big.bin "$WORK/src/dir/link"
 ln "$WORK/src/dir/big.bin" "$WORK/src/dir/hard.bin"
 
-echo "== ingesting the tree through a v1 mount =="
-mkdir -p "$WORK/v1mnt"
-"$WORK/pelfs" mount --state-dir "$WORK/state" --writeback --no-lease \
-  --snapshot-interval 0 "$PREFIX" "$WORK/v1mnt"
-cp -R "$WORK/src/." "$WORK/v1mnt/"
+echo "== creating the volume and ingesting the tree through a writable mount =="
+"$WORK/pelfs" init --state-dir "$WORK/state" "$PREFIX"
+mkdir -p "$WORK/ingest"
+"$WORK/pelfs" mount --rw --state-dir "$WORK/state" --no-lease \
+  --snapshot-interval 0 "$PREFIX" "$WORK/ingest"
+cp -R "$WORK/src/." "$WORK/ingest/"
 # cp -R copies a hardlink as an independent file (and cp -a fails on
 # backends without xattr support), so make the link inside the mount —
 # the point is to publish an inode with nlink > 1.
-rm "$WORK/v1mnt/dir/hard.bin"
-ln "$WORK/v1mnt/dir/big.bin" "$WORK/v1mnt/dir/hard.bin"
+rm "$WORK/ingest/dir/hard.bin"
+ln "$WORK/ingest/dir/big.bin" "$WORK/ingest/dir/hard.bin"
 
-echo "== publishing generation 0 through the control socket =="
+echo "== publishing the ingested tree through the control socket =="
 "$WORK/pelfs" ctl "$PREFIX" publish
 "$WORK/pelfs" umount "$PREFIX"
 
@@ -116,8 +117,7 @@ links=$(stat -c %h "$WORK/mnt/dir/big.bin")
 [ "$links" -ge 2 ] || { echo "hardlink count is $links, want >= 2" >&2; exit 1; }
 echo "symlink + hardlink metadata preserved"
 
-# Read-only enforcement: the phase-3 mount refuses writes until the
-# overlay binding lands.
+# Read-only enforcement: a mount without --rw refuses writes.
 if touch "$WORK/mnt/should-fail" 2>/dev/null; then
   echo "read-only mount accepted a write" >&2
   exit 1
@@ -241,7 +241,7 @@ echo "Ctrl+C verified: payload interrupted (130), pelfs completed its teardown"
 MOUNT_PID=$!
 for _ in $(seq 200); do [ -e "$WORK/mnt/cmd-made.txt" ] && break; sleep 0.1; done
 
-echo "== pelfs shell on an EMPTY prefix creates a v2 volume =="
+echo "== pelfs shell on an EMPTY prefix creates a volume =="
 "$WORK/fakeorigin" -listen 127.0.0.1:18998 -root "$WORK/origin2" &
 ORIGIN2_PID=$!
 mkdir -p "$WORK/origin2"
@@ -255,14 +255,14 @@ fresh_status=0
   sh -c 'echo hello > greeting.txt; mkdir -p sub' > "$WORK/fresh.log" 2>&1 || fresh_status=$?
 [ "$fresh_status" = "0" ] || { echo "shell on empty prefix failed ($fresh_status):" >&2; sed 's/^/    /' "$WORK/fresh.log" | tail -8; exit 1; }
 grep -q "created volume" "$WORK/fresh.log" || { echo "shell did not CREATE a volume:" >&2; sed 's/^/    /' "$WORK/fresh.log" | tail -8; exit 1; }
-grep -q "catalog-native engine" "$WORK/fresh.log" || { echo "new volume was not native:" >&2; sed 's/^/    /' "$WORK/fresh.log" | tail -8; exit 1; }
-# The federation must hold a v2 volume: refs + packs, and NO JuiceFS meta/.
-[ -f "$WORK/origin2/fresh/refs/main" ] || { echo "no v2 ref created" >&2; ls -R "$WORK/origin2" | head; exit 1; }
-# meta/ may exist for the advisory lease (meta/lease.json); what must
-# NOT exist is a JuiceFS snapshot session directory.
+grep -q "catalog-native" "$WORK/fresh.log" || { echo "new volume was not served natively:" >&2; sed 's/^/    /' "$WORK/fresh.log" | tail -8; exit 1; }
+# The federation must hold refs + packs and nothing else of substance.
+[ -f "$WORK/origin2/fresh/refs/main" ] || { echo "no ref created" >&2; ls -R "$WORK/origin2" | head; exit 1; }
+# meta/ may exist for the advisory lease (meta/lease.json); nothing else
+# belongs under it.
 if [ -d "$WORK/origin2/fresh/meta" ]; then
   extra=$(ls -A "$WORK/origin2/fresh/meta" | grep -v '^lease.json$' || true)
-  [ -z "$extra" ] || { echo "JuiceFS metadata appeared in a v2 volume: $extra" >&2; exit 1; }
+  [ -z "$extra" ] || { echo "unexpected metadata objects appeared: $extra" >&2; exit 1; }
 fi
 "$WORK/pelfs" mount-gen --state-dir "$WORK/state-fresh2" "$NEWPREFIX" "$WORK/mnt2" &
 FRESH_PID=$!
@@ -271,9 +271,9 @@ for _ in $(seq 200); do [ -e "$WORK/mnt2/greeting.txt" ] && break; sleep 0.1; do
 grep -q hello "$WORK/mnt2/greeting.txt" || { echo "fresh-volume write did not survive" >&2; exit 1; }
 unmount_at "$WORK/mnt2"; wait "$FRESH_PID" 2>/dev/null || true
 kill "$ORIGIN2_PID" 2>/dev/null || true
-echo "empty-prefix verified: v2 volume created, native engine, content sealed and re-readable"
+echo "empty-prefix verified: volume created, content sealed and re-readable"
 
-echo "== pelfs shell runs the catalog-native engine on a v2 volume =="
+echo "== pelfs shell serves an existing volume =="
 unmount_at "$WORK/mnt"
 wait "$MOUNT_PID" 2>/dev/null || true
 "$WORK/pelfs" shell --state-dir "$WORK/state" "$PREFIX" -- \
@@ -281,8 +281,8 @@ wait "$MOUNT_PID" 2>/dev/null || true
   > "$WORK/shell-native.log" 2>&1
 shell_status=$?
 [ "$shell_status" = "0" ] || { echo "pelfs shell failed ($shell_status):" >&2; sed 's/^/    /' "$WORK/shell-native.log" | tail -8; exit 1; }
-grep -q "catalog-native engine" "$WORK/shell-native.log" || {
-  echo "pelfs shell did NOT select the catalog-native engine:" >&2
+grep -q "catalog-native" "$WORK/shell-native.log" || {
+  echo "pelfs shell did NOT mount the volume:" >&2
   sed 's/^/    /' "$WORK/shell-native.log" | tail -8; exit 1; }
 grep -q "sealed generation" "$WORK/shell-native.log" || {
   echo "pelfs shell did not seal on exit:" >&2; sed 's/^/    /' "$WORK/shell-native.log" | tail -8; exit 1; }
@@ -292,7 +292,7 @@ grep -q "sealed generation" "$WORK/shell-native.log" || {
 MOUNT_PID=$!
 for _ in $(seq 200); do [ -e "$WORK/mnt/from-shell.txt" ] && break; sleep 0.1; done
 grep -q "written by pelfs shell" "$WORK/mnt/from-shell.txt" || { echo "shell write did not survive the seal" >&2; exit 1; }
-echo "pelfs shell verified: native engine, sealed on exit, write survives"
+echo "pelfs shell verified: mounted, sealed on exit, write survives"
 
 echo "== strict prefetch: everything local before serving =="
 unmount_at "$WORK/mnt"
@@ -447,4 +447,4 @@ if [ "$BENCH" = "--bench" ]; then
   bench "rm -rf"             rm -rf "$WORK/baseline/corpus"
 fi
 
-echo "== PASS: phase-3 catalog-native mount verified =="
+echo "== PASS: catalog-native mount verified =="

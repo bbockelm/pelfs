@@ -2,31 +2,23 @@ package main
 
 import (
 	"context"
-	"crypto/ed25519"
-	"encoding/hex"
-	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
 
 	"github.com/bbockelm/pelfs/internal/fsck"
-	"github.com/bbockelm/pelfs/internal/pelicanobj"
-	"github.com/bbockelm/pelfs/internal/refs"
 	"github.com/bbockelm/pelfs/internal/superblock"
 )
 
-// cmdFsckGen checks one published v2 generation: pack list, catalog and
-// shard reachability, structural invariants, and chunk presence (chunk
-// CONTENT only with --deep). It is named fsck-gen rather than fsck because
-// the v1 `pelfs fsck` — which verifies JuiceFS block objects against the
-// metadata engine — still exists; the two check different eras of the
-// format and will merge when the v1 engine is deleted.
-func cmdFsckGen(args []string) int {
+// cmdFsck checks one published generation: pack list, catalog and shard
+// reachability, structural invariants, and chunk presence (chunk CONTENT
+// only with --deep).
+func cmdFsck(args []string) int {
 	var branch, tag, pubkeyHex string
 	var deep bool
 	var workers int
-	o, pos, err := parseArgs("fsck-gen", args, 1, 1, func(fs *flag.FlagSet, o *cmdOpts) {
+	o, pos, err := parseArgs("fsck", args, 1, 1, func(fs *flag.FlagSet, o *cmdOpts) {
 		fs.StringVar(&branch, "branch", "main", "branch to check")
 		fs.StringVar(&tag, "tag", "", "check a tag instead of a branch head")
 		fs.StringVar(&pubkeyHex, "volume-pubkey", "", "hex Ed25519 volume key to trust (default: pin on first use)")
@@ -39,29 +31,7 @@ func cmdFsckGen(args []string) int {
 	prefix := pos[0]
 	ctx := context.Background()
 
-	stateDir := o.stateDir
-	if stateDir == "" {
-		stateDir = volDir(prefix)
-	}
-	if err := os.MkdirAll(stateDir, 0700); err != nil {
-		return exitErr(err)
-	}
-	inner, err := pelicanobj.New(ctx, pelicanobj.Config{
-		PrefixURL: prefix, TokenPath: o.token, Insecure: o.insecure,
-		AcquireToken: !o.noAcquireToken,
-	})
-	if err != nil {
-		return exitErr(err)
-	}
-	var trusted ed25519.PublicKey
-	if pubkeyHex != "" {
-		k, err := hex.DecodeString(pubkeyHex)
-		if err != nil || len(k) != ed25519.PublicKeySize {
-			return exitErr(errors.New("--volume-pubkey must be 64 hex characters"))
-		}
-		trusted = k
-	}
-	rstore, err := refs.New(inner, stateDir, trusted)
+	inner, rstore, stateDir, err := volumeStore(ctx, o, prefix, pubkeyHex)
 	if err != nil {
 		return exitErr(err)
 	}
@@ -82,7 +52,7 @@ func cmdFsckGen(args []string) int {
 
 	var dek []byte
 	if o.encryptKeyPath != "" {
-		kek, err := superblock.LoadRSAPrivateKeyFile(o.encryptKeyPath, []byte(os.Getenv("JFS_RSA_PASSPHRASE")))
+		kek, err := superblock.LoadRSAPrivateKeyFile(o.encryptKeyPath, keyPassphrase())
 		if err != nil {
 			return exitErr(fmt.Errorf("load --encrypt-key: %w", err))
 		}

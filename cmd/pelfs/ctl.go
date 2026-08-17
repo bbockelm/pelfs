@@ -10,75 +10,12 @@ import (
 	"time"
 
 	"github.com/bbockelm/pelfs/internal/control"
-	"github.com/bbockelm/pelfs/internal/stats"
 )
-
-// controlHooks connects a live session to its control socket. mnt-level
-// operations (staging drain) belong to the frontend; the hooks cover what
-// the session owns directly.
-func (s *session) controlHooks(started time.Time, readOnly bool, mountPoint string) control.Hooks {
-	h := control.Hooks{
-		Status: func() map[string]any {
-			return map[string]any{
-				"pid":        os.Getpid(),
-				"prefix":     s.prefix,
-				"mountpoint": mountPoint,
-				"read_only":  readOnly,
-				"started":    started.Format(time.RFC3339),
-				"uptime_s":   int64(time.Since(started).Seconds()),
-			}
-		},
-		StatsJSON: func() ([]byte, error) {
-			// The collector writes its file atomically every 30s and on
-			// demand here; serve the same document.
-			if err := s.stats.Flush(); err != nil {
-				return nil, err
-			}
-			return os.ReadFile(s.statsPath)
-		},
-		BugreportExtra: func() map[string][]byte {
-			extra := make(map[string][]byte)
-			if b, err := os.ReadFile(filepath.Join(s.stateDir, "refs", "volume.pub")); err == nil {
-				extra["volume.pub"] = b
-			}
-			return extra
-		},
-	}
-	if !readOnly {
-		h.Flush = func(ctx context.Context) error {
-			return s.packs.Flush(ctx)
-		}
-		h.Publish = func(ctx context.Context) (string, error) {
-			if err := s.packs.Flush(ctx); err != nil {
-				return "", fmt.Errorf("pre-publish pack flush: %w", err)
-			}
-			res, err := publishCore(ctx, s, "main", "")
-			if err != nil {
-				return "", err
-			}
-			s.stats.Update(func(sum *stats.Summary) { sum.SnapshotsUploaded++ })
-			return fmt.Sprintf("generation %d: %d chunks uploaded, %d catalogs, %d new packs",
-				res.Superblock.Generation, res.Stats.ChunksAdded, res.Stats.Catalogs, len(res.NewPacks)), nil
-		}
-	}
-	return h
-}
-
-// startControl brings the control socket up; failure is loud but never
-// fatal — a mount without a control socket beats no mount.
-func (s *session) startControl(started time.Time, readOnly bool, mountPoint string) *control.Server {
-	srv, err := control.Start(s.stateDir, s.controlHooks(started, readOnly, mountPoint))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "pelfs: control socket unavailable: %v\n", err)
-		return nil
-	}
-	return srv
-}
 
 // cmdCtl talks to a running mount's control socket.
 func cmdCtl(args []string) int {
 	if len(args) < 2 {
-		return exitErr(errors.New("usage: pelfs ctl <prefix-or-mountpoint> <status|stats|flush|publish|bugreport> [-o file]"))
+		return exitErr(errors.New("usage: pelfs ctl <prefix-or-mountpoint> <status|stats|publish|bugreport> [-o file]"))
 	}
 	target, verb := args[0], args[1]
 	out := ""
@@ -100,8 +37,6 @@ func cmdCtl(args []string) int {
 		body, err = c.Do(ctx, "GET", "/v1/status")
 	case "stats":
 		body, err = c.Do(ctx, "GET", "/v1/stats")
-	case "flush":
-		body, err = c.Do(ctx, "POST", "/v1/flush")
 	case "publish":
 		body, err = c.Do(ctx, "POST", "/v1/publish")
 	case "pprof":

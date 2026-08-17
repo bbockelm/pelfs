@@ -219,7 +219,12 @@ func (p *pipeline) planReuse(baseCats map[uint64]superblock.CatalogEntry) {
 			}
 		}
 		p.writeOrder = append(p.writeOrder, root)
-		for _, child := range p.childRoots(root) {
+		children := p.childRoots(root)
+		// Kept rather than recomputed: writeCatalogs needs the same
+		// answer per catalog, and childRoots walks the whole span to
+		// produce it.
+		p.catChildren[root] = children
+		for _, child := range children {
 			visit(child)
 		}
 	}

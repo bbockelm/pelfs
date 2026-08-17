@@ -56,6 +56,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -146,6 +147,12 @@ type Options struct {
 	// VolumeID identifies a volume being created by InitVolume. Every
 	// other path takes identity from the previous generation.
 	VolumeID [16]byte
+	// CatalogConcurrency bounds how many catalogs are built at once; zero
+	// uses the machine's parallelism. It changes only how long the step
+	// takes, never what it produces — the appends stay in plan order (see
+	// writeCatalogs), which is exactly why it is settable: a test can seal
+	// one tree at 1 and at N and compare the bytes.
+	CatalogConcurrency int
 
 	// emptySource selects the empty-root source (InitVolume).
 	emptySource bool
@@ -249,6 +256,7 @@ func Publish(ctx context.Context, o Options) (*Result, error) {
 		carried:      make(map[uint64]superblock.CatalogEntry),
 		catWeight:    make(map[uint64]int64),
 		catPromoted:  make(map[uint64]int),
+		catChildren:  make(map[uint64][]uint64),
 	}
 	defer p.pk.abort()
 
@@ -440,6 +448,7 @@ type pipeline struct {
 	carried      map[uint64]superblock.CatalogEntry
 	carriedList  []superblock.CatalogEntry
 	writeOrder   []uint64
+	catChildren  map[uint64][]uint64
 	needContent  map[uint64]bool
 	catWeight    map[uint64]int64
 	catPromoted  map[uint64]int
@@ -796,23 +805,134 @@ func (p *pipeline) writeShards(ctx context.Context) ([]superblock.ShardEntry, er
 	return out, nil
 }
 
+// catalogBuild is one finished catalog's outcome: its identity, or why it
+// has none.
+type catalogBuild struct {
+	id  chunkid.Identity
+	err error
+}
+
 // writeCatalogs builds the catalogs the plan says are not being carried
-// forward, in the order it left them (descendants before ancestors — a
-// parent records its children's identities), and returns the root catalog
-// identity, which is a carried one when the whole tree is unchanged.
+// forward and returns the root catalog identity, which is a carried one
+// when the whole tree is unchanged.
+//
+// Building is CONCURRENT and appending is not, and the split is what makes
+// the result independent of scheduling. A catalog is a pure function of
+// its own span plus the identities of the catalogs at its boundaries, and
+// distinct catalogs share nothing — no rows, no files, no state — so
+// several can be built at once. What they must not share is the packer:
+// pack membership and entry order are the order add() is called in, so a
+// generation built on a 12-core machine would otherwise lay its packs out
+// differently from the same generation built on one core. The appends
+// therefore run here, in p.writeOrder, exactly as they did serially.
+//
+// The one real dependency is the catalog tree itself: a parent records its
+// children's identities, so it cannot start until they are finished.
+// p.writeOrder is already descendants-before-ancestors, so dispatching in
+// that order and waiting on each catalog's children is enough.
 func (p *pipeline) writeCatalogs(ctx context.Context) (chunkid.Identity, error) {
-	for _, ino := range p.writeOrder {
-		id, err := p.writeCatalog(ctx, ino)
-		if err != nil {
-			return chunkid.Identity{}, err
+	order := p.writeOrder
+	pos := make(map[uint64]int, len(order))
+	for i, ino := range order {
+		pos[ino] = i
+	}
+	built := make([]catalogBuild, len(order))
+	// The encoded bytes live apart from the rest so the consumer can drop
+	// each one as soon as it is appended, without touching a struct the
+	// dispatcher still reads identities out of.
+	stored := make([][]byte, len(order))
+	done := make([]chan struct{}, len(order))
+	for i := range done {
+		done[i] = make(chan struct{})
+	}
+	// A slot is taken when a build starts and given back when its bytes
+	// have been appended, so the encoded catalogs held in memory at once
+	// are bounded by the worker count rather than by the tree.
+	sem := make(chan struct{}, p.catalogWorkers(len(order)))
+	dispatched := make(chan struct{})
+
+	go func() {
+		defer close(dispatched)
+		for i, ino := range order {
+			childIDs := make(map[uint64]chunkid.Identity)
+			var childErr error
+			for _, c := range p.catChildren[ino] {
+				j, building := pos[c]
+				if !building {
+					// A carried child: planReuse recorded its identity
+					// before any of this started.
+					childIDs[c] = p.catIdentity[c]
+					continue
+				}
+				<-done[j]
+				if built[j].err != nil {
+					childErr = built[j].err
+					break
+				}
+				childIDs[c] = built[j].id
+			}
+			sem <- struct{}{}
+			go func(i int, ino uint64, childIDs map[uint64]chunkid.Identity, childErr error) {
+				defer close(done[i])
+				if childErr != nil {
+					built[i].err = childErr
+					return
+				}
+				built[i].id, stored[i], built[i].err = p.buildCatalog(ino, childIDs)
+			}(i, ino, childIDs, childErr)
 		}
-		p.catIdentity[ino] = id
+	}()
+
+	var firstErr error
+	for i, ino := range order {
+		<-done[i]
+		entry := stored[i]
+		stored[i] = nil
+		<-sem
+		if firstErr != nil {
+			continue
+		}
+		if built[i].err != nil {
+			firstErr = built[i].err
+			continue
+		}
+		if err := p.pk.add(ctx, built[i].id.Hex(), packstore.EntryCatalog, entry); err != nil {
+			firstErr = fmt.Errorf("publish: pack catalog %s: %w", p.pathOf[ino], err)
+			continue
+		}
+		p.stats.Catalogs++
+	}
+	// Nothing may write catIdentity while the dispatcher is still reading
+	// it for carried children.
+	<-dispatched
+	if firstErr != nil {
+		return chunkid.Identity{}, firstErr
+	}
+	for i, ino := range order {
+		p.catIdentity[ino] = built[i].id
 	}
 	rootID, ok := p.catIdentity[p.src.Root()]
 	if !ok {
 		return chunkid.Identity{}, errors.New("publish: no catalog was produced for the tree root")
 	}
 	return rootID, nil
+}
+
+// catalogWorkers bounds catalog building. Zero in Options means "as many
+// as the machine has", which is the right default for a step that is
+// CPU-bound (SQLite page writes, BLAKE3, zstd) and shares nothing.
+func (p *pipeline) catalogWorkers(catalogs int) int {
+	n := p.o.CatalogConcurrency
+	if n <= 0 {
+		n = runtime.GOMAXPROCS(0)
+	}
+	if n > catalogs {
+		n = catalogs
+	}
+	if n < 1 {
+		n = 1
+	}
+	return n
 }
 
 // buildDirNode computes the catalog weight tree (W = 200·entries +
@@ -877,7 +997,12 @@ func (p *pipeline) inlineLen(r *rec) int64 {
 	return 0
 }
 
-func (p *pipeline) writeCatalog(ctx context.Context, rootIno uint64) (chunkid.Identity, error) {
+// buildCatalog produces one catalog's identity and its encoded pack entry.
+// It touches no shared mutable state — the pipeline maps it reads are
+// finished by the time the plan is settled — so several may run at once;
+// childIDs is this catalog's own copy of the identities at its boundaries,
+// rather than a read of the shared map the caller is still filling in.
+func (p *pipeline) buildCatalog(rootIno uint64, childIDs map[uint64]chunkid.Identity) (chunkid.Identity, []byte, error) {
 	fp := filepath.Join(p.tmpDir, fmt.Sprintf("catalog-%d.db", rootIno))
 	cw, err := catalog.Create(fp, catalog.Meta{
 		VolumeUUID:   p.volUUID,
@@ -886,7 +1011,7 @@ func (p *pipeline) writeCatalog(ctx context.Context, rootIno uint64) (chunkid.Id
 		IdentityAlgo: p.identityAlgo(),
 	})
 	if err != nil {
-		return chunkid.Identity{}, fmt.Errorf("publish: create catalog %s: %w", p.pathOf[rootIno], err)
+		return chunkid.Identity{}, nil, fmt.Errorf("publish: create catalog %s: %w", p.pathOf[rootIno], err)
 	}
 	seen := make(map[uint64]bool)
 	var emit func(ino uint64) error
@@ -896,7 +1021,7 @@ func (p *pipeline) writeCatalog(ctx context.Context, rootIno uint64) (chunkid.Id
 		}
 		for _, e := range p.dirs[ino] {
 			if e.typ == catalog.TypeDir && p.isCatRoot[e.inode] {
-				id, ok := p.catIdentity[e.inode]
+				id, ok := childIDs[e.inode]
 				if !ok {
 					return fmt.Errorf("child catalog %s not yet written (split order bug)", p.pathOf[e.inode])
 				}
@@ -935,14 +1060,13 @@ func (p *pipeline) writeCatalog(ctx context.Context, rootIno uint64) (chunkid.Id
 	}
 	if err := emit(rootIno); err != nil {
 		cw.Close() //nolint:errcheck
-		return chunkid.Identity{}, fmt.Errorf("publish: catalog %s: %w", p.pathOf[rootIno], err)
+		return chunkid.Identity{}, nil, fmt.Errorf("publish: catalog %s: %w", p.pathOf[rootIno], err)
 	}
-	id, err := p.packSQLite(ctx, cw, fp, packstore.EntryCatalog)
+	id, stored, err := encodeSQLite(cw, fp, p.hasher, p.o.DEK)
 	if err != nil {
-		return chunkid.Identity{}, fmt.Errorf("publish: pack catalog %s: %w", p.pathOf[rootIno], err)
+		return chunkid.Identity{}, nil, fmt.Errorf("publish: encode catalog %s: %w", p.pathOf[rootIno], err)
 	}
-	p.stats.Catalogs++
-	return id, nil
+	return id, stored, nil
 }
 
 // emitInode writes one inode's node row (once per writer) and, when
@@ -994,27 +1118,42 @@ func (p *pipeline) emitInode(w *catalog.Writer, seen map[uint64]bool, ino uint64
 	return nil
 }
 
-// packSQLite closes a catalog/shard writer, hashes the file bytes into its
-// identity, encodes (always zstd — nested rows and the superblock carry no
-// alg column, so the encoding must be fixed), and appends the pack entry.
+// packSQLite encodes a catalog/shard and appends it to a pack. Always
+// zstd: nested rows and the superblock carry no alg column, so the
+// encoding must be fixed.
 func (p *pipeline) packSQLite(ctx context.Context, cw *catalog.Writer, fp, typ string) (chunkid.Identity, error) {
-	if err := cw.Close(); err != nil {
-		return chunkid.Identity{}, err
-	}
-	raw, err := os.ReadFile(fp)
-	if err != nil {
-		return chunkid.Identity{}, err
-	}
-	id := p.hasher.Sum(raw)
-	stored, err := entrycodec.EncodeZstd(raw, p.o.DEK)
+	id, stored, err := encodeSQLite(cw, fp, p.hasher, p.o.DEK)
 	if err != nil {
 		return chunkid.Identity{}, err
 	}
 	if err := p.pk.add(ctx, id.Hex(), typ, stored); err != nil {
 		return chunkid.Identity{}, err
 	}
-	_ = os.Remove(fp)
 	return id, nil
+}
+
+// encodeSQLite closes a catalog/shard writer, hashes the file bytes into
+// its identity, and encodes the pack entry.
+//
+// It is deliberately free of the pipeline: everything it touches is its
+// own writer, its own file, and two immutable values, so catalog builds
+// can run side by side. Appending to a pack is the caller's job, because
+// that is the step whose ORDER is observable in the output.
+func encodeSQLite(cw *catalog.Writer, fp string, hasher chunkid.Hasher, dek []byte) (chunkid.Identity, []byte, error) {
+	if err := cw.Close(); err != nil {
+		return chunkid.Identity{}, nil, err
+	}
+	raw, err := os.ReadFile(fp)
+	if err != nil {
+		return chunkid.Identity{}, nil, err
+	}
+	id := hasher.Sum(raw)
+	stored, err := entrycodec.EncodeZstd(raw, dek)
+	if err != nil {
+		return chunkid.Identity{}, nil, err
+	}
+	_ = os.Remove(fp)
+	return id, stored, nil
 }
 
 func (p *pipeline) buildSuperblock(newPacks []packstore.SealedPack, shards []superblock.ShardEntry, rootID chunkid.Identity) (*superblock.Superblock, []byte, error) {

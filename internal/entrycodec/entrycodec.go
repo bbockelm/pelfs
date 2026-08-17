@@ -17,6 +17,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"fmt"
+	"runtime"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -36,9 +37,19 @@ const nonceSize = 12
 
 // Shared codecs: EncodeAll/DecodeAll are stateless and safe for concurrent
 // use (same pattern as the packstore trailer codec).
+//
+// The concurrency setting is not about splitting one call across cores —
+// EncodeAll never does that — it sizes the pool of encoder states callers
+// draw from, so it is really the number of ENTRIES that may be encoded at
+// once. At one, a publish building several catalogs in parallel would
+// queue them all behind a single state and get nothing for the
+// parallelism. Bounded rather than unbounded because each state carries a
+// window's worth of buffers.
 var (
-	zEnc, _ = zstd.NewWriter(nil, zstd.WithEncoderConcurrency(1))
-	zDec, _ = zstd.NewReader(nil, zstd.WithDecoderConcurrency(1))
+	codecConcurrency = min(runtime.GOMAXPROCS(0), 8)
+
+	zEnc, _ = zstd.NewWriter(nil, zstd.WithEncoderConcurrency(codecConcurrency))
+	zDec, _ = zstd.NewReader(nil, zstd.WithDecoderConcurrency(codecConcurrency))
 )
 
 // Encode prepares one pack entry: zstd-compress data, keep the smaller of

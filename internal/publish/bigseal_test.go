@@ -69,7 +69,7 @@ func TestBigTreeSealCost(t *testing.T) {
 
 	head = timedSeal(t, "initial seal", inner, ov, head, priv, index, "")
 
-	for phase := 2; phase <= 4; phase++ {
+	for phase := 2; phase <= 5; phase++ {
 		_ = ov.Close()
 		_ = gfs.Close()
 		// Reopen exactly as a fresh mount does: a new genfs over the
@@ -114,6 +114,17 @@ func TestBigTreeSealCost(t *testing.T) {
 				t.Fatalf("write deep.txt: %v", err)
 			}
 			head = timedSeal(t, "one-file seal (deep)", inner, ov, head, priv, index, "")
+		case 5:
+			// The untar shape: every inode dirty, no byte of content new.
+			// Whatever this seal costs is catalog construction and nothing
+			// else, which is the only way to read the cost honestly — an
+			// initial seal mixes in chunking, and a one-file seal measures
+			// the reuse path instead.
+			start := time.Now()
+			n := chmodTree(t, ov, 1)
+			t.Logf("dirtied %d inodes in %s", n, time.Since(start).Round(time.Millisecond))
+			head = timedSeal(t, "whole-tree seal (no new content)", inner, ov, head, priv, index,
+				os.Getenv("PELFS_BIGSEAL_WHOLETREE_CPUPROFILE"))
 		}
 	}
 	_ = ov.Close()
@@ -121,6 +132,45 @@ func TestBigTreeSealCost(t *testing.T) {
 
 	// The generation every phase built on must still read back whole.
 	verifyBigTree(t, inner, head.Superblock, dirs)
+}
+
+// chmodTree touches the mode of every inode below root, which dirties the
+// whole tree without staging a single byte — the state an untar leaves
+// behind once its content has already been checkpointed.
+func chmodTree(t *testing.T, ov *overlay.FS, root uint64) int {
+	t.Helper()
+	ctx := context.Background()
+	n := 0
+	var walk func(ino uint64)
+	walk = func(ino uint64) {
+		ents, err := ov.Readdir(ctx, ino)
+		if err != nil {
+			t.Fatalf("readdir %d: %v", ino, err)
+		}
+		for _, e := range ents {
+			// Residency in the base is established by LOOKUP, not by
+			// readdir, so a write addressed straight at a readdir'd inode is
+			// rejected as stale — exactly as it would be for a kernel that
+			// never looked the name up.
+			node, err := ov.Lookup(ctx, ino, e.Name)
+			if err != nil {
+				t.Fatalf("lookup %d/%s: %v", ino, e.Name, err)
+			}
+			mode := uint32(0640)
+			if node.Type == 2 {
+				mode = 0750
+			}
+			if _, err := ov.SetAttr(ctx, node.Inode, overlay.SetAttrIn{Mode: &mode}); err != nil {
+				t.Fatalf("setattr %d: %v", node.Inode, err)
+			}
+			n++
+			if node.Type == 2 {
+				walk(node.Inode)
+			}
+		}
+	}
+	walk(root)
+	return n
 }
 
 // verifyBigTree walks the final generation through a COLD cache and reads

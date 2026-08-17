@@ -29,7 +29,7 @@ func TestExplainReportsWhatGoNFSWouldDiscard(t *testing.T) {
 	// routinely, go-nfs has an NFS status for it and never uses it for a
 	// filesystem error, so it lands on the client as EIO.
 	err := &os.PathError{Op: "chmod", Path: "/deep/tree/file.c", Err: syscall.ESTALE}
-	if got := explain("chmod", "/deep/tree/file.c", err); got != error(err) {
+	if got := explain("chmod", "/deep/tree/file.c", toldEIO, err); got != error(err) {
 		t.Fatalf("explain changed the error: %v", got)
 	}
 	line := out.String()
@@ -56,7 +56,7 @@ func TestExplainStaysQuietForTranslatableErrors(t *testing.T) {
 		&os.PathError{Op: "open", Path: "/a", Err: syscall.EPERM},
 		&os.PathError{Op: "write", Path: "/a", Err: syscall.ENOSPC},
 	} {
-		explain("open", "/a", err)
+		explain("open", "/a", toldEACCES, err)
 	}
 	if out.Len() != 0 {
 		t.Errorf("reported a translatable error: %q", out.String())
@@ -79,7 +79,7 @@ func TestReportIsRateLimitedAndFree(t *testing.T) {
 	eioSuppressed.Store(0)
 	err := errors.New("something no NFS status describes")
 
-	if n := testing.AllocsPerRun(200, func() { explain("create", "/a/b/c", err) }); n != 0 {
+	if n := testing.AllocsPerRun(200, func() { explain("create", "/a/b/c", toldEIO, err) }); n != 0 {
 		t.Errorf("suppressed report allocates %v times per call", n)
 	}
 	if out.Len() != 0 {
@@ -90,7 +90,7 @@ func TestReportIsRateLimitedAndFree(t *testing.T) {
 	}
 
 	eioReportedAt.Store(0)
-	explain("create", "/a/b/c", err)
+	explain("create", "/a/b/c", toldEIO, err)
 	line := out.String()
 	if !strings.Contains(line, "told EIO") {
 		t.Errorf("no report after the window: %q", line)

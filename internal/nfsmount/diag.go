@@ -138,19 +138,35 @@ func attrErr(op, path string, err error) error {
 	}
 	st := statusOf(err)
 	if st == nfs.NFSStatusIO {
-		report(op, path, err)
+		report(op, path, toldEIO, err)
 	}
 	return &nfs.NFSStatusError{NFSStatus: st, WrappedErr: err}
 }
 
+// The status go-nfs answers when it cannot place an error, which differs
+// by RPC and is what the report has to name if it is to be true. The
+// handlers that reach each billy method are listed with the method.
+const (
+	// onGetattr, onRemove, onRmdir, onRename, onRead: anything unplaced
+	// becomes NFS3ERR_IO.
+	toldEIO = "EIO"
+	// onCreate, onMkdir, onSymlink, onWrite's open, onRead's open,
+	// onReadlink: unplaced errors become NFS3ERR_ACCES, which is no more
+	// true than EIO and just as unexplained.
+	toldEACCES = "EACCES"
+	// onReaddir, onReaddirplus: NFS3ERR_NOTDIR for anything but a
+	// permission error.
+	toldENOTDIR = "ENOTDIR"
+)
+
 // explain returns err unchanged, reporting it first if go-nfs is about to
-// flatten it to EIO. It is written to be wrapped around a return value so
-// no call site grows a branch.
-func explain(op, path string, err error) error {
+// discard it in favor of told. It is written to be wrapped around a return
+// value so no call site grows a branch.
+func explain(op, path, told string, err error) error {
 	if translatable(err) {
 		return err
 	}
-	report(op, path, err)
+	report(op, path, told, err)
 	return err
 }
 
@@ -158,7 +174,7 @@ func explain(op, path string, err error) error {
 // must not allocate: a workload that trips this trips it thousands of
 // times, and the reply it is delaying is the thing the client is waiting
 // for.
-func report(op, path string, err error) {
+func report(op, path, told string, err error) {
 	now := time.Now().UnixNano()
 	last := eioReportedAt.Load()
 	if now-last < int64(eioReportEvery) || !eioReportedAt.CompareAndSwap(last, now) {
@@ -166,12 +182,12 @@ func report(op, path string, err error) {
 		return
 	}
 	if n := eioSuppressed.Swap(0); n > 0 {
-		ui.Error("nfs {op} {path}: no NFS status describes this error, so the client is told EIO: {error} (and {suppressed} more like it since the last report)",
-			"op", op, "path", path, "error", err, "suppressed", n)
+		ui.Error("nfs {op} {path}: no NFS status describes this error, so the client is told {told}: {error} (and {suppressed} more like it since the last report)",
+			"op", op, "path", path, "told", told, "error", err, "suppressed", n)
 		return
 	}
-	ui.Error("nfs {op} {path}: no NFS status describes this error, so the client is told EIO: {error}",
-		"op", op, "path", path, "error", err)
+	ui.Error("nfs {op} {path}: no NFS status describes this error, so the client is told {told}: {error}",
+		"op", op, "path", path, "told", told, "error", err)
 }
 
 // diagnose wraps fs so that every error it returns passes the explainer
@@ -216,64 +232,64 @@ func (d *diagFS) Capabilities() billy.Capability {
 
 func (d *diagFS) Create(filename string) (billy.File, error) {
 	f, err := d.Filesystem.Create(filename)
-	return d.wrap(f), explain("create", filename, err)
+	return d.wrap(f), explain("create", filename, toldEACCES, err)
 }
 
 func (d *diagFS) Open(filename string) (billy.File, error) {
 	f, err := d.Filesystem.Open(filename)
-	return d.wrap(f), explain("open", filename, err)
+	return d.wrap(f), explain("open", filename, toldEACCES, err)
 }
 
 func (d *diagFS) OpenFile(filename string, flag int, perm os.FileMode) (billy.File, error) {
 	f, err := d.Filesystem.OpenFile(filename, flag, perm)
-	return d.wrap(f), explain("open", filename, err)
+	return d.wrap(f), explain("open", filename, toldEACCES, err)
 }
 
 func (d *diagFS) Stat(filename string) (os.FileInfo, error) {
 	fi, err := d.Filesystem.Stat(filename)
-	return fi, explain("stat", filename, err)
+	return fi, explain("stat", filename, toldEIO, err)
 }
 
 func (d *diagFS) Rename(oldpath, newpath string) error {
-	return explain("rename", oldpath, d.Filesystem.Rename(oldpath, newpath))
+	return explain("rename", oldpath, toldEIO, d.Filesystem.Rename(oldpath, newpath))
 }
 
 func (d *diagFS) Remove(filename string) error {
-	return explain("remove", filename, d.Filesystem.Remove(filename))
+	return explain("remove", filename, toldEIO, d.Filesystem.Remove(filename))
 }
 
 func (d *diagFS) TempFile(dir, prefix string) (billy.File, error) {
 	f, err := d.Filesystem.TempFile(dir, prefix)
-	return d.wrap(f), explain("tempfile", dir, err)
+	return d.wrap(f), explain("tempfile", dir, toldEACCES, err)
 }
 
 func (d *diagFS) ReadDir(path string) ([]os.FileInfo, error) {
 	entries, err := d.Filesystem.ReadDir(path)
-	return entries, explain("readdir", path, err)
+	return entries, explain("readdir", path, toldENOTDIR, err)
 }
 
 func (d *diagFS) MkdirAll(filename string, perm os.FileMode) error {
-	return explain("mkdir", filename, d.Filesystem.MkdirAll(filename, perm))
+	return explain("mkdir", filename, toldEACCES, d.Filesystem.MkdirAll(filename, perm))
 }
 
 func (d *diagFS) Lstat(filename string) (os.FileInfo, error) {
 	fi, err := d.Filesystem.Lstat(filename)
-	return fi, explain("lstat", filename, err)
+	return fi, explain("lstat", filename, toldEIO, err)
 }
 
 func (d *diagFS) Symlink(target, link string) error {
-	return explain("symlink", link, d.Filesystem.Symlink(target, link))
+	return explain("symlink", link, toldEACCES, d.Filesystem.Symlink(target, link))
 }
 
 func (d *diagFS) Readlink(link string) (string, error) {
 	target, err := d.Filesystem.Readlink(link)
-	return target, explain("readlink", link, err)
+	return target, explain("readlink", link, toldEACCES, err)
 }
 
 func (d *diagFS) Chroot(path string) (billy.Filesystem, error) {
 	inner, err := d.Filesystem.Chroot(path)
 	if err != nil {
-		return nil, explain("chroot", path, err)
+		return nil, explain("chroot", path, toldEIO, err)
 	}
 	return diagnose(inner), nil
 }
@@ -313,22 +329,22 @@ func (d *diagFS) wrap(f billy.File) billy.File {
 
 func (f *diagFile) Read(p []byte) (int, error) {
 	n, err := f.File.Read(p)
-	return n, explain("read", f.File.Name(), err)
+	return n, explain("read", f.File.Name(), toldEIO, err)
 }
 
 func (f *diagFile) ReadAt(p []byte, off int64) (int, error) {
 	n, err := f.File.ReadAt(p, off)
-	return n, explain("read", f.File.Name(), err)
+	return n, explain("read", f.File.Name(), toldEIO, err)
 }
 
 func (f *diagFile) Write(p []byte) (int, error) {
 	n, err := f.File.Write(p)
-	return n, explain("write", f.File.Name(), err)
+	return n, explain("write", f.File.Name(), toldEIO, err)
 }
 
 func (f *diagFile) Seek(offset int64, whence int) (int64, error) {
 	pos, err := f.File.Seek(offset, whence)
-	return pos, explain("seek", f.File.Name(), err)
+	return pos, explain("seek", f.File.Name(), toldEIO, err)
 }
 
 // Truncate takes the attribute path too: go-nfs calls it from exactly one
@@ -339,5 +355,5 @@ func (f *diagFile) Truncate(size int64) error {
 }
 
 func (f *diagFile) Close() error {
-	return explain("close", f.File.Name(), f.File.Close())
+	return explain("close", f.File.Name(), toldEIO, f.File.Close())
 }

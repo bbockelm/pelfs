@@ -717,11 +717,54 @@ func (fs *FS) Readlink(ctx context.Context, ino uint64) (string, error) {
 	return string(target), nil
 }
 
+// noXattrsFor reports whether ino provably has NO extended attribute,
+// decided from whole-catalog facts alone — no query, and in particular not
+// the node-row query that finding an inode's content catalog otherwise
+// costs. Almost no tree uses extended attributes, and a seal asks every
+// inode in the tree; two map lookups is the honest price of "none".
+//
+// Both places an inode's xattr rows can live have to be empty: the
+// residency catalog, and — if the inode falls in a shard's range, which is
+// the only way it could be promoted — that shard. A false answer means
+// only "ask properly", so the cost of the conservative direction is the
+// query that would have run anyway.
+func (fs *FS) noXattrsFor(ctx context.Context, ino uint64) (bool, error) {
+	catHex, err := fs.residencyOf(ino)
+	if err != nil {
+		return false, err
+	}
+	empty, err := fs.catalogHasNoXattrs(ctx, catHex)
+	if err != nil || !empty {
+		return false, err
+	}
+	for i := range fs.sb.Shards {
+		sh := &fs.sb.Shards[i]
+		if sh.FirstInode <= ino && ino <= sh.LastInode {
+			return fs.catalogHasNoXattrs(ctx, hex.EncodeToString(sh.Identity[:]))
+		}
+	}
+	return true, nil
+}
+
+func (fs *FS) catalogHasNoXattrs(ctx context.Context, catHex string) (bool, error) {
+	cat, release, err := fs.cats.acquire(ctx, catHex)
+	if err != nil {
+		return false, err
+	}
+	defer release()
+	return !cat.HasXattrs(), nil
+}
+
 // GetXattr returns one extended attribute; ErrNotExist when the inode has
 // no attribute of that name.
 func (fs *FS) GetXattr(ctx context.Context, ino uint64, name string) ([]byte, error) {
 	fs.swapMu.RLock()
 	defer fs.swapMu.RUnlock()
+	if none, err := fs.noXattrsFor(ctx, ino); err != nil {
+		return nil, err
+	} else if none {
+		return nil, ErrNotExist
+	}
 	cat, release, _, err := fs.acquireContent(ctx, ino)
 	if err != nil {
 		return nil, err
@@ -743,6 +786,11 @@ func (fs *FS) GetXattr(ctx context.Context, ino uint64, name string) ([]byte, er
 func (fs *FS) ListXattr(ctx context.Context, ino uint64) ([]string, error) {
 	fs.swapMu.RLock()
 	defer fs.swapMu.RUnlock()
+	if none, err := fs.noXattrsFor(ctx, ino); err != nil {
+		return nil, err
+	} else if none {
+		return nil, nil
+	}
 	cat, release, _, err := fs.acquireContent(ctx, ino)
 	if err != nil {
 		return nil, err

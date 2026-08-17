@@ -400,9 +400,20 @@ func TestHardlinks(t *testing.T) {
 	if got := readAll(t, fs, smallIno, len(smallContent), 64); !bytes.Equal(got, smallContent) {
 		t.Fatalf("shard inline content = %q", got)
 	}
-	// Promoted files' xattrs live in the shard too.
+	// Promoted files' xattrs live in the shard too — and ONLY there, since
+	// path catalogs carry a promoted inode's node row without its content
+	// records. This volume's only xattr is this one, so the path catalog's
+	// xattr table is empty: the whole-catalog "no xattrs here" shortcut has
+	// to consult the shard as well, or the attribute disappears.
 	if val, err := fs.GetXattr(ctx, smallIno, "user.tag"); err != nil || string(val) != "shared" {
 		t.Fatalf("promoted xattr = %q (%v)", val, err)
+	}
+	if names, err := fs.ListXattr(ctx, smallIno); err != nil || len(names) != 1 || names[0] != "user.tag" {
+		t.Fatalf("promoted ListXattr = %v (%v)", names, err)
+	}
+	// An unpromoted inode in the same volume genuinely has none.
+	if names, err := fs.ListXattr(ctx, dirIno); err != nil || len(names) != 0 {
+		t.Fatalf("ListXattr of an attribute-free inode = %v (%v)", names, err)
 	}
 }
 

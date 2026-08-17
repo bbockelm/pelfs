@@ -134,6 +134,9 @@ func (fs *FS) DirtyScope() (map[uint64]struct{}, bool, error) {
 // rowDirtyLocked is the table half of DirtyInodes: inodes with a row that
 // makes them differ from the base generation.
 func (fs *FS) rowDirtyLocked() (map[uint64]struct{}, error) {
+	if set, err := fs.dirtyRowInodesLocked(); err != nil || set != nil {
+		return set, err
+	}
 	set := make(map[uint64]struct{})
 	for _, q := range []string{
 		`SELECT inode FROM onode`,
@@ -181,31 +184,20 @@ func (fs *FS) parentsOfLocked(ino uint64) ([]uint64, error) {
 			out = append(out, p)
 		}
 	}
-	rows, err := fs.q.Query(`SELECT parent FROM oedge WHERE inode = ?`, int64(ino))
+	parents, err := fs.oedgeParentsLocked(ino)
 	if err != nil {
 		return nil, err
 	}
-	for rows.Next() {
-		var parent uint64
-		if err := rows.Scan(&parent); err != nil {
-			rows.Close() //nolint:errcheck
-			return nil, err
-		}
+	for _, parent := range parents {
 		add(parent)
-	}
-	if err := closeRows(rows); err != nil {
-		return nil, err
 	}
 	if pe, ok := fs.prov[ino]; ok {
 		add(pe.parent)
 	}
-	var parent int64
-	err = fs.q.QueryRow(`SELECT parent FROM obase WHERE inode = ?`, int64(ino)).Scan(&parent)
-	switch {
-	case err == nil:
-		add(uint64(parent))
-	case !errors.Is(err, sql.ErrNoRows):
+	if pe, ok, err := fs.obaseLocked(fs.q, ino); err != nil {
 		return nil, err
+	} else if ok {
+		add(pe.parent)
 	}
 	if len(out) == 0 {
 		if p, err := fs.base.Parent(ino); err == nil {
@@ -370,11 +362,11 @@ func (fs *FS) BaseRootCatalog() [32]byte { return fs.base.RootCatalog() }
 func (fs *FS) BaseContent(ctx context.Context, ino uint64) (genfs.Content, bool, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
-	staged, err := hasContent(fs.q, ino)
+	staged, err := fs.stagedLocked(fs.q, ino)
 	if err != nil || staged {
 		return genfs.Content{}, false, err
 	}
-	row, err := getONode(fs.q, ino)
+	row, err := fs.onodeLocked(fs.q, ino)
 	if err != nil {
 		return genfs.Content{}, false, err
 	}

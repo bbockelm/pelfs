@@ -126,6 +126,10 @@ type FS struct {
 	// base.Lookup succeeded for ino via the recorded edge, and residency
 	// is pinned (Forget is never forwarded to the base).
 	prov map[uint64]provEdge
+	// rows is the dirty tables read as sets rather than queried per inode,
+	// armed by PrepareSeal and dropped by every transaction (see bulk.go).
+	// nil means read the tables.
+	rows *rowCache
 
 	// seq counts mutating operations; modSeq records, per inode, the seq
 	// of its last modification. Snapshot names the seq it froze, and
@@ -385,6 +389,12 @@ func (fs *FS) allocInodeLocked(tx querier) (uint64, error) {
 // the transaction is about to take, so any query a previous transaction
 // met for the first time is compiled here — before Begin, never inside.
 func (fs *FS) withTx(fn func(tx querier) error) error {
+	// Every mutation runs through here, which makes it the one place the
+	// set-oriented row cache has to be dropped: rows this transaction is
+	// about to change must not be answered from a snapshot taken before it.
+	// Re-arming needs the filesystem lock this caller is holding, so the
+	// cache cannot come back mid-transaction either.
+	fs.rows = nil
 	fs.q.warm()
 	tx, err := fs.db.Begin()
 	if err != nil {
@@ -464,20 +474,18 @@ func (fs *FS) ensureBaseDepth(ctx context.Context, q querier, ino uint64, depth 
 		// The recorded edge is gone or now names something else — a swap
 		// moved the inode. The persisted chain below is then the authority.
 	}
-	var parent int64
-	var name []byte
-	err := q.QueryRow(`SELECT parent, name FROM obase WHERE inode = ?`, int64(ino)).Scan(&parent, &name)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil
-	}
+	chain, ok, err := fs.obaseLocked(q, ino)
 	if err != nil {
 		return err
 	}
-	if err := fs.ensureBaseDepth(ctx, q, uint64(parent), depth+1); err != nil {
+	if !ok {
+		return nil
+	}
+	if err := fs.ensureBaseDepth(ctx, q, chain.parent, depth+1); err != nil {
 		return err
 	}
-	if _, err := fs.baseLookupLocked(ctx, uint64(parent), string(name)); err != nil {
-		return fmt.Errorf("overlay: replay base edge %d/%q: %w", parent, name, err)
+	if _, err := fs.baseLookupLocked(ctx, chain.parent, chain.name); err != nil {
+		return fmt.Errorf("overlay: replay base edge %d/%q: %w", chain.parent, chain.name, err)
 	}
 	return nil
 }

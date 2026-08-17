@@ -314,6 +314,13 @@ func (s *Snapshot) Readdir(ctx context.Context, ino uint64) ([]DirEntry, error) 
 	return s.view.Readdir(ctx, ino)
 }
 
+// PrepareSeal arms the frozen view's set-oriented read of the dirty
+// tables. A snapshot is never written, so nothing can invalidate it.
+func (s *Snapshot) PrepareSeal() error { return s.view.PrepareSeal() }
+
+// ReleaseSeal drops it, and its memory with it.
+func (s *Snapshot) ReleaseSeal() { s.view.ReleaseSeal() }
+
 // ReaddirRetain lists the frozen merged view of a directory and makes its
 // base entries operable, which is what a seal walking this view needs.
 func (s *Snapshot) ReaddirRetain(ctx context.Context, ino uint64) ([]DirEntry, error) {

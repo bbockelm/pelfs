@@ -1040,3 +1040,182 @@ func TestDirtySetMatchesReopen(t *testing.T) {
 		}
 	}
 }
+
+// The set-oriented read of the dirty tables (PrepareSeal) must be
+// indistinguishable from querying them: same answers to every read, and a
+// mutation must be visible immediately afterwards rather than served from
+// a snapshot taken before it.
+func TestPreparedSealReadsMatchTheTables(t *testing.T) {
+	ctx := context.Background()
+	fx := newFixture(t, "5ea15ea1-0000-4000-8000-000000000001")
+	ov := openOverlay(t, fx, t.TempDir())
+
+	// A state that touches every dirty table: attribute overrides, staged
+	// content, new inodes, a whiteout, a rename (obase provenance), xattrs
+	// including a tombstone, and a symlink.
+	base := lookupPath(t, ov, "base.txt")
+	mode := uint32(0600)
+	if _, err := ov.SetAttr(ctx, base.Inode, overlay.SetAttrIn{Mode: &mode}); err != nil {
+		t.Fatal(err)
+	}
+	tagged := lookupPath(t, ov, "tagged.txt")
+	if _, err := ov.Write(ctx, tagged.Inode, 0, []byte("rewritten")); err != nil {
+		t.Fatal(err)
+	}
+	if err := ov.SetXattr(ctx, tagged.Inode, "user.new", []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	if err := ov.RemoveXattr(ctx, tagged.Inode, "user.color"); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := ov.Create(ctx, rootIno, "fresh.txt", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ov.Write(ctx, fresh.Inode, 0, []byte("fresh body")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ov.Symlink(ctx, rootIno, "ln", "base.txt", 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	dir := lookupPath(t, ov, "dir")
+	child := lookupPath(t, ov, "dir/child.txt")
+	if err := ov.Rename(ctx, dir.Inode, "child.txt", rootIno, "moved.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ov.Unlink(ctx, rootIno, "big.bin"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Snapshot every read while the tables are the authority.
+	take := func() reads {
+		r := reads{
+			Dirs:   map[uint64][]overlay.DirEntry{},
+			Attrs:  map[uint64]overlay.Node{},
+			Xattrs: map[uint64]map[string][]byte{},
+		}
+		var walk func(ino uint64)
+		walk = func(ino uint64) {
+			ents, err := ov.Readdir(ctx, ino)
+			if err != nil {
+				t.Fatalf("readdir %d: %v", ino, err)
+			}
+			r.Dirs[ino] = ents
+			for _, e := range ents {
+				n, err := ov.Lookup(ctx, ino, e.Name)
+				if err != nil {
+					t.Fatalf("lookup %d/%s: %v", ino, e.Name, err)
+				}
+				r.Attrs[n.Inode] = n
+				xa, err := ov.AllXattrs(ctx, n.Inode)
+				if err != nil {
+					t.Fatalf("xattrs %d: %v", n.Inode, err)
+				}
+				r.Xattrs[n.Inode] = xa
+				if n.Type == 2 {
+					walk(n.Inode)
+				}
+			}
+		}
+		walk(rootIno)
+		var err error
+		if r.Link, err = ov.Readlink(ctx, r.Dirs[rootIno][nameIndex(t, r.Dirs[rootIno], "ln")].Node.Inode); err != nil {
+			t.Fatalf("readlink: %v", err)
+		}
+		rc, err := ov.OpenFile(ctx, tagged.Inode, int64(len("rewritten")))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r.Content, err = io.ReadAll(rc); err != nil {
+			t.Fatal(err)
+		}
+		rc.Close() //nolint:errcheck
+		if r.Dirty, err = ov.DirtyInodes(); err != nil {
+			t.Fatal(err)
+		}
+		if r.Scope, r.ScopeOK, err = ov.DirtyScope(); err != nil {
+			t.Fatal(err)
+		}
+		if r.NextIno, err = ov.NextInode(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ov.Lookup(ctx, rootIno, "big.bin"); err != nil {
+			r.Unlinked = err.Error()
+		}
+		return r
+	}
+	fromTables := take()
+
+	if err := ov.PrepareSeal(); err != nil {
+		t.Fatalf("PrepareSeal: %v", err)
+	}
+	fromCache := take()
+	if diff := compareReads(fromTables, fromCache); diff != "" {
+		t.Fatalf("armed reads differ from the tables: %s", diff)
+	}
+
+	// A mutation while armed drops the cache; the change must be visible
+	// at once, not hidden behind the snapshot.
+	if _, err := ov.Create(ctx, rootIno, "after.txt", 0644, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	ents, err := ov.Readdir(ctx, rootIno)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nameIndex(t, ents, "after.txt") < 0 {
+		t.Fatal("a file created while the seal cache was armed is missing from the listing")
+	}
+	dirtyNow, err := ov.DirtyInodes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dirtyNow) <= len(fromTables.Dirty) {
+		t.Fatalf("dirty set did not grow after a create while armed: %d then %d",
+			len(fromTables.Dirty), len(dirtyNow))
+	}
+	ov.ReleaseSeal()
+	if diff := compareReads(fromTables, take()); diff == "" {
+		t.Fatal("the post-arm mutation left every read unchanged; the check proves nothing")
+	}
+	_ = child
+}
+
+// reads is one whole-filesystem read, taken twice: once against the
+// tables and once against the armed cache.
+type reads struct {
+	Dirs     map[uint64][]overlay.DirEntry
+	Attrs    map[uint64]overlay.Node
+	Xattrs   map[uint64]map[string][]byte
+	Link     string
+	Content  []byte
+	Dirty    map[uint64]struct{}
+	Scope    map[uint64]struct{}
+	ScopeOK  bool
+	NextIno  uint64
+	Unlinked string
+}
+
+// compareReads names the first field on which two whole-filesystem reads
+// disagree, so a failure says WHICH answer the cache got wrong.
+func compareReads(a, b reads) string {
+	av, bv := reflect.ValueOf(a), reflect.ValueOf(b)
+	for i := 0; i < av.NumField(); i++ {
+		x := av.Field(i).Interface()
+		y := bv.Field(i).Interface()
+		if !reflect.DeepEqual(x, y) {
+			return fmt.Sprintf("%s: %v != %v", av.Type().Field(i).Name, x, y)
+		}
+	}
+	return ""
+}
+
+func nameIndex(t *testing.T, ents []overlay.DirEntry, name string) int {
+	t.Helper()
+	for i, e := range ents {
+		if e.Name == name {
+			return i
+		}
+	}
+	return -1
+}

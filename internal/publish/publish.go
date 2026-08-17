@@ -328,14 +328,22 @@ func Publish(ctx context.Context, o Options) (*Result, error) {
 // superblock it shadows, so its identity comes from the previous
 // generation. The returned func releases source resources.
 func openSource(o Options) (Source, string, func(), error) {
-	switch {
-	case o.emptySource:
+	if o.emptySource {
 		return &emptyRoot{nextInode: 2}, formatVolumeID(o.VolumeID), func() {}, nil
-	case o.OverlaySnapshot != nil:
-		return &overlaySource{fs: o.OverlaySnapshot}, formatVolumeID(o.Prev.VolumeID), func() {}, nil
-	default:
-		return &overlaySource{fs: o.Overlay}, formatVolumeID(o.Prev.VolumeID), func() {}, nil
 	}
+	var view overlayView = o.Overlay
+	if o.OverlaySnapshot != nil {
+		view = o.OverlaySnapshot
+	}
+	// A seal reads every inode's rows, so the overlay reads its dirty
+	// tables once into memory rather than answering a point query per
+	// inode. It is armed here and dropped by the returned func because it
+	// costs memory proportional to the dirty state, which no other caller
+	// should be made to hold.
+	if err := view.PrepareSeal(); err != nil {
+		return nil, "", nil, fmt.Errorf("publish: prepare source: %w", err)
+	}
+	return &overlaySource{fs: view}, formatVolumeID(o.Prev.VolumeID), view.ReleaseSeal, nil
 }
 
 func applyDefaults(o *Options) error {

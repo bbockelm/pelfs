@@ -133,6 +133,8 @@ type CatalogReuser interface {
 type overlayView interface {
 	RootInode() uint64
 	NextInode() (uint64, error)
+	PrepareSeal() error
+	ReleaseSeal()
 	Lookup(ctx context.Context, parent uint64, name string) (overlay.Node, error)
 	GetAttr(ctx context.Context, ino uint64) (overlay.Node, error)
 	ReaddirRetain(ctx context.Context, ino uint64) ([]overlay.DirEntry, error)

@@ -14,6 +14,8 @@ import (
 	"github.com/go-git/go-billy/v5"
 	nfs "github.com/willscott/go-nfs"
 	nfshelper "github.com/willscott/go-nfs/helpers"
+
+	"github.com/bbockelm/pelfs/internal/ui"
 )
 
 // handleCacheSize bounds the file-handle <-> path cache in the NFS handler.
@@ -28,8 +30,16 @@ type Server struct {
 	serveErr chan error
 }
 
-// quietLogger drops go-nfs log lines that are expected and harmless here,
-// so that real problems stay visible.
+// quietLogger routes go-nfs's own log lines into pelfs's, and drops the
+// ones that are expected and harmless here.
+//
+// Routing matters as much as filtering. go-nfs logs through the standard
+// library's log package, which writes to raw stderr in its own format and
+// is therefore absent from a structured pelfs log entirely — and the few
+// lines that name a failing RPC ("Error applying attributes", the one
+// upstream line that explains an EIO on CREATE) are exactly the lines
+// somebody reading that log is looking for. A message the server emits
+// about our filesystem is a pelfs message.
 type quietLogger struct {
 	nfs.Logger
 }
@@ -45,7 +55,19 @@ func (l *quietLogger) Errorf(format string, args ...interface{}) {
 	if strings.Contains(format, "exclusive") {
 		return
 	}
-	l.Logger.Errorf(format, args...)
+	ui.Error("nfs server: {message}", "message", strings.TrimSpace(fmt.Sprintf(format, args...)))
+}
+
+func (l *quietLogger) Error(args ...interface{}) {
+	ui.Error("nfs server: {message}", "message", strings.TrimSpace(fmt.Sprint(args...)))
+}
+
+func (l *quietLogger) Warnf(format string, args ...interface{}) {
+	ui.Warn("nfs server: {message}", "message", strings.TrimSpace(fmt.Sprintf(format, args...)))
+}
+
+func (l *quietLogger) Warn(args ...interface{}) {
+	ui.Warn("nfs server: {message}", "message", strings.TrimSpace(fmt.Sprint(args...)))
 }
 
 func init() {
@@ -60,7 +82,10 @@ func Serve(bfs billy.Filesystem) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("nfs listen: %w", err)
 	}
-	handler := nfshelper.NewNullAuthHandler(bfs)
+	// diagnose sits between go-nfs and the filesystem so that an error
+	// go-nfs will flatten to NFS3ERR_IO is reported before it is lost
+	// (diag.go).
+	handler := nfshelper.NewNullAuthHandler(diagnose(bfs))
 	cached := newHandles(handler, handleCacheSize)
 	s := &Server{
 		Port:     ln.Addr().(*net.TCPAddr).Port,

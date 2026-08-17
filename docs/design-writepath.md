@@ -119,6 +119,45 @@ A chunk that is superseded *after* its flush is ordinary garbage in a
 pack, reclaimed by whatever repack eventually exists. Creating packs is
 nearly free; repacking is deferrable. That is the intended asymmetry.
 
+### Two kinds of flush, and only one of them waits
+
+"Flush" names two operations with different contracts, and conflating
+them is a mistake the prototype made — its `Flush` blocks on the network
+and is documented as "what a checkpoint or a seal calls".
+
+**Background flush (periodic, while mounted).** Takes a consistent point
+— freeze the memtable, capture the catalog state that goes with it — and
+**returns immediately**. Packing, uploading and the ref flip proceed in
+the background while the mount keeps serving and the user keeps writing.
+This is what `--snapshot-interval` drives. It must not block: a mount
+that stalls every few minutes to talk to a federation is precisely the
+behaviour the snapshot-based checkpoint was removed for.
+
+Consequences to design for:
+- The published generation appears *later* than the checkpoint that
+  started it. That is fine — the mount serves its own view regardless,
+  and the branch head simply advances when the publication lands.
+- Publications must not overtake one another: generation N's ref flip
+  has to precede N+1's, so a checkpoint whose publication is still in
+  flight when the next one fires must either coalesce with it or be
+  skipped. Skipping is the simpler rule and loses nothing, since the
+  later checkpoint covers a superset.
+- A failed background publication must not fail the mount. Retry on the
+  next interval; the memtable and the buffer file remain authoritative
+  until publication succeeds.
+
+**Synchronous flush (explicit, or at shutdown).** `pelfs ctl publish`,
+and the seal at exit. These *must* complete before returning, because the
+caller's whole purpose is to know the data has landed — neither the CLI
+verb nor a shell exit may finish while bytes are still in flight. This is
+the only place a user waits on the network by design, and at shutdown it
+is unavoidable: the process is about to stop, so anything unpublished
+would be lost or left for a later mount to recover.
+
+The practical effect on a session: writes pace against the flusher (the
+backpressure rule below), periodic checkpoints cost nothing observable,
+and exit waits only for whatever the last interval did not already cover.
+
 ### Flush, and the backpressure rule
 
 Flushing is asynchronous: the writer swaps in a fresh memtable and

@@ -34,8 +34,9 @@ type Refresher struct {
 	srv   *fuse.Server
 	fetch Fetcher
 	every time.Duration
-	// logger takes a ui message and its attributes; the seam exists so a
-	// test can watch what a swap reported without reading stderr.
+	// logger takes a ui message and its attributes. It is a field rather
+	// than a direct call so a caller can route a swap report somewhere
+	// other than pelfs's own output.
 	logger func(msg string, attrs ...any)
 }
 

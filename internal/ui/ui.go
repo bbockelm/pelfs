@@ -77,12 +77,7 @@ import (
 // mutex-guarded variable.
 var current atomic.Pointer[slog.Logger]
 
-func init() { current.Store(newLogger(os.Stderr, Structured(os.Stderr))) }
-
-// Logger returns the process logger, for handing to code that wants a
-// *slog.Logger of its own. It writes through the same handler, so its
-// output cannot drift from everything else pelfs says.
-func Logger() *slog.Logger { return current.Load() }
+func init() { current.Store(newLogger(os.Stderr, structuredFor(os.Stderr))) }
 
 // Info states what pelfs is doing. Most of what pelfs says is this:
 // progress a user asked for by running the command.
@@ -96,11 +91,11 @@ func Warn(msg string, args ...any) { current.Load().Warn(msg, args...) }
 // status.
 func Error(msg string, args ...any) { current.Load().Error(msg, args...) }
 
-// Structured reports whether w should get timestamped, attributed output
-// rather than bare prose. Exported so a command that redirects its own
-// stderr (the mount daemon) can ask the same question of the file it is
-// about to write.
-func Structured(w io.Writer) bool {
+// structuredFor reports whether w should get timestamped, attributed
+// output rather than bare prose. A background mount needs no special
+// case: its stderr IS the log file it was spawned with, so it answers
+// this question about the file and formats accordingly.
+func structuredFor(w io.Writer) bool {
 	switch os.Getenv("PELFS_LOG_FORMAT") {
 	case "plain":
 		return false

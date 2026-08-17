@@ -42,8 +42,8 @@ const timeLayout = "2006-01-02T15:04:05.000Z07:00"
 var bufs = sync.Pool{New: func() any { b := make([]byte, 0, 256); return &b }}
 
 func (h *handler) Handle(_ context.Context, r slog.Record) error {
-	// A fixed array covers every message pelfs sends; nothing here
-	// carries more attributes than this.
+	// A fixed array holds the attributes of every message pelfs actually
+	// sends; a longer one still works, it just allocates.
 	var stack [12]slog.Attr
 	attrs := append(stack[:0], h.with...)
 	r.Attrs(func(a slog.Attr) bool { attrs = append(attrs, a); return true })
@@ -79,8 +79,12 @@ func (h *handler) Handle(_ context.Context, r slog.Record) error {
 	_, err := h.w.Write(b)
 	h.mu.Unlock()
 
-	*bp = b
-	bufs.Put(bp)
+	// A buffer that grew to hold one enormous message must not be kept
+	// alive by the pool for the life of the process.
+	if cap(b) <= 8<<10 {
+		*bp = b
+		bufs.Put(bp)
+	}
 	return err
 }
 

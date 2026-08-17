@@ -454,6 +454,93 @@ into a new catalog on *every* generation that touches that catalog, so
 the cost recurs for the life of the volume, while a packed chunk is
 written once and referenced thereafter.
 
+### Measured: keep 4096
+
+`TestInlineMaxSweep` (`internal/publish`) sweeps the threshold over a real
+Linux 6.6 checkout — 81,690 files, 5,316 directories, 1290.8 MiB, 51.4% of
+files at or below 4096, which is the corpus the paragraphs above describe.
+Every byte and request count below is reproducible to the byte across
+runs; wall times are macOS and vary 10–30% run to run, so both runs are
+shown where they differ.
+
+| | never | 512 | 1024 | **4096** | 16384 |
+|---|---|---|---|---|---|
+| files inlined | 0 | 11.5% | 21.0% | **51.4%** | 81.8% |
+| catalogs in the generation | 3 | 3 | 5 | **24** | 105 |
+| initial seal, wall | 22.3 s | 19.0 s | 20.2–26.1 s | **20.6–21.4 s** | 22.3–23.6 s |
+| initial seal, uploaded | 263.3 MiB | 261.8 | 259.8 | **248.8** | 230.2 |
+| … catalog (exit-only) | 5.6 MiB | 6.1 | 7.5 | **19.9** | 65.5 |
+| … data (session-flushable) | 254.3 MiB | 252.6 | 249.6 | **227.2** | 164.1 |
+| one-file seal, wall | 1.61–1.80 s | 1.59–1.63 s | 1.36–1.39 s | **0.85 s** | 0.85–1.34 s |
+| one-file seal, namespace rebuilt | 79.4% | 78.0% | 63.4% | **23.0%** | 10.1% |
+| whole-tree reseal, wall | 2.03–2.14 s | 1.97–2.10 s | 1.87–2.14 s | **2.24–2.81 s** | 4.18–4.85 s |
+| whole-tree reseal, uploaded | 5.6 MiB | 6.1 | 7.5 | **19.9** | 65.5 |
+| 100 scattered small reads, cold | 2.29 s, 102 GET, 3.5 MiB | 1.92, 85, 3.8 | 1.62, 70, 5.5 | **1.23–1.29, 48, 16.8** | 1.41–1.48, 39, 70.5 |
+| … a neighbour in each directory | 2.20, 99 GET | 1.78, 79 | 1.40, 63 | **0.67–0.72, 30** | 0.006, 0 |
+| `grep -r arch/powerpc`, 2026 files | 20.6–21.3 s, 909 GET | 17.9–19.3, 783 | 15.8, 693 | **9.2–9.3, 404** | 2.7, 116 |
+| mount (open + root readdir) | 118 ms, 6.7 MiB | 115, 6.4 | 126, 5.9 | **109, 4.4** | 95, 3.8 |
+
+Reads are against a store with a modelled 20 ms round trip; warm re-reads
+cost 0 GET at every threshold, so only the cold column discriminates.
+
+**The guess above was wrong in direction.** Lowering `InlineMax` makes
+every measured axis worse except one, and the one it improves is smaller
+than it looks. Three findings the framing missed:
+
+**Inline bytes are what make catalogs numerous.** Catalog weight is
+`200·entries + inline_bytes` and the split bounds it at `SMax` — so a
+catalog costs about the same to rewrite whatever the threshold is, and
+what the threshold moves is how MANY catalogs the tree has. With nothing
+inline the kernel tree weighs 16.6 MiB and splits into **3** catalogs, and
+one changed file rebuilds 79% of the namespace. At 4096 it weighs 78.7 MiB
+and splits into **24**, and one changed file rebuilds 23% — 15 subtrees
+pruned, 21 catalogs carried by reference, and a one-file seal that takes
+0.85 s instead of 1.6–1.8 s. Packing does not "make catalogs small"; it
+makes them few.
+
+**Inlining uploads fewer bytes, not more.** Total wire falls monotonically
+as the threshold rises: 263.3 MiB at never, 248.8 at 4096, 230.2 at 16384.
+A chunked small file costs a chunkref row plus a pack trailer entry that an
+inline file does not, and a catalog is zstd-encoded as one blob over
+thousands of files' source text, which compresses far better than a
+separate frame per 1–4 KiB chunk. "Inline in a packfile or inline in
+SQLite" is not byte-neutral: SQLite is the cheaper container for small
+source files.
+
+**The pack cache does not mitigate the cold small-file read.** With
+nothing inline, reading a *different* small file from each sampled
+directory still costs one GET per file (99 GET for 99 files) — the
+promotion rule's ratio guard refuses for a scattered reader, exactly as
+designed, and the scattered reader is the interactive case. The
+mitigation only appears once the files are inline, so it is no defence of
+packing them.
+
+What packing genuinely buys is the one thing the memtable cares about:
+bytes that can leave during the session. At 4096, 19.9 MiB of the initial
+seal can only move after the walk, against 5.6 MiB at never — the seal
+uploads 14.5 MiB *less* in total but 14.3 MiB more of it lands in the
+synchronous exit. That penalty applies only to a generation that rewrites
+the whole tree; the steady-state one-file seal moves 5.1 MiB at 4096
+against 4.5 MiB at never, and it finishes twice as fast.
+
+Going the other way past 4096 stops paying. 16384 buys a much faster
+directory walk (2.7 s against 9.2 s) but converts round trips into
+bandwidth: 70.5 MiB transferred to read 100 scattered small files, against
+16.8 MiB at 4096 — and it is *slower* in wall time, because the catalog a
+scattered reader must pull grows with the threshold. Its whole-tree reseal
+also doubles, to 65.5 MiB and 4.2–4.8 s.
+
+The workloads do disagree — batch extraction keeps improving past 16384,
+interactive browsing has its latency minimum at 4096 and its byte cost
+exploding past it — and there is one default. 4096 is at the interactive
+optimum and already 2.3× better than never on the batch walk, so it is the
+value that serves both.
+
+**Settled: `DefaultInlineMax` stays 4096.** Nothing in the sweep argues
+for lowering it, and the recurring cost the section opens with is real but
+small: the whole-tree reseal that carries all 62.1 MiB of inline bytes
+forward costs 2.24–2.81 s against 2.03–2.14 s with nothing inline at all.
+
 ## Settled
 
 - **Crash recovery** as described above. `fsync` flows through to the

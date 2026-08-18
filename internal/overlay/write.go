@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"os"
+	"io"
 	"time"
 
 	"github.com/bbockelm/pelfs/internal/catalog"
@@ -94,15 +94,10 @@ func (fs *FS) Create(ctx context.Context, parent uint64, name string, mode, uid,
 		if _, err := tx.Exec(`INSERT INTO ocontent (inode) VALUES (?)`, int64(ino)); err != nil {
 			return err
 		}
-		// The staging file lands before commit; a crash leaves at worst
-		// an orphan file for a never-committed inode, truncated on the
-		// number's eventual reuse of the path (numbers themselves are
-		// never reissued after commit).
-		f, err := os.OpenFile(fs.stagingPath(ino), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
-		if err != nil {
-			return err
-		}
-		return f.Close()
+		// The body lands before commit; a crash leaves at worst an orphan
+		// for a never-committed inode, truncated on the number's eventual
+		// reuse (numbers themselves are never reissued after commit).
+		return fs.content.Create(ino)
 	})
 }
 
@@ -237,7 +232,9 @@ func (fs *FS) Unlink(ctx context.Context, parent uint64, name string) error {
 		return fs.dropNodeRefLocked(tx, r.ino, &removeStaging)
 	})
 	if err == nil && removeStaging != 0 {
-		fs.dropStagingLocked(removeStaging)
+		if drop := fs.content.Drop(removeStaging); drop != nil {
+			drop()
+		}
 	}
 	return err
 }
@@ -414,7 +411,9 @@ func (fs *FS) Rename(ctx context.Context, srcParent uint64, srcName string, dstP
 		return putOEdge(tx, dstParent, dstName, src.ino, src.typ)
 	})
 	if err == nil && removeStaging != 0 {
-		fs.dropStagingLocked(removeStaging)
+		if drop := fs.content.Drop(removeStaging); drop != nil {
+			drop()
+		}
 	}
 	return err
 }
@@ -440,11 +439,15 @@ func (fs *FS) materializeAttrsLocked(ctx context.Context, tx querier, ino uint64
 	return row, nil
 }
 
-// materializeContentLocked stages ino's content: file-granular COW. The
-// first copyLen bytes of base content land in the staging file (callers
-// pass the full length for writes, the surviving length for truncates),
-// the file is synced, and only then does the publishing row join the
-// transaction — a crash before commit leaves an invisible orphan file.
+// materializeContentLocked gives ino a writable body: file-granular COW.
+// The first copyLen bytes of base content are copied in (callers pass the
+// full length for writes, the surviving length for truncates), and only
+// then does the publishing row join the transaction — a crash before
+// commit leaves an invisible orphan.
+//
+// The copy is why the write path exists to replace this store: writing
+// one byte of a clean file costs the whole file, and for a file that only
+// the base generation holds, "the whole file" is a download.
 func (fs *FS) materializeContentLocked(ctx context.Context, tx querier, row *onodeRow, copyLen int64) error {
 	staged, err := hasContent(tx, row.Inode)
 	if err != nil || staged {
@@ -456,48 +459,39 @@ func (fs *FS) materializeContentLocked(ctx context.Context, tx querier, row *ono
 	if copyLen > row.Length {
 		copyLen = row.Length
 	}
-	fp := fs.stagingPath(row.Inode)
-	f, err := os.OpenFile(fp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
-	if err != nil {
-		return err
-	}
-	fail := func(err error) error {
-		f.Close()     //nolint:errcheck
-		os.Remove(fp) //nolint:errcheck
-		return err
-	}
+	var src io.Reader
 	if copyLen > 0 {
 		if err := fs.ensureBaseLocked(ctx, tx, row.Inode); err != nil {
-			return fail(err)
+			return err
 		}
-		buf := make([]byte, copyBufSize)
-		for off := int64(0); off < copyLen; {
-			want := copyLen - off
-			if want > int64(len(buf)) {
-				want = int64(len(buf))
-			}
-			k, err := fs.base.Read(ctx, row.Inode, off, buf[:want])
-			if err != nil {
-				return fail(fmt.Errorf("overlay: COW copy inode %d at %d: %w", row.Inode, off, err))
-			}
-			if k == 0 {
-				return fail(fmt.Errorf("overlay: COW copy inode %d: EOF at %d of %d", row.Inode, off, copyLen))
-			}
-			if _, err := f.Write(buf[:k]); err != nil {
-				return fail(err)
-			}
-			off += int64(k)
-		}
+		src = &baseReader{ctx: ctx, fs: fs, ino: row.Inode}
 	}
-	if err := f.Sync(); err != nil {
-		return fail(err)
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(fp) //nolint:errcheck
+	if err := fs.content.Adopt(ctx, row.Inode, copyLen, src); err != nil {
 		return err
 	}
 	_, err = tx.Exec(`INSERT INTO ocontent (inode) VALUES (?)`, int64(row.Inode))
 	return err
+}
+
+// baseReader streams one inode out of the base generation, which is what
+// a content store adopting a clean file reads from.
+type baseReader struct {
+	ctx context.Context
+	fs  *FS
+	ino uint64
+	off int64
+}
+
+func (r *baseReader) Read(p []byte) (int, error) {
+	n, err := r.fs.base.Read(r.ctx, r.ino, r.off, p)
+	r.off += int64(n)
+	if err != nil {
+		return n, err
+	}
+	if n == 0 {
+		return 0, io.ErrUnexpectedEOF
+	}
+	return n, nil
 }
 
 // Write stores data at off, staging base content first (COW at file
@@ -520,20 +514,7 @@ func (fs *FS) Write(ctx context.Context, ino uint64, off int64, data []byte) (in
 		if err := fs.materializeContentLocked(ctx, tx, row, row.Length); err != nil {
 			return err
 		}
-		// Bytes below off are the only ones this write disturbs, so a
-		// pure append never copies for a live snapshot.
-		if err := fs.copyOutForSnapshotsLocked(ino, off); err != nil {
-			return err
-		}
-		f, err := os.OpenFile(fs.stagingPath(ino), os.O_WRONLY, 0600)
-		if err != nil {
-			return err
-		}
-		if _, err := f.WriteAt(data, off); err != nil {
-			f.Close() //nolint:errcheck
-			return err
-		}
-		if err := f.Close(); err != nil {
+		if err := fs.content.WriteAt(ctx, ino, off, data); err != nil {
 			return err
 		}
 		if end := off + int64(len(data)); end > row.Length {
@@ -586,12 +567,7 @@ func (fs *FS) SetAttr(ctx context.Context, ino uint64, in SetAttrIn) (Node, erro
 			if err := fs.materializeContentLocked(ctx, tx, row, *in.Size); err != nil {
 				return err
 			}
-			// A shrink destroys bytes below the new size; an extension
-			// only adds above it, which no snapshot can see.
-			if err := fs.copyOutForSnapshotsLocked(ino, *in.Size); err != nil {
-				return err
-			}
-			if err := os.Truncate(fs.stagingPath(ino), *in.Size); err != nil {
+			if err := fs.content.Truncate(ctx, ino, *in.Size); err != nil {
 				return err
 			}
 			row.Length = *in.Size

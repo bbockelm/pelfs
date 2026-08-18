@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"os"
 	"sort"
 	"strconv"
 )
@@ -72,10 +71,10 @@ func (fs *FS) Rebase(ctx context.Context, sealedSeq uint64, sealed Options) (*Re
 	// below commits, and inode numbers are never reissued, so the removal
 	// waits until the lock is gone. Defers run last-in-first-out: the
 	// unlock below runs first, then this.
-	var unlink []string
+	var unlink []func()
 	defer func() {
-		for _, p := range unlink {
-			os.Remove(p) //nolint:errcheck
+		for _, drop := range unlink {
+			drop()
 		}
 	}()
 	defer fs.mu.Unlock()
@@ -216,8 +215,9 @@ func (fs *FS) Rebase(ctx context.Context, sealedSeq uint64, sealed Options) (*Re
 	// live, which is the expected case; the unlinks themselves happen
 	// after the lock is dropped.
 	for _, ino := range drop {
-		_, _ = fs.handOverPinsLocked(ino, 0)
-		unlink = append(unlink, fs.stagingPath(ino))
+		if deferred := fs.content.Drop(ino); deferred != nil {
+			unlink = append(unlink, deferred)
+		}
 	}
 
 	// Re-derive the dirty set from the rebased tables rather than editing

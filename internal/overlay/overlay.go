@@ -117,12 +117,10 @@ type FS struct {
 	q          *stmtCache
 	dir        string
 	stagingDir string
-	// stagingFallback is set on a SNAPSHOT's frozen view: the live
-	// overlay's staging directory, read when the snapshot's own scratch
-	// holds no copy of an inode. A freeze links nothing (snapshot.go), so
-	// the absence of a copy means the live file still holds the frozen
-	// bytes.
-	stagingFallback string
+	// content is where the BYTES of changed files live (content.go).
+	// Everything else about them — names, attributes, structure — is in
+	// the database above.
+	content contentStore
 
 	// mu serializes every operation: one writer, one transaction at a
 	// time. SQLite serializes writes anyway, so a finer lock would buy
@@ -152,11 +150,6 @@ type FS struct {
 	// snapshot published (child inode -> the edge naming it). Rebase
 	// replays it against the sealed base.
 	snapEdges map[uint64]map[uint64]provEdge
-	// snapPins is one entry per LIVE snapshot: the staging lengths that
-	// snapshot froze, which the write path hands the staging file over for
-	// before it disturbs those bytes (snapshot.go, handOverPinsLocked and
-	// copyOutForSnapshotsLocked).
-	snapPins []*snapPin
 }
 
 const (
@@ -314,6 +307,7 @@ func Open(dir string, base *genfs.FS, opts Options) (*FS, error) {
 		q:          newStmtCache(db),
 		dir:        dir,
 		stagingDir: stagingDir,
+		content:    newStagingContent(stagingDir),
 		prov:       make(map[uint64]provEdge),
 		modSeq:     make(map[uint64]uint64),
 		snapEdges:  make(map[uint64]map[uint64]provEdge),
@@ -415,10 +409,6 @@ func (fs *FS) withTx(fn func(tx querier) error) error {
 		return err
 	}
 	return tx.Commit()
-}
-
-func (fs *FS) stagingPath(ino uint64) string {
-	return filepath.Join(fs.stagingDir, strconv.FormatUint(ino, 10))
 }
 
 // baseLookupLocked resolves one BASE edge and records it as provenance:

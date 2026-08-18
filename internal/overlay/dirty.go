@@ -1,8 +1,6 @@
 package overlay
 
-import (
-	"os"
-)
+import ()
 
 // DirtyNode is one changed inode: overlay-new (Base false) or a base
 // inode with modified attributes/content (Base true).
@@ -183,8 +181,8 @@ func (fs *FS) Stats() (Stats, error) {
 			return Stats{}, err
 		}
 		s.StagedFiles++
-		if fi, err := os.Stat(fs.stagingPath(ino)); err == nil {
-			s.StagedBytes += fi.Size()
+		if n, ok := fs.content.Size(ino); ok {
+			s.StagedBytes += n
 		}
 	}
 	if err := rows.Err(); err != nil {

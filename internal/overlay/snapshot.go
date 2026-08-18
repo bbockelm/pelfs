@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -53,16 +52,6 @@ import (
 // the moves are paid one at a time, off the lock's critical path, for the
 // handful of files the mount actually disturbs while a seal runs; and no
 // staging file is ever reachable by two names.
-
-// snapPin is one live snapshot's frozen staging state, registered with
-// the owning FS: where its scratch lives, and the length it froze each
-// staged inode at. An inode leaves lens the moment the live side has
-// handed its bytes over — there is nothing left to protect. Identity is
-// the pointer: Close removes exactly this one.
-type snapPin struct {
-	dir  string
-	lens map[uint64]int64
-}
 
 // Snapshot is a consistent read-only view of an overlay at one instant.
 // It serves the same read API as FS, from its own database connection and
@@ -129,14 +118,12 @@ func (fs *FS) Snapshot(dir string) (*Snapshot, error) {
 			return nil, fmt.Errorf("overlay: snapshot dir: %w", err)
 		}
 	}
-	snap := &Snapshot{owner: fs, seq: fs.seq, dir: dir,
-		pin: &snapPin{dir: stagingDir, lens: make(map[uint64]int64)}}
+	snap := &Snapshot{owner: fs, seq: fs.seq, dir: dir}
 	if err := fs.freezeLocked(snap, dir, stagingDir); err != nil {
 		os.RemoveAll(stagingDir)                     //nolint:errcheck
 		os.Remove(filepath.Join(dir, overlayDBName)) //nolint:errcheck
 		return nil, err
 	}
-	fs.snapPins = append(fs.snapPins, snap.pin)
 	return snap, nil
 }
 
@@ -179,8 +166,14 @@ func (fs *FS) freezeLocked(snap *Snapshot, dir, stagingDir string) error {
 		return err
 	}
 	start = time.Now()
-	for _, s := range content {
-		snap.pin.lens[s.ino] = s.length
+	// The freeze is a map fill and nothing else. A content store whose
+	// bytes are already immutable needs no pin at all.
+	if f, ok := fs.content.(contentFreezer); ok {
+		lens := make(map[uint64]int64, len(content))
+		for _, st := range content {
+			lens[st.ino] = st.length
+		}
+		snap.pin = f.freeze(stagingDir, lens)
 	}
 	snap.cost.Staged = len(content)
 	snap.cost.Freeze = time.Since(start)
@@ -259,12 +252,12 @@ func openSnapshotView(fs *FS, dir, stagingDir string) (*FS, error) {
 		q:          newStmtCache(db),
 		dir:        dir,
 		stagingDir: stagingDir,
-		// The freeze links nothing, so most inodes are read straight out
-		// of the live staging directory (see Read).
-		stagingFallback: fs.stagingDir,
-		prov:            prov,
-		modSeq:          make(map[uint64]uint64),
-		snapEdges:       make(map[uint64]map[uint64]provEdge),
+		// The freeze copies nothing, so most inodes are read straight out
+		// of the LIVE staging directory (see stagingContent.open).
+		content:   &stagingContent{dir: stagingDir, fallback: fs.stagingDir},
+		prov:      prov,
+		modSeq:    make(map[uint64]uint64),
+		snapEdges: make(map[uint64]map[uint64]provEdge),
 	}, nil
 }
 
@@ -291,11 +284,8 @@ func (s *Snapshot) Discard() error { return s.release(false) }
 func (s *Snapshot) release(deleteScratch bool) error {
 	s.closeOnce.Do(func() {
 		s.owner.mu.Lock()
-		for i, p := range s.owner.snapPins {
-			if p == s.pin {
-				s.owner.snapPins = append(s.owner.snapPins[:i], s.owner.snapPins[i+1:]...)
-				break
-			}
+		if f, ok := s.owner.content.(contentFreezer); ok && s.pin != nil {
+			f.release(s.pin)
 		}
 		s.owner.mu.Unlock()
 		if s.view != nil {
@@ -400,125 +390,6 @@ func (s *Snapshot) DirtyInodes() (map[uint64]struct{}, error) { return s.view.Di
 // DirtyScope reports the frozen changed set placed in the namespace: the
 // directories a seal of this snapshot must descend into.
 func (s *Snapshot) DirtyScope() (map[uint64]struct{}, bool, error) { return s.view.DirtyScope() }
-
-// handOverPinsLocked gives ino's current staging file to every live
-// snapshot that still depends on it, by MOVING it into that snapshot's
-// scratch, and reports where it went ("" when nobody needed it). It is
-// what makes the freeze lazy: a snapshot takes a file only where the live
-// side is about to stop keeping those bytes, so the cost follows what the
-// mount does during a seal rather than the size of the dirty set.
-//
-// below bounds it the way the copy-out rule does: a snapshot that froze
-// ino at length L does not care about bytes at or above L, so a change
-// entirely above L needs nothing. Pass 0 for "all of it" — the file is
-// going away.
-//
-// An inode drops out of lens once handed over: the snapshot has the file
-// itself, and nothing the live side does to the name afterwards can reach
-// it. A missing live file drops out too — there is nothing to hand over,
-// and a read of it should fail loudly rather than quietly serve somebody
-// else's bytes.
-//
-// ORDER MATTERS, and it is the whole of the lock-free read rule: the file
-// arrives in the scratch BEFORE the live name stops naming those bytes. A
-// reader that finds no copy, opens the live file, and then still finds no
-// copy cannot have been overtaken.
-func (fs *FS) handOverPinsLocked(ino uint64, below int64) (string, error) {
-	if len(fs.snapPins) == 0 {
-		return "", nil
-	}
-	live := fs.stagingPath(ino)
-	name := strconv.FormatUint(ino, 10)
-	moved := ""
-	for _, p := range fs.snapPins {
-		l, ok := p.lens[ino]
-		if !ok || l <= below {
-			continue
-		}
-		dst := filepath.Join(p.dir, name)
-		var err error
-		if moved == "" {
-			// The first taker gets the file itself. One rename, and no
-			// staging file ever answers to two names.
-			err = os.Rename(live, dst)
-		} else {
-			// A second live snapshot is not a thing a seal produces today
-			// (one seal at a time, and it releases its snapshot), but the
-			// pin list is a list, so the case has an answer: copy from
-			// wherever the file went.
-			err = copyFileSync(moved, dst)
-		}
-		if err != nil && !os.IsNotExist(err) {
-			return moved, fmt.Errorf("overlay: hand inode %d to a live snapshot: %w", ino, err)
-		}
-		if err == nil {
-			moved = dst
-		}
-		delete(p.lens, ino)
-	}
-	return moved, nil
-}
-
-// dropStagingLocked removes a purged inode's staging file, offering it to
-// any live snapshot first: the snapshot froze content the transaction
-// that just committed has stopped referencing, and this file is the only
-// copy of it. Best effort, like the removal it replaces — if the hand-off
-// fails the seal reading that inode fails loudly, which is the outcome
-// this ordering exists to make impossible to miss.
-func (fs *FS) dropStagingLocked(ino uint64) {
-	_, _ = fs.handOverPinsLocked(ino, 0)
-	os.Remove(fs.stagingPath(ino)) //nolint:errcheck
-}
-
-// copyOutForSnapshotsLocked gives ino a private staging file when a live
-// snapshot froze bytes below `below`. The snapshot takes the current file
-// and the live side copies itself a fresh one, because a write below the
-// frozen length needs the bytes it is not overwriting.
-func (fs *FS) copyOutForSnapshotsLocked(ino uint64, below int64) error {
-	moved, err := fs.handOverPinsLocked(ino, below)
-	if err != nil || moved == "" {
-		return err
-	}
-	live := fs.stagingPath(ino)
-	// Through a temporary, then rename: a crash must not leave the live
-	// name pointing at a half-written copy. The suffix cannot collide with
-	// a staging path (those are decimal).
-	tmp := live + ".cow"
-	if err := copyFileSync(moved, tmp); err != nil {
-		return fmt.Errorf("overlay: snapshot copy-out inode %d: %w", ino, err)
-	}
-	if err := os.Rename(tmp, live); err != nil {
-		os.Remove(tmp) //nolint:errcheck
-		return err
-	}
-	return nil
-}
-
-// copyFileSync writes a durable copy: the staging crash contract is that
-// bytes are on disk before anything points at them.
-func copyFileSync(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close() //nolint:errcheck
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
-	if err != nil {
-		return err
-	}
-	fail := func(err error) error {
-		out.Close()    //nolint:errcheck
-		os.Remove(dst) //nolint:errcheck
-		return err
-	}
-	if _, err := io.Copy(out, in); err != nil {
-		return fail(err)
-	}
-	if err := out.Sync(); err != nil {
-		return fail(err)
-	}
-	return out.Close()
-}
 
 // sortedInodes orders a set for deterministic reports and replays.
 func sortedInodes(set map[uint64]struct{}) []uint64 {

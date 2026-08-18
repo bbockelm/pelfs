@@ -28,18 +28,19 @@ scopes up front.
 ## How it works
 
 - **Data path**: files are split by content-defined chunking, and chunks are
-  written into large immutable **pack** objects under `<prefix>/packs/`.
-  Readers locate a chunk from the generation's pack list and fetch it as an
-  HTTP range request — Pelican origins and caches serve ranges natively, so
-  a pack is never fetched whole. The transport
+  written into immutable **pack** objects under `<prefix>/packs/`. Readers
+  locate a chunk from the generation's pack list and fetch the pack that
+  holds it whole — packs are cut small (2 MiB) precisely so that this is
+  cheap, and a source-tree walk is about 40x faster than the same reads
+  issued as ranges. The transport
   ([internal/pelicanobj](internal/pelicanobj/)) is built for `pelican://` /
   `osdf://` on the Pelican client library (`client.PelicanFS`, plus
   `DoStat`/`DoList`/`DoDelete`), inheriting director handling, endpoint
   failover, retries, ETag plumbing, and token discovery/acquisition. A small
   direct-HTTP transport handles plain `http(s)://` prefixes for tests and
   development against a bare server.
-- **Metadata**: SQLite **catalogs**, split by subtree, stored as ordinary
-  pack entries and addressed by content hash. A signed **superblock** names
+- **Metadata**: **catalogs**, split by subtree, stored as ordinary pack
+  entries and addressed by content hash. A signed **superblock** names
   the root catalog, the inode shards, and the pack list; `refs/<branch>` is
   the one mutable object in the volume. Inodes are stable across
   generations, which is what lets a mount swap to a newer generation by

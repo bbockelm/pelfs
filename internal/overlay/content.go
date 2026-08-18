@@ -262,6 +262,37 @@ type contentFreezer interface {
 
 var _ contentFreezer = (*stagingContent)(nil)
 
+// contentSnapshotter is the other way to freeze: a store whose content is
+// append-only hands back a read-only VIEW of itself rather than
+// protecting mutable bytes. There is nothing for the live side to do
+// differently afterwards, which is why it needs no pin, no scratch and no
+// copy-out.
+//
+// The work splits in two because only one half can hold the lock.
+// prepareSnapshot may be slow and touch the network (the memtable flushes
+// its ring) and runs with the mount serving; freezeContent is the
+// instant, and must be quick.
+type contentSnapshotter interface {
+	prepareSnapshot(ctx context.Context) error
+	freezeContent(ctx context.Context) (frozenContentStore, error)
+}
+
+// frozenContentStore is a content store that also knows when it is done.
+type frozenContentStore interface {
+	contentStore
+	releaseFrozen()
+}
+
+// contentCanFreeze reports whether a seal can walk a frozen view of this
+// overlay's content at all.
+func (fs *FS) contentCanFreeze() bool {
+	if _, ok := fs.content.(contentFreezer); ok {
+		return true
+	}
+	_, ok := fs.content.(contentSnapshotter)
+	return ok
+}
+
 func (c *stagingContent) freeze(dir string, lens map[uint64]int64) *snapPin {
 	p := &snapPin{dir: dir, lens: lens}
 	c.pins = append(c.pins, p)

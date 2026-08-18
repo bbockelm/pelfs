@@ -48,7 +48,7 @@ var snapDirs = map[*overlay.Snapshot]string{}
 func takeSnapshot(t *testing.T, ov *overlay.FS) *overlay.Snapshot {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), "snap")
-	snap, err := ov.Snapshot(dir)
+	snap, err := ov.Snapshot(context.Background(), dir)
 	if err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}
@@ -1065,7 +1065,7 @@ func TestSnapshotCostAtScale(t *testing.T) {
 
 	snapDir := filepath.Join(t.TempDir(), "snap")
 	start = time.Now()
-	snap, err := ov.Snapshot(snapDir)
+	snap, err := ov.Snapshot(context.Background(), snapDir)
 	if err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}

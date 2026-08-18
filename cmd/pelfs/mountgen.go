@@ -961,7 +961,7 @@ func (g *genSession) sealLocked(ctx context.Context, follow bool) (*publish.Resu
 		if err != nil {
 			return nil, err
 		}
-		snap, err = g.ov.Snapshot(snapDir)
+		snap, err = g.ov.Snapshot(ctx, snapDir)
 		if err != nil {
 			os.RemoveAll(snapDir) //nolint:errcheck
 			return nil, fmt.Errorf("snapshot the overlay: %w", err)

@@ -506,6 +506,32 @@ content store implements when it has already chunked what it holds. A
 staging overlay does not implement it and the seal reads and chunks as
 before; a memtable-backed one does, and the seal chunks nothing.
 
+### The checkpoint freeze becomes a map copy
+
+A checkpoint needs a view of the content that does not change under it.
+The staging store buys that with pinned files, a hand-over protocol, a
+scratch directory and a copy-out on every mutation below a frozen length
+— all of it because its bytes are MUTABLE and the live side overwrites
+them in place. Extents are append-only, so a frozen map is a frozen file.
+
+The rule that makes it that cheap is that FREEZING FLUSHES FIRST: after a
+flush every extent a content map names has a location, so nothing the
+frozen view refers to is still in the ring, and the ring is the only
+thing that gets recycled. A checkpoint has to flush before it can render
+a catalog row anyway, so this costs it nothing new.
+
+The work splits in two because only one half can hold the overlay's lock.
+Flushing the ring may take as long as an upload and runs with the mount
+still serving; the freeze itself is a second, small flush covering only
+what arrived meanwhile, plus the map copy. Measured on 200 staged inodes:
+
+    froze 200 staged inodes in 1.56 ms
+      (vacuum 1.21 ms, content 43 µs, namespace 130 µs)
+
+43 µs of content work against 200 × 362 µs = 72 ms of hardlinking. The
+whole freeze is now dominated by the VACUUM of the dirty metadata, which
+is what the cost breakdown always claimed it should be.
+
 ### What journalling a write costs
 
 The design left this open: the write path records one journal row per

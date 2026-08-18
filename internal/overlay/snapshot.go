@@ -62,11 +62,15 @@ import (
 // before swapping the base (the seal-then-swap order does this anyway).
 type Snapshot struct {
 	owner *FS
-	view  *FS
-	seq   uint64
-	dir   string
-	pin   *snapPin
-	cost  SnapshotCost
+	// frozen is the content view an append-only store handed over, closed
+	// with the snapshot. Nil for a staging store, which protects its bytes
+	// with pins instead (see snapPin).
+	frozen frozenContentStore
+	view   *FS
+	seq    uint64
+	dir    string
+	pin    *snapPin
+	cost   SnapshotCost
 
 	closeOnce sync.Once
 	closeErr  error
@@ -97,9 +101,20 @@ func (s *Snapshot) Cost() SnapshotCost { return s.cost }
 
 // Snapshot freezes the overlay into dir, which must be empty or absent
 // and belongs to the snapshot until Close removes it.
-func (fs *FS) Snapshot(dir string) (*Snapshot, error) {
+func (fs *FS) Snapshot(ctx context.Context, dir string) (*Snapshot, error) {
 	if dir == "" {
 		return nil, errors.New("overlay: Snapshot requires a scratch directory")
+	}
+	// A content store may have expensive, network-touching work to do
+	// before an instant can exist at all — the memtable flushes what is
+	// still in its ring, because an extent with no location cannot be
+	// named by a frozen view. It happens OUTSIDE the lock: the mount must
+	// not stop answering for the length of an upload. Whatever arrives
+	// during it is caught by the small second flush inside freeze.
+	if p, ok := fs.content.(contentSnapshotter); ok {
+		if err := p.prepareSnapshot(ctx); err != nil {
+			return nil, err
+		}
 	}
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -107,13 +122,11 @@ func (fs *FS) Snapshot(dir string) (*Snapshot, error) {
 	if filepath.Clean(dir) == filepath.Clean(fs.dir) {
 		return nil, errors.New("overlay: a snapshot cannot be taken into the overlay's own directory")
 	}
-	// A content store that cannot be frozen must say so here rather than
-	// produce a view whose metadata is consistent and whose bytes are
-	// absent. The write path's ring is append-only, so its instant is a
-	// position and freezing it is a different mechanism entirely — not
-	// built yet, and silence would look like a seal that published empty
-	// files.
-	if _, ok := fs.content.(contentFreezer); !ok {
+	// A content store that can do neither is one whose bytes a frozen
+	// view could not reach. Saying so beats producing a view whose
+	// metadata is consistent and whose content is absent — a seal that
+	// publishes empty files.
+	if !fs.contentCanFreeze() {
 		return nil, errors.New("overlay: this content store cannot be frozen; " +
 			"seal the live overlay instead of a snapshot")
 	}
@@ -129,7 +142,7 @@ func (fs *FS) Snapshot(dir string) (*Snapshot, error) {
 		}
 	}
 	snap := &Snapshot{owner: fs, seq: fs.seq, dir: dir}
-	if err := fs.freezeLocked(snap, dir, stagingDir); err != nil {
+	if err := fs.freezeLocked(ctx, snap, dir, stagingDir); err != nil {
 		os.RemoveAll(stagingDir)                     //nolint:errcheck
 		os.Remove(filepath.Join(dir, overlayDBName)) //nolint:errcheck
 		return nil, err
@@ -140,7 +153,7 @@ func (fs *FS) Snapshot(dir string) (*Snapshot, error) {
 // freezeLocked does the work Snapshot must not interleave: copy the
 // tables, link the staged content, and record the merged namespace Rebase
 // replays against the sealed base.
-func (fs *FS) freezeLocked(snap *Snapshot, dir, stagingDir string) error {
+func (fs *FS) freezeLocked(ctx context.Context, snap *Snapshot, dir, stagingDir string) error {
 	dbPath := filepath.Join(dir, overlayDBName)
 	if err := os.Remove(dbPath); err != nil && !os.IsNotExist(err) {
 		return err
@@ -176,14 +189,24 @@ func (fs *FS) freezeLocked(snap *Snapshot, dir, stagingDir string) error {
 		return err
 	}
 	start = time.Now()
-	// The freeze is a map fill and nothing else. A content store whose
-	// bytes are already immutable needs no pin at all.
+	// The freeze is a map fill and nothing else, whichever store answers.
+	// A staging store records the lengths it must protect; an append-only
+	// one hands back a read-only view of itself and has nothing to
+	// protect at all.
+	viewContent := contentStore(&stagingContent{dir: stagingDir, fallback: fs.stagingDir})
 	if f, ok := fs.content.(contentFreezer); ok {
 		lens := make(map[uint64]int64, len(content))
 		for _, st := range content {
 			lens[st.ino] = st.length
 		}
 		snap.pin = f.freeze(stagingDir, lens)
+	} else if sn, ok := fs.content.(contentSnapshotter); ok {
+		frozen, err := sn.freezeContent(ctx)
+		if err != nil {
+			return err
+		}
+		viewContent = frozen
+		snap.frozen = frozen
 	}
 	snap.cost.Staged = len(content)
 	snap.cost.Freeze = time.Since(start)
@@ -196,7 +219,7 @@ func (fs *FS) freezeLocked(snap *Snapshot, dir, stagingDir string) error {
 	snap.cost.Edges = time.Since(start)
 
 	start = time.Now()
-	view, err := openSnapshotView(fs, dir, stagingDir)
+	view, err := openSnapshotView(fs, dir, stagingDir, viewContent)
 	if err != nil {
 		return err
 	}
@@ -234,7 +257,7 @@ func readEdgeMap(q querier) (map[uint64]provEdge, error) {
 // shares the base generation (genfs is safe for concurrent use) and
 // inherits this session's base residency, but nothing else: its own lock,
 // its own connection, its own staging files.
-func openSnapshotView(fs *FS, dir, stagingDir string) (*FS, error) {
+func openSnapshotView(fs *FS, dir, stagingDir string, content contentStore) (*FS, error) {
 	// immutable=1: the frozen copy is written once, by the VACUUM INTO
 	// above, and never touched again — so the pager can skip both the
 	// POSIX locking and the change-detection stat it would otherwise pay
@@ -262,12 +285,10 @@ func openSnapshotView(fs *FS, dir, stagingDir string) (*FS, error) {
 		q:          newStmtCache(db),
 		dir:        dir,
 		stagingDir: stagingDir,
-		// The freeze copies nothing, so most inodes are read straight out
-		// of the LIVE staging directory (see stagingContent.open).
-		content:   &stagingContent{dir: stagingDir, fallback: fs.stagingDir},
-		prov:      prov,
-		modSeq:    make(map[uint64]uint64),
-		snapEdges: make(map[uint64]map[uint64]provEdge),
+		content:    content,
+		prov:       prov,
+		modSeq:     make(map[uint64]uint64),
+		snapEdges:  make(map[uint64]map[uint64]provEdge),
 	}, nil
 }
 
@@ -298,6 +319,9 @@ func (s *Snapshot) release(deleteScratch bool) error {
 			f.release(s.pin)
 		}
 		s.owner.mu.Unlock()
+		if s.frozen != nil {
+			s.frozen.releaseFrozen()
+		}
 		if s.view != nil {
 			s.closeErr = s.view.Close()
 		}

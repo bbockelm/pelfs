@@ -22,7 +22,7 @@ import (
 //
 // The caller's contract, in order, and none of it optional:
 //
-//  1. snap := fs.Snapshot(dir); seq := snap.Seq()
+//  1. snap := fs.Snapshot(ctx, dir); seq := snap.Seq()
 //  2. seal snap (NOT the live overlay) and publish it successfully
 //  3. swap the base *genfs.FS in place to the sealed generation
 //     (genfs.Swap, which also re-descends kernel-held residency)

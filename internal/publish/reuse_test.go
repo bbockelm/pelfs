@@ -151,7 +151,7 @@ func (v *reuseVol) checkpoint() *publish.Result {
 	v.t.Helper()
 	ctx := context.Background()
 	v.snaps++
-	snap, err := v.ov.Snapshot(filepath.Join(v.state, fmt.Sprintf("snap-%d", v.snaps)))
+	snap, err := v.ov.Snapshot(context.Background(), filepath.Join(v.state, fmt.Sprintf("snap-%d", v.snaps)))
 	if err != nil {
 		v.t.Fatalf("snapshot: %v", err)
 	}

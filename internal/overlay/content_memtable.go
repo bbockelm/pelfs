@@ -2,6 +2,7 @@ package overlay
 
 import (
 	"context"
+	"errors"
 	"os"
 
 	"github.com/bbockelm/pelfs/internal/genfs"
@@ -39,9 +40,91 @@ type memtableContent struct {
 }
 
 var (
-	_ contentStore   = (*memtableContent)(nil)
-	_ ContentRecords = (*memtableContent)(nil)
+	_ contentStore       = (*memtableContent)(nil)
+	_ ContentRecords     = (*memtableContent)(nil)
+	_ contentSnapshotter = (*memtableContent)(nil)
+	_ frozenContentStore = (*frozenMemtableContent)(nil)
+	_ ContentRecords     = (*frozenMemtableContent)(nil)
 )
+
+// prepareSnapshot flushes with the mount still serving. It is the
+// expensive half — chunking, hashing and uploading whatever is in the
+// ring — and it happens outside the overlay's lock precisely because a
+// checkpoint must not stop the mount for the length of an upload.
+func (m *memtableContent) prepareSnapshot(ctx context.Context) error {
+	return m.store.Flush(ctx)
+}
+
+// freezeContent is the instant. The flush inside it covers only what
+// arrived since prepareSnapshot, so the lock hold is a small flush and a
+// copy of the extent maps rather than a session's worth of upload.
+func (m *memtableContent) freezeContent(ctx context.Context) (frozenContentStore, error) {
+	f, err := m.store.Freeze(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &frozenMemtableContent{store: m.store, view: f}, nil
+}
+
+// frozenMemtableContent serves one instant of a memtable's content. It is
+// read-only by construction: a seal walks it and nothing writes to it,
+// and the write methods say so rather than silently accepting bytes that
+// would belong to no generation.
+type frozenMemtableContent struct {
+	store *memtable.Store
+	view  *memtable.Frozen
+	seal  *memtable.Sealer
+}
+
+func (f *frozenMemtableContent) releaseFrozen() { f.view.Release() }
+
+func (f *frozenMemtableContent) ReadAt(ctx context.Context, ino uint64, off int64, dst []byte) (int, error) {
+	return f.view.Read(ctx, ino, off, dst)
+}
+
+func (f *frozenMemtableContent) Size(ino uint64) (int64, bool) { return f.view.Size(ino), true }
+
+func (f *frozenMemtableContent) Create(uint64) error { return errFrozenContent }
+func (f *frozenMemtableContent) Adopt(context.Context, uint64, int64, baseFile) error {
+	return errFrozenContent
+}
+func (f *frozenMemtableContent) WriteAt(context.Context, uint64, int64, []byte) error {
+	return errFrozenContent
+}
+func (f *frozenMemtableContent) Truncate(context.Context, uint64, int64) error {
+	return errFrozenContent
+}
+func (f *frozenMemtableContent) Drop(uint64) func() { return nil }
+
+var errFrozenContent = errors.New("overlay: a frozen content view is read-only")
+
+// Records renders the instant. No flush here: freezing already did it,
+// and doing it again would fold bytes written after the instant into the
+// generation being published.
+func (f *frozenMemtableContent) Records(ctx context.Context, ino uint64) (genfs.Content, bool, error) {
+	if f.seal == nil {
+		f.seal = f.store.NewSealer()
+	}
+	size := f.view.Size(ino)
+	if size == 0 {
+		return genfs.Content{}, false, nil
+	}
+	refs, err := f.view.Records(ctx, f.seal, ino)
+	if err != nil {
+		return genfs.Content{}, false, err
+	}
+	return genfs.Content{Length: size, Refs: refs}, true, nil
+}
+
+func (f *frozenMemtableContent) Packs(ctx context.Context) ([]packstore.SealedPack, error) {
+	if f.seal != nil {
+		if err := f.seal.Finish(ctx); err != nil {
+			return nil, err
+		}
+		f.seal = nil
+	}
+	return f.store.Packs(), nil
+}
 
 func newMemtableContent(store *memtable.Store) *memtableContent {
 	return &memtableContent{store: store}

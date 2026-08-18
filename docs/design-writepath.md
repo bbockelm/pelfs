@@ -174,13 +174,59 @@ exactly when there is something to fill it with. The `tar` case falls
 out: each file is written once, nothing supersedes it, and its extents
 age straight through.
 
-Promotion may pass through more than one level, which is the point of
-calling this an LSM. Each hop is another chance for churn to die before
-anything is sent, and costs a copy of whatever is still live. Whether
-more than one level pays depends on whether real workloads produce
-content that survives one collapse and dies before a second — an editor's
-save cycle, a build output rewritten repeatedly — and that is a
-measurement against real corpora, not an argument.
+### One ring, not a stack of tables
+
+The first sketch had discrete levels: an active table, a frozen table,
+maybe more, with content copied between them. Counting what that costs
+kills it. Two tables double the cheap thing — mmap'd file pages the OS
+can evict — while a flush duplicates the *expensive* thing, because a
+table's contents exist simultaneously as raw extents and as the chunked,
+compressed packs built from them, for the whole duration of the flush.
+
+The buffer is therefore a **ring**. Writes append at the head; packing
+consumes from the tail; a reclaimed region is immediately reusable. Three
+consequences, and the first is the one that answers the cost:
+
+- **Duplication is bounded by pack size, not table size.** A tail region
+  becomes a pack, the pack is uploaded, the region is reclaimed. What
+  exists twice is the few packs in flight rather than a whole table — and
+  it improves as the pack target shrinks, which suits a 2 MiB target.
+- **Backpressure is gradual instead of a cliff.** A writer blocks only
+  when the head catches the tail, and the tail advances continuously. The
+  two-table prototype blocked on 38 of 39 rotations, in whole-table
+  steps; a ring paces a fast writer smoothly against the uplink.
+- **Age becomes a coordinate, not a level.** How old an extent is, is
+  simply how far behind the head it sits. Promotion is one distance
+  rather than a level count plus a copy per hop, which dissolves the
+  question of how many levels are worth having.
+
+What a ring does not fix: a dead extent in the middle still occupies its
+space until the tail passes it. It is skipped at packing and never
+uploaded, so the generational win survives intact — but unlike dropping a
+whole table, it does not free space early.
+
+### Reclamation, wraparound, recovery
+
+Three obligations the ring adds, all of them well-trodden:
+
+**A reader watermark.** The tail may not advance past the oldest offset a
+reader still holds. The prototype already learned the underlying lesson —
+recycling a table unmaps bytes a reader may be mid-read of, which is a
+segfault rather than a stale answer — and a ring makes it finer-grained
+rather than different in kind.
+
+**Wraparound.** A record never straddles the seam: a writer that cannot
+fit one pads to the end and wraps. Usable capacity is therefore slightly
+below the buffer size, which is a reason to size the buffer above the
+promotion distance rather than at it.
+
+**Sequenced records.** An append-only log is recovered by scanning until
+a bad CRC. A ring cannot be, because stale bytes beyond the head are
+well-formed records from a previous lap. Every record carries a
+monotonically increasing sequence number, and recovery accepts the
+longest run whose sequences ascend — the discipline a write-ahead log
+uses, and the reason the recovery section above is written in terms of
+"the surviving run" rather than "everything before the first bad CRC".
 
 ### Queued for upload is the seal boundary
 
@@ -209,13 +255,21 @@ Starting points, to be revised with operating experience:
 
 | | |
 |---|---|
-| memtable | 64 MiB |
+| ring buffer | 72 MiB |
+| promotion distance (start packing) | 64 MiB |
+| headroom before a writer blocks | 8 MiB |
 | queued-for-upload threshold | 64 MiB |
-| total uncommitted | 128 MiB |
 | pack target | 2 MiB today, plausibly 4–16 MiB |
 
-The two 64 MiB figures bound how much work a crash can lose and how much
-a session can run ahead of its uplink. The pack target is a separate dial
+The buffer is deliberately LARGER than the promotion distance. Packing is
+not free — it chunks, hashes and compresses — so a writer that filled the
+buffer exactly at the moment packing began would block immediately and
+every time. The 8 MiB of slack is the writer's runway: it keeps writing
+while the tail is being drained, and blocks only if it outruns the
+packer by more than that.
+
+The promotion distance bounds how much a crash can lose and how far a
+session may run ahead of its uplink. The pack target is a separate dial
 — it sets what a READER fetches, since a reader takes packs whole — and
 the recent sweep put it at 2 MiB on the argument that a scattered reader
 pays a factor of two there against seventeen at 64 MiB. It is the number

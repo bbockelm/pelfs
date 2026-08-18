@@ -68,8 +68,9 @@ func TestRingWrapsAndReclaims(t *testing.T) {
 // A writer must be told to wait rather than overwrite bytes the tail has
 // not released. That refusal IS the backpressure signal.
 func TestRingRefusesToOverwriteLiveBytes(t *testing.T) {
-	r, _ := newRing(t, 4<<10)
-	payload := bytes.Repeat([]byte{0x7f}, 900)
+	const size = 16 << 10
+	r, _ := newRing(t, size)
+	payload := bytes.Repeat([]byte{0x7f}, MaxRecord(size))
 	var appended int
 	for {
 		if _, err := r.Append(&Record{Handle: Handle(appended)}, payload); err != nil {
@@ -100,14 +101,14 @@ func TestRingRefusesToOverwriteLiveBytes(t *testing.T) {
 // from a previous lap with LOWER sequence numbers; recovery must stop
 // there rather than reading them as live.
 func TestRingRecoveryStopsAtAStaleLap(t *testing.T) {
-	const size = 4 << 10
+	const size = 16 << 10
 	path := filepath.Join(t.TempDir(), "ring")
 	r, err := CreateRing(path, size)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	payload := bytes.Repeat([]byte{0x11}, 400)
+	payload := bytes.Repeat([]byte{0x11}, MaxRecord(size))
 	// Fill, reclaim, and lap so older records sit ahead of the head.
 	for i := 0; i < 40; i++ {
 		if _, err := r.Append(&Record{Handle: Handle(i), Inode: uint64(i)}, payload); errors.Is(err, ErrRingFull) {
@@ -200,7 +201,7 @@ func TestRingRecoveryStopsAtATornRecord(t *testing.T) {
 // record ever straddles — which is what lets At hand out one contiguous
 // slice with no copy.
 func TestRingPadsRatherThanStraddling(t *testing.T) {
-	const size = 4 << 10
+	const size = 16 << 10
 	r, _ := newRing(t, size)
 	big := bytes.Repeat([]byte{0x33}, 1200)
 	var last uint64
@@ -239,5 +240,70 @@ func TestRingAgeIsDistanceBehindTheHead(t *testing.T) {
 	}
 	if fmt.Sprint(r.Used()) != fmt.Sprint(age) {
 		t.Fatalf("used %d and age %d should agree with nothing reclaimed", r.Used(), age)
+	}
+}
+
+// TestRingSeparatesFullFromTooLarge is the deadlock guard. A writer that
+// blocks until space frees is correct for a full ring and an infinite
+// loop for a record that can never fit, so the two must be distinguishable
+// with errors.Is rather than by message.
+func TestRingSeparatesFullFromTooLarge(t *testing.T) {
+	const size = 8 << 10
+	r, _ := newRing(t, size)
+
+	huge := bytes.Repeat([]byte{0x55}, size)
+	_, err := r.Append(&Record{Handle: 1}, huge)
+	if !errors.Is(err, ErrRecordTooLarge) {
+		t.Fatalf("oversized record: err = %v, want ErrRecordTooLarge", err)
+	}
+	if errors.Is(err, ErrRingFull) {
+		t.Fatal("an impossible record reported itself as merely full; a waiting writer would spin forever")
+	}
+
+	// A legal record fills the ring and reports ErrRingFull, which IS
+	// waitable: reclaiming lets it through.
+	ok := bytes.Repeat([]byte{0x66}, MaxRecord(size))
+	var full bool
+	for i := 0; i < 100 && !full; i++ {
+		if _, err := r.Append(&Record{Handle: Handle(i)}, ok); errors.Is(err, ErrRingFull) {
+			full = true
+		} else if err != nil {
+			t.Fatalf("append: %v", err)
+		}
+	}
+	if !full {
+		t.Fatal("the ring never reported full")
+	}
+	if err := r.Reclaim(r.Head()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Append(&Record{Handle: 999}, ok); err != nil {
+		t.Fatalf("a maximum-size record must fit a drained ring, even after a pad: %v", err)
+	}
+}
+
+// The trap the size cap closes: with a record near the ring's own size, a
+// pad plus the record cannot fit even in a drained ring, so a writer
+// waiting on a packer with nothing left to pack would wait forever. At
+// the cap, a drained ring always admits a record whatever the seam.
+func TestRingAlwaysAdmitsAMaxRecordWhenDrained(t *testing.T) {
+	const size = 16 << 10
+	r, _ := newRing(t, size)
+	payload := bytes.Repeat([]byte{0x77}, MaxRecord(size))
+
+	// Walk the head to many different offsets relative to the seam, and
+	// require a drained ring to accept a full-size record at each.
+	for i := 0; i < 40; i++ {
+		if _, err := r.Append(&Record{Handle: Handle(i)}, payload); err != nil {
+			if !errors.Is(err, ErrRingFull) {
+				t.Fatalf("append %d: %v", i, err)
+			}
+			if err := r.Reclaim(r.Head()); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := r.Append(&Record{Handle: Handle(i)}, payload); err != nil {
+				t.Fatalf("drained ring refused a maximum-size record at head %d: %v", r.Head(), err)
+			}
+		}
 	}
 }

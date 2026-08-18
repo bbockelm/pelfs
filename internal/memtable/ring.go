@@ -63,6 +63,25 @@ const (
 // advances. It is routine — it is the backpressure signal — not a fault.
 var ErrRingFull = errors.New("memtable: ring full")
 
+// ErrRecordTooLarge reports a record no amount of waiting can fit. It is
+// a SEPARATE sentinel from ErrRingFull on purpose: a writer that blocks
+// until space frees is correct for one and an infinite loop for the
+// other, and an unstructured error would make the two indistinguishable.
+// The caller's answer is to split the write, never to wait.
+var ErrRecordTooLarge = errors.New("memtable: record too large for the ring")
+
+// MaxRecord is the largest payload a ring of the given size accepts.
+//
+// It is a fraction of the ring rather than "whatever fits", which closes
+// a subtler trap than the obvious one. A record is padded past the seam
+// rather than straddling it, and the pad consumes ring space too — so a
+// record approaching the ring's own size can fail to fit even when
+// nothing is live, and a writer waiting for a packer that has nothing
+// left to pack would wait forever. Capping a record at an eighth of the
+// ring means a pad plus a record always fits in a drained ring, so
+// waiting always terminates.
+func MaxRecord(ringSize int) int { return ringSize/8 - ringRecHdr }
+
 // CreateRing makes a ring file of exactly size bytes of data region and
 // maps it. The file is preallocated: appends are stores into the mapping
 // and never extend the file, because extending would mean remapping under
@@ -134,10 +153,11 @@ func (r *Ring) Tail() uint64 { return r.tail }
 // never straddles the seam: if it will not fit before the end of the
 // mapping, the remainder is filled with a pad record and the write wraps.
 func (r *Ring) Append(rec *Record, payload []byte) (uint64, error) {
-	need := uint64(ringRecHdr + len(payload))
-	if need > r.size {
-		return 0, fmt.Errorf("memtable: record of %d bytes exceeds the ring", need)
+	if len(payload) > MaxRecord(int(r.size)) {
+		return 0, fmt.Errorf("%w: %d bytes against a %d-byte limit in a %d-byte ring",
+			ErrRecordTooLarge, len(payload), MaxRecord(int(r.size)), r.size)
 	}
+	need := uint64(ringRecHdr + len(payload))
 	off := r.head % r.size
 	if off+need > r.size {
 		// Pad to the seam. The pad consumes ring space, so it must fit

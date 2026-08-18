@@ -32,6 +32,10 @@ type Options struct {
 	PromotionDistance uint64
 	// Obj is the federation. Flushes upload packs to packs/<name>.
 	Obj pelicanobj.Store
+	// Base is the immutable generation this store's content sits over.
+	// Without it a file the session did not create cannot be adopted, and
+	// the caller must supply its bytes.
+	Base Base
 	// PackCacheBytes bounds the local copy of packs (see packCache). Zero
 	// takes DefaultPackCacheBytes; PackCacheDisabled turns it off, which
 	// makes every read of packed content a federation round trip.
@@ -89,6 +93,15 @@ type Stats struct {
 	// LostHandles counts extents a recovery could not find. Nonzero means
 	// data loss and the caller must say so out loud.
 	LostHandles int64
+	// AdoptedFiles and AdoptedBytes count files taken over from the base
+	// generation by REFERENCE — the operation the staging store performs
+	// by copying the whole file. AdoptedInline and AdoptedByReading count
+	// the two shapes that still have to move bytes; if either ever
+	// approaches AdoptedFiles, the saving has quietly stopped happening.
+	AdoptedFiles     int64
+	AdoptedBytes     int64
+	AdoptedInline    int64
+	AdoptedByReading int64
 	// PackReadsLocal and PackReadsRemote split reads of packed content by
 	// where the bytes came from. The claim they check is the one that
 	// decides whether staging can go away: content this session wrote
@@ -123,6 +136,13 @@ type Store struct {
 	index map[Handle]Record // handle -> its record, position absolute
 	live  map[Handle]int    // content references per handle
 	order []Handle          // handles in ring order, oldest first
+
+	base Base
+	// baseRefs holds, per ADOPTED handle, the base generation's own
+	// content records for that file (base.go). An extent is either these,
+	// or a ring record, or a location-map entry — the three places bytes
+	// can be, resolved in one place each.
+	baseRefs map[Handle]baseExtent
 
 	// cache is the local copy of packs this session wrote or read. It is
 	// what lets a seal re-chunk a rewrite without fetching back bytes it
@@ -209,6 +229,8 @@ func newStore(opts Options) (*Store, error) {
 		promotion: opts.PromotionDistance,
 		index:     make(map[Handle]Record),
 		live:      make(map[Handle]int),
+		base:      opts.Base,
+		baseRefs:  make(map[Handle]baseExtent),
 		obj:       opts.Obj,
 		chunkOpts: opts.Chunk,
 		hasher:    opts.Hasher,
@@ -531,6 +553,8 @@ func (s *Store) Close() error {
 // handed back the moment the tail passes them.
 type source struct {
 	ring   bool
+	base   bool
+	ino    uint64
 	pos    uint64
 	off    int
 	length int
@@ -581,6 +605,12 @@ func (s *Store) Read(ctx context.Context, ino uint64, off int64, p []byte) (int,
 	clear(p[:n]) // holes and gaps read as zeros
 	for _, part := range parts {
 		dst := p[part.dst : part.dst+part.src.len()]
+		if part.src.base {
+			if _, err := s.base.Read(ctx, part.src.ino, int64(part.src.off), dst); err != nil {
+				return 0, err
+			}
+			continue
+		}
 		if part.src.ring {
 			b, ok := s.ring.At(part.src.pos, part.src.off+part.src.length)
 			if !ok {
@@ -601,7 +631,7 @@ func (s *Store) Read(ctx context.Context, ino uint64, off int64, p []byte) (int,
 }
 
 func (src source) len() int {
-	if src.ring {
+	if src.ring || src.base {
 		return src.length
 	}
 	n := 0
@@ -691,6 +721,12 @@ func (s *Store) plan(ino uint64, off int64, n int) ([]readPart, int, error) {
 
 // resolveLocked turns a handle plus an intra-extent range into a source.
 func (s *Store) resolveLocked(h Handle, skip, length int) (source, error) {
+	if be, ok := s.baseRefs[h]; ok {
+		// An adopted file's bytes are still the base generation's, and the
+		// base is immutable — nothing to pin, and nothing this store has
+		// to hold a copy of.
+		return source{base: true, ino: be.ino, off: skip, length: length}, nil
+	}
 	if rec, ok := s.index[h]; ok {
 		// Pinning here is what makes reading outside the lock safe: the
 		// packer may reclaim while this read is in flight, and the ring

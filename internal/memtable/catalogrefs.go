@@ -36,31 +36,36 @@ var ErrNotFlushed = errors.New("memtable: content has not been flushed, so it ha
 // file order: the resolution of a content row against the location map,
 // before any question of what a ChunkRef can express.
 type piece struct {
-	id    chunkid.Identity
-	off   int64 // offset into the chunk
-	n     int64 // bytes taken
-	at    int64 // file offset they land at
-	total int64 // the chunk's whole length
+	id   chunkid.Identity
+	off  int64 // offset into the chunk
+	n    int64 // bytes taken
+	at   int64 // file offset they land at
+	llen int64 // the chunk's whole LOGICAL length
+	clen int64 // ... and its stored length, which differ once a chunk is
+	// compressed or encrypted. Both travel because a ChunkRef carries
+	// both, and a chunk adopted from the base must be emitted with the
+	// base's own numbers rather than re-derived ones.
 }
 
 // group is consecutive pieces of the SAME chunk, taken in order and with
 // no gap — the unit a ChunkRef can name, if it covers the whole chunk.
 type group struct {
-	id    chunkid.Identity
-	off   int64
-	n     int64
-	at    int64
-	total int64
+	id   chunkid.Identity
+	off  int64
+	n    int64
+	at   int64
+	llen int64
+	clen int64
 }
 
-func (g group) whole() bool { return g.off == 0 && g.n == g.total }
+func (g group) whole() bool { return g.off == 0 && g.n == g.llen }
 func (g group) end() int64  { return g.at + g.n }
 
 func (g group) ref() catalog.ChunkRef {
 	return catalog.ChunkRef{
 		Identity:      append([]byte(nil), g.id[:]...),
-		LLen:          g.total,
-		CLen:          g.total,
+		LLen:          g.llen,
+		CLen:          g.clen,
 		LogicalOffset: g.at,
 	}
 }
@@ -77,6 +82,14 @@ func (s *Store) piecesLocked(ino uint64) ([]piece, error) {
 	for _, r := range c.refs {
 		if _, ok := s.index[r.Handle]; ok {
 			return nil, fmt.Errorf("%w: inode %d extent %d is still in the ring", ErrNotFlushed, ino, r.Handle)
+		}
+		// An adopted extent resolves to the BASE generation's own records.
+		// They tile by construction — that is how a generation publishes a
+		// file — so an untouched range of an adopted file costs a seal
+		// nothing at all, and only what a write disturbed is re-chunked.
+		if be, ok := s.baseRefs[r.Handle]; ok {
+			out = append(out, be.pieces(r.FileOff, int64(r.Skip), int64(r.Length))...)
+			continue
 		}
 		slices, ok := s.handleLoc[r.Handle]
 		if !ok {
@@ -99,11 +112,12 @@ func (s *Store) piecesLocked(ino uint64) ([]piece, error) {
 			delta := max(want-pos, 0)
 			take := int64(min(cs.Length-delta, remaining))
 			out = append(out, piece{
-				id:    cs.ID,
-				off:   int64(cs.ChunkOff + delta),
-				n:     take,
-				at:    at,
-				total: loc.Length,
+				id:   cs.ID,
+				off:  int64(cs.ChunkOff + delta),
+				n:    take,
+				at:   at,
+				llen: loc.Length,
+				clen: loc.Length,
 			})
 			at += take
 			want += int(take)
@@ -134,7 +148,7 @@ func groupPieces(ps []piece) []group {
 				continue
 			}
 		}
-		out = append(out, group{id: p.id, off: p.off, n: p.n, at: p.at, total: p.total})
+		out = append(out, group{id: p.id, off: p.off, n: p.n, at: p.at, llen: p.llen, clen: p.clen})
 	}
 	return out
 }
@@ -155,7 +169,7 @@ func (s *Store) ChunkRefs(ino uint64) ([]catalog.ChunkRef, error) {
 	for _, g := range groupPieces(ps) {
 		if !g.whole() {
 			return nil, fmt.Errorf("%w: inode %d wants bytes [%d,%d) of chunk %s (length %d) at file offset %d",
-				ErrNotTiled, ino, g.off, g.off+g.n, g.id, g.total, g.at)
+				ErrNotTiled, ino, g.off, g.off+g.n, g.id, g.llen, g.at)
 		}
 		out = append(out, g.ref())
 	}

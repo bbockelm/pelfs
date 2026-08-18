@@ -25,7 +25,7 @@ type catJob struct {
 // are queued rather than recursed into, so exactly one path catalog is
 // open at a time however deep the tree nests (shards are the exception —
 // see openShard).
-func (c *checker) walk(ctx context.Context, root *catalog.Catalog, rootHex string) {
+func (c *checker) walk(ctx context.Context, root catalog.Reader, rootHex string) {
 	seenInode := make(map[uint64]bool)
 	visited := map[string]bool{rootHex: true}
 	queue := []catJob{{idHex: rootHex, ino: rootInode, path: "/"}}
@@ -61,7 +61,7 @@ func (c *checker) walk(ctx context.Context, root *catalog.Catalog, rootHex strin
 // live in the SAME catalog; transition points are appended to the queue.
 // walked guards against an edge cycling back to an ancestor within one
 // catalog — a corrupt catalog must not hang fsck.
-func (c *checker) walkDir(ctx context.Context, cat *catalog.Catalog, j catJob, ino uint64, dirPath string,
+func (c *checker) walkDir(ctx context.Context, cat catalog.Reader, j catJob, ino uint64, dirPath string,
 	seenInode, walked map[uint64]bool, visited map[string]bool, queue *[]catJob) {
 	if walked[ino] {
 		c.problem(KindCycle, dirPath, "directory inode %d is reachable more than once within catalog %s", ino, j.idHex)
@@ -157,7 +157,7 @@ func (c *checker) walkDir(ctx context.Context, cat *catalog.Catalog, j catJob, i
 // (nlink > 1) files keep their content in an inode shard; their node row
 // stays in the path catalog, which is the routing genfs performs at read
 // time and the invariant checked here.
-func (c *checker) checkFile(ctx context.Context, cat *catalog.Catalog, j catJob, n catalog.Node, filePath string) {
+func (c *checker) checkFile(ctx context.Context, cat catalog.Reader, j catJob, n catalog.Node, filePath string) {
 	content := cat
 	ino := uint64(n.Inode)
 	if n.Nlink > 1 {

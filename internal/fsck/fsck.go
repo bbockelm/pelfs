@@ -188,7 +188,7 @@ type checker struct {
 
 	// shards holds open shard handles for the whole sweep — they are few
 	// (one per inode range) and are revisited by every promoted inode.
-	shards map[string]*catalog.Catalog
+	shards map[string]catalog.Reader
 
 	// chunks records the distinct chunk identities the namespace
 	// references; jobs is the deep-mode work list, one entry per identity.
@@ -243,7 +243,7 @@ func Check(ctx context.Context, o Options) (*Report, error) {
 		rep:      &Report{},
 		spillDir: spillDir,
 		index:    make(map[string]packLoc),
-		shards:   make(map[string]*catalog.Catalog),
+		shards:   make(map[string]catalog.Reader),
 	}
 	defer c.closeShards()
 
@@ -327,7 +327,7 @@ func (c *checker) checkPacks(ctx context.Context) {
 // openRoot opens the root catalog and settles the identity mode. The root
 // is spilled before its algo is known, so it is verified retroactively —
 // the same order genfs.Open uses.
-func (c *checker) openRoot(ctx context.Context) (*catalog.Catalog, string, error) {
+func (c *checker) openRoot(ctx context.Context) (catalog.Reader, string, error) {
 	rootHex := hex.EncodeToString(c.o.SB.RootCatalog[:])
 	plain, err := c.decodeObject(ctx, rootHex)
 	if err != nil {
@@ -342,7 +342,7 @@ func (c *checker) openRoot(ctx context.Context) (*catalog.Catalog, string, error
 	if err != nil {
 		return nil, "", err
 	}
-	root, err := catalog.Open(fp)
+	root, err := catalog.OpenReader(fp)
 	if err != nil {
 		os.Remove(fp) //nolint:errcheck
 		c.problem(KindBadCatalog, "/", "root catalog %s: %v", rootHex, err)
@@ -390,7 +390,7 @@ func (c *checker) checkShards(ctx context.Context) {
 
 // openShard opens (and caches) one inode shard. Shards outlive the walk
 // because every promoted inode routes through one.
-func (c *checker) openShard(ctx context.Context, idHex, path string) *catalog.Catalog {
+func (c *checker) openShard(ctx context.Context, idHex, path string) catalog.Reader {
 	if cat, ok := c.shards[idHex]; ok {
 		return cat // nil is cached too: report the failure once
 	}
@@ -411,7 +411,7 @@ func (c *checker) closeShards() {
 // one catalog-class object (path catalog or inode shard), reporting rather
 // than returning failures. A nil result means the object is unusable and
 // the problem is already recorded.
-func (c *checker) openCatalogObject(ctx context.Context, idHex, path, missingKind, badKind string) *catalog.Catalog {
+func (c *checker) openCatalogObject(ctx context.Context, idHex, path, missingKind, badKind string) catalog.Reader {
 	plain, err := c.decodeObject(ctx, idHex)
 	if err != nil {
 		if errors.Is(err, errNotIndexed) {
@@ -431,7 +431,7 @@ func (c *checker) openCatalogObject(ctx context.Context, idHex, path, missingKin
 		c.problem(badKind, path, "%s: spill: %v", idHex, err)
 		return nil
 	}
-	cat, err := catalog.Open(fp)
+	cat, err := catalog.OpenReader(fp)
 	if err != nil {
 		os.Remove(fp) //nolint:errcheck
 		c.problem(badKind, path, "%s: %v", idHex, err)
@@ -475,7 +475,7 @@ func (c *checker) spill(idHex string, plain []byte) (string, error) {
 
 // releaseCatalog closes a catalog and drops its spill file. Catalogs are
 // visited exactly once by the descent, so nothing is kept open.
-func (c *checker) releaseCatalog(cat *catalog.Catalog, idHex string) {
+func (c *checker) releaseCatalog(cat catalog.Reader, idHex string) {
 	if cat != nil {
 		cat.Close() //nolint:errcheck
 	}

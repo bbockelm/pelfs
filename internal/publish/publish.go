@@ -213,6 +213,15 @@ type Options struct {
 	// VolumeID identifies a volume being created by InitVolume. Every
 	// other path takes identity from the previous generation.
 	VolumeID [16]byte
+	// StaticCatalogs emits catalogs in the packed static format instead of
+	// SQLite (docs/design-catalog.md). It affects only what this publish
+	// WRITES: catalogs are immutable and content-addressed, so anything an
+	// earlier generation published stays exactly as it was, and a reader
+	// picks an implementation per catalog from the bytes. A volume is
+	// therefore mixed until every subtree has been touched, which is the
+	// intended migration — converting in bulk would give every catalog a
+	// new identity and re-upload the whole namespace.
+	StaticCatalogs bool
 	// CatalogConcurrency bounds how many catalogs are built at once; zero
 	// uses the machine's parallelism. It changes only how long the step
 	// takes, never what it produces — the appends stay in plan order (see
@@ -875,23 +884,22 @@ func (p *pipeline) writeShards(ctx context.Context) ([]superblock.ShardEntry, er
 	for i, part := range parts {
 		first, last := part[0], part[len(part)-1]
 		fp := filepath.Join(p.tmpDir, fmt.Sprintf("shard-%d.db", i))
-		cw, err := catalog.Create(fp, catalog.Meta{
+		cw, err := p.newCatalogBuilder(fp, catalog.Meta{
 			VolumeUUID:   p.volUUID,
 			CoveredPath:  fmt.Sprintf("inodes:%d-%d", first, last),
 			Generation:   p.gen,
 			IdentityAlgo: p.identityAlgo(),
-		})
+		}, first)
 		if err != nil {
 			return nil, fmt.Errorf("publish: create shard: %w", err)
 		}
 		seen := make(map[uint64]bool)
 		for _, ino := range part {
 			if err := p.emitInode(cw, seen, ino, true); err != nil {
-				cw.Close() //nolint:errcheck
 				return nil, fmt.Errorf("publish: shard inode %d: %w", ino, err)
 			}
 		}
-		id, err := p.packSQLite(ctx, cw, fp, packstore.EntryShard)
+		id, err := p.packCatalog(ctx, cw, packstore.EntryShard)
 		if err != nil {
 			return nil, fmt.Errorf("publish: pack shard: %w", err)
 		}
@@ -1111,12 +1119,12 @@ func (p *pipeline) inlineLen(r *rec) int64 {
 // rather than a read of the shared map the caller is still filling in.
 func (p *pipeline) buildCatalog(rootIno uint64, childIDs map[uint64]chunkid.Identity) (chunkid.Identity, []byte, error) {
 	fp := filepath.Join(p.tmpDir, fmt.Sprintf("catalog-%d.db", rootIno))
-	cw, err := catalog.Create(fp, catalog.Meta{
+	cw, err := p.newCatalogBuilder(fp, catalog.Meta{
 		VolumeUUID:   p.volUUID,
 		CoveredPath:  p.pathOf[rootIno],
 		Generation:   p.gen,
 		IdentityAlgo: p.identityAlgo(),
-	})
+	}, rootIno)
 	if err != nil {
 		return chunkid.Identity{}, nil, fmt.Errorf("publish: create catalog %s: %w", p.pathOf[rootIno], err)
 	}
@@ -1166,10 +1174,9 @@ func (p *pipeline) buildCatalog(rootIno uint64, childIDs map[uint64]chunkid.Iden
 		return nil
 	}
 	if err := emit(rootIno); err != nil {
-		cw.Close() //nolint:errcheck
 		return chunkid.Identity{}, nil, fmt.Errorf("publish: catalog %s: %w", p.pathOf[rootIno], err)
 	}
-	id, stored, err := encodeSQLite(cw, fp, p.hasher, p.o.DEK)
+	id, stored, err := encodeCatalog(cw, p.hasher, p.o.DEK)
 	if err != nil {
 		return chunkid.Identity{}, nil, fmt.Errorf("publish: encode catalog %s: %w", p.pathOf[rootIno], err)
 	}
@@ -1179,7 +1186,7 @@ func (p *pipeline) buildCatalog(rootIno uint64, childIDs map[uint64]chunkid.Iden
 // emitInode writes one inode's node row (once per writer) and, when
 // content is true, its content records. Promoted inodes pass content=false
 // in path catalogs — node row only — and content=true in their shard.
-func (p *pipeline) emitInode(w *catalog.Writer, seen map[uint64]bool, ino uint64, content bool) error {
+func (p *pipeline) emitInode(w catalog.Builder, seen map[uint64]bool, ino uint64, content bool) error {
 	if seen[ino] {
 		return nil
 	}
@@ -1225,11 +1232,22 @@ func (p *pipeline) emitInode(w *catalog.Writer, seen map[uint64]bool, ino uint64
 	return nil
 }
 
-// packSQLite encodes a catalog/shard and appends it to a pack. Always
+// newCatalogBuilder opens a builder in whichever encoding this publish
+// emits. Existing catalogs are untouched either way: they are immutable
+// and content-addressed, so a volume simply holds both kinds and a
+// subtree migrates the next time something in it changes.
+func (p *pipeline) newCatalogBuilder(fp string, meta catalog.Meta, rootIno uint64) (catalog.Builder, error) {
+	if p.o.StaticCatalogs {
+		return catalog.NewStaticWriter(meta, int64(rootIno), p.o.InlineMax), nil
+	}
+	return catalog.Create(fp, meta)
+}
+
+// packCatalog encodes a catalog/shard and appends it to a pack. Always
 // zstd: nested rows and the superblock carry no alg column, so the
 // encoding must be fixed.
-func (p *pipeline) packSQLite(ctx context.Context, cw *catalog.Writer, fp, typ string) (chunkid.Identity, error) {
-	id, stored, err := encodeSQLite(cw, fp, p.hasher, p.o.DEK)
+func (p *pipeline) packCatalog(ctx context.Context, cw catalog.Builder, typ string) (chunkid.Identity, error) {
+	id, stored, err := encodeCatalog(cw, p.hasher, p.o.DEK)
 	if err != nil {
 		return chunkid.Identity{}, err
 	}
@@ -1239,18 +1257,15 @@ func (p *pipeline) packSQLite(ctx context.Context, cw *catalog.Writer, fp, typ s
 	return id, nil
 }
 
-// encodeSQLite closes a catalog/shard writer, hashes the file bytes into
-// its identity, and encodes the pack entry.
+// encodeCatalog finishes a catalog/shard builder, hashes its bytes into
+// an identity, and encodes the pack entry.
 //
 // It is deliberately free of the pipeline: everything it touches is its
-// own writer, its own file, and two immutable values, so catalog builds
-// can run side by side. Appending to a pack is the caller's job, because
-// that is the step whose ORDER is observable in the output.
-func encodeSQLite(cw *catalog.Writer, fp string, hasher chunkid.Hasher, dek []byte) (chunkid.Identity, []byte, error) {
-	if err := cw.Close(); err != nil {
-		return chunkid.Identity{}, nil, err
-	}
-	raw, err := os.ReadFile(fp)
+// own builder and two immutable values, so catalog builds can run side by
+// side. Appending to a pack is the caller's job, because that is the step
+// whose ORDER is observable in the output.
+func encodeCatalog(cw catalog.Builder, hasher chunkid.Hasher, dek []byte) (chunkid.Identity, []byte, error) {
+	raw, err := cw.Finish()
 	if err != nil {
 		return chunkid.Identity{}, nil, err
 	}
@@ -1259,7 +1274,6 @@ func encodeSQLite(cw *catalog.Writer, fp string, hasher chunkid.Hasher, dek []by
 	if err != nil {
 		return chunkid.Identity{}, nil, err
 	}
-	_ = os.Remove(fp)
 	return id, stored, nil
 }
 

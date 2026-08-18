@@ -211,27 +211,35 @@ func (s *Static) Meta() Meta { return s.meta }
 
 func (s *Static) HasXattrs() bool { return s.header.Flags&headerFlagAnyXattr != 0 }
 
+// Lookup resolves one name under parent. A transition point has BOTH
+// halves — the dirent whose node lives in this catalog, and the identity
+// of the child catalog its contents live in — so both are returned when
+// both are present, and a caller that gets a nested identity without a
+// dirent is looking at a corrupt catalog.
 func (s *Static) Lookup(parent int64, name []byte) (LookupResult, error) {
+	var res LookupResult
 	i := s.lowerBoundEdge(parent, name)
 	if i < s.edgeCount() && s.edgeParent(i) == parent {
 		if n, ok := s.edgeName(i); ok && bytes.Equal(n, name) {
 			r := s.edgeAt(i)
-			return LookupResult{Dirent: &Dirent{
+			res.Dirent = &Dirent{
 				Name:  n,
 				Inode: int64(binary.LittleEndian.Uint64(r[8:])),
 				Type:  r[22],
-			}}, nil
+			}
 		}
 	}
-	// A name can also be a mount point for a nested catalog.
 	if j, ok := s.findNested(parent, name); ok {
 		id, ok := s.identityAt(j)
 		if !ok {
 			return LookupResult{}, fmt.Errorf("%w: nested record names identity %d, which is absent", errCorrupt, j)
 		}
-		return LookupResult{NestedIdentity: id}, nil
+		res.NestedIdentity = id
 	}
-	return LookupResult{}, nil
+	if res.Dirent == nil && res.NestedIdentity == nil {
+		return LookupResult{}, ErrNotExist
+	}
+	return res, nil
 }
 
 func (s *Static) nestedCount() int { return len(s.nested) / nestedLen }

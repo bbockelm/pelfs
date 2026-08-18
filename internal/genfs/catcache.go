@@ -20,7 +20,7 @@ type catCache struct {
 	fs      *FS
 	cap     int
 	rootHex string
-	root    *catalog.Catalog
+	root    catalog.Reader
 
 	mu   sync.Mutex
 	byID map[string]*catHandle
@@ -29,12 +29,12 @@ type catCache struct {
 
 type catHandle struct {
 	id   string
-	cat  *catalog.Catalog
+	cat  catalog.Reader
 	refs int
 	elem *list.Element
 }
 
-func newCatCache(fs *FS, capacity int, rootHex string, root *catalog.Catalog) *catCache {
+func newCatCache(fs *FS, capacity int, rootHex string, root catalog.Reader) *catCache {
 	return &catCache{
 		fs:      fs,
 		cap:     capacity,
@@ -48,7 +48,7 @@ func newCatCache(fs *FS, capacity int, rootHex string, root *catalog.Catalog) *c
 // acquire returns an open handle for the catalog with the given identity,
 // fetching/spilling/opening it on miss. The returned release func MUST be
 // called when the caller is done with the handle.
-func (c *catCache) acquire(ctx context.Context, idHex string) (*catalog.Catalog, func(), error) {
+func (c *catCache) acquire(ctx context.Context, idHex string) (catalog.Reader, func(), error) {
 	if idHex == c.rootHex {
 		return c.root, func() {}, nil
 	}
@@ -77,7 +77,7 @@ func (c *catCache) acquire(ctx context.Context, idHex string) (*catalog.Catalog,
 	if err != nil {
 		return nil, nil, err
 	}
-	cat, err := catalog.Open(fp)
+	cat, err := catalog.OpenReader(fp)
 	if err != nil {
 		return nil, nil, err
 	}

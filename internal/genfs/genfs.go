@@ -256,7 +256,7 @@ func Open(ctx context.Context, o Options) (*FS, error) {
 	if err != nil {
 		return nil, fmt.Errorf("genfs: root catalog: %w", err)
 	}
-	root, err := catalog.Open(rootPath)
+	root, err := catalog.OpenReader(rootPath)
 	if err != nil {
 		return nil, fmt.Errorf("genfs: open root catalog: %w", err)
 	}
@@ -759,7 +759,7 @@ func (fs *FS) Forget(ino uint64, nlookup uint64) {
 // catalog. Promoted regular files (nlink > 1 <=> record lives in an inode
 // shard) route to their shard; node attrs always come from the path
 // catalog's row.
-func (fs *FS) acquireContent(ctx context.Context, ino uint64) (*catalog.Catalog, func(), catalog.Node, error) {
+func (fs *FS) acquireContent(ctx context.Context, ino uint64) (catalog.Reader, func(), catalog.Node, error) {
 	catHex, err := fs.residencyOf(ino)
 	if err != nil {
 		return nil, nil, catalog.Node{}, err

@@ -178,8 +178,9 @@ type Xattr struct {
 // Writer builds a new catalog. It is not safe for concurrent use; all rows
 // are written in one implicit transaction committed by Close.
 type Writer struct {
-	db *sql.DB
-	tx *sql.Tx
+	db   *sql.DB
+	tx   *sql.Tx
+	path string
 
 	node    *sql.Stmt
 	edge    *sql.Stmt
@@ -219,7 +220,7 @@ func Create(path string, meta Meta) (*Writer, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	w := &Writer{db: db}
+	w := &Writer{db: db, path: path}
 	if err := w.init(meta); err != nil {
 		db.Close()
 		os.Remove(path)
@@ -325,6 +326,23 @@ func (w *Writer) SetSymlink(inode int64, target []byte) error {
 
 // Close commits everything and finalizes the catalog file. The Writer is
 // unusable afterwards.
+// Finish commits the catalog and returns its bytes, removing the file it
+// built through. The static builder has no file at all, so returning
+// bytes is the shape both encodings share — and it keeps the publisher
+// from knowing which one it used.
+func (w *Writer) Finish() ([]byte, error) {
+	path := w.path
+	if err := w.Close(); err != nil {
+		return nil, err
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	_ = os.Remove(path)
+	return raw, nil
+}
+
 func (w *Writer) Close() error {
 	if w.tx == nil {
 		return errors.New("catalog: writer already closed")

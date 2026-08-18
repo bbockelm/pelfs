@@ -114,7 +114,7 @@ func (fs *FS) Swap(ctx context.Context, sb *superblock.Superblock) (*SwapReport,
 			return nil, fmt.Errorf("genfs: swap: root catalog identity mismatch: got %s", id.Hex())
 		}
 	}
-	root, err := catalog.Open(rootPath)
+	root, err := catalog.OpenReader(rootPath)
 	if err != nil {
 		return nil, fmt.Errorf("genfs: swap: open root catalog: %w", err)
 	}

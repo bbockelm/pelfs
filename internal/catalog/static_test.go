@@ -75,8 +75,11 @@ func TestStaticRoundTrip(t *testing.T) {
 	if err != nil || res.Dirent == nil || res.Dirent.Inode != 2 {
 		t.Fatalf("lookup alpha: %+v err=%v", res.Dirent, err)
 	}
-	if res, err := s.Lookup(1, []byte("absent")); err != nil || res.Dirent != nil || res.NestedIdentity != nil {
-		t.Fatalf("lookup of a missing name returned %+v (err %v)", res, err)
+	// A name with neither half is ErrNotExist, not an empty result: genfs
+	// distinguishes them, and returning nil here made it read an absent
+	// entry as a transition point missing its dirent.
+	if _, err := s.Lookup(1, []byte("absent")); !errors.Is(err, ErrNotExist) {
+		t.Fatalf("lookup of a missing name: err = %v, want ErrNotExist", err)
 	}
 
 	// A nested mount point resolves through the same call.
@@ -307,4 +310,48 @@ func exerciseAll(s *Static) {
 	}
 	_ = s.Meta()
 	_ = s.HasXattrs()
+}
+
+// TestStaticLookupReturnsBothHalvesOfATransition pins the contract the
+// end-to-end seal caught me violating: a transition point has a dirent
+// whose node lives in THIS catalog and an identity naming the child
+// catalog its contents live in. Returning only the first made genfs
+// resolve the name without ever switching catalogs; returning only the
+// second made it report a transition with no dirent half.
+func TestStaticLookupReturnsBothHalvesOfATransition(t *testing.T) {
+	w := NewStaticWriter(Meta{IdentityAlgo: "blake3-256"}, 1, 2048)
+	if err := w.AddNode(Node{Inode: 1, Type: 2, Mode: 0755}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.AddNode(Node{Inode: 2, Type: 2, Mode: 0755}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.AddEdge(1, []byte("child"), 2, 2); err != nil {
+		t.Fatal(err)
+	}
+	childCat := bytes.Repeat([]byte{0x5e}, 32)
+	if err := w.AddNested(1, []byte("child"), childCat); err != nil {
+		t.Fatal(err)
+	}
+	blob, err := w.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := OpenStatic(blob)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := s.Lookup(1, []byte("child"))
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	if res.Dirent == nil {
+		t.Error("transition point returned no dirent half")
+	} else if res.Dirent.Inode != 2 {
+		t.Errorf("dirent inode = %d, want 2", res.Dirent.Inode)
+	}
+	if !bytes.Equal(res.NestedIdentity, childCat) {
+		t.Errorf("nested identity = %x, want %x", res.NestedIdentity, childCat)
+	}
 }

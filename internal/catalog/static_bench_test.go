@@ -20,7 +20,15 @@ const benchPerDir = 40
 
 // benchTree feeds one catalog's worth of a source-shaped tree into
 // whichever writer it is given.
-func benchTree(addNode func(Node), addEdge func(int64, []byte, int64, uint8), inline func(int64, []byte)) {
+func benchTree(tb testing.TB, b Builder) {
+	must := func(err error) {
+		if err != nil {
+			tb.Fatal(err)
+		}
+	}
+	addNode := func(n Node) { must(b.AddNode(n)) }
+	addEdge := func(p int64, name []byte, i int64, t uint8) { must(b.AddEdge(p, name, i, t)) }
+	inline := func(i int64, data []byte) { must(b.SetInline(i, data)) }
 	ino := int64(1)
 	addNode(Node{Inode: ino, Type: 2, Mode: 0755, Nlink: 2})
 	root := ino
@@ -48,7 +56,7 @@ func benchDirInode(n int) int64 {
 
 func buildStaticBench(tb testing.TB) []byte {
 	w := NewStaticWriter(Meta{VolumeUUID: "u", CoveredPath: "/", IdentityAlgo: "blake3-256"}, 1, 2048)
-	benchTree(w.AddNode, w.AddEdge, func(i int64, b []byte) { w.SetInline(i, b) })
+	benchTree(tb, w)
 	blob, err := w.Finish()
 	if err != nil {
 		tb.Fatal(err)
@@ -61,22 +69,9 @@ func buildSQLiteBench(tb testing.TB, path string) {
 	if err != nil {
 		tb.Fatal(err)
 	}
-	var ferr error
-	keep := func(err error) {
-		if err != nil && ferr == nil {
-			ferr = err
-		}
-	}
-	benchTree(
-		func(n Node) { keep(w.AddNode(n)) },
-		func(p int64, name []byte, i int64, t uint8) { keep(w.AddEdge(p, name, i, t)) },
-		func(i int64, b []byte) { keep(w.SetInline(i, b)) },
-	)
+	benchTree(tb, w)
 	if err := w.Close(); err != nil {
 		tb.Fatal(err)
-	}
-	if ferr != nil {
-		tb.Fatal(ferr)
 	}
 }
 

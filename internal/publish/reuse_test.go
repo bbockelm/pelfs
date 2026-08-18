@@ -66,6 +66,8 @@ type reuseVol struct {
 	// small fixture into a TREE of catalogs instead of one flat catalog.
 	// Zero takes the default.
 	smax int64
+	// static publishes catalogs in the packed format instead of SQLite.
+	static bool
 	// maxRes is the residency bound every genfs this volume opens carries,
 	// so a remount reproduces the mount it replaces.
 	maxRes int
@@ -134,6 +136,7 @@ func (v *reuseVol) sealOnly(prev *publish.Result) *publish.Result {
 		Overlay: v.ov, Inner: v.inner, SpoolDir: v.t.TempDir(),
 		SigningKey: v.priv, Prev: prev.Superblock, PrevRaw: prev.Raw,
 		TargetPackSize: 1 << 20, DedupIndexPath: v.index, SMax: v.smax,
+		StaticCatalogs: v.static,
 	})
 	if err != nil {
 		v.t.Fatalf("seal: %v", err)
@@ -160,6 +163,7 @@ func (v *reuseVol) checkpoint() *publish.Result {
 		OverlaySnapshot: snap, Inner: v.inner, SpoolDir: v.t.TempDir(),
 		SigningKey: v.priv, Prev: v.head.Superblock, PrevRaw: v.head.Raw,
 		TargetPackSize: 1 << 20, DedupIndexPath: v.index, SMax: v.smax,
+		StaticCatalogs: v.static,
 	})
 	if err != nil {
 		v.t.Fatalf("seal: %v", err)

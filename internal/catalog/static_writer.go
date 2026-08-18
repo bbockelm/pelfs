@@ -68,45 +68,40 @@ func NewStaticWriter(meta Meta, rootInode int64, inlineMax int64) *StaticWriter 
 	return &StaticWriter{meta: meta, rootInode: rootInode, inlineMax: uint32(inlineMax)}
 }
 
-func (w *StaticWriter) fail(err error) {
-	if w.err == nil {
-		w.err = err
-	}
+func (w *StaticWriter) AddNode(n Node) error {
+	w.nodes = append(w.nodes, n)
+	return nil
 }
 
-func (w *StaticWriter) AddNode(n Node) { w.nodes = append(w.nodes, n) }
-
-func (w *StaticWriter) AddEdge(parent int64, name []byte, inode int64, typ uint8) {
+func (w *StaticWriter) AddEdge(parent int64, name []byte, inode int64, typ uint8) error {
 	w.edges = append(w.edges, staticEdge{parent: parent, inode: inode, name: clone(name), typ: typ})
+	return nil
 }
 
-func (w *StaticWriter) AddNested(parent int64, name, catalogIdentity []byte) {
+func (w *StaticWriter) AddNested(parent int64, name, catalogIdentity []byte) error {
 	if len(catalogIdentity) != identityLen {
-		w.fail(fmt.Errorf("catalog: nested identity is %d bytes, want %d", len(catalogIdentity), identityLen))
-		return
+		return fmt.Errorf("catalog: nested identity is %d bytes, want %d", len(catalogIdentity), identityLen)
 	}
 	w.nested = append(w.nested, staticNested{parent: parent, name: clone(name), identity: clone(catalogIdentity)})
+	return nil
 }
 
 // AddChunks records one file's content. The index is positional, which
 // is what the reader scans in; LogicalOffset is not stored because it is
 // the running sum of the lengths before it.
-func (w *StaticWriter) AddChunks(inode int64, refs []ChunkRef) {
+func (w *StaticWriter) AddChunks(inode int64, refs []ChunkRef) error {
 	for i, r := range refs {
 		if len(r.Identity) != identityLen {
-			w.fail(fmt.Errorf("catalog: chunk identity is %d bytes, want %d", len(r.Identity), identityLen))
-			return
+			return fmt.Errorf("catalog: chunk identity is %d bytes, want %d", len(r.Identity), identityLen)
 		}
 		// A chunk is bounded by the chunker's maximum, far below 4 GiB.
 		// Refuse rather than truncate: a silently wrong length would be
 		// indistinguishable from corruption at read time.
 		if r.LLen < 0 || r.LLen > 0xffffffff || r.CLen < 0 || r.CLen > 0xffffffff {
-			w.fail(fmt.Errorf("catalog: chunk length out of range (llen %d, clen %d)", r.LLen, r.CLen))
-			return
+			return fmt.Errorf("catalog: chunk length out of range (llen %d, clen %d)", r.LLen, r.CLen)
 		}
 		if r.Alg < 0 || r.Alg > 0xff || r.KeyID < 0 || r.KeyID > 0xffffffff {
-			w.fail(fmt.Errorf("catalog: chunk alg %d or key %d out of range", r.Alg, r.KeyID))
-			return
+			return fmt.Errorf("catalog: chunk alg %d or key %d out of range", r.Alg, r.KeyID)
 		}
 		w.chunks = append(w.chunks, staticChunk{
 			inode: inode, idx: uint32(i), identity: clone(r.Identity),
@@ -114,18 +109,22 @@ func (w *StaticWriter) AddChunks(inode int64, refs []ChunkRef) {
 			alg: uint8(r.Alg), keyID: uint32(r.KeyID),
 		})
 	}
+	return nil
 }
 
-func (w *StaticWriter) SetInline(inode int64, data []byte) {
+func (w *StaticWriter) SetInline(inode int64, data []byte) error {
 	w.inline = append(w.inline, staticBlobRec{inode: inode, data: clone(data)})
+	return nil
 }
 
-func (w *StaticWriter) SetSymlink(inode int64, target []byte) {
+func (w *StaticWriter) SetSymlink(inode int64, target []byte) error {
 	w.symlinks = append(w.symlinks, staticBlobRec{inode: inode, data: clone(target)})
+	return nil
 }
 
-func (w *StaticWriter) AddXattr(inode int64, name, value []byte) {
+func (w *StaticWriter) AddXattr(inode int64, name, value []byte) error {
 	w.xattrs = append(w.xattrs, staticXattr{inode: inode, name: clone(name), value: clone(value)})
+	return nil
 }
 
 func clone(b []byte) []byte {

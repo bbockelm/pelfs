@@ -41,7 +41,7 @@ func TestRingWrapsAndReclaims(t *testing.T) {
 		pos, err := r.Append(&Record{Handle: h, Inode: uint64(h)}, payload)
 		if errors.Is(err, ErrRingFull) {
 			// Reclaim everything: the point is that the ring keeps going.
-			if err := r.Reclaim(r.Head()); err != nil {
+			if _, err := r.Reclaim(r.Head()); err != nil {
 				t.Fatal(err)
 			}
 			laps++
@@ -88,7 +88,7 @@ func TestRingRefusesToOverwriteLiveBytes(t *testing.T) {
 		t.Fatal("the ring refused its first record")
 	}
 	// Releasing space lets the writer proceed again.
-	if err := r.Reclaim(r.Head()); err != nil {
+	if _, err := r.Reclaim(r.Head()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := r.Append(&Record{Handle: 999}, payload); err != nil {
@@ -112,7 +112,7 @@ func TestRingRecoveryStopsAtAStaleLap(t *testing.T) {
 	// Fill, reclaim, and lap so older records sit ahead of the head.
 	for i := 0; i < 40; i++ {
 		if _, err := r.Append(&Record{Handle: Handle(i), Inode: uint64(i)}, payload); errors.Is(err, ErrRingFull) {
-			if err := r.Reclaim(r.Head()); err != nil {
+			if _, err := r.Reclaim(r.Head()); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := r.Append(&Record{Handle: Handle(i), Inode: uint64(i)}, payload); err != nil {
@@ -210,7 +210,7 @@ func TestRingPadsRatherThanStraddling(t *testing.T) {
 	}
 	// The next record cannot fit before the seam; it must land at the
 	// start of the mapping rather than wrapping around it.
-	if err := r.Reclaim(r.Head()); err != nil {
+	if _, err := r.Reclaim(r.Head()); err != nil {
 		t.Fatal(err)
 	}
 	pos := appendN(t, r, 99, big)
@@ -274,7 +274,7 @@ func TestRingSeparatesFullFromTooLarge(t *testing.T) {
 	if !full {
 		t.Fatal("the ring never reported full")
 	}
-	if err := r.Reclaim(r.Head()); err != nil {
+	if _, err := r.Reclaim(r.Head()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := r.Append(&Record{Handle: 999}, ok); err != nil {
@@ -298,12 +298,62 @@ func TestRingAlwaysAdmitsAMaxRecordWhenDrained(t *testing.T) {
 			if !errors.Is(err, ErrRingFull) {
 				t.Fatalf("append %d: %v", i, err)
 			}
-			if err := r.Reclaim(r.Head()); err != nil {
+			if _, err := r.Reclaim(r.Head()); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := r.Append(&Record{Handle: Handle(i)}, payload); err != nil {
 				t.Fatalf("drained ring refused a maximum-size record at head %d: %v", r.Head(), err)
 			}
 		}
+	}
+}
+
+// TestRingReclaimStopsAtAPinnedReader pins the rule the caller used to
+// own. Bytes behind the tail become writable immediately, so reclaiming
+// past a reader is a torn read of live data rather than a stale answer —
+// and the reader here is holding the OLDEST record, which is exactly the
+// one a tail sweep would take first.
+func TestRingReclaimStopsAtAPinnedReader(t *testing.T) {
+	const size = 16 << 10
+	r, _ := newRing(t, size)
+	payload := bytes.Repeat([]byte{0x88}, 1000)
+
+	first := appendN(t, r, 1, payload)
+	second := appendN(t, r, 2, payload)
+	for i := 3; i <= 6; i++ {
+		appendN(t, r, Handle(i), payload)
+	}
+
+	r.Pin(first)
+	got, err := r.Reclaim(r.Head())
+	if err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	if got != first {
+		t.Fatalf("reclaimed to %d with a reader pinned at %d", got, first)
+	}
+	// The pinned record must still read back correctly.
+	if b, ok := r.At(first, len(payload)); !ok || !bytes.Equal(b, payload) {
+		t.Fatalf("pinned record became unreadable (ok=%v)", ok)
+	}
+
+	// Releasing the oldest pin lets the tail move to the next holder.
+	r.Pin(second)
+	r.Unpin(first)
+	got, err = r.Reclaim(r.Head())
+	if err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	if got != second {
+		t.Fatalf("reclaimed to %d, want the next pinned position %d", got, second)
+	}
+
+	r.Unpin(second)
+	got, err = r.Reclaim(r.Head())
+	if err != nil {
+		t.Fatalf("reclaim: %v", err)
+	}
+	if got != r.Head() {
+		t.Fatalf("with nothing pinned the tail should reach the head, got %d", got)
 	}
 }

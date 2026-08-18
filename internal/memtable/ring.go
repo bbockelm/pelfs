@@ -33,6 +33,13 @@ type Ring struct {
 	head uint64 // absolute position of the next append
 	tail uint64 // absolute position of the oldest unreclaimed byte
 	seq  uint64 // sequence stamped on the next record
+
+	// pins counts readers holding each position. Reclaim may not pass the
+	// oldest of them: the bytes behind the tail become writable at once,
+	// so releasing one out from under a reader is a torn read of live
+	// data, not a stale answer. The map is small by construction — it
+	// holds only positions with a reader in flight.
+	pins map[uint64]int
 }
 
 const (
@@ -214,16 +221,52 @@ func (r *Ring) At(pos uint64, length int) ([]byte, bool) {
 	return r.data[off+ringRecHdr : off+ringRecHdr+uint64(length)], true
 }
 
-// Reclaim advances the tail to an absolute position, freeing everything
-// before it. The CALLER owns the watermark rule: the tail must never pass
-// the oldest position a reader still holds, because the bytes behind it
-// become writable immediately.
-func (r *Ring) Reclaim(to uint64) error {
+// Pin holds a position against reclamation for as long as a reader is
+// reading it. Unpin releases it. Every Pin must be matched.
+func (r *Ring) Pin(pos uint64) {
+	if r.pins == nil {
+		r.pins = make(map[uint64]int)
+	}
+	r.pins[pos]++
+}
+
+func (r *Ring) Unpin(pos uint64) {
+	if n := r.pins[pos]; n > 1 {
+		r.pins[pos] = n - 1
+	} else {
+		delete(r.pins, pos)
+	}
+}
+
+// oldestPin reports the lowest pinned position, or the head when nothing
+// is pinned.
+func (r *Ring) oldestPin() uint64 {
+	oldest := r.head
+	for pos := range r.pins {
+		if pos < oldest {
+			oldest = pos
+		}
+	}
+	return oldest
+}
+
+// Reclaim advances the tail toward an absolute position and returns where
+// it actually reached, which may be short of the request.
+//
+// The watermark is enforced HERE rather than left to the caller. Bytes
+// behind the tail become writable immediately, so passing a position a
+// reader still holds is a torn read of live data — and a rule that lives
+// in one place cannot be forgotten by the next caller the way an
+// interface contract can.
+func (r *Ring) Reclaim(to uint64) (uint64, error) {
 	if to < r.tail || to > r.head {
-		return fmt.Errorf("memtable: reclaim to %d outside [%d,%d]", to, r.tail, r.head)
+		return r.tail, fmt.Errorf("memtable: reclaim to %d outside [%d,%d]", to, r.tail, r.head)
+	}
+	if limit := r.oldestPin(); to > limit {
+		to = limit
 	}
 	r.tail = to
-	return r.writeFileHeader()
+	return r.tail, r.writeFileHeader()
 }
 
 // Sync flushes the mapping. Durability is the caller's policy; the ring

@@ -7,7 +7,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/bbockelm/pelfs/internal/packstore"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
@@ -56,21 +59,62 @@ const DefaultPackCacheBytes = 1 << 30
 // Zero means the default, so "off" needs a value of its own.
 const PackCacheDisabled = -1
 
+// newPackCache opens the cache and ADOPTS whatever is already there.
+//
+// A pack is immutable and its name is unique, so a cached file is valid
+// for as long as the pack is: across sessions, across generations, across
+// the volume's life. Emptying it at startup — which this used to do, on
+// the assumption that a new session had no map for those packs — was
+// wrong even then and became visibly wrong with the journal, which hands
+// a recovered session exactly that map. A remount would then re-fetch,
+// from the federation, packs sitting on its own disk.
+//
+// Files are adopted oldest-first so that a cache over its bound evicts in
+// the same order it would have during the session that filled it.
 func newPackCache(dir string, max int64) (*packCache, error) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, err
 	}
-	// A directory left by a previous session holds packs whose locations
-	// this one has no map for. They are not readable and not free, so the
-	// cache starts empty on disk as well as in memory.
 	ents, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
 	}
-	for _, e := range ents {
-		os.Remove(filepath.Join(dir, e.Name())) //nolint:errcheck
+	type held struct {
+		name string
+		size int64
+		mod  time.Time
 	}
-	return &packCache{dir: dir, max: max, have: make(map[string]int64)}, nil
+	var found []held
+	for _, e := range ents {
+		if e.IsDir() {
+			continue
+		}
+		// A half-finished download from a killed session: named so it
+		// cannot be mistaken for a pack, and worth nothing to anyone.
+		if strings.HasPrefix(e.Name(), "fetch.") {
+			os.Remove(filepath.Join(dir, e.Name())) //nolint:errcheck
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		found = append(found, held{name: e.Name(), size: info.Size(), mod: info.ModTime()})
+	}
+	sort.Slice(found, func(i, j int) bool { return found[i].mod.Before(found[j].mod) })
+	c := &packCache{dir: dir, max: max, have: make(map[string]int64)}
+	for _, f := range found {
+		c.admit(f.name, f.size)
+	}
+	return c, nil
+}
+
+// Adopted reports what was already on disk when the cache opened: reads
+// this session will not have to make.
+func (c *packCache) adopted() (packs int, bytes int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.have), c.size
 }
 
 func (c *packCache) path(name string) string { return filepath.Join(c.dir, name) }

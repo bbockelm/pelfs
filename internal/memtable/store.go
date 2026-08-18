@@ -43,6 +43,11 @@ type Options struct {
 	// PackTarget is the size packs are cut at. Zero takes
 	// DefaultPackTarget.
 	PackTarget int64
+	// PackCacheDir is where the local copy of packs lives. Empty puts it
+	// under Dir, which is right for a test and wrong for a mount: Dir is
+	// session state, retired with the generation it described, and a pack
+	// cache outlives both.
+	PackCacheDir string
 	// UploadQueueBytes bounds how much cut-but-unsent pack data may
 	// accumulate before packing waits for the uplink. Zero takes
 	// DefaultUploadQueueBytes; the bound wants to be generous, because
@@ -334,7 +339,11 @@ func newStore(opts Options) (*Store, error) {
 	s.cond = sync.NewCond(&s.mu)
 	s.uploads = newUploadQueue(opts.Obj, opts.UploadQueueBytes, opts.UploadWorkers)
 	if opts.PackCacheBytes > 0 {
-		c, err := newPackCache(filepath.Join(opts.Dir, "packs"), opts.PackCacheBytes)
+		cacheDir := opts.PackCacheDir
+		if cacheDir == "" {
+			cacheDir = filepath.Join(opts.Dir, "packs")
+		}
+		c, err := newPackCache(cacheDir, opts.PackCacheBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -653,6 +662,15 @@ func (s *Store) waitPackLocked() error {
 		s.cond.Wait()
 	}
 	return s.flushErr
+}
+
+// CacheAdopted reports the packs already on local disk when this store
+// opened — content it can read without the federation.
+func (s *Store) CacheAdopted() (packs int, bytes int64) {
+	if s.cache == nil {
+		return 0, 0
+	}
+	return s.cache.adopted()
 }
 
 // Packs returns the packs this store has uploaded, for a superblock's

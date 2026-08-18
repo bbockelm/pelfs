@@ -107,6 +107,10 @@ type genSession struct {
 	// makes the clock's fields safe as well as the boundary singular.
 	downOnce sync.Once
 
+	// content is the write path's store, when this session has one. The
+	// checkpoint policy asks it how far behind the uplink is.
+	content *memtable.Store
+
 	// Session upload accounting, for the periodic "still uploading" line.
 	uploadMu    sync.Mutex
 	uploadPacks int
@@ -223,11 +227,23 @@ func (g *genSession) openContent(ctx context.Context, disabled bool) (*memtable.
 	// to lose it quietly.
 	if rep.Loss() {
 		ui.Warn("the previous session left content that could not be recovered:\n{report}", "report", rep.String())
+	} else if recs := recoveredExtents(rep); recs > 0 {
+		// Said out loud even when nothing was lost. A silent recovery
+		// leaves a user watching a mount behave differently — reading
+		// through a location map it rebuilt, finishing a session it did
+		// not start — with no account of why.
+		ui.Info("recovered {extents} extents from the previous session; its unsealed changes are still here",
+			"extents", recs)
+	}
+	if packs, bytes := store.CacheAdopted(); packs > 0 {
+		ui.Info("{packs} packs are already on local disk ({bytes}); reads of them cost nothing",
+			"packs", packs, "bytes", ui.ByteCount(bytes))
 	}
 	// Once-only: the seal at exit closes it as soon as the last thing that
 	// reads it is done, and the teardown defer closes it on every other
 	// path. Both must be able to call it.
 	g.closeContent = sync.OnceValue(closeStore)
+	g.content = store
 	return store, nil
 }
 
@@ -246,6 +262,24 @@ func longestWait(worst time.Duration) string {
 		return ""
 	}
 	return ", longest " + worst.Round(time.Millisecond).String()
+}
+
+// uploadBacklog is how much this session has cut into packs and not yet
+// sent, or zero when its content is in staging files.
+func (g *genSession) uploadBacklog() int64 {
+	if g.content == nil {
+		return 0
+	}
+	return g.content.Stats().UploadBacklog
+}
+
+// recoveredExtents totals what a recovery found across its buffers.
+func recoveredExtents(rep *memtable.Report) int {
+	n := 0
+	for _, b := range rep.Buffers {
+		n += b.Records
+	}
+	return n
 }
 
 // sessionUploadInterval is how often a session says it is uploading. Per
@@ -1311,10 +1345,28 @@ const slowCheckpoint = 10 * time.Second
 // saturated the entire time. Pressure is the honest trigger: a session
 // that writes fast should publish often, whatever the clock says.
 //
-// 128 MiB is a compromise between filling the uplink early and paying a
-// checkpoint's fixed costs too often. It is deliberately larger than the
-// pack target so a checkpoint still cuts full packs.
-const checkpointBytes = 128 << 20
+// The number is much larger than it was, because the reason for the old
+// one has gone. It was 128 MiB when a session's content sat in staging
+// files until the seal: checkpointing often was the only way to get bytes
+// out before the user typed exit. The write path uploads continuously, so
+// that job is done by the ring's aging rule, and what a checkpoint adds
+// is a published NAMESPACE and inodes returned to clean.
+//
+// Those are worth having, and they are not worth having every 128 MiB. On
+// a kernel-tree extraction the old threshold fired six checkpoints costing
+// 108s, about 110s of which was the whole regression against the staging
+// path — and half of that was the follow phase, with the mount blocked.
+const checkpointBytes = 1 << 30
+
+// checkpointBacklogHold skips a pressure checkpoint while the uplink is
+// still working through what the session already produced.
+//
+// A checkpoint under those conditions is the wrong thing twice: it drains
+// the queue before it can freeze, so it waits for exactly the backlog it
+// found, and it then blocks the mount through publish and rebase. The
+// content is going out either way. Better to let it, and checkpoint when
+// the session has caught up or the interval comes round.
+const checkpointBacklogHold = 64 << 20
 
 // pressureSampleInterval is how often staged bytes are measured. It is a
 // fraction of the checkpoint interval, floored so a long interval still
@@ -1372,7 +1424,13 @@ func (g *genSession) checkpointPeriodically(ctx context.Context, every time.Dura
 		case <-ctx.Done():
 			return
 		case <-sample.C:
-			if n := g.stagedBytes(); n < checkpointBytes {
+			staged := g.stagedBytes()
+			if staged < checkpointBytes {
+				continue
+			}
+			if backlog := g.uploadBacklog(); backlog > checkpointBacklogHold {
+				// Already pushing. A checkpoint here would wait for this
+				// backlog and then block the mount besides.
 				continue
 			}
 			if time.Now().Before(retryAfter) {
@@ -1392,7 +1450,8 @@ func (g *genSession) checkpointPeriodically(ctx context.Context, every time.Dura
 			default:
 				backoff, retryAfter = 0, time.Time{}
 				ui.Info("checkpointed {staged} of staged content in {duration} ({summary})",
-					"staged", ui.ByteCount(checkpointBytes), "duration", time.Since(start), "summary", summary)
+					"staged", ui.ByteCount(staged), "duration", time.Since(start).Round(time.Millisecond),
+					"summary", summary)
 			}
 		case <-t.C:
 			start := time.Now()

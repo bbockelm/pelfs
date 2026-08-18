@@ -45,6 +45,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	_ "modernc.org/sqlite" // registers the "sqlite" driver for the overlay database
 
@@ -118,6 +120,49 @@ type provEdge struct {
 	name   string
 }
 
+// opLock is the overlay's lock with an account of what waiting for it
+// costs. Lock is on the path of every filesystem operation, so the two
+// clock reads it adds are deliberate: an operation that reaches SQLite is
+// already orders of magnitude more expensive, and knowing how long the
+// mount was blocked is worth more than the nanoseconds.
+//
+// It measures WAITING rather than holding. A long hold nobody is waiting
+// behind costs the user nothing; a short one that fifty operations queue
+// behind is what a stall actually is.
+type opLock struct {
+	sync.Mutex
+	waitNS  atomic.Int64
+	worstNS atomic.Int64
+	waits   atomic.Int64
+}
+
+func (l *opLock) Lock() {
+	start := time.Now()
+	l.Mutex.Lock()
+	d := int64(time.Since(start))
+	if d < int64(time.Millisecond) {
+		// Uncontended, or near enough that nobody noticed. Counting these
+		// would bury the ones that matter in millions of nanoseconds.
+		return
+	}
+	l.waitNS.Add(d)
+	l.waits.Add(1)
+	for {
+		worst := l.worstNS.Load()
+		if d <= worst || l.worstNS.CompareAndSwap(worst, d) {
+			return
+		}
+	}
+}
+
+// LockWait reports how long callers have waited for this overlay: the
+// total, the longest single wait, and how many waits were long enough to
+// count. Sample it either side of an operation to learn what that
+// operation cost the mount.
+func (fs *FS) LockWait() (total, worst time.Duration, waits int64) {
+	return time.Duration(fs.mu.waitNS.Load()), time.Duration(fs.mu.worstNS.Load()), fs.mu.waits.Load()
+}
+
 // FS is one open overlay over one base generation.
 type FS struct {
 	base *genfs.FS
@@ -135,7 +180,12 @@ type FS struct {
 	// mu serializes every operation: one writer, one transaction at a
 	// time. SQLite serializes writes anyway, so a finer lock would buy
 	// concurrency the storage layer refuses to deliver.
-	mu sync.Mutex
+	//
+	// It counts what waiting for it costs, because EVERY filesystem
+	// operation takes it: time spent waiting here is time the mount is
+	// not answering, and until it was measured the only evidence of a
+	// stall was an NFS client declaring the server dead.
+	mu opLock
 	// dirtySet is the in-memory answer to IsDirty (see accessors.go);
 	// nil until first use, then maintained by every mutating path.
 	dirtySet map[uint64]struct{}

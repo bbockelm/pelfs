@@ -144,16 +144,23 @@ func Error(msg string, args ...any) { current.Load().Error(msg, args...) }
 // needs no special case: its stderr IS the log file it was spawned with,
 // so it answers this question about the file and formats accordingly.
 //
-// An unrecognized value falls back to detection rather than failing: a
-// typo in an environment variable must not cost a user their log.
+// An unrecognized value falls back to detection rather than failing — a
+// typo must not cost a user their log — but it SAYS so. Falling back
+// silently is worse than either: someone who asked for timestamps and got
+// the terminal format reads the absence as a regression in the program
+// rather than a typo in their shell, which is exactly what happened.
 func FormatFor(w io.Writer) Format {
-	switch os.Getenv("PELFS_LOG_FORMAT") {
+	switch v := os.Getenv("PELFS_LOG_FORMAT"); v {
 	case "plain":
 		return Plain
 	case "text":
 		return Text
 	case "json":
 		return JSON
+	case "":
+	default:
+		Warn("PELFS_LOG_FORMAT={value} is not one of plain, text or json; "+
+			"choosing by whether this is a terminal instead", "value", v)
 	}
 	if f, ok := w.(*os.File); ok && term.IsTerminal(int(f.Fd())) {
 		return Plain

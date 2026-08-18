@@ -231,6 +231,23 @@ func (g *genSession) openContent(ctx context.Context, disabled bool) (*memtable.
 	return store, nil
 }
 
+// markSwapped closes the swap phase and hands back the overlay, so the
+// rebase that follows is timed on its own.
+func (g *genSession) markSwapped(phases *phaseClock) *overlay.FS {
+	phases.mark("swap")
+	return g.ov
+}
+
+// longestWait renders the worst single wait, when this seal set it. A
+// total says how much serving time went; the worst says whether it went
+// as one stall a client would time out on, or as many nobody noticed.
+func longestWait(worst time.Duration) string {
+	if worst <= 0 {
+		return ""
+	}
+	return ", longest " + worst.Round(time.Millisecond).String()
+}
+
 // sessionUploadInterval is how often a session says it is uploading. Per
 // pack would be a line every second or two on a fast link; the point is
 // only to make a long, slow push distinguishable from a stall, which one
@@ -1040,7 +1057,33 @@ func (g *genSession) sealLocked(ctx context.Context, follow bool) (*publish.Resu
 	// on a session that had touched a large tree the freeze alone rivalled
 	// the publish it precedes.
 	phases := newPhaseClock()
-	defer func() { phases.report(phases.sentence("sealed")) }()
+	blockedBefore, worstBefore, waitsBefore := int64(0), time.Duration(0), int64(0)
+	if g.ov != nil {
+		var total time.Duration
+		total, worstBefore, waitsBefore = g.ov.LockWait()
+		blockedBefore = int64(total)
+	}
+	defer func() {
+		phases.report(phases.sentence("sealed"))
+		// What the seal cost the MOUNT, which is a different question from
+		// what it cost the seal: a phase that runs for ten seconds with the
+		// overlay's lock held is ten seconds of a filesystem that does not
+		// answer, and until this was reported the only evidence of it was
+		// an NFS client giving up.
+		if g.ov == nil {
+			return
+		}
+		total, worst, waits := g.ov.LockWait()
+		blocked := time.Duration(int64(total) - blockedBefore)
+		if n := waits - waitsBefore; n > 0 && blocked > 250*time.Millisecond {
+			if worst <= worstBefore {
+				worst = 0
+			}
+			ui.Info("the mount was blocked {blocked} across {waits} operations during this seal"+
+				"{longest}", "blocked", blocked.Round(time.Millisecond), "waits", n,
+				"longest", longestWait(worst))
+		}
+	}()
 
 	// A CHECKPOINT seals a FROZEN view, not the live overlay: it publishes
 	// while writers keep working, so it needs its input to correspond to an
@@ -1094,7 +1137,7 @@ func (g *genSession) sealLocked(ctx context.Context, follow bool) (*publish.Resu
 			// Said separately because it is NOT a stall: the mount served
 			// throughout, and reporting it as freeze time is what made a
 			// slow uplink look like a slow lock.
-			ui.Info("pushed this session's remaining content in {drain} before freezing; the mount kept serving",
+			ui.Info("pushed this session's remaining content in {drain} before freezing",
 				"drain", sc.Drain.Round(time.Millisecond))
 		}
 		ui.Info("froze the overlay in {total} (vacuum {vacuum}, {staged} staged inodes in {pin}, "+
@@ -1158,10 +1201,14 @@ func (g *genSession) sealLocked(ctx context.Context, follow bool) (*publish.Resu
 	// exit path, paid by someone who has stopped working and is waiting
 	// to get their shell back.
 	if follow {
+		// Reported as two marks, not one. Swapping the base and rebasing
+		// the overlay are different work under different locks — genfs's
+		// swap lock and the overlay's — and a single "follow" number
+		// cannot say which of them the mount was waiting behind.
 		if _, err := g.gfs.Swap(ctx, res.Superblock); err != nil {
 			ui.Warn("sealed generation {generation}, but the mount could not follow it ({error}); inodes stay dirty",
 				"generation", res.Superblock.Generation, "error", err)
-		} else if rep, err := g.ov.Rebase(ctx, snap.Seq(), overlay.Options{
+		} else if rep, err := g.markSwapped(phases).Rebase(ctx, snap.Seq(), overlay.Options{
 			BaseRoot:       res.Superblock.RootCatalog,
 			BaseGeneration: res.Superblock.Generation,
 		}); err != nil {
@@ -1172,7 +1219,7 @@ func (g *genSession) sealLocked(ctx context.Context, follow bool) (*publish.Resu
 				"clean", ui.Count(len(rep.Clean), "inode"), "dirty", rep.Dirty)
 			g.stats.Update(func(sum *stats.Summary) { sum.RebasedClean += int64(len(rep.Clean)) })
 		}
-		phases.mark("follow")
+		phases.mark("rebase")
 	}
 
 	// The seal counts against whichever phase it ran in, so "0 seals while
@@ -1227,7 +1274,7 @@ func (g *genSession) checkpoint(ctx context.Context) (string, error) {
 	// terminal at the moment it happens. Printed only once the overlay is
 	// known dirty, so an idle cadence stays silent.
 	ui.Info("checkpoint started: publishing what this session has written so far "+
-		"({staged} staged, {dirty} dirty); the mount keeps serving",
+		"({staged} staged, {dirty} dirty)",
 		"staged", ui.ByteCount(st.StagedBytes), "dirty", ui.Count(st.DirtyNodes, "inode"))
 	// A checkpoint keeps serving, so the mount must follow what it just
 	// published — that is what lets the redundant overlay rows go.
@@ -1235,7 +1282,7 @@ func (g *genSession) checkpoint(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	ui.Info("checkpoint: sealed generation {generation} while mounted; the mount keeps serving",
+	ui.Info("checkpoint: sealed generation {generation} while mounted",
 		"generation", res.Superblock.Generation)
 	return fmt.Sprintf("generation %d: %d chunks uploaded, %d catalogs written (%d carried), %d new packs",
 		res.Superblock.Generation, res.Stats.ChunksAdded, res.Stats.Catalogs,

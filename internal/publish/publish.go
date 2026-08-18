@@ -3,14 +3,13 @@
 // TRANSFORM (walk the tree, chunk file content, build split path catalogs
 // and inode shards, append everything to packs), UPLOAD (pack seals), and
 // FLIP (write the signed superblock to refs/<branch>). See
-// docs/design-packfs.md, "Publish: the transactional pipeline" and "Phase 3
-// VFS architecture" (write path = overlay + seal).
+// docs/design-packfs.md, "Publish: the transactional pipeline", and on the
+// catalog-native mount, where the write path is overlay + seal.
 //
-// For the cut source, CUT and RECONCILE are the session's job — by the time
-// this package runs, the cut database exists and every block it references
-// is durable in the session's blob store. For the overlay source there is
-// no cut at all: publish IS the durability step for staged content, and
-// nothing downstream of the walk changes.
+// Publish IS the durability step for staged content: until it runs, a
+// session's writes exist only in the overlay's staging files on local
+// disk. Nothing downstream of the walk changes what is published, so the
+// walk is the whole of what a generation means.
 //
 // How much of the tree a publish touches, and the deliberate
 // simplifications, each marked at its site:

@@ -43,11 +43,11 @@ func (e *emptyRoot) Stat(_ context.Context, ino uint64) (SrcNode, error) {
 	if ino != 1 {
 		return SrcNode{}, fmt.Errorf("publish: empty volume has no inode %d", ino)
 	}
-	// Own the root as the user creating the volume. Leaving UID/GID at
-	// zero made a fresh volume's root owned by root with mode 0755 --
+	// Own the root as the user creating the volume. UID/GID left at zero
+	// give a fresh volume a root owned by root with mode 0755 --
 	// unwritable by the very person who just created it, so the first
-	// command run in the new mount failed with EPERM. It only escaped
-	// notice because the container gate runs as root.
+	// command run in the new mount fails with EPERM. The container gate
+	// runs as root and so cannot see this at all.
 	return SrcNode{
 		Inode: 1,
 		Type:  catalog.TypeDir,

@@ -195,12 +195,12 @@ func TestSealBeyondResidencyAfterNamespaceChanges(t *testing.T) {
 	}
 }
 
-// The reported failure's actual shape: a NEW SESSION over a volume it did
-// not write. Every same-session test above is blind to it, because a
+// The failure's actual shape: a NEW SESSION over a volume it did not
+// write. Every same-session test above is blind to it, because a
 // checkpoint's rebase re-pins provenance for everything the session wrote,
 // so the walk inherits a full set of base descent steps it never had to
-// record. A fresh mount inherits none, which is what an owner opening an
-// 85k-inode volume has.
+// record. A fresh mount inherits none, which is the situation anyone
+// remounting an 85k-inode volume is in.
 //
 // The walk must therefore record its own: it lists a directory and makes
 // its entries resident in one pass, and residency past the bound is

@@ -32,11 +32,10 @@ type SrcEntry struct {
 }
 
 // Source is the tree publish reads: the write overlay under seal, or the
-// empty root of a brand-new volume. Implementations are walked strictly
-// by descent —
-// Root, then Readdir per directory — so a source whose residency comes
-// from lookup order (the overlay over genfs) can establish it on the way
-// down.
+// empty root of a brand-new volume. Implementations are walked strictly by
+// descent — Root, then Readdir per directory — so a source whose residency
+// comes from lookup order (the overlay over genfs) can establish it on the
+// way down.
 type Source interface {
 	// Root is the inode the walk starts at.
 	Root() uint64
@@ -116,14 +115,15 @@ type CatalogReuser interface {
 
 // ---- overlay source ----
 
-// overlaySource seals a phase-3 write overlay: the merged base+dirty view
-// IS the generation's contents, so the seal walks it exactly like a cut.
+// overlaySource seals a write overlay: the merged base+dirty view IS the
+// generation's contents, so the seal walks that view and nothing else.
 //
 // Residency is the one thing a listing does not carry: genfs serves an
 // inode only after the descent that reached it, and an ordinary Readdir
 // returns base entries without establishing it. The seal therefore reads
-// directories through ReaddirRetain, which lists and makes resident in the
-// same pass — the bulk form of the Lookup-per-entry loop this used to run.
+// directories through ReaddirRetain, which lists and makes resident in
+// the same pass — the bulk form of the Lookup-per-entry loop the walk
+// would otherwise run, at one round trip per name.
 //
 // overlayView is the read surface a seal walks. Both *overlay.FS and
 // *overlay.Snapshot satisfy it, so a checkpoint can seal a FROZEN view
@@ -200,8 +200,8 @@ func (s *overlaySource) Xattrs(ctx context.Context, ino uint64) (map[string][]by
 	return s.fs.AllXattrs(ctx, ino)
 }
 func (s *overlaySource) Open(ctx context.Context, ino uint64, length int64) (io.ReadCloser, error) {
-	// Both the live overlay and a snapshot stream content themselves;
-	// this used to hand-roll positional reads.
+	// Both the live overlay and a snapshot stream content themselves, so
+	// there is no reason to hand-roll positional reads here.
 	return s.fs.OpenFile(ctx, ino, length)
 }
 

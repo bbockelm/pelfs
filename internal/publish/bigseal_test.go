@@ -340,7 +340,7 @@ func timedSeal(t *testing.T, label string, inner *meterStore, ov *overlay.FS, pr
 }
 
 // processCPU is user+system CPU for the whole process, which is what the
-// owner's `20s CPU` number measures.
+// seal-cost line a session prints reports as its CPU number.
 func processCPU() time.Duration {
 	var ru syscall.Rusage
 	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {

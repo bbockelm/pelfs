@@ -214,8 +214,8 @@ func (r linkReport) log(t *testing.T, label string, bw float64) {
 }
 
 // linkProfile is one point in the bandwidth/latency space a seal has to
-// survive: the owner's home uplink, a decent residential link, and a
-// long-fat data-centre path where a single stream cannot fill the pipe.
+// survive: a slow home uplink, a decent residential link, and a long-fat
+// data-centre path where a single stream cannot fill the pipe.
 type linkProfile struct {
 	name   string
 	mbits  float64

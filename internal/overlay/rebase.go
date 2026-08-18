@@ -59,24 +59,90 @@ type RebaseReport struct {
 // is that snapshot's Seq; sealed carries the published generation's
 // identity, exactly as Open takes the base's (NextInode is ignored — the
 // overlay's own allocator is authoritative and must never rewind).
+// rebaseBatch is how many inodes one batch drops before the lock is
+// released. Big enough that per-transaction overhead stays small, short
+// enough that a filesystem operation arriving mid-rebase waits for a
+// batch rather than for the whole set.
+const rebaseBatch = 512
+
+// rebaseBatchLocked drops the overlay rows of one batch of cleaned
+// inodes. The caller holds the lock and keeps holding it.
+//
+// Membership is re-checked here rather than trusted from the set computed
+// before the first batch: the lock is released between batches, so an
+// inode can be written in the meantime, and dropping its rows then would
+// lose that write. modSeq is what says so, and it is the same test the
+// set was built with.
+func (fs *FS) rebaseBatchLocked(batch []uint64, sealedSeq uint64, clean map[uint64]struct{},
+	rep *RebaseReport) error {
+	var drop []uint64
+	if err := fs.withTx(func(tx querier) error {
+		for _, ino := range batch {
+			if fs.modSeqOfLocked(ino) > sealedSeq {
+				// Written since the batching began. It is dirty again, and
+				// belongs to the next generation rather than this one.
+				delete(clean, ino)
+				continue
+			}
+			staged, err := hasContent(tx, ino)
+			if err != nil {
+				return err
+			}
+			if staged {
+				drop = append(drop, ino)
+			}
+			for _, q := range []string{
+				`DELETE FROM onode WHERE inode = ?`,
+				`DELETE FROM ocontent WHERE inode = ?`,
+				`DELETE FROM oxattr WHERE inode = ?`,
+				`DELETE FROM osymlink WHERE inode = ?`,
+			} {
+				if _, err := tx.Exec(q, int64(ino)); err != nil {
+					return err
+				}
+			}
+			// Edges belong to their parent: every namespace mutation
+			// stamps the parent, so a clean parent means its whole
+			// directory — whiteouts included — is what was published. A
+			// published deletion needs no whiteout: the name is gone from
+			// the new base, so the merged view resolves it to nothing on
+			// its own.
+			res, err := tx.Exec(`DELETE FROM oedge WHERE parent = ?`, int64(ino))
+			if err != nil {
+				return err
+			}
+			if n, err := res.RowsAffected(); err == nil {
+				rep.Edges += int(n)
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	// The content goes NOW, with the lock still held, rather than on a
+	// list replayed after the whole rebase. That list was safe only while
+	// one lock hold covered the entire rebase: with the lock released
+	// between batches, an inode whose rows were just dropped can be
+	// written again — staging a fresh file under the same number — and a
+	// deferred unlink would then delete the new one. A test caught exactly
+	// that.
+	//
+	// The cost is what it was before it was deferred, minus the scale: one
+	// unlink per staged inode in THIS batch, so tens of milliseconds
+	// rather than the seconds a whole source tree took.
+	for _, ino := range drop {
+		if deferred := fs.content.Drop(ino); deferred != nil {
+			deferred()
+		}
+	}
+	return nil
+}
+
 func (fs *FS) Rebase(ctx context.Context, sealedSeq uint64, sealed Options) (*RebaseReport, error) {
 	if sealed.BaseRoot == ([32]byte{}) {
 		return nil, errors.New("overlay: Rebase requires the sealed generation's BaseRoot")
 	}
 	fs.mu.Lock()
-	// Unlinking the staging file of every inode this rebase cleans is one
-	// syscall apiece — 58 µs each on APFS, so seconds on a dirty set the
-	// size of an unpacked source tree — and it would hold the mount's lock
-	// for all of it. Nothing references those files once the transaction
-	// below commits, and inode numbers are never reissued, so the removal
-	// waits until the lock is gone. Defers run last-in-first-out: the
-	// unlock below runs first, then this.
-	var unlink []func()
-	defer func() {
-		for _, drop := range unlink {
-			drop()
-		}
-	}()
 	defer fs.mu.Unlock()
 
 	if live := fs.base.RootCatalog(); live != sealed.BaseRoot {
@@ -127,40 +193,52 @@ func (fs *FS) Rebase(ctx context.Context, sealedSeq uint64, sealed Options) (*Re
 	cleaned := sortedInodes(clean)
 
 	rep := &RebaseReport{BaseGeneration: sealed.BaseGeneration, Unresolved: sortedInodes(unresolved)}
-	var drop []uint64
-	err = fs.withTx(func(tx querier) error {
-		for _, ino := range cleaned {
-			staged, err := hasContent(tx, ino)
-			if err != nil {
-				return err
-			}
-			if staged {
-				drop = append(drop, ino)
-			}
-			for _, q := range []string{
-				`DELETE FROM onode WHERE inode = ?`,
-				`DELETE FROM ocontent WHERE inode = ?`,
-				`DELETE FROM oxattr WHERE inode = ?`,
-				`DELETE FROM osymlink WHERE inode = ?`,
-			} {
-				if _, err := tx.Exec(q, int64(ino)); err != nil {
-					return err
-				}
-			}
-			// Edges belong to their parent: every namespace mutation
-			// stamps the parent, so a clean parent means its whole
-			// directory — whiteouts included — is what was published. A
-			// published deletion needs no whiteout: the name is gone from
-			// the new base, so the merged view resolves it to nothing on
-			// its own.
-			res, err := tx.Exec(`DELETE FROM oedge WHERE parent = ?`, int64(ino))
-			if err != nil {
-				return err
-			}
-			if n, err := res.RowsAffected(); err == nil {
-				rep.Edges += int(n)
-			}
+
+	// The base generation is recorded BEFORE any row is dropped, and in
+	// its own transaction, which is what lets everything after it be
+	// interruptible. A crash in between leaves an overlay over the new
+	// base carrying rows that shadow content that base already has:
+	// redundant, identical, and harmless. The other order is not safe —
+	// rows dropped while the overlay still claims the OLD base would be
+	// content missing from the merged view after a reopen.
+	if err := fs.withTx(func(tx querier) error {
+		if err := metaSet(tx, metaBaseRoot, hex.EncodeToString(sealed.BaseRoot[:])); err != nil {
+			return err
 		}
+		return metaSet(tx, metaBaseGeneration, strconv.FormatUint(sealed.BaseGeneration, 10))
+	}); err != nil {
+		return nil, err
+	}
+
+	// Dropping rows for tens of thousands of inodes is the bulk of a
+	// rebase, and it used to hold the mount's lock for all of it — 7 to
+	// 11 seconds on a source tree, which is long enough for an NFS client
+	// to declare the server dead. It is done in batches now, with the
+	// lock released between them, because none of it is load-bearing:
+	// rebasing is what hands inodes back as CLEAN, and an inode that does
+	// not get there simply keeps paying the short dirty TTL.
+	//
+	// What the release makes possible is a writer dirtying an inode this
+	// loop was about to clean, so each batch re-checks under the lock
+	// rather than trusting the set computed before the first one. Dropping
+	// rows for an inode written since the snapshot would be losing that
+	// write.
+	for start := 0; start < len(cleaned); start += rebaseBatch {
+		end := min(start+rebaseBatch, len(cleaned))
+		if err := fs.rebaseBatchLocked(cleaned[start:end], sealedSeq, clean, rep); err != nil {
+			return nil, err
+		}
+		if end < len(cleaned) {
+			// The only point of the batching: hand the lock to whoever is
+			// waiting. Go's mutex passes it directly to a waiter that has
+			// been queued for a millisecond, which is exactly the filesystem
+			// operation this exists to let through.
+			fs.mu.Unlock()
+			fs.mu.Lock()
+		}
+	}
+
+	err = fs.withTx(func(tx querier) error {
 		// The snapshot's namespace IS the new base's namespace, so it is
 		// also the provenance a reopened overlay must replay: an inode
 		// the overlay moved lives in the new base at its MERGED path, and
@@ -208,18 +286,6 @@ func (fs *FS) Rebase(ctx context.Context, sealedSeq uint64, sealed Options) (*Re
 	if err != nil {
 		return nil, err
 	}
-	// A rebase runs after the seal that published these inodes, so no
-	// snapshot should still be reading them — but the hand-over runs
-	// anyway, because "should" is the wrong footing for the step that
-	// deletes the only copy of a file. It is a no-op when no snapshot is
-	// live, which is the expected case; the unlinks themselves happen
-	// after the lock is dropped.
-	for _, ino := range drop {
-		if deferred := fs.content.Drop(ino); deferred != nil {
-			unlink = append(unlink, deferred)
-		}
-	}
-
 	// Re-derive the dirty set from the rebased tables rather than editing
 	// it: agreement with a fresh reopen is then structural, not a claim.
 	fs.dirtySet = nil

@@ -53,6 +53,34 @@ requires.
 **Build cost.** A sorted array is written once, sequentially. There is no
 rebalancing, so nothing is read back.
 
+## Measured
+
+Both implementations building the same 16,400-entry source-shaped tree
+and answering the same read mix — a directory listing with attributes
+plus a lookup per entry, which is what a mount issues:
+
+| | static | SQLite | |
+|---|---|---|---|
+| build | 8.66 ms | 69.5 ms | 8.0× |
+| read, serial | 6.3 µs | 199 µs | 31× |
+| read, parallel | 3.9 µs | 267 µs | 69× |
+| allocations per read | 47 | 2,124 | 45× |
+| raw size | 132.8 B/entry | 87.9 B/entry | **1.51× larger** |
+| zstd'd | 9.9 B/entry | 11.8 B/entry | 0.84× |
+
+The concurrency prediction is confirmed in the sharpest possible form:
+**SQLite gets slower under parallelism** (199 → 267 µs) while the static
+format gets faster (6.3 → 3.9 µs). That is the allocator mutex, and it is
+the ceiling a mount hits whenever many operations read catalogs at once.
+
+Raw size is a **loss**, not the modest win this document first predicted:
+fixed-width records against SQLite's varints. It is recorded here because
+it is the one axis where the format is worse. What crosses the wire is
+the compressed form, where zero padding is exactly what a compressor
+eats, and there the format is 16% smaller — but a reader that maps a
+catalog locally holds the larger raw form, so this is a trade, not a free
+win.
+
 ## What it must serve
 
 The entire query surface, from `internal/catalog`:

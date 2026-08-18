@@ -107,6 +107,12 @@ type genSession struct {
 	// makes the clock's fields safe as well as the boundary singular.
 	downOnce sync.Once
 
+	// Session upload accounting, for the periodic "still uploading" line.
+	uploadMu    sync.Mutex
+	uploadPacks int
+	uploadBytes int64
+	uploadSaid  time.Time
+
 	// closeContent releases the write path's content store and its
 	// journal, in that order. Nil when the session keeps its content in
 	// staging files.
@@ -207,6 +213,7 @@ func (g *genSession) openContent(ctx context.Context, disabled bool) (*memtable.
 		DEK:               g.dek,
 		KeyID:             int64(g.keyID),
 		PromotionDistance: memtable.DefaultPromotionDistance,
+		OnUpload:          g.reportSessionUpload,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("open the write path's content store: %w", err)
@@ -222,6 +229,36 @@ func (g *genSession) openContent(ctx context.Context, disabled bool) (*memtable.
 	// path. Both must be able to call it.
 	g.closeContent = sync.OnceValue(closeStore)
 	return store, nil
+}
+
+// sessionUploadInterval is how often a session says it is uploading. Per
+// pack would be a line every second or two on a fast link; the point is
+// only to make a long, slow push distinguishable from a stall, which one
+// line a minute does.
+const sessionUploadInterval = 30 * time.Second
+
+// reportSessionUpload accounts for what the write path sends while the
+// user works, and says so periodically.
+//
+// Silence here was read as a hang, and reasonably: a mount that has
+// stopped answering and a mount pushing 64 MiB up a 2 MiB/s link look
+// identical from the outside. Reporting the RATE is what tells them
+// apart, so it is the rate this prints.
+func (g *genSession) reportSessionUpload(pack string, bytes int64, elapsed time.Duration) {
+	g.uploadMu.Lock()
+	g.uploadPacks++
+	g.uploadBytes += bytes
+	packs, total := g.uploadPacks, g.uploadBytes
+	since := time.Since(g.uploadSaid)
+	if since < sessionUploadInterval && g.uploadSaid.After(g.started) {
+		g.uploadMu.Unlock()
+		return
+	}
+	g.uploadSaid = time.Now()
+	g.uploadMu.Unlock()
+	ui.Info("uploading as you write: {packs} packs, {bytes} so far (last pack {size} in {elapsed})",
+		"packs", packs, "bytes", ui.ByteCount(total),
+		"size", ui.ByteCount(bytes), "elapsed", elapsed.Round(time.Millisecond))
 }
 
 // runMountGen serves one generation. Reached from `pelfs mount-gen` and,
@@ -1053,7 +1090,14 @@ func (g *genSession) sealLocked(ctx context.Context, follow bool) (*publish.Resu
 		defer releaseSnap()
 		release = releaseSnap
 		sc := snap.Cost()
-		ui.Info("froze the overlay in {total} (vacuum {vacuum}, {staged} staged files pinned in {pin}, "+
+		if sc.Drain > time.Second {
+			// Said separately because it is NOT a stall: the mount served
+			// throughout, and reporting it as freeze time is what made a
+			// slow uplink look like a slow lock.
+			ui.Info("pushed this session's remaining content in {drain} before freezing; the mount kept serving",
+				"drain", sc.Drain.Round(time.Millisecond))
+		}
+		ui.Info("froze the overlay in {total} (vacuum {vacuum}, {staged} staged inodes in {pin}, "+
 			"namespace {namespace}, open {open})",
 			"total", sc.Total().Round(time.Millisecond), "vacuum", sc.Vacuum.Round(time.Millisecond),
 			"staged", sc.Staged, "pin", sc.Freeze.Round(time.Millisecond),

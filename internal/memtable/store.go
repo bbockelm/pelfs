@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/bbockelm/pelfs/internal/chunkid"
 	"github.com/bbockelm/pelfs/internal/entrycodec"
@@ -15,10 +16,23 @@ import (
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 )
 
-// DefaultTableSize is the memtable capacity. The design says to start at
-// the pack target so the common case produces full packs; it is one knob
-// here rather than two for exactly that reason.
-const DefaultTableSize = 64 << 20
+// DefaultTableSize is the ring's capacity, and it must be LARGER than the
+// promotion distance or aging can never fire: Promotable is
+// used - distance, and used cannot exceed the ring. Setting the two equal
+// meant nothing was ever packed by age, so the only path that packed was
+// the one where a writer had already blocked on a full ring — a mount
+// that stops dead for the length of an upload, repeatedly. The gap
+// between this and DefaultPromotionDistance is the writer's runway, and a
+// check at construction now refuses a configuration without one.
+const DefaultTableSize = DefaultRingSize
+
+// DefaultPackTarget is the cut size for packs this store writes. It is
+// the FORMAT's cut size (publish's target), not the ring's size: a reader
+// fetches packs whole, and a pack is not reclaimable — nor readable —
+// until the whole of it has landed. Cutting at the ring's size made every
+// upload a 64 MiB monolith, which on a home uplink is half a minute
+// during which the ring cannot drain and the mount cannot write.
+const DefaultPackTarget = 2 << 20
 
 // Options configures a Store.
 type Options struct {
@@ -26,6 +40,9 @@ type Options struct {
 	Dir string
 	// TableSize is the ring's capacity in bytes, headers included.
 	TableSize int
+	// PackTarget is the size packs are cut at. Zero takes
+	// DefaultPackTarget.
+	PackTarget int64
 	// PromotionDistance is how far behind the head an extent must fall
 	// before the packer takes it. Zero packs whatever is there, which is
 	// what a flush wants; DefaultPromotionDistance is what a session
@@ -54,6 +71,11 @@ type Options struct {
 	// every chunkref this store writes.
 	DEK   []byte
 	KeyID int64
+	// OnUpload is called once per pack this store sends, from the packing
+	// goroutine. A session that packs as it writes is otherwise silent for
+	// minutes at a time, and silence during a slow upload is
+	// indistinguishable from a stall — which is exactly how it was read.
+	OnUpload func(pack string, bytes int64, elapsed time.Duration)
 	// Hooks are test seams; all fields may be nil.
 	Hooks Hooks
 }
@@ -123,12 +145,13 @@ type Stats struct {
 // Store is the write path: one active memtable, at most one flushing
 // memtable, and a location map naming what has reached the federation.
 type Store struct {
-	dir       string
-	tableSize int
-	obj       pelicanobj.Store
-	chunkOpts chunkid.Options
-	hasher    chunkid.Hasher
-	hooks     Hooks
+	dir        string
+	tableSize  int
+	packTarget int64
+	obj        pelicanobj.Store
+	chunkOpts  chunkid.Options
+	hasher     chunkid.Hasher
+	hooks      Hooks
 
 	// promotion is how far behind the head an extent must fall before it
 	// is packed. Zero means pack everything, which is what a flush asks
@@ -147,10 +170,11 @@ type Store struct {
 	live  map[Handle]int    // content references per handle
 	order []Handle          // handles in ring order, oldest first
 
-	journal Journal
-	base    Base
-	dek     []byte
-	keyID   int64
+	journal  Journal
+	base     Base
+	dek      []byte
+	keyID    int64
+	onUpload func(string, int64, time.Duration)
 	// baseRefs holds, per ADOPTED handle, the base generation's own
 	// content records for that file (base.go). An extent is either these,
 	// or a ring record, or a location-map entry — the three places bytes
@@ -236,6 +260,20 @@ func newStore(opts Options) (*Store, error) {
 	if opts.TableSize == 0 {
 		opts.TableSize = DefaultTableSize
 	}
+	if opts.PackTarget == 0 {
+		opts.PackTarget = DefaultPackTarget
+	}
+	// A promotion distance at or above the ring's size is not a tuning
+	// choice, it is a store that never ages anything out: every pack run
+	// would start from a writer that has already stopped. The record cap
+	// bounds how much a single append can consume of what is left, so the
+	// runway has to clear it.
+	if runway := int64(opts.TableSize) - int64(opts.PromotionDistance); opts.PromotionDistance > 0 &&
+		runway <= int64(MaxRecord(opts.TableSize)) {
+		return nil, fmt.Errorf("memtable: a %d-byte ring with a %d-byte promotion distance leaves %d bytes "+
+			"of runway, under the %d-byte record cap: packing would only ever start from a blocked writer",
+			opts.TableSize, opts.PromotionDistance, runway, MaxRecord(opts.TableSize))
+	}
 	if opts.TableSize <= recordHeader {
 		return nil, fmt.Errorf("memtable: table size %d leaves no room for a record", opts.TableSize)
 	}
@@ -246,23 +284,24 @@ func newStore(opts Options) (*Store, error) {
 		opts.PackCacheBytes = DefaultPackCacheBytes
 	}
 	s := &Store{
-		dir:       opts.Dir,
-		tableSize: opts.TableSize,
-		promotion: opts.PromotionDistance,
-		index:     make(map[Handle]Record),
-		live:      make(map[Handle]int),
-		base:      opts.Base,
-		journal:   opts.Journal,
-		dek:       opts.DEK,
-		keyID:     opts.KeyID,
-		baseRefs:  make(map[Handle]baseExtent),
-		obj:       opts.Obj,
-		chunkOpts: opts.Chunk,
-		hasher:    opts.Hasher,
-		hooks:     opts.Hooks,
-		content:   make(map[uint64]*content),
-		handleLoc: make(map[Handle][]ChunkSlice),
-		chunkLoc:  make(map[string]PackLoc),
+		dir:        opts.Dir,
+		tableSize:  opts.TableSize,
+		promotion:  opts.PromotionDistance,
+		packTarget: opts.PackTarget,
+		index:      make(map[Handle]Record),
+		live:       make(map[Handle]int),
+		base:       opts.Base,
+		journal:    opts.Journal,
+		dek:        opts.DEK,
+		keyID:      opts.KeyID,
+		baseRefs:   make(map[Handle]baseExtent),
+		obj:        opts.Obj,
+		chunkOpts:  opts.Chunk,
+		hasher:     opts.Hasher,
+		hooks:      opts.Hooks,
+		content:    make(map[uint64]*content),
+		handleLoc:  make(map[Handle][]ChunkSlice),
+		chunkLoc:   make(map[string]PackLoc),
 	}
 	s.cond = sync.NewCond(&s.mu)
 	if opts.PackCacheBytes > 0 {

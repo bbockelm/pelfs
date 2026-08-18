@@ -84,6 +84,11 @@ type Snapshot struct {
 // proving: a Freeze that grows with the staged file count is the
 // regression this design was built to remove.
 type SnapshotCost struct {
+	// Drain is content pushed to the federation before the instant could
+	// be taken, WITHOUT the lock held. It is not part of the stall, and
+	// counting it as freezing is how a slow uplink came to look like a
+	// slow freeze.
+	Drain  time.Duration
 	Vacuum time.Duration // VACUUM INTO: the frozen copy of the dirty tables
 	Freeze time.Duration // recording the staged lengths to pin
 	Edges  time.Duration // reading the namespace map Rebase replays against
@@ -91,7 +96,8 @@ type SnapshotCost struct {
 	Staged int           // staged files the snapshot pinned
 }
 
-// Total is the whole time the overlay lock was held.
+// Total is the whole time the overlay lock was held. Drain is excluded
+// on purpose: the mount kept serving through it.
 func (c SnapshotCost) Total() time.Duration {
 	return c.Vacuum + c.Freeze + c.Edges + c.Open
 }
@@ -111,10 +117,13 @@ func (fs *FS) Snapshot(ctx context.Context, dir string) (*Snapshot, error) {
 	// named by a frozen view. It happens OUTSIDE the lock: the mount must
 	// not stop answering for the length of an upload. Whatever arrives
 	// during it is caught by the small second flush inside freeze.
+	drain := time.Duration(0)
 	if p, ok := fs.content.(contentSnapshotter); ok {
+		start := time.Now()
 		if err := p.prepareSnapshot(ctx); err != nil {
 			return nil, err
 		}
+		drain = time.Since(start)
 	}
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -142,6 +151,7 @@ func (fs *FS) Snapshot(ctx context.Context, dir string) (*Snapshot, error) {
 		}
 	}
 	snap := &Snapshot{owner: fs, seq: fs.seq, dir: dir}
+	snap.cost.Drain = drain
 	if err := fs.freezeLocked(ctx, snap, dir, stagingDir); err != nil {
 		os.RemoveAll(stagingDir)                     //nolint:errcheck
 		os.Remove(filepath.Join(dir, overlayDBName)) //nolint:errcheck

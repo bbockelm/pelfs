@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"time"
 
 	"github.com/bbockelm/pelfs/internal/chunkid"
 	"github.com/bbockelm/pelfs/internal/entrycodec"
@@ -102,7 +103,7 @@ func (s *Store) snapshot(b *batch) ([]inodePlan, *flushResult) {
 }
 
 func (s *Store) chunkAndPack(ctx context.Context, b *batch, plan []inodePlan, res *flushResult) error {
-	pk := newFlushPacker(s.obj, s.dir, int64(s.tableSize), s.cache, s.dek, s.keyID)
+	pk := newFlushPacker(s.obj, s.dir, s.packTarget, s.cache, s.dek, s.keyID, s.onUpload)
 	defer pk.abort()
 	for _, ip := range plan {
 		if err := s.chunkInode(ctx, b, ip.exts, pk, res); err != nil {
@@ -259,12 +260,13 @@ func (s *Store) failFlush(err error) {
 // publish.packer: that file is being rewritten elsewhere, and a flush
 // needs the per-chunk offsets that packer does not surface.
 type flushPacker struct {
-	obj    pelicanobj.Store
-	dir    string
-	target int64
-	cache  *packCache
-	dek    []byte
-	keyID  int64
+	obj      pelicanobj.Store
+	dir      string
+	target   int64
+	cache    *packCache
+	dek      []byte
+	keyID    int64
+	onUpload func(string, int64, time.Duration)
 
 	w       *packstore.PackWriter
 	pend    []pendingLoc
@@ -284,9 +286,10 @@ type pendingLoc struct {
 	alg     uint8
 }
 
-func newFlushPacker(obj pelicanobj.Store, dir string, target int64, cache *packCache, dek []byte, keyID int64) *flushPacker {
+func newFlushPacker(obj pelicanobj.Store, dir string, target int64, cache *packCache, dek []byte, keyID int64,
+	onUpload func(string, int64, time.Duration)) *flushPacker {
 	return &flushPacker{
-		obj: obj, dir: dir, target: target, cache: cache, dek: dek, keyID: keyID,
+		obj: obj, dir: dir, target: target, cache: cache, dek: dek, keyID: keyID, onUpload: onUpload,
 		pending: make(map[string]struct{}),
 		locs:    make(map[string]PackLoc),
 	}
@@ -364,6 +367,7 @@ func (p *flushPacker) cut(ctx context.Context) error {
 		}
 		retained = true
 	}
+	started := time.Now()
 	if err := upload(ctx, p.obj); err != nil {
 		if retained {
 			// Nothing published references this pack, so the local copy is
@@ -374,6 +378,9 @@ func (p *flushPacker) cut(ctx context.Context) error {
 	}
 	if retained {
 		p.cache.admit(sp.Name, sp.Size)
+	}
+	if p.onUpload != nil {
+		p.onUpload(sp.Name, sp.Size, time.Since(started))
 	}
 	p.w = nil
 	p.sealed = append(p.sealed, sp)

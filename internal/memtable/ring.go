@@ -7,6 +7,7 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 )
@@ -31,9 +32,17 @@ type Ring struct {
 	data  []byte // the data region: whole[ringFileHdr:]
 	size  uint64 // len(data), fixed for the file's life
 
-	head uint64 // absolute position of the next append
-	tail uint64 // absolute position of the oldest unreclaimed byte
-	seq  uint64 // sequence stamped on the next record
+	// head and tail are ATOMIC because At reads them without the store's
+	// lock. That is the design — resolve a position under the lock, read
+	// the bytes outside it, with a pin holding the tail back — but the
+	// bounds check inside At is still a read of state a concurrent
+	// Reclaim writes. The pin makes the BYTES safe; this makes the check
+	// safe. Writers always hold the store's lock, so plain loads and
+	// stores are enough and no compare-and-swap is needed.
+	head atomic.Uint64 // absolute position of the next append
+	tail atomic.Uint64 // absolute position of the oldest unreclaimed byte
+
+	seq uint64 // sequence stamped on the next record
 
 	// pins counts readers holding each position. Reclaim may not pass the
 	// oldest of them: the bytes behind the tail become writable at once,
@@ -163,8 +172,8 @@ func (r *Ring) writeFileHeader() error {
 	h := r.hdr()
 	copy(h[0:8], ringMagic)
 	binary.LittleEndian.PutUint64(h[8:], r.size)
-	binary.LittleEndian.PutUint64(h[16:], r.tail)
-	binary.LittleEndian.PutUint64(h[24:], r.head)
+	binary.LittleEndian.PutUint64(h[16:], r.tail.Load())
+	binary.LittleEndian.PutUint64(h[24:], r.head.Load())
 	binary.LittleEndian.PutUint64(h[32:], r.seq)
 	binary.LittleEndian.PutUint32(h[40:], crc32.Checksum(h[0:40], crcTable))
 	return nil
@@ -173,15 +182,15 @@ func (r *Ring) writeFileHeader() error {
 func (r *Ring) hdr() []byte { return r.whole[:ringFileHdr] }
 
 // Used reports bytes written and not yet reclaimed.
-func (r *Ring) Used() uint64 { return r.head - r.tail }
+func (r *Ring) Used() uint64 { return r.head.Load() - r.tail.Load() }
 
 // Free reports how much a writer may still append before it must wait.
 func (r *Ring) Free() uint64 { return r.size - r.Used() }
 
 // Head and Tail expose the absolute positions, which is what an aging
 // policy compares against: an extent at position p is head-p bytes old.
-func (r *Ring) Head() uint64 { return r.head }
-func (r *Ring) Tail() uint64 { return r.tail }
+func (r *Ring) Head() uint64 { return r.head.Load() }
+func (r *Ring) Tail() uint64 { return r.tail.Load() }
 
 // Append writes one extent and returns its absolute position. A record
 // never straddles the seam: if it will not fit before the end of the
@@ -192,7 +201,8 @@ func (r *Ring) Append(rec *Record, payload []byte) (uint64, error) {
 			ErrRecordTooLarge, len(payload), MaxRecord(int(r.size)), r.size)
 	}
 	need := uint64(ringRecHdr + len(payload))
-	off := r.head % r.size
+	head := r.head.Load()
+	off := head % r.size
 	if off+need > r.size {
 		// Pad to the seam. The pad consumes ring space, so it must fit
 		// too, or the writer waits rather than silently overwriting.
@@ -201,13 +211,14 @@ func (r *Ring) Append(rec *Record, payload []byte) (uint64, error) {
 			return 0, ErrRingFull
 		}
 		r.writePad(off, pad)
-		r.head += pad
+		head += pad
+		r.head.Store(head)
 		off = 0
 	}
 	if need > r.Free() {
 		return 0, ErrRingFull
 	}
-	pos := r.head
+	pos := head
 	h := r.data[off : off+ringRecHdr]
 	binary.LittleEndian.PutUint32(h[0:], ringRecMagic)
 	binary.LittleEndian.PutUint32(h[4:], uint32(len(payload)))
@@ -220,7 +231,7 @@ func (r *Ring) Append(rec *Record, payload []byte) (uint64, error) {
 	crc = crc32.Update(crc, crcTable, payload)
 	binary.LittleEndian.PutUint32(h[40:], crc)
 
-	r.head += need
+	r.head.Store(head + need)
 	r.seq++
 	return pos, nil
 }
@@ -241,7 +252,7 @@ func (r *Ring) writePad(off, n uint64) {
 // because a written record's bytes never change.
 func (r *Ring) At(pos uint64, length int) ([]byte, bool) {
 	end := pos + uint64(ringRecHdr) + uint64(length)
-	if pos < r.tail || end > r.head {
+	if pos < r.tail.Load() || end > r.head.Load() {
 		return nil, false
 	}
 	off := pos % r.size
@@ -268,7 +279,7 @@ func (r *Ring) Unpin(pos uint64) {
 // oldestPin reports the lowest pinned position, or the head when nothing
 // is pinned.
 func (r *Ring) oldestPin() uint64 {
-	oldest := r.head
+	oldest := r.head.Load()
 	for pos := range r.pins {
 		if pos < oldest {
 			oldest = pos
@@ -286,14 +297,14 @@ func (r *Ring) oldestPin() uint64 {
 // in one place cannot be forgotten by the next caller the way an
 // interface contract can.
 func (r *Ring) Reclaim(to uint64) (uint64, error) {
-	if to < r.tail || to > r.head {
-		return r.tail, fmt.Errorf("memtable: reclaim to %d outside [%d,%d]", to, r.tail, r.head)
+	if tail, head := r.tail.Load(), r.head.Load(); to < tail || to > head {
+		return tail, fmt.Errorf("memtable: reclaim to %d outside [%d,%d]", to, tail, head)
 	}
 	if limit := r.oldestPin(); to > limit {
 		to = limit
 	}
-	r.tail = to
-	return r.tail, r.writeFileHeader()
+	r.tail.Store(to)
+	return to, r.writeFileHeader()
 }
 
 // Promotable reports how many bytes at the tail are old enough to pack,
@@ -316,7 +327,8 @@ func (r *Ring) Promotable(distance uint64) uint64 {
 // [from, to). Packing works from the TAIL because that is where the
 // oldest bytes are, and age is the whole promotion rule.
 func (r *Ring) PromotableRange(distance uint64) (from, to uint64) {
-	return r.tail, r.tail + r.Promotable(distance)
+	tail := r.tail.Load()
+	return tail, tail + r.Promotable(distance)
 }
 
 // Sync flushes the mapping. Durability is the caller's policy; the ring
@@ -401,8 +413,9 @@ func OpenRing(path string) (*Ring, []Record, error) {
 		return nil, nil, err
 	}
 	r.Truncated, r.Missing = truncated, missing
-	r.tail = binary.LittleEndian.Uint64(h[16:])
-	r.head = r.tail
+	tail := binary.LittleEndian.Uint64(h[16:])
+	r.tail.Store(tail)
+	r.head.Store(tail)
 	r.seq = 1
 
 	// The two ways a run ends are worth telling apart. Unwritten space and
@@ -412,7 +425,7 @@ func OpenRing(path string) (*Ring, []Record, error) {
 	// to be told about, because everything behind it is unreachable even if
 	// it is still on the disk.
 	var live []Record
-	pos := r.tail
+	pos := r.tail.Load()
 	for {
 		off := pos % r.size
 		if off+ringRecHdr > r.size {
@@ -451,7 +464,7 @@ func OpenRing(path string) (*Ring, []Record, error) {
 			})
 		}
 		pos += total
-		r.head = pos
+		r.head.Store(pos)
 		r.seq = seq + 1
 	}
 	return r, live, nil

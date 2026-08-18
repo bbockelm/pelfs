@@ -1,5 +1,5 @@
-// Package rawfuse is the phase-3 raw FUSE binding (docs/design-packfs.md,
-// "Phase 3 VFS architecture"): fuse.RawFileSystem mapped 1:1 onto the genfs
+// Package rawfuse is the raw FUSE binding (docs/design-packfs.md, on the
+// catalog-native mount): fuse.RawFileSystem mapped 1:1 onto the genfs
 // generation resolver (Bind, read-only) or onto the write overlay over that
 // generation (BindRW, read-write). A read-only binding answers EROFS to
 // every mutating op — the op is understood and refused, not unimplemented.
@@ -40,11 +40,11 @@ import (
 // expiry.
 const entryValidity = 10 * 365 * 24 * time.Hour
 
-// dirtyValidity is the entry/attr TTL stamped on a DIRTY reply. Zero is
-// the maximally conservative answer, and an unpack pays for it: with no
-// attribute cache the kernel re-asks about every change it made itself,
-// which traced at 5 GETATTRs and 2 LOOKUPs per created file — 14 FUSE
-// round trips for a file that needs 8.
+// dirtyValidity is the entry/attr TTL stamped on a DIRTY reply: short,
+// deliberately not zero. Zero is the maximally conservative answer and an
+// unpack pays for it — with no attribute cache the kernel re-asks about
+// every change it made itself, which measures 5 GETATTRs and 2 LOOKUPs
+// per created file, 14 FUSE round trips for a file that needs 8.
 //
 // A short TTL is sound because the overlay has exactly one writer. The
 // mount owns it exclusively (the database is opened locking_mode
@@ -298,8 +298,9 @@ func (r *raw) validity(ino uint64) time.Duration {
 }
 
 // isDirty is the overlay-touched predicate on its own. Page-cache
-// retention keys off this rather than off a zero TTL: the two policies
-// answer different questions, and only one of them is a duration.
+// retention keys off this rather than off the reply's TTL: the two
+// policies answer different questions, and only one of them is a
+// duration.
 func (r *raw) isDirty(ino uint64) bool {
 	return r.dirty != nil && r.dirty.has(ino)
 }

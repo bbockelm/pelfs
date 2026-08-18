@@ -57,10 +57,10 @@ type handles struct {
 //
 // A handle retains a path; a verifier retains a whole directory LISTING —
 // one fs.FileInfo per entry, measured at ~85 bytes each. Sizing the two
-// alike (which they were: verifyLimit = the handle limit = 1<<20) puts no
-// useful ceiling on the second: a million cached listings of a thousand
-// entries is 84 GB. Measured on a 100k-file / 2000-directory tree, one
-// `find` left 11 MB of listings pinned for the life of the mount.
+// alike — a verifier bound at the handle limit of 1<<20 — puts no useful
+// ceiling on the second: a million cached listings of a thousand entries
+// is 84 GB. Measured on a 100k-file / 2000-directory tree, one `find`
+// left 11 MB of listings pinned for the life of the mount.
 //
 // Nothing needs them for that long. A verifier exists to keep ONE client's
 // READDIR continuation self-consistent while the directory changes under

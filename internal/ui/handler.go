@@ -13,8 +13,8 @@ import (
 // prefix identifies our lines on a terminal three programs are writing
 // to. See the package comment. A warning or an error says so in the
 // prose lead as well, so that the level a collector reads as a field is
-// the same level a person reads on the terminal -- and so that call
-// sites stop shouting WARNING at each other in the message text.
+// the same level a person reads on the terminal -- and so that no call
+// site has to shout WARNING in its own message text.
 const (
 	prefix     = "pelfs: "
 	warnPrefix = "pelfs: warning: "

@@ -430,10 +430,9 @@ func TestReadAtChunkBoundaries(t *testing.T) {
 	}
 }
 
-// TestReadAfterWrite mirrors internal/nfsmount's readafterwrite test: the
-// invariant a git clone depends on is that whatever size Stat reports, a
-// read returns at least that many bytes — immediately, with no flush and
-// no close.
+// TestReadAfterWrite pins the invariant a git clone depends on: whatever
+// size Stat reports, a read returns at least that many bytes —
+// immediately, with no flush and no close.
 func TestReadAfterWrite(t *testing.T) {
 	bfs, _ := newRW(t, "aaaa1111-2222-3333-4444-555566667777")
 	data := bytes.Repeat([]byte("pelfs-pack-data!"), 512<<10/16) // 512 KiB

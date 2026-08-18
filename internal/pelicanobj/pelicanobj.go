@@ -152,12 +152,12 @@ type UnverifiedReader interface {
 //
 // It exists because a decorator that embeds the Store interface silently
 // drops every capability outside it. Both optional interfaces here are
-// exactly that kind of capability, and both were quietly inert on the
-// mount path for precisely this reason: the direct-read rule never
-// applied, and the unverified-read fallback could not find a transport
-// able to perform it. Probing a decorator without unwrapping does not
-// fail loudly, it just does nothing, which is why these lookups go
-// through the helpers below rather than a bare type assertion.
+// exactly that kind of capability, and the mount path reaches its
+// transport only through decorators: probe one without unwrapping and the
+// direct-read rule simply never applies, while the unverified-read
+// fallback finds no transport able to perform it. Neither failure is
+// loud — nothing happens at all — which is why these lookups go through
+// the helpers below rather than a bare type assertion.
 type Unwrapper interface {
 	Unwrap() Store
 }
@@ -228,10 +228,10 @@ func ReadMutable(ctx context.Context, s Store, key string) ([]byte, error) {
 	})
 	if rerr != nil {
 		// Say that the retry was tried and failed. Reporting only the
-		// original error made these two outcomes -- "never attempted"
-		// and "attempted, still refused" -- indistinguishable from the
-		// outside, which cost a debugging round trip against a real
-		// federation.
+		// original error leaves two outcomes -- "never attempted" and
+		// "attempted, still refused" -- indistinguishable from the
+		// outside, and telling them apart then costs a round trip
+		// against a real federation.
 		ui.Warn("unverified re-read of {key} also failed: {error}", "key", key, "error", rerr)
 		return nil, err
 	}
@@ -264,12 +264,12 @@ func readWhole(open func() (io.ReadCloser, error)) ([]byte, error) {
 //
 // The typed check is the right one, but it is not sufficient on its own.
 // The error crosses the PelicanFS boundary, where a transfer failure can
-// be rebuilt as a plain error, and a lost type meant the fallback never
-// ran against the deployment it was written for -- the failure looked
-// exactly like having no fallback at all. So the code is matched
-// textually too. That is ugly, and it is deliberate: this whole path is
-// a temporary workaround for a misbehaving origin, and being unable to
-// recognize the very condition it exists for is the worse failure.
+// be rebuilt as a plain error, and a lost type makes the fallback
+// silently never run -- indistinguishable, from outside, from having no
+// fallback at all. So the code is matched textually too. That is ugly,
+// and it is deliberate: this whole path is a temporary workaround for a
+// misbehaving origin, and being unable to recognize the very condition it
+// exists for is the worse failure.
 func isChecksumMismatch(err error) bool {
 	if err == nil {
 		return false

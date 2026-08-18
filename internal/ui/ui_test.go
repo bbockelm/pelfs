@@ -91,8 +91,8 @@ func TestTextLeavesNoPlaceholderUnexpanded(t *testing.T) {
 	if strings.ContainsAny(out, "{}") {
 		t.Errorf("text output leaked a placeholder:\n%s", out)
 	}
-	// The tail of fields is what made the prose redundant; it is gone, so
-	// no line may end in one.
+	// A tail of fields is what makes the prose redundant, so no line may
+	// end in one.
 	for _, l := range strings.Split(strings.TrimSuffix(out, "\n"), "\n") {
 		if regexp.MustCompile(`\s[a-z_]+=\S+$`).MatchString(l) {
 			t.Errorf("text line still carries fields: %q", l)

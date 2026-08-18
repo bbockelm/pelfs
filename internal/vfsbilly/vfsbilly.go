@@ -1,7 +1,7 @@
-// Package vfsbilly adapts the phase-3 catalog-native stack to
-// billy.Filesystem, the interface the go-nfs server consumes
-// (internal/nfsmount.Serve). It is the piece that lets the stack be
-// mounted on macOS with the OS NFS client — no macFUSE, no kext.
+// Package vfsbilly adapts the catalog-native stack to billy.Filesystem,
+// the interface the go-nfs server consumes (internal/nfsmount.Serve). It
+// is the piece that lets the stack be mounted on macOS with the OS NFS
+// client — no macFUSE, no kext.
 //
 // Path resolution is by DESCENT. genfs serves an inode only once a Lookup
 // has established residency for it, so every path handed to this adapter
@@ -11,11 +11,11 @@
 // an inode remembered from an earlier operation is not on its own
 // resident, so a memoized descent that hits ErrStale re-walks for real.
 //
-// There is no handle cache. The overlay commits each
-// Write to its staging file before returning, so a handle carries no
-// buffered state and nothing has to reconcile a metadata length with bytes
-// still in flight — the entire class of truncation bugs that cache exists
-// to prevent (see internal/nfsmount/handlecache.go) does not arise here.
+// Open handles hold no buffered state. The overlay commits each Write to
+// its staging file before returning, so nothing has to reconcile a
+// metadata length against bytes still in flight — the entire class of
+// truncation bugs a write-back handle cache exists to prevent does not
+// arise here.
 package vfsbilly
 
 import (

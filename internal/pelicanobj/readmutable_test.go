@@ -98,8 +98,9 @@ func (s *plainStore) Get(_ context.Context, _ string, _, _ int64) (io.ReadCloser
 
 // TestChecksumMismatchSurvivesTypeLoss pins the textual half of the
 // detection. The typed check is preferred, but the error crosses a
-// boundary that can rebuild it as a plain error, and when that happened
-// the fallback silently never ran.
+// boundary that can rebuild it as a plain error, and a flattened error
+// the detector does not recognize leaves the fallback silently never
+// running.
 func TestChecksumMismatchSurvivesTypeLoss(t *testing.T) {
 	typed := error_codes.NewTransfer_ChecksumMismatchError(errors.New("md5 differs"))
 	flattened := errors.New(typed.Error())
@@ -167,11 +168,11 @@ type decorator struct {
 
 func (d decorator) Unwrap() Store { return d.inner }
 
-// TestReadMutableUnwrapsDecorators is the regression that matters most in
-// this file. The fallback was correct and completely inert in production
-// because the mount hands refs a statistics wrapper, not the transport,
-// and a bare type assertion stopped at the wrapper -- no error, no
-// warning, just nothing happening.
+// TestReadMutableUnwrapsDecorators guards the way this fallback fails
+// worst. The mount hands refs a statistics wrapper, not the transport, so
+// a bare type assertion stops at the wrapper and leaves the fallback
+// correct and completely inert -- no error, no warning, just nothing
+// happening.
 func TestReadMutableUnwrapsDecorators(t *testing.T) {
 	fed := &mismatchStore{
 		getErr: error_codes.NewTransfer_ChecksumMismatchError(errors.New("md5 differs")),
@@ -192,7 +193,7 @@ func TestReadMutableUnwrapsDecorators(t *testing.T) {
 	}
 }
 
-// The same hiding disabled the direct-read rule for mutable objects.
+// The same hiding would disable the direct-read rule for mutable objects.
 func TestAsDirectReaderUnwrapsDecorators(t *testing.T) {
 	fed := &cachedTransport{}
 	wrapped := decorator{Store: fed, inner: fed}

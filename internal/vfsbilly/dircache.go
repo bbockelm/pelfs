@@ -7,8 +7,7 @@ import (
 
 // noDirCache disables memoization, restoring a full descent per operation.
 // It is the bisection switch for a suspected staleness bug on a real
-// mount, in the same spirit as PELFS_NFS_NO_HANDLE_CACHE: if a workload
-// misbehaves with memoization on and behaves with
+// mount: if a workload misbehaves with memoization on and behaves with
 // PELFS_NFS_NO_DESCENT_CACHE=1, this is implicated; if it misbehaves
 // either way, the cause is elsewhere.
 var noDirCache = os.Getenv("PELFS_NFS_NO_DESCENT_CACHE") == "1"

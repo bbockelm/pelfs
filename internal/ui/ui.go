@@ -1,8 +1,8 @@
 // Package ui is pelfs's voice. Every line the program says to its user
 // goes through here, so "what does a pelfs message look like" is answered
-// in one place rather than at a hundred call sites — which is how the
-// output came to carry a different shape every few messages, one of them
-// applied to exactly two lines.
+// in one place rather than at a hundred call sites — where the answer
+// drifts every few messages and the output carries a different shape in
+// each corner of the program.
 //
 // # Format is a property of the sink; the reader is a human either way
 //
@@ -23,10 +23,10 @@
 // they lost by not being present is WHEN, so every line is stamped and
 // levelled; what they did not lose is the ability to read English, so the
 // sentence is rendered in full and nothing is appended after it. Inferring
-// "a machine is reading this" from the absence of a tty was the mistake:
-// it made the common case read a template ("ready to serve in {total} …
-// total=2.587s") that a person has to reassemble in their head, which is
-// worse for them than either the prose or the fields alone.
+// "a machine is reading this" from the absence of a tty gets that reader
+// wrong: it makes the common case read a template ("ready to serve in
+// {total} … total=2.587s") that a person has to reassemble in their head,
+// which is worse for them than either the prose or the fields alone.
 //
 // json is the machine format, and it is reached only by asking for it.
 // It is where the properties a collector needs live: msg is the message
@@ -41,13 +41,13 @@
 //
 // There is deliberately no per-message exception and no --log-timestamps
 // flag. Both would put the decision back at the call site, and a rule
-// that stamps only the "important" lines produces exactly the output that
-// made this package necessary: one stamped line in a run of unstamped
-// ones reads as a bug, not as emphasis. The case the exception was
-// reaching for — a user waiting out a long seal or upload — is served
-// better by having those messages report their own DURATION ("seal took
-// 24s"), which answers "how long did that take" that a pair of wall-clock
-// stamps only implies.
+// that stamps only the "important" lines produces exactly the output this
+// package exists to prevent: one stamped line in a run of unstamped ones
+// reads as a bug, not as emphasis. The case such an exception reaches
+// for — a user waiting out a long seal or upload — is served better by
+// having those messages report their own DURATION ("seal took 24s"),
+// which answers "how long did that take" that a pair of wall-clock stamps
+// only implies.
 //
 // # The pelfs: prefix stays, in every format
 //
@@ -73,14 +73,14 @@
 // no attributes.
 //
 // No format shows a value twice. Every value pelfs logs is named by its
-// template, so a sink that interpolated AND emitted fields printed all of
-// them twice on one line, and the breakdowns that are nothing but values
-// ("torn down in …", "ready to serve in …") came out at double length
-// with the prose buried in front of its own duplicate. Each sink picks one
-// view for its own reader: plain and text render the sentence and stop,
-// json emits the template and the fields. A value that happens to contain
-// a newline cannot split a record in either of the two log formats — text
-// folds it, json escapes it.
+// template, so a sink that interpolated AND emitted fields would print all
+// of them twice on one line, and the breakdowns that are nothing but
+// values ("torn down in …", "ready to serve in …") would come out at
+// double length with the prose buried in front of its own duplicate. Each
+// sink picks one view for its own reader: plain and text render the
+// sentence and stop, json emits the template and the fields. A value that
+// happens to contain a newline cannot split a record in either of the two
+// log formats — text folds it, json escapes it.
 //
 // An attribute named for the prose that reads it back ("lease release")
 // becomes a key with no space in it, in the placeholder as well as in the

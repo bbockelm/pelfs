@@ -1,8 +1,7 @@
 // Package fsck verifies one published v2 generation end to end
 // (docs/design-packfs.md): the signed pack list, catalog and inode-shard
 // reachability, the structural invariants of the catalog schema, chunk
-// presence, and — in deep mode — chunk content. It is the catalog-native
-// replacement for internal/offline's Fsck and the sibling of
+// presence, and — in deep mode — chunk content. It is the sibling of
 // internal/retention, which is the GC half of the same maintenance pair.
 //
 // Reads go directly through packstore + entrycodec + catalog rather than

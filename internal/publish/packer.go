@@ -31,6 +31,14 @@ type packer struct {
 	sealed []packstore.SealedPack
 	added  map[string]struct{}
 
+	// located remembers where the few entries a caller ASKED about landed
+	// (addLocated), and pending is the subset still waiting for the pack
+	// they are in to be named. Kept per-request rather than for every
+	// entry: a publish appends a chunk per CDC cut, and a map of all of
+	// them would be a location index nobody reads.
+	located map[string]*entryLoc
+	pending []*entryLoc
+
 	// Uploads run in the background so building the next pack overlaps
 	// the current one's round trip. mu guards sealed and err against the
 	// upload goroutines; sem bounds how many are in flight at once.
@@ -71,6 +79,17 @@ type UploadReport struct {
 	Busy  time.Duration
 }
 
+// entryLoc is where one appended entry landed: the offset and stored
+// length inside a pack, and — once that pack has been cut, which is when a
+// pack is named — the pack itself. An empty pack name means the location
+// is not knowable yet, and a caller that needs one must treat that as "no
+// location" rather than wait for it.
+type entryLoc struct {
+	pack   string
+	off    int64
+	length int64
+}
+
 func newPacker(inner pelicanobj.Store, dir string, target, first int64, conc int) *packer {
 	if first <= 0 || first > target {
 		first = target
@@ -81,6 +100,7 @@ func newPacker(inner pelicanobj.Store, dir string, target, first int64, conc int
 	return &packer{
 		inner: inner, dir: dir, target: target, cur: first,
 		added:   make(map[string]struct{}),
+		located: make(map[string]*entryLoc),
 		sem:     make(chan struct{}, conc),
 		started: time.Now(),
 	}
@@ -137,26 +157,52 @@ func (p *packer) has(key string) bool {
 // add appends one entry, cutting the current pack first when the entry
 // would push it past the target. Duplicate keys are silently skipped.
 func (p *packer) add(ctx context.Context, key, typ string, data []byte) error {
+	_, err := p.addEntry(ctx, key, typ, data, false)
+	return err
+}
+
+// addLocated is add for an entry whose location the caller wants back —
+// the root catalog, whose superblock hint is written from it.
+//
+// The note is filled in later: an entry's offset is known at append time,
+// but the pack it is in has no name until it is cut. A nil result means
+// the packer cannot say where the entry is (a duplicate of something added
+// without a note), and an empty Pack means it is still in the open pack;
+// both are ordinary, because the hint is optional.
+func (p *packer) addLocated(ctx context.Context, key, typ string, data []byte) (*entryLoc, error) {
+	return p.addEntry(ctx, key, typ, data, true)
+}
+
+func (p *packer) addEntry(ctx context.Context, key, typ string, data []byte, note bool) (*entryLoc, error) {
 	if p.has(key) {
-		return nil
+		// Content addressing means the duplicate is the same bytes, so an
+		// earlier note for this key describes them just as well.
+		return p.located[key], nil
 	}
 	if p.w != nil && p.w.Size() > 0 && p.w.Size()+int64(len(data)) > p.cur {
 		if err := p.cut(ctx); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	if p.w == nil {
 		w, err := packstore.NewPackWriter(p.dir)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		p.w = w
 	}
+	off := p.w.Size()
 	if err := p.w.Add(key, typ, data); err != nil {
-		return err
+		return nil, err
 	}
 	p.added[key] = struct{}{}
-	return nil
+	if !note {
+		return nil, nil
+	}
+	loc := &entryLoc{off: off, length: int64(len(data))}
+	p.located[key] = loc
+	p.pending = append(p.pending, loc)
+	return loc, nil
 }
 
 // cut finalizes the open pack (if any) and starts its upload in the
@@ -178,6 +224,12 @@ func (p *packer) cut(ctx context.Context) error {
 		return err
 	}
 	p.w = nil
+	// The pack now has a name, which is the half of a noted location that
+	// could not be known while it was being written.
+	for _, loc := range p.pending {
+		loc.pack = sp.Name
+	}
+	p.pending = nil
 	// Ramp toward the steady-state target. The early packs exist to get
 	// bytes onto the wire while the walk is still running; once the pipe
 	// is full there is nothing left to buy and per-object overhead —

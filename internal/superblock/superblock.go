@@ -103,6 +103,34 @@ type CatalogEntry struct {
 	Promoted uint32   `cbor:"promoted"`
 }
 
+// RootHint says where the root catalog's stored bytes SAT when this
+// generation was published: which pack, at what offset, for how many
+// stored bytes. It is a hint, and the word is load-bearing.
+//
+// Identity remains the truth. A repack moves objects between packs and
+// rewrites neither the catalogs nor the chunkrefs that name them — that
+// separation is the premise of the format — so nothing keeps this in step
+// with reality, and a generation published before a repack carries a hint
+// pointing into a pack that no longer holds those bytes. A reader must
+// therefore read what it points at, check the bytes against RootCatalog,
+// and on any disagreement resolve the root the ordinary way (pack
+// trailers). The cost of a stale hint is that fallback; it can never be a
+// wrong answer.
+//
+// It exists because locating the root catalog is the one lookup a mount
+// cannot avoid and cannot defer: the identity-to-location map lives in
+// pack trailers, so a cold mount that guesses wrong pays a round trip per
+// pack of the generation before it can answer anything. The root is
+// special in a way no other entry is — it is asked for exactly once, first,
+// by everyone — which is why only the root gets one. Locations for the
+// whole catalog list would recouple identity to location and be
+// invalidated wholesale by a single repack.
+type RootHint struct {
+	Pack   string `cbor:"pack"`
+	Off    int64  `cbor:"off"`
+	Length int64  `cbor:"length"`
+}
+
 // KeyEntry is one row of the key table: a 32-byte key wrapped by the user
 // KEK. Key-id 0 is reserved to mean plaintext and never appears here.
 type KeyEntry struct {
@@ -164,6 +192,11 @@ type Superblock struct {
 	// that do not maintain it; a reader needs nothing from it, and a
 	// publisher that finds it absent simply rebuilds every catalog.
 	Catalogs []CatalogEntry `cbor:"catalogs,omitempty"`
+	// RootCatalogHint, when set, is where the root catalog was written (see
+	// RootHint). Optional in both directions: a writer that does not track
+	// it omits it, and a reader that finds it absent — or finds it stale —
+	// resolves the root through the pack index instead.
+	RootCatalogHint *RootHint `cbor:"root_catalog_hint,omitempty"`
 
 	// SigningPub is informational — it names the key that produced
 	// Signature so tooling can report custody, but Verify never trusts it

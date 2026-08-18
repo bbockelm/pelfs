@@ -579,6 +579,11 @@ type pipeline struct {
 	// TRANSFORM so the superblock can list what provided records name.
 	providedPacks []packstore.SealedPack
 
+	// rootLoc is where writeCatalogs appended the root catalog, or nil when
+	// this publish did not write one (the whole tree was carried forward).
+	// It becomes the superblock's root-catalog hint.
+	rootLoc *entryLoc
+
 	chunkSeen   map[chunkid.Identity]chunkInfo
 	dnIno       map[*catalog.DirNode]uint64
 	pathOf      map[uint64]string
@@ -1090,9 +1095,17 @@ func (p *pipeline) writeCatalogs(ctx context.Context) (chunkid.Identity, error) 
 			firstErr = built[i].err
 			continue
 		}
-		if err := p.pk.add(ctx, built[i].id.Hex(), packstore.EntryCatalog, entry); err != nil {
+		loc, err := p.pk.addLocated(ctx, built[i].id.Hex(), packstore.EntryCatalog, entry)
+		if err != nil {
 			firstErr = fmt.Errorf("publish: pack catalog %s: %w", p.pathOf[ino], err)
 			continue
+		}
+		if ino == p.src.Root() {
+			// Where the root catalog landed, for the superblock's hint. This
+			// is the one moment it is known for free; a reader that had to
+			// work it out would be fetching pack trailers to do it, which is
+			// the cost the hint exists to skip.
+			p.rootLoc = loc
 		}
 		p.stats.Catalogs++
 	}
@@ -1422,6 +1435,7 @@ func (p *pipeline) buildSuperblock(newPacks []packstore.SealedPack, shards []sup
 		},
 		KeyTable: p.o.KeyTable,
 	}
+	sb.RootCatalogHint = p.rootCatalogHint(rootID)
 	if p.o.DEK != nil {
 		// Catalog/shard/backup entries have no per-entry keyid column;
 		// the superblock states the one key that encrypts them all.
@@ -1438,6 +1452,32 @@ func (p *pipeline) buildSuperblock(newPacks []packstore.SealedPack, shards []sup
 		return nil, nil, fmt.Errorf("publish: encode superblock: %w", err)
 	}
 	return sb, raw, nil
+}
+
+// rootCatalogHint is where a reader should LOOK for the root catalog
+// first, or nil when this publish cannot say.
+//
+// Two sources, in the order they are trustworthy. This publish's own
+// append is exact — it put the bytes there. Otherwise the root catalog is
+// one the previous generation published (nothing else can produce a root
+// this seal did not write), so its hint still describes the same object,
+// and only if it names the same identity: carrying a hint across a
+// changed root would point a reader at the wrong bytes, which costs a
+// wasted read and a fallback but is pure waste.
+//
+// Either way it is only a hint, never a claim. The pack a hint names is
+// listed by this generation when written, but a later repack may move the
+// bytes out of it without rewriting anything that names them by identity,
+// so the reader verifies and falls back.
+func (p *pipeline) rootCatalogHint(rootID chunkid.Identity) *superblock.RootHint {
+	if p.rootLoc != nil && p.rootLoc.pack != "" {
+		return &superblock.RootHint{Pack: p.rootLoc.pack, Off: p.rootLoc.off, Length: p.rootLoc.length}
+	}
+	if p.o.Prev != nil && p.o.Prev.RootCatalogHint != nil && p.o.Prev.RootCatalog == [32]byte(rootID) {
+		h := *p.o.Prev.RootCatalogHint
+		return &h
+	}
+	return nil
 }
 
 // flip writes the new generation to refs/<branch>. Best-effort CAS: the

@@ -339,3 +339,76 @@ func TestUnknownFieldDocIsRejected(t *testing.T) {
 		t.Fatal("document with an unknown signed field verified; signed content was silently dropped")
 	}
 }
+
+// The root-catalog hint is optional in both directions, which is the whole
+// of its compatibility story: a superblock written before it existed
+// decodes with none and verifies, and one carrying it round-trips and
+// verifies too. Being a nilable, omitempty field is what makes both true —
+// an absent hint contributes nothing to the encoding, so it cannot change
+// the bytes an older generation was signed over.
+func TestRootHintIsOptionalInBothDirections(t *testing.T) {
+	pub, priv := genKey(t)
+
+	old := testSuperblock()
+	if err := old.Sign(priv); err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	enc := mustEncode(t, old)
+	if bytes.Contains(enc, []byte("root_catalog_hint")) {
+		t.Fatal("a superblock with no hint still wrote the key")
+	}
+	dec, err := Decode(enc)
+	if err != nil {
+		t.Fatalf("decode hintless superblock: %v", err)
+	}
+	if dec.RootCatalogHint != nil {
+		t.Fatalf("decoded a hint out of a superblock that has none: %+v", dec.RootCatalogHint)
+	}
+	if err := dec.Verify(pub); err != nil {
+		t.Fatalf("a superblock written before the hint existed no longer verifies: %v", err)
+	}
+
+	hinted := testSuperblock()
+	hinted.RootCatalogHint = &RootHint{Pack: "p-0002-bb", Off: 4096, Length: 1234}
+	if err := hinted.Sign(priv); err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	dec, err = Decode(mustEncode(t, hinted))
+	if err != nil {
+		t.Fatalf("decode hinted superblock: %v", err)
+	}
+	if dec.RootCatalogHint == nil || *dec.RootCatalogHint != *hinted.RootCatalogHint {
+		t.Fatalf("hint round-tripped as %+v, want %+v", dec.RootCatalogHint, hinted.RootCatalogHint)
+	}
+	if err := dec.Verify(pub); err != nil {
+		t.Fatalf("verify hinted superblock: %v", err)
+	}
+}
+
+// A reader that does not know the field must still be able to READ the
+// document — the hint is a shortcut, not content anything depends on. What
+// such a reader must not do is claim the document verified, which is the
+// standing rule for any dropped signed field (TestUnknownFieldDocIsRejected)
+// and is why the hint is worth nothing to a reader that cannot see it.
+func TestHintedSuperblockDecodesForAReaderThatIgnoresIt(t *testing.T) {
+	_, priv := genKey(t)
+	sb := testSuperblock()
+	sb.RootCatalogHint = &RootHint{Pack: "p-0001-aa", Off: 64, Length: 900}
+	if err := sb.Sign(priv); err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	// The struct as it was before the field existed, decoded from bytes
+	// written after.
+	var older struct {
+		Generation  uint64      `cbor:"generation"`
+		RootCatalog [32]byte    `cbor:"root_catalog"`
+		PackList    []PackEntry `cbor:"pack_list"`
+	}
+	if err := cbor.Unmarshal(mustEncode(t, sb), &older); err != nil {
+		t.Fatalf("a reader that ignores the hint could not decode: %v", err)
+	}
+	if older.Generation != sb.Generation || older.RootCatalog != sb.RootCatalog ||
+		len(older.PackList) != len(sb.PackList) {
+		t.Fatalf("the fields such a reader does know came back wrong: %+v", older)
+	}
+}

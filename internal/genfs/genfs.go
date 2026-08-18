@@ -252,9 +252,17 @@ func Open(ctx context.Context, o Options) (*FS, error) {
 	}
 
 	rootHex := hex.EncodeToString(o.SB.RootCatalog[:])
-	rootPath, err := fs.spillCatalog(ctx, rootHex)
-	if err != nil {
-		return nil, fmt.Errorf("genfs: root catalog: %w", err)
+	// The hint first (roothint.go): it names the pack holding the root
+	// catalog, so a mount that follows it reads that pack and nothing else.
+	// Without one — an older superblock, or a hint that no longer describes
+	// where the bytes are — the root is located the ordinary way, which
+	// means fetching pack trailers until one claims it.
+	rootPath, ok := fs.spillRootFromHint(ctx, rootHex)
+	if !ok {
+		var err error
+		if rootPath, err = fs.spillCatalog(ctx, rootHex); err != nil {
+			return nil, fmt.Errorf("genfs: root catalog: %w", err)
+		}
 	}
 	root, err := catalog.OpenReader(rootPath)
 	if err != nil {

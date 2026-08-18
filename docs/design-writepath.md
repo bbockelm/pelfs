@@ -474,6 +474,33 @@ identity to a *source* under the lock and reading outside it is necessary
 and not sufficient: immutable bytes still get unmapped when a region is
 recycled, so the source must also be pinned.
 
+### How a seal gets content it never chunked
+
+`publish.ContentProvider` is the seam (`internal/publish/source.go`): a
+source that has already chunked and uploaded its own content answers with
+records, and TRANSFORM neither opens the file nor runs CDC over it.
+
+It is a sibling of `ContentReuser`, not a use of it, and the difference is
+the safety argument. Reused records name bytes in **Prev's** packs, which
+`buildSuperblock` carries forward verbatim — which is why reuse is gated
+on the source answering from exactly the generation being built on.
+Provided records name bytes in packs **this session** uploaded, which no
+previous superblock lists, so the generation being built must list them
+itself (`ProvidedPacks`). Omitting them would produce a signed,
+valid-looking generation that becomes unreadable at the next retention
+sweep, discovered by a reader long afterwards.
+
+Proven end to end (`internal/publish/provider_test.go`): a flat namespace
+whose content lives in a memtable, flushed during the session, then
+sealed. The seal added 0 content chunks, the generation listed the
+session's packs, and every file read back byte-exact through `genfs`,
+which knows nothing about any of this. A file below the inline threshold
+is declined by the provider and read the ordinary way, which is the
+fallback path working rather than a special case.
+
+`Options.Source` publishes such a source directly. The overlay remains
+the producer a mount uses; it is just no longer the definition of a tree.
+
 ### Interaction with the overlay's metadata
 
 None of this changes how names, attributes, and directory structure are

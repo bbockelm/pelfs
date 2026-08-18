@@ -6,6 +6,7 @@ import (
 
 	"github.com/bbockelm/pelfs/internal/genfs"
 	"github.com/bbockelm/pelfs/internal/overlay"
+	"github.com/bbockelm/pelfs/internal/packstore"
 )
 
 // SrcNode is one inode as TRANSFORM needs it: the catalog's attribute
@@ -79,6 +80,34 @@ type ContentReuser interface {
 	// changes do not count, a write or truncate does — and the caller
 	// reads and re-chunks instead.
 	ExistingContent(ctx context.Context, ino uint64) (genfs.Content, bool, error)
+}
+
+// ContentProvider is the optional Source capability of a source that has
+// ALREADY chunked and uploaded its own content, so TRANSFORM neither
+// reads it nor pushes it through CDC. The write path's memtable is the
+// one that does this: it packs bytes as they are written, during the
+// session, instead of leaving every byte of it to the seal.
+//
+// It is a sibling of ContentReuser rather than a use of it, and the
+// difference is the whole safety argument. Reused records name bytes in
+// PREV's packs, which buildSuperblock carries forward verbatim — that is
+// why reuse is gated on the source answering from exactly the generation
+// being built on. Provided records name bytes in packs THIS session
+// uploaded, which no previous superblock lists, so the generation being
+// built must list them itself or it is signed and unreadable: a chunkref
+// pointing at a pack retention is entitled to delete.
+//
+// Sources that do not pack their own content simply do not implement it.
+type ContentProvider interface {
+	// ProvidedContent returns ino's content records when the source has
+	// them. ok is false when it does not, and the caller reads and chunks
+	// the ordinary way — a redundant chunking costs time, a missing record
+	// costs the file.
+	ProvidedContent(ctx context.Context, ino uint64) (genfs.Content, bool, error)
+	// ProvidedPacks are every pack holding bytes ProvidedContent named.
+	// Called once, after the last ProvidedContent, because a provider may
+	// still be cutting packs while it answers.
+	ProvidedPacks(ctx context.Context) ([]packstore.SealedPack, error)
 }
 
 // CatalogReuser is the optional Source capability that spares TRANSFORM

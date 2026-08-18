@@ -163,6 +163,17 @@ type Options struct {
 	// an instant, which is the precondition for rebasing inodes back to
 	// clean afterwards. Mutually exclusive with Overlay.
 	OverlaySnapshot *overlay.Snapshot
+	// Source publishes an arbitrary tree instead of an overlay, and is
+	// mutually exclusive with both fields above. Prev is still required:
+	// a generation is a successor to one, and that is where the volume
+	// identity comes from.
+	//
+	// It exists because the overlay is one producer of a tree, not the
+	// definition of one. A source that has already chunked and uploaded
+	// its own content (ContentProvider) is the case that matters — the
+	// write path packs during the session, and a seal of it should
+	// neither read nor re-chunk what is already in packs.
+	Source Source
 	// Inner is the raw transport: pack uploads and the ref write.
 	Inner pelicanobj.Store
 	// SpoolDir holds pack spools and catalog build files.
@@ -243,6 +254,11 @@ type Stats struct {
 	PromotedInodes                  int
 	ChunksAdded, ChunksDeduped      int
 	DedupIndexChunks                int // identities preloaded from the sidecar
+	// ProvidedFiles/ProvidedChunks count content the SOURCE had already
+	// chunked and uploaded, which the seal neither read nor packed. It is
+	// the measure of how much of a seal the write path moved off the exit
+	// path and into the session.
+	ProvidedFiles, ProvidedChunks int
 	// ReusedFiles/ReusedChunks count content carried forward from the
 	// previous generation instead of read and re-chunked — the files this
 	// seal never opened.
@@ -374,6 +390,14 @@ func Publish(ctx context.Context, o Options) (*Result, error) {
 	if err := p.transform(ctx); err != nil {
 		return nil, err
 	}
+	// After TRANSFORM, not during: a provider may still be cutting packs
+	// while it answers, so the list is only complete once nothing more
+	// will be asked of it.
+	if cp, ok := src.(ContentProvider); ok {
+		if p.providedPacks, err = cp.ProvidedPacks(ctx); err != nil {
+			return nil, fmt.Errorf("publish: source packs: %w", err)
+		}
+	}
 	shards, err := p.writeShards(ctx)
 	if err != nil {
 		return nil, err
@@ -428,6 +452,13 @@ func openSource(o Options) (Source, string, func(), error) {
 	if o.emptySource {
 		return &emptyRoot{nextInode: 2}, formatVolumeID(o.VolumeID), func() {}, nil
 	}
+	if o.Source != nil {
+		// A source that is not an overlay: it brings its own tree and, if
+		// it implements ContentProvider, its own already-packed content.
+		// The volume identity still comes from the generation being built
+		// on, because that is what a generation IS a successor to.
+		return o.Source, formatVolumeID(o.Prev.VolumeID), func() {}, nil
+	}
 	var view overlayView = o.Overlay
 	if o.OverlaySnapshot != nil {
 		view = o.OverlaySnapshot
@@ -447,8 +478,15 @@ func applyDefaults(o *Options) error {
 	switch {
 	case o.emptySource:
 		// InitVolume supplies the tree itself.
+	case o.Source != nil:
+		if o.Overlay != nil || o.OverlaySnapshot != nil {
+			return errors.New("publish: Source and Overlay are mutually exclusive")
+		}
+		if o.Prev == nil {
+			return errors.New("publish: sealing a Source requires Prev (the generation it succeeds)")
+		}
 	case o.Overlay == nil && o.OverlaySnapshot == nil:
-		return errors.New("publish: Overlay or OverlaySnapshot is required")
+		return errors.New("publish: Overlay, OverlaySnapshot, or Source is required")
 	case o.Overlay != nil && o.OverlaySnapshot != nil:
 		return errors.New("publish: Overlay and OverlaySnapshot are mutually exclusive")
 	case o.Prev == nil:
@@ -536,6 +574,10 @@ type pipeline struct {
 	recs     map[uint64]*rec
 	maxInode uint64
 	promoted []uint64
+
+	// providedPacks are the source's own packs, collected once after
+	// TRANSFORM so the superblock can list what provided records name.
+	providedPacks []packstore.SealedPack
 
 	chunkSeen   map[chunkid.Identity]chunkInfo
 	dnIno       map[*catalog.DirNode]uint64
@@ -686,6 +728,7 @@ func (p *pipeline) walk(ctx context.Context) error {
 // catalogreuse.go).
 func (p *pipeline) transform(ctx context.Context) error {
 	reuse := p.contentReuser()
+	provide, _ := p.src.(ContentProvider)
 	for _, ino := range p.sortedInodes() {
 		r := p.recs[ino]
 		if r.n.Type != catalog.TypeFile || r.n.Length == 0 {
@@ -704,6 +747,19 @@ func (p *pipeline) transform(ctx context.Context) error {
 				return err
 			}
 			if reused {
+				continue
+			}
+		}
+		// A source that packed its own content answers before the chunker
+		// is reached at all. Asked AFTER reuse, because reuse is cheaper
+		// still — it costs nothing at either end, while providing has
+		// already paid for chunking during the session.
+		if provide != nil {
+			provided, err := p.provideContent(ctx, provide, r)
+			if err != nil {
+				return err
+			}
+			if provided {
 				continue
 			}
 		}
@@ -793,6 +849,37 @@ func (p *pipeline) reuseContent(ctx context.Context, cr ContentReuser, r *rec) (
 		return false, nil
 	}
 	p.stats.ReusedFiles++
+	return true, nil
+}
+
+// provideContent installs content the source packed itself, reporting
+// whether it did. Unlike reuse, there is no generation to gate on: the
+// records name packs this session uploaded, and buildSuperblock lists
+// them (see ProvidedPacks). What is checked is the same standing
+// agreement between the two halves of the merged view — a length that
+// disagrees means the namespace and the content describe different files,
+// and re-chunking is the safe answer.
+func (p *pipeline) provideContent(ctx context.Context, cp ContentProvider, r *rec) (bool, error) {
+	c, ok, err := cp.ProvidedContent(ctx, r.n.Inode)
+	if err != nil || !ok {
+		return false, err
+	}
+	if c.Length != r.n.Length {
+		return false, nil
+	}
+	switch inlineNow := r.n.Length <= p.o.InlineMax; {
+	case c.Inline != nil && inlineNow:
+		r.inline = c.Inline
+		p.stats.InlineFiles++
+	case c.Refs != nil && !inlineNow:
+		r.chunks = c.Refs
+		p.rememberReusedChunks(c.Refs)
+		p.stats.ChunkedFiles++
+		p.stats.ProvidedChunks += len(c.Refs)
+	default:
+		return false, nil
+	}
+	p.stats.ProvidedFiles++
 	return true, nil
 }
 
@@ -1294,6 +1381,15 @@ func (p *pipeline) buildSuperblock(newPacks []packstore.SealedPack, shards []sup
 		packList = append(packList, p.o.Prev.PackList...)
 	}
 	for _, sp := range newPacks {
+		packList = append(packList, superblock.PackEntry{Name: sp.Name, TrailerHash: sp.TrailerHash, Size: sp.Size})
+	}
+	// Packs the SOURCE uploaded, holding content it provided rather than
+	// content this seal chunked. Listing them is not bookkeeping: a
+	// provided chunkref names bytes in one of these, and retention deletes
+	// any pack no live superblock names — so a generation that omitted
+	// them would be signed, valid-looking, and unreadable after the next
+	// sweep.
+	for _, sp := range p.providedPacks {
 		packList = append(packList, superblock.PackEntry{Name: sp.Name, TrailerHash: sp.TrailerHash, Size: sp.Size})
 	}
 	// The high-water mark prefers the source's real allocator counter;

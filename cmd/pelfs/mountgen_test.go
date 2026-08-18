@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -786,4 +787,45 @@ func TestPhaseSplitChargesACheckpointToTheSession(t *testing.T) {
 			sum.TeardownPhase.Put.Bytes, sum.SessionPhase.Put.Bytes)
 	}
 	checkPhasesReconcile(t, sum)
+}
+
+// TestCheckpointFiresUnderWritePressure pins the trigger that the clock
+// alone cannot provide. Extracting a kernel tree wrote 441 MiB in 1m45s
+// against a 5 minute interval, so no checkpoint fired and the entire
+// session's upload landed after the user typed exit. A session that
+// writes fast has to publish often regardless of elapsed time.
+func TestCheckpointFiresUnderWritePressure(t *testing.T) {
+	g := newGenSession(t, true)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rstore, err := refs.New(g.inner, t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// An interval far longer than this test will run: if a checkpoint
+	// happens, only pressure can have caused it.
+	go g.checkpointPeriodically(ctx, time.Hour)
+
+	// Stage more than the threshold. Written as several files because
+	// staged bytes are summed across staging files, which is what the
+	// sampler reads.
+	body := make([]byte, 8<<20)
+	for i := 0; i < (checkpointBytes/len(body))+2; i++ {
+		writeFile(t, g.ov, fmt.Sprintf("big-%02d.bin", i), string(body))
+	}
+
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		f, err := rstore.Fetch(ctx, "main")
+		if err == nil && f.Superblock.Generation >= 1 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("staged %d bytes without a checkpoint; only the hour-long timer could publish it",
+				g.stagedBytes())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }

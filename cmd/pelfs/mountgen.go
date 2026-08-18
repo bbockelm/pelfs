@@ -1134,13 +1134,78 @@ const slowCheckpoint = 10 * time.Second
 // swallow failures and keep going -- tearing a mount down over a
 // transient federation error would cost the user far more than a late
 // checkpoint does.
+// checkpointBytes is how much staged content triggers a checkpoint
+// regardless of the clock.
+//
+// A time-only trigger cannot adapt to write rate, and the failure is not
+// subtle: extracting a kernel tree wrote 441 MiB in 1m45s against the 5
+// minute default, so no checkpoint ever fired and the whole session's
+// upload landed after the user typed exit — 40s of it, with the uplink
+// saturated the entire time. Pressure is the honest trigger: a session
+// that writes fast should publish often, whatever the clock says.
+//
+// 128 MiB is a compromise between filling the uplink early and paying a
+// checkpoint's fixed costs too often. It is deliberately larger than the
+// pack target so a checkpoint still cuts full packs.
+const checkpointBytes = 128 << 20
+
+// pressureSampleInterval is how often staged bytes are measured. It is a
+// fraction of the checkpoint interval, floored so a long interval still
+// notices a burst promptly and capped so a short one does not turn
+// sampling into its own load.
+func pressureSampleInterval(every time.Duration) time.Duration {
+	d := every / 10
+	if d < time.Second {
+		d = time.Second
+	}
+	if d > 15*time.Second {
+		d = 15 * time.Second
+	}
+	return d
+}
+
+// stagedBytes reports how much content is waiting to be published, or -1
+// when the overlay cannot be sampled (it is being sealed, or is gone).
+func (g *genSession) stagedBytes() int64 {
+	g.ovMu.RLock()
+	defer g.ovMu.RUnlock()
+	if g.ov == nil || g.spent {
+		return -1
+	}
+	st, err := g.ov.Stats()
+	if err != nil {
+		return -1
+	}
+	return st.StagedBytes
+}
+
 func (g *genSession) checkpointPeriodically(ctx context.Context, every time.Duration) {
 	t := time.NewTicker(every)
 	defer t.Stop()
+	// Sampling is far more frequent than the interval so a burst is
+	// noticed while it is still being written rather than after it.
+	sample := time.NewTicker(pressureSampleInterval(every))
+	defer sample.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-sample.C:
+			if n := g.stagedBytes(); n < checkpointBytes {
+				continue
+			}
+			start := time.Now()
+			summary, err := g.checkpoint(ctx)
+			switch {
+			case ctx.Err() != nil:
+				return
+			case err != nil:
+				ui.Warn("checkpoint under write pressure failed, retrying "+
+					"(your changes remain safe in the overlay): {error}", "error", err)
+			default:
+				ui.Info("checkpointed {staged} of staged content in {duration} ({summary})",
+					"staged", ui.ByteCount(checkpointBytes), "duration", time.Since(start), "summary", summary)
+			}
 		case <-t.C:
 			start := time.Now()
 			summary, err := g.checkpoint(ctx)

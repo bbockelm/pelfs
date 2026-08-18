@@ -20,9 +20,11 @@ import (
 	"github.com/go-git/go-billy/v5"
 	"github.com/hanwen/go-fuse/v2/fuse"
 
+	"github.com/bbockelm/pelfs/internal/chunkid"
 	"github.com/bbockelm/pelfs/internal/control"
 	"github.com/bbockelm/pelfs/internal/genfs"
 	"github.com/bbockelm/pelfs/internal/lease"
+	"github.com/bbockelm/pelfs/internal/memtable"
 	"github.com/bbockelm/pelfs/internal/nfsmount"
 	"github.com/bbockelm/pelfs/internal/overlay"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
@@ -105,6 +107,11 @@ type genSession struct {
 	// makes the clock's fields safe as well as the boundary singular.
 	downOnce sync.Once
 
+	// closeContent releases the write path's content store and its
+	// journal, in that order. Nil when the session keeps its content in
+	// staging files.
+	closeContent func() error
+
 	// reclaimFn overrides how a retired directory's bytes are freed; nil
 	// takes the background default. Only tests set it.
 	reclaimFn func(string)
@@ -143,6 +150,7 @@ func (s countedStore) StatKey(ctx context.Context, key string) (*pelicanobj.KeyI
 type genArgs struct {
 	branch, tag, pubkeyHex  string
 	rw, noSeal, subshell    bool
+	noMemtable              bool
 	signingKeyPath, backend string
 	poll                    time.Duration
 }
@@ -155,6 +163,7 @@ func cmdMountGen(args []string) int {
 		fs.StringVar(&a.pubkeyHex, "volume-pubkey", "", "hex Ed25519 volume key to trust (default: pin on first use)")
 		fs.BoolVar(&a.rw, "rw", false, "mount read-write through a local overlay; unmount SEALS the changes into the next generation")
 		fs.BoolVar(&a.noSeal, "no-seal", false, "with --rw, keep the overlay at unmount instead of publishing it (resume by remounting)")
+		fs.BoolVar(&a.noMemtable, "no-memtable", false, "with --rw, keep written content in staging files and chunk it all at the seal, instead of packing and uploading during the session")
 		fs.BoolVar(&a.subshell, "subshell", false, "run a subshell in the mount and unmount (sealing, with --rw) when it exits; a trailing `-- command [args...]` runs that instead of a shell and implies this flag")
 		fs.DurationVar(&a.poll, "poll", 0, "read-only: re-check the branch head this often and swap generations live (0 = pinned, the reproducible-batch default)")
 		fs.StringVar(&a.signingKeyPath, "signing-key", "", "hex Ed25519 volume signing key file to seal with (default: <state-dir>/v2-signing.key; a volume's key is per-VOLUME, so a second machine must import it)")
@@ -169,6 +178,57 @@ func cmdMountGen(args []string) int {
 		return exitErr(err)
 	}
 	return runMountGen(o, pos[0], pos[1], command, a)
+}
+
+// openContent builds the write path's content store: writes land in an
+// mmap'd ring, age out into packs, and reach the federation DURING the
+// session instead of at the seal that ends it (docs/design-writepath.md).
+//
+// It is the default because of what it removes rather than what it adds.
+// A staging session leaves every byte it wrote to be chunked, hashed and
+// uploaded after the user types exit; it copies a whole file into staging
+// the first time one byte of a base file is written; and its checkpoints
+// freeze by hardlinking every dirty file with the mount's lock held,
+// which is measured in seconds on a source tree.
+//
+// It returns nil — meaning staging files — in two cases, each said out
+// loud rather than inferred:
+//
+//   - --no-memtable, for a session that wants the old behaviour.
+//   - An ENCRYPTED volume. The memtable's packer writes chunks as it
+//     receives them, and chunk encryption lives in the publish pipeline,
+//     so using it here would put plaintext in the federation. The rows it
+//     writes would still READ correctly, which is exactly why this refuses
+//     rather than warns.
+func (g *genSession) openContent(ctx context.Context, disabled bool) (*memtable.Store, error) {
+	switch {
+	case disabled:
+		return nil, nil
+	case len(g.dek) != 0:
+		ui.Info("this volume is encrypted, so written content stays in staging files " +
+			"and is chunked at the seal (the write path does not encrypt yet)")
+		return nil, nil
+	}
+	store, rep, closeStore, err := overlay.OpenContentStore(filepath.Join(g.stateDir, "content"), memtable.Options{
+		Obj:               g.inner,
+		Base:              g.gfs,
+		Hasher:            chunkid.NewHasher(g.identityKey),
+		PromotionDistance: memtable.DefaultPromotionDistance,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("open the write path's content store: %w", err)
+	}
+	// Recovery is allowed to lose content — a mount is tied to a job, and
+	// a crashed job usually discards its state — but it is never allowed
+	// to lose it quietly.
+	if rep.Loss() {
+		ui.Warn("the previous session left content that could not be recovered:\n{report}", "report", rep.String())
+	}
+	// Once-only: the seal at exit closes it as soon as the last thing that
+	// reads it is done, and the teardown defer closes it on every other
+	// path. Both must be able to call it.
+	g.closeContent = sync.OnceValue(closeStore)
+	return store, nil
 }
 
 // runMountGen serves one generation. Reached from `pelfs mount-gen` and,
@@ -367,11 +427,15 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		// generation, and unmount seals it into the next one. Nothing
 		// mutates the base, so an interrupted session loses at most the
 		// unsealed overlay — which survives on disk for a remount.
-		g.ov, err = overlay.Open(g.overlayDir, g.gfs, overlay.Options{
+		ovOpts := overlay.Options{
 			NextInode:      g.gfs.NextInode(),
 			BaseRoot:       g.gfs.RootCatalog(),
 			BaseGeneration: g.gfs.Generation(),
-		})
+		}
+		if ovOpts.Memtable, err = g.openContent(ctx, a.noMemtable); err != nil {
+			return fail(err)
+		}
+		g.ov, err = overlay.Open(g.overlayDir, g.gfs, ovOpts)
 		if err != nil {
 			if errors.Is(err, overlay.ErrGeneration) {
 				// The branch moved on while this overlay sat unsealed —
@@ -385,6 +449,15 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 					err, g.overlayDir, branch)
 			}
 			return fail(fmt.Errorf("open overlay: %w", err))
+		}
+		// The content store outlives the overlay: the seal at exit renders
+		// its records, so it closes after everything that reads it. Defers
+		// run last-in-first-out, so registering it FIRST is what puts it
+		// last.
+		if closeContent := g.closeContent; closeContent != nil {
+			// Captured, not re-read: the seal path is entitled to have
+			// closed it already, and a nil field then is not an error.
+			defer g.down.timed("content", func() { closeContent() }) //nolint:errcheck
 		}
 		defer g.down.timed("overlay", func() { g.ov.Close() }) //nolint:errcheck
 	}
@@ -1314,6 +1387,17 @@ func (g *genSession) sealAtExit(ctx context.Context) error {
 	if err := g.retireDir(g.overlayDir); err != nil {
 		ui.Warn("sealed, but the spent overlay at {overlay} could not be retired: {error}",
 			"overlay", g.overlayDir, "error", err)
+	}
+	// The content store's journal describes extents of the generation just
+	// superseded, and its ring holds nothing the seal did not publish. Both
+	// are spent for exactly the reason the overlay is.
+	if g.closeContent != nil {
+		if err := g.closeContent(); err != nil {
+			ui.Warn("the write path's content store did not close cleanly: {error}", "error", err)
+		}
+		if err := g.retireDir(filepath.Join(g.stateDir, "content")); err != nil {
+			ui.Warn("sealed, but the spent content store could not be retired: {error}", "error", err)
+		}
 	}
 	exit.mark("retire")
 	exit.report(exit.sentence("sealed and retired the overlay"))

@@ -506,6 +506,32 @@ content store implements when it has already chunked what it holds. A
 staging overlay does not implement it and the seal reads and chunks as
 before; a memtable-backed one does, and the seal chunks nothing.
 
+### Shipped: on by default, with two ways out
+
+A writable mount uses the memtable unless told otherwise
+(`cmd/pelfs`, `openContent`). It is the default because of what it
+REMOVES: a staging session leaves every byte it wrote to be chunked,
+hashed and uploaded after the user types exit; it copies a whole file
+into staging the first time one byte of a base file is written; and its
+checkpoints freeze by hardlinking every dirty file with the mount's lock
+held.
+
+Two paths still get staging files, each said out loud rather than
+inferred:
+
+  - `--no-memtable`, for a session that wants the old behaviour.
+  - An **encrypted volume**. The memtable's packer writes chunks as it
+    receives them, and chunk encryption lives in the publish pipeline —
+    so using it there would put plaintext in the federation. The rows it
+    writes would still READ correctly, which is exactly why this refuses
+    rather than warns. Wiring the DEK through the flush packer is the
+    work that removes this case.
+
+The content store lives at `<state-dir>/content` and outlives the
+overlay, because the seal at exit renders its records. It is retired
+alongside the spent overlay for the same reason the overlay is: its
+journal describes extents of a generation that is no longer the head.
+
 ### The checkpoint freeze becomes a map copy
 
 A checkpoint needs a view of the content that does not change under it.

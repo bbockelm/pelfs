@@ -182,8 +182,9 @@ type overlaySource struct {
 // An overlay knows exactly which inodes it has touched, which is what
 // makes the reuse capabilities answerable at all.
 var (
-	_ ContentReuser = (*overlaySource)(nil)
-	_ CatalogReuser = (*overlaySource)(nil)
+	_ ContentProvider = (*overlaySource)(nil)
+	_ ContentReuser   = (*overlaySource)(nil)
+	_ CatalogReuser   = (*overlaySource)(nil)
 )
 
 func (s *overlaySource) Root() uint64 { return s.fs.RootInode() }
@@ -235,6 +236,35 @@ func (s *overlaySource) Open(ctx context.Context, ino uint64, length int64) (io.
 }
 
 func (s *overlaySource) BaseGeneration() [32]byte { return s.fs.BaseRootCatalog() }
+
+// records is the overlay's already-chunked content, when its content
+// store has any. A staging overlay has none and the two methods below
+// decline, which puts the seal back on the ordinary read-and-chunk path.
+func (s *overlaySource) records() (overlay.ContentRecords, bool) {
+	fs, ok := s.fs.(interface {
+		ContentRecords() (overlay.ContentRecords, bool)
+	})
+	if !ok {
+		return nil, false
+	}
+	return fs.ContentRecords()
+}
+
+func (s *overlaySource) ProvidedContent(ctx context.Context, ino uint64) (genfs.Content, bool, error) {
+	r, ok := s.records()
+	if !ok {
+		return genfs.Content{}, false, nil
+	}
+	return r.Records(ctx, ino)
+}
+
+func (s *overlaySource) ProvidedPacks(ctx context.Context) ([]packstore.SealedPack, error) {
+	r, ok := s.records()
+	if !ok {
+		return nil, nil
+	}
+	return r.Packs(ctx)
+}
 
 func (s *overlaySource) ExistingContent(ctx context.Context, ino uint64) (genfs.Content, bool, error) {
 	return s.fs.BaseContent(ctx, ino)

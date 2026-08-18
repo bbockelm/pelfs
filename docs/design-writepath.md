@@ -501,6 +501,27 @@ fallback path working rather than a special case.
 `Options.Source` publishes such a source directly. The overlay remains
 the producer a mount uses; it is just no longer the definition of a tree.
 
+The overlay reaches this seam through `overlay.ContentRecords`, which its
+content store implements when it has already chunked what it holds. A
+staging overlay does not implement it and the seal reads and chunks as
+before; a memtable-backed one does, and the seal chunks nothing.
+
+### The re-chunk bound is the CHUNK size, not the file
+
+Worth stating plainly, because a measurement makes it look worse than it
+is. A partial rewrite costs the patch plus the chunks it straddles — at
+most two — and nothing else. But "at most two chunks" is only small if
+chunks are small: a 5-byte patch in a file the base published as ONE
+120 KB chunk re-chunks 119,995 bytes, and at the shipped 4 MiB average it
+would re-chunk up to about 8 MiB.
+
+That is a property of the chunk size the BASE chose, not of this
+mechanism, and it is the floor for any design that keeps "whole chunks,
+end to end": the surviving part of a straddled chunk is a partial chunk,
+and the only way to name it is to make it a new whole one. The dials, if
+it ever hurts: a smaller CDC average, or an inline threshold that keeps
+small files out of chunks entirely.
+
 ### Interaction with the overlay's metadata
 
 None of this changes how names, attributes, and directory structure are

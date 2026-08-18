@@ -107,6 +107,16 @@ func (fs *FS) Snapshot(dir string) (*Snapshot, error) {
 	if filepath.Clean(dir) == filepath.Clean(fs.dir) {
 		return nil, errors.New("overlay: a snapshot cannot be taken into the overlay's own directory")
 	}
+	// A content store that cannot be frozen must say so here rather than
+	// produce a view whose metadata is consistent and whose bytes are
+	// absent. The write path's ring is append-only, so its instant is a
+	// position and freezing it is a different mechanism entirely — not
+	// built yet, and silence would look like a seal that published empty
+	// files.
+	if _, ok := fs.content.(contentFreezer); !ok {
+		return nil, errors.New("overlay: this content store cannot be frozen; " +
+			"seal the live overlay instead of a snapshot")
+	}
 	stagingDir := filepath.Join(dir, stagingDirName)
 	// The two entries below are the snapshot's by contract, so a reused
 	// scratch directory starts clean rather than serving a stale link.

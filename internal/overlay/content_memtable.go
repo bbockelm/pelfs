@@ -3,7 +3,9 @@ package overlay
 import (
 	"context"
 
+	"github.com/bbockelm/pelfs/internal/genfs"
 	"github.com/bbockelm/pelfs/internal/memtable"
+	"github.com/bbockelm/pelfs/internal/packstore"
 )
 
 // memtableContent keeps the bytes of changed files in the write path's
@@ -29,9 +31,16 @@ import (
 //     over this store freezes nothing and hands nothing over.
 type memtableContent struct {
 	store *memtable.Store
+	// seal is the render in progress. One per seal run: it accumulates
+	// whatever re-chunking the run needs into a shared pack, and Packs
+	// finishes it.
+	seal *memtable.Sealer
 }
 
-var _ contentStore = (*memtableContent)(nil)
+var (
+	_ contentStore   = (*memtableContent)(nil)
+	_ ContentRecords = (*memtableContent)(nil)
+)
 
 func newMemtableContent(store *memtable.Store) *memtableContent {
 	return &memtableContent{store: store}
@@ -71,4 +80,42 @@ func (m *memtableContent) Drop(ino uint64) func() {
 
 func (m *memtableContent) Size(ino uint64) (int64, bool) {
 	return m.store.Size(ino), true
+}
+
+// Records renders one inode as catalog rows. The first call FLUSHES:
+// identity binds when a pack is written, so content still in the ring has
+// no rows yet — and the flush happens once per seal because the sealer it
+// creates lives for the whole run.
+func (m *memtableContent) Records(ctx context.Context, ino uint64) (genfs.Content, bool, error) {
+	if m.seal == nil {
+		if err := m.store.Flush(ctx); err != nil {
+			return genfs.Content{}, false, err
+		}
+		m.seal = m.store.NewSealer()
+	}
+	size := m.store.Size(ino)
+	if size == 0 {
+		// Nothing written and nothing adopted: the caller reads it the
+		// ordinary way, which for an empty file costs nothing.
+		return genfs.Content{}, false, nil
+	}
+	refs, err := m.seal.Inode(ctx, ino)
+	if err != nil {
+		return genfs.Content{}, false, err
+	}
+	return genfs.Content{Length: size, Refs: refs}, true, nil
+}
+
+// Packs finishes the run and reports every pack this store has uploaded.
+// All of them, not just this run's: a chunk row rendered above may name a
+// pack cut minutes ago, during the session, and the superblock has to
+// list that one too.
+func (m *memtableContent) Packs(ctx context.Context) ([]packstore.SealedPack, error) {
+	if m.seal != nil {
+		if err := m.seal.Finish(ctx); err != nil {
+			return nil, err
+		}
+		m.seal = nil
+	}
+	return m.store.Packs(), nil
 }

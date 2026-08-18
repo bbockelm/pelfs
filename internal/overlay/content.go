@@ -7,6 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+
+	"github.com/bbockelm/pelfs/internal/genfs"
+	"github.com/bbockelm/pelfs/internal/packstore"
 )
 
 // contentStore is where an overlay keeps the BYTES of the files it has
@@ -51,6 +54,33 @@ type contentStore interface {
 	// none. It answers the STAGED-bytes statistic, which drives the
 	// pressure checkpoint, so it must not be an estimate.
 	Size(ino uint64) (int64, bool)
+}
+
+// ContentRecords is the capability of a content store that has ALREADY
+// chunked and uploaded what it holds, so a seal can publish it without
+// reading or re-chunking a byte. A staging store cannot: its bytes are
+// bytes and nothing has ever hashed them.
+//
+// It is what connects the write path to publish.ContentProvider, and the
+// pack list is the load-bearing half: those chunks live in packs this
+// session uploaded, which no previous superblock names, so the generation
+// being built has to name them or it is signed and unreadable.
+type ContentRecords interface {
+	// Records returns ino's content as catalog rows, and false when this
+	// store has nothing for it.
+	Records(ctx context.Context, ino uint64) (genfs.Content, bool, error)
+	// Packs are every pack holding bytes Records named. Called once, after
+	// the last Records: a store may still be cutting packs while it
+	// answers.
+	Packs(ctx context.Context) ([]packstore.SealedPack, error)
+}
+
+// ContentRecords reports whether this overlay's content is already
+// chunked and uploaded, and hands back the surface a seal reads it
+// through.
+func (fs *FS) ContentRecords() (ContentRecords, bool) {
+	r, ok := fs.content.(ContentRecords)
+	return r, ok
 }
 
 // baseFile is one file as the base generation holds it, offered both

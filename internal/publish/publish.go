@@ -1351,14 +1351,31 @@ func (p *pipeline) buildSuperblock(newPacks []packstore.SealedPack, shards []sup
 // aborts loudly instead of being silently clobbered.
 func flip(ctx context.Context, o Options, raw []byte) error {
 	key := RefPrefix + o.Branch
+	// The CAS reads through a store that BYPASSES federation caches, which
+	// a plain read does not. A ref is the one mutable object in the
+	// format, so a cached copy of it is stale by construction — and the
+	// staleness is not benign here: a session that checkpoints repeatedly
+	// publishes a new generation every few minutes, the cache keeps
+	// serving the one before it, and the compare then fails against the
+	// session's OWN last flip while blaming a concurrent writer that does
+	// not exist. Every checkpoint after the first would abort at the flip,
+	// having already done and uploaded all of its work.
+	//
+	// internal/refs bypasses caches for the same reason; publish did not,
+	// which is what made this show up only under a checkpointing mount.
+	inner := o.Inner
+	if d, ok := pelicanobj.AsDirectReader(inner); ok {
+		inner = d.DirectVariant()
+	}
 	if o.Prev == nil {
-		if _, err := o.Inner.StatKey(ctx, key); err == nil {
+		if _, err := inner.StatKey(ctx, key); err == nil {
 			return fmt.Errorf("publish: %s already exists; pass its current generation as Prev", key)
 		}
-	} else if cur, err := readRef(ctx, o.Inner, key); err == nil && !bytes.Equal(cur, o.PrevRaw) {
+	} else if cur, err := pelicanobj.ReadMutable(ctx, inner, key); err == nil && !bytes.Equal(cur, o.PrevRaw) {
 		// A missing ref is tolerated (recovering a lost ref is legitimate);
 		// a DIFFERENT ref means a concurrent writer won.
-		return fmt.Errorf("publish: %s changed since the previous generation was read (concurrent writer?)", key)
+		return fmt.Errorf("publish: %s changed since the previous generation was read: %s",
+			key, describeRefSkew(cur, o.Prev))
 	}
 	if err := o.Inner.Put(ctx, key, bytes.NewReader(raw)); err != nil {
 		return fmt.Errorf("publish: flip %s: %w", key, err)
@@ -1366,20 +1383,26 @@ func flip(ctx context.Context, o Options, raw []byte) error {
 	return nil
 }
 
-func readRef(ctx context.Context, s pelicanobj.Store, key string) ([]byte, error) {
-	rc, err := s.Get(ctx, key, 0, -1)
+// describeRefSkew says WHICH generation the branch holds against the one
+// this publish grew from. The bare "it changed" left no way to tell a real
+// concurrent writer from a stale read of our own work without going and
+// fetching the ref by hand.
+func describeRefSkew(cur []byte, prev *superblock.Superblock) string {
+	got, err := superblock.Decode(cur)
 	if err != nil {
-		return nil, err
+		return fmt.Sprintf("it holds %d bytes this session cannot parse, not generation %d", len(cur), prev.Generation)
 	}
-	data, rerr := io.ReadAll(rc)
-	cerr := rc.Close()
-	if rerr != nil {
-		return nil, rerr
+	switch {
+	case got.Generation < prev.Generation:
+		return fmt.Sprintf("it holds generation %d, OLDER than the generation %d this seal grew from — "+
+			"a stale read rather than a concurrent writer", got.Generation, prev.Generation)
+	case got.Generation == prev.Generation:
+		return fmt.Sprintf("it holds a different generation %d than the one this seal grew from "+
+			"(concurrent writer?)", got.Generation)
+	default:
+		return fmt.Sprintf("it holds generation %d, newer than the generation %d this seal grew from "+
+			"(concurrent writer?)", got.Generation, prev.Generation)
 	}
-	if cerr != nil {
-		return nil, cerr
-	}
-	return data, nil
 }
 
 // ---- small helpers ----

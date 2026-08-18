@@ -48,6 +48,9 @@ type PackWriter struct {
 	size int64
 	tr   trailer
 	keys map[string]struct{}
+	// keep is set by Retain: the spool has been handed to the caller as a
+	// local copy of the pack, so Abort closes it rather than deleting it.
+	keep bool
 }
 
 // NewPackWriter creates a spool in dir.
@@ -149,11 +152,36 @@ func (w *PackWriter) Finalize() (SealedPack, func(context.Context, pelicanobj.St
 	return sp, upload, nil
 }
 
-// Abort discards the spool. Safe to call after Seal or repeatedly.
+// Retain moves the spool to path and keeps it there instead of deleting
+// it once the upload lands. Call it after Finalize and before the upload
+// runs: the upload streams from the open descriptor, which a rename does
+// not disturb.
+//
+// It exists because the spool a publish just wrote IS the pack — same
+// bytes, same layout, already durable — so a caller that wants a local
+// copy should take that one rather than download back what it uploaded a
+// moment ago. The caller owns the file from here: if the upload then
+// fails, nothing published references it and it is the caller's to
+// remove.
+func (w *PackWriter) Retain(path string) error {
+	if w.f == nil {
+		return fmt.Errorf("pack writer: nothing to retain")
+	}
+	if err := os.Rename(w.f.Name(), path); err != nil {
+		return fmt.Errorf("pack writer: retain at %s: %w", path, err)
+	}
+	w.keep = true
+	return nil
+}
+
+// Abort discards the spool, or merely closes it when Retain has handed it
+// to the caller. Safe to call after Seal or repeatedly.
 func (w *PackWriter) Abort() {
 	if w.f != nil {
 		_ = w.f.Close()
-		_ = os.Remove(w.f.Name())
+		if !w.keep {
+			_ = os.Remove(w.f.Name())
+		}
 		w.f = nil
 	}
 }

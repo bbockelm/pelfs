@@ -23,6 +23,9 @@ type countingStore struct {
 	mu   sync.Mutex
 	objs map[string][]byte
 	puts int
+	// gets counts what had to come BACK off the wire, which is the only
+	// way to tell "the local copy served this" from "it worked".
+	gets int
 	// bytesPut is what actually crossed the wire, trailers included, so
 	// it is always at least the store's own UploadedBytes accounting.
 	bytesPut int64
@@ -75,6 +78,7 @@ func (m *countingStore) Put(_ context.Context, key string, in io.Reader) error {
 func (m *countingStore) Get(_ context.Context, key string, off, limit int64) (io.ReadCloser, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.gets++
 	data, ok := m.objs[key]
 	if !ok {
 		return nil, os.ErrNotExist
@@ -136,6 +140,12 @@ func (m *countingStore) stats() (puts int, bytes int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.puts, m.bytesPut
+}
+
+func (m *countingStore) getCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.gets
 }
 
 // contains reports whether any uploaded object holds needle. It is the

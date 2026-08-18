@@ -32,6 +32,10 @@ type Options struct {
 	PromotionDistance uint64
 	// Obj is the federation. Flushes upload packs to packs/<name>.
 	Obj pelicanobj.Store
+	// PackCacheBytes bounds the local copy of packs (see packCache). Zero
+	// takes DefaultPackCacheBytes; PackCacheDisabled turns it off, which
+	// makes every read of packed content a federation round trip.
+	PackCacheBytes int64
 	// Chunk configures the CDC pass. Zero fields take chunkid's defaults.
 	Chunk chunkid.Options
 	// Hasher binds chunk identity (keyed for encrypted volumes).
@@ -85,6 +89,12 @@ type Stats struct {
 	// LostHandles counts extents a recovery could not find. Nonzero means
 	// data loss and the caller must say so out loud.
 	LostHandles int64
+	// PackReadsLocal and PackReadsRemote split reads of packed content by
+	// where the bytes came from. The claim they check is the one that
+	// decides whether staging can go away: content this session wrote
+	// stays readable — and re-chunkable at seal — without the network.
+	PackReadsLocal  int64
+	PackReadsRemote int64
 }
 
 // Store is the write path: one active memtable, at most one flushing
@@ -113,6 +123,11 @@ type Store struct {
 	index map[Handle]Record // handle -> its record, position absolute
 	live  map[Handle]int    // content references per handle
 	order []Handle          // handles in ring order, oldest first
+
+	// cache is the local copy of packs this session wrote or read. It is
+	// what lets a seal re-chunk a rewrite without fetching back bytes it
+	// uploaded minutes ago.
+	cache *packCache
 
 	packing bool // a pack run is in flight
 	// reclaimTo is the furthest position a completed pack has asked the
@@ -185,6 +200,9 @@ func newStore(opts Options) (*Store, error) {
 	if err := os.MkdirAll(opts.Dir, 0700); err != nil {
 		return nil, err
 	}
+	if opts.PackCacheBytes == 0 {
+		opts.PackCacheBytes = DefaultPackCacheBytes
+	}
 	s := &Store{
 		dir:       opts.Dir,
 		tableSize: opts.TableSize,
@@ -200,6 +218,13 @@ func newStore(opts Options) (*Store, error) {
 		chunkLoc:  make(map[string]PackLoc),
 	}
 	s.cond = sync.NewCond(&s.mu)
+	if opts.PackCacheBytes > 0 {
+		c, err := newPackCache(filepath.Join(opts.Dir, "packs"), opts.PackCacheBytes)
+		if err != nil {
+			return nil, err
+		}
+		s.cache = c
+	}
 	return s, nil
 }
 
@@ -586,7 +611,27 @@ func (src source) len() int {
 	return n
 }
 
+// readPack reads one slice of one pack, from the local copy when there is
+// one. A miss fetches the pack WHOLE and keeps it, which is the format's
+// own read policy and also what makes a later seal of the same file free:
+// reading a file to edit it pulls in the chunks the edit will straddle.
 func (s *Store) readPack(ctx context.Context, sl packSlice, dst []byte) error {
+	if s.cache != nil {
+		f, ok := s.cache.open(sl.pack)
+		if !ok {
+			var err error
+			if f, err = s.cache.fetch(ctx, s.obj, sl.pack); err != nil {
+				return err
+			}
+			s.countPackRead(false)
+		} else {
+			s.countPackRead(true)
+		}
+		defer f.Close() //nolint:errcheck
+		_, err := f.ReadAt(dst, sl.off)
+		return err
+	}
+	s.countPackRead(false)
 	rc, err := s.obj.Get(ctx, packstore.PackDirKey+"/"+sl.pack, sl.off, int64(sl.length))
 	if err != nil {
 		return err
@@ -594,6 +639,16 @@ func (s *Store) readPack(ctx context.Context, sl packSlice, dst []byte) error {
 	defer rc.Close() //nolint:errcheck
 	_, err = io.ReadFull(rc, dst)
 	return err
+}
+
+func (s *Store) countPackRead(local bool) {
+	s.mu.Lock()
+	if local {
+		s.stats.PackReadsLocal++
+	} else {
+		s.stats.PackReadsRemote++
+	}
+	s.mu.Unlock()
 }
 
 // plan resolves a read to sources under the lock. The ordering — active

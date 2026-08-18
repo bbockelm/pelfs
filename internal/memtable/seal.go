@@ -25,11 +25,13 @@ import (
 // store's own read path, so there is one resolver and the seal cannot
 // disagree with the mount about what a file contains.
 //
-// The cost this moves onto the seal, stated plainly: sourcing a
-// straddling chunk from a pack that is no longer local means a seal can
-// block on the network for bytes the user already wrote. The answer is a
-// pin (keep locally any chunk a still-dirty inode only partially
-// references), not a format change, and it is not built yet.
+// The cost this could move onto the seal is a fetch: a straddling chunk
+// in a pack that is no longer local would make publishing depend on the
+// network for content that never left this machine. The local pack cache
+// is what answers that (packcache.go) — a pack this session wrote is
+// retained rather than deleted after its upload, and a pack read pulls
+// the whole thing in — so the fetch is left only for content this session
+// neither wrote nor read. It stays correct in that case, just slower.
 type Sealer struct {
 	s  *Store
 	pk *flushPacker
@@ -38,7 +40,7 @@ type Sealer struct {
 // NewSealer starts a seal. Every inode it renders may add chunks to the
 // same run of packs, so Finish must be called once at the end.
 func (s *Store) NewSealer() *Sealer {
-	return &Sealer{s: s, pk: newFlushPacker(s.obj, s.dir, int64(s.tableSize))}
+	return &Sealer{s: s, pk: newFlushPacker(s.obj, s.dir, int64(s.tableSize), s.cache)}
 }
 
 // Inode renders one inode's content as catalog rows.

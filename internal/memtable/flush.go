@@ -100,7 +100,7 @@ func (s *Store) snapshot(b *batch) ([]inodePlan, *flushResult) {
 }
 
 func (s *Store) chunkAndPack(ctx context.Context, b *batch, plan []inodePlan, res *flushResult) error {
-	pk := newFlushPacker(s.obj, s.dir, int64(s.tableSize))
+	pk := newFlushPacker(s.obj, s.dir, int64(s.tableSize), s.cache)
 	defer pk.abort()
 	for _, ip := range plan {
 		if err := s.chunkInode(ctx, b, ip.exts, pk, res); err != nil {
@@ -238,6 +238,7 @@ type flushPacker struct {
 	obj    pelicanobj.Store
 	dir    string
 	target int64
+	cache  *packCache
 
 	w       *packstore.PackWriter
 	pend    []pendingLoc
@@ -255,9 +256,9 @@ type pendingLoc struct {
 	length int64
 }
 
-func newFlushPacker(obj pelicanobj.Store, dir string, target int64) *flushPacker {
+func newFlushPacker(obj pelicanobj.Store, dir string, target int64, cache *packCache) *flushPacker {
 	return &flushPacker{
-		obj: obj, dir: dir, target: target,
+		obj: obj, dir: dir, target: target, cache: cache,
 		pending: make(map[string]struct{}),
 		locs:    make(map[string]PackLoc),
 	}
@@ -310,8 +311,28 @@ func (p *flushPacker) cut(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// The spool IS the pack, so it is handed to the local cache rather
+	// than deleted after the upload. Retaining BEFORE the upload is what
+	// makes it a rename of a file already on disk instead of a second
+	// copy of it; the upload streams from the open descriptor, which a
+	// rename does not disturb.
+	retained := false
+	if p.cache != nil {
+		if err := p.w.Retain(p.cache.path(sp.Name)); err != nil {
+			return err
+		}
+		retained = true
+	}
 	if err := upload(ctx, p.obj); err != nil {
+		if retained {
+			// Nothing published references this pack, so the local copy is
+			// garbage rather than a cache entry.
+			p.cache.drop(sp.Name)
+		}
 		return err
+	}
+	if retained {
+		p.cache.admit(sp.Name, sp.Size)
 	}
 	p.w = nil
 	p.sealed = append(p.sealed, sp)

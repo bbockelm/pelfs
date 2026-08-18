@@ -117,7 +117,7 @@ a file whose extent was partially overwritten has live bytes that do not
 tile onto whole chunks, and no catalog row can name them. The prototype
 pins the case as `ErrNotTiled` (`internal/memtable/catalogrefs.go`).
 
-Two ways out, and this is the first thing to decide:
+Three ways out were on the table:
 
 1. **Grow `ChunkRef` a chunk-offset field.** A format change, though an
    additive one under the evolution rule.
@@ -125,10 +125,59 @@ Two ways out, and this is the first thing to decide:
    chunk is wholly live and tiles by construction. No format change; more
    chunk boundaries, and boundaries that depend on overwrite history
    rather than content alone, which weakens dedup.
+3. **Re-chunk the span at seal**, from the bytes as they now read.
 
-The resolver must change either way: `genfs` must consult live memtables
-before the pack index, and must treat "identity present in the location
-map" as the terminal case rather than the only one.
+**Settled: 3** (`internal/memtable/seal.go`, `Sealer`). The format keeps
+"whole chunks laid end to end", which is what keeps every chunk boundary
+a legal dedup boundary and a legal catalog split point, and every reader
+stays trivial.
+
+It is affordable because the repair is bounded by the REWRITE rather than
+by the file. A rewritten span replaces the chunks wholly inside it, which
+are never read, and leaves the chunks wholly outside it tiling as they
+were; only the chunk straddling each end has to be read back — at most
+two per contiguous dirty region, whatever its size. Measured at a 4 KiB
+average chunk:
+
+| rewrite | file | re-chunked |
+| --- | --- | --- |
+| 300-byte patch | 200,000 B | 7,279 B, 2 spans |
+| three 500-byte patches | 120,000 B | 14,794 B, 3 spans |
+| 4,000-byte append | 150,000 B | 0 B |
+| untouched | 90,000 B | 0 B, 0 uploads |
+
+The append costing nothing is structural, not luck: a flush cuts the CDC
+stream at the extent it packed, so a published tail chunk is already
+whole and an appended extent chunks on its own. Appends never straddle.
+
+`ChunkRefs` is kept as a strict renderer that refuses `ErrNotTiled`,
+because the honest way to know that a seal moved no bytes is to have
+something that fails when it would have to.
+
+The resolver must change regardless: `genfs` must consult the ring before
+the pack index, and must treat "identity present in the location map" as
+the terminal case rather than the only one.
+
+### The seal must not need the network
+
+Re-chunking reads the straddling chunk from wherever it now lives, and if
+that is a pack no longer on this machine, publishing content the user
+already wrote depends on the federation being up. Staging gives that
+guarantee away for free today, by keeping every dirty file on local disk.
+
+The write path gives it a different way (`internal/memtable/packcache.go`).
+A pack this session wrote is RETAINED rather than deleted after its
+upload — the spool already is the pack, byte for byte, so keeping it is a
+rename rather than a copy — and an ordinary read of packed content pulls
+the whole pack in and keeps that too. So the fetch is left only for
+content this session neither wrote nor read, which is rare in the shape
+that matters: to edit a file you have to read it.
+
+Eviction is oldest-first against a byte cap and deliberately not clever
+about what a seal might need. A miss costs a fetch, never correctness.
+The tests count federation `Get`s rather than asserting that it works,
+because everything here works either way; the point is that the bytes do
+not come off the wire.
 
 ### Overwrites die in memory
 

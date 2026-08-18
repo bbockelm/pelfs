@@ -158,6 +158,69 @@ The practical effect on a session: writes pace against the flusher (the
 backpressure rule below), periodic checkpoints cost nothing observable,
 and exit waits only for whatever the last interval did not already cover.
 
+### Aging, not settling: when content is eligible to leave
+
+An earlier draft looked for a moment when a file was "settled" — `close`,
+or an idle timer — before chunking it. That is a guess dressed as a
+signal. A file can be reopened, appended to, or written through an mmap,
+and a long-running appender never closes at all.
+
+Extents are promoted by **age**: elapsed time or, more usefully,
+accumulated bytes behind them. An extent superseded before it is promoted
+was never sent, and one that survives promotion was stable enough to be
+worth sending. Nothing has to predict a file's future, and the rule
+tunes itself — a burst pushes data through faster, filling the uplink
+exactly when there is something to fill it with. The `tar` case falls
+out: each file is written once, nothing supersedes it, and its extents
+age straight through.
+
+Promotion may pass through more than one level, which is the point of
+calling this an LSM. Each hop is another chance for churn to die before
+anything is sent, and costs a copy of whatever is still live. Whether
+more than one level pays depends on whether real workloads produce
+content that survives one collapse and dies before a second — an editor's
+save cycle, a build output rewritten repeatedly — and that is a
+measurement against real corpora, not an argument.
+
+### Queued for upload is the seal boundary
+
+**A pack queued for upload is sealed.** Its bytes and its identity are
+fixed from that moment; nothing rewrites it. Everything below that line —
+the active table, any frozen level — is still rewritable, and compaction
+there is free because no one outside the process has seen it.
+
+This is a better boundary than "settled per file" because it is a
+property of the pack rather than a guess about a file, and it gives
+compaction one unambiguous line to respect.
+
+It raises a question that turns out to be already answered: a pack
+uploaded mid-session is in no generation's pack list until the next ref
+flip, so what stops a concurrent GC from deleting it? The age guard.
+Pack names embed their creation time (`p-<unixnano hex>-<rand>`), and
+retention skips anything younger than `Params.TGraceSeconds`, 72 hours by
+default. The window between uploading a pack and referencing it is
+minutes. The guard was built for coordination-free safety among writers
+and it covers this case by three orders of magnitude — but it should be
+pinned by a test rather than left as a coincidence.
+
+### Sizes
+
+Starting points, to be revised with operating experience:
+
+| | |
+|---|---|
+| memtable | 64 MiB |
+| queued-for-upload threshold | 64 MiB |
+| total uncommitted | 128 MiB |
+| pack target | 2 MiB today, plausibly 4–16 MiB |
+
+The two 64 MiB figures bound how much work a crash can lose and how much
+a session can run ahead of its uplink. The pack target is a separate dial
+— it sets what a READER fetches, since a reader takes packs whole — and
+the recent sweep put it at 2 MiB on the argument that a scattered reader
+pays a factor of two there against seventeen at 64 MiB. It is the number
+least settled of the four.
+
 ### Flush, and the backpressure rule
 
 Flushing is asynchronous: the writer swaps in a fresh memtable and

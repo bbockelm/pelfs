@@ -15,9 +15,9 @@ import (
 // sealed and published, the new generation CONTAINS that snapshot's
 // merged view — so every overlay row whose last modification the snapshot
 // captured is redundant, and dropping it makes the inode clean again:
-// resolvable from the base, and eligible for the immutability dividend's
-// effectively infinite entry/attr TTLs (docs/design-packfs.md, "Phase 3
-// VFS architecture"). Without it a long session monotonically loses
+// resolvable from the base, and eligible for the effectively infinite
+// entry/attr TTLs immutable content earns (docs/design-packfs.md, on the
+// catalog-native mount). Without it a long session monotonically loses
 // caching, because every inode it ever touched keeps paying the short
 // dirty TTL long after its content was published.
 //

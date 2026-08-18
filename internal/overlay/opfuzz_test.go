@@ -7,7 +7,9 @@ package overlay_test
 // model, with full-tree divergence checks — the fsx/syzkaller shape that
 // has historically shaken real bugs out of filesystems.
 //
-// CONTAINMENT IS MANDATORY (owner requirement). This file:
+// CONTAINMENT IS MANDATORY: this fuzzer generates arbitrary filesystem
+// operation sequences, so it must never be able to reach a real tree.
+// This file:
 //   - only builds under the `opfuzz` tag (never part of normal test runs),
 //   - refuses to execute unless PELFS_OPFUZZ_CONTAINED=1, which only
 //     scripts/opfuzz-docker.sh sets — inside a network-less, cap-dropped,
@@ -140,9 +142,10 @@ func (m *model) unlink(parent uint64, name string, wantDir bool) error {
 }
 
 func (m *model) rename(sp uint64, sn string, dp uint64, dn string) error {
-	// Same-name no-op comes FIRST (the fuzzer's first catch was this
-	// model corrupting itself by running the replace branch on a
-	// self-rename).
+	// Same-name no-op comes FIRST: a self-rename that falls through to
+	// the replace branch unlinks the source and then binds a name to the
+	// inode it just removed, corrupting the model the overlay is being
+	// compared against.
 	if sp == dp && sn == dn {
 		if _, _, err := m.lookup(sp, sn); err != nil {
 			return err
@@ -163,9 +166,9 @@ func (m *model) rename(sp uint64, sn string, dp uint64, dn string) error {
 	}
 	moving := m.nodes[ino]
 	_ = moving
-	// NOTE: no directory-loop guard — the overlay defers EINVAL to the
-	// binding (v0 deviation), and the model mirrors the implementation
-	// under test, not idealized POSIX.
+	// NOTE: no directory-loop guard — the overlay leaves EINVAL for a
+	// rename of a directory into its own subtree to the binding, and the
+	// model mirrors the implementation under test, not idealized POSIX.
 	if tgt, exists := dd.children[dn]; exists {
 		if tgt == ino {
 			return nil // hardlinks to the same inode: POSIX no-op

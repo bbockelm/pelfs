@@ -875,15 +875,17 @@ func TestDirty(t *testing.T) {
 	}
 }
 
-// The accessors exist to replace consumer workarounds; each is checked
-// against the behavior it replaces.
+// Each accessor is checked against the hand-rolled answer a consumer
+// would otherwise have to compute, since that equivalence is the only
+// reason to have it.
 func TestAccessors(t *testing.T) {
 	ctx := context.Background()
 	fx := newFixture(t, "acce5501-0000-4000-8000-000000000001")
 	ov := openOverlay(t, fx, t.TempDir())
 
-	// NextInode advances past created inodes and SURVIVES deletion — the
-	// tree-walk reconstruction seal used cannot see burned numbers.
+	// NextInode advances past created inodes and SURVIVES deletion —
+	// reconstructing the counter from a tree walk cannot see a number
+	// burned by an inode that was created and then removed.
 	start, err := ov.NextInode()
 	if err != nil {
 		t.Fatalf("NextInode: %v", err)

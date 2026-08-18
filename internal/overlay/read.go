@@ -182,8 +182,8 @@ func (fs *FS) Readdir(ctx context.Context, ino uint64) ([]DirEntry, error) {
 // provenance record that lets it be re-established after eviction.
 //
 // It exists for the seal, which descends the whole tree with no kernel
-// Lookup behind it. Readdir alone leaves base entries un-resident, so the
-// seal used to re-resolve every name it had just been handed — three
+// Lookup behind it. Readdir alone leaves base entries un-resident, which
+// leaves such a caller re-resolving every name it was just handed — three
 // catalog queries and four overlay queries per entry, to learn nothing
 // Readdir had not already returned. The base does the retaining in bulk
 // (genfs.ReaddirRetain), which is where the equivalence lives: same

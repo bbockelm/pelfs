@@ -11,10 +11,12 @@ import (
 	"github.com/bbockelm/pelfs/internal/genfs"
 )
 
-// Accessors that exist because consumers were forced to reimplement them:
-// seal reconstructed the inode counter from the tree, the FUSE binding
-// maintained its own dirty set to pick TTLs, and both built ad-hoc
-// readers. Each one here replaces a documented workaround.
+// Accessors that exist so consumers do not each reimplement them. Without
+// NextInode a seal has to reconstruct the inode counter by walking the
+// tree, which cannot see numbers burned by created-then-deleted inodes;
+// without IsDirty the FUSE binding has to maintain its own dirty set to
+// pick TTLs; and both would hand-roll readers over state only the overlay
+// can answer for.
 
 // NextInode reports the persisted allocator high-water mark. Seal records
 // it in the superblock so the next generation's writers never reuse a

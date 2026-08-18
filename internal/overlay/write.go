@@ -338,7 +338,8 @@ func (fs *FS) Rmdir(ctx context.Context, parent uint64, name string) error {
 // follow because children resolve via the moved inode. An existing
 // destination is replaced atomically (directories only when empty in the
 // merged view). Loop prevention (moving a directory into its own
-// subtree) is the binding's responsibility in v0.
+// subtree) is left to the binding, which is the layer that already walks
+// ancestors and can answer it without a second descent here.
 func (fs *FS) Rename(ctx context.Context, srcParent uint64, srcName string, dstParent uint64, dstName string) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()

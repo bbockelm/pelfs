@@ -70,11 +70,11 @@ func truncWrite(ctx context.Context, ov *overlay.FS, ino uint64, data []byte) er
 // sealAndSwap publishes the overlay as the next generation and moves the
 // served base onto it — steps 2 and 3 of Rebase's contract.
 //
-// The seal walks the LIVE overlay rather than the snapshot only because
-// publish.Options takes an *overlay.FS today; every caller here leaves the
-// overlay untouched between the snapshot and the seal, so the two views
-// are the same bytes. What Rebase depends on is the ORDER, and that is
-// exercised exactly as a mount would run it.
+// The seal walks the LIVE overlay rather than the snapshot, which is
+// sound here because every caller leaves the overlay untouched between
+// the snapshot and the seal, so the two views are the same bytes. What
+// Rebase depends on is the ORDER, and that is exercised exactly as a
+// mount would run it.
 func sealAndSwap(t *testing.T, fx *fixture, ov *overlay.FS) *publish.Result {
 	t.Helper()
 	ctx := context.Background()

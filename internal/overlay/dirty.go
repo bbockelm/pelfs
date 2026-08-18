@@ -36,10 +36,10 @@ type DirtySymlink struct {
 	Target string
 }
 
-// DirtyReport is the seal's future input: everything the overlay changed
-// relative to the base generation, in deterministic order (nodes,
-// content, symlinks by inode; edges by parent then name; xattrs by inode
-// then name).
+// DirtyReport is the whole changed set in one value: everything the
+// overlay changed relative to the base generation, in deterministic order
+// (nodes, content, symlinks by inode; edges by parent then name; xattrs
+// by inode then name).
 type DirtyReport struct {
 	Nodes    []DirtyNode
 	Edges    []DirtyEdge

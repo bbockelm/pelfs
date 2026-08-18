@@ -1,6 +1,6 @@
-// Package overlay is the phase-3 write path: a crash-safe local shadow of
+// Package overlay is the write path: a crash-safe local shadow of
 // dirty state over one immutable base generation served by genfs
-// (docs/design-packfs.md, "Phase 3 VFS architecture": write path =
+// (docs/design-packfs.md, on the catalog-native mount: the write path is
 // overlay + seal). Writes never mutate the base; a later seal walks the
 // overlay's dirty set (Dirty) into new catalogs and packs.
 //
@@ -12,8 +12,10 @@
 //
 // Content COW is file-granular: the first write or truncate of a base
 // file copies its surviving content into staging before the mutation
-// applies. The large-file-append cost (full copy on first dirty byte) is
-// accepted for v0; chunk-granular COW is the listed later optimization.
+// applies. Appending to a large file therefore copies the whole thing on
+// the first dirty byte, which is accepted because the sessions this
+// serves rewrite small files far more often than they extend huge ones;
+// chunk-granular COW is the escape hatch if that stops being true.
 //
 // Resolution order: overlay wins. A whiteout row (oedge.inode = 0) hides
 // a base name; an oedge for an existing base name replaces it (rename
@@ -117,7 +119,8 @@ type FS struct {
 	stagingDir string
 
 	// mu serializes every operation: one writer, one transaction at a
-	// time (v0 simplicity; SQLite serializes writes anyway).
+	// time. SQLite serializes writes anyway, so a finer lock would buy
+	// concurrency the storage layer refuses to deliver.
 	mu sync.Mutex
 	// dirtySet is the in-memory answer to IsDirty (see accessors.go);
 	// nil until first use, then maintained by every mutating path.

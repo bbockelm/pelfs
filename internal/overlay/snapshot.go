@@ -20,16 +20,17 @@ import (
 // Snapshot freezes the overlay at one instant so a seal can walk a view
 // no writer moves under it. Without it, a mid-session checkpoint is tar
 // over a live directory: the published generation is self-consistent but
-// corresponds to no instant, and nothing may be marked clean afterwards
-// (cmd/pelfs's checkpoint keeps every dirty row for exactly that reason).
-// With it, the seal's input has a sequence number, and Rebase can drop
-// the state that sequence published.
+// corresponds to no instant, so nothing it published could be marked
+// clean afterwards and every touched inode would keep paying the dirty
+// TTL for the rest of the session. With it, the seal's input has a
+// sequence number, and Rebase can drop the state that sequence
+// published.
 //
 // Two halves, frozen differently:
 //
-//   - Metadata by VACUUM INTO, the CUT primitive already used for v1
-//     publishes: one consistent copy of the dirty tables, read afterwards
-//     through its own connection.
+//   - Metadata by VACUUM INTO: one consistent copy of the dirty tables,
+//     taken under the lock and read afterwards through its own
+//     connection.
 //   - Content by one hardlink per staging file plus the length the
 //     snapshot recorded. A link is the cheap clone every POSIX filesystem
 //     has (no reflink required) and costs no data movement; in exchange

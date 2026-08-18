@@ -516,16 +516,20 @@ into staging the first time one byte of a base file is written; and its
 checkpoints freeze by hardlinking every dirty file with the mount's lock
 held.
 
-Two paths still get staging files, each said out loud rather than
-inferred:
+`--no-memtable` is the way back to staging files.
 
-  - `--no-memtable`, for a session that wants the old behaviour.
-  - An **encrypted volume**. The memtable's packer writes chunks as it
-    receives them, and chunk encryption lives in the publish pipeline —
-    so using it there would put plaintext in the federation. The rows it
-    writes would still READ correctly, which is exactly why this refuses
-    rather than warns. Wiring the DEK through the flush packer is the
-    work that removes this case.
+Pack entries go through the SAME codec publish uses
+(`internal/entrycodec`): zstd unless it makes them bigger, then
+AES-256-GCM under the volume's key. That is not a nicety — a session that
+packs as it writes must produce the objects a seal would have produced,
+or it is not writing the same format. 200,000 bytes of compressible
+content upload as 664, and an encrypted volume's plaintext is not in the
+objects, which is the only test that settles it.
+
+One consequence worth knowing: a stored entry has no addressable
+interior, so a partial read fetches and decodes the whole chunk. That is
+the same thing genfs does, and it is why the cut size bounds what a
+scattered read costs.
 
 The content store lives at `<state-dir>/content` and outlives the
 overlay, because the seal at exit renders its records. It is retired

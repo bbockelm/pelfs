@@ -191,28 +191,21 @@ func cmdMountGen(args []string) int {
 // freeze by hardlinking every dirty file with the mount's lock held,
 // which is measured in seconds on a source tree.
 //
-// It returns nil — meaning staging files — in two cases, each said out
-// loud rather than inferred:
-//
-//   - --no-memtable, for a session that wants the old behaviour.
-//   - An ENCRYPTED volume. The memtable's packer writes chunks as it
-//     receives them, and chunk encryption lives in the publish pipeline,
-//     so using it here would put plaintext in the federation. The rows it
-//     writes would still READ correctly, which is exactly why this refuses
-//     rather than warns.
+// It returns nil — meaning staging files — only for --no-memtable.
+// Encrypted volumes are served here too: the packer runs pack entries
+// through the same codec publish does (zstd unless it grows them, then
+// AES-256-GCM under the volume's key), so what reaches the federation is
+// the same objects a seal would have written.
 func (g *genSession) openContent(ctx context.Context, disabled bool) (*memtable.Store, error) {
-	switch {
-	case disabled:
-		return nil, nil
-	case len(g.dek) != 0:
-		ui.Info("this volume is encrypted, so written content stays in staging files " +
-			"and is chunked at the seal (the write path does not encrypt yet)")
+	if disabled {
 		return nil, nil
 	}
 	store, rep, closeStore, err := overlay.OpenContentStore(filepath.Join(g.stateDir, "content"), memtable.Options{
 		Obj:               g.inner,
 		Base:              g.gfs,
 		Hasher:            chunkid.NewHasher(g.identityKey),
+		DEK:               g.dek,
+		KeyID:             int64(g.keyID),
 		PromotionDistance: memtable.DefaultPromotionDistance,
 	})
 	if err != nil {

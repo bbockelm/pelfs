@@ -63,7 +63,10 @@ CREATE TABLE IF NOT EXISTS ochunk (
 	identity TEXT PRIMARY KEY,
 	pack     TEXT NOT NULL,
 	off      INTEGER NOT NULL,
-	length   INTEGER NOT NULL
+	stored   INTEGER NOT NULL,
+	logical  INTEGER NOT NULL,
+	alg      INTEGER NOT NULL,
+	key_id   INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS opack (
 	name    TEXT PRIMARY KEY,
@@ -80,6 +83,14 @@ func openContentJournal(dir string) (*contentJournal, error) {
 		return nil, fmt.Errorf("overlay: open content journal: %w", err)
 	}
 	db.SetMaxOpenConns(1)
+	// The journal describes one unsealed session and is retired with it,
+	// so an older layout is scratch rather than history: start over rather
+	// than half-read it. A recovery that finds nothing reports the loss,
+	// which is the honest outcome for state this process cannot parse.
+	if err := resetIfOldSchema(db); err != nil {
+		db.Close() //nolint:errcheck
+		return nil, err
+	}
 	if _, err := db.Exec(journalSchema); err != nil {
 		db.Close() //nolint:errcheck
 		return nil, fmt.Errorf("overlay: content journal schema: %w", err)
@@ -90,6 +101,27 @@ func openContentJournal(dir string) (*contentJournal, error) {
 		return nil, fmt.Errorf("overlay: content journal: %w", err)
 	}
 	return &contentJournal{db: db, append: stmt}, nil
+}
+
+// journalSchemaVersion is bumped whenever the tables change shape.
+const journalSchemaVersion = 2
+
+func resetIfOldSchema(db *sql.DB) error {
+	var have int64
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&have); err != nil {
+		return fmt.Errorf("overlay: content journal version: %w", err)
+	}
+	if have != journalSchemaVersion {
+		for _, t := range []string{"ojournal", "ohandle", "ochunk", "opack"} {
+			if _, err := db.Exec(`DROP TABLE IF EXISTS ` + t); err != nil {
+				return fmt.Errorf("overlay: reset content journal: %w", err)
+			}
+		}
+		if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, journalSchemaVersion)); err != nil {
+			return fmt.Errorf("overlay: content journal version: %w", err)
+		}
+	}
+	return nil
 }
 
 func (j *contentJournal) Close() error {
@@ -127,8 +159,10 @@ func (j *contentJournal) Located(l memtable.Location) error {
 		}
 	}
 	for id, loc := range l.Chunks {
-		if _, err := tx.Exec(`INSERT OR REPLACE INTO ochunk (identity, pack, off, length) VALUES (?, ?, ?, ?)`,
-			id, loc.Pack, loc.Off, loc.Length); err != nil {
+		if _, err := tx.Exec(
+			`INSERT OR REPLACE INTO ochunk (identity, pack, off, stored, logical, alg, key_id)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			id, loc.Pack, loc.Off, loc.Stored, loc.Logical, int64(loc.Alg), loc.KeyID); err != nil {
 			return fail(err)
 		}
 	}
@@ -190,17 +224,19 @@ func (j *contentJournal) Load() (memtable.Durable, error) {
 		return memtable.Durable{}, err
 	}
 
-	crows, err := j.db.Query(`SELECT identity, pack, off, length FROM ochunk`)
+	crows, err := j.db.Query(`SELECT identity, pack, off, stored, logical, alg, key_id FROM ochunk`)
 	if err != nil {
 		return memtable.Durable{}, err
 	}
 	for crows.Next() {
 		var id string
 		var loc memtable.PackLoc
-		if err := crows.Scan(&id, &loc.Pack, &loc.Off, &loc.Length); err != nil {
+		var alg int64
+		if err := crows.Scan(&id, &loc.Pack, &loc.Off, &loc.Stored, &loc.Logical, &alg, &loc.KeyID); err != nil {
 			crows.Close() //nolint:errcheck
 			return memtable.Durable{}, err
 		}
+		loc.Alg = uint8(alg)
 		d.Chunks[id] = loc
 	}
 	if err := closeRows(crows); err != nil {

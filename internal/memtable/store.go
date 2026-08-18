@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/bbockelm/pelfs/internal/chunkid"
+	"github.com/bbockelm/pelfs/internal/entrycodec"
 	"github.com/bbockelm/pelfs/internal/packstore"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 )
@@ -48,6 +49,11 @@ type Options struct {
 	Chunk chunkid.Options
 	// Hasher binds chunk identity (keyed for encrypted volumes).
 	Hasher chunkid.Hasher
+	// DEK encrypts pack entries (AES-256-GCM); nil stores them in the
+	// clear. KeyID names it in the superblock's key table, and travels in
+	// every chunkref this store writes.
+	DEK   []byte
+	KeyID int64
 	// Hooks are test seams; all fields may be nil.
 	Hooks Hooks
 }
@@ -143,6 +149,8 @@ type Store struct {
 
 	journal Journal
 	base    Base
+	dek     []byte
+	keyID   int64
 	// baseRefs holds, per ADOPTED handle, the base generation's own
 	// content records for that file (base.go). An extent is either these,
 	// or a ring record, or a location-map entry — the three places bytes
@@ -191,13 +199,22 @@ type ChunkSlice struct {
 	Length   int
 }
 
-// PackLoc is where a chunk landed: the second half of the location map,
-// and the half the format already has — a pack name and an offset,
-// reachable from the superblock's pack list through pack trailers.
+// PackLoc is where a chunk landed AND how it was stored: the second half
+// of the location map, reachable from the superblock's pack list through
+// pack trailers.
+//
+// Stored and Logical differ the moment a chunk is compressed, and the
+// pair is what a catalog row carries too (CLen and LLen). Carrying both
+// here rather than one length is what lets a chunk be compressed and
+// encrypted on the way into a pack — and it is why a read fetches whole
+// chunks: a range inside a compressed, sealed entry means nothing.
 type PackLoc struct {
-	Pack   string
-	Off    int64
-	Length int64
+	Pack    string
+	Off     int64
+	Stored  int64 // bytes in the pack
+	Logical int64 // bytes after decoding
+	Alg     uint8 // entrycodec compression id
+	KeyID   int64 // superblock key table id, 0 for plaintext
 }
 
 func bufferName(seq uint64) string { return fmt.Sprintf("mem-%06d.buf", seq) }
@@ -236,6 +253,8 @@ func newStore(opts Options) (*Store, error) {
 		live:      make(map[Handle]int),
 		base:      opts.Base,
 		journal:   opts.Journal,
+		dek:       opts.DEK,
+		keyID:     opts.KeyID,
 		baseRefs:  make(map[Handle]baseExtent),
 		obj:       opts.Obj,
 		chunkOpts: opts.Chunk,
@@ -606,9 +625,12 @@ func (s *Store) ringAt(pos uint64, length int) []byte {
 	return b
 }
 
+// packSlice is one chunk to fetch and the part of it that is wanted. It
+// names the whole stored entry rather than a byte range inside it,
+// because a compressed or encrypted entry has no addressable interior.
 type packSlice struct {
-	pack   string
-	off    int64
+	loc    PackLoc
+	skip   int // where in the DECODED chunk the wanted bytes start
 	length int
 }
 
@@ -691,11 +713,12 @@ func (src source) len() int {
 // own read policy and also what makes a later seal of the same file free:
 // reading a file to edit it pulls in the chunks the edit will straddle.
 func (s *Store) readPack(ctx context.Context, sl packSlice, dst []byte) error {
+	stored := make([]byte, sl.loc.Stored)
 	if s.cache != nil {
-		f, ok := s.cache.open(sl.pack)
+		f, ok := s.cache.open(sl.loc.Pack)
 		if !ok {
 			var err error
-			if f, err = s.cache.fetch(ctx, s.obj, sl.pack); err != nil {
+			if f, err = s.cache.fetch(ctx, s.obj, sl.loc.Pack); err != nil {
 				return err
 			}
 			s.countPackRead(false)
@@ -703,17 +726,30 @@ func (s *Store) readPack(ctx context.Context, sl packSlice, dst []byte) error {
 			s.countPackRead(true)
 		}
 		defer f.Close() //nolint:errcheck
-		_, err := f.ReadAt(dst, sl.off)
-		return err
+		if _, err := f.ReadAt(stored, sl.loc.Off); err != nil {
+			return err
+		}
+	} else {
+		s.countPackRead(false)
+		rc, err := s.obj.Get(ctx, packstore.PackDirKey+"/"+sl.loc.Pack, sl.loc.Off, sl.loc.Stored)
+		if err != nil {
+			return err
+		}
+		defer rc.Close() //nolint:errcheck
+		if _, err := io.ReadFull(rc, stored); err != nil {
+			return err
+		}
 	}
-	s.countPackRead(false)
-	rc, err := s.obj.Get(ctx, packstore.PackDirKey+"/"+sl.pack, sl.off, int64(sl.length))
+	plain, err := entrycodec.Decode(stored, sl.loc.Alg, s.dek)
 	if err != nil {
-		return err
+		return fmt.Errorf("memtable: decode chunk in %s at %d: %w", sl.loc.Pack, sl.loc.Off, err)
 	}
-	defer rc.Close() //nolint:errcheck
-	_, err = io.ReadFull(rc, dst)
-	return err
+	if int64(len(plain)) != sl.loc.Logical {
+		return fmt.Errorf("memtable: chunk in %s at %d decoded to %d bytes, want %d",
+			sl.loc.Pack, sl.loc.Off, len(plain), sl.loc.Logical)
+	}
+	copy(dst, plain[sl.skip:sl.skip+len(dst)])
+	return nil
 }
 
 func (s *Store) countPackRead(local bool) {
@@ -800,11 +836,7 @@ func (s *Store) resolveLocked(h Handle, skip, length int) (source, error) {
 		if !ok {
 			return source{}, fmt.Errorf("memtable: chunk %s has no location", cs.ID)
 		}
-		out = append(out, packSlice{
-			pack:   loc.Pack,
-			off:    loc.Off + int64(cs.ChunkOff+delta),
-			length: take,
-		})
+		out = append(out, packSlice{loc: loc, skip: cs.ChunkOff + delta, length: take})
 		want += take
 		remaining -= take
 		pos += cs.Length

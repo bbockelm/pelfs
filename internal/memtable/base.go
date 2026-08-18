@@ -154,12 +154,14 @@ func (be baseExtent) pieces(at int64, skip, length int64) []piece {
 		lo := max(r.LogicalOffset, want)
 		hi := min(r.LogicalOffset+r.LLen, end)
 		out = append(out, piece{
-			id:   chunkIdentity(r.Identity),
-			off:  lo - r.LogicalOffset,
-			n:    hi - lo,
-			at:   at + (lo - want),
-			llen: r.LLen,
-			clen: r.CLen,
+			id:    chunkIdentity(r.Identity),
+			off:   lo - r.LogicalOffset,
+			n:     hi - lo,
+			at:    at + (lo - want),
+			llen:  r.LLen,
+			clen:  r.CLen,
+			alg:   uint8(r.Alg),
+			keyID: r.KeyID,
 		})
 	}
 	return out

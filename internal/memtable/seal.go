@@ -40,7 +40,7 @@ type Sealer struct {
 // NewSealer starts a seal. Every inode it renders may add chunks to the
 // same run of packs, so Finish must be called once at the end.
 func (s *Store) NewSealer() *Sealer {
-	return &Sealer{s: s, pk: newFlushPacker(s.obj, s.dir, int64(s.tableSize), s.cache)}
+	return &Sealer{s: s, pk: newFlushPacker(s.obj, s.dir, int64(s.tableSize), s.cache, s.dek, s.keyID)}
 }
 
 // Inode renders one inode's live content as catalog rows.

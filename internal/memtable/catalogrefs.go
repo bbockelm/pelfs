@@ -45,17 +45,21 @@ type piece struct {
 	// compressed or encrypted. Both travel because a ChunkRef carries
 	// both, and a chunk adopted from the base must be emitted with the
 	// base's own numbers rather than re-derived ones.
+	alg   uint8 // how the stored bytes were encoded
+	keyID int64 // which key sealed them, 0 for plaintext
 }
 
 // group is consecutive pieces of the SAME chunk, taken in order and with
 // no gap — the unit a ChunkRef can name, if it covers the whole chunk.
 type group struct {
-	id   chunkid.Identity
-	off  int64
-	n    int64
-	at   int64
-	llen int64
-	clen int64
+	id    chunkid.Identity
+	off   int64
+	n     int64
+	at    int64
+	llen  int64
+	clen  int64
+	alg   uint8
+	keyID int64
 }
 
 func (g group) whole() bool { return g.off == 0 && g.n == g.llen }
@@ -66,6 +70,8 @@ func (g group) ref() catalog.ChunkRef {
 		Identity:      append([]byte(nil), g.id[:]...),
 		LLen:          g.llen,
 		CLen:          g.clen,
+		Alg:           int64(g.alg),
+		KeyID:         g.keyID,
 		LogicalOffset: g.at,
 	}
 }
@@ -117,12 +123,14 @@ func (s *Store) piecesOfLocked(c *content, ino uint64) ([]piece, error) {
 			delta := max(want-pos, 0)
 			take := int64(min(cs.Length-delta, remaining))
 			out = append(out, piece{
-				id:   cs.ID,
-				off:  int64(cs.ChunkOff + delta),
-				n:    take,
-				at:   at,
-				llen: loc.Length,
-				clen: loc.Length,
+				id:    cs.ID,
+				off:   int64(cs.ChunkOff + delta),
+				n:     take,
+				at:    at,
+				llen:  loc.Logical,
+				clen:  loc.Stored,
+				alg:   loc.Alg,
+				keyID: loc.KeyID,
 			})
 			at += take
 			want += int(take)
@@ -153,7 +161,8 @@ func groupPieces(ps []piece) []group {
 				continue
 			}
 		}
-		out = append(out, group{id: p.id, off: p.off, n: p.n, at: p.at, llen: p.llen, clen: p.clen})
+		out = append(out, group{id: p.id, off: p.off, n: p.n, at: p.at,
+			llen: p.llen, clen: p.clen, alg: p.alg, keyID: p.keyID})
 	}
 	return out
 }

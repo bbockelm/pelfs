@@ -3,10 +3,12 @@ package memtable
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"sort"
 
 	"github.com/bbockelm/pelfs/internal/chunkid"
+	"github.com/bbockelm/pelfs/internal/entrycodec"
 	"github.com/bbockelm/pelfs/internal/packstore"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 )
@@ -100,7 +102,7 @@ func (s *Store) snapshot(b *batch) ([]inodePlan, *flushResult) {
 }
 
 func (s *Store) chunkAndPack(ctx context.Context, b *batch, plan []inodePlan, res *flushResult) error {
-	pk := newFlushPacker(s.obj, s.dir, int64(s.tableSize), s.cache)
+	pk := newFlushPacker(s.obj, s.dir, int64(s.tableSize), s.cache, s.dek, s.keyID)
 	defer pk.abort()
 	for _, ip := range plan {
 		if err := s.chunkInode(ctx, b, ip.exts, pk, res); err != nil {
@@ -261,6 +263,8 @@ type flushPacker struct {
 	dir    string
 	target int64
 	cache  *packCache
+	dek    []byte
+	keyID  int64
 
 	w       *packstore.PackWriter
 	pend    []pendingLoc
@@ -273,19 +277,27 @@ type flushPacker struct {
 }
 
 type pendingLoc struct {
-	key    string
-	off    int64
-	length int64
+	key     string
+	off     int64
+	stored  int64
+	logical int64
+	alg     uint8
 }
 
-func newFlushPacker(obj pelicanobj.Store, dir string, target int64, cache *packCache) *flushPacker {
+func newFlushPacker(obj pelicanobj.Store, dir string, target int64, cache *packCache, dek []byte, keyID int64) *flushPacker {
 	return &flushPacker{
-		obj: obj, dir: dir, target: target, cache: cache,
+		obj: obj, dir: dir, target: target, cache: cache, dek: dek, keyID: keyID,
 		pending: make(map[string]struct{}),
 		locs:    make(map[string]PackLoc),
 	}
 }
 
+// add stores one chunk. The bytes are ENCODED first — zstd unless that
+// makes them bigger, then AES-256-GCM when the volume has a key — which
+// is the same treatment publish gives a chunk, through the same codec.
+// Doing it here rather than at the seal is the whole point: a session
+// that packs as it writes must produce the same objects a seal would, or
+// it is not the same format.
 func (p *flushPacker) add(ctx context.Context, id chunkid.Identity, data []byte) error {
 	key := id.Hex()
 	if _, done := p.locs[key]; done {
@@ -310,13 +322,20 @@ func (p *flushPacker) add(ctx context.Context, id chunkid.Identity, data []byte)
 		}
 		p.w = w
 	}
+	stored, alg, err := entrycodec.Encode(data, p.dek)
+	if err != nil {
+		return fmt.Errorf("memtable: encode chunk %s: %w", key, err)
+	}
 	off := p.w.Size()
-	if err := p.w.Add(key, packstore.EntryData, data); err != nil {
+	if err := p.w.Add(key, packstore.EntryData, stored); err != nil {
 		return err
 	}
-	p.pend = append(p.pend, pendingLoc{key: key, off: off, length: int64(len(data))})
+	p.pend = append(p.pend, pendingLoc{
+		key: key, off: off,
+		stored: int64(len(stored)), logical: int64(len(data)), alg: alg,
+	})
 	p.pending[key] = struct{}{}
-	p.bytes += int64(len(data))
+	p.bytes += int64(len(stored))
 	p.count++
 	return nil
 }
@@ -359,7 +378,10 @@ func (p *flushPacker) cut(ctx context.Context) error {
 	p.w = nil
 	p.sealed = append(p.sealed, sp)
 	for _, pl := range p.pend {
-		p.locs[pl.key] = PackLoc{Pack: sp.Name, Off: pl.off, Length: pl.length}
+		p.locs[pl.key] = PackLoc{
+			Pack: sp.Name, Off: pl.off,
+			Stored: pl.stored, Logical: pl.logical, Alg: pl.alg, KeyID: p.keyID,
+		}
 	}
 	p.pend = nil
 	clear(p.pending)

@@ -66,6 +66,16 @@ const (
 // the head are well-formed records from a previous lap; it accepts the
 // longest run whose sequences ascend.
 
+// The sizes the write path runs at. The ring is deliberately LARGER than
+// the distance that triggers packing: packing chunks, hashes and
+// compresses, so a ring sized exactly at its trigger would block a writer
+// the instant packing began and on every cycle after. The difference is
+// the writer's runway while the tail drains.
+const (
+	DefaultRingSize          = 72 << 20
+	DefaultPromotionDistance = 64 << 20
+)
+
 // ErrRingFull reports that a record cannot be appended until the tail
 // advances. It is routine — it is the backpressure signal — not a fault.
 var ErrRingFull = errors.New("memtable: ring full")
@@ -79,6 +89,13 @@ var ErrRecordTooLarge = errors.New("memtable: record too large for the ring")
 
 // MaxRecord is the largest payload a ring of the given size accepts.
 //
+// A sixteenth, not an eighth: the cap has to fit inside the RUNWAY —
+// the slack between the promotion distance and the ring's size — or one
+// record can carry a writer from "not yet packing" to "full" in a single
+// append, blocking it the instant packing begins, which is the exact
+// pathology the runway exists to prevent. At the shipped sizes that is a
+// 4.5 MiB record against 8 MiB of runway, and a test holds the relation.
+//
 // It is a fraction of the ring rather than "whatever fits", which closes
 // a subtler trap than the obvious one. A record is padded past the seam
 // rather than straddling it, and the pad consumes ring space too — so a
@@ -87,7 +104,7 @@ var ErrRecordTooLarge = errors.New("memtable: record too large for the ring")
 // left to pack would wait forever. Capping a record at an eighth of the
 // ring means a pad plus a record always fits in a drained ring, so
 // waiting always terminates.
-func MaxRecord(ringSize int) int { return ringSize/8 - ringRecHdr }
+func MaxRecord(ringSize int) int { return ringSize/16 - ringRecHdr }
 
 // CreateRing makes a ring file of exactly size bytes of data region and
 // maps it. The file is preallocated: appends are stores into the mapping
@@ -267,6 +284,29 @@ func (r *Ring) Reclaim(to uint64) (uint64, error) {
 	}
 	r.tail = to
 	return r.tail, r.writeFileHeader()
+}
+
+// Promotable reports how many bytes at the tail are old enough to pack,
+// given the promotion distance. Age is distance behind the head, so this
+// is one subtraction — the property that let the design drop discrete
+// levels in favour of a single coordinate.
+//
+// It returns 0 rather than a negative when the ring holds less than the
+// distance, which is the common case for a short session: nothing is old
+// enough, so nothing is packed, and the seal at exit handles the lot.
+func (r *Ring) Promotable(distance uint64) uint64 {
+	used := r.Used()
+	if used <= distance {
+		return 0
+	}
+	return used - distance
+}
+
+// PromotableRange reports the absolute positions a packer should consume,
+// [from, to). Packing works from the TAIL because that is where the
+// oldest bytes are, and age is the whole promotion rule.
+func (r *Ring) PromotableRange(distance uint64) (from, to uint64) {
+	return r.tail, r.tail + r.Promotable(distance)
 }
 
 // Sync flushes the mapping. Durability is the caller's policy; the ring

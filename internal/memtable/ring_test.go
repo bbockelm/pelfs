@@ -32,10 +32,10 @@ func appendN(t *testing.T, r *Ring, h Handle, payload []byte) uint64 {
 // have: space freed at the tail is reusable immediately, so a writer can
 // lap the buffer indefinitely as long as packing keeps up.
 func TestRingWrapsAndReclaims(t *testing.T) {
-	const size = 8 << 10
+	const size = 32 << 10
 	r, _ := newRing(t, size)
 
-	payload := bytes.Repeat([]byte{0xab}, 500)
+	payload := bytes.Repeat([]byte{0xab}, MaxRecord(size))
 	var laps int
 	for h := Handle(1); h <= 200; h++ {
 		pos, err := r.Append(&Record{Handle: h, Inode: uint64(h)}, payload)
@@ -159,13 +159,13 @@ func TestRingRecoveryStopsAtAStaleLap(t *testing.T) {
 // what recovery owes the caller: the surviving prefix, and no silence
 // about the rest.
 func TestRingRecoveryStopsAtATornRecord(t *testing.T) {
-	const size = 8 << 10
+	const size = 32 << 10
 	path := filepath.Join(t.TempDir(), "ring")
 	r, err := CreateRing(path, size)
 	if err != nil {
 		t.Fatal(err)
 	}
-	payload := bytes.Repeat([]byte{0x22}, 300)
+	payload := bytes.Repeat([]byte{0x22}, MaxRecord(size))
 	var positions []uint64
 	for i := 0; i < 5; i++ {
 		positions = append(positions, appendN(t, r, Handle(i), payload))
@@ -201,9 +201,9 @@ func TestRingRecoveryStopsAtATornRecord(t *testing.T) {
 // record ever straddles — which is what lets At hand out one contiguous
 // slice with no copy.
 func TestRingPadsRatherThanStraddling(t *testing.T) {
-	const size = 16 << 10
+	const size = 32 << 10
 	r, _ := newRing(t, size)
-	big := bytes.Repeat([]byte{0x33}, 1200)
+	big := bytes.Repeat([]byte{0x33}, MaxRecord(size))
 	var last uint64
 	for i := 0; i < 3; i++ {
 		last = appendN(t, r, Handle(i), big)
@@ -228,8 +228,9 @@ func TestRingPadsRatherThanStraddling(t *testing.T) {
 // Age is a subtraction, which is what makes the promotion rule cheap:
 // an extent at position p is head-p bytes old.
 func TestRingAgeIsDistanceBehindTheHead(t *testing.T) {
-	r, _ := newRing(t, 64<<10)
-	payload := bytes.Repeat([]byte{0x44}, 1000)
+	const size = 64 << 10
+	r, _ := newRing(t, size)
+	payload := bytes.Repeat([]byte{0x44}, MaxRecord(size))
 	first := appendN(t, r, 1, payload)
 	for i := 2; i <= 10; i++ {
 		appendN(t, r, Handle(i), payload)
@@ -314,9 +315,9 @@ func TestRingAlwaysAdmitsAMaxRecordWhenDrained(t *testing.T) {
 // and the reader here is holding the OLDEST record, which is exactly the
 // one a tail sweep would take first.
 func TestRingReclaimStopsAtAPinnedReader(t *testing.T) {
-	const size = 16 << 10
+	const size = 32 << 10
 	r, _ := newRing(t, size)
-	payload := bytes.Repeat([]byte{0x88}, 1000)
+	payload := bytes.Repeat([]byte{0x88}, MaxRecord(size))
 
 	first := appendN(t, r, 1, payload)
 	second := appendN(t, r, 2, payload)
@@ -355,5 +356,60 @@ func TestRingReclaimStopsAtAPinnedReader(t *testing.T) {
 	}
 	if got != r.Head() {
 		t.Fatalf("with nothing pinned the tail should reach the head, got %d", got)
+	}
+}
+
+// TestRingPromotionIsASubtraction pins the rule that replaced discrete
+// levels: an extent's age is how far behind the head it sits, so what is
+// eligible to pack is whatever exceeds the promotion distance. Nothing is
+// copied between levels and nothing tracks a level count.
+func TestRingPromotionIsASubtraction(t *testing.T) {
+	const size = 64 << 10
+	const distance = 16 << 10
+	r, _ := newRing(t, size)
+	payload := bytes.Repeat([]byte{0x99}, MaxRecord(size))
+	unit := uint64(ringRecHdr + len(payload))
+
+	// Below the distance nothing is old enough, which is the short-session
+	// case: the seal at exit takes everything.
+	for r.Used() < distance {
+		appendN(t, r, 1, payload)
+		if got := r.Promotable(distance); r.Used() <= distance && got != 0 {
+			t.Fatalf("promotable %d with only %d used against a %d distance", got, r.Used(), distance)
+		}
+	}
+
+	// Past it, exactly the excess is eligible, and it starts at the tail.
+	appendN(t, r, 2, payload)
+	want := r.Used() - distance
+	if got := r.Promotable(distance); got != want {
+		t.Fatalf("promotable %d, want %d", got, want)
+	}
+	from, to := r.PromotableRange(distance)
+	if from != r.Tail() {
+		t.Fatalf("promotion starts at %d, not the tail %d", from, r.Tail())
+	}
+	if to-from != want {
+		t.Fatalf("promotion range covers %d bytes, want %d", to-from, want)
+	}
+
+	// Reclaiming what was promoted drops the ring back under the distance.
+	if _, err := r.Reclaim(to); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.Promotable(distance); got != 0 {
+		t.Fatalf("promotable %d after reclaiming the eligible range", got)
+	}
+	_ = unit
+}
+
+// The shipped sizes must leave a writer runway: a ring sized exactly at
+// its trigger blocks the instant packing starts, every cycle.
+func TestDefaultRingLeavesRunwayAboveThePromotionDistance(t *testing.T) {
+	if DefaultRingSize <= DefaultPromotionDistance {
+		t.Fatalf("ring %d must exceed the promotion distance %d", DefaultRingSize, DefaultPromotionDistance)
+	}
+	if runway := DefaultRingSize - DefaultPromotionDistance; runway < MaxRecord(DefaultRingSize) {
+		t.Fatalf("runway %d is smaller than one maximum record %d", runway, MaxRecord(DefaultRingSize))
 	}
 }

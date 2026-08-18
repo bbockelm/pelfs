@@ -117,6 +117,12 @@ type FS struct {
 	q          *stmtCache
 	dir        string
 	stagingDir string
+	// stagingFallback is set on a SNAPSHOT's frozen view: the live
+	// overlay's staging directory, read when the snapshot's own scratch
+	// holds no copy of an inode. A freeze links nothing (snapshot.go), so
+	// the absence of a copy means the live file still holds the frozen
+	// bytes.
+	stagingFallback string
 
 	// mu serializes every operation: one writer, one transaction at a
 	// time. SQLite serializes writes anyway, so a finer lock would buy
@@ -147,8 +153,9 @@ type FS struct {
 	// replays it against the sealed base.
 	snapEdges map[uint64]map[uint64]provEdge
 	// snapPins is one entry per LIVE snapshot: the staging lengths that
-	// snapshot froze, which the write path copies out from before
-	// disturbing (snapshot.go, breakSnapshotLinkLocked).
+	// snapshot froze, which the write path hands the staging file over for
+	// before it disturbs those bytes (snapshot.go, handOverPinsLocked and
+	// copyOutForSnapshotsLocked).
 	snapPins []*snapPin
 }
 

@@ -705,9 +705,13 @@ One publish at a time, five phases. The session owns the first two;
    N+2 and are irrelevant. A mid-session **checkpoint** freezes the
    overlay to get that instant, because it publishes while writers keep
    working; the **seal at unmount** does not, because the mountpoint is
-   already gone and the live overlay *is* an instant. That distinction is
-   worth ~32 s of hardlinking plus ~6 s of unlinking on an 85k-file
-   session, all of it in front of a waiting user.
+   already gone and the live overlay *is* an instant. The freeze itself
+   copies nothing: it records each staged file's length, the seal reads
+   the live staging files, and the live side moves a file into the
+   snapshot's scratch only when it is about to disturb bytes below the
+   recorded length. Freezing eagerly instead — one hardlink per staged
+   file — cost 8.5 s of overlay lock hold on a 28k-file dirty set, which
+   is long enough for an NFS client to call the server dead.
 2. **RECONCILE.** Everything the cut references must exist locally before
    it can be packed.
 3. **TRANSFORM.** From the cut, regenerate every dirty catalog and inode

@@ -65,6 +65,19 @@ func (fs *FS) Rebase(ctx context.Context, sealedSeq uint64, sealed Options) (*Re
 		return nil, errors.New("overlay: Rebase requires the sealed generation's BaseRoot")
 	}
 	fs.mu.Lock()
+	// Unlinking the staging file of every inode this rebase cleans is one
+	// syscall apiece — 58 µs each on APFS, so seconds on a dirty set the
+	// size of an unpacked source tree — and it would hold the mount's lock
+	// for all of it. Nothing references those files once the transaction
+	// below commits, and inode numbers are never reissued, so the removal
+	// waits until the lock is gone. Defers run last-in-first-out: the
+	// unlock below runs first, then this.
+	var unlink []string
+	defer func() {
+		for _, p := range unlink {
+			os.Remove(p) //nolint:errcheck
+		}
+	}()
 	defer fs.mu.Unlock()
 
 	if live := fs.base.RootCatalog(); live != sealed.BaseRoot {
@@ -115,7 +128,7 @@ func (fs *FS) Rebase(ctx context.Context, sealedSeq uint64, sealed Options) (*Re
 	cleaned := sortedInodes(clean)
 
 	rep := &RebaseReport{BaseGeneration: sealed.BaseGeneration, Unresolved: sortedInodes(unresolved)}
-	var drop []string
+	var drop []uint64
 	err = fs.withTx(func(tx querier) error {
 		for _, ino := range cleaned {
 			staged, err := hasContent(tx, ino)
@@ -123,7 +136,7 @@ func (fs *FS) Rebase(ctx context.Context, sealedSeq uint64, sealed Options) (*Re
 				return err
 			}
 			if staged {
-				drop = append(drop, fs.stagingPath(ino))
+				drop = append(drop, ino)
 			}
 			for _, q := range []string{
 				`DELETE FROM onode WHERE inode = ?`,
@@ -196,8 +209,15 @@ func (fs *FS) Rebase(ctx context.Context, sealedSeq uint64, sealed Options) (*Re
 	if err != nil {
 		return nil, err
 	}
-	for _, p := range drop {
-		os.Remove(p) //nolint:errcheck
+	// A rebase runs after the seal that published these inodes, so no
+	// snapshot should still be reading them — but the hand-over runs
+	// anyway, because "should" is the wrong footing for the step that
+	// deletes the only copy of a file. It is a no-op when no snapshot is
+	// live, which is the expected case; the unlinks themselves happen
+	// after the lock is dropped.
+	for _, ino := range drop {
+		_, _ = fs.handOverPinsLocked(ino, 0)
+		unlink = append(unlink, fs.stagingPath(ino))
 	}
 
 	// Re-derive the dirty set from the rebased tables rather than editing

@@ -38,17 +38,24 @@ matters, but nothing notices until the content is chunked. (This is a
 weaker complaint than it looks; see the correction in "What the prototype
 falsified" — staging never *uploads* the dead versions either.)
 
-A third cost — the hardlink freeze — has since been paid down without any
-of this. A seal needs a view that does not change under it, and freezing
-one hardlinked every staging file: measured at 31.6 s for 85k files on
-APFS plus 5.9 s to unlink them again. The **seal at unmount no longer
-freezes at all**: it runs after the mountpoint is gone and the server has
-stopped, so the live overlay already is an instant. Only a mid-session
-**checkpoint** freezes, because it publishes while writers keep working
-and it hands inodes back to the kernel as clean afterwards. So the freeze
-cost is now bounded to the checkpoint path, and a write path that removed
-mutable local content would remove what is left of it rather than all of
-it.
+A third cost — the freeze — has since been paid down without any of this,
+twice. A seal needs a view that does not change under it, and freezing one
+used to hardlink every staging file: measured at 31.6 s for 85k files on
+APFS (362 µs per link) plus 5.9 s to unlink them again. First, the **seal
+at unmount no longer freezes at all**: it runs after the mountpoint is
+gone and the server has stopped, so the live overlay already is an
+instant. Then the remaining path, the mid-session **checkpoint**, stopped
+copying anything at freeze time: it records each staged file's length and
+reads the live staging files, and the live side hands a file over — one
+rename — only when it is about to disturb bytes below the recorded length.
+A 28k-file checkpoint went from 8.5 s of overlay lock hold to tens of
+milliseconds, which matters because the lock is the mount: at 8.5 s the
+NFS client had already declared the server unresponsive and writes were
+failing.
+
+So the freeze cost is now bounded to what a checkpoint's writers actually
+disturb, and a write path that removed mutable local content would remove
+what is left of it rather than all of it.
 
 ## The shape: an LSM tree whose bottom level is the federation
 

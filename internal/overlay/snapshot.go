@@ -31,20 +31,36 @@ import (
 //   - Metadata by VACUUM INTO: one consistent copy of the dirty tables,
 //     taken under the lock and read afterwards through its own
 //     connection.
-//   - Content by one hardlink per staging file plus the length the
-//     snapshot recorded. A link is the cheap clone every POSIX filesystem
-//     has (no reflink required) and costs no data movement; in exchange
-//     the live side must copy a file out from under the link before it
-//     disturbs any byte below the recorded length. Appends and extending
-//     truncates land above it and never copy.
+//   - Content by RECORDING each staged file's length and nothing else.
+//     The snapshot reads the LIVE staging file, which stays correct for
+//     as long as the live side leaves the first recorded-length bytes
+//     alone; before it stops doing that — a write below the length, a
+//     truncate, an unlink, a rebase drop — it MOVES the old file into the
+//     snapshot's scratch and takes itself a private copy back if it still
+//     needs one.
 //
-// Lock cost is therefore the VACUUM (proportional to dirty METADATA, not
-// to the tree and not to staged bytes) plus one link syscall per staged
-// file. No file content is copied while the lock is held.
+// This used to freeze content eagerly, as one hardlink per staged file
+// taken under the lock, and it was wrong twice over. It is not free per
+// FILE — 362 µs each on APFS — so a session that unpacks a source tree
+// paid 8.5 s of lock hold on a 28,184-file dirty set, which is a mount
+// that has stopped answering: NFS calls the server unresponsive at five
+// seconds and writes begin to fail. And it left staging files with two
+// names, which is a property every other part of the overlay then has to
+// keep in mind for no benefit it can name.
+//
+// Handing the file over by RENAME has neither problem. The freeze pays
+// only the VACUUM and the edge map, both proportional to dirty METADATA;
+// the moves are paid one at a time, off the lock's critical path, for the
+// handful of files the mount actually disturbs while a seal runs; and no
+// staging file is ever reachable by two names.
 
-// snapPin is one live snapshot's frozen staging lengths, registered with
-// the owning FS. Identity is the pointer: Close removes exactly this one.
+// snapPin is one live snapshot's frozen staging state, registered with
+// the owning FS: where its scratch lives, and the length it froze each
+// staged inode at. An inode leaves lens the moment the live side has
+// handed its bytes over — there is nothing left to protect. Identity is
+// the pointer: Close removes exactly this one.
 type snapPin struct {
+	dir  string
 	lens map[uint64]int64
 }
 
@@ -69,12 +85,14 @@ type Snapshot struct {
 
 // SnapshotCost is where taking one snapshot went. Freezing runs with the
 // overlay's lock held, so a slow one stalls the mount as well as the seal
-// that asked for it — and the two halves scale with completely different
-// things (dirty metadata versus staged FILE COUNT), so a single duration
-// cannot say which to go after.
+// that asked for it. Every part of it is now proportional to dirty
+// METADATA — recording the staged lengths is a map fill, not file work —
+// and the breakdown is kept because that is the claim it has to keep
+// proving: a Freeze that grows with the staged file count is the
+// regression this design was built to remove.
 type SnapshotCost struct {
 	Vacuum time.Duration // VACUUM INTO: the frozen copy of the dirty tables
-	Freeze time.Duration // pinning staged content
+	Freeze time.Duration // recording the staged lengths to pin
 	Edges  time.Duration // reading the namespace map Rebase replays against
 	Open   time.Duration // opening the frozen view
 	Staged int           // staged files the snapshot pinned
@@ -111,7 +129,8 @@ func (fs *FS) Snapshot(dir string) (*Snapshot, error) {
 			return nil, fmt.Errorf("overlay: snapshot dir: %w", err)
 		}
 	}
-	snap := &Snapshot{owner: fs, seq: fs.seq, dir: dir, pin: &snapPin{lens: make(map[uint64]int64)}}
+	snap := &Snapshot{owner: fs, seq: fs.seq, dir: dir,
+		pin: &snapPin{dir: stagingDir, lens: make(map[uint64]int64)}}
 	if err := fs.freezeLocked(snap, dir, stagingDir); err != nil {
 		os.RemoveAll(stagingDir)                     //nolint:errcheck
 		os.Remove(filepath.Join(dir, overlayDBName)) //nolint:errcheck
@@ -161,10 +180,6 @@ func (fs *FS) freezeLocked(snap *Snapshot, dir, stagingDir string) error {
 	}
 	start = time.Now()
 	for _, s := range content {
-		dst := filepath.Join(stagingDir, strconv.FormatUint(s.ino, 10))
-		if err := linkOrCopy(fs.stagingPath(s.ino), dst); err != nil {
-			return fmt.Errorf("overlay: snapshot staging inode %d: %w", s.ino, err)
-		}
 		snap.pin.lens[s.ino] = s.length
 	}
 	snap.cost.Staged = len(content)
@@ -244,9 +259,12 @@ func openSnapshotView(fs *FS, dir, stagingDir string) (*FS, error) {
 		q:          newStmtCache(db),
 		dir:        dir,
 		stagingDir: stagingDir,
-		prov:       prov,
-		modSeq:     make(map[uint64]uint64),
-		snapEdges:  make(map[uint64]map[uint64]provEdge),
+		// The freeze links nothing, so most inodes are read straight out
+		// of the live staging directory (see Read).
+		stagingFallback: fs.stagingDir,
+		prov:            prov,
+		modSeq:          make(map[uint64]uint64),
+		snapEdges:       make(map[uint64]map[uint64]provEdge),
 	}, nil
 }
 
@@ -261,11 +279,13 @@ func (s *Snapshot) Close() error { return s.release(true) }
 // Discard releases the snapshot exactly as Close does but LEAVES its
 // scratch directory on disk, handing ownership of it to the caller.
 //
-// The scratch holds one hardlink per staged inode, so deleting it is an
-// unlink per file in the session's dirty set — measured in seconds for an
-// unpacked source tree, and paid wherever the release happens to fall. A
-// caller that can move the directory aside and reclaim it when nobody is
-// waiting should do that instead, and this is how it takes it over.
+// The scratch holds a file only for the inodes the mount disturbed while
+// the seal ran, which is usually none of them — but a session that
+// rewrites what it just wrote can leave a substantial set behind, and
+// deleting those is an unlink apiece, paid wherever the release happens
+// to fall. A caller that can move the directory aside and reclaim it when
+// nobody is waiting should do that instead, and this is how it takes it
+// over.
 func (s *Snapshot) Discard() error { return s.release(false) }
 
 func (s *Snapshot) release(deleteScratch bool) error {
@@ -381,45 +401,97 @@ func (s *Snapshot) DirtyInodes() (map[uint64]struct{}, error) { return s.view.Di
 // directories a seal of this snapshot must descend into.
 func (s *Snapshot) DirtyScope() (map[uint64]struct{}, bool, error) { return s.view.DirtyScope() }
 
-// breakSnapshotLinkLocked gives ino a private staging file when a live
-// snapshot froze bytes at or above below. Snapshots hold hardlinks, so
-// the copy replaces the LIVE name and every snapshot keeps the old inode;
-// one copy therefore satisfies all of them, which is why the pin is
-// dropped from every live snapshot afterwards.
-func (fs *FS) breakSnapshotLinkLocked(ino uint64, below int64) error {
-	pinned := false
-	for _, p := range fs.snapPins {
-		if l, ok := p.lens[ino]; ok && l > below {
-			pinned = true
-			break
-		}
-	}
-	if !pinned {
-		return nil
+// handOverPinsLocked gives ino's current staging file to every live
+// snapshot that still depends on it, by MOVING it into that snapshot's
+// scratch, and reports where it went ("" when nobody needed it). It is
+// what makes the freeze lazy: a snapshot takes a file only where the live
+// side is about to stop keeping those bytes, so the cost follows what the
+// mount does during a seal rather than the size of the dirty set.
+//
+// below bounds it the way the copy-out rule does: a snapshot that froze
+// ino at length L does not care about bytes at or above L, so a change
+// entirely above L needs nothing. Pass 0 for "all of it" — the file is
+// going away.
+//
+// An inode drops out of lens once handed over: the snapshot has the file
+// itself, and nothing the live side does to the name afterwards can reach
+// it. A missing live file drops out too — there is nothing to hand over,
+// and a read of it should fail loudly rather than quietly serve somebody
+// else's bytes.
+//
+// ORDER MATTERS, and it is the whole of the lock-free read rule: the file
+// arrives in the scratch BEFORE the live name stops naming those bytes. A
+// reader that finds no copy, opens the live file, and then still finds no
+// copy cannot have been overtaken.
+func (fs *FS) handOverPinsLocked(ino uint64, below int64) (string, error) {
+	if len(fs.snapPins) == 0 {
+		return "", nil
 	}
 	live := fs.stagingPath(ino)
-	// The suffix cannot collide with a staging path (those are decimal).
+	name := strconv.FormatUint(ino, 10)
+	moved := ""
+	for _, p := range fs.snapPins {
+		l, ok := p.lens[ino]
+		if !ok || l <= below {
+			continue
+		}
+		dst := filepath.Join(p.dir, name)
+		var err error
+		if moved == "" {
+			// The first taker gets the file itself. One rename, and no
+			// staging file ever answers to two names.
+			err = os.Rename(live, dst)
+		} else {
+			// A second live snapshot is not a thing a seal produces today
+			// (one seal at a time, and it releases its snapshot), but the
+			// pin list is a list, so the case has an answer: copy from
+			// wherever the file went.
+			err = copyFileSync(moved, dst)
+		}
+		if err != nil && !os.IsNotExist(err) {
+			return moved, fmt.Errorf("overlay: hand inode %d to a live snapshot: %w", ino, err)
+		}
+		if err == nil {
+			moved = dst
+		}
+		delete(p.lens, ino)
+	}
+	return moved, nil
+}
+
+// dropStagingLocked removes a purged inode's staging file, offering it to
+// any live snapshot first: the snapshot froze content the transaction
+// that just committed has stopped referencing, and this file is the only
+// copy of it. Best effort, like the removal it replaces — if the hand-off
+// fails the seal reading that inode fails loudly, which is the outcome
+// this ordering exists to make impossible to miss.
+func (fs *FS) dropStagingLocked(ino uint64) {
+	_, _ = fs.handOverPinsLocked(ino, 0)
+	os.Remove(fs.stagingPath(ino)) //nolint:errcheck
+}
+
+// copyOutForSnapshotsLocked gives ino a private staging file when a live
+// snapshot froze bytes below `below`. The snapshot takes the current file
+// and the live side copies itself a fresh one, because a write below the
+// frozen length needs the bytes it is not overwriting.
+func (fs *FS) copyOutForSnapshotsLocked(ino uint64, below int64) error {
+	moved, err := fs.handOverPinsLocked(ino, below)
+	if err != nil || moved == "" {
+		return err
+	}
+	live := fs.stagingPath(ino)
+	// Through a temporary, then rename: a crash must not leave the live
+	// name pointing at a half-written copy. The suffix cannot collide with
+	// a staging path (those are decimal).
 	tmp := live + ".cow"
-	if err := copyFileSync(live, tmp); err != nil {
+	if err := copyFileSync(moved, tmp); err != nil {
 		return fmt.Errorf("overlay: snapshot copy-out inode %d: %w", ino, err)
 	}
 	if err := os.Rename(tmp, live); err != nil {
 		os.Remove(tmp) //nolint:errcheck
 		return err
 	}
-	for _, p := range fs.snapPins {
-		delete(p.lens, ino)
-	}
 	return nil
-}
-
-// linkOrCopy freezes src at dst by hardlink, falling back to a copy when
-// the scratch is on another filesystem or links are unavailable.
-func linkOrCopy(src, dst string) error {
-	if err := os.Link(src, dst); err == nil {
-		return nil
-	}
-	return copyFileSync(src, dst)
 }
 
 // copyFileSync writes a durable copy: the staging crash contract is that

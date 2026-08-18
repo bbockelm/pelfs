@@ -176,7 +176,7 @@ func (fs *FS) baseHasEdgeLocked(ctx context.Context, q querier, parent uint64, n
 // whiteouts on its base edges). No onode row means untouched base
 // attributes: the whiteout alone expresses the deletion and seal
 // recomputes nlink from surviving edges.
-func (fs *FS) dropNodeRefLocked(tx querier, ino uint64, removeStaging *string) error {
+func (fs *FS) dropNodeRefLocked(tx querier, ino uint64, removeStaging *uint64) error {
 	row, err := getONode(tx, ino)
 	if err != nil || row == nil {
 		return err
@@ -192,7 +192,7 @@ func (fs *FS) dropNodeRefLocked(tx querier, ino uint64, removeStaging *string) e
 // purgeNodeLocked removes every per-inode row; the staging path is
 // reported for post-commit removal (files must not vanish before the
 // transaction that stops referencing them commits).
-func (fs *FS) purgeNodeLocked(tx querier, ino uint64, removeStaging *string) error {
+func (fs *FS) purgeNodeLocked(tx querier, ino uint64, removeStaging *uint64) error {
 	for _, q := range []string{
 		`DELETE FROM onode WHERE inode = ?`,
 		`DELETE FROM oxattr WHERE inode = ?`,
@@ -207,7 +207,7 @@ func (fs *FS) purgeNodeLocked(tx querier, ino uint64, removeStaging *string) err
 		return err
 	}
 	if n, err := res.RowsAffected(); err == nil && n > 0 && removeStaging != nil {
-		*removeStaging = fs.stagingPath(ino)
+		*removeStaging = ino
 	}
 	return nil
 }
@@ -229,15 +229,15 @@ func (fs *FS) Unlink(ctx context.Context, parent uint64, name string) error {
 	// The target's own rows change too (a surviving link's nlink, or a
 	// purge), which the dirty set cannot express once they are gone.
 	fs.bumpSeqLocked(r.ino)
-	var removeStaging string
+	var removeStaging uint64
 	err = fs.withTx(func(tx querier) error {
 		if err := fs.removeEdgeLocked(ctx, tx, parent, name, r.overlay); err != nil {
 			return err
 		}
 		return fs.dropNodeRefLocked(tx, r.ino, &removeStaging)
 	})
-	if err == nil && removeStaging != "" {
-		os.Remove(removeStaging) //nolint:errcheck
+	if err == nil && removeStaging != 0 {
+		fs.dropStagingLocked(removeStaging)
 	}
 	return err
 }
@@ -378,7 +378,7 @@ func (fs *FS) Rename(ctx context.Context, srcParent uint64, srcName string, dstP
 			}
 		}
 	}
-	var removeStaging string
+	var removeStaging uint64
 	err = fs.withTx(func(tx querier) error {
 		if dstErr == nil {
 			// Replace the destination. No whiteout at the destination
@@ -413,8 +413,8 @@ func (fs *FS) Rename(ctx context.Context, srcParent uint64, srcName string, dstP
 		}
 		return putOEdge(tx, dstParent, dstName, src.ino, src.typ)
 	})
-	if err == nil && removeStaging != "" {
-		os.Remove(removeStaging) //nolint:errcheck
+	if err == nil && removeStaging != 0 {
+		fs.dropStagingLocked(removeStaging)
 	}
 	return err
 }
@@ -522,7 +522,7 @@ func (fs *FS) Write(ctx context.Context, ino uint64, off int64, data []byte) (in
 		}
 		// Bytes below off are the only ones this write disturbs, so a
 		// pure append never copies for a live snapshot.
-		if err := fs.breakSnapshotLinkLocked(ino, off); err != nil {
+		if err := fs.copyOutForSnapshotsLocked(ino, off); err != nil {
 			return err
 		}
 		f, err := os.OpenFile(fs.stagingPath(ino), os.O_WRONLY, 0600)
@@ -588,7 +588,7 @@ func (fs *FS) SetAttr(ctx context.Context, ino uint64, in SetAttrIn) (Node, erro
 			}
 			// A shrink destroys bytes below the new size; an extension
 			// only adds above it, which no snapshot can see.
-			if err := fs.breakSnapshotLinkLocked(ino, *in.Size); err != nil {
+			if err := fs.copyOutForSnapshotsLocked(ino, *in.Size); err != nil {
 				return err
 			}
 			if err := os.Truncate(fs.stagingPath(ino), *in.Size); err != nil {

@@ -262,10 +262,11 @@ func TestSnapshotIsolation(t *testing.T) {
 	}
 }
 
-// TestSnapshotAppendAndOverwrite proves the copy-on-write rule the
-// hardlink capture rests on: a write ABOVE the frozen length shares the
-// staging file and is invisible to the snapshot; a write BELOW it copies
-// the file out first, and both views stay right.
+// TestSnapshotAppendAndOverwrite proves the copy-on-write rule the lazy
+// pin rests on: the freeze copies nothing, a write ABOVE the frozen
+// length keeps sharing the live staging file and is invisible to the
+// snapshot, and a write BELOW it hands the old file over before changing
+// a byte. Both views stay right throughout.
 func TestSnapshotAppendAndOverwrite(t *testing.T) {
 	ctx := context.Background()
 	fx := newFixture(t, "5a405a40-0002-4000-8000-000000000002")
@@ -289,28 +290,35 @@ func TestSnapshotAppendAndOverwrite(t *testing.T) {
 	}
 
 	snap := takeSnapshot(t, ov)
-	sameStaging := func(ino uint64) bool {
+	// handedOver reports whether the snapshot has taken its own copy of an
+	// inode yet. Everything below turns on this: a snapshot that copied
+	// eagerly would answer true from the start, and its freeze would cost
+	// one file operation per staged inode with the overlay locked.
+	handedOver := func(ino uint64) bool {
 		t.Helper()
-		live, err := os.Stat(filepath.Join(dir, "staging", strconv.FormatUint(ino, 10)))
-		if err != nil {
-			t.Fatalf("stat live staging: %v", err)
-		}
 		frozen, err := os.Stat(filepath.Join(snapDir(snap), "staging", strconv.FormatUint(ino, 10)))
+		if os.IsNotExist(err) {
+			return false
+		}
 		if err != nil {
 			t.Fatalf("stat snapshot staging: %v", err)
 		}
-		return os.SameFile(live, frozen)
+		live, err := os.Stat(filepath.Join(dir, "staging", strconv.FormatUint(ino, 10)))
+		if err == nil && os.SameFile(live, frozen) {
+			t.Fatal("the snapshot's copy IS the live staging file; the live side can still change it underneath")
+		}
+		return true
 	}
-	if !sameStaging(app.Inode) || !sameStaging(ow.Inode) {
-		t.Fatal("snapshot did not capture staging by hardlink; the copy-on-write assertions below prove nothing")
+	if handedOver(app.Inode) || handedOver(ow.Inode) {
+		t.Fatal("the freeze copied staging files; its cost then scales with the dirty set, not with dirty metadata")
 	}
 
 	tail := bytes.Repeat([]byte("B"), 1000)
 	if _, err := ov.Write(ctx, app.Inode, int64(len(head)), tail); err != nil {
 		t.Fatal(err)
 	}
-	if !sameStaging(app.Inode) {
-		t.Error("an append copied the staging file out; only writes below the frozen length need to")
+	if handedOver(app.Inode) {
+		t.Error("an append handed the staging file over; only writes below the frozen length need to")
 	}
 	// A second append, and an extending truncate: still no copy.
 	if _, err := ov.Write(ctx, app.Inode, int64(len(head)+len(tail)), []byte("C")); err != nil {
@@ -320,18 +328,18 @@ func TestSnapshotAppendAndOverwrite(t *testing.T) {
 	if _, err := ov.SetAttr(ctx, app.Inode, overlay.SetAttrIn{Size: &grow}); err != nil {
 		t.Fatal(err)
 	}
-	if !sameStaging(app.Inode) {
-		t.Error("an extending truncate copied the staging file out")
+	if handedOver(app.Inode) {
+		t.Error("an extending truncate handed the staging file over")
 	}
 	mustBody(t, snap, "append.txt", head)
 
-	// In-place overwrite: the file must be copied out from under the
-	// snapshot's link before a single byte changes.
+	// In-place overwrite: the old file must reach the snapshot before a
+	// single byte of it changes.
 	if _, err := ov.Write(ctx, ow.Inode, 100, bytes.Repeat([]byte("Z"), 8)); err != nil {
 		t.Fatal(err)
 	}
-	if sameStaging(ow.Inode) {
-		t.Fatal("an in-place overwrite mutated the file the snapshot holds")
+	if !handedOver(ow.Inode) {
+		t.Fatal("an in-place overwrite changed the bytes the snapshot froze without handing them over")
 	}
 	mustBody(t, snap, "overwrite.txt", head)
 	wantLive := append([]byte{}, head...)
@@ -343,11 +351,62 @@ func TestSnapshotAppendAndOverwrite(t *testing.T) {
 	if _, err := ov.SetAttr(ctx, app.Inode, overlay.SetAttrIn{Size: &small}); err != nil {
 		t.Fatal(err)
 	}
-	if sameStaging(app.Inode) {
-		t.Fatal("a shrinking truncate mutated the file the snapshot holds")
+	if !handedOver(app.Inode) {
+		t.Fatal("a shrinking truncate changed the bytes the snapshot froze without handing them over")
 	}
 	mustBody(t, snap, "append.txt", head)
 	mustBody(t, ov, "append.txt", head[:small])
+}
+
+// A snapshot reads the LIVE staging file until the live side hands it
+// over, so the paths that DELETE one are as load-bearing as the paths
+// that rewrite it: unlink, rename-over, and the rebase drop each destroy
+// the only copy of content a seal in flight is still walking.
+func TestSnapshotSurvivesDeletionOfStagedContent(t *testing.T) {
+	ctx := context.Background()
+	fx := newFixture(t, "5a405a40-0007-4000-8000-000000000007")
+	ov := openOverlay(t, fx, "")
+
+	body := bytes.Repeat([]byte("gone"), 2048)
+	victim, err := ov.Create(ctx, rootIno, "unlinked.txt", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ov.Write(ctx, victim.Inode, 0, body); err != nil {
+		t.Fatal(err)
+	}
+	replaced, err := ov.Create(ctx, rootIno, "replaced.txt", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ov.Write(ctx, replaced.Inode, 0, body); err != nil {
+		t.Fatal(err)
+	}
+	survivor, err := ov.Create(ctx, rootIno, "survivor.txt", 0644, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ov.Write(ctx, survivor.Inode, 0, []byte("kept")); err != nil {
+		t.Fatal(err)
+	}
+
+	snap := takeSnapshot(t, ov)
+
+	if err := ov.Unlink(ctx, rootIno, "unlinked.txt"); err != nil {
+		t.Fatal(err)
+	}
+	// Rename over a staged file purges the destination inode the same way.
+	if err := ov.Rename(ctx, rootIno, "survivor.txt", rootIno, "replaced.txt"); err != nil {
+		t.Fatal(err)
+	}
+
+	mustBody(t, snap, "unlinked.txt", body)
+	mustBody(t, snap, "replaced.txt", body)
+	// And the live view really did delete them.
+	if _, err := lookupPathErr(ov, "unlinked.txt"); err == nil {
+		t.Error("the unlinked name still resolves in the live view")
+	}
+	mustBody(t, ov, "replaced.txt", []byte("kept"))
 }
 
 // snapDir recovers a snapshot's scratch path (the test chose it).

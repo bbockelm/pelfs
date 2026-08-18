@@ -950,12 +950,12 @@ func (g *genSession) sealLocked(ctx context.Context, follow bool) (*publish.Resu
 	// runs after the mountpoint is gone and the server has stopped, so
 	// there is no writer left to race: the live overlay IS an instant.
 	// Nothing rebases afterwards either (follow is false), which is the
-	// only consumer of a snapshot's sequence number. Freezing it anyway
-	// cost one hardlink per staged inode on the way in and one unlink on
-	// the way out — measured at ~32s and ~6s for 85k staged files, both
-	// paid by someone waiting to get their shell back — to produce a view
-	// byte-for-byte identical to the one already on disk.
+	// only consumer of a snapshot's sequence number. So freezing would
+	// produce a view byte-for-byte identical to the one already on disk,
+	// for someone who has stopped working and is waiting to get their
+	// shell back.
 	var snap *overlay.Snapshot
+	release := func() {}
 	if follow {
 		snapDir, err := os.MkdirTemp(g.stateDir, "snapshot-*")
 		if err != nil {
@@ -967,10 +967,14 @@ func (g *genSession) sealLocked(ctx context.Context, follow bool) (*publish.Resu
 			return nil, fmt.Errorf("snapshot the overlay: %w", err)
 		}
 		// Releasing is deferred so it also covers the error returns below,
-		// and it is the LAST thing the clock sees: the scratch a snapshot
-		// leaves is one file per staged inode, so deleting those in place
-		// is the same unlink storm retiring a spent overlay would be.
-		defer func() {
+		// and called explicitly the moment the publish is done. The window
+		// matters: while a snapshot is live, every mount write that lands
+		// below a frozen length costs a rename plus a copy of that file
+		// (overlay/snapshot.go). The seal stops reading the frozen view
+		// when Seal returns, so nothing after that point needs to keep
+		// paying for it — least of all the rebase, which drops staging
+		// files by the thousand.
+		releaseSnap := sync.OnceFunc(func() {
 			// Discard, not Close: the scratch is retired by rename below
 			// rather than unlinked file by file here.
 			_ = snap.Discard()
@@ -979,7 +983,9 @@ func (g *genSession) sealLocked(ctx context.Context, follow bool) (*publish.Resu
 					"dir", snapDir, "error", err)
 			}
 			phases.mark("release")
-		}()
+		})
+		defer releaseSnap()
+		release = releaseSnap
 		sc := snap.Cost()
 		ui.Info("froze the overlay in {total} (vacuum {vacuum}, {staged} staged files pinned in {pin}, "+
 			"namespace {namespace}, open {open})",
@@ -1013,6 +1019,10 @@ func (g *genSession) sealLocked(ctx context.Context, follow bool) (*publish.Resu
 		return nil, err
 	}
 	phases.mark("publish")
+	// Nothing reads the frozen view from here on (the rebase below wants
+	// only its sequence number), so the mount stops paying for it now
+	// rather than at the end of the function.
+	release()
 	g.reportSealCost(cost, res.Upload)
 	// The anchor must advance with the branch head: the next seal's
 	// lineage hash and its compare-and-swap against refs/<branch> both

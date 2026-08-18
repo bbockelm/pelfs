@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
 
 	"github.com/bbockelm/pelfs/internal/catalog"
 )
@@ -410,7 +412,7 @@ func (fs *FS) Read(ctx context.Context, ino uint64, off int64, dst []byte) (int,
 	if off+n > row.Length {
 		n = row.Length - off
 	}
-	f, err := os.Open(fs.stagingPath(ino))
+	f, err := fs.openStaging(ino)
 	if err != nil {
 		return 0, err
 	}
@@ -421,6 +423,41 @@ func (fs *FS) Read(ctx context.Context, ino uint64, off int64, dst []byte) (int,
 		return 0, fmt.Errorf("overlay: staging read inode %d at %d: %w", ino, off, err)
 	}
 	return int(n), nil
+}
+
+// openStaging opens ino's staged content. On the live overlay that is one
+// open; on a snapshot's frozen view it is the lazy pin's read side.
+//
+// A snapshot's scratch holds a file only for inodes the live side has
+// since overwritten, truncated, or removed — the freeze itself copies
+// nothing — so an absent one means the live staging file still holds the
+// frozen bytes below the frozen length, which is all this view will read
+// of it.
+//
+// The re-check is what makes that safe without holding the live overlay's
+// lock. The live side always moves the old file into the scratch BEFORE
+// its own name stops naming those bytes, so a reader that saw no copy,
+// opened the live name, and still sees no copy cannot have been overtaken
+// by a copy-out. If one did land in between, it is the truth and the
+// live handle is not.
+func (fs *FS) openStaging(ino uint64) (*os.File, error) {
+	if fs.stagingFallback == "" {
+		return os.Open(fs.stagingPath(ino))
+	}
+	frozen := fs.stagingPath(ino)
+	if f, err := os.Open(frozen); err == nil {
+		return f, nil
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	live, liveErr := os.Open(filepath.Join(fs.stagingFallback, strconv.FormatUint(ino, 10)))
+	if f, err := os.Open(frozen); err == nil {
+		if liveErr == nil {
+			live.Close() //nolint:errcheck
+		}
+		return f, nil
+	}
+	return live, liveErr
 }
 
 // typeName aids error text only.

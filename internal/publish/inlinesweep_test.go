@@ -92,7 +92,9 @@ func TestInlineMaxSweep(t *testing.T) {
 func inlineSweepValues() []int64 {
 	spec := os.Getenv("PELFS_INLINE_MAXES")
 	if spec == "" {
-		return []int64{1, 256, 512, 1024, 4096, 16384}
+		// 2048 is the shipped default and belongs in the default sweep: a
+		// threshold nobody re-measures is a number nobody can defend.
+		return []int64{1, 256, 512, 1024, 2048, 4096, 16384}
 	}
 	var out []int64
 	for _, f := range strings.Split(spec, ",") {

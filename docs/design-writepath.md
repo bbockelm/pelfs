@@ -649,9 +649,16 @@ against 19.9 on this tree — while a one-file change still rebuilds only
 41% of the namespace against 23%. Raising it trades exit latency for read
 locality; lowering it trades incremental seal cost for it.
 
-2048 is not one of the columns in the table above, and the sweep's
-default value list does not include it. The two figures quoted for it
-therefore do not have the same provenance as the rest of this section.
+Those figures are measured, not interpolated between the columns above:
+they come from a separate run of the same harness over the same corpus at
+1024/2048/4096. The full 2048 row — 9 catalogs, 41.2 MiB of namespace,
+initial seal 255.5 MiB on the wire (11.2 catalog + 242.1 data), one-file
+seal 1.15 s rebuilding 40.9% of the namespace with 6 catalogs reused and
+5 subtrees pruned, whole-tree reseal 1.94 s (the fastest of the three),
+100 scattered cold reads in 1.34 s over 57 GET.
+
+The sweep's default value list now includes 2048, so the shipped default
+is re-measured rather than taken on trust.
 
 ## Settled
 

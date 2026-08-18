@@ -39,15 +39,15 @@ const (
 // Section identifiers. A reader SKIPS an id it does not know, which is
 // the hinge that lets a minor version add sections.
 const (
-	secNames      = 1 // arena: entry and xattr names
-	secEdges      = 2 // sorted by (parent, name)
-	secNodes      = 3 // sorted by inode
-	secChunks     = 4 // sorted by (inode, idx)
-	secInline     = 5 // sorted by inode
-	secXattrs     = 6 // sorted by (inode, name)
-	secSymlinks   = 7 // sorted by inode
-	secNested     = 8 // sorted by (parent, name)
-	secIdentities = 9 // 32-byte identities, referenced by index
+	secNames      = 1  // arena: entry and xattr names
+	secEdges      = 2  // sorted by (parent, name)
+	secNodes      = 3  // sorted by inode
+	secChunks     = 4  // sorted by (inode, idx)
+	secInline     = 5  // sorted by inode
+	secXattrs     = 6  // sorted by (inode, name)
+	secSymlinks   = 7  // sorted by inode
+	secNested     = 8  // sorted by (parent, name)
+	secIdentities = 9  // 32-byte identities, referenced by index
 	secBlobs      = 10 // arena: inline data, xattr values, symlink targets
 	secMeta       = 11 // catalog metadata (strings into secBlobs)
 )

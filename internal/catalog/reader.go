@@ -58,6 +58,16 @@ var (
 	_ Builder = (*StaticWriter)(nil)
 )
 
+// OrderChecker is implemented by encodings whose read paths ASSUME an
+// ordering they do not verify at open. The static format binary-searches
+// sorted arrays and checking that on every open would be O(n), so the
+// check is offered here for fsck to run instead. A SQLite catalog does
+// not implement it: its order is a B-tree primary key, maintained by the
+// engine rather than assumed by the reader.
+type OrderChecker interface {
+	CheckOrder() error
+}
+
 // sqliteMagic is the first 16 bytes of every SQLite database file.
 const sqliteMagic = "SQLite format 3\x00"
 

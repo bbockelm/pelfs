@@ -36,6 +36,7 @@ func (c *checker) walk(ctx context.Context, root catalog.Reader, rootHex string)
 	}
 	seenInode[rootInode] = true
 	c.rep.Dirs++
+	c.checkCatalogOrder(root, "/")
 
 	cat := root
 	for i := 0; i < len(queue); i++ {
@@ -49,11 +50,25 @@ func (c *checker) walk(ctx context.Context, root catalog.Reader, rootHex string)
 				continue
 			}
 			c.rep.Catalogs++
+			c.checkCatalogOrder(cat, j.path)
 		}
 		c.walkDir(ctx, cat, j, j.ino, j.path, seenInode, make(map[uint64]bool), visited, &queue)
 		if i > 0 {
 			c.releaseCatalog(cat, j.idHex)
 		}
+	}
+}
+
+// checkCatalogOrder runs the O(n) sortedness pass an encoding may leave
+// to fsck. A reader that binary-searches an unsorted array returns wrong
+// answers rather than unsafe ones, so nothing else would ever notice.
+func (c *checker) checkCatalogOrder(cat catalog.Reader, path string) {
+	oc, ok := cat.(catalog.OrderChecker)
+	if !ok {
+		return
+	}
+	if err := oc.CheckOrder(); err != nil {
+		c.problem(KindBadCatalog, path, "%v", err)
 	}
 }
 

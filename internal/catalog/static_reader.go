@@ -397,6 +397,19 @@ func (s *Static) Chunks(inode int64) ([]ChunkRef, error) {
 		logical += ref.LLen
 		out = append(out, ref)
 	}
+	if out == nil {
+		return nil, nil
+	}
+	// A file's chunk lengths must account for exactly its length. The
+	// check belongs on the read path rather than in fsck because a short
+	// read here would silently serve a truncated file.
+	n, err := s.Stat(inode)
+	if err != nil {
+		return nil, fmt.Errorf("catalog: inode %d has chunks but no node row: %w", inode, err)
+	}
+	if logical != n.Length {
+		return nil, fmt.Errorf("catalog: inode %d chunk lengths sum to %d, node length is %d", inode, logical, n.Length)
+	}
 	return out, nil
 }
 
@@ -417,13 +430,18 @@ func (s *Static) blobFor(sec []byte, inode int64) ([]byte, bool, error) {
 	return b, true, nil
 }
 
+// Inline returns nil, nil for an inode with no inline record. That is
+// not the same convention as Symlink, which reports ErrNotExist — the two
+// contracts differ in the SQLite encoding and callers depend on the
+// difference, so this encoding matches them method by method rather than
+// imposing a uniformity of its own.
 func (s *Static) Inline(inode int64) ([]byte, error) {
 	b, ok, err := s.blobFor(s.inline, inode)
 	if err != nil {
 		return nil, err
 	}
 	if !ok {
-		return nil, ErrNotExist
+		return nil, nil
 	}
 	return b, nil
 }
@@ -463,3 +481,105 @@ func (s *Static) Xattrs(inode int64) ([]Xattr, error) {
 // Close exists so a Static can stand where a *Catalog stands. The blob is
 // owned by whoever mapped it.
 func (s *Static) Close() error { return nil }
+
+// CheckOrder verifies every record array is sorted on its documented key
+// and that each edge indexes a node for its own inode.
+//
+// The reader deliberately does NOT do this at open: it is O(n) over the
+// whole catalog, and paying it on every open would undo the reason the
+// format exists. An out-of-order catalog returns wrong answers rather
+// than unsafe ones, so the check belongs where an O(n) pass is expected —
+// fsck — and this is the method it calls.
+func (s *Static) CheckOrder() error {
+	for i := 1; i < s.edgeCount(); i++ {
+		p, q := s.edgeParent(i-1), s.edgeParent(i)
+		if p > q {
+			return fmt.Errorf("catalog: edges out of order at %d: parent %d after %d", i, q, p)
+		}
+		if p < q {
+			continue
+		}
+		a, ok := s.edgeName(i - 1)
+		if !ok {
+			return fmt.Errorf("catalog: edge %d has a name outside the arena", i-1)
+		}
+		b, ok := s.edgeName(i)
+		if !ok {
+			return fmt.Errorf("catalog: edge %d has a name outside the arena", i)
+		}
+		if bytes.Compare(a, b) >= 0 {
+			return fmt.Errorf("catalog: edges out of order at %d: %q after %q under parent %d", i, b, a, p)
+		}
+	}
+	for i := range make([]struct{}, s.edgeCount()) {
+		r := s.edgeAt(i)
+		idx := int(binary.LittleEndian.Uint32(r[24:]))
+		if idx >= s.nodeCount() {
+			return fmt.Errorf("catalog: edge %d indexes node %d of %d", i, idx, s.nodeCount())
+		}
+		if got, want := s.nodeRecord(idx).Inode, int64(binary.LittleEndian.Uint64(r[8:])); got != want {
+			return fmt.Errorf("catalog: edge %d indexes a node for inode %d, not %d", i, got, want)
+		}
+	}
+
+	ascending := func(name string, count int, key func(int) int64) error {
+		for i := 1; i < count; i++ {
+			if key(i-1) > key(i) {
+				return fmt.Errorf("catalog: %s out of order at %d: %d after %d", name, i, key(i), key(i-1))
+			}
+		}
+		return nil
+	}
+	inodeAt := func(sec []byte, width int) func(int) int64 {
+		return func(i int) int64 { return int64(binary.LittleEndian.Uint64(sec[i*width:])) }
+	}
+	if err := ascending("nodes", s.nodeCount(), inodeAt(s.nodes, nodeLen)); err != nil {
+		return err
+	}
+	if err := ascending("inline", len(s.inline)/inlineLen, inodeAt(s.inline, inlineLen)); err != nil {
+		return err
+	}
+	if err := ascending("symlinks", len(s.symlinks)/symlinkLen, inodeAt(s.symlinks, symlinkLen)); err != nil {
+		return err
+	}
+	if err := ascending("chunkrefs", s.chunkCount(), inodeAt(s.chunks, chunkLen)); err != nil {
+		return err
+	}
+	if err := ascending("xattrs", len(s.xattrs)/xattrLen, inodeAt(s.xattrs, xattrLen)); err != nil {
+		return err
+	}
+	// Chunk indexes must ascend within one inode, since a reader takes
+	// them in stored order and computes logical offsets as a prefix sum.
+	for i := 1; i < s.chunkCount(); i++ {
+		prev, cur := s.chunks[(i-1)*chunkLen:], s.chunks[i*chunkLen:]
+		if binary.LittleEndian.Uint64(prev) != binary.LittleEndian.Uint64(cur) {
+			continue
+		}
+		if binary.LittleEndian.Uint32(prev[8:]) >= binary.LittleEndian.Uint32(cur[8:]) {
+			return fmt.Errorf("catalog: chunkrefs out of order at %d within inode %d",
+				i, int64(binary.LittleEndian.Uint64(cur)))
+		}
+	}
+	for i := 1; i < s.nestedCount(); i++ {
+		p := int64(binary.LittleEndian.Uint64(s.nestedAt(i - 1)))
+		q := int64(binary.LittleEndian.Uint64(s.nestedAt(i)))
+		if p > q {
+			return fmt.Errorf("catalog: nested out of order at %d: parent %d after %d", i, q, p)
+		}
+		if p < q {
+			continue
+		}
+		a, ok := s.nestedName(i - 1)
+		if !ok {
+			return fmt.Errorf("catalog: nested %d has a name outside the arena", i-1)
+		}
+		b, ok := s.nestedName(i)
+		if !ok {
+			return fmt.Errorf("catalog: nested %d has a name outside the arena", i)
+		}
+		if bytes.Compare(a, b) >= 0 {
+			return fmt.Errorf("catalog: nested out of order at %d: %q after %q", i, b, a)
+		}
+	}
+	return nil
+}

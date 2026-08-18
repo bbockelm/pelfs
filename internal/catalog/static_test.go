@@ -29,7 +29,7 @@ func buildStatic(t *testing.T) []byte {
 	w.AddNode(dir(1))
 	w.AddNode(dir(2))
 	w.AddNode(file(3, 5, 1))
-	w.AddNode(file(4, 0, 2)) // hardlinked: two names below
+	w.AddNode(file(4, 14, 2)) // hardlinked; length must equal its chunk lengths
 	w.AddNode(Node{Inode: 5, Type: 3, Mode: 0777, Nlink: 1})
 
 	// Deliberately added out of order: the writer sorts.
@@ -151,8 +151,15 @@ func TestStaticRoundTrip(t *testing.T) {
 	if tgt, err := s.Symlink(5); err != nil || string(tgt) != "alpha/zeta.txt" {
 		t.Fatalf("symlink = %q, err %v", tgt, err)
 	}
-	if _, err := s.Inline(4); !errors.Is(err, ErrNotExist) {
-		t.Fatalf("inline of a chunked file: err = %v, want ErrNotExist", err)
+	// Inline and Symlink deliberately differ: an absent inline record is
+	// nil with no error, an absent symlink is ErrNotExist. Callers depend
+	// on both, so this pins them against the SQLite encoding rather than
+	// against whatever this one happens to do.
+	if data, err := s.Inline(4); err != nil || data != nil {
+		t.Fatalf("inline of a chunked file: %q, err %v; want nil, nil", data, err)
+	}
+	if _, err := s.Symlink(4); !errors.Is(err, ErrNotExist) {
+		t.Fatalf("symlink of a non-symlink: err = %v, want ErrNotExist", err)
 	}
 
 	chunks, err := s.Chunks(4)
@@ -353,5 +360,47 @@ func TestStaticLookupReturnsBothHalvesOfATransition(t *testing.T) {
 	}
 	if !bytes.Equal(res.NestedIdentity, childCat) {
 		t.Errorf("nested identity = %x, want %x", res.NestedIdentity, childCat)
+	}
+}
+
+// TestCheckOrderCatchesDisorder is the other half of the format's
+// bargain: reads assume sortedness and never verify it, so the O(n) pass
+// fsck runs has to actually detect a violation. Swapping two adjacent
+// edge records is the cheapest way to produce one.
+func TestCheckOrderCatchesDisorder(t *testing.T) {
+	blob := buildStatic(t)
+	s, err := OpenStatic(blob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CheckOrder(); err != nil {
+		t.Fatalf("a freshly built catalog failed its own order check: %v", err)
+	}
+
+	// Find the edges section and swap the first two records.
+	var off, ln uint64
+	for i := 0; i < int(binary.LittleEndian.Uint16(blob[14:])); i++ {
+		e := blob[staticHeaderLen+i*sectionEntryLen:]
+		if binary.LittleEndian.Uint32(e[0:]) == secEdges {
+			off = binary.LittleEndian.Uint64(e[8:])
+			ln = binary.LittleEndian.Uint64(e[16:])
+		}
+	}
+	if ln < 2*edgeLen {
+		t.Fatalf("fixture has too few edges to reorder")
+	}
+	bad := append([]byte(nil), blob...)
+	a := bad[off : off+edgeLen]
+	b := bad[off+edgeLen : off+2*edgeLen]
+	tmp := append([]byte(nil), a...)
+	copy(a, b)
+	copy(b, tmp)
+
+	s2, err := OpenStatic(bad)
+	if err != nil {
+		t.Fatalf("swapping records made the catalog unopenable: %v", err)
+	}
+	if err := s2.CheckOrder(); err == nil {
+		t.Fatal("CheckOrder passed a catalog whose edges are out of order")
 	}
 }

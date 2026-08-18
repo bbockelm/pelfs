@@ -506,6 +506,35 @@ content store implements when it has already chunked what it holds. A
 staging overlay does not implement it and the seal reads and chunks as
 before; a memtable-backed one does, and the seal chunks nothing.
 
+### What journalling a write costs
+
+The design left this open: the write path records one journal row per
+operation (`memtable.Journal`), and the staging store it replaces records
+nothing beyond the onode row it was already writing. Measured against the
+staging store on the same overlay, writes only, nothing sealed:
+
+| shape | staging | memtable |
+| --- | --- | --- |
+| 2,000 files of 8 KiB | 542 ms | **237 ms** (0.44×) |
+| one 32 MiB file in 128 KiB writes | 22 ms | 61 ms (2.74×) |
+
+The two numbers do not measure the same work, and that difference IS the
+design: staging counts no chunking, hashing, packing or uploading at all,
+because it defers every byte of it to the seal, where the user is
+waiting. So the streaming ratio is work moved rather than work added. The
+question the measurement answers is narrower — whether the journal makes
+a write too expensive to do at all — and it does not.
+
+The many-small-files shape, which is the workload the whole write path
+exists for, is more than twice as FAST: a create plus a write costs a
+staging store a file creation and a file write, and costs the memtable a
+ring append and one row.
+
+One thing did have to be fixed to get there. The journal's insert is
+prepared once rather than re-parsed per row; without that the streaming
+case ran at 5.6× rather than 2.7×, which is the overhead of parsing the
+same statement 256 times rather than anything about durability.
+
 ### The re-chunk bound is the CHUNK size, not the file
 
 Worth stating plainly, because a measurement makes it look worse than it

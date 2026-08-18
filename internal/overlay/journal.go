@@ -35,6 +35,11 @@ import (
 //     used, for the same reason.
 type contentJournal struct {
 	db *sql.DB
+	// append is prepared once. It runs on every write in the session, and
+	// re-parsing the same INSERT each time is pure overhead on the one
+	// path where the overhead is visible: a streaming write is nothing
+	// but this statement, repeated.
+	append *sql.Stmt
 }
 
 const contentDBName = "content.db"
@@ -79,15 +84,24 @@ func openContentJournal(dir string) (*contentJournal, error) {
 		db.Close() //nolint:errcheck
 		return nil, fmt.Errorf("overlay: content journal schema: %w", err)
 	}
-	return &contentJournal{db: db}, nil
+	stmt, err := db.Prepare(`INSERT INTO ojournal (op, inode, handle, fileoff, length) VALUES (?, ?, ?, ?, ?)`)
+	if err != nil {
+		db.Close() //nolint:errcheck
+		return nil, fmt.Errorf("overlay: content journal: %w", err)
+	}
+	return &contentJournal{db: db, append: stmt}, nil
 }
 
-func (j *contentJournal) Close() error { return j.db.Close() }
+func (j *contentJournal) Close() error {
+	err := j.append.Close()
+	if cerr := j.db.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
 
 func (j *contentJournal) Append(e memtable.JournalEntry) error {
-	_, err := j.db.Exec(
-		`INSERT INTO ojournal (op, inode, handle, fileoff, length) VALUES (?, ?, ?, ?, ?)`,
-		int64(e.Op), int64(e.Inode), int64(e.Handle), e.Off, e.Length)
+	_, err := j.append.Exec(int64(e.Op), int64(e.Inode), int64(e.Handle), e.Off, e.Length)
 	if err != nil {
 		return fmt.Errorf("overlay: journal append: %w", err)
 	}

@@ -127,8 +127,8 @@ func runInMount(o *cmdOpts, prefix, mountPoint string, command []string) int {
 	//
 	// This MUST be signal.Notify and not signal.Ignore: signal.Ignore sets
 	// the disposition to SIG_IGN, which execve PRESERVES, so the shell and
-	// everything it spawns would inherit an un-interruptible SIGINT — the
-	// reason `sleep 5m` inside `pelfs shell` used to survive Ctrl+C. A
+	// everything it spawns would inherit an un-interruptible SIGINT, which
+	// is what lets a `sleep 5m` inside `pelfs shell` survive Ctrl+C. A
 	// notified signal leaves a handler installed here, and execve resets
 	// handlers to SIG_DFL in the child.
 	sigs := make(chan os.Signal, 4)

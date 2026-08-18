@@ -50,9 +50,9 @@ func TestSplitCommandTail(t *testing.T) {
 	}
 }
 
-// TestParseArgsWithCommand is the BUG-1 argument-splitting gate: the
-// positional-count check must still count only real positionals, and the
-// command must arrive intact.
+// TestParseArgsWithCommand gates the argument split: the positional-count
+// check must still count only real positionals, and the command must
+// arrive intact.
 func TestParseArgsWithCommand(t *testing.T) {
 	o, pos, cmd, err := parseArgsWithCommand("shell", []string{"--ro", "pfx", "--", "ls", "-la"}, 1, 1, nil)
 	if err != nil {
@@ -170,19 +170,20 @@ func TestRunInMountCommand(t *testing.T) {
 	}
 }
 
-// TestRunInMountInterrupt is the BUG-2 gate. It re-executes this test binary
-// as a helper in its OWN process group, then signals that whole group the
-// way a terminal signals its foreground group on Ctrl+C. The payload must
-// die and pelfs must survive to run teardown.
+// TestRunInMountInterrupt gates keyboard-signal handling. It re-executes
+// this test binary as a helper in its OWN process group, then signals that
+// whole group the way a terminal signals its foreground group on Ctrl+C.
+// The payload must die and pelfs must survive to run teardown.
 func TestRunInMountInterrupt(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		sig  syscall.Signal
 		want int
 	}{
-		// Ctrl+C: the child is interrupted, pelfs keeps going. Before the
-		// fix, signal.Ignore(SIGINT) left the child with an inherited
-		// SIG_IGN and `sleep` ran to completion.
+		// Ctrl+C: the child is interrupted, pelfs keeps going. Ignoring
+		// SIGINT here instead of notifying on it would leave the child with
+		// an inherited SIG_IGN across execve, and `sleep` would run to
+		// completion.
 		{"sigint", syscall.SIGINT, 130},
 		// Ctrl+\: same convention, different signal.
 		{"sigquit", syscall.SIGQUIT, 131},
@@ -196,7 +197,7 @@ func TestRunInMountInterrupt(t *testing.T) {
 				t.Fatalf("pelfs did not survive %v to run teardown; output:\n%s", tc.sig, out)
 			}
 			// HELPER-STATUS=0 with a full-length elapsed is the signature of
-			// the original bug: the payload inherited SIG_IGN and slept the
+			// an uninterruptible payload: it inherited SIG_IGN and slept the
 			// signal out.
 			if want := fmt.Sprintf("HELPER-STATUS=%d", tc.want); !hasLine(out, want) {
 				t.Errorf("want %s; output:\n%s", want, out)

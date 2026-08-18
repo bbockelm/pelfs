@@ -125,8 +125,8 @@ var _ pelicanobj.Unwrapper = countedStore{}
 // Unwrap exposes the transport underneath the counter. Without it this
 // decorator hides every capability the real store has beyond the Store
 // interface: the direct-read rule for mutable objects and the
-// unverified-read fallback both probe for such interfaces, and both were
-// silently inert on this path because the probe stopped here.
+// unverified-read fallback both probe for such interfaces, and without a
+// way through the counter both go silently inert on this path.
 func (s countedStore) Unwrap() pelicanobj.Store { return s.raw }
 
 func (s countedStore) ListDir(ctx context.Context, dir string) ([]pelicanobj.DirEntry, error) {
@@ -226,10 +226,10 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		return exitErr(err)
 	}
 
-	// Startup is a sequence of federation round trips, and the owner of a
-	// slow mount cannot tell which one they waited on. Each phase is timed
-	// and reported together at the end, in the same spirit as the seal
-	// cost line.
+	// Startup is a sequence of federation round trips, and someone waiting
+	// on a slow mount cannot tell which one they waited on. Each phase is
+	// timed and reported together at the end, in the same spirit as the
+	// seal cost line.
 	startup := newPhaseClock()
 	raw, err := pelicanobj.New(ctx, pelicanobj.Config{
 		PrefixURL: prefix,
@@ -244,10 +244,9 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		return fail(err)
 	}
 	// Probe access up front. This is what triggers the interactive flow
-	// once, for the read+create+modify
-	// union a whole session needs, and it turns a missing or too-narrow
-	// credential into one clear message here rather than an opaque
-	// failure deep in the mount.
+	// once, for the read+create+modify union a whole session needs, and it
+	// turns a missing or too-narrow credential into one clear message here
+	// rather than an opaque failure deep in the mount.
 	startup.mark("discovery")
 	if err := pelicanobj.Preflight(ctx, raw, prefix, !rw); err != nil {
 		return fail(err)
@@ -453,10 +452,10 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	// Seal on a cadence, not only at unmount. A session that sealed
 	// nothing until exit pays for everything it did in one lump at the
 	// end -- minutes of packing and uploading after the user has already
-	// typed `exit` -- where v1 exited promptly because it had been
-	// snapshotting all along. The checkpoint path is explicitly safe to
-	// run under a live mount (it seals a frozen snapshot while writes
-	// continue), so drive it on a timer.
+	// typed `exit`, when the same work spread across the session would
+	// have overlapped with the writes that produced it. The checkpoint
+	// path is explicitly safe to run under a live mount (it seals a frozen
+	// snapshot while writes continue), so drive it on a timer.
 	//
 	// What each seal after the first costs is the DELTA in content: files
 	// a previous generation already published are carried forward by
@@ -782,8 +781,9 @@ func (g *genSession) reportSealCost(c sealCost, up publish.UploadReport) {
 
 // phaseClock times a sequence phase by phase, so "the mount took 15
 // seconds" can be answered with which part did. Startup and teardown both
-// use one: each is a chain of federation round trips and OS calls, and the
-// owner of a slow one cannot otherwise tell which they waited on.
+// use one: each is a chain of federation round trips and OS calls, and
+// nobody waiting on a slow one can otherwise tell which link they waited
+// on.
 //
 // A clock is inert until begin() — the teardown clock is built with the
 // session but must not start counting until the payload has exited, and
@@ -968,8 +968,8 @@ func (g *genSession) sealLocked(ctx context.Context, follow bool) (*publish.Resu
 		}
 		// Releasing is deferred so it also covers the error returns below,
 		// and it is the LAST thing the clock sees: the scratch a snapshot
-		// leaves is one file per staged inode, and deleting those in place
-		// is the same unlink storm the spent overlay used to be.
+		// leaves is one file per staged inode, so deleting those in place
+		// is the same unlink storm retiring a spent overlay would be.
 		defer func() {
 			// Discard, not Close: the scratch is retired by rename below
 			// rather than unlinked file by file here.
@@ -1027,7 +1027,8 @@ func (g *genSession) sealLocked(ctx context.Context, follow bool) (*publish.Resu
 	// snapshot go clean; anything written during the seal stays dirty.
 	//
 	// A failure here costs performance, never correctness: the session
-	// simply keeps paying zero TTLs for state that is already durable.
+	// simply keeps paying the short dirty TTL, and re-answering the
+	// kernel's questions about it, for state that is already durable.
 	//
 	// All of it is skipped at unmount. Swap re-descends the whole resident
 	// tree and Rebase rewrites overlay rows, both to hand a LIVE mount a
@@ -1070,27 +1071,26 @@ func (g *genSession) sealLocked(ctx context.Context, follow bool) (*publish.Resu
 // checkpoint is POST /v1/publish on a writable mount: seal what is in the
 // overlay right now into a new generation, and keep serving.
 //
-// Nothing the mount holds changes, and that is what makes an in-place
-// checkpoint safe. The served generation stays the one genfs opened, and
-// the overlay keeps every dirty row: its merged base+dirty view IS what
-// was just published, so every attribute and page the kernel has cached is
-// still correct and there is nothing to invalidate. Only the seal anchor
-// moves. The next seal therefore re-walks the same merged view over the
-// generation it just produced — content-identical if nothing changed since
-// (which costs a redundant generation, never a wrong one), and the union
-// of old and new work if anything did.
+// What the kernel is holding stays correct across it, and that is what
+// makes an in-place checkpoint safe. Publishing reads a FROZEN view of
+// the overlay (sealLocked takes a snapshot when it is going to follow),
+// so the generation corresponds to an instant even though writers never
+// stopped. Afterwards the mount moves onto what it just published and the
+// overlay drops the rows that view made redundant, which is how the
+// published inodes get their long clean TTLs back; anything written
+// during the seal stays dirty and keeps the short one.
 //
 // Two properties a caller must know:
 //
-//   - The walk is not atomic against writers inside the mount. The overlay
-//     has no snapshot primitive, so a checkpoint of a live tree captures
-//     what the walk saw, exactly like
-//     tar over a live directory. The generation is always self-consistent
-//     and signed; it just may not correspond to any instant.
+//   - Writes that land DURING the checkpoint are not in it. The frozen
+//     view is the instant the snapshot was taken, so the generation is
+//     self-consistent and signed but is not the tree as of the moment the
+//     call returns. The next seal picks up the difference.
 //   - The branch head now names a generation the ON-DISK overlay does not
-//     sit over. Everything up to the checkpoint is durable — the point of
-//     the verb — but a crash before unmount strands the delta written
-//     after it: overlay.Open refuses a base it was not recorded against.
+//     sit over. Everything up to the checkpoint is durable — that is what
+//     the verb is for — but a crash before unmount strands the delta
+//     written after it: overlay.Open refuses a base it was not recorded
+//     against.
 func (g *genSession) checkpoint(ctx context.Context) (string, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()

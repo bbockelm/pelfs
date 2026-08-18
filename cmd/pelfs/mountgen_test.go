@@ -24,7 +24,7 @@ import (
 	"github.com/bbockelm/pelfs/internal/stats"
 )
 
-// newGenSession builds a real phase-3 session over a fakeorigin-backed
+// newGenSession builds a real mount session over a fakeorigin-backed
 // volume: generation 0, a genfs over it, and (when rw) a write overlay.
 // Everything but the kernel binding, which is what the control socket and
 // the seal path actually touch.
@@ -179,7 +179,7 @@ func TestMountGenControlStatusAndStats(t *testing.T) {
 		t.Fatalf("stats body %s: %v", body, err)
 	}
 	if !sum.Writable || sum.Backend != "fuse" {
-		t.Errorf("stats did not carry the phase-3 facts: %+v", sum)
+		t.Errorf("stats did not carry the session's mode and backend: %+v", sum)
 	}
 	// The hook samples before flushing, so the dirty write above must be
 	// visible without waiting for the periodic tick.
@@ -365,7 +365,7 @@ func TestRetireOverlayRenamesInsteadOfDeleting(t *testing.T) {
 	}
 
 	// Hold the reclaim back so the state right after retirement is
-	// observable: the point of the change is that retirement itself does
+	// observable: what is being asserted is that retirement itself does
 	// not delete anything.
 	var reclaimed []string
 	g.reclaimFn = func(dir string) { reclaimed = append(reclaimed, dir) }

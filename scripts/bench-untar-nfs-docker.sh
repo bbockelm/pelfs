@@ -212,6 +212,18 @@ LN=$(stat -c %h "$SAMPLE")
 [ "$LN" = 2 ] || { echo "$SAMPLE has nlink $LN, want 2"; exit 1; }
 echo "$NLINKS hard links extracted, no failures; a sample pair shares one inode with nlink 2"
 
+# rmdir of a non-empty directory used to reach the client as EIO, because
+# no handler answered NFS3ERR_NOTEMPTY. Anything that reads the errno --
+# `rm -r` deciding whether to recurse, a build system cleaning a tree --
+# needs the real one.
+mkdir -p "$W/nmnt/notempty" && : > "$W/nmnt/notempty/keep"
+RMERR=$(rmdir "$W/nmnt/notempty" 2>&1 || true)
+case "$RMERR" in
+  *"not empty"*) echo "rmdir of a non-empty directory: $RMERR" ;;
+  *) echo "rmdir of a non-empty directory reported: ${RMERR:-success}, want ENOTEMPTY"; exit 1 ;;
+esac
+rm -rf "$W/nmnt/notempty"
+
 # A throughput number is worthless if the bytes are wrong, and the
 # resolution caches this benchmark exists to measure are exactly the kind
 # of thing that returns the wrong file quickly. Compare the whole tree

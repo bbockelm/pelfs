@@ -1,13 +1,21 @@
-# go-nfs: two gaps, and why we don't fork (yet)
+# go-nfs: the fork we carry, and what is left in it
 
 The loopback-NFS backend runs on [willscott/go-nfs](https://github.com/willscott/go-nfs).
-Two of its behaviors are wrong for us. Neither is patchable from outside the
-package, and neither currently justifies a fork — this note records the
-analysis so the decision can be revisited quickly.
+Three of its behaviors were wrong for us; two are fixed on a fork, one was
+fixed upstream, and one remains tolerated. This note records what the fork
+holds, why it exists rather than a set of local wrappers, and what is still
+open.
 
-## Why interception is impossible
+    replace github.com/willscott/go-nfs => github.com/bbockelm/go-nfs <pseudo-version>
 
-Every avenue is closed by design:
+The branch is `pelfs-nfs-fixes` on `github.com/bbockelm/go-nfs`, based on
+upstream `master` (not the v0.0.4 tag: master carries the RMDIR fix below).
+Every commit on it is minimal and self-contained, written to be offered
+upstream unchanged. Offering them is the owner's call.
+
+## Why the fixes cannot live in pelfs
+
+Every avenue for intercepting a handler is closed by design:
 
 - **The dispatch table is write-once.** Handlers live in a package-global
   `registeredHandlers` map, populated by the package's own `init()`.
@@ -21,85 +29,106 @@ Every avenue is closed by design:
 - **`Server` has no per-instance handlers.** It carries only an embedded
   `Handler`, an ID, and a context; dispatch still consults the global map.
 - **The `Handler` interface is below the decision point.** For CREATE, the
-  EXCLUSIVE rejection happens while parsing the request, before the
-  filesystem is ever consulted.
+  EXCLUSIVE rejection happened while parsing the request, before the
+  filesystem was ever consulted.
 
 Rewriting RPCs in a wrapping `net.Listener` would technically work and is
 far worse than a fork: it means re-implementing record marking and XDR, and
 the substitution changes message sizes.
 
-So the only real options are: fork, vendor, or upstream.
+## Fixed on the fork: LINK
 
-## Gap 1: EXCLUSIVE create is rejected
-
-`onCreate` fails any NFSv3 EXCLUSIVE create with `NFS3ERR_NOTSUPP` and logs
-`failing create to indicate lack of support for 'exclusive' mode` (upstream
-marks it `// TODO`). That is what *every* `O_CREAT|O_EXCL` open becomes, and
-git uses it for each lockfile and every `mkstemp`, so the message repeats
-constantly.
-
-**Why we tolerate it:** the macOS client falls back to GUARDED, which keeps
-the property that matters — the create still fails if the name already
-exists, so `O_EXCL`'s mutual exclusion is preserved. What's lost is
-retransmission idempotency: a retried CREATE for a request that already
-succeeded answers `EXIST` instead of OK. A loopback TCP mount does not
-retransmit. Evidence: a full `git clone` (61k objects) creates thousands of
-files this way and completes.
-
-The log noise is filtered in `internal/nfsmount` (`quietLogger`).
-
-## Gap 2: COMMIT is a no-op
-
-`onCommit` replies OK without flushing, documented as "we always push writes
-to the backing store". That was true before our write-handle cache and is
-not true now, which makes an `fsync()` through the mount a lie.
-
-**Why we tolerate it:** durability comes from other paths — the idle janitor,
-`Rename`/`Remove` (git's write-then-rename is the case that matters), and
-the flush at unmount, which is the one that actually bit us (see
-`internal/nfsmount/handlecache.go`). A crash mid-session loses the local
-cache regardless, and pelfs's durability promise is the final upload at exit.
-
-## Gap 3: LINK is broken at both ends of the wire
-
-`ln`, and every hardlink entry in a tarball, comes back as **EIO**. This is
-not our error translation; the RPC never reaches our filesystem intact.
+`ln`, and every hardlink entry in a tarball, used to come back as **EIO**.
+That was not our error translation; the RPC never reached our filesystem
+intact.
 
 RFC 1813 defines `LINK3args` as `nfs_fh3 file` followed by
-`diropargs3 link`. `onLink` reads a `diropargs3` first — so it takes the
-source file's handle as `link.dir` and the target *directory's handle* as
-`link.name` — then reads a `sattr3` that is not in the message at all,
-which usually runs off the end of the body and yields `NFS3ERR_INVAL`. Even
-if it did not, the failure reply is 4 bytes short: `LINK3resfail` is
-`post_op_attr` + `wcc_data` (12 bytes), and the wcc error formatter writes 8.
-The client cannot decode the reply and reports EIO.
+`diropargs3 link`. `onLink` read a `diropargs3` first — taking the source
+file's handle as `link.dir` and the target directory's handle as
+`link.name` — then a `sattr3` that is not in the message at all, which
+usually ran off the end of the body. The reply was wrong at both ends too:
+`LINK3resok` carries no file handle, and the failure body was 8 bytes where
+`LINK3resfail` is `post_op_attr` + `wcc_data`, i.e. 12. A client cannot
+decode a reply four bytes short, so it reported EIO rather than whatever
+status the server had chosen.
 
-Implementing `nfs.UnixChange` on the binding does NOT help: `onLink` would
-then hand `Link` a raw file handle where it expects a path.
+The fork parses the message as defined and sizes both replies correctly.
+It also stops requiring the operation to arrive through `nfs.UnixChange`,
+whose `Link` takes two paths that the old parse had no way to produce: a
+filesystem can now implement `nfs.HardLinker` — the same two-path shape,
+on the filesystem itself — and `internal/vfsbilly` does. `internal/nfsmount`
+forwards it through the diagnostic wrapper only when the wrapped filesystem
+really has it, the same conditional-wrapping rule that governs
+`billy.Change`.
 
-There is also no way to warn the client off. A client only issues LINK if
-FSINFO advertises `FSF3_LINK`, and `onFSInfo` sets that bit for any
-filesystem satisfying `billy.Symlink` — which every `billy.Filesystem` does
-by definition, since `Symlink` is one of its embedded interfaces. The bit is
-unconditionally on.
+`onFSInfo` used to set `FSF3_LINK` for any filesystem satisfying
+`billy.Symlink` — which every `billy.Filesystem` does by definition, since
+`Symlink` is one of its embedded interfaces — so the bit was
+unconditionally on and a client had no way to know the operation would
+fail. It now tracks what `onLink` can actually do.
 
-**Why we tolerate it:** hard links are rare in the workloads a scratch
-volume sees, and the failure is loud rather than silent — nothing is
-written. `internal/nfsmount` says so once at mount time so that an EIO from
-`ln` has a findable explanation.
+Gated by `scripts/bench-untar-nfs-docker.sh`, whose corpus contains a hard
+link for every fourth file: the extraction must report zero tar failures,
+and a sample pair must share one inode with nlink 2.
 
-Reproduced (Linux client, the `scripts/bench-untar-nfs-docker.sh` image):
+## Fixed on the fork: EXCLUSIVE create
 
-    tar: .../changes.rst: Cannot hard link to '.../changes-link.rst': Input/output error
+`onCreate` failed any NFSv3 EXCLUSIVE create with `NFS3ERR_NOTSUPP` and
+logged `failing create to indicate lack of support for 'exclusive' mode`
+(upstream marked it `// TODO`). That is what *every* `O_CREAT|O_EXCL` open
+becomes, and git uses it for each lockfile and every `mkstemp`.
 
-## Gap 4: an unrecognized error becomes NFS3ERR_IO
+The fork implements the mode: create when the name is free, succeed without
+touching the file when the same verifier comes back (a retransmission), and
+`NFS3ERR_EXIST` when a different one does. `fs.Create` truncates, so it is
+skipped on a retransmission — re-running it would discard the data the
+original request's writes already put there. Verifiers are held in memory
+with a TTL rather than persisted in the file's timestamps as RFC 1813
+suggests; the property that matters — never truncating a file whose name
+someone else won — holds either way, and a verifier lost to a restart or
+the TTL merely turns a retransmission back into the EXIST error it was
+before.
 
-`onCreate`, `onMkdir`, `onSymlink`, `onRemove`, `onRmdir`, `onRename` and
-`onRead` answer `NFSStatusIO` for any billy error they cannot place, and
-they place only three: `os.IsNotExist`, `os.IsExist`, `os.IsPermission`.
-`rmdir` of a non-empty directory is the case that shows up in practice —
-ENOTEMPTY has an NFS status (`NFS3ERR_NOTEMPTY`) that no handler ever
-returns.
+**This is not a throughput win, and the measurement should be believed over
+the intuition.** Removing the wasted round trip drops CREATE from 2.00 to
+1.00 per created file and raises SETATTR by exactly as much: EXCLUSIVE
+carries a verifier where GUARDED carries the attributes, so the client
+follows with a SETATTR to apply them. 5.43 RPCs per file either way, and no
+measurable difference in wall time. What it buys is retransmission
+idempotency, a mode that answers what the protocol says it should, and the
+removal of the log filter `internal/nfsmount` used to need.
+
+The same commit fixes the reply's `post_op_attr`, which stat'ed
+`billy.File.Name()` — a basename, resolved against the export root rather
+than the directory the file was created in.
+
+## Fixed upstream: RMDIR on a non-empty directory
+
+`onRmDir` delegated to `onRemove`, so an ENOTEMPTY from the backend became
+`NFS3ERR_IO`; `NFS3ERR_NOTEMPTY` existed and no handler returned it.
+Upstream `master` fixes this (`onRemoveObj` lists the directory and answers
+`NFSStatusNotEmpty` before removing anything), which is one reason the fork
+is based on master rather than on the v0.0.4 tag we used to pin. Gated in
+`scripts/bench-untar-nfs-docker.sh`.
+
+## Still tolerated: COMMIT is a no-op
+
+`onCommit` replies OK without flushing, documented as "we always push writes
+to the backing store". That is true for the filesystem we serve:
+`internal/vfsbilly` has no write-handle cache — the overlay commits each
+Write to its staging file before returning — so there is nothing buffered
+for a COMMIT to flush. Durability beyond that is the seal at exit, which is
+pelfs's actual promise.
+
+A patch honoring an optional `Sync() error` on the backend's `billy.File`
+is easy and was written once; it is not carried because nothing here needs
+it, and a fork should hold only what is load-bearing.
+
+## Still tolerated: an unrecognized error becomes NFS3ERR_IO
+
+`onCreate`, `onMkdir`, `onSymlink`, `onRemove`, `onRename` and `onRead`
+answer `NFSStatusIO` for any billy error they cannot place, and they place
+only three: `os.IsNotExist`, `os.IsExist`, `os.IsPermission`.
 
 Worse, `onSetAttr` returns `SetFileAttributes.Apply`'s error verbatim,
 commented "Already an nfsstatuserror" — which it is not, for the Chmod,
@@ -108,29 +137,11 @@ error raw. The response formatter then falls through to
 `ResponseCodeSystemError`: an RPC-level rejection rather than an NFS status,
 which is how a perfectly ordinary ENOENT reached a client as EIO.
 
-**What we do about it:** `internal/nfsmount/diag.go` wraps the served
-filesystem. Errors from the attribute setters come back as
-`*nfs.NFSStatusError` carrying the status that describes them, which fixes
-SETATTR outright and leaves Apply's own `os.ErrPermission` test working
-through the wrap. Everything else that is about to become NFS3ERR_IO is
-logged with its operation, path and cause, rate-limited, so a bare
-"Input/output error" on a client is always explained on the server.
-
-## The patches, if we ever want them
-
-A branch implementing both is at `~/projects/go-nfs`, branch
-`pelfs-exclusive-create` (commit `67d9b3e`), with upstream's tests passing:
-
-- EXCLUSIVE create with an in-memory verifier cache (TTL, dropped on remove
-  and rename) so retransmits are idempotent and never re-run `fs.Create`,
-  which truncates and would discard the original request's data.
-  Watch out: `SetFileAttributes.Apply` dereferences its receiver's fields,
-  and EXCLUSIVE carries a verifier rather than attributes — pass
-  `&SetFileAttributes{}`, never `nil`.
-- COMMIT honoring an optional `Sync() error` on the backend's `billy.File`.
-  `billyFile.Sync` already implements it.
-
-Both are upstreamable; a PR is the right home. If they are needed before
-that lands, wire them in with a replace pointing at a **pushed** fork
-(`github.com/<user>/go-nfs@<sha>`), not a local path — CI cannot resolve a
-local path.
+**What we do about it:** this one *is* fixable from outside, so it is.
+`internal/nfsmount/diag.go` wraps the served filesystem. Errors from the
+attribute setters come back as `*nfs.NFSStatusError` carrying the status
+that describes them, which fixes SETATTR outright and leaves Apply's own
+`os.ErrPermission` test working through the wrap. Everything else that is
+about to become NFS3ERR_IO is logged with its operation, path and cause,
+rate-limited, so a bare "Input/output error" on a client is always
+explained on the server.

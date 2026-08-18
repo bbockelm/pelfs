@@ -49,6 +49,7 @@ import (
 	_ "modernc.org/sqlite" // registers the "sqlite" driver for the overlay database
 
 	"github.com/bbockelm/pelfs/internal/genfs"
+	"github.com/bbockelm/pelfs/internal/memtable"
 )
 
 // RootInode is the volume root, shared with the base generation.
@@ -98,6 +99,15 @@ type Options struct {
 	// BaseGeneration is the base superblock's generation counter, stored
 	// for diagnostics.
 	BaseGeneration uint64
+	// Memtable puts the BYTES of changed files in the write path's
+	// memtable instead of in one staging file per dirty inode
+	// (content_memtable.go). Nil keeps the staging directory.
+	//
+	// The two are held to the same contract (contentStore) and the same
+	// tests; what differs is when content reaches the federation — at the
+	// seal, or during the session — and what it costs to write one byte of
+	// a file that came from the base.
+	Memtable *memtable.Store
 }
 
 // provEdge records how an inode was reached in the BASE namespace: one
@@ -301,13 +311,20 @@ func Open(dir string, base *genfs.FS, opts Options) (*FS, error) {
 		db.Close() //nolint:errcheck
 		return nil, err
 	}
+	// The staging directory is created either way — an overlay reopened
+	// with a different backend must still find the previous one's files,
+	// and an empty directory costs nothing.
+	content := contentStore(newStagingContent(stagingDir))
+	if opts.Memtable != nil {
+		content = newMemtableContent(opts.Memtable)
+	}
 	return &FS{
 		base:       base,
 		db:         db,
 		q:          newStmtCache(db),
 		dir:        dir,
 		stagingDir: stagingDir,
-		content:    newStagingContent(stagingDir),
+		content:    content,
 		prov:       make(map[uint64]provEdge),
 		modSeq:     make(map[uint64]uint64),
 		snapEdges:  make(map[uint64]map[uint64]provEdge),

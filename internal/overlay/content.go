@@ -26,10 +26,14 @@ type contentStore interface {
 	// leaves at worst an orphan nothing points at.
 	Create(ino uint64) error
 	// Adopt gives ino a writable body that begins as the first length
-	// bytes of src — the base generation's version of the file. This is
-	// copy-on-write at FILE granularity: the caller has already
-	// established base residency, and src yields exactly length bytes.
-	Adopt(ctx context.Context, ino uint64, length int64, src io.Reader) error
+	// bytes of the base generation's version of it. The caller has
+	// already established base residency.
+	//
+	// baseFile offers the same file two ways on purpose. A store that
+	// keeps bytes copies them; a store that keeps IDENTITIES takes the
+	// records and moves nothing, which is the difference between "writing
+	// one byte of a 1 GiB file costs 1 GiB" and "it costs one row".
+	Adopt(ctx context.Context, ino uint64, length int64, base baseFile) error
 	// ReadAt fills dst from ino at off.
 	ReadAt(ctx context.Context, ino uint64, off int64, dst []byte) (int, error)
 	// WriteAt stores data at off. Bytes below off are the only ones a
@@ -47,6 +51,14 @@ type contentStore interface {
 	// none. It answers the STAGED-bytes statistic, which drives the
 	// pressure checkpoint, so it must not be an estimate.
 	Size(ino uint64) (int64, bool)
+}
+
+// baseFile is one file as the base generation holds it, offered both
+// ways: as bytes to copy, and as the inode number a store that speaks to
+// the base itself can ask about.
+type baseFile struct {
+	ino  uint64
+	body io.Reader
 }
 
 // stagingContent is one file per dirty inode under a directory: the
@@ -84,7 +96,7 @@ func (c *stagingContent) Create(ino uint64) error {
 // Adopt copies the base version in. The file is synced before the caller
 // commits the row that publishes it, so a crash before commit leaves an
 // invisible orphan rather than a row pointing at half a file.
-func (c *stagingContent) Adopt(ctx context.Context, ino uint64, length int64, src io.Reader) error {
+func (c *stagingContent) Adopt(_ context.Context, ino uint64, length int64, base baseFile) error {
 	fp := c.path(ino)
 	f, err := os.OpenFile(fp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 	if err != nil {
@@ -96,7 +108,7 @@ func (c *stagingContent) Adopt(ctx context.Context, ino uint64, length int64, sr
 		return err
 	}
 	if length > 0 {
-		if n, err := io.CopyN(f, src, length); err != nil {
+		if n, err := io.CopyN(f, base.body, length); err != nil {
 			return fail(fmt.Errorf("overlay: COW copy inode %d: %d of %d bytes: %w", ino, n, length, err))
 		}
 	}

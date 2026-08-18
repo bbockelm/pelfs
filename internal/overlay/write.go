@@ -459,14 +459,14 @@ func (fs *FS) materializeContentLocked(ctx context.Context, tx querier, row *ono
 	if copyLen > row.Length {
 		copyLen = row.Length
 	}
-	var src io.Reader
+	base := baseFile{ino: row.Inode}
 	if copyLen > 0 {
 		if err := fs.ensureBaseLocked(ctx, tx, row.Inode); err != nil {
 			return err
 		}
-		src = &baseReader{ctx: ctx, fs: fs, ino: row.Inode}
+		base.body = &baseReader{ctx: ctx, fs: fs, ino: row.Inode}
 	}
-	if err := fs.content.Adopt(ctx, row.Inode, copyLen, src); err != nil {
+	if err := fs.content.Adopt(ctx, row.Inode, copyLen, base); err != nil {
 		return err
 	}
 	_, err = tx.Exec(`INSERT INTO ocontent (inode) VALUES (?)`, int64(row.Inode))

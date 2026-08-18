@@ -358,6 +358,28 @@ func (s *Store) Truncate(ino uint64, size int64) {
 	s.applyLocked(dropped)
 }
 
+// Forget drops an inode's content map. Its extents lose their last
+// reference, which is exactly what happens when a write supersedes one:
+// an extent still in the ring dies there and is never uploaded, and one
+// already in a pack becomes garbage for a repack to sweep.
+//
+// It does NOT touch the location map. A handle that has been published
+// may still be named by a catalog row in an earlier generation, and
+// retention is what decides when those packs go — not a file being
+// deleted in a session that has not sealed yet.
+func (s *Store) Forget(ino uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c, ok := s.content[ino]
+	if !ok {
+		return
+	}
+	dropped := make(map[Handle]int)
+	c.punch(0, c.size, dropped)
+	s.applyLocked(dropped)
+	delete(s.content, ino)
+}
+
 // Size reports ino's current length.
 func (s *Store) Size(ino uint64) int64 {
 	s.mu.Lock()

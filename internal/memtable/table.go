@@ -3,7 +3,6 @@ package memtable
 import (
 	"path/filepath"
 	"sync"
-	"sync/atomic"
 )
 
 // table is one level of the tree: a buffer file plus the in-memory index
@@ -26,12 +25,6 @@ type table struct {
 	// flush can find the content it must consult without walking every
 	// inode in the session.
 	inodes map[uint64]struct{}
-
-	// abandon tells an in-flight flush to stop chunking and emit what is
-	// left as-is. Set by a writer that is blocked waiting for this table
-	// to finish, since CDC is optional work standing between it and a
-	// free table.
-	abandon atomic.Bool
 
 	// pins guards the mapping against a reader that resolved a source
 	// under the store's lock and is still reading it. Immutability of the

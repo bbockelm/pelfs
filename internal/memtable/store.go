@@ -32,12 +32,6 @@ type Options struct {
 	Hasher chunkid.Hasher
 	// Hooks are test seams; all fields may be nil.
 	Hooks Hooks
-	// KeepCDCUnderPressure disables the release valve, so a flush finishes
-	// its chunking even while a writer waits on it. It exists to measure
-	// what the valve is worth: the design treats abandonment as an
-	// exception, and a measurement that cannot turn it off cannot say
-	// whether that is true.
-	KeepCDCUnderPressure bool
 }
 
 // Hooks let a test observe the inside of a flush, which is the only way
@@ -71,11 +65,6 @@ type Stats struct {
 	// BlockedWrites counts writes that had to wait for a flush to finish
 	// — the backpressure rule firing.
 	BlockedWrites int64
-	// AbandonedFlushes counts flushes that gave up the rest of their CDC
-	// pass under that pressure; RawChunks counts the chunks they emitted
-	// without a boundary search.
-	AbandonedFlushes int64
-	RawChunks        int64
 	// LostHandles counts extents a recovery could not find. Nonzero means
 	// data loss and the caller must say so out loud.
 	LostHandles int64
@@ -90,7 +79,6 @@ type Store struct {
 	chunkOpts chunkid.Options
 	hasher    chunkid.Hasher
 	hooks     Hooks
-	keepCDC   bool
 
 	mu   sync.Mutex
 	cond *sync.Cond
@@ -174,7 +162,6 @@ func newStore(opts Options) (*Store, error) {
 		chunkOpts: opts.Chunk,
 		hasher:    opts.Hasher,
 		hooks:     opts.Hooks,
-		keepCDC:   opts.KeepCDCUnderPressure,
 		content:   make(map[uint64]*content),
 		handleLoc: make(map[Handle][]ChunkSlice),
 		chunkLoc:  make(map[string]PackLoc),
@@ -320,12 +307,6 @@ func (s *Store) rotateLocked(ctx context.Context) error {
 		if s.flushErr != nil {
 			return s.flushErr
 		}
-		// The in-flight flush's remaining CDC is optional work standing
-		// between this writer and a free table. Tell it to stop before
-		// settling in to wait, not after.
-		if !s.keepCDC {
-			s.flushing.abandon.Store(true)
-		}
 		if !waited {
 			// Counted before the wait, not after: a caller watching for
 			// backpressure needs to see it while it is happening.
@@ -363,7 +344,6 @@ func (s *Store) Flush(ctx context.Context) error {
 	// authoritative. Retrying it is the recovery, not discarding it.
 	if s.flushing != nil && s.flushErr != nil {
 		s.flushErr = nil
-		s.flushing.abandon.Store(false)
 		s.startFlushLocked(ctx, s.flushing)
 	}
 	// Tables a crash left behind go first: they are older than anything

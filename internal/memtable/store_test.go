@@ -230,63 +230,6 @@ func bufferFiles(t *testing.T, s *Store) int {
 	return n
 }
 
-// CDC is optional for correctness, so a flush under pressure abandons it.
-// The pack is worse deduped; the content still reads back byte-exact.
-func TestAbandonedCDCStillProducesCorrectContent(t *testing.T) {
-	ctx := context.Background()
-	started := make(chan struct{})
-	release := make(chan struct{})
-	s, _ := newTestStore(t, 256<<10, Hooks{
-		FlushStarted: func(seq uint64) {
-			if seq == 0 {
-				close(started)
-				<-release
-			}
-		},
-	})
-
-	want := make(map[uint64][]byte)
-	for ino := uint64(1); ino <= 4; ino++ {
-		want[ino] = fill(60<<10, ino)
-		if err := s.Write(ctx, ino, 0, want[ino]); err != nil {
-			t.Fatal(err)
-		}
-	}
-	// Push past the table so the first flush starts and parks.
-	if err := s.Write(ctx, 5, 0, fill(60<<10, 5)); err != nil {
-		t.Fatal(err)
-	}
-	want[5] = nil
-	<-started
-
-	// A second writer now demands the flushing table, which is the signal
-	// that makes the flusher give up chunking.
-	blocked := make(chan error, 1)
-	go func() { blocked <- s.Write(ctx, 6, 0, fill(300<<10, 6)) }()
-	// The flusher must not be released until the blocked writer has set
-	// the abandon flag, or there is no pressure to release from.
-	waitForBlocked(t, s)
-	close(release)
-	if err := <-blocked; err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Flush(ctx); err != nil {
-		t.Fatal(err)
-	}
-	st := s.Stats()
-	if st.AbandonedFlushes == 0 || st.RawChunks == 0 {
-		t.Fatalf("expected an abandoned CDC pass, got %+v", st)
-	}
-	for ino := uint64(1); ino <= 4; ino++ {
-		if got := readAll(t, s, ino); !bytes.Equal(got, want[ino]) {
-			t.Fatalf("inode %d does not read back byte-exact after an abandoned CDC pass", ino)
-		}
-	}
-}
-
-// A crash between "the pack is durable" and "its locations are
-// published" must lose nothing: until publication succeeds the memtable
-// is the only authority, so it stays.
 func TestCrashBetweenUploadAndPublish(t *testing.T) {
 	ctx := context.Background()
 	var mu sync.Mutex

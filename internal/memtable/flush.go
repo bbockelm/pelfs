@@ -26,10 +26,8 @@ type flushResult struct {
 	packs          []packstore.SealedPack
 	uploadedBytes  int64
 	uploadedChunks int64
-	rawChunks      int64
 	deadExtents    int64
 	deadBytes      int64
-	abandoned      bool
 }
 
 func (s *Store) runFlush(ctx context.Context, t *table) {
@@ -116,12 +114,12 @@ func (s *Store) chunkAndPack(ctx context.Context, t *table, plan []inodePlan, re
 // chunkInode runs the CDC pass over one inode's surviving extents and
 // feeds the resulting chunks to the pack.
 //
-// The abandon check is the backpressure release valve: chunking exists
-// for dedup and incremental re-upload, not for correctness, so a flush
-// that is holding a writer hostage stops searching for boundaries and
-// ships what is left verbatim. Note that abandoning does NOT skip
-// hashing — a pack entry's key IS the chunk identity — so what it buys is
-// the cut search and the chunker's copy, not the digest.
+// There is no way to abandon the pass under pressure. That release valve
+// was built and measured, and it LOST: a session ran 10.31s with it
+// against 7.77s without, abandoning 38 of 39 flushes even at zero
+// modelled latency. Abandoning cannot skip hashing, because a pack
+// entry's key IS the chunk identity, so it trades a cheap gear-hash scan
+// for extra pack entries and comes out behind.
 func (s *Store) chunkInode(ctx context.Context, t *table, exts []Record, pk *flushPacker, res *flushResult) error {
 	starts := make([]int64, len(exts)+1)
 	for i, r := range exts {
@@ -155,7 +153,7 @@ func (s *Store) chunkInode(ctx context.Context, t *table, exts []Record, pk *flu
 	}
 	ch := chunkid.NewChunker(io.MultiReader(readers...), s.chunkOpts)
 	var pos int64
-	for pos < total && !t.abandon.Load() {
+	for pos < total {
 		c, err := ch.Next()
 		if err == io.EOF {
 			break
@@ -169,26 +167,6 @@ func (s *Store) chunkInode(ctx context.Context, t *table, exts []Record, pk *flu
 		}
 		emit(pos, id, len(c.Data))
 		pos += int64(len(c.Data))
-	}
-	if pos >= total {
-		return nil
-	}
-	res.abandoned = true
-	// Whatever the chunker had buffered past pos is discarded: the bytes
-	// are still in the frozen buffer at a known offset, so the remainder
-	// is re-read from the mapping rather than recovered from the chunker.
-	for i, r := range exts {
-		if starts[i+1] <= pos {
-			continue
-		}
-		from := int(max(pos, starts[i]) - starts[i])
-		data := t.buf.At(r.Off+from, r.Length-from)
-		id := s.hasher.Sum(data)
-		if err := pk.add(ctx, id, data); err != nil {
-			return err
-		}
-		emit(max(pos, starts[i]), id, len(data))
-		res.rawChunks++
 	}
 	return nil
 }
@@ -210,10 +188,6 @@ func (s *Store) publish(t *table, res *flushResult) {
 	s.stats.Packs += int64(len(res.packs))
 	s.stats.DeadExtents += res.deadExtents
 	s.stats.DeadBytes += res.deadBytes
-	s.stats.RawChunks += res.rawChunks
-	if res.abandoned {
-		s.stats.AbandonedFlushes++
-	}
 	s.flushing = nil
 	s.cond.Broadcast()
 	s.mu.Unlock()
@@ -269,7 +243,7 @@ func (p *flushPacker) add(ctx context.Context, id chunkid.Identity, data []byte)
 		return nil
 	}
 	// The open pack's entries need their own lookup, not a scan of pend: an
-	// abandoned CDC pass emits one chunk per extent, so a pack can hold
+	// a chunk per extent is possible for tiny files, so a pack can hold
 	// thousands of small entries rather than the sixteen a 4 MiB average
 	// would give.
 	if _, open := p.pending[key]; open {

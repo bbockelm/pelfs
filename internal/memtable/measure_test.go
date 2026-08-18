@@ -168,12 +168,9 @@ func TestMeasureWritePathAgainstStaging(t *testing.T) {
 	staging.report(t, "staging file per inode (what exists today)")
 	t.Logf("  peak local content footprint: %s (one file per inode, held for the session)", mib(live))
 
-	mem := measureMemtable(t, plan, latency, false)
+	mem := measureMemtable(t, plan, latency)
 	mem.report(t, "memtable (this prototype)")
 	t.Logf("  peak local content footprint: %s (two tables, whatever the session's size)", mib(2*DefaultTableSize))
-
-	keep := measureMemtable(t, plan, latency, true)
-	keep.report(t, "memtable with the CDC release valve disabled")
 }
 
 // measureStaging reproduces today's shape: a local file per inode, a
@@ -270,11 +267,11 @@ func measureStaging(t *testing.T, plan []fileSpec, latency time.Duration) result
 // measureMemtable runs the same session through the prototype. The seal
 // is Flush: it moves at most one memtable, and only what is still live in
 // it.
-func measureMemtable(t *testing.T, plan []fileSpec, latency time.Duration, keepCDC bool) result {
+func measureMemtable(t *testing.T, plan []fileSpec, latency time.Duration) result {
 	ctx := context.Background()
 	dir := t.TempDir()
 	obj := &countingStore{objs: map[string][]byte{}, discard: true, latency: latency}
-	s, err := New(Options{Dir: dir, TableSize: DefaultTableSize, Obj: obj, KeepCDCUnderPressure: keepCDC})
+	s, err := New(Options{Dir: dir, TableSize: DefaultTableSize, Obj: obj})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -309,9 +306,8 @@ func measureMemtable(t *testing.T, plan []fileSpec, latency time.Duration, keepC
 	res.uploadedAt["seal (flush tail)"] = st.UploadedBytes - duringWrite
 	res.uploaded = st.UploadedBytes
 	res.packs = int(st.Packs)
-	res.extra = fmt.Sprintf("%d extents written, %d died in memory (%s never sent); %d flushes, %d blocked writes, %d/%d flushes abandoned CDC, %d of %d chunks skipped the boundary search",
-		st.Extents, st.DeadExtents, mib(st.DeadBytes), st.Flushes, st.BlockedWrites,
-		st.AbandonedFlushes, st.Flushes, st.RawChunks, st.UploadedChunks)
+	res.extra = fmt.Sprintf("%d extents written, %d died in memory (%s never sent); %d flushes, %d blocked writes",
+		st.Extents, st.DeadExtents, mib(st.DeadBytes), st.Flushes, st.BlockedWrites)
 	return res
 }
 

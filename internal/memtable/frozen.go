@@ -29,6 +29,14 @@ import (
 type Frozen struct {
 	s    *Store
 	rows map[uint64]*content
+	// held is the ADOPTED handles these rows name, with multiplicity. They
+	// are the one thing a frozen view owns beyond memory: an adopted
+	// extent's baseRefs entry is collected the moment nothing names it,
+	// and the live map may overwrite or forget the file the instant Freeze
+	// returns. Ring records need no equivalent — the flush above emptied
+	// the ring of anything a content row names, which is the same rule
+	// that makes this whole arrangement a map copy.
+	held []Handle
 }
 
 // Freeze flushes and then captures the content maps. The instant is the
@@ -50,16 +58,43 @@ func (s *Store) Freeze(ctx context.Context) (*Frozen, error) {
 				return nil, fmt.Errorf("memtable: freeze: inode %d extent %d is still in the ring after a flush",
 					ino, r.Handle)
 			}
+			if _, adopted := s.baseRefs[r.Handle]; adopted {
+				f.held = append(f.held, r.Handle)
+			}
 		}
 		f.rows[ino] = &content{size: c.size, refs: append([]ExtentRef(nil), c.refs...)}
 	}
+	// Counted only once the whole view exists: a freeze that returned an
+	// error above would otherwise leave references nobody can release.
+	d := make(map[Handle]int, len(f.held))
+	for _, h := range f.held {
+		d[h]++
+	}
+	s.applyLocked(d)
 	return f, nil
 }
 
-// Release drops the frozen maps. It exists for symmetry and for the day
-// something is held; today a frozen view owns nothing but memory, which
-// is the whole point of the arrangement.
-func (f *Frozen) Release() { f.rows = nil }
+// Release drops the frozen maps and the references they hold. The maps
+// themselves are only memory — that is the whole point of the
+// arrangement — but the adopted extents they name are collectable state,
+// so a view that is never released pins those for the session.
+func (f *Frozen) Release() {
+	if f.rows == nil {
+		return
+	}
+	f.rows = nil
+	if len(f.held) == 0 {
+		return
+	}
+	d := make(map[Handle]int, len(f.held))
+	for _, h := range f.held {
+		d[h]--
+	}
+	f.held = nil
+	f.s.mu.Lock()
+	f.s.applyLocked(d)
+	f.s.mu.Unlock()
+}
 
 // Size reports a file's length as of the instant.
 func (f *Frozen) Size(ino uint64) int64 {

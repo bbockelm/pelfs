@@ -37,6 +37,17 @@ type baseExtent struct {
 	ino    uint64
 	refs   []catalog.ChunkRef
 	length int64
+	// nrefs is how many content refs name this handle, counting a frozen
+	// view's copy of a map as well as the live one. Nothing else can say
+	// when the entry is dead: an adopted handle is never in the ring, so
+	// the live set that governs ring records skips it entirely, and an
+	// entry nobody collects is one per file the session ever adopted, held
+	// for the length of the mount.
+	//
+	// It counts REFS, not handles, because a write landing inside an
+	// adopted file splits its ref in two and both still name it — which is
+	// the same delta content.punch already reports.
+	nrefs int
 }
 
 // ErrNoBase reports a store asked to adopt without a base to adopt from.
@@ -93,11 +104,17 @@ func (s *Store) Adopt(ctx context.Context, ino uint64, length int64) error {
 	defer s.mu.Unlock()
 	h := s.nextHandle
 	s.nextHandle++
-	s.baseRefs[h] = baseExtent{ino: ino, refs: c.Refs, length: c.Length}
 	cnt := s.contentFor(ino)
 	dropped := make(map[Handle]int)
 	cnt.punch(0, cnt.size, dropped)
 	s.applyLocked(dropped)
+	// One reference, for the ref insert is about to make: insert reports
+	// only the refs it DISPLACES, never the one it adds, which is why the
+	// ring path counts its own handle by hand too.
+	s.baseRefs[h] = baseExtent{ino: ino, refs: c.Refs, length: c.Length, nrefs: 1}
+	// The deltas above have been applied; leaving them in the map would
+	// apply them a second time below.
+	clear(dropped)
 	cnt.insert(0, int(length), h, dropped)
 	cnt.size = length
 	s.applyLocked(dropped)

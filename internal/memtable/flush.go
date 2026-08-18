@@ -30,6 +30,7 @@ type flushResult struct {
 	packs          []packstore.SealedPack
 	uploadedBytes  int64
 	uploadedChunks int64
+	dedupedChunks  int64
 	deadExtents    int64
 	deadBytes      int64
 	uploaded       *sync.WaitGroup
@@ -112,7 +113,7 @@ func (s *Store) snapshot(b *batch) ([]inodePlan, *flushResult) {
 }
 
 func (s *Store) chunkAndPack(ctx context.Context, b *batch, plan []inodePlan, res *flushResult) error {
-	pk := newFlushPacker(s.obj, s.dir, s.packTarget, s.cache, s.dek, s.keyID, s.onUpload, s.uploads)
+	pk := s.newPacker()
 	defer pk.abort()
 	for _, ip := range plan {
 		if err := s.chunkInode(ctx, b, ip.exts, pk, res); err != nil {
@@ -127,6 +128,7 @@ func (s *Store) chunkAndPack(ctx context.Context, b *batch, plan []inodePlan, re
 	res.uploaded = &pk.outstanding
 	res.uploadedBytes = pk.bytes
 	res.uploadedChunks = pk.count
+	res.dedupedChunks = pk.skipped
 	return nil
 }
 
@@ -204,6 +206,7 @@ func (s *Store) publish(b *batch, res *flushResult) {
 	s.packs = append(s.packs, res.packs...)
 	s.stats.UploadedBytes += res.uploadedBytes
 	s.stats.UploadedChunks += res.uploadedChunks
+	s.stats.DedupedChunks += res.dedupedChunks
 	s.stats.Packs += int64(len(res.packs))
 	s.stats.DeadExtents += res.deadExtents
 	s.stats.DeadBytes += res.deadBytes
@@ -223,17 +226,11 @@ func (s *Store) publish(b *batch, res *flushResult) {
 		s.reclaimTo = b.to
 	}
 	s.releaseLocked()
-	if s.journal != nil {
-		if err := s.journal.Located(Location{
-			Handles: res.handleLoc, Chunks: res.chunkLoc, Packs: res.packs,
-		}); err != nil {
-			// The bytes are on the federation and the map is in memory;
-			// only the RECORD of the map failed. Reads keep working, and a
-			// crash now would lose content that is already durable — so it
-			// is a failed flush, retried, rather than a silent downgrade.
-			s.flushErr = err
-		}
-	}
+	// The journal record is NOT written here. It belongs after the packs
+	// have landed (runFlush), and writing it at this point was a leftover
+	// from when uploads were synchronous with the pack run: it recorded a
+	// location for a pack that may still have been in the queue, which is
+	// the one thing the wait in runFlush exists to prevent.
 	s.packing = false
 	s.cond.Broadcast()
 	s.mu.Unlock()
@@ -293,9 +290,15 @@ type flushPacker struct {
 	pending map[string]struct{}
 	locs    map[string]PackLoc
 
-	sealed []packstore.SealedPack
-	bytes  int64
-	count  int64
+	// placed asks the store whether a chunk already has a location — the
+	// only dedup that reaches back past this run. Nil for a packer with no
+	// store behind it, which is what the measurement harness builds.
+	placed func(key string) bool
+
+	sealed  []packstore.SealedPack
+	bytes   int64
+	count   int64
+	skipped int64
 	// outstanding counts packs cut and not yet landed. A flush installs
 	// its locations without waiting on any of them; only the journal
 	// record waits, because that record is what a later session would
@@ -321,6 +324,31 @@ func newFlushPacker(obj pelicanobj.Store, dir string, target int64, cache *packC
 	}
 }
 
+// newPacker builds a packer bound to this store, which is the only kind
+// that can dedup against what earlier flushes already sent.
+func (s *Store) newPacker() *flushPacker {
+	p := newFlushPacker(s.obj, s.dir, s.packTarget, s.cache, s.dek, s.keyID, s.onUpload, s.uploads)
+	p.placed = s.placedChunk
+	return p
+}
+
+// placedChunk reports whether the store already knows where a chunk's
+// bytes are. It takes the lock for the lookup and nothing else: a packer
+// runs OFF the store's lock by design, and holding it across a compress,
+// an encrypt and a pack write would put every writer behind every chunk.
+//
+// Racing here is harmless in both directions. A location installed just
+// after the lookup means one chunk is stored twice, which is a wasted
+// upload and not a wrong answer; a location installed just before means
+// the chunk is skipped, and skipping is only ever correct — identity IS
+// the content, so the entry already in the map is these bytes.
+func (s *Store) placedChunk(key string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.chunkLoc[key]
+	return ok
+}
+
 // add stores one chunk. The bytes are ENCODED first — zstd unless that
 // makes them bigger, then AES-256-GCM when the volume has a key — which
 // is the same treatment publish gives a chunk, through the same codec.
@@ -337,6 +365,20 @@ func (p *flushPacker) add(ctx context.Context, id chunkid.Identity, data []byte)
 	// thousands of small entries rather than the sixteen a 4 MiB average
 	// would give.
 	if _, open := p.pending[key]; open {
+		return nil
+	}
+	// Neither of those maps outlives the run, so without this a chunk the
+	// store sent in an EARLIER flush is compressed, encrypted and uploaded
+	// again — the same bytes appearing under a second inode, or a rewrite
+	// that restored what was already there, both of which are ordinary. The
+	// re-chunk path has always made this check (Sealer.rechunk); making it
+	// here is what puts the flush path on the same footing.
+	//
+	// The chunk is deliberately NOT recorded in p.locs: this run did not
+	// place it, and a caller that copies p.locs into the store's map must
+	// not overwrite the location that already answers for it.
+	if p.placed != nil && p.placed(key) {
+		p.skipped++
 		return nil
 	}
 	if p.w != nil && p.w.Size() > 0 && p.w.Size()+int64(len(data)) > p.target {

@@ -115,7 +115,13 @@ type Stats struct {
 	// excluded, so it compares directly against WrittenBytes.
 	UploadedBytes  int64
 	UploadedChunks int64
-	Packs          int64
+	// DedupedChunks counts chunks a flush or a seal produced whose bytes
+	// the store already had a location for, so they were neither encoded
+	// nor sent. Repeats inside one pack run were always free; this is the
+	// CROSS-flush case, and it is the one that costs real bytes on a tree
+	// where the same content arrives under several names.
+	DedupedChunks int64
+	Packs         int64
 	// ReclaimErrors counts ring regions a completed pack could not
 	// release. That costs space, never correctness, so it is a statistic
 	// rather than a failure.
@@ -500,18 +506,37 @@ func (c *content) place(off int64, length int, h Handle) map[Handle]int {
 	return d
 }
 
-// applyLocked pushes reference-count deltas onto handles still in the
-// ring. A handle already packed and reclaimed is not here; losing its
+// applyLocked pushes reference-count deltas onto the two kinds of handle
+// that have local state to lose: ring records, and extents adopted from
+// the base. A handle already packed and reclaimed is neither — losing its
 // last reference makes it garbage in a pack, which is a repack's problem
 // and not this path's.
+//
+// This is the ONLY place either count moves, which is what makes it
+// reachable from every path that can drop a reference: a write that
+// supersedes, a truncate, a Forget, an Adopt over an existing body, and a
+// frozen view being released.
 func (s *Store) applyLocked(d map[Handle]int) {
 	for h, delta := range d {
-		if _, ok := s.index[h]; !ok {
+		if _, ok := s.index[h]; ok {
+			s.live[h] += delta
+			if s.live[h] <= 0 {
+				delete(s.live, h)
+			}
 			continue
 		}
-		s.live[h] += delta
-		if s.live[h] <= 0 {
-			delete(s.live, h)
+		if be, ok := s.baseRefs[h]; ok {
+			be.nrefs += delta
+			if be.nrefs <= 0 {
+				// Nothing names the handle any more, in the live map or in
+				// any frozen view — those count their copies here too. What
+				// goes is only this store's note that it borrowed the base's
+				// records; the base still holds them, and a catalog row in
+				// an earlier generation still names the same chunks.
+				delete(s.baseRefs, h)
+				continue
+			}
+			s.baseRefs[h] = be
 		}
 	}
 }

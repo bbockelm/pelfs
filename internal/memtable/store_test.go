@@ -148,6 +148,61 @@ func TestDeadExtentsAreNeverUploaded(t *testing.T) {
 	}
 }
 
+// Dedup has to reach past the run that produced the chunk. The packer's
+// own maps die with the flush, so content that appears again in a LATER
+// one — the same file under a second name, an archive extracted twice,
+// a rewrite that restored what was already there — was compressed,
+// encrypted and uploaded a second time, with the location map already
+// answering for every byte of it.
+func TestFlushDedupsAgainstEarlierFlushes(t *testing.T) {
+	ctx := context.Background()
+	s, obj := newTestStore(t, 1<<20, Hooks{})
+
+	body := fill(120000, 91)
+	if err := s.Write(ctx, 1, 0, body); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	first := s.Stats()
+	puts, sent := obj.stats()
+	if first.UploadedChunks < 2 {
+		t.Fatalf("the first flush placed %d chunks; the claim is about several", first.UploadedChunks)
+	}
+
+	// A different inode, a later flush, byte-identical content.
+	if err := s.Write(ctx, 2, 0, body); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	second := s.Stats()
+
+	if n := second.UploadedChunks - first.UploadedChunks; n != 0 {
+		t.Errorf("the second flush uploaded %d chunks the store already had a location for", n)
+	}
+	if n := second.UploadedBytes - first.UploadedBytes; n != 0 {
+		t.Errorf("the second flush uploaded %d bytes already on the federation", n)
+	}
+	if second.DedupedChunks < first.UploadedChunks {
+		t.Errorf("skipped %d chunks, want at least the %d the first flush placed",
+			second.DedupedChunks, first.UploadedChunks)
+	}
+	// Not the accounting but the wire: no pack was cut, so nothing was put.
+	if p, b := obj.stats(); p != puts || b != sent {
+		t.Errorf("the second flush put %d objects / %d bytes; it had nothing new to send", p-puts, b-sent)
+	}
+	// And the second file resolves through the FIRST flush's locations,
+	// which is what makes skipping the upload legal rather than lossy.
+	if got := readAll(t, s, 2); !bytes.Equal(got, body) {
+		t.Fatal("the deduped file does not read back byte-exact")
+	}
+	t.Logf("second flush of the same %d bytes: %d chunks skipped, %d bytes and %d objects not re-sent",
+		len(body), second.DedupedChunks, first.UploadedBytes, puts)
+}
+
 // Backpressure: the ring is one preallocated file, so a writer that
 // outruns the packer waits rather than growing anything. The footprint is
 // the assertion that matters — a design that answered pressure by

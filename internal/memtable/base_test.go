@@ -270,6 +270,122 @@ func TestAdoptRespectsATruncatedLength(t *testing.T) {
 	}
 }
 
+// adoptedCount is len(baseRefs) under the lock. The state this is about
+// is invisible from outside the package, which is exactly why nothing
+// noticed it accumulating.
+func adoptedCount(s *Store) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.baseRefs)
+}
+
+// A baseRefs entry has no other owner: nothing on the federation has ever
+// heard of an adopted handle, so an entry the store does not collect is
+// one per file the session ever adopted, held until unmount.
+func TestAdoptedExtentsAreCollectedWhenNothingNamesThem(t *testing.T) {
+	ctx := context.Background()
+	base := newFakeBase()
+	for ino := uint64(1); ino <= 4; ino++ {
+		base.put(ino, fill(20000, ino))
+	}
+	s, _ := newBaseStore(t, base)
+	for ino := uint64(1); ino <= 4; ino++ {
+		if err := s.Adopt(ctx, ino, 20000); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := adoptedCount(s); n != 4 {
+		t.Fatalf("%d adopted extents after adopting four files", n)
+	}
+
+	// The three ways a handle loses its last reference.
+	if err := s.Write(ctx, 1, 0, fill(20000, 101)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Truncate(2, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Forget(3); err != nil {
+		t.Fatal(err)
+	}
+	if n := adoptedCount(s); n != 1 {
+		t.Fatalf("%d adopted extents after overwriting, truncating and forgetting three of the four", n)
+	}
+
+	// A patch in the middle SPLITS the ref in two and both still name the
+	// handle, so a scheme that collected on the first delta would strand
+	// the surviving ranges.
+	patch := fill(100, 104)
+	if err := s.Write(ctx, 4, 8000, patch); err != nil {
+		t.Fatal(err)
+	}
+	if n := adoptedCount(s); n != 1 {
+		t.Fatalf("%d adopted extents after a patch that left most of the file adopted", n)
+	}
+	if err := s.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	want := append([]byte(nil), base.body[4]...)
+	copy(want[8000:], patch)
+	if got := readAll(t, s, 4); !bytes.Equal(got, want) {
+		t.Fatal("the patched adopted file does not read back byte-exact")
+	}
+
+	if err := s.Truncate(4, 0); err != nil {
+		t.Fatal(err)
+	}
+	if n := adoptedCount(s); n != 0 {
+		t.Errorf("%d adopted extents left after every file that used one was replaced", n)
+	}
+}
+
+// A frozen view names extents the live map may have dropped since, so
+// collection counts its copies too. Without that a checkpoint could not
+// render a file the mount overwrote while it ran — the view would resolve
+// to an adopted handle the store had already forgotten it borrowed.
+func TestAFrozenViewKeepsAnAdoptedExtentAlive(t *testing.T) {
+	ctx := context.Background()
+	base := newFakeBase()
+	body := fill(30000, 61)
+	base.put(7, body)
+	s, _ := newBaseStore(t, base)
+
+	if err := s.Adopt(ctx, 7, int64(len(body))); err != nil {
+		t.Fatal(err)
+	}
+	f, err := s.Freeze(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	replacement := fill(30000, 62)
+	if err := s.Write(ctx, 7, 0, replacement); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := adoptedCount(s); n != 1 {
+		t.Fatalf("%d adopted extents while a frozen view still names one", n)
+	}
+
+	got := make([]byte, f.Size(7))
+	if _, err := f.Read(ctx, 7, 0, got); err != nil {
+		t.Fatalf("reading the frozen view after the live file was replaced: %v", err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatal("the frozen view does not resolve to the adopted bytes")
+	}
+	if live := readAll(t, s, 7); !bytes.Equal(live, replacement) {
+		t.Fatal("the live file does not read back as the replacement")
+	}
+
+	f.Release()
+	if n := adoptedCount(s); n != 0 {
+		t.Errorf("%d adopted extents after the last view of one was released", n)
+	}
+}
+
 // A store with no base cannot adopt, and must say so rather than
 // inventing empty content.
 func TestAdoptWithoutABaseIsAnError(t *testing.T) {

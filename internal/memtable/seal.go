@@ -40,7 +40,7 @@ type Sealer struct {
 // NewSealer starts a seal. Every inode it renders may add chunks to the
 // same run of packs, so Finish must be called once at the end.
 func (s *Store) NewSealer() *Sealer {
-	return &Sealer{s: s, pk: newFlushPacker(s.obj, s.dir, s.packTarget, s.cache, s.dek, s.keyID, s.onUpload, s.uploads)}
+	return &Sealer{s: s, pk: s.newPacker()}
 }
 
 // Inode renders one inode's live content as catalog rows.
@@ -124,19 +124,14 @@ func (sl *Sealer) rechunk(ctx context.Context, view *Frozen, ino uint64, from, t
 			return nil, fmt.Errorf("memtable: re-chunk inode %d at %d: %w", ino, at, err)
 		}
 		id := s.hasher.Sum(c.Data)
-		// A chunk this store has already placed needs no second copy: the
-		// identity IS the content, so the existing one is these bytes. It
-		// happens more than the name "re-chunk" suggests — rewriting a
-		// region with what was already there, or re-cutting a boundary at
-		// the same place twice — and paying for it would make a rewrite
-		// cost bytes it did not change.
-		s.mu.Lock()
-		_, placed := s.chunkLoc[id.Hex()]
-		s.mu.Unlock()
-		if !placed {
-			if err := sl.pk.add(ctx, id, c.Data); err != nil {
-				return nil, err
-			}
+		// A chunk this store has already placed needs no second copy, and
+		// add makes that check for every producer. It matters more here than
+		// the name "re-chunk" suggests — rewriting a region with what was
+		// already there, or re-cutting a boundary at the same place twice —
+		// because paying for it would make a rewrite cost bytes it did not
+		// change.
+		if err := sl.pk.add(ctx, id, c.Data); err != nil {
+			return nil, err
 		}
 		out = append(out, catalog.ChunkRef{
 			Identity:      append([]byte(nil), id[:]...),
@@ -178,6 +173,7 @@ func (sl *Sealer) Finish(ctx context.Context) error {
 	s.packs = append(s.packs, sl.pk.sealed...)
 	s.stats.UploadedBytes += sl.pk.bytes
 	s.stats.UploadedChunks += sl.pk.count
+	s.stats.DedupedChunks += sl.pk.skipped
 	s.stats.Packs += int64(len(sl.pk.sealed))
 	if s.journal != nil {
 		// The re-chunk's own chunks and packs. A seal that published rows

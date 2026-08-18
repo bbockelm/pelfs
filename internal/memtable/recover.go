@@ -246,7 +246,17 @@ func Recover(opts Options, d Durable) (*Store, *Report, error) {
 		for _, r := range row.Refs {
 			if _, ok := found[r.Handle]; ok {
 				c.refs = append(c.refs, r)
-				s.live[r.Handle]++
+				// Two counts, because an extent is either a ring record or
+				// an adopted one and never both. Putting an adopted handle
+				// in the ring's live set would make it uncollectable: only
+				// the count on the baseRefs entry decides when that entry
+				// goes.
+				if be, adopted := s.baseRefs[r.Handle]; adopted {
+					be.nrefs++
+					s.baseRefs[r.Handle] = be
+				} else {
+					s.live[r.Handle]++
+				}
 				continue
 			}
 			if _, ok := s.handleLoc[r.Handle]; ok {
@@ -260,6 +270,14 @@ func Recover(opts Options, d Durable) (*Store, *Report, error) {
 		}
 		sort.Slice(c.refs, func(i, j int) bool { return c.refs[i].FileOff < c.refs[j].FileOff })
 		s.content[row.Inode] = c
+	}
+	// An adopted handle no surviving content row names is dead on arrival.
+	// The rows are the only thing that can reference one, so re-adopting it
+	// above bought a record of a borrowing that nothing does any more.
+	for h, be := range s.baseRefs {
+		if be.nrefs == 0 {
+			delete(s.baseRefs, h)
+		}
 	}
 	for ino := range lostInodes {
 		rep.LostInodes = append(rep.LostInodes, ino)

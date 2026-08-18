@@ -64,11 +64,11 @@ var (
 // an end-of-file marker, not a failure.
 //
 // ENOTEMPTY is excluded FIRST because syscall.Errno.Is answers true for
-// errors.Is(ENOTEMPTY, os.ErrExist) -- an alias that is fair for a
-// caller asking "did this fail because something was already there" and
-// a trap here, since no go-nfs handler answers NFS3ERR_NOTEMPTY. An
-// rmdir of a non-empty directory reaches the client as EIO, and that is
-// worth a line.
+// errors.Is(ENOTEMPTY, os.ErrExist) -- an alias that is fair for a caller
+// asking "did this fail because something was already there" and a trap
+// here, where it would name the wrong status. RMDIR is answered by go-nfs
+// itself, which lists the directory before removing it; an ENOTEMPTY that
+// still reaches this wrapper lost a race and is worth a line.
 func translatable(err error) bool {
 	if errors.Is(err, syscall.ENOTEMPTY) {
 		return false
@@ -194,13 +194,20 @@ func report(op, path, told string, err error) {
 // before go-nfs gets a chance to discard it.
 func diagnose(fs billy.Filesystem) billy.Filesystem {
 	d := diagFS{Filesystem: fs}
-	// billy.Change is not part of billy.Filesystem, and go-nfs decides
-	// whether SETATTR is supported at all by type-asserting for it. A
-	// wrapper that always implemented it would claim SETATTR support the
-	// wrapped filesystem does not have, so the assertion is answered by
-	// which type is returned.
-	if ch, ok := fs.(billy.Change); ok {
+	// Neither billy.Change nor nfs.HardLinker is part of billy.Filesystem,
+	// and go-nfs decides whether SETATTR and LINK are supported at all by
+	// type-asserting for them. A wrapper that always implemented them
+	// would claim support the wrapped filesystem does not have, so the
+	// assertions are answered by which type is returned.
+	ch, changeable := fs.(billy.Change)
+	ln, linkable := fs.(nfs.HardLinker)
+	switch {
+	case changeable && linkable:
+		return &diagChangeLinkFS{diagChangeFS{diagFS: d, ch: ch}, diagLinker{ln}}
+	case changeable:
 		return &diagChangeFS{diagFS: d, ch: ch}
+	case linkable:
+		return &diagLinkFS{d, diagLinker{ln}}
 	}
 	return &d
 }
@@ -214,10 +221,33 @@ type diagChangeFS struct {
 	ch billy.Change
 }
 
+// diagLinker carries the hard-link half, so the two wrapper shapes that
+// need it share one implementation.
+type diagLinker struct {
+	ln nfs.HardLinker
+}
+
+func (d diagLinker) Link(oldname, newname string) error {
+	return explain("link", newname, toldEIO, d.ln.Link(oldname, newname))
+}
+
+type diagLinkFS struct {
+	diagFS
+	diagLinker
+}
+
+type diagChangeLinkFS struct {
+	diagChangeFS
+	diagLinker
+}
+
 var (
 	_ billy.Filesystem = (*diagFS)(nil)
 	_ billy.Capable    = (*diagFS)(nil)
 	_ billy.Change     = (*diagChangeFS)(nil)
+	_ billy.Change     = (*diagChangeLinkFS)(nil)
+	_ nfs.HardLinker   = (*diagLinkFS)(nil)
+	_ nfs.HardLinker   = (*diagChangeLinkFS)(nil)
 )
 
 // Capabilities is forwarded explicitly: it is not part of

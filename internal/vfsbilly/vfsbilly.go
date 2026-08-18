@@ -30,6 +30,7 @@ import (
 
 	"github.com/go-git/go-billy/v5"
 	"github.com/go-git/go-billy/v5/helper/chroot"
+	nfs "github.com/willscott/go-nfs"
 
 	"github.com/bbockelm/pelfs/internal/catalog"
 	"github.com/bbockelm/pelfs/internal/genfs"
@@ -67,6 +68,10 @@ var (
 	_ billy.Filesystem = (*billyFS)(nil)
 	_ billy.Change     = (*billyFS)(nil)
 	_ billy.Capable    = (*billyFS)(nil)
+	// LINK is dispatched on this interface, not on billy.Change, and a
+	// signature that drifts from it would silently turn hard links back
+	// into "not supported" rather than fail to build.
+	_ nfs.HardLinker = (*billyFS)(nil)
 )
 
 // New returns a billy.Filesystem over a read-write overlay. Nodes it
@@ -455,6 +460,31 @@ func (b *billyFS) mkdirAll(c context.Context, parts []string, perm os.FileMode, 
 		dir = child.Inode
 	}
 	return nil
+}
+
+// Link hard-links the inode already at oldname under newname. It is the
+// operation go-nfs's LINK handler looks for on the filesystem itself
+// (nfs.HardLinker), which is the only route that works here: the RPC
+// names both its source and its destination directory by file handle,
+// and the handler resolves each to a path before asking.
+//
+// The source is resolved WITHOUT following a terminal symlink, matching
+// link(2) and the fact that a handle for a symlink names the symlink.
+func (b *billyFS) Link(oldname, newname string) error {
+	if b.ov == nil {
+		return roErr("link", newname)
+	}
+	c := ctx()
+	src, err := b.resolve(c, oldname)
+	if err != nil {
+		return pe("link", oldname, err)
+	}
+	dir, name, err := b.resolveParent(c, newname)
+	if err != nil {
+		return pe("link", newname, err)
+	}
+	_, err = b.ov.Link(c, src.Inode, dir, name)
+	return pe("link", newname, err)
 }
 
 // Symlink.

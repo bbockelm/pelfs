@@ -75,28 +75,43 @@ for c in $(seq 0 $((CHUNKS - 1))); do
     mkdir -p "$dir"
     for f in $(seq 0 $((per - 1))); do
       printf 'file %d %d\n%*s' "$d" "$f" 900 '' > "$dir/f$f.c"
+      # Every fourth file also appears under a second name. Real archives
+      # carry hardlink entries, and they are the entries a frontend is
+      # most likely to get wrong -- so the corpus contains them, and the
+      # extraction below is checked for the failures they used to cause.
+      [ $(( f % 4 )) -eq 0 ] && ln "$dir/f$f.c" "$dir/f$f.link.c"
     done
   done
   tar -C "$W/src/c$c" -cf "$W/chunk$c.tar" tree
 done
 NFILES=$(find "$W/src" -type f | wc -l)
 PERCHUNK=$(find "$W/src/c0" -type f | wc -l)
-echo "corpus: $NFILES files in $CHUNKS chunks of ~$PERCHUNK"
+NLINKS=$(find "$W/src" -name '*.link.c' | wc -l)
+echo "corpus: $NFILES files ($NLINKS of them hard links) in $CHUNKS chunks of ~$PERCHUNK"
 rm -rf "$W/src"
 
 # untar_chunks <label> <dest-root>: extract every chunk into its own
-# subdirectory, timing each, then report the aggregate.
+# subdirectory, timing each, then report the aggregate. tar's stderr is
+# kept per label: an extraction that "succeeds" while refusing entries is
+# the failure mode this benchmark has actually seen.
 untar_chunks() {
-  local label="$1" root="$2" c S E TS TE
+  local label="$1" root="$2" c S E TS TE errs="$W/out/untar-$1.err"
+  : > "$errs"
   TS=$(t0)
   for c in $(seq 0 $((CHUNKS - 1))); do
     [ -f "$W/chunk$c.tar" ] || continue
     mkdir -p "$root/c$c"
-    S=$(t0); tar -C "$root/c$c" -xf "$W/chunk$c.tar"; E=$(t0)
+    S=$(t0); tar -C "$root/c$c" -xf "$W/chunk$c.tar" 2>>"$errs" || true; E=$(t0)
     rate "  $label chunk $c" "$S" "$E" "$PERCHUNK"
   done
   TE=$(t0)
   rate "$label TOTAL" "$TS" "$TE" "$NFILES"
+  local n
+  n=$(grep -c . "$errs" || true)
+  if [ "$n" != 0 ]; then
+    echo "  $label: $n tar failures:"
+    sort "$errs" | uniq -c | sort -rn | head -5 | sed 's/^/    /'
+  fi
 }
 
 echo
@@ -180,6 +195,22 @@ join "$W/out/ms.before" "$W/out/ms.after" | awk -v n="$NFILES" '
   END { printf "  %-14s %8d  %6.2f/file\n", "TOTAL", tot, tot/n }' | sort -k2 -rn
 
 wait "$PPROF_PID" 2>/dev/null || true
+
+# Hard links are the entries the NFS frontend used to refuse outright, so
+# the extraction is a gate and not just a stopwatch: an untar that reports
+# any failure at all has not created the tree it was asked to.
+echo
+echo "== hard links through the NFS mount =="
+NERR=$(grep -c . "$W/out/untar-nfs.err" || true)
+[ "$NERR" = 0 ] || { echo "UNTAR FAILURES ($NERR):"; head -5 "$W/out/untar-nfs.err"; exit 1; }
+SAMPLE=$(find "$W/nmnt" -name '*.link.c' -print -quit)
+[ -n "$SAMPLE" ] || { echo "no hard link was extracted"; exit 1; }
+ORIG="${SAMPLE%.link.c}.c"
+LN=$(stat -c %h "$SAMPLE")
+[ "$(stat -c %i "$SAMPLE")" = "$(stat -c %i "$ORIG")" ] || {
+  echo "$SAMPLE and $ORIG are separate inodes, not a hard link"; exit 1; }
+[ "$LN" = 2 ] || { echo "$SAMPLE has nlink $LN, want 2"; exit 1; }
+echo "$NLINKS hard links extracted, no failures; a sample pair shares one inode with nlink 2"
 
 # A throughput number is worthless if the bytes are wrong, and the
 # resolution caches this benchmark exists to measure are exactly the kind

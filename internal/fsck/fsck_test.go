@@ -3,7 +3,6 @@ package fsck_test
 import (
 	"context"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	mrand "math/rand"
 	"net/http/httptest"
@@ -11,8 +10,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"github.com/klauspost/compress/zstd"
 
 	"github.com/bbockelm/pelfs/internal/fakeorigin"
 	"github.com/bbockelm/pelfs/internal/fsck"
@@ -234,6 +231,11 @@ func TestMissingPack(t *testing.T) {
 // different one (the created_ms stamp is bumped). The pack still parses,
 // so what fails is the hash against the SIGNED pack list — the failure
 // mode a silently rewritten location map produces.
+//
+// It works on the TABLE form, which is what packs are written in now, and
+// it edits the stamp in place: same length, same footer, different hash.
+// Nothing here needs to know how entries are encoded, which is the point
+// — this test is about the hash, not the layout.
 func rewriteTrailer(t *testing.T, packPath string) {
 	t.Helper()
 	raw, err := os.ReadFile(packPath)
@@ -241,40 +243,18 @@ func rewriteTrailer(t *testing.T, packPath string) {
 		t.Fatal(err)
 	}
 	n := len(raw)
-	if n < 16 || string(raw[n-8:]) != "PELFSPK2" {
-		t.Fatalf("%s is not a PELFSPK2 pack", packPath)
+	if n < 16 || string(raw[n-8:]) != "PELFSPK3" {
+		t.Fatalf("%s does not carry a table trailer", packPath)
 	}
 	idxLen := int(binary.LittleEndian.Uint64(raw[n-16 : n-8]))
 	off := n - 16 - idxLen
-	dec, err := zstd.NewReader(nil)
-	if err != nil {
-		t.Fatal(err)
+	if idxLen < 16 || off < 0 {
+		t.Fatalf("%s has a %d-byte trailer", packPath, idxLen)
 	}
-	defer dec.Close()
-	js, err := dec.DecodeAll(raw[off:n-16], nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var doc map[string]any
-	if err := json.Unmarshal(js, &doc); err != nil {
-		t.Fatal(err)
-	}
-	doc["created_ms"] = float64(1)
-	js2, err := json.Marshal(doc)
-	if err != nil {
-		t.Fatal(err)
-	}
-	enc, err := zstd.NewWriter(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	stored := enc.EncodeAll(js2, nil)
-	enc.Close() //nolint:errcheck
-	out := append(append([]byte(nil), raw[:off]...), stored...)
-	footer := make([]byte, 16)
-	binary.LittleEndian.PutUint64(footer[:8], uint64(len(stored)))
-	copy(footer[8:], "PELFSPK2")
-	if err := os.WriteFile(packPath, append(out, footer...), 0600); err != nil {
+	// The created stamp sits at offset 8 of the stored trailer, after its
+	// magic (internal/packstore, tableHeader).
+	binary.LittleEndian.PutUint64(raw[off+8:off+16], 1)
+	if err := os.WriteFile(packPath, raw, 0600); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -294,7 +274,8 @@ func TestCorruptTrailer(t *testing.T) {
 	if len(problemsOf(rep, fsck.KindMissingPack)) != 0 {
 		t.Fatal("a present-but-rewritten pack must not be reported missing")
 	}
-	// A rewritten trailer is also a size change, and the sweep keeps going.
+	// The rewrite keeps the pack's length, so nothing reports a size
+	// change and the sweep carries on to the end.
 	if rep.Files != res.Stats.Files {
 		t.Fatalf("the sweep stopped early: %d files", rep.Files)
 	}

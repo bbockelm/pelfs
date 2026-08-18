@@ -39,6 +39,7 @@ import (
 const (
 	magic         = "PELFSPK1" // trailer stored as plain JSON (legacy packs)
 	magicZ        = "PELFSPK2" // trailer stored as zstd-compressed JSON
+	magicT        = "PELFSPK3" // trailer stored as a sorted lookup table
 	footerSize    = 8 + 8      // stored-trailer length + magic
 	tailProbe     = 128 << 10
 	defaultTarget = 64 << 20
@@ -65,20 +66,48 @@ var (
 )
 
 // encodeTrailer returns the stored trailer bytes and the 16-byte footer.
+//
+// The table form (PELFSPK3) is written now. A trailer is consulted to
+// answer ONE question — where is this identity — and the JSON forms make
+// a reader decompress the whole document and parse every entry before it
+// can answer, which a mount pays once per pack. The table is read in
+// place (see internal/packidx and LookupStored).
+//
+// Every key in a pack is a 32-byte identity in hex, which is what makes
+// the table possible; a key that is not falls back to JSON rather than
+// being dropped, because a trailer that cannot describe an entry is worse
+// than a slow one.
 func encodeTrailer(tr *trailer) (stored, footer []byte, err error) {
-	raw, err := json.Marshal(tr)
+	stored, err = encodeTable(tr)
+	m := magicT
 	if err != nil {
-		return nil, nil, err
+		raw, jerr := json.Marshal(tr)
+		if jerr != nil {
+			return nil, nil, jerr
+		}
+		stored, m = trailerEnc.EncodeAll(raw, nil), magicZ
 	}
-	stored = trailerEnc.EncodeAll(raw, nil)
 	footer = make([]byte, footerSize)
 	binary.LittleEndian.PutUint64(footer[:8], uint64(len(stored)))
-	copy(footer[8:], magicZ)
+	copy(footer[8:], m)
 	return stored, footer, nil
+}
+
+// knownTrailerMagic is the one place the set of trailer forms is written
+// down. Packs are immutable, so every form ever written stays readable
+// for as long as a generation names the pack carrying it — and a reader
+// that learns a new form must learn it HERE as well as in the decoder.
+// Adding PELFSPK3 to the decoder alone made every new pack unreadable,
+// with the footer check rejecting it before the decoder was reached.
+func knownTrailerMagic(m string) bool {
+	return m == magic || m == magicZ || m == magicT
 }
 
 // decodeTrailer parses stored trailer bytes according to the footer magic.
 func decodeTrailer(stored []byte, m string) (*trailer, error) {
+	if m == magicT {
+		return decodeTable(stored)
+	}
 	raw := stored
 	if m == magicZ {
 		var err error
@@ -183,7 +212,10 @@ func FetchTrailerStoredVerified(ctx context.Context, inner pelicanobj.Store, nam
 // superblock's TrailerHash); this only decodes them.
 func ParseStoredTrailer(stored []byte) ([]PackEntry, error) {
 	m := magic
-	if len(stored) >= 4 && binary.LittleEndian.Uint32(stored[:4]) == zstdFrameMagic {
+	switch {
+	case isTable(stored):
+		m = magicT
+	case len(stored) >= 4 && binary.LittleEndian.Uint32(stored[:4]) == zstdFrameMagic:
 		m = magicZ
 	}
 	tr, err := decodeTrailer(stored, m)
@@ -209,7 +241,7 @@ func StoredTrailerFrom(r io.ReaderAt, size int64) ([]byte, error) {
 	if _, err := r.ReadAt(footer[:], size-footerSize); err != nil {
 		return nil, err
 	}
-	if m := string(footer[8:]); m != magic && m != magicZ {
+	if m := string(footer[8:]); !knownTrailerMagic(m) {
 		return nil, fmt.Errorf("bad pack magic")
 	}
 	idxLen := int64(binary.LittleEndian.Uint64(footer[:8]))
@@ -278,7 +310,7 @@ func parseTail(ctx context.Context, inner pelicanobj.Store, name string, size in
 		return nil, nil, 0, fmt.Errorf("bad pack magic")
 	}
 	m := string(buf[len(buf)-8:])
-	if m != magic && m != magicZ {
+	if !knownTrailerMagic(m) {
 		return nil, nil, 0, fmt.Errorf("bad pack magic")
 	}
 	idxLen := int64(binary.LittleEndian.Uint64(buf[len(buf)-16 : len(buf)-8]))

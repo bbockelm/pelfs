@@ -213,15 +213,19 @@ type Options struct {
 	// VolumeID identifies a volume being created by InitVolume. Every
 	// other path takes identity from the previous generation.
 	VolumeID [16]byte
-	// StaticCatalogs emits catalogs in the packed static format instead of
-	// SQLite (docs/design-catalog.md). It affects only what this publish
-	// WRITES: catalogs are immutable and content-addressed, so anything an
-	// earlier generation published stays exactly as it was, and a reader
-	// picks an implementation per catalog from the bytes. A volume is
-	// therefore mixed until every subtree has been touched, which is the
-	// intended migration — converting in bulk would give every catalog a
-	// new identity and re-upload the whole namespace.
-	StaticCatalogs bool
+	// SQLiteCatalogs emits catalogs as SQLite databases instead of the
+	// packed static format (docs/design-catalog.md), which is the default.
+	// Measured on an 80k-file tree, the static format reseals the whole
+	// tree in 0.61s against 3.03s, seals a one-file change in 217ms
+	// against 535ms, and lets a mount fetch 1.2 MiB instead of 1.8.
+	//
+	// This affects only what a publish WRITES. Catalogs are immutable and
+	// content-addressed, so anything an earlier generation published stays
+	// exactly as it was, and a reader picks an implementation per catalog
+	// from the bytes. A volume is mixed until every subtree has been
+	// touched, which is the intended migration — converting in bulk would
+	// give every catalog a new identity and re-upload the whole namespace.
+	SQLiteCatalogs bool
 	// CatalogConcurrency bounds how many catalogs are built at once; zero
 	// uses the machine's parallelism. It changes only how long the step
 	// takes, never what it produces — the appends stay in plan order (see
@@ -1237,10 +1241,10 @@ func (p *pipeline) emitInode(w catalog.Builder, seen map[uint64]bool, ino uint64
 // and content-addressed, so a volume simply holds both kinds and a
 // subtree migrates the next time something in it changes.
 func (p *pipeline) newCatalogBuilder(fp string, meta catalog.Meta, rootIno uint64) (catalog.Builder, error) {
-	if p.o.StaticCatalogs {
-		return catalog.NewStaticWriter(meta, int64(rootIno), p.o.InlineMax), nil
+	if p.o.SQLiteCatalogs {
+		return catalog.Create(fp, meta)
 	}
-	return catalog.Create(fp, meta)
+	return catalog.NewStaticWriter(meta, int64(rootIno), p.o.InlineMax), nil
 }
 
 // packCatalog encodes a catalog/shard and appends it to a pack. Always

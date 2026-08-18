@@ -116,7 +116,7 @@ func (e *readEnv) entry(key string) []byte {
 // openCatalog fetches a catalog/shard entry, decodes it (catalog entries
 // are always AlgZstd — nothing references them with an alg column),
 // verifies its identity, and opens it from a temp file.
-func (e *readEnv) openCatalog(identity []byte) *catalog.Catalog {
+func (e *readEnv) openCatalog(identity []byte) catalog.Reader {
 	e.t.Helper()
 	stored := e.entry(hex.EncodeToString(identity))
 	plain, err := entrycodec.Decode(stored, entrycodec.AlgZstd, e.dek)
@@ -131,7 +131,7 @@ func (e *readEnv) openCatalog(identity []byte) *catalog.Catalog {
 	if err := os.WriteFile(fp, plain, 0600); err != nil {
 		e.t.Fatal(err)
 	}
-	c, err := catalog.Open(fp)
+	c, err := catalog.OpenReader(fp)
 	if err != nil {
 		e.t.Fatalf("open catalog %x: %v", identity, err)
 	}
@@ -141,7 +141,7 @@ func (e *readEnv) openCatalog(identity []byte) *catalog.Catalog {
 
 // readChunks reassembles a chunked file from its chunkrefs via pack reads,
 // verifying stored lengths and identities along the way.
-func (e *readEnv) readChunks(c *catalog.Catalog, ino int64) []byte {
+func (e *readEnv) readChunks(c catalog.Reader, ino int64) []byte {
 	e.t.Helper()
 	refs, err := c.Chunks(ino)
 	if err != nil {
@@ -280,7 +280,12 @@ func TestPublishEndToEnd(t *testing.T) {
 	// node row (lookup/stat without the child catalog) plus the nested
 	// locator (SMax forced the split).
 	root := env.openCatalog(sb.RootCatalog[:])
-	if m := root.Meta(); m.CoveredPath != "/" || m.Generation != sb.Generation || m.VolumeUUID != "3f2c8a1e-5b4d-4e6f-9a0b-1c2d3e4f5a6b" {
+	// No generation is asserted: the static format deliberately carries
+	// none. A generation number varies between otherwise identical builds,
+	// and stamping it into catalog_meta is exactly what gave every
+	// unchanged subtree a new identity and defeated catalog reuse. The
+	// generation lives in the superblock, which is the mutable object.
+	if m := root.Meta(); m.CoveredPath != "/" || m.VolumeUUID != "3f2c8a1e-5b4d-4e6f-9a0b-1c2d3e4f5a6b" {
 		t.Fatalf("root catalog meta = %+v", m)
 	}
 	dirents, nesteds, err := root.Readdir(publishRootInode)
@@ -374,7 +379,7 @@ func TestPublishEndToEnd(t *testing.T) {
 
 	// Hardlink pair: both edges present, nlink 2 everywhere, content
 	// recorded once — in the inode shard, not in either path catalog.
-	for _, c := range []*catalog.Catalog{root, dirCat} {
+	for _, c := range []catalog.Reader{root, dirCat} {
 		n, err := c.Stat(int64(hardIno))
 		if err != nil {
 			t.Fatalf("hardlink node missing from a path catalog: %v", err)
@@ -484,8 +489,10 @@ func TestPublishSecondGeneration(t *testing.T) {
 	// The changed content round-trips; the unchanged file is intact.
 	env := newReadEnv(t, inner, nil, nil)
 	root := env.openCatalog(sb2.RootCatalog[:])
-	if root.Meta().Generation != sb2.Generation {
-		t.Fatalf("root catalog generation = %d, want %d", root.Meta().Generation, sb2.Generation)
+	// The catalog carries no generation by design; the superblock is where
+	// a generation number belongs. See the note in TestPublishEndToEnd.
+	if root.Meta().CoveredPath != "/" {
+		t.Fatalf("root catalog covers %q, want /", root.Meta().CoveredPath)
 	}
 	_, nesteds, err := root.Readdir(publishRootInode)
 	if err != nil {

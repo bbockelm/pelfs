@@ -16,7 +16,6 @@ import (
 // catalogs with nested transition points rather than one flat catalog.
 func TestSealWithStaticCatalogsReadsBack(t *testing.T) {
 	v := newReuseVol(t, [16]byte{0x57, 0xa7, 0x1c})
-	v.static = true
 	v.smax = splitTreeSMax
 	v.splitTree()
 	res := v.checkpoint()
@@ -33,6 +32,7 @@ func TestSealMixesCatalogEncodings(t *testing.T) {
 	v := newReuseVol(t, [16]byte{0x71, 0x1e, 0xd0})
 	v.smax = splitTreeSMax
 	v.splitTree()
+	v.sqlite = true
 	first := v.checkpoint() // generation 1: every catalog is SQLite
 
 	// Touch one file, then publish in the new format. Everything outside
@@ -40,7 +40,7 @@ func TestSealMixesCatalogEncodings(t *testing.T) {
 	// generation references both encodings at once.
 	ino := v.create(overlay.RootInode, "added-under-static.txt", []byte("new"))
 	_ = ino
-	v.static = true
+	v.sqlite = false
 	second := v.checkpoint()
 	if second.Superblock.Generation <= first.Superblock.Generation {
 		t.Fatalf("second checkpoint did not advance the generation")

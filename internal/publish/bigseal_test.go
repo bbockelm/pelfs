@@ -324,9 +324,9 @@ func timedSeal(t *testing.T, label string, inner *meterStore, ov *overlay.FS, pr
 		// resource and the wall time stops improving while the CPU keeps
 		// climbing.
 		CatalogConcurrency: envInt("PELFS_BIGSEAL_CATCONC", 0),
-		// PELFS_BIGSEAL_STATIC=1 seals in the packed catalog format, so
-		// the same measurement covers both encodings on the same tree.
-		StaticCatalogs: os.Getenv("PELFS_BIGSEAL_STATIC") != "",
+		// PELFS_BIGSEAL_SQLITE=1 seals in the older SQLite encoding, so the
+		// same measurement covers both on the same tree.
+		SQLiteCatalogs: os.Getenv("PELFS_BIGSEAL_SQLITE") != "",
 	})
 	if err != nil {
 		t.Fatalf("%s: %v", label, err)

@@ -1,16 +1,18 @@
 # The catalog format: a static, mmap'd layout
 
-Status: design, being built. Companion to `design-packfs.md`, which
-covers packs, superblocks and generations. This document specifies the
-on-disk layout of a **catalog** — the immutable, content-addressed
-namespace object a generation is made of — and the versioning rules that
-let it change later.
+Status: **shipped, and the default.** `internal/catalog` writes this
+format unless `publish.Options.SQLiteCatalogs` is set, and a reader picks
+an implementation per catalog from the first bytes of the blob, so a
+volume may hold both. Companion to `design-packfs.md`, which covers packs,
+superblocks and generations. This document specifies the on-disk layout of
+a **catalog** — the immutable, content-addressed namespace object a
+generation is made of — and the versioning rules that let it change later.
 
 It replaces SQLite for catalogs only. The write overlay stays on SQLite,
 where transactions, crash recovery and an open-ended query surface are
 worth a query engine.
 
-## Why
+## Why it replaced SQLite
 
 A catalog is immutable, content-addressed, downloaded, and read through
 exactly ten queries. It was implemented as a SQLite database because that
@@ -33,7 +35,7 @@ any format must do. The syscall breakdown says where it goes: `pread`
 plus `memclrNoHeapPointers` 0.24s of allocator churn from
 `modernc.org/memory` and the Go runtime servicing it.
 
-Three properties motivate the replacement, in order of importance:
+Three properties motivated the replacement, in order of importance:
 
 **Concurrency.** `modernc.org/libc` puts every SQLite allocation in the
 process behind one global mutex. Parallel catalog building measured 6.44s
@@ -48,7 +50,9 @@ subtree hashed differently every seal, silently defeating catalog reuse
 until it was found. Page layout, freelists and insert order are all
 things we neither control nor want to depend on. A packed format is
 byte-deterministic by construction, which is what content addressing
-requires.
+requires. (The SQLite encoding still stamps it —
+`catalog.go`, `metaGeneration` — which is one more reason it is no longer
+the default.)
 
 **Build cost.** A sorted array is written once, sequentially. There is no
 rebalancing, so nothing is read back.
@@ -80,6 +84,10 @@ the compressed form, where zero padding is exactly what a compressor
 eats, and there the format is 16% smaller — but a reader that maps a
 catalog locally holds the larger raw form, so this is a trade, not a free
 win.
+
+End to end on an 80k-file tree, the switch reseals the whole tree in
+0.61s against 3.03s, seals a one-file change in 217 ms against 535 ms, and
+lets a mount fetch 1.2 MiB instead of 1.8.
 
 ## What it must serve
 
@@ -115,8 +123,8 @@ would have to break the signature or find a hash collision first.
 
 What it must survive is **corruption** — a truncated download, a bad
 cache, a torn local file — without reading out of bounds or panicking.
-The rules that follow are written for that, and the `opfuzz` harness is
-pointed at the parser from the first commit.
+The rules that follow are written for that, and `FuzzStaticCatalog`
+(`internal/catalog/fuzz_test.go`) is pointed at the parser.
 
 Concretely:
 
@@ -129,7 +137,9 @@ Concretely:
 - **Sortedness is not verified at open.** It is O(n) over the whole
   catalog and would defeat the purpose. A catalog whose records are out
   of order returns wrong answers, never unsafe reads — and `fsck` checks
-  order explicitly, which is the right place for an O(n) check.
+  order explicitly (`Static.CheckOrder`, reached through
+  `catalog.OrderChecker` from `internal/fsck/walk.go`), which is the right
+  place for an O(n) check.
 
 ## Layout
 
@@ -145,7 +155,7 @@ size, so a validated section can be aliased as a slice of records.
     │ sections, 8-byte aligned, any order  │
     │   names, edges, nodes, chunks,       │
     │   inline, xattr, symlink, nested,    │
-    │   identities, blobs                  │
+    │   identities, blobs, meta            │
     └──────────────────────────────────────┘
 
 ### Header (64 bytes)
@@ -161,20 +171,24 @@ size, so a validated section can be aliased as a slice of records.
 | 24 | 8 | `root_inode` |
 | 32 | 8 | `entry_count` (edges) |
 | 40 | 8 | `node_count` |
-| 48 | 4 | `identity_algo` |
+| 48 | 4 | `identity_algo` (1 = `blake3-256`, 2 = `blake3-256-keyed`) |
 | 52 | 4 | `inline_max` (the threshold this catalog was built with) |
 | 56 | 8 | reserved, zero |
 
 `flags` bit 0 is "this catalog holds at least one xattr", which answers
 the `HasXattrs` question from the header with no section read at all —
-today's fast path, kept.
+`genfs.catalogHasNoXattrs` is the caller.
+
+`identity_algo` is duplicated here numerically because it is the value
+`genfs` switches on; the string form survives in the meta section.
 
 ### Section table
 
 One 24-byte entry per section: `id uint32`, `flags uint32`, `off uint64`,
 `len uint64`. Entries are ordered by `id`. An unknown `id` is **skipped**,
 which is the forward-compatibility hinge: a future minor version may add
-sections that an older reader ignores.
+sections that an older reader ignores. `flags` is reserved: the writer
+leaves it zero and the reader does not consult it.
 
 | id | section | record |
 |---|---|---|
@@ -188,6 +202,7 @@ sections that an older reader ignores.
 | 8 | nested | 24 bytes, sorted by `(parent, name)` |
 | 9 | identities | 32 bytes, referenced by index |
 | 10 | blobs | arena, no records |
+| 11 | meta | 24 bytes, one record |
 
 ### Records
 
@@ -200,7 +215,7 @@ sections that an older reader ignores.
 | 16 | 4 | `name_off` into names |
 | 20 | 2 | `name_len` |
 | 22 | 1 | `type` |
-| 23 | 1 | `flags` |
+| 23 | 1 | reserved, zero |
 | 24 | 4 | `node_idx` into nodes |
 | 28 | 4 | reserved, zero |
 
@@ -208,12 +223,27 @@ sections that an older reader ignores.
 is a contiguous scan of edges plus a direct index into nodes — no search
 per entry, and no duplication of node records for hardlinked inodes.
 
-**Node (64 bytes)** — `inode`, `mtime_ns`, `ctime_ns`, `length` (8 each),
-then `mode`, `uid`, `gid`, `nlink`, `rdev`, `keyid` (4 each), then `type`
-and `flags` (1 each), padded to 64 with zeroes.
+**Node (64 bytes)**
+
+| off | size | field |
+|---|---|---|
+| 0 | 8 | `inode` |
+| 8 | 8 | `mtime_ns` |
+| 16 | 8 | `ctime_ns` |
+| 24 | 8 | `length` |
+| 32 | 4 | `mode` |
+| 36 | 4 | `uid` |
+| 40 | 4 | `gid` |
+| 44 | 4 | `nlink` |
+| 48 | 4 | `rdev` |
+| 52 | 4 | `keyid` |
+| 56 | 4 | `flags` |
+| 60 | 1 | `type` |
+| 61 | 3 | reserved, zero |
 
 **Chunkref (64 bytes)** — `inode` (8), `idx` (4), `llen` (4), `clen` (4),
-`keyid` (4), `alg` (1), 3 bytes zero padding, `identity` (32).
+`keyid` (4), `alg` (1) at offset 24, seven bytes of zero padding, then
+`identity` (32) at offset 32. The identity is 8-byte aligned deliberately.
 
 **Inline (16 bytes)** and **symlink (16 bytes)** — `inode` (8),
 `blob_off` (4), `blob_len` (4).
@@ -223,6 +253,24 @@ bytes zero, `blob_off` (4), `blob_len` (4).
 
 **Nested (24 bytes)** — `parent` (8), `name_off` (4), `name_len` (2), 2
 bytes zero, `identity_idx` (4) into identities, 4 bytes zero.
+
+**Meta (24 bytes, one record)** — three `(blob_off uint32, blob_len
+uint32)` pairs into the blob arena: volume UUID, covered path, identity
+algorithm as a string. The **generation is deliberately absent** — see
+Determinism. The format version is in the header rather than here, so the
+meta section carries only what rescue needs to identify the blob.
+
+### A hole cannot be represented
+
+`catalog.ChunkRef` documents a nil `Identity` as a sparse-file hole, and
+the SQLite encoding stores it as a NULL identity. The static writer
+**rejects** it: `AddChunks` requires exactly 32 identity bytes, and the
+reader always returns 32. This is consistent with what publish produces —
+holes materialize as zero bytes through the chunker, so content stays
+byte-exact and sparseness is not preserved — but it means the hole
+representation is unreachable on the default path, and the ChunkRef
+contract, `fsck`'s hole handling, and the SQLite encoding all still
+describe a case the shipped format cannot express.
 
 ### Reads
 
@@ -235,6 +283,10 @@ bytes zero, `identity_idx` (4) into identities, 4 bytes zero.
 - **Stat, inline, symlink** — binary search by `inode`.
 - **Chunkrefs, xattrs** — lower-bound on `inode`, then scan; already in
   `idx` (respectively name) order.
+
+Every accessor **decodes** fields with `binary.LittleEndian` out of a raw
+`[]byte`. Nothing in `internal/catalog` imports `unsafe`; see the appendix
+for the aliasing option and why it stayed unbuilt.
 
 ## Determinism
 
@@ -251,13 +303,14 @@ unchanged subtree rewrite itself under SQLite. The rules:
 5. **Nothing derived from the environment appears anywhere** — no
    timestamp, no hostname, no generation number, no build counter. The
    `generation` stamp is precisely what broke reuse before, and it does
-   not exist in this format. Where a caller needs to know the generation,
-   it is in the superblock, which is the mutable object that may carry
+   not exist in this format: the writer ignores `Meta.Generation` even
+   when a caller sets it. Where a caller needs to know the generation, it
+   is in the superblock, which is the mutable object that may carry
    mutable facts.
 
-A test pins this the way `TestChunkIdentityDomainIsStable` pins chunk
-boundaries: build the same tree twice, in one process and across
-processes, and require identical bytes.
+`TestStaticIsDeterministic` (`internal/catalog/static_test.go`) pins this
+within one process, and also proves that insertion order does not matter.
+The cross-process half of the claim is **not** covered by a test.
 
 ## Versioning
 
@@ -282,6 +335,13 @@ Changing `format_major` therefore rewrites every catalog it touches and
 loses reuse against prior generations for those subtrees. That is a real
 cost and the reason the record layouts above carry reserved space.
 
+The same rule is what governs the coexistence with SQLite catalogs: the
+reader dispatches on the blob's first bytes (`PELFSCAT` or
+`SQLite format 3\0`), so switching the default converted nothing. A volume
+stays mixed until every subtree has been touched, which is the intended
+migration — converting in bulk would give every catalog a new identity and
+re-upload the whole namespace.
+
 ## What this does not change
 
 - **The overlay stays SQLite.** It is local, mutable, transactional, and
@@ -289,25 +349,43 @@ cost and the reason the record layouts above carry reserved space.
 - **Nothing about packs, superblocks, or generations.** A catalog is
   still an entry in a pack, still identified by BLAKE3 over its bytes,
   still carried forward by reference when unchanged.
-- **The `catalog` package's interface.** The format sits behind it, so
-  `genfs`, `publish` and `fsck` do not know which implementation they
-  are talking to — which is also how the two get A/B measured.
+- **The `catalog` package's interface.** Both encodings satisfy `Reader`
+  and both builders satisfy `Builder`, so `genfs`, `publish` and `fsck` do
+  not know which implementation they are talking to — which is also how
+  the two got A/B measured.
 
 ## Open questions
 
-1. **Aliasing versus decoding.** Validated sections can be aliased as
-   `[]Edge` with `unsafe.Slice`, or decoded field-by-field with
-   `binary.LittleEndian` on each access. Aliasing is faster and imposes
-   alignment and layout constraints that Go does not check; decoding
-   costs a few nanoseconds per field and is obviously safe. Start with
-   decoding, measure, and only alias if it is worth the hazard.
-2. **Name prefix compression.** Sibling names in a source tree share long
+1. **Name prefix compression.** Sibling names in a source tree share long
    prefixes. Compressing them shrinks the arena and the download, at the
    cost of a more complex comparison in the hot lookup path. Deferred
    until the size measurement says what it would buy — and note zstd over
-   the whole catalog already captures some of it.
-3. **Dense inode indexing.** If a catalog's inodes turn out to be dense,
+   the whole catalog already captures some of it. The arena today
+   deduplicates whole strings and nothing finer.
+2. **Dense inode indexing.** If a catalog's inodes turn out to be dense,
    the node section could be indexed directly rather than binary
-   searched. Worth measuring on a real tree before adding a second path.
-4. Whether `inline_max` belongs in the header at all, or whether recording
-   the threshold a catalog was built with invites readers to depend on it.
+   searched. Every node lookup is a `sort.Search` today. Worth measuring
+   on a real tree before adding a second path.
+3. **Whether `inline_max` belongs in the header at all.** It is written,
+   and no reader consults it. Recording the threshold a catalog was built
+   with may invite readers to depend on it; removing it is a major-version
+   change, so the cost of leaving it is one word per catalog.
+
+## Appendix: considered and not taken
+
+**Aliasing sections as typed slices.** A validated section can be aliased
+as `[]Edge` with `unsafe.Slice` instead of decoded field-by-field on each
+access. Aliasing is faster and imposes alignment and layout constraints
+that Go does not check; decoding costs a few nanoseconds per field and is
+obviously safe. The decision was to start with decoding, measure, and
+alias only if it proved worth the hazard — and it has not been measured
+against, so decoding is what ships. The record layouts above are already
+alignment-clean, so the option stays open.
+
+**Verifying sortedness at open.** Rejected as O(n) over the whole catalog,
+which is exactly the cost the format exists to avoid. Out-of-order records
+produce wrong answers, never unsafe reads, so the check belongs in `fsck`.
+Note that `CheckOrder` is weaker than the format in two places: xattrs are
+checked for ascending `inode` but not for ascending `(inode, name)`, and
+the node, inline and symlink arrays are checked with `>` rather than `>=`,
+so duplicate keys pass.

@@ -30,31 +30,19 @@ type Server struct {
 	serveErr chan error
 }
 
-// quietLogger routes go-nfs's own log lines into pelfs's, and drops the
-// ones that are expected and harmless here.
+// quietLogger routes go-nfs's own log lines into pelfs's.
 //
-// Routing matters as much as filtering. go-nfs logs through the standard
-// library's log package, which writes to raw stderr in its own format and
-// is therefore absent from a structured pelfs log entirely — and the few
-// lines that name a failing RPC ("Error applying attributes", the one
-// upstream line that explains an EIO on CREATE) are exactly the lines
-// somebody reading that log is looking for. A message the server emits
-// about our filesystem is a pelfs message.
+// go-nfs logs through the standard library's log package, which writes to
+// raw stderr in its own format and is therefore absent from a structured
+// pelfs log entirely — and the few lines that name a failing RPC ("Error
+// applying attributes", the one upstream line that explains an EIO on
+// CREATE) are exactly the lines somebody reading that log is looking for.
+// A message the server emits about our filesystem is a pelfs message.
 type quietLogger struct {
 	nfs.Logger
 }
 
-// Errorf filters the EXCLUSIVE-create rejection. go-nfs does not implement
-// NFSv3 EXCLUSIVE mode, which is what every O_CREAT|O_EXCL open becomes —
-// git alone does it for each lockfile and every mkstemp, so the message
-// repeats constantly. The client falls back to GUARDED, which preserves the
-// property that matters (the create still fails if the name already
-// exists); only retransmission idempotency is lost, and a loopback TCP
-// mount does not retransmit.
 func (l *quietLogger) Errorf(format string, args ...interface{}) {
-	if strings.Contains(format, "exclusive") {
-		return
-	}
 	ui.Error("nfs server: {message}", "message", strings.TrimSpace(fmt.Sprintf(format, args...)))
 }
 

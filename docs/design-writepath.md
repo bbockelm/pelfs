@@ -1,20 +1,26 @@
 # The write path: pack as you go
 
-> **Status: DESIGN. Not built, and not scheduled.** Nothing in this
-> document describes how pelfs writes today. The shipped write path is
-> the overlay plus staging directory described in `design-packfs.md`:
-> every modified file gets a local file keyed by inode, and the seal at
-> unmount does all the chunking, packing and uploading at once.
+> **Status: BEING BUILT, NOT YET WIRED IN.** `internal/memtable` is an
+> active implementation of this design — 15 commits, ~4,200 lines across
+> 8 files, with 8 test files including a model-based random test and
+> measurement harnesses. It is well past a sketch.
 >
-> The only code that exists is `internal/memtable`, a vertical slice
-> built to measure the idea. **No non-test file in the tree imports it.**
-> It is not wired into a mount, a seal, or a checkpoint, and removing it
-> would change no user-visible behaviour. Where this document says "the
-> prototype", it means that package; everything else is unimplemented.
+> But **no non-test file in the tree imports it.** It is not connected to
+> a mount, a seal, or a checkpoint, so nothing here describes how pelfs
+> writes today, and deleting the package would change no user-visible
+> behaviour. The shipped write path is still the overlay plus staging
+> directory: every modified file gets a local file keyed by inode, and a
+> checkpoint or the seal at unmount does the chunking, packing and
+> uploading.
 >
-> Read `design-packfs.md` for the format and the read path. This document
-> covers only how bytes written by a user would become bytes in a pack,
-> and what measurement has already said about that.
+> Read the two statuses together. Where this document says "the
+> prototype" it means that package, and its measurements are real. Where
+> it describes behaviour — flush contracts, backpressure, recovery — that
+> is what the package does in isolation, not what a user gets.
+>
+> The integration work this needs is listed under "Designed, not built".
+> Read `design-packfs.md` for the format, the read path, and the write
+> path as it actually ships.
 
 ## What is wrong with the current write path
 
@@ -686,6 +692,34 @@ is re-measured rather than taken on trust.
   recovering a buffer file, and the feature has no remaining user. It is
   still a flag on `mount` and `mount-gen` today, because none of this is
   built.
+
+## Designed, not built
+
+`internal/memtable` implements the machinery in isolation. Reaching a
+user needs all of the following, and the first item gates the rest:
+
+- **The catalog cannot express a partially overwritten extent** (see "The
+  format does not yet support late-bound identity"). Either `ChunkRef`
+  grows a chunk-offset field or the flusher chunks only live sub-ranges.
+  Nothing else can land until this is decided, because it determines what
+  a flush is allowed to emit.
+- **A durable location map.** A flush must persist one row per surviving
+  extent; nothing on the federation has heard of an extent handle, so
+  this cannot be rebuilt from packs.
+- **`genfs` must resolve through live memtables** before the pack index,
+  treating a location-map hit as the terminal case rather than the only
+  one.
+- **The overlay's content side must move off staging files** — content
+  rows stop meaning "there is a staging file for this inode" and start
+  naming extent handles. `materializeContentLocked` and the staging
+  directory go away for every inode that is not deferred.
+- **A background flush that does not block**, which the prototype's
+  `Flush` does (see "Two kinds of flush"). A periodic checkpoint must
+  take its consistent point and return.
+- **The deferred-inode escape hatch** for randomly rewritten files, with
+  the promotion heuristic and its one-way rule.
+- **Crash recovery wired to a real session**: recovery currently
+  reconciles against an in-memory content map, not the overlay database.
 
 ## Open questions
 

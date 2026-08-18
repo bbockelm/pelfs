@@ -66,15 +66,18 @@ func (m *memtableContent) WriteAt(ctx context.Context, ino uint64, off int64, da
 }
 
 func (m *memtableContent) Truncate(_ context.Context, ino uint64, size int64) error {
-	m.store.Truncate(ino, size)
-	return nil
+	return m.store.Truncate(ino, size)
 }
 
 // Drop forgets an inode's content. There is no file to unlink, so nothing
 // is deferred: the extents it referenced become unreferenced, die in the
 // ring if they never left it, and are a repack's problem if they did.
 func (m *memtableContent) Drop(ino uint64) func() {
-	m.store.Forget(ino)
+	// The purge has already committed, so there is nothing left to refuse:
+	// a journal failure here is reported and the record is reconciled at
+	// the next recovery, which replays a content map for an inode no
+	// namespace row names and drops it.
+	_ = m.store.Forget(ino)
 	return nil
 }
 

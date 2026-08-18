@@ -1,6 +1,7 @@
 package memtable
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -37,6 +38,11 @@ type Durable struct {
 	Handles map[Handle][]ChunkSlice
 	Chunks  map[string]PackLoc
 	Packs   []packstore.SealedPack
+	// Adopted is handle -> the base inode it was adopted from. The
+	// records themselves are not stored: the base generation is immutable
+	// and still holds them, so recovery asks it again rather than keeping
+	// a second copy that could disagree.
+	Adopted map[Handle]uint64
 }
 
 // Durable returns the state that would have been committed to the
@@ -48,6 +54,10 @@ func (s *Store) Durable() Durable {
 		Handles: make(map[Handle][]ChunkSlice, len(s.handleLoc)),
 		Chunks:  make(map[string]PackLoc, len(s.chunkLoc)),
 		Packs:   append([]packstore.SealedPack(nil), s.packs...),
+		Adopted: make(map[Handle]uint64, len(s.baseRefs)),
+	}
+	for h, be := range s.baseRefs {
+		d.Adopted[h] = be.ino
 	}
 	inodes := make([]uint64, 0, len(s.content))
 	for ino := range s.content {
@@ -201,6 +211,20 @@ func Recover(opts Options, d Durable) (*Store, *Report, error) {
 			}
 		}
 		rep.Buffers = append(rep.Buffers, br)
+	}
+
+	// Adopted extents come back from the base, which still describes those
+	// files exactly as it did when they were taken over.
+	for h, ino := range d.Adopted {
+		c, err := opts.Base.ContentOf(context.Background(), ino)
+		if err != nil {
+			return nil, nil, fmt.Errorf("memtable: re-adopt inode %d: %w", ino, err)
+		}
+		s.baseRefs[h] = baseExtent{ino: ino, refs: c.Refs, length: c.Length}
+		found[h] = struct{}{}
+		if h >= s.nextHandle {
+			s.nextHandle = h + 1
+		}
 	}
 
 	s.handleLoc = make(map[Handle][]ChunkSlice, len(d.Handles))

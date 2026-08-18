@@ -163,6 +163,12 @@ func (sl *Sealer) Finish(ctx context.Context) error {
 	s.stats.UploadedBytes += sl.pk.bytes
 	s.stats.UploadedChunks += sl.pk.count
 	s.stats.Packs += int64(len(sl.pk.sealed))
+	if s.journal != nil {
+		// The re-chunk's own chunks and packs. A seal that published rows
+		// naming them without recording where they are would leave the
+		// next session unable to read what this one just wrote.
+		return s.journal.Located(Location{Chunks: sl.pk.locs, Packs: sl.pk.sealed})
+	}
 	return nil
 }
 

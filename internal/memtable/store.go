@@ -32,6 +32,10 @@ type Options struct {
 	PromotionDistance uint64
 	// Obj is the federation. Flushes upload packs to packs/<name>.
 	Obj pelicanobj.Store
+	// Journal records what a crash must not lose (journal.go). Nil means
+	// this store's content does not survive one, which is what the
+	// prototype and most tests want.
+	Journal Journal
 	// Base is the immutable generation this store's content sits over.
 	// Without it a file the session did not create cannot be adopted, and
 	// the caller must supply its bytes.
@@ -137,7 +141,8 @@ type Store struct {
 	live  map[Handle]int    // content references per handle
 	order []Handle          // handles in ring order, oldest first
 
-	base Base
+	journal Journal
+	base    Base
 	// baseRefs holds, per ADOPTED handle, the base generation's own
 	// content records for that file (base.go). An extent is either these,
 	// or a ring record, or a location-map entry — the three places bytes
@@ -230,6 +235,7 @@ func newStore(opts Options) (*Store, error) {
 		index:     make(map[Handle]Record),
 		live:      make(map[Handle]int),
 		base:      opts.Base,
+		journal:   opts.Journal,
 		baseRefs:  make(map[Handle]baseExtent),
 		obj:       opts.Obj,
 		chunkOpts: opts.Chunk,
@@ -291,6 +297,11 @@ func (s *Store) Write(ctx context.Context, ino uint64, off int64, p []byte) erro
 		s.order = append(s.order, h)
 		s.live[h]++
 		s.applyLocked(s.contentFor(ino).place(off, n, h))
+		if err := s.journalLocked(JournalEntry{
+			Op: OpPlace, Inode: ino, Handle: h, Off: off, Length: int64(n),
+		}); err != nil {
+			return err
+		}
 		s.stats.WrittenBytes += int64(n)
 		s.stats.Extents++
 		off += int64(n)
@@ -350,12 +361,13 @@ func (s *Store) appendLocked(ctx context.Context, rec *Record, payload []byte) (
 }
 
 // Truncate resizes ino, dropping content past the new size.
-func (s *Store) Truncate(ino uint64, size int64) {
+func (s *Store) Truncate(ino uint64, size int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	dropped := make(map[Handle]int)
 	s.contentFor(ino).truncate(size, dropped)
 	s.applyLocked(dropped)
+	return s.journalLocked(JournalEntry{Op: OpTruncate, Inode: ino, Length: size})
 }
 
 // Forget drops an inode's content map. Its extents lose their last
@@ -367,17 +379,18 @@ func (s *Store) Truncate(ino uint64, size int64) {
 // may still be named by a catalog row in an earlier generation, and
 // retention is what decides when those packs go — not a file being
 // deleted in a session that has not sealed yet.
-func (s *Store) Forget(ino uint64) {
+func (s *Store) Forget(ino uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	c, ok := s.content[ino]
 	if !ok {
-		return
+		return nil
 	}
 	dropped := make(map[Handle]int)
 	c.punch(0, c.size, dropped)
 	s.applyLocked(dropped)
 	delete(s.content, ino)
+	return s.journalLocked(JournalEntry{Op: OpForget, Inode: ino})
 }
 
 // Size reports ino's current length.

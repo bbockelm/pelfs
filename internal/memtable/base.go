@@ -66,9 +66,9 @@ func (s *Store) Adopt(ctx context.Context, ino uint64, length int64) error {
 	}
 	if length <= 0 {
 		s.mu.Lock()
+		defer s.mu.Unlock()
 		s.contentFor(ino).size = 0
-		s.mu.Unlock()
-		return nil
+		return s.journalLocked(JournalEntry{Op: OpTruncate, Inode: ino, Length: 0})
 	}
 	if c.Inline != nil {
 		if int64(len(c.Inline)) < length {
@@ -103,7 +103,7 @@ func (s *Store) Adopt(ctx context.Context, ino uint64, length int64) error {
 	s.applyLocked(dropped)
 	s.stats.AdoptedFiles++
 	s.stats.AdoptedBytes += length
-	return nil
+	return s.journalLocked(JournalEntry{Op: OpAdopt, Inode: ino, Handle: h, Length: length})
 }
 
 // adoptByReading is the fallback: pull the bytes through the base's read

@@ -206,10 +206,32 @@ func (s *Store) publish(b *batch, res *flushResult) {
 	if n := len(b.recs); n > 0 && n <= len(s.order) {
 		s.order = s.order[n:]
 	}
+	if s.journal != nil {
+		if err := s.journal.Located(Location{
+			Handles: res.handleLoc, Chunks: res.chunkLoc, Packs: res.packs,
+		}); err != nil {
+			// The bytes are on the federation and the map is in memory;
+			// only the RECORD of the map failed. Reads keep working, and a
+			// crash now would lose content that is already durable — so it
+			// is a failed flush, retried, rather than a silent downgrade.
+			s.flushErr = err
+		}
+	}
 	if b.to > s.reclaimTo {
 		s.reclaimTo = b.to
 	}
 	s.releaseLocked()
+	if s.journal != nil {
+		if err := s.journal.Located(Location{
+			Handles: res.handleLoc, Chunks: res.chunkLoc, Packs: res.packs,
+		}); err != nil {
+			// The bytes are on the federation and the map is in memory;
+			// only the RECORD of the map failed. Reads keep working, and a
+			// crash now would lose content that is already durable — so it
+			// is a failed flush, retried, rather than a silent downgrade.
+			s.flushErr = err
+		}
+	}
 	s.packing = false
 	s.cond.Broadcast()
 	s.mu.Unlock()

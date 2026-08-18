@@ -8,61 +8,72 @@ import (
 	"github.com/bbockelm/pelfs/internal/chunkid"
 )
 
-// ErrNotTiled reports content that cannot be written into a catalog row.
+// ErrNotTiled reports content that cannot be written into a catalog row as
+// it stands.
 //
-// This is where the design turns out to be wrong. It claims a content row
-// can name an extent handle and that "neither binding — identity at
-// flush, location within a pack — ever rewrites a catalog row", because a
-// catalog.ChunkRef already carries an identity rather than a place. But a
-// ChunkRef also says WHERE in the file the chunk goes, via LogicalOffset,
-// and genfs reads it as "chunk bytes [0, LLen) are file bytes
-// [LogicalOffset, LogicalOffset+LLen)". There is no field for an offset
-// INTO the chunk.
+// A catalog.ChunkRef carries an identity and a LogicalOffset, and genfs
+// reads it as "chunk bytes [0, LLen) are file bytes [LogicalOffset,
+// +LLen)". There is no field for an offset INTO the chunk. So the format
+// can express a file only as whole chunks laid end to end, and the moment
+// a write lands inside an already-published extent, the surviving bytes
+// are two disjoint ranges of the file while the chunk CDC produced spans
+// both plus the hole between them.
 //
-// So the format can express a file only as whole chunks laid end to end.
-// The moment a write lands inside an already-appended extent, the
-// extent's surviving bytes are two disjoint ranges of the file while the
-// chunk CDC produced still spans both plus the hole between them — and no
-// ChunkRef can say "take the first 5000 bytes of this chunk". Today's
-// path never hits this because it re-chunks the whole file from a staging
-// file at seal, which is exactly the work the design is trying to stop
-// doing.
+// That is a limit of what a catalog can SAY, not a defect to be worked
+// around in the reader: keeping "whole chunks, end to end" is what keeps
+// every chunk boundary a legal dedup boundary and a legal catalog split
+// point. The answer is to re-chunk the affected span at seal (see
+// Sealer), which is bounded by the rewrite rather than by the file.
+// ChunkRefs itself stays strict, because the honest way to know whether a
+// seal moved any bytes is to have something that refuses to.
 var ErrNotTiled = errors.New("memtable: content does not tile onto whole chunks")
 
-// ErrNotFlushed reports content still in a memtable. Identity binds at
-// flush, so a seal must flush before it can write a catalog row.
+// ErrNotFlushed reports content still in the ring. Identity binds when a
+// pack is written, so a seal must flush before it can write a catalog row.
 var ErrNotFlushed = errors.New("memtable: content has not been flushed, so it has no identity yet")
 
-// ChunkRefs renders one inode's content as the rows a seal would write
-// into a catalog. It moves no bytes: everything it needs was decided at
-// flush. That is the "a seal becomes metadata only" claim, made concrete
-// enough to fail.
-func (s *Store) ChunkRefs(ino uint64) ([]catalog.ChunkRef, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// piece is one contiguous run of one chunk's bytes that a file wants, in
+// file order: the resolution of a content row against the location map,
+// before any question of what a ChunkRef can express.
+type piece struct {
+	id    chunkid.Identity
+	off   int64 // offset into the chunk
+	n     int64 // bytes taken
+	at    int64 // file offset they land at
+	total int64 // the chunk's whole length
+}
+
+// group is consecutive pieces of the SAME chunk, taken in order and with
+// no gap — the unit a ChunkRef can name, if it covers the whole chunk.
+type group struct {
+	id    chunkid.Identity
+	off   int64
+	n     int64
+	at    int64
+	total int64
+}
+
+func (g group) whole() bool { return g.off == 0 && g.n == g.total }
+func (g group) end() int64  { return g.at + g.n }
+
+func (g group) ref() catalog.ChunkRef {
+	return catalog.ChunkRef{
+		Identity:      append([]byte(nil), g.id[:]...),
+		LLen:          g.total,
+		CLen:          g.total,
+		LogicalOffset: g.at,
+	}
+}
+
+// piecesLocked resolves one inode's live content into the chunk bytes it
+// wants, in file order. It is the shared front half of both renderers:
+// the strict one below and the re-chunking one in seal.go.
+func (s *Store) piecesLocked(ino uint64) ([]piece, error) {
 	c, ok := s.content[ino]
 	if !ok {
 		return nil, nil
 	}
-	var out []catalog.ChunkRef
-	// A chunk becomes a row only once the file has consumed the WHOLE of
-	// it, in order and with no gap. That accounting has to span content
-	// refs rather than live inside one: a write larger than the ring's
-	// record cap is split into several extents, the CDC pass runs over an
-	// inode's extents as one stream, and so a chunk routinely straddles
-	// the boundary between two of them. Judging each ref on its own would
-	// call that untileable when the file tiles perfectly.
-	var open struct {
-		live bool
-		id   chunkid.Identity
-		have int64 // bytes of the chunk the file has taken so far
-		want int64 // the chunk's length
-		at   int64 // file offset the chunk starts at
-	}
-	notTiled := func(cs ChunkSlice, chunkOff, take, at int64, total int64) error {
-		return fmt.Errorf("%w: inode %d wants bytes [%d,%d) of chunk %s (length %d) at file offset %d",
-			ErrNotTiled, ino, chunkOff, chunkOff+take, cs.ID, total, at)
-	}
+	var out []piece
 	for _, r := range c.refs {
 		if _, ok := s.index[r.Handle]; ok {
 			return nil, fmt.Errorf("%w: inode %d extent %d is still in the ring", ErrNotFlushed, ino, r.Handle)
@@ -86,49 +97,67 @@ func (s *Store) ChunkRefs(ino uint64) ([]catalog.ChunkRef, error) {
 				return nil, fmt.Errorf("memtable: chunk %s has no location", cs.ID)
 			}
 			delta := max(want-pos, 0)
-			take := min(cs.Length-delta, remaining)
-			chunkOff := int64(cs.ChunkOff + delta)
-			switch {
-			case !open.live:
-				// A catalog row can name this chunk only if the file takes
-				// it from its first byte.
-				if chunkOff != 0 {
-					return nil, notTiled(cs, chunkOff, int64(take), at, loc.Length)
-				}
-				open.live, open.id, open.have, open.want, open.at = true, cs.ID, 0, loc.Length, at
-			case cs.ID != open.id || chunkOff != open.have || at != open.at+open.have:
-				// The file jumped: either to a different chunk mid-way
-				// through this one, or over a hole inside it. Neither has a
-				// ChunkRef that can say so.
-				return nil, notTiled(cs, chunkOff, int64(take), at, open.want)
-			}
-			open.have += int64(take)
-			if open.have > open.want {
-				return nil, notTiled(cs, chunkOff, int64(take), at, open.want)
-			}
-			if open.have == open.want {
-				out = append(out, catalog.ChunkRef{
-					Identity:      append([]byte(nil), open.id[:]...),
-					LLen:          open.want,
-					CLen:          open.want,
-					LogicalOffset: open.at,
-				})
-				open.live = false
-			}
-			at += int64(take)
-			want += take
-			remaining -= take
+			take := int64(min(cs.Length-delta, remaining))
+			out = append(out, piece{
+				id:    cs.ID,
+				off:   int64(cs.ChunkOff + delta),
+				n:     take,
+				at:    at,
+				total: loc.Length,
+			})
+			at += take
+			want += int(take)
+			remaining -= int(take)
 			pos += cs.Length
 		}
 		if remaining != 0 {
 			return nil, fmt.Errorf("memtable: inode %d extent %d resolves %d bytes short", ino, r.Handle, remaining)
 		}
 	}
-	if open.live {
-		// The file ended part-way through a chunk: the rest of it belongs
-		// to bytes that were overwritten or truncated away.
-		return nil, fmt.Errorf("%w: inode %d ends %d bytes into chunk %s (length %d) at file offset %d",
-			ErrNotTiled, ino, open.have, open.id, open.want, open.at)
+	return out, nil
+}
+
+// groupPieces joins pieces that continue one another within one chunk.
+//
+// The join has to span content refs rather than live inside one: a write
+// larger than the ring's record cap is split into several extents, the
+// CDC pass runs over an inode's extents as one stream, and so a chunk
+// routinely straddles the boundary between two of them. Judging each ref
+// on its own would call that untileable when the file tiles perfectly.
+func groupPieces(ps []piece) []group {
+	var out []group
+	for _, p := range ps {
+		if n := len(out); n > 0 {
+			g := &out[n-1]
+			if g.id == p.id && g.off+g.n == p.off && g.end() == p.at {
+				g.n += p.n
+				continue
+			}
+		}
+		out = append(out, group{id: p.id, off: p.off, n: p.n, at: p.at, total: p.total})
+	}
+	return out
+}
+
+// ChunkRefs renders one inode's content as the rows a seal would write
+// into a catalog, and REFUSES anything the format cannot say. It moves no
+// bytes: everything it needs was decided when the packs were written.
+// That is the "a seal becomes metadata only" claim, kept in a form that
+// can fail — Sealer is the same rendering with the repair attached.
+func (s *Store) ChunkRefs(ino uint64) ([]catalog.ChunkRef, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ps, err := s.piecesLocked(ino)
+	if err != nil {
+		return nil, err
+	}
+	var out []catalog.ChunkRef
+	for _, g := range groupPieces(ps) {
+		if !g.whole() {
+			return nil, fmt.Errorf("%w: inode %d wants bytes [%d,%d) of chunk %s (length %d) at file offset %d",
+				ErrNotTiled, ino, g.off, g.off+g.n, g.id, g.total, g.at)
+		}
+		out = append(out, g.ref())
 	}
 	return out, nil
 }

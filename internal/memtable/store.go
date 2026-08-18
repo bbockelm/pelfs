@@ -72,6 +72,13 @@ type Stats struct {
 	// release. That costs space, never correctness, so it is a statistic
 	// rather than a failure.
 	ReclaimErrors int64
+	// RechunkedSpans and RechunkedBytes count what a seal could not
+	// express as whole chunks and had to chunk again (see Sealer). They
+	// are the price of keeping "whole chunks, end to end" in the format,
+	// and the claim they check is that it is proportional to the REWRITE
+	// rather than to the file.
+	RechunkedSpans int64
+	RechunkedBytes int64
 	// BlockedWrites counts writes that had to wait for a flush to finish
 	// — the backpressure rule firing.
 	BlockedWrites int64

@@ -16,9 +16,9 @@
 //     by the ETag observed at fetch time: writers detect a lost race
 //     instead of silently clobbering. The transports expose stat-ETags
 //     but not conditional PUT, so the guard is check-then-put with a
-//     narrow window — same as the v1 snapshot manager — and the advisory
-//     lease keeps concurrent writers out of even that window. True
-//     If-Match lands when the transport grows it.
+//     narrow window, and the advisory lease keeps concurrent writers out
+//     of even that window. True If-Match lands when the transport grows
+//     it.
 package refs
 
 import (
@@ -87,12 +87,12 @@ func New(inner pelicanobj.Store, stateDir string, trusted ed25519.PublicKey) (*S
 	// cache breaks read-after-write, and against a cache that
 	// mis-reports object length it returns a truncated body — which
 	// surfaces as a checksum mismatch, not as anything recognizably
-	// cache-shaped. Enforcing it here rather than at each call site is
-	// deliberate: three of four callers had already got it wrong.
-	// Unwrap decorators to find the transport: a stats counter or the pack
-	// layer embeds the Store interface and hides this capability, which
-	// made this rule silently inert on the mount path even though it is
-	// enforced here rather than at the call sites.
+	// cache-shaped. That is why it is enforced here instead of at each
+	// call site: the symptom points nowhere near the cause, so a caller
+	// that forgets has no way to learn it. Unwrap decorators to find the
+	// transport: a stats counter or the pack layer embeds the Store
+	// interface and hides this capability, which would leave the rule
+	// silently inert on the mount path.
 	if d, ok := pelicanobj.AsDirectReader(inner); ok {
 		inner = d.DirectVariant()
 	}

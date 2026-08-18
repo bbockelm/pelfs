@@ -9,8 +9,8 @@ import (
 // Default chunking parameters (decided in docs/design-packfs.md and
 // recorded per-volume in the superblock): scientific data dedups
 // modestly, so per-chunk costs — a catalog row and a range-GET — argue
-// for large chunks; 4 MiB average preserves continuity with the v1
-// block size.
+// for large chunks, while a larger average also means a small edit
+// re-uploads a larger chunk. 4 MiB is the balance struck between them.
 const (
 	DefaultMinSize = 1 << 20  // 1 MiB
 	DefaultAvgSize = 4 << 20  // 4 MiB
@@ -101,14 +101,14 @@ func NewChunker(r io.Reader, opts Options) *Chunker {
 // initialWindow is the buffer a Chunker starts with; it grows toward
 // MaxSize only for streams that actually reach it.
 //
-// The window used to be allocated at MaxSize (16 MiB by default) the
-// moment a Chunker was constructed, and publish constructs one PER FILE.
-// A seal of a tree of small files therefore reserved 16 MiB to chunk each
-// 8 KiB file: measured on a 60,000-file seal, chunkid.NewChunker held
-// 400 MB of the 477 MB live heap at the peak — 84% of it — and pushed
-// 16 MiB per file through the collector. The window must reach MaxSize
-// for a large file, so the size is not wrong; reserving it before a byte
-// has been read is.
+// Reserving MaxSize (16 MiB by default) at construction is the obvious
+// shape and the wrong one, because publish constructs a Chunker PER
+// FILE: a tree of small files then reserves 16 MiB to chunk each 8 KiB
+// of content. Measured on a 60,000-file seal, that reservation had
+// chunkid.NewChunker holding 400 MB of the 477 MB live heap at the peak
+// — 84% of it — and pushing 16 MiB per file through the collector. The
+// window must still reach MaxSize for a large file, so the size is not
+// wrong; paying for it before a byte has been read is.
 const initialWindow = 64 << 10
 
 // topMask returns a mask of the k highest bits of a uint64.
@@ -119,11 +119,11 @@ func topMask(k int) uint64 {
 // fill tops the window up to max bytes, growing the buffer as it goes
 // rather than having reserved max up front.
 //
-// It delivers exactly what io.ReadFull(r, buf[n:max]) delivered before —
-// the window is filled to max, or the reader runs out and the error is
-// recorded — so the cut search sees the same bytes and chunk boundaries,
-// and therefore chunk identities and the volume's dedup domain, are
-// bit-for-bit unchanged.
+// It must deliver exactly what io.ReadFull(r, buf[n:max]) delivers —
+// the window filled to max, or the reader out of bytes and the error
+// recorded — because what the cut search sees defines chunk boundaries,
+// and therefore chunk identities and the volume's dedup domain. Those
+// may not depend on how the buffer grew underneath them.
 func (c *Chunker) fill() {
 	for c.n < c.max {
 		if c.n == len(c.buf) {

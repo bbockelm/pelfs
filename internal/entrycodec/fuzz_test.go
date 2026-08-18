@@ -9,7 +9,7 @@ import (
 // panic on arbitrary input, and on encrypted volumes any mutation must
 // fail the GCM open (never yield different plaintext silently).
 //
-//	go test -tags nogspt,notikv -fuzz FuzzDecode ./internal/entrycodec/
+//	go test -fuzz FuzzDecode ./internal/entrycodec/
 func FuzzDecode(f *testing.F) {
 	key := bytes.Repeat([]byte{7}, KeySize)
 	plainZ, algZ, _ := Encode([]byte("hello hello hello hello"), nil)

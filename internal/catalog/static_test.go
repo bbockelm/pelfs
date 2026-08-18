@@ -76,8 +76,8 @@ func TestStaticRoundTrip(t *testing.T) {
 		t.Fatalf("lookup alpha: %+v err=%v", res.Dirent, err)
 	}
 	// A name with neither half is ErrNotExist, not an empty result: genfs
-	// distinguishes them, and returning nil here made it read an absent
-	// entry as a transition point missing its dirent.
+	// distinguishes them, and a nil result here reads as an absent entry
+	// being a transition point missing its dirent.
 	if _, err := s.Lookup(1, []byte("absent")); !errors.Is(err, ErrNotExist) {
 		t.Fatalf("lookup of a missing name: err = %v, want ErrNotExist", err)
 	}
@@ -198,8 +198,8 @@ func TestStaticRoundTrip(t *testing.T) {
 // TestStaticIsDeterministic is the property content addressing depends
 // on: the same tree must produce the same bytes, or an unchanged subtree
 // gets a new identity every seal and catalog reuse silently stops. The
-// previous format failed exactly here, by stamping the generation into
-// its metadata.
+// SQLite encoding fails exactly here, by stamping the generation into
+// its catalog_meta; this one records no generation at all.
 func TestStaticIsDeterministic(t *testing.T) {
 	a := buildStatic(t)
 	b := buildStatic(t)
@@ -319,12 +319,12 @@ func exerciseAll(s *Static) {
 	_ = s.HasXattrs()
 }
 
-// TestStaticLookupReturnsBothHalvesOfATransition pins the contract the
-// end-to-end seal caught me violating: a transition point has a dirent
-// whose node lives in THIS catalog and an identity naming the child
-// catalog its contents live in. Returning only the first made genfs
-// resolve the name without ever switching catalogs; returning only the
-// second made it report a transition with no dirent half.
+// TestStaticLookupReturnsBothHalvesOfATransition pins the contract an
+// end-to-end seal depends on: a transition point has a dirent whose node
+// lives in THIS catalog and an identity naming the child catalog its
+// contents live in. Returning only the first makes genfs resolve the
+// name without ever switching catalogs; returning only the second makes
+// it report a transition with no dirent half.
 func TestStaticLookupReturnsBothHalvesOfATransition(t *testing.T) {
 	w := NewStaticWriter(Meta{IdentityAlgo: "blake3-256"}, 1, 2048)
 	if err := w.AddNode(Node{Inode: 1, Type: 2, Mode: 0755}); err != nil {

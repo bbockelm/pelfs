@@ -80,7 +80,7 @@ func TestLoadRSAPrivateKeyPEM(t *testing.T) {
 	})
 
 	t.Run("legacy encrypted pem", func(t *testing.T) {
-		//nolint:staticcheck // v1 key files may use RFC 1423 encryption
+		//nolint:staticcheck // legacy RFC 1423 encryption; real key files still use it
 		block, err := x509.EncryptPEMBlock(rand.Reader, "RSA PRIVATE KEY",
 			x509.MarshalPKCS1PrivateKey(kek), []byte("hunter2"), x509.PEMCipherAES256)
 		if err != nil {
@@ -110,8 +110,8 @@ func TestLoadRSAPrivateKeyPEM(t *testing.T) {
 	})
 }
 
-// End-to-end: the KEK loaded from a v1-style PEM file unwraps the exact
-// key-table entries a superblock round-trips.
+// End-to-end: a KEK loaded from a PEM file unwraps the exact key-table
+// entries a superblock round-trips.
 func TestKeyTableThroughSuperblock(t *testing.T) {
 	kek, _ := testKEK()
 	dek := bytes.Repeat([]byte{0x0d}, WrappedKeySize)

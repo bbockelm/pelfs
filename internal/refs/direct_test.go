@@ -19,10 +19,10 @@ func (s *cachedStore) DirectVariant() pelicanobj.Store {
 }
 
 // TestNewForcesDirectReads pins the invariant that the mutable superblock
-// is never read through a federation cache. Three of four callers passed a
-// cache-served store before this was enforced inside New, and the symptom
-// against a real federation was an md5 mismatch on refs/main -- nothing
-// that pointed at caching.
+// is never read through a federation cache. Handing New a cache-served
+// store is the easy mistake, and against a real federation it surfaces as
+// an md5 mismatch on refs/main -- nothing that points at caching, which
+// is why New enforces the switch rather than trusting its callers.
 func TestNewForcesDirectReads(t *testing.T) {
 	cached := &cachedStore{}
 	s, err := New(cached, t.TempDir(), ed25519.PublicKey(nil))

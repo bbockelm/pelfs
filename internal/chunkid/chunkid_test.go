@@ -305,8 +305,9 @@ func TestIdentityHexRoundTrip(t *testing.T) {
 }
 
 // A Chunker must not reserve MaxSize before it knows the stream needs it.
-// publish builds one per file, so a 16 MiB window per 8 KiB file was 84%
-// of the live heap at a seal's peak (see initialWindow).
+// publish builds one per file, so a 16 MiB window per 8 KiB file puts 84%
+// of a seal's peak live heap in windows nothing will ever fill (see
+// initialWindow).
 func TestChunkerWindowGrowsWithTheStream(t *testing.T) {
 	small := randStream(t, 11, 8000)
 	c := NewChunker(bytes.NewReader(small), Options{})
@@ -329,7 +330,7 @@ func TestChunkerWindowGrowsWithTheStream(t *testing.T) {
 	}
 }
 
-// The growth loop must deliver the same window as a single ReadFull did,
+// The growth loop must deliver the same window a single ReadFull would,
 // however grudgingly the reader hands bytes over: cut points define the
 // volume's dedup domain and may not depend on read granularity.
 func TestChunkerCutsIndependentOfReadGranularity(t *testing.T) {

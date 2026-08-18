@@ -13,10 +13,11 @@ import (
 )
 
 // Operational robustness for federation I/O: retry with backoff on
-// failure, and log every failed attempt and every slow operation. The pelican client retries some transport
-// errors internally; this layer covers the failures that surface anyway —
-// origin restarts, token refresh races, cache 5xxs — with capped
-// exponential backoff plus jitter, honoring context cancellation.
+// failure, and log every failed attempt and every slow operation. The
+// pelican client retries some transport errors internally; this layer
+// covers the failures that surface anyway — origin restarts, token
+// refresh races, cache 5xxs — with capped exponential backoff plus
+// jitter, honoring context cancellation.
 const (
 	defaultRetries = 8
 	backoffBase    = 100 * time.Millisecond

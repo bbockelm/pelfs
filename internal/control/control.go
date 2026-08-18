@@ -68,9 +68,9 @@ func Start(stateDir string, h Hooks) (*Server, error) {
 	}
 	// Own the unlink explicitly. By default a unix listener removes its
 	// socket file when it closes, asynchronously enough that on Linux the
-	// removal landed AFTER a successor had created its own socket at the
-	// same path — the successor then chmod'd a file that no longer
-	// existed (CI caught exactly this). With unlink-on-close off, create
+	// removal can land AFTER a successor has created its own socket at
+	// the same path — the successor then chmods a file that no longer
+	// exists (seen on Linux under CI). With unlink-on-close off, create
 	// and remove are strictly ordered by us: Start creates, Close
 	// removes.
 	if ul, ok := ln.(*net.UnixListener); ok {

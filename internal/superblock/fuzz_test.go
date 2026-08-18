@@ -10,7 +10,7 @@ import (
 // document). Decode must never panic, and nothing that fails Verify may
 // be mistaken for trusted.
 //
-//	go test -tags nogspt,notikv -fuzz FuzzDecodeVerify ./internal/superblock/
+//	go test -fuzz FuzzDecodeVerify ./internal/superblock/
 func FuzzDecodeVerify(f *testing.F) {
 	pub, priv, _ := ed25519.GenerateKey(nil)
 	sb := &Superblock{

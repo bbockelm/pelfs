@@ -10,7 +10,7 @@ import (
 // input it must terminate, respect [Min, Max] bounds, reassemble exactly,
 // and be deterministic.
 //
-//	go test -tags nogspt,notikv -fuzz FuzzChunker ./internal/chunkid/
+//	go test -fuzz FuzzChunker ./internal/chunkid/
 func FuzzChunker(f *testing.F) {
 	f.Add([]byte("small"))
 	f.Add(bytes.Repeat([]byte{0}, 5000))

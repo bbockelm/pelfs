@@ -109,14 +109,15 @@ type PackEntry struct {
 	Off    int64  `json:"o"`
 	Length int64  `json:"l"`
 	// Type distinguishes entry kinds for disaster-recovery scavenging
-	// (docs/design-packfs.md): "" or "data" = data chunk; v2 adds
-	// "catalog", "shard", and "sb" (superblock backup). Reserved now so
-	// phase-1 packs remain forward-compatible with the rescue tooling.
+	// (docs/design-packfs.md): "" or "data" = data chunk, plus "catalog",
+	// "shard", and "sb" (superblock backup). It is omitempty, so a pack
+	// of nothing but chunks carries no types and the rescue tooling has
+	// to read an absent field as a data chunk.
 	Type string `json:"t,omitempty"`
 }
 
 // FetchTrailer reads and parses one pack trailer directly from a transport
-// (no Store needed): the v2 restore path resolves identities from a
+// (no Store needed): the restore path resolves identities from a
 // GENERATION pack list, not a directory listing, and rescue inventories
 // packs the same way. A non-positive size is looked up with a stat.
 func FetchTrailer(ctx context.Context, inner pelicanobj.Store, name string, size int64) ([]PackEntry, error) {

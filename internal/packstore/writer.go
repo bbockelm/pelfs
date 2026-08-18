@@ -15,11 +15,13 @@ import (
 )
 
 // Entry types recorded in pack trailers (docs/design-packfs.md, typed
-// entries): the phase-1 middleware writes only data entries; the v2
-// publish pipeline adds catalogs, inode shards, and superblock backups so
-// rescue can inventory a namespace from packs alone.
+// entries). The field is omitted when empty, and an absent type means a
+// data chunk — so a pack holding nothing but chunks records no types at
+// all, and every reader must read the empty type as data. Catalogs,
+// inode shards, and superblock backups say what they are so rescue can
+// inventory a namespace from packs alone.
 const (
-	EntryData       = "" // "data" is implied; phase-1 packs predate the field
+	EntryData       = "" // "data" is implied; a chunks-only pack omits the field
 	EntryCatalog    = "catalog"
 	EntryShard      = "shard"
 	EntrySuperblock = "sb"
@@ -37,9 +39,10 @@ type SealedPack struct {
 
 // PackWriter accumulates typed entries into a local spool file whose byte
 // layout is already the final pack (zero-copy publish) and seals it as one
-// federation object. It is the v2 publish pipeline's pack builder; unlike
-// Store it has no read side, no tombstones, and no background lifecycle —
-// TRANSFORM writes, Seal uploads, done. Not safe for concurrent use.
+// federation object. It is the publish pipeline's pack builder, and it is
+// write-only and single-shot — TRANSFORM writes, Seal uploads, done —
+// with no read side and no lifecycle of its own to run. Not safe for
+// concurrent use.
 type PackWriter struct {
 	f    *os.File
 	size int64
@@ -114,10 +117,10 @@ func (w *PackWriter) Seal(ctx context.Context, inner pelicanobj.Store) (SealedPa
 // The split exists because a pack's identity -- name, trailer hash, size
 // -- is fully determined once the trailer is written, while the upload
 // is a long round trip that has nothing left to learn from the caller.
-// Sealing them together forced a publish to stall its walk on every
-// pack: on a high-latency link that measured ~25s per pack, paid
-// strictly one after another. The upload function may be called from
-// another goroutine; it removes the spool once the bytes are durable.
+// Sealing them together stalls a publish's walk on every pack: on a
+// high-latency link that is ~25s per pack, paid strictly one after
+// another. The upload function may be called from another goroutine; it
+// removes the spool once the bytes are durable.
 func (w *PackWriter) Finalize() (SealedPack, func(context.Context, pelicanobj.Store) error, error) {
 	if len(w.tr.Entries) == 0 {
 		return SealedPack{}, nil, fmt.Errorf("pack writer: refusing to seal an empty pack")

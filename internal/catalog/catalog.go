@@ -360,7 +360,7 @@ func (w *Writer) Close() error {
 
 // Catalog reads a finished catalog. Safe for concurrent use.
 //
-// Read statements are prepared once and cached: profiling the phase-3
+// Read statements are prepared once and cached: profiling a mount's
 // lookup path showed SQL PARSING (sqlite3's yacc reduce) burning ~13% of
 // CPU because database/sql re-prepares on every Query call with
 // arguments. Catalogs are immutable and read hot, so the parse belongs at

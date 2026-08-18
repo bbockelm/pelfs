@@ -312,8 +312,9 @@ func (w *StaticWriter) Finish() ([]byte, error) {
 
 	// Metadata strings live in the blob arena; the section holds three
 	// (offset, length) pairs. The GENERATION is deliberately absent: it
-	// varies between otherwise identical builds, and stamping it into the
-	// catalog is what defeated reuse under the previous format.
+	// varies between otherwise identical builds, so stamping it into the
+	// catalog — as the SQLite encoding's catalog_meta does — gives an
+	// unchanged subtree a new identity every seal and defeats reuse.
 	metaSec := make([]byte, metaLen)
 	if err := putMetaString(metaSec[0:], blobs, w.meta.VolumeUUID); err != nil {
 		return nil, err

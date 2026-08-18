@@ -12,7 +12,7 @@ import (
 // range-mangling cache can hand back anything. decodeTrailer and parseTail
 // must never panic and never return entries pointing outside the object.
 //
-//	go test -tags nogspt,notikv -fuzz FuzzDecodeTrailer ./internal/packstore/
+//	go test -fuzz FuzzDecodeTrailer ./internal/packstore/
 
 func FuzzDecodeTrailer(f *testing.F) {
 	// Seeds: a valid PK2 trailer, a valid legacy PK1 body, and junk.

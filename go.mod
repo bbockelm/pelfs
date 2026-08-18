@@ -136,4 +136,11 @@ require (
 // as soon as the fixes land on pelican main.
 replace github.com/pelicanplatform/pelican => github.com/bbockelm/pelican v0.0.0-20260816185645-991d3b61662d
 
+// Fork replace: LINK misparsed its own arguments and answered failures
+// with an undersized reply, so hard links reached clients as EIO; and
+// EXCLUSIVE create was refused outright. Neither is patchable from
+// outside the package — the dispatch table is write-once and the handler
+// signature is unexported (docs/go-nfs-patches.md). Branch
+// pelfs-nfs-fixes of https://github.com/bbockelm/go-nfs, based on
+// upstream master, whose commits are written to be offered upstream.
 replace github.com/willscott/go-nfs => github.com/bbockelm/go-nfs v0.0.5-0.20260818015720-8f6a47800e57

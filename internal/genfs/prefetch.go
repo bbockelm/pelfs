@@ -14,10 +14,10 @@ import (
 
 // Prefetch warms the decoded-chunk cache for a whole generation.
 //
-// This is the batch disposition the v1 mount already offers: an HTCondor
-// job that wants every byte local before it starts, so a mid-job
-// federation failure cannot stall it — and, in strict mode, that refuses
-// to run at all rather than discover a missing chunk halfway through.
+// It serves the batch disposition: an HTCondor job that wants every byte
+// local before it starts, so a mid-job federation failure cannot stall it
+// — and, in strict mode, that refuses to run at all rather than discover
+// a missing chunk halfway through.
 //
 // It walks catalogs rather than the pack list on purpose. The pack list
 // includes catalogs, shards, and superblock backups, and after a repack

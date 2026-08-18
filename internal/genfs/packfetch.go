@@ -18,20 +18,20 @@ import (
 
 // Pack fetching: a pack is fetched WHOLE, or not at all.
 //
-// A chunk read used to be exactly one ranged GET. Measured on a real
-// federation session: 429 MB across 40,029 requests, about 10.7 KB each —
-// one full round trip per CDC chunk. Bandwidth was never the constraint;
-// latency was, one chunk at a time.
+// The obvious policy is one ranged GET per chunk. Measured on a real
+// federation session that costs 429 MB across 40,029 requests, about
+// 10.7 KB each — one full round trip per CDC chunk. Bandwidth is never
+// the constraint there; latency is, one chunk at a time.
 //
-// The policy that replaced it fetched packs whole only after gathering
-// evidence that a reader was consuming one — a byte ratio, an entry ratio,
-// a floor on distinct entries, and a bound on how far ahead of the reader
-// it was allowed to speculate. It worked, and it was unpredictable: the
-// same read cost a kilobyte or sixty-four megabytes depending on what the
-// mount happened to have asked for earlier. Tuning it meant tuning four
-// constants against a workload nobody can name in advance.
+// The obvious repair is to fetch a pack whole once there is evidence a
+// reader is consuming one — a byte ratio, an entry ratio, a floor on
+// distinct entries, and a bound on how far ahead of the reader it may
+// speculate. That works, and it is unpredictable: the same read costs a
+// kilobyte or sixty-four megabytes depending on what the mount happened
+// to have asked for earlier, and tuning it means tuning four constants
+// against a workload nobody can name in advance.
 //
-// The unit of transfer is now the unit of storage instead. A pack is
+// So the unit of transfer is the unit of storage instead. A pack is
 // immutable and content-addressed, so it is the natural cache object; the
 // cost of pulling one is bounded by the PUBLISHER's cut size, which is a
 // number a volume owner can actually choose, rather than by a heuristic a
@@ -40,19 +40,19 @@ import (
 //
 // Where this LOSES, plainly: a reader taking single small files from all
 // over a tree moves several times the bytes ranged reads would (twice, at
-// the shipped cut size; seventeen times at the old 64 MiB). It is faster
+// the shipped cut size; seventeen times at a 64 MiB one). It is faster
 // even then, because it is fewer round trips — so the loss lands on a
 // bandwidth-bound link and not on a latency-bound one. A reader with less
 // disk than bandwidth turns it off.
 //
-// What survives from the old mechanism, and why:
+// Ranged reads do not disappear, and where they remain they are scoped:
 //
-//   - COALESCE and PARALLELIZE are still here, but only for the mount that
-//     has switched whole-pack caching OFF (PackCacheBytes negative — less
-//     disk than bandwidth) and for the fallback when a download fails.
-//     Neither may become a read error.
-//   - The pack cache is still bounded and still evicts, because a large
-//     volume does not fit on a client.
+//   - COALESCE and PARALLELIZE serve only the mount that has switched
+//     whole-pack caching OFF (PackCacheBytes negative — less disk than
+//     bandwidth) and the fallback when a download fails. Neither may
+//     become a read error.
+//   - The pack cache is bounded and evicts, because a large volume does
+//     not fit on a client.
 //
 // Integrity is unchanged. A cached pack is not trusted as a unit: only its
 // LENGTH is checked against the signed pack list, and every entry taken out

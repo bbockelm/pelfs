@@ -1,5 +1,5 @@
-// Package genfs is the FUSE-agnostic read-only core of the phase-3
-// catalog-native VFS (docs/design-packfs.md, "Phase 3 VFS architecture"):
+// Package genfs is the FUSE-agnostic read-only core of the catalog-native
+// VFS (docs/design-packfs.md, on the catalog-native mount): a
 // generation resolver — catalog descent, inode residency, shard routing,
 // chunk reads — resolved directly against v2 catalogs and packs. The API is
 // kernel-shaped so a raw-FUSE binding maps onto it 1:1.

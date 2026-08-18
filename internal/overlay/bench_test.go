@@ -5,7 +5,7 @@ package overlay_test
 // that is the overlay itself (the FUSE round trip and the kernel are not
 // in the picture here).
 //
-//	CGO_ENABLED=0 go test -tags nogspt,notikv -bench . -benchmem ./internal/overlay/
+//	CGO_ENABLED=0 go test -bench . -benchmem ./internal/overlay/
 
 import (
 	"context"

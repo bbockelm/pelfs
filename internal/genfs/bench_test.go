@@ -1,10 +1,10 @@
 package genfs_test
 
-// Microbenchmarks for the phase-3 read path: metadata operations under
+// Microbenchmarks for the read path: metadata operations under
 // varying concurrency (the kernel issues Lookup/GetAttr storms during
 // builds and git-status walks) and chunk reads from the warm cache.
 //
-//	CGO_ENABLED=0 go test -tags nogspt,notikv -bench . -benchmem ./internal/genfs/
+//	CGO_ENABLED=0 go test -bench . -benchmem ./internal/genfs/
 //
 // The fixture is a published generation over an in-process fakeorigin, so
 // numbers include the full stack below the FUSE boundary — catalog SQLite

@@ -1,203 +1,213 @@
-# pelfs v2 format: packed objects, split catalogs, signed superblock
+# The pelfs format: packed objects, split catalogs, signed superblock
 
-Status: **shipped** — this format is what pelfs is. Every section is
-settled, with rejected alternatives recorded; the only deferred items
-(end of document) wait on external partners or production mileage, not
-on design. The v1 engine described below as the thing being replaced has
-been deleted; its account is kept because the reasons it existed, and
-the reasons it stopped being enough, are the argument for everything
-here.
+Status: **shipped** — this format is what pelfs is. Every section below
+describes the system as built, with two exceptions that are marked in
+place and listed together under "Designed, not built". Considered-and-
+rejected alternatives live in Appendix B; the engine this format replaced
+is Appendix A.
 
-## Why change
+In one sentence: **writable CVMFS with restic-style packs** —
+content-addressed immutable packs and split catalogs, with a single small
+signed mutable superblock as the trust and consistency root.
 
-Three problems observed with the v1 (JuiceFS blocks + whole-volume SQLite
-snapshot) layout, all confirmed in real use:
-
-1. **Small objects.** Every JuiceFS slice becomes its own federation object.
-   Small files and fragmented writes produce storms of tiny objects (we
-   measured uniform 32KB objects from the NFS backend before the handle
-   cache); each costs an HTTP round trip, pollutes the namespace, and
-   caches poorly.
-2. **Metadata scaling.** The entire SQLite catalog is re-uploaded every
-   snapshot interval, forever, no matter how little changed. Cost grows
-   with volume size, not churn. A million-file volume pays gigabytes of
-   upload per hour while idle.
-3. **Cache hostility.** Data blocks are keyed by mutable-looking names and
-   the metadata snapshot is overwritten in place, so mutable-object reads
-   must bypass federation caches (`?directread`) and the lease machinery
-   guards several objects.
-
-The v2 format is, in one sentence: **writable CVMFS with restic-style
-packs** — content-addressed immutable packs and split SQLite catalogs, with
-a single small signed mutable superblock as the trust and consistency root.
-
-## Object classes
+## What a volume is
 
 The federation prefix holds exactly four kinds of objects. Everything
-under refs/ is mutable and ETag-guarded; everything else is immutable.
-(Full layout, naming, and the no-manifest decision: see "Federation
-namespace layout" below.)
+under `refs/` is mutable and guarded on ETag; everything else is
+immutable.
 
 ```
 <prefix>/
-  refs/<branch>         <- mutable superblocks; small, signed, ETag-CAS
-  tags/<name>           <- immutable superblocks (frozen generations)
-  leases/<branch>.json  <- advisory liveness beacons
-  packs/p-<ts>-<rand>   <- immutable packs: data chunks, small files,
-                           catalogs, inode shards, superblock backups
+  refs/<branch>         mutable superblocks (branch heads)
+  tags/<name>           immutable superblocks (frozen generations)
+  meta/lease.json       advisory liveness beacon, one per volume
+  packs/p-<ts>-<rand>   immutable packs: data chunks, small files,
+                        catalogs, inode shards, superblock backups
 ```
 
-### 1. Packs
+Pack names stay time-ordered (`p-<unixnano hex>-<rand>`) rather than
+content-derived: the age guard in GC and the creation ordering come free,
+and integrity does not need hash *names* — each generation's pack list
+records the trailer hash, so a fetched pack verifies against the list.
+Normal operation never lists the namespace: the superblock carries the
+pack set, and refs and tags are addressed by name. Listing is needed only
+by GC. No manifest object exists.
+
+## Packs
 
 A pack is a concatenation of **independently compressed (and encrypted)
-chunks**, plus an index mapping `chunk-hash -> (offset, length)`. Any chunk
-is retrievable with a single HTTP range request — Pelican origins and
-caches serve ranges natively, so the FORMAT never requires a whole
+entries**, plus an index mapping `entry-key -> (offset, length)`. Any
+entry is retrievable with a single HTTP range request — Pelican origins
+and caches serve ranges natively, so the FORMAT never requires a whole
 object to serve one entry. Whether a reader exercises that is its own
-policy; genfs takes packs whole and relies on a small cut size instead
-("Whole packs, not ranges").
-
-Explicitly rejected: the literal git packfile format. Git packs are zlib
-streams with delta chains optimized for whole-object reconstruction; a
-filesystem serves range reads, and delta chains force reconstructing an
-object to serve any byte of it. The "edits share storage with the previous
-version" benefit comes instead from **content-defined chunking** (FastCDC):
-an edited large file re-chunks and shares unmodified chunks with its
-ancestor via content addressing, at zero read-path cost. True deltas, if
-ever wanted, are confined to small objects and are not in this design.
+policy, and the shipped reader does not: it takes packs whole and relies
+on a small cut size instead (see "Whole packs, not ranges").
 
 Packs hold everything: data chunks, whole small files, catalogs, inode
-shards. Target pack size is **2 MiB**; the open-pack append strategy is
-the spool-file design below.
+shards, and one superblock backup per publish.
 
-That target was 64 MiB (the phase-1 middleware's) until the read path
-stopped reading packs in pieces. A reader now fetches a pack WHOLE or not
-at all, which makes the cut size the granularity of every transfer it
-makes — the publisher's answer to "what does one small file cost", which
-is not a question a reader can answer for itself. See "Whole packs, not
-ranges" below for the sweep behind the number.
+### Byte layout
+
+A pack is entry bytes, then a JSON index trailer, then a fixed 16-byte
+footer — nothing else, and nothing at the front. There is no header,
+because the local spool file must already be the final layout and a
+header would have to be rewritten at seal time.
+
+```
+offset 0
++------------------------------------------------------------+
+| entry 0 bytes   (independently compressed, then encrypted)  |
+| entry 1 bytes                                               |
+| ...              byte-packed, no alignment padding          |
+| entry N-1 bytes                                             |
++------------------------------------------------------------+  <- trailer_off
+| trailer: zstd-compressed JSON, unencrypted                  |
+|   (decompressed:)                                           |
+|   {                                                         |
+|     "v": 1,                                                 |
+|     "created_ms": 1755300000000,                            |
+|     "entries": [        // sorted by key                    |
+|       {"k":"<key>", "o":<offset>, "l":<length>,             |
+|        "t":"catalog"},  // "t" omitted for data entries     |
+|       ...                                                   |
+|     ]                                                       |
+|   }                                                         |
++------------------------------------------------------------+
+| footer, 16 bytes:                                           |
+|   [0:8)   uint64 little-endian = STORED trailer length      |
+|   [8:16)  magic "PELFSPK2"                                  |
+|           ("PELFSPK1" = uncompressed-JSON trailer,          |
+|            still read, never written)                       |
++------------------------------------------------------------+
+```
+
+The two footer magics are a real wire distinction and the only versioning
+the container has: `PELFSPK1` marks a plain-JSON trailer and is accepted
+forever; every pack written today is `PELFSPK2`. The trailer struct also
+carries a `"dead"` tombstone list, which nothing writes and nothing reads
+— it belonged to a shadowing scheme this format does not use (Appendix A)
+and survives only as a field.
+
+Locating what a pack holds takes at most two range requests: a fixed-size
+tail probe (128 KiB, `packstore.tailProbe`) — the magic and trailer length
+sit at the very end, and the trailer is usually inside the probe — and, if
+the trailer is longer than the probe, one exact range read for the rest.
+There is no separate index object and no index at the front: the trailer
+IS the index, and putting it at the end is what lets the local spool file
+upload verbatim.
+
+`"o"`/`"l"` are relative to the pack start and locate the
+COMPRESSED+ENCRYPTED entry bytes. How to decode them — compression algo,
+key id — is recorded in the record that referenced the entry (catalog
+chunkref columns), never sniffed from the bytes.
+
+**Entry types** (`"t"`): absent for data chunks, `"catalog"`, `"shard"`,
+`"sb"` for a superblock backup, so rescue can inventory a namespace from
+packs alone.
+
+**Trailer hash**: the superblock's pack list records BLAKE3-256 of the
+STORED trailer bytes, so a reader verifies the location map right after
+the tail read, before even decompressing. Entry data integrity does not
+depend on this — chunk identities are end-to-end.
+
+Index cost: ~100 bytes of JSON per entry before compression; zstd takes
+the structural repetition out, leaving mostly the incompressible hash keys
+(~40–50 B/entry stored). Measured across a Linux 6.6 corpus, trailers are
+0.84–0.86% of stored bytes at every cut size from 1 to 64 MiB — the ratio
+is set by entry size, not by pack size, so cutting smaller costs objects
+and pack-list rows, not container overhead. JSON-inside-zstd is
+deliberate: rescue tooling gets human-legible structure for the cost of a
+`zstd -d`.
+
+### Compression and encryption are per entry
+
+Each entry is independently compressed, and the algorithm is recorded
+explicitly (an algo id in the referencing record — never sniffed from
+magic bytes) so it is per-entry flexible: zstd by default, `none` under a
+store-if-smaller policy (compress, keep the smaller of the two — the
+git/borg trick that avoids paying for incompressible data), future
+algorithms are new ids. Order is compress-then-encrypt; encrypting first
+would destroy compressibility. Encryption is AES-256-GCM with a random
+12-byte nonce prepended. Entries are byte-packed with **no alignment
+padding**: HTTP range requests are byte-granular and the local cache reads
+whole entries, so alignment would pay only if packs were mmap'd locally.
+
+(Noted: compressed sizes leak through encryption, a CRIME-family side
+channel accepted for a scratch filesystem.)
+
+This resolves the classic tension between sub-pack fetching and
+compression ratio in favor of fetching: per-entry compression makes every
+entry independently range-readable, at the cost of losing cross-file
+compression context. Two mitigations keep the ratio loss small: tiny files
+mostly live *inline in catalogs*, so pack entries skew large, where
+per-entry zstd approaches solid ratios anyway; and if small-entry corpora
+ever matter, a per-pack zstd dictionary would recover most of the gap
+while preserving per-entry independence.
+
+### Cut size, the ramp, and upload concurrency
+
+Target pack size is **2 MiB** (`publish.DefaultTargetPackSize`). Because a
+reader fetches packs whole, the cut size is the granularity of every
+transfer it makes — the publisher's answer to "what does one small file
+cost", which is not a question a reader can answer for itself. The sweep
+behind the number is under "Whole packs, not ranges".
 
 **The first packs of a publish are cut smaller** — 1 MiB, doubling until
 the cut size reaches the target — because nothing can be uploaded until a
 whole pack exists. Cutting only at the target leaves the uplink idle
 through the first packful of walking and then has to drain the remainder
 after the walk is over; starting small is the same trade as TCP slow
-start.
-Measured against a modelled link on a 185 MiB seal, the ramp takes the
-share of the seal with nothing in flight from 2.0% to 0.5% at 20 Mb/s and
-from 18% to 3% at 1 Gb/s, and moves the first byte from 1.6 s into the
-seal to 0.3 s. (Those figures were taken at a 64 MiB target with an
-8 MiB ramp; the shape of the argument is unchanged at 2 MiB from 1 MiB,
-the magnitude is smaller.) It costs at most three extra packs however
-large the volume — and a pack is never free again, because it is a row in
-every superblock from now on. In wall time the ramp is
-worth −1.6% at 20 Mb/s and −6.5% at 100 Mb/s against +6% on a 1 Gb/80 ms
-path, where the seal is limited by how fast the walk produces packs
-(link utilization there is ~17%) and the extra round trips are the whole
-cost. The trade is taken toward the slow link deliberately: that is where
-a seal is 80 s rather than 9 s.
+start. Measured against a modelled link on a 185 MiB seal, the ramp takes
+the share of the seal with nothing in flight from 2.0% to 0.5% at 20 Mb/s
+and from 18% to 3% at 1 Gb/s, and moves the first byte from 1.6 s into the
+seal to 0.3 s. (Those figures were taken at a 64 MiB target with an 8 MiB
+ramp; the shape of the argument is unchanged at 2 MiB from 1 MiB, the
+magnitude is smaller.) It costs at most three extra packs however large
+the volume — and a pack is never free again, because it is a row in every
+superblock from now on. In wall time the ramp is worth −1.6% at 20 Mb/s
+and −6.5% at 100 Mb/s against +6% on a 1 Gb/80 ms path, where the seal is
+limited by how fast the walk produces packs and the extra round trips are
+the whole cost. The trade is taken toward the slow link deliberately: that
+is where a seal is 80 s rather than 9 s.
 
-**Pack uploads run concurrently, four at a time.** The number is a
-property of the link, not of the format. On a bandwidth-bound uplink the
-streams only divide the same pipe — measured seal wall time at 20 Mb/s is
-flat from one stream to eight — while on a long-fat path a single stream
-is window-limited and cannot fill the pipe alone: at 1 Gb/s and 80 ms RTT
-the same seal takes 17.1 s with one stream, 11.7 s with two, 9.0 s with
-four, and nothing more with eight. Four is where that curve flattens. It
-stays settable (`publish.Options.UploadConcurrency`) because a
-data-centre node and a laptop sharing its uplink with a mount that is
-still serving reads do not want the same answer.
+**Pack uploads run four at a time.** The number is a property of the link,
+not of the format. On a bandwidth-bound uplink the streams only divide the
+same pipe — measured seal wall time at 20 Mb/s is flat from one stream to
+eight — while on a long-fat path a single stream is window-limited and
+cannot fill the pipe alone: at 1 Gb/s and 80 ms RTT the same seal takes
+17.1 s with one stream, 11.7 s with two, 9.0 s with four, and nothing more
+with eight. Four is where that curve flattens. It stays settable
+(`publish.Options.UploadConcurrency`) because a data-centre node and a
+laptop sharing its uplink with a mount that is still serving reads do not
+want the same answer.
 
-**Write path (the "memtable"):** the accumulating structure is a local
-spool file — an append-only file whose byte layout is already the final
-pack layout, plus an in-memory key -> (offset, length) table. There is no
-merge step: cutting a pack appends the index trailer and uploads the spool
-verbatim (zero-copy publish). Reads of not-yet-flushed entries are served
-from the spool. The spool is not mmap'd (plain WriteAt/ReadAt; mmap of a
-growing file buys remap churn, not speed). Entries are byte-packed with
-**no alignment padding**: HTTP range requests are byte-granular and the
-local block cache reads whole entries, so alignment would pay only if
-packs were mmap'd locally — revisit then, not before.
+### The spool file
 
-**Compression is per-entry, never per-pack-stream.** Each entry is
-independently compressed, and the compression algorithm is recorded
-explicitly (an algo id in the entry's index/catalog record — never sniffed
-from magic bytes) so it is per-entry flexible: zstd by default, `none`
-under a store-if-smaller policy (compress, keep the smaller of the two —
-the git/borg trick that avoids paying for incompressible data), future
-algorithms are new ids. Order is compress-then-encrypt — encrypting first
-would destroy compressibility. (Noted: compressed sizes leak through
-encryption, a CRIME-family side channel we accept for a scratch
-filesystem.)
+The accumulating structure on the write side is a local spool file — an
+append-only file whose byte layout is already the final pack layout, plus
+an in-memory key -> (offset, length) table. There is no merge step:
+cutting a pack appends the index trailer and uploads the spool verbatim.
+Reads of not-yet-flushed entries are served from the spool. The spool is
+not mmap'd (plain `WriteAt`/`ReadAt`; mmap of a growing file buys remap
+churn, not speed).
 
-**Pack byte layout.** A pack is entry bytes, then a JSON index trailer,
-then a fixed 16-byte footer — nothing else, and nothing at the front (no
-header: the spool file must already be the final layout, and a header
-would have to be rewritten at seal time):
-
-```
-offset 0
-+------------------------------------------------------------+
-| entry 0 bytes   (independently compressed, then encrypted) |
-| entry 1 bytes                                              |
-| ...              byte-packed, no alignment padding         |
-| entry N-1 bytes                                            |
-+------------------------------------------------------------+  <- trailer_off
-| trailer: zstd-compressed JSON, unencrypted                 |
-|   (decompressed:)                                          |
-|   {                                                        |
-|     "v": 1,                                                |
-|     "created_ms": 1755300000000,                           |
-|     "entries": [        // sorted by key                   |
-|       {"k":"<key>", "o":<offset>, "l":<length>,            |
-|        "t":"catalog"},  // "t" omitted for data entries    |
-|       ...                                                  |
-|     ],                                                     |
-|     "dead": ["<key>", ...]   // phase-1 tombstones only    |
-|   }                                                        |
-+------------------------------------------------------------+
-| footer, 16 bytes:                                          |
-|   [0:8)   uint64 little-endian = STORED trailer length    |
-|   [8:16)  magic "PELFSPK2"                                 |
-|           ("PELFSPK1" = legacy uncompressed-JSON trailer,  |
-|            still read, never written)                      |
-+------------------------------------------------------------+
-```
-
-Locating what a pack holds takes at most two range requests: (1) a
-fixed-size tail probe (128 KiB) — the magic and trailer length sit at the
-very end, and the trailer is usually inside the probe; (2) if the trailer
-is longer than the probe, one exact range read for the rest. There is no
-separate index object and no index at the front: the trailer IS the
-index, and putting it at the end is what lets the local spool file upload
-verbatim (zero-copy seal).
-
-What the reader does with that map is its own policy, not the
-container's. genfs asks it one question — WHICH pack holds this identity
-— and then fetches that pack whole.
+## Reading
 
 ### Whole packs, not ranges
 
 A pack is immutable and content-addressed, so it is the natural unit for
-a reader's cache. It is now also the unit of transfer: a mount fetches a
-pack whole on the first entry anyone wants from it, and never reads one
-in pieces. (`PackCacheBytes` negative turns this off and leaves reads on
-coalesced ranges — the setting for a client with less disk than
-bandwidth.)
+a reader's cache. It is also the unit of transfer: a mount fetches a pack
+whole on the first entry anyone wants from it, and never reads one in
+pieces. `genfs.Options.PackCacheBytes` bounds the cache; a **negative**
+value turns whole-pack fetching off and leaves reads on coalesced ranges —
+the setting for a client with less disk than bandwidth, and the only
+configuration in which a pack is read in pieces at all. A pack larger than
+256 MiB is never taken whole, and any whole-pack failure degrades to
+ranges.
 
-This replaced a promotion heuristic that fetched a pack whole only after
-a reader had demonstrably started consuming it — a byte ratio, an entry
-ratio, a floor on distinct entries, and a bound on how far ahead of the
-reader it would speculate. It worked, and it was unpredictable: the same
-read cost a kilobyte or sixty-four megabytes depending on what the mount
-had happened to read earlier, and tuning it meant tuning four constants
-against a workload nobody can name in advance. Bounding the transfer is
-the publisher's job instead, through the cut size.
-
-Swept against a Linux 6.6 checkout (81,690 files, 255 MiB stored,
-`InlineMax` 2048) at a modelled 20 ms round trip, with each read measured
-both ways — packs whole, and on coalesced ranges, which is the floor on
-bytes moved:
+Swept against a Linux 6.6 checkout (81,690 files, 255 MiB stored) at a
+modelled 20 ms round trip, with each read measured both ways — packs
+whole, and on coalesced ranges, which is the floor on bytes moved:
 
 | cut | packs | pack list | cold mount | walk 2026 files | 100 scattered files |
 |-----|-------|-----------|------------|-----------------|---------------------|
@@ -233,18 +243,18 @@ locating a pack costs at all.
 
 The cost that does not appear in the table: every pack is a row in this
 generation's pack list and in every superblock after it, since publish
-carries the list forward. The list grows as volume size over the cut
-size, so a volume two orders of magnitude larger than this corpus wants a
+carries the list forward. The list grows as volume size over the cut size,
+so a volume two orders of magnitude larger than this corpus wants a
 proportionally larger cut.
 
-### The location layer is resolved on demand
+### Locations resolve on demand
 
 A catalog names an entry's identity; a trailer says which pack holds it.
 A mount needs exactly one of those answers to serve its first question —
-where the root catalog lives — so it no longer indexes the generation to
-start. Probing runs newest-pack-first, which is a good bet because
-publish appends this generation's packs after the ones it carried forward
-and writes the root catalog last.
+where the root catalog lives — so it does not index the generation to
+start. Probing runs newest-pack-first, with a budget of four serial
+probes, which is a good bet because publish appends this generation's
+packs after the ones it carried forward and writes the root catalog last.
 
 Measured at three pack counts, before and after (cold mount to first
 readdir, 20 ms modelled round trip):
@@ -259,163 +269,195 @@ Two rules keep it honest. **Absence is only ever reported from a complete
 map**: "present in no listed pack" fails a read, and a seal's
 carry-forward check would read it as "this content is gone", so the probe
 resolves every listed pack before saying it. And the callers that reason
-about content they are not about to read — fsck, a seal's carry-forward
+about content they are not about to read — `fsck`, a seal's carry-forward
 check, a prefetch — ask for the whole map explicitly rather than relying
 on a mount having built it.
 
-The bet on recency loses for a chunk in an old pack. Past a handful of
-serial probes the rest of the map resolves at once: at 1002 packs that
-first old read costs 1001 GETs and 125 MiB — precisely what the eager
-index used to charge every mount — and never again, since verified
-trailers are kept on disk. Recording a location in the superblock would
-remove even that; see "Open format questions".
+The bet on recency loses for a chunk in an old pack. Past the probe budget
+the rest of the map resolves at once: at 1002 packs that first old read
+costs 1001 GETs and 125 MiB — precisely what an eager index would charge
+every mount — and never again, since verified trailers are kept on disk.
+Recording a location in the superblock would remove even that; see "Open
+format questions".
 
-The `"o"`/`"l"` offsets are relative to the pack start and locate the
-COMPRESSED+ENCRYPTED entry bytes; how to decode them (compression algo,
-key id) is recorded in the record that referenced the entry (catalog
-chunkref columns), never sniffed from the bytes. What the two eras
-share and where they differ:
+## Catalogs
 
-- **Keys**: phase 1 uses JuiceFS block object keys
-  (`chunks/0/0/1_0_4194304`); v2 uses hex chunk/catalog/shard
-  identities. Same trailer schema either way.
-- **Types** (`"t"`): phase 1 writes only data entries (field omitted);
-  v2 adds `"catalog"`, `"shard"`, `"sb"` (superblock backup) so rescue
-  can inventory a namespace from packs alone.
-- **Tombstones** (`"dead"`): phase-1 LSM shadowing only. v2 never needs
-  them — liveness is defined by the generation's pack list + catalogs.
-- **Trailer hash**: v2's superblock pack list records BLAKE3-256 of the
-  STORED trailer bytes, so a reader verifies the location map right
-  after the tail read, before even decompressing. Entry data integrity
-  does not depend on this — chunk identities are end-to-end.
+A catalog covers a subtree of the namespace. Each is a self-contained
+blob, packed, content-addressed by BLAKE3 over its bytes, and carried
+forward by reference into later generations whose subtree did not change.
 
-Index cost: ~100 bytes of JSON per entry before compression; zstd takes
-the structural repetition out, leaving mostly the incompressible hash
-keys (~40-50 B/entry stored). Measured across the Linux 6.6 corpus,
-trailers are 0.84–0.86% of stored bytes at every cut size from 1 to
-64 MiB — the ratio is set by entry size, not by pack size, so cutting
-smaller costs objects and pack-list rows, not container overhead.
-JSON-inside-zstd is deliberate: one
-schema across both eras, and rescue tooling still gets human-legible
-structure for the cost of a zstd -d.
+What a catalog holds, independent of encoding:
 
-This resolves the classic tension between **sub-pack fetching and
-compression ratio** in favor of fetching: per-entry compression makes
-every entry independently range-readable, at the cost of losing cross-file
-compression context. Two mitigations keep the ratio loss small: tiny files
-— where solid compression wins big — mostly live *inline in catalogs*,
-so pack entries skew large, where per-entry zstd approaches solid ratios
-anyway; and if small-entry corpora ever matter, a per-pack **zstd
-dictionary** (trained over the pack's entries, stored in the pack header,
-referenced by algo id) recovers most of the solid-compression gap while
-preserving per-entry independence. Whole-pack solid compression is
-rejected outright: one cold read would fetch and decompress everything
-before it.
+- **metadata** — volume UUID, covered path, identity algorithm: the
+  self-identification rescue needs.
+- **nodes** — `inode, type, mode, uid, gid, mtime_ns, ctime_ns, nlink,
+  length, rdev, keyid, flags`. **No atime**: persisting it would dirty
+  catalogs on read, an absurdity on a publish-what-changed filesystem.
+  Special files (fifo, dev, socket) store as types with `rdev`; the NFS
+  frontend may refuse to expose some.
+- **edges** — `(parent, name) -> inode, type`.
+- **nested** — transition points: `(parent, name) -> child catalog
+  identity`. A transition directory carries BOTH halves in the parent
+  catalog: its edge and node rows, so lookup and stat of the directory
+  itself never fetch the child, plus the nested locator; only descending
+  into its entries opens the child.
+- **chunkrefs** — `(inode, idx) -> identity, llen, clen, alg, keyid`.
+  Logical offsets are prefix sums of `llen` at load. Sparse holes are
+  *not* preserved: they materialize as zero bytes through the chunker, so
+  content stays byte-exact and sparseness does not.
+- **inline** — bytes for small files, stored RAW, because the catalog is
+  itself zstd-compressed as one pack entry and per-row compression would
+  only degrade the catalog-level ratio.
+- **xattrs** and **symlink targets**.
 
-### 2. Path catalogs
+Catalogs contain **only** records with `nlink == 1`, plus references to
+promoted inodes (see hardlinks). That makes every directory boundary a
+legal split point unconditionally — the splitter needs no hardlink
+awareness.
 
-SQLite databases (schema inspired by JuiceFS's node/edge/chunk tables, not
-bound to them) covering a subtree of the namespace. Each catalog is a
-self-contained blob, packed, content-addressed.
+Catalog and shard entries are always zstd-compressed and encrypted under
+the single key named by the superblock's `catalog_key_id` (0 =
+plaintext). Unlike chunks, their references carry no per-entry alg/keyid
+columns, so the encoding is stated once, never sniffed.
 
-- **Inline data:** files at or below a threshold (default 4KB — one SQLite
-  page; SQLite outperforms filesystems for blobs below ~10KB) are stored
-  directly in the catalog row. No federation object exists for them, and
-  the metadata fetch carries their content.
-- **Splitting:** when a catalog exceeds its threshold, it splits at a
-  directory boundary chosen by subtree weight; the parent catalog carries a
-  transition-point row (the CVMFS nested-catalog scheme). Split at S_max,
-  merge back at S_min << S_max — hysteresis prevents thrashing. Policy and
-  thresholds below are **measured**, not guessed (simulation over four
-  real trees: a miniconda root, a node_modules, glibc, and a 16GB/677K-
-  entry Go module cache; proto-catalog SQLite validated the row model).
+### Two encodings
 
-  **Weight function:** W = 200·entries + inline_bytes (+ xattr bytes).
-  Measured structural cost is 176 B/entry, so 200 is mildly conservative.
-  Inline bytes MUST be in the weight — they dominate real catalogs (62-91%
-  of files inline across the sample trees; 46 of 59 MB of a miniconda's
-  catalog weight is inline data). An entry-count threshold alone (CVMFS's
-  choice) would produce wildly variable catalog sizes here.
+Catalogs are written in a **static, mmap-friendly packed format**
+(`PELFSCAT`), specified in `design-catalog.md`. A SQLite encoding also
+exists and is still read; `publish.Options.SQLiteCatalogs` selects it for
+writing. A reader dispatches on the blob's first bytes, so a generation
+may reference both, and switching the default converted nothing — a volume
+stays mixed until every subtree has been touched. Converting in bulk would
+give every catalog a new identity and re-upload the whole namespace.
 
-  **Policy: bottom-up, peel largest child first.** Walking post-order, a
-  directory whose accumulated weight exceeds S_max detaches its largest
-  attached child subtree (which becomes a nested catalog), repeating until
-  it fits. The naive alternative — detach the whole directory when it
-  exceeds — measurably fails: a directory of many medium children detaches
-  as one catalog 10-15x over threshold. Peeling keeps p95 <= S_max on
-  every sampled tree.
+The static format was worth building: on an 80k-file tree it reseals the
+whole tree in 0.61 s against 3.03 s, seals a one-file change in 217 ms
+against 535 ms, and lets a mount fetch 1.2 MiB instead of 1.8. The reason
+is in `design-catalog.md`, and the sharpest part of it is that the SQLite
+encoding stamps the generation into its metadata, so an unchanged subtree
+hashed differently every seal and silently defeated reuse.
 
-  **Thresholds: S_max = 8 MiB, S_min = 1 MiB** (merge a nested catalog
-  below S_min into its parent only if the parent stays under S_max; 8:1
-  hysteresis). At 8 MiB: miniconda = 31 catalogs (nest depth <= 3),
-  node_modules = 87, glibc = 10, Go module cache = 527 (depth <= 4, zero
-  pathological). 2 MiB explodes catalog counts (1,447 for the module
-  cache, depth 6) for no churn benefit; 32 MiB collapses miniconda to two
-  catalogs, making a one-file touch republish ~30 MB. Dirty amplification
-  at 8 MiB: a leaf write republishes the leaf catalog plus <= 4 ancestors,
-  and post-split ancestors hold only residue rows, so the republish unit
-  is ~one catalog (<= 8 MiB raw, ~1/3 of that compressed — catalogs
-  measure 36% under zlib).
+### Inline data
 
-  **Flat-directory exception:** a single directory whose own rows exceed
-  S_max cannot split (catalog roots are directories) and remains one
-  oversized catalog. Measured worst case: @mui/icons-material at 13.3 MiB
-  (thousands of tiny inlined files in one directory) — under 5 MiB
-  compressed, tolerable, and rare (one to two per sampled ecosystem tree).
+Files at or below `publish.DefaultInlineMax` — **2048 bytes** — are stored
+directly in the catalog. No federation object exists for them, and the
+metadata fetch carries their content.
 
-  **Hardlink validation:** the miniconda tree carries 23,598 hardlink
-  groups and every one of them spans catalogs at any reasonable S_max —
-  confirming both that eager promotion was the right call (lazy promotion
-  would have bought nothing) and that its cost is trivial: ~24K shard
-  records, roughly 5 MB, for a full conda installation.
-- Catalogs contain **only** records with nlink == 1, plus references
-  (see hardlinks). This makes every directory boundary a legal split point
-  unconditionally — the splitter needs no hardlink awareness.
+The threshold is a two-sided trade, swept over a real kernel tree in
+`TestInlineMaxSweep` and written up in `design-writepath.md`. The
+counter-intuitive half: inlining is what makes catalogs *numerous* rather
+than large, and catalog count is what makes an incremental seal cheap. At
+4096 one changed file rebuilds 23% of the namespace; at 1024 it rebuilds
+63%. 2048 is the deliberate middle — it halves the catalog bytes a seal
+must move at exit against 4096 (11.2 MiB against 19.9 on that tree) while
+a one-file change still rebuilds only 41%.
 
-### 3. Inode shards ("inode catalogs")
+### Splitting
 
-Structurally identical to path catalogs — same SQLite-blob-in-pack format —
-but keyed by **inode** instead of path. They hold the records of promoted
-(nlink > 1) files. Shards are range-partitioned by dynamic boundaries
-(B-tree-leaf style, split at the median inode on overflow, merge on
-underflow); the routing lives in the superblock. Because they partition by
-sort order rather than tree structure, shards can never form unsplittable
-atoms.
+When a catalog exceeds its threshold it splits at a directory boundary
+chosen by subtree weight; the parent carries a transition-point row (the
+CVMFS nested-catalog scheme). Split at `S_max`, merge back at
+`S_min << S_max` — hysteresis prevents thrashing. Policy and thresholds
+are **measured**, not guessed: simulation over four real trees (a
+miniconda root, a node_modules, glibc, and a 16 GB/677K-entry Go module
+cache).
 
-Monotonic inode allocation gives temporal locality for free: newly promoted
-inodes land in the tail shard, publish churn concentrates there, and old
-shards go cold and live in federation caches indefinitely.
+**Weight function:** `W = 200·entries + inline_bytes (+ xattr bytes)`.
+Measured structural cost is 176 B/entry, so 200 is mildly conservative.
+Inline bytes MUST be in the weight — they dominate real catalogs (62–91%
+of files inline across the sample trees; 46 of 59 MB of a miniconda's
+catalog weight is inline data). An entry-count threshold alone (CVMFS's
+choice) would produce wildly variable catalog sizes here.
 
-### 4. Superblock
+**Policy: bottom-up, peel largest child first.** Walking post-order, a
+directory whose accumulated weight exceeds `S_max` detaches its largest
+attached child subtree (which becomes a nested catalog), repeating until
+it fits. The naive alternative — detach the whole directory when it
+exceeds — measurably fails: a directory of many medium children detaches
+as one catalog 10–15x over threshold. Peeling keeps p95 <= `S_max` on
+every sampled tree.
 
-The single mutable object and the root of both trust and consistency:
+**Thresholds: `S_max` = 8 MiB, `S_min` = 1 MiB** (merge a nested catalog
+below `S_min` into its parent only if the parent stays under `S_max`; 8:1
+hysteresis). At 8 MiB: miniconda = 31 catalogs (nest depth <= 3),
+node_modules = 87, glibc = 10, Go module cache = 527 (depth <= 4, zero
+pathological). 2 MiB explodes catalog counts (1,447 for the module cache,
+depth 6) for no churn benefit; 32 MiB collapses miniconda to two catalogs,
+making a one-file touch republish ~30 MB.
+
+**Flat-directory exception:** a single directory whose own rows exceed
+`S_max` cannot split (catalog roots are directories) and remains one
+oversized catalog. It is not a special case in the code so much as where
+the peeling loop runs out of children. Measured worst case:
+`@mui/icons-material` at 13.3 MiB (thousands of tiny inlined files in one
+directory) — under 5 MiB compressed, tolerable, and rare.
+
+### Carry-forward
+
+An unchanged subtree's catalog is referenced, not rewritten. Publish arms
+this before the walk (`internal/publish/catalogreuse.go`) and refuses it
+wholesale unless the previous generation exists, the seal builds directly
+on it, and `S_max`, `InlineMax` and the catalog key id all match — any of
+those changes what the bytes would be. Per subtree it additionally
+requires that nothing below is dirty, that the previous generation rooted
+a catalog at exactly that path, and that the span holds no promoted
+inodes. A pruned subtree is one the seal never reads at all, which is the
+difference between "did not rewrite the tree" and "did not look at it".
+
+## Inode shards
+
+Structurally identical to catalogs — same blob-in-pack shape — but keyed
+by **inode** instead of path. They hold the content records (chunkrefs,
+inline, xattrs) of promoted (`nlink > 1`) files. Promoted inodes keep
+their node row in every referencing path catalog as well, so a stat from a
+path catalog needs no shard fetch, and the shard stays authoritative for
+content.
+
+Shards are contiguous inode ranges, split when a range grows past a
+target weight; the routing lives in the superblock as
+`(first_inode, last_inode, identity)`. Because they partition by sort
+order rather than tree structure, shards can never form unsplittable
+atoms. Monotonic inode allocation gives temporal locality for free: newly
+promoted inodes land in the tail shard, publish churn concentrates there,
+and old shards go cold and live in federation caches indefinitely.
+
+## The superblock
+
+The single mutable object and the root of both trust and consistency. It
+is CBOR, encoded deterministically, loaded fully into RAM, and signed with
+the signature field zeroed.
 
 | field | purpose |
 |---|---|
-| format version, generation counter | identify + order snapshots |
-| root catalog hash | entry point of the namespace |
-| catalog routing (transition points -> pack locations) | find any catalog without fetching parents' bodies |
-| inode-shard ranges -> pack locations | find any promoted inode record |
-| **pack list** (name, size, trailer hash per pack) | the generation's location layer: which packs constitute this snapshot |
-| `next_inode` | allocator high-water mark |
-| key table (key-id -> wrapped DEK) | confidentiality keys, wrapped by the user's KEK |
-| previous-superblock hash | lineage: snapshot history, fork detection |
-| signature | trust root over all of the above |
+| `FormatVersion`, `Generation` | identify and order snapshots |
+| `VolumeID`, `CreatedUnixNano` | volume identity, timestamp |
+| `RootCatalog` | entry point of the namespace |
+| `Shards` | inode-shard ranges -> catalog identity |
+| `PackList` | name, size, trailer hash per pack: the generation's pack set |
+| `NextInode` | allocator high-water mark |
+| `KeyTable` | key-id -> KEK-wrapped DEK or identity key |
+| `CatalogKeyID` | the one key catalogs and shards are encrypted under |
+| `Params` | `SMaxBytes`, `SMinBytes`, `InlineMax`, `TGraceSeconds`, `RetainK` |
+| `Catalogs` | a seal-planning hint, not routing — see below |
+| `Condemned` | repack's ledger of dropped packs (no writer yet) |
+| `PrevHash` | lineage: snapshot history, fork detection |
+| `SigningPub`, `NextPub`, `Signature` | trust root and rotation |
 
-Format: deliberately boring (CBOR or a tiny SQLite DB, loaded fully into
-RAM). A minimal-perfect-hash mmap structure was considered and rejected:
-the superblock has one row per *catalog/shard* (thousands at pathological
-extremes, since each holds ~100K entries), far below where MPH pays. If a
-per-pack chunk index ever holds millions of entries, a sorted-hash-array
-with binary search on mmap is the next step there — still not MPH.
+**Nothing in the superblock says where any identity lives.** `Catalogs`
+carries `(inode, identity, path, weight, promoted)` for each catalog in
+the generation, and exists so the next seal can plan reuse; a reader needs
+nothing from it. There is no identity-to-pack map anywhere except a pack
+trailer, which is why a cold mount probes trailers newest-first. The
+options for changing that are under "Open format questions".
+
+A minimal-perfect-hash mmap structure was considered and rejected: the
+superblock has one row per catalog or shard, far below where MPH pays.
 
 Because everything else is immutable and content-addressed, the superblock
 is the only object a *reader* ever depends on that mutates, and the only
-thing a reader must re-fetch to observe a new generation. Readers get
-snapshot-consistent views by pinning a generation. Federation caches work
-at full strength for all data and all metadata; `?directread` is needed
-only for the superblock (and the advisory lease, which no reader touches —
-see the concurrency section).
+thing a reader must re-fetch to observe a new generation. Federation
+caches work at full strength for all data and all metadata; `?directread`
+is needed only for the superblock and for the advisory lease.
 
 That "only" is a trap, and we fell into it. Because the direct-read
 requirement applies to just two objects, it was originally satisfied at
@@ -425,33 +467,11 @@ real federation was not a stale read but an md5 mismatch on `refs/main`: a
 cache that mis-reports object length returns a truncated body, so a
 caching bug arrives disguised as corruption. The invariant now lives
 inside `refs.New` and `lease.Acquire`, which switch any store they are
-handed to its direct variant (`pelicanobj.DirectReader`). Rule of thumb:
-an invariant that holds for exactly the objects one package owns belongs
-inside that package, not in its callers' heads.
+handed to its direct variant. Rule of thumb: an invariant that holds for
+exactly the objects one package owns belongs inside that package, not in
+its callers' heads.
 
-## Concurrency: CAS is the guard, the lease is a courtesy
-
-The volume has exactly **two** mutable objects, with disjoint roles:
-
-- **Superblock — consistency.** The publish-time superblock flip is an ETag
-  compare-and-swap. If two writers race, the loser's flip fails cleanly:
-  its packs are uploaded but unreferenced (orphans for GC), nothing
-  interleaves, nothing corrupts. This is a categorical improvement over
-  v1, where concurrent writers destructively interleave chunk objects and
-  the lease is load-bearing for correctness.
-- **Lease — liveness (advisory).** The v1 lease survives essentially
-  unchanged (heartbeat + TTL + takeover warning), but demoted: its only
-  job in v2 is preventing *wasted work* — fail fast at mount instead of at
-  the first failed publish, warn mid-session on takeover. It is unsigned,
-  not content-addressed, never read by read-only mounts, and its loss or
-  corruption affects no data. `--no-lease` and `--ro` semantics carry over.
-
-Rejected: heartbeating through the superblock itself (to keep a
-"one mutable object" purity claim). That conflates roles — re-signing
-every 30s, lineage polluted or bypassed by heartbeats, and readers unable
-to distinguish "new generation" from "still alive" without parsing.
-
-## Identity vs. location: how snapshots record where chunks land
+## Identity versus location
 
 A snapshot must capture *what* every file's chunks are without freezing
 *where* they live, or repack would invalidate history. The decomposition:
@@ -461,539 +481,180 @@ A snapshot must capture *what* every file's chunks are without freezing
   subtree's catalog stay hash-identical (and therefore shared) across any
   number of generations.
 - **Location lives in pack trailers, versioned by the superblock's pack
-  list.** Trailers (hash -> offset, length within their pack) are
-  immutable and shared; each superblock records the *set of packs* that
-  constitutes its generation — a per-pack list (name, size, trailer
-  hash), not a per-chunk map, so it stays small (hundreds of entries for
-  a million-chunk volume, versus tens of MB for a chunk-level manifest).
-  Resolution is: hash -> this generation's pack set -> trailer -> range.
+  list.** Trailers are immutable and shared; each superblock records the
+  *set of packs* that constitutes its generation — a per-pack list, not a
+  per-chunk map, so it stays small (hundreds of entries for a
+  million-chunk volume, versus tens of MB for a chunk-level manifest).
+  Resolution is: identity -> this generation's pack set -> trailer ->
+  range.
 
 Consequences:
 
-- **Tagged generations never rot.** A generation pins its pack set;
-  repack emits a *new* generation whose list routes moved chunks to the
-  new pack, while retained older generations keep their old packs alive.
-  GC's pack-liveness question is simply "does any retained generation's
-  pack list name this pack" (plus the reader grace window).
-- **Repack remains metadata-free in v2**: catalogs never change; only the
-  next superblock's pack list does.
-- **Bootstrap-by-listing dies with phase 1.** Today a session lists
-  packs/ and trusts name-ordered shadowing; in v2 the superblock hands a
-  fresh session the authoritative, generation-consistent pack set — no
-  listing, no race against concurrent repack.
+- **Tagged generations never rot.** A generation pins its pack set; a
+  repack would emit a *new* generation whose list routes moved chunks to
+  the new pack, while retained older generations keep their old packs
+  alive. GC's pack-liveness question is simply "does any retained
+  generation's pack list name this pack", plus the reader grace window.
+- **Repack would be metadata-free**: catalogs never change; only the next
+  superblock's pack list does.
 - File versioning in the user-visible sense falls out: mount any tagged
   generation for its point-in-time tree; a file's versions across
-  generations are different chunk lists in (mostly shared) catalogs, with
-  CDC + content addressing sharing every unchanged chunk between
-  versions. Retention policy is ref/tag retention.
-
-(Contrast with v1, which has the same two layers — metadata references
-logical block names, trailers map names to locations — but does not
-version the pack set and deletes overwritten blocks eagerly: a v1
-"snapshot" is a crash-recovery checkpoint whose older siblings rot as
-later sessions tombstone their blocks. Only the newest is guaranteed
-consistent, by the pre-snapshot flush ordering.)
-
-## Retention and GC (v2)
-
-Retention is expressed entirely in the ref/generation layer, and the pack
-list makes the sweep set arithmetic rather than tree traversal:
-
-- **Pack lists carry forward.** Publish appends new packs to the
-  previous generation's list; the only thing that ever REMOVES a pack
-  from the list is repack (inside TRANSFORM). So a branch head's list
-  covers every ancestor's packs except the recently repacked-away ones.
-- **The condemned ledger covers those.** When repack drops a pack from
-  the list, the new superblock records it in a small `condemned` ledger
-  as (name, condemned-at); publish carries ledger entries forward until
-  they age past `T_grace`, then drops them. A reader pinned to a
-  recent anonymous generation therefore keeps its packs for the full
-  grace window, and GC never needs an ancestor's superblock — the head
-  states everything. (An earlier draft walked lineage hashes to
-  ancestors' pack lists instead; rejected because anonymous ancestors'
-  superblocks are not reliably fetchable once the ref moves — they live
-  only as scattered in-pack backups.)
-- **Retained packs** = the union over every ref head and every tag of
-  (pack list + condemned entries younger than T_grace). No catalog
-  walking is needed for deletion safety — the pack list *is* the
-  reachable closure at pack granularity. Retention deliberately
-  overapproximates liveness; repack trims dead bytes *within* retained
-  generations. T_grace defaults to 72h, is recorded in the superblock
-  Params so writers, readers, and GC agree, and is configurable per
-  volume.
-- **Sweep** = delete packs that are (a) absent from the retained union
-  AND (b) older than T_grace by name timestamp. Guard (b) is what makes
-  GC safe to run concurrently with writers and forkers, with no locking:
-  a writer's new packs are always younger than T_grace, so they are never
-  candidates regardless of when GC listed the refs; and the fork rule
-  (fork only from ref-reachable generations) means any mid-GC fork's
-  closure is already inside the retained set. GC re-lists refs
-  immediately before issuing deletes as a cheap window-narrower, not a
-  correctness requirement.
-- **Granularity:** whole packs, superseded superblock backups, and ref
-  debris only — never entries (repack's job). Deleting a branch or tag is
-  how space is actually released.
-- **Who runs it:** each publish piggybacks the condemned-ledger upkeep
-  for its own branch (append repacked-away packs, drop entries past
-  T_grace — pure superblock bookkeeping); the actual sweep is an
-  explicit `pelfs gc`, which needs no lease.
-- **The reader contract:** a reader pinned to an untagged generation
-  older than T_grace may see "snapshot expired — refresh or remount." A
-  workflow that needs a longer pin tags first; tags pin exactly and
-  indefinitely.
-
-## Signing and key management (v2)
-
-- **Two keys, two jobs.** The volume *signing* keypair (Ed25519,
-  generated at volume creation) authenticates superblocks; the user KEK
-  wraps DEKs and the identity key for confidentiality. They have
-  different lifecycles and different audiences: every reader verifies
-  signatures, only key-holders decrypt. An unencrypted volume still has a
-  signing key.
-- **First-mount trust**, in order of preference: an explicit
-  `--volume-pubkey` (or fingerprint embedded in a shared tag reference);
-  else trust-on-first-use with the key pinned in local state and loud
-  errors on change (the SSH model). Registry-issued attestation was
-  considered and is explicitly out: pelfs stays a pure client of dumb
-  federation storage, with no registry integration.
-- **Rotation:** a superblock may introduce a successor public key, signed
-  by the current key; readers follow the custody chain through lineage.
-  Compromise recovery is out-of-band re-pinning (custody chains cannot
-  distinguish a stolen key's rotation from a legitimate one).
-- **Threat model, stated honestly:** the federation origin is dumb
-  storage and cannot verify signatures, so a compromised *write token*
-  permits clobbering the mutable ref objects — an availability attack.
-  Signatures make forgery detectable (readers reject), and lineage plus
-  in-pack superblock backups make recovery mechanical (`pelfs rescue`).
-  Integrity holds; availability under token compromise does not, and no
-  client-side design can change that.
-
-## Federation namespace layout (v2)
-
-```
-<prefix>/
-  refs/<branch>          mutable superblocks (branch heads); ETag-CAS
-  tags/<name>            immutable superblocks (frozen generations)
-  leases/<branch>.json   advisory liveness beacon, one per branch
-  packs/p-<ts>-<rand>    immutable packs (data, catalogs, shards, backups)
-```
-
-Pack names stay time-ordered (`p-<unixnano hex>-<rand>`) rather than
-content-derived: the age guard in GC and the creation ordering come free,
-and integrity does not need hash *names* — each generation's pack list
-records the trailer hash, so a fetched pack verifies against the list.
-(Outer hash-naming was considered and rejected as buying nothing.)
-Normal operation never lists the namespace: the superblock carries the
-pack set, and refs/tags are addressed by name. Listing is needed only by
-`pelfs rescue` and cross-ref GC (PROPFIND over refs/, tags/, packs/). No
-manifest object exists.
-
-## Catalog schema (v2)
-
-Informed by the proto-catalog measurements (176 B/entry structural, 36%
-compression). All tables WITHOUT ROWID where the key is natural.
-
-- `catalog_meta(key, value)` — volume UUID, covered path, generation,
-  format version, identity algo — the self-identification rescue needs.
-- `node(inode PK, type, mode, uid, gid, mtime_ns, ctime_ns, nlink,
-  length, rdev, keyid, flags)` — **no atime** (scratch volumes run
-  noatime; persisting atime would dirty catalogs on read, an absurdity).
-  Special files (fifo/dev/socket) store as types with rdev; the NFS
-  frontend may refuse to expose some — recorded limitation.
-- `edge(parent, name BLOB, inode, type)` PK(parent, name).
-- `nested(parent, name BLOB, catalog_identity BLOB)` — transition points.
-  A transition directory carries BOTH halves in the parent catalog: its
-  edge and node rows (lookup and stat of the directory itself never
-  fetch the child catalog) plus the nested locator; only descending
-  into its entries opens the child. Catalog and shard pack entries are
-  always zstd-compressed and encrypted under the single key named by
-  the superblock's `catalog_key_id` (0 = plaintext) — unlike chunks,
-  their references carry no per-entry alg/keyid columns, so the
-  encoding is stated once, never sniffed.
-- `chunkref(inode, idx, identity BLOB[32], llen, clen, alg, keyid)` —
-  logical offsets are prefix sums of llen at load (rows per file are few;
-  saves 8 bytes/row); holes in sparse files are rows with NULL identity
-  and llen = hole length.
-- `inline(inode PK, data BLOB)` — separate table keeps node rows hot.
-  Inline data is stored RAW: the catalog file is itself zstd-compressed
-  as one pack entry, so per-row compression would only degrade the
-  catalog-level ratio (and the 36% measured compression already has
-  inline bytes dominating the input).
-- `xattr(inode, name, value)`; `symlink(inode PK, target)`.
-- Inode shards reuse node/chunkref/inline/xattr keyed purely by inode.
-- Dropped from the JuiceFS lineage: sessions, sustained inodes, flocks,
-  plocks, delayed-slices, dir-stats (recomputable), counters (superblock
-  owns them), trash, and ACL tables (POSIX ACLs out of scope for v2.0;
-  xattrs can carry them opaquely).
-
-## Session control socket
-
-The primary interface stays `pelfs shell` / `mount` / `umount`; publish
-is a session activity, not a separate workflow. Each session listens on
-a Unix-domain socket in its state directory (`control.sock`) speaking
-plain HTTP (the Docker pattern — curl-able, no custom framing):
-
-- `GET  /v1/status`    — mount point, prefix, generation, uptime
-- `GET  /v1/stats`     — the live session-statistics JSON
-- `POST /v1/flush`     — drain staging + packs now
-- `POST /v1/publish`   — cut + publish a v2 generation now
-- `GET  /v1/bugreport` — tar.gz: stats, status, config (redacted),
-  goroutine dump (the "client hung" debugging kit)
-
-`pelfs ctl <prefix-or-mountpoint> <verb>` is the CLI client. The socket
-is 0600 in the per-volume state dir; possession of the state dir is
-already possession of the volume's local keys, so no further auth.
-
-## Writeback modes and the dirty cap
-
-Three write dispositions per session:
-
-- **Synchronous** (no --writeback): today's default; every block upload
-  completes before the write returns durable.
-- **Writeback** (--writeback): staged locally, uploaded ASAP in the
-  background. The dirty-bytes cap rides the staging store's existing
-  full-detection: when staged bytes exceed the cap
-  (--writeback-cap, default: the cache budget), new writes fall back to
-  SYNCHRONOUS upload — writers slow down, the session never explodes
-  local disk (the 5 GB-of-overwrites concern, capped at the other
-  layer).
-- **Accumulate** (--accumulate, explicitly NOT default): the
-  traditional HTCondor shape — nothing uploads during the job; all
-  output stays in local staging (reads are served from it), and
-  PUBLICATION at job end pushes v2 packs + catalogs directly. The v1
-  block objects are never uploaded at all, and v1 snapshots are
-  disabled in this mode (they would reference blocks that exist
-  nowhere); the publish at exit is mandatory, and a crash before it
-  loses the session's writes — exactly the stated batch contract
-  ("mid-job upload failures are fine iff the final upload succeeds").
-  Cap-full in accumulate mode is ENOSPC to the writer, never a silent
-  mid-job upload. Implementation note: staging-forever is JuiceFS's
-  UploadDelay knob; the accumulate publish reads file content through
-  the chunk store, which serves staged-but-never-uploaded blocks
-  locally.
-
-## Codec marking: every compression/encryption site, enumerated
-
-The CVMFS scar to avoid: bytes whose compression algorithm is implied by
-convention rather than recorded. Every place v2 transforms bytes, and
-where its algorithm lives:
-
-| bytes | compression | encryption | recorded where |
-|---|---|---|---|
-| chunk pack entries | zstd or none (store-if-smaller) | AES-256-GCM or none | `chunkref.alg` + `chunkref.keyid` columns, per entry |
-| catalog / shard / superblock-backup pack entries | always zstd | one volume key or none | fixed by rule + `superblock.catalog_key_id` (their references have no per-entry columns) |
-| pack trailer | zstd (PELFSPK2) or none (PELFSPK1) | never | footer magic versions the codec |
-| superblock | none | never (signed, public) | `format_version` field |
-| catalog SQLite | n/a (SQLite is self-describing for schema) | n/a | `catalog_meta` carries `format version` + `identity algo` — semantics are versioned even though the container describes itself |
-| inline rows | raw (see schema note) | rides inside the catalog entry | n/a |
-
-New algorithms are new ids (or a new footer magic); nothing is ever
-sniffed from magic bytes inside an entry.
-
-## Where decoded data is cached
-
-- **Phase 1 / v1 blocks:** the JuiceFS block cache (`CacheDir`) stores
-  block objects as they exist in the federation (post any v1
-  compression/encryption); packstore below it adds nothing.
-- **Phase 2 hydrated reads:** the hydrate layer caches DECODED chunks
-  (post-zstd, post-AES) keyed by chunk identity in the volume state
-  directory; the JuiceFS block cache above it additionally caches the
-  block objects it synthesizes from them. The double caching is an
-  accepted phase-2 cost.
-- **Phase 3:** one cache — decoded chunks keyed by identity — becomes
-  the only local data store.
-
-## Fuzzing strategy (three tiers)
-
-1. **Parser fuzzing — unrestricted.** Everything that parses untrusted
-   federation bytes has a native Go fuzz target: pack trailers,
-   superblock decode+verify (mutations must never verify; VerifyChain
-   must never panic), entry codec (GCM fails closed), and the chunker
-   (termination, bounds, exact reassembly, determinism). Pure functions
-   on byte slices; run anywhere, run in CI. First run already forced a
-   hardening fix (negative trailer extents reaching the range-read
-   path).
-2. **Op-sequence fuzzing — CONTAINED, ALWAYS.** Random filesystem
-   operation sequences (the fsx/syzkaller shape that historically
-   shakes real bugs out of filesystems) against the overlay+genfs
-   stack, checked against an in-memory reference model, plus a
-   concurrent stress mode under the race detector. This tier mutates
-   real files (staging, SQLite, caches), so a bug under fuzz pressure
-   could write ANYWHERE the process can — containment is mandatory,
-   never optional: the harness only builds under the `opfuzz` tag,
-   refuses to run unless the containment launcher's env is present,
-   does its own path work through os.Root, and the ONLY sanctioned
-   entrypoint is scripts/opfuzz-docker.sh — a network-less,
-   cap-dropped, unprivileged, read-only-rootfs container whose only
-   writable space is a tmpfs (the repo and module cache mount
-   read-only).
-3. **Mounted-FS fuzzing — future, same containment.** Driving real
-   syscalls through the kernel against a `mount-gen`/phase-3 mount
-   (Linux CI): the fuzzer process lives in the same launcher-shaped
-   container with the mountpoint as its os.Root, so neither a VFS bug
-   nor a fuzzer bug can traverse out. Lands with Linux CI mounts.
-
-## Benchmarks and acceptance criteria (v2)
-
-Fixed suite, run against a local posixv2 federation and one real OSDF
-prefix; targets follow from the measurements in this document:
-
-1. Kernel-source untar + publish: publish cost ∝ churn; republish after
-   touching one file ≈ one catalog + ancestors (≤ ~4 MB compressed).
-2. `conda create` (the hardlink storm): completes; promotion adds ≤ ~10 MB
-   of shards; subsequent publish seconds, not minutes.
-3. `git clone` + `git status`: correct (the v1 NFS lessons as regression
-   tests) and status latency within 2x local disk on warm cache.
-4. 10 GB single-file write: ≥ 0.8x the raw pelican upload throughput of
-   the same host (chunking+packing overhead budget: 20%).
-5. Cold mount of a 1M-entry volume: ≤ 30 s to usable in phase 2
-   (full-hydrate ≈ 60-120 MB compressed metadata); ≤ 3 s in phase 3
-   (lazy descent).
-6. Overwrite-loop soak: federation usage stays ≤ live/L + G + one pack
-   (the repack bound), verified over hours.
-
-## Migration: v1 -> v2
-
-Decision: **no in-place migration.** A v1 volume is drained by mounting
-it read-only with v1 code and publishing its contents into a fresh v2
-prefix (a copy pipeline through the filesystem layer — `pelfs migrate`
-can automate exactly this and nothing subtler). In-place conversion is
-rejected: it would force every v2 reader to carry v1's slice-name block
-layout and unversioned-snapshot semantics forever, for the convenience of
-volumes that are, by charter, scratch. Phase-1 packs are already
-forward-compatible where it matters (typed trailer entries), and the
-phase-1 middleware never writes anything a v1 mount cannot read back.
-
-## Disaster recovery: scavenging a lost superblock
-
-The superblock is the only mutable object, which makes it the natural
-worry: what survives if it is lost or corrupted? Answer: everything except
-the map — packs contain the catalogs and inode shards as well as the data,
-so recovery is a scavenging problem, made tractable by three format
-provisions:
-
-1. **Typed pack entries.** Every trailer entry carries a type (data chunk,
-   catalog, inode shard, superblock backup; absent = data). One byte of
-   JSON per entry; without it, recovery would have to sniff SQLite magic,
-   which encryption makes impossible.
-2. **Self-identifying catalogs.** Each catalog embeds a metadata table:
-   volume UUID, its covered subtree root path, the generation that
-   produced it, and — because transition-point rows carry child catalog
-   hashes — the tree is *self-assembling*: find all catalog entries,
-   descend by embedded child hashes, and a root candidate is any catalog
-   covering "/" that no other catalog references. Generation stamps order
-   candidates; recovery prefers the newest generation whose reachable
-   closure is complete (a crash mid-publish legitimately leaves a newer,
-   incomplete set — publish ordering uploads packs before flipping the
-   superblock — so fall back a generation when the closure has holes).
-3. **Superblock backups ride in packs.** Superblocks are tiny; each pack
-   carries the most recent one as an entry (type: superblock-backup,
-   including its ref name). Losing the mutable object then costs only the
-   generations since the last pack — recovery becomes "restore the newest
-   embedded backup, verify its signature, re-point the ref," recovering
-   the allocator counter, shard ranges, pack list, and the KEK-wrapped
-   key table exactly. (A lost KEK is still fatal for encrypted data, by
-   design; the wrapped DEK in a backup is harmless to expose.)
-
-`pelfs rescue` (the human-facing tool; specified here, implemented with
-phase 2): enumerate packs,
-inventory trailers, assemble the newest complete generation, then report —
-subtrees intact, files damaged by missing chunks, catalogs missing (their
-siblings remain fine), and a hash-only lost+found for data reachable from
-no surviving catalog (promoted inode-shard records can even recover file
-bodies whose dirents are gone). Partial pack loss degrades proportionally
-and legibly, because the hash tree makes "what is missing" exactly
-enumerable rather than a guess.
-
-(Phase-1/v1 note: today the metadata snapshot objects under meta/ are the
-only namespace record; packs hold logically-named blocks, so losing every
-snapshot leaves lost+found-grade recovery only. keep-sessions retention is
-the v1 mitigation. The phase-1 trailer format already reserves the entry
-type field so existing packs stay forward-compatible with scavenging.)
+  generations are different chunk lists in mostly-shared catalogs, with
+  content-defined chunking and content addressing sharing every unchanged
+  chunk between versions. Retention policy is ref and tag retention.
 
 ## Refs: branches, tags, and forks
 
-A superblock generation is already a commit: immutable once written, signed,
-parent-linked via the lineage hash, rooting an immutable object graph. Refs
-add the missing distinction between a commit and the *name* pointing at it:
+A superblock generation is already a commit: immutable once written,
+signed, parent-linked via the lineage hash, rooting an immutable object
+graph. Refs add the missing distinction between a commit and the *name*
+pointing at it:
 
 - **Branch** — a mutable ref object (`refs/<name>`), advanced by publish.
-  Each ref is independently ETag-CAS'd and guarded by its own advisory
-  lease; the entire concurrency section applies per-ref. The v2 design's
-  single superblock is simply `refs/main`, which bare-prefix mounts use by
-  default.
-- **Tag / named snapshot** — an immutable ref: a frozen superblock under a
-  name, never CAS'd. Costs one tiny object; everything it references is
-  shared. Read-only tag mounts are exactly the pinned-generation mounts
-  described above.
+  Each is independently guarded and covered by the advisory lease. A bare
+  prefix mounts `refs/main`.
+- **Tag** — an immutable ref: a frozen superblock under a name, never
+  overwritten. Costs one tiny object; everything it references is shared.
+  Read-only tag mounts are the pinned-generation mounts. *Reading* a tag
+  is wired up (`--tag`); `refs.Store.Tag` exists but no command calls it,
+  so tags cannot currently be created through the CLI.
 - **Fork** — a new ref whose first superblock's parent is the forked
-  generation. Copy-on-write over the whole volume: catalogs, shards, and
-  chunks are shared until they diverge.
+  generation, giving copy-on-write over the whole volume. **Not
+  implemented.** The rules below are the design it would have to obey.
 
 Consequences, deliberate and otherwise:
 
 - **Single-writer becomes single-writer per branch.** Writers on different
   branches never conflict: disjoint superblocks, shared immutable objects,
-  and content-addressed pack uploads collide only on identical content
-  (idempotent). This enables the fan-out batch pattern — one tagged base
-  environment, N jobs each forking a private writable branch and
-  publishing results as tags — container-image layering for scratch data.
+  and content-addressed pack uploads collide only on identical content.
+  This enables the fan-out batch pattern — one tagged base environment, N
+  jobs each forking a private writable branch and publishing results as
+  tags.
 - **Fork rule (GC soundness):** forking is allowed only from ref-reachable
   generations — a branch's history within the GC grace window, or any tag.
   To fork something older, tag it first. This closes the race between
   forking a generation and GC condemning it.
-- **GC is multi-root mark-and-sweep:** the live set is the union of
-  reachability from all refs plus the grace window. Refs are enumerated by
-  listing (they are few); no refs-manifest object exists. Deleting a
-  branch is how space is actually freed.
-
-  Kept scalable by four structural properties. (1) Content addressing
-  dedups the mark walk: unchanged subtrees share catalog hashes, so each
-  distinct catalog is visited once regardless of how many refs and
-  generations reference it — mark cost is proportional to *distinct*
-  metadata, not refs × tree. (2) The walk is two-level: each catalog
-  carries a summary of the **pack ids** it references, so the mark phase
-  unions pack-id sets and computes per-pack liveness ratios without
-  touching chunk-level detail; only packs falling below a liveness
-  threshold get exact, entry-level accounting — and that happens as part
-  of repacking them anyway (copy live entries forward, delete the pack).
-  The GC unit is the pack. (3) The generational frontier is free:
-  monotonic naming means objects younger than the grace window are never
-  candidates, so GC scans only the old tail. (4) The fork rule makes
-  concurrent GC sound without coordination: forks come only from
-  ref-reachable generations, so an object unreachable from every ref and
-  older than the grace window can never become reachable again.
 - **Inode uniqueness is per-lineage.** Fork descendants allocate from the
   same counter and may assign equal inode values to different files —
   harmless, since inodes need uniqueness only within a mounted tree and
   branches mount separately. A future cross-branch *merge* would need to
   renumber one side; merge is explicitly out of scope, and this rule is
   why.
-- Retention becomes explicit: tags are the user-controlled form of
-  keeping a generation; anonymous generations get the T_grace window
-  via the condemned ledger. Keep what you name, grace-window the rest.
+- Retention becomes explicit: tags are the user-controlled form of keeping
+  a generation; anonymous generations get the `T_grace` window. Keep what
+  you name, grace-window the rest.
 
-## Read-only mounts and update propagation
+## Concurrency: the ref guard, and the lease as a courtesy
 
-Read-only clients ingest external updates by polling the superblock and
-atomically swapping generations. CVMFS's propagation pain — often
-misdiagnosed — was never "caches served the wrong object" (their objects
-are content-addressed too); it was (a) manifest freshness behind TTL'd
-squid hierarchies with no bypass, and (b) live catalog reload renumbering
-inodes under the kernel (their inodes are assigned per catalog load),
-which broke open files and spawned years of translation machinery. Both
-are structurally absent here:
+The volume has exactly **two** mutable objects, with disjoint roles:
 
-- **Freshness signal:** a conditional GET (`If-None-Match` + ETag,
-  `?directread`) of one tiny object against the origin. A stream of 304s;
-  no TTL guessing. Poll interval is a mount option.
-- **Generation swap:** verify signature; verify **lineage** (the new
-  generation must chain, via previous-superblock hashes, to a known
-  ancestor — a fork from a stolen lease is detected exactly here); then
-  atomically replace the in-memory routing table. Stable inodes mean
-  generations agree on file identity: kernel-cached dentries/inodes for
-  unchanged files remain valid, changed files keep their inode.
-- **Per-handle snapshot isolation:** an open file's chunk list was
-  resolved at open against immutable chunks, so open handles keep reading
-  their generation's content consistently across a swap — no torn files,
-  ever. The GC grace window (T_grace via the condemned ledger) is the
-  contract backing this; a reader older than the window gets an
-  explicit "snapshot expired, refresh" rather than a silent mixture.
-- **Refresh policy is per-mount, not architectural:** batch jobs
-  (HTCondor) default to **pinned** — one generation for the job's
-  lifetime, for reproducibility; interactive read-only mounts default to
-  polling. No reader registration exists (readers stay invisible, no
-  third mutable object); staleness bounds come from the time-based GC
-  grace window instead.
+- **Superblock — consistency.** The publish-time flip re-stats the ref and
+  refuses if its ETag moved since the fetch (`refs.ErrStaleFlip`). If two
+  writers race, the loser's flip fails: its packs are uploaded but
+  unreferenced (orphans for GC), nothing interleaves, nothing corrupts.
+  This is **check-then-put, not a true compare-and-swap** — the transport
+  has no `If-Match` — so the window is narrow rather than zero. A separate
+  monotonicity guard (`refs.ErrRollback`) refuses a branch head older than
+  the newest generation this client has already accepted.
+- **Lease — liveness (advisory).** Heartbeat plus TTL plus takeover
+  warning, at `meta/lease.json`. Its only job is preventing *wasted work*:
+  fail fast at mount instead of at the first failed publish, warn
+  mid-session on takeover. It is unsigned, not content-addressed, never
+  read by read-only mounts, and its loss or corruption affects no data.
+  `--no-lease` skips it; `--steal-lease` overrides a live one.
 
-Status: IMPLEMENTED (internal/rawfuse.Refresher, `mount-gen --poll`),
-verified on a real kernel with two independent processes — a reader
-following the branch picks up another writer's sealed generation with
-no remount, invalidating only what it holds. Historical note follows.
+Given that the flip is not atomic, the lease is doing more work than
+"courtesy" implies. It is the only thing standing between two writers and
+a lost generation, and it is advisory.
 
-Phase caveat: live refresh requires the catalog-native runtime (phase 3),
-where a swap is a routing-pointer change over directly-read catalogs. In
-phase 2 — read-only mounts hydrating the JuiceFS hot engine from catalogs
-— refresh means remount. Acceptable for batch; stated here so nobody
-discovers it in production.
+## Signing, keys, and trust
 
-## Overwrite churn
+- **Two keys, two jobs.** The volume *signing* keypair (Ed25519, generated
+  at volume creation) authenticates superblocks; the user KEK — an RSA
+  private key, `--encrypt-key`, unlocked by `$PELFS_KEY_PASSPHRASE` —
+  wraps DEKs and the identity key for confidentiality. They have different
+  lifecycles and different audiences: every reader verifies signatures,
+  only key-holders decrypt. An unencrypted volume still has a signing key.
+- **First-mount trust**: an explicit `--volume-pubkey`, else
+  trust-on-first-use with the key pinned under the state directory
+  (`refs/volume.pub`) and loud errors on change — the SSH model.
+  Registry-issued attestation is explicitly out: pelfs stays a pure client
+  of dumb federation storage.
+- **Rotation:** a superblock may introduce a successor public key
+  (`NextPub`), signed by the current key; readers follow the custody chain
+  through lineage in `VerifyChain`. Verification is implemented; **nothing
+  in the CLI sets `NextPub`**, so rotation cannot be initiated today.
+  Compromise recovery is out-of-band re-pinning — custody chains cannot
+  distinguish a stolen key's rotation from a legitimate one.
+- **Threat model, stated honestly:** the federation origin is dumb storage
+  and cannot verify signatures, so a compromised *write token* permits
+  clobbering the mutable ref objects — an availability attack. Signatures
+  make forgery detectable (readers reject), and lineage plus in-pack
+  superblock backups make recovery mechanical. Integrity holds;
+  availability under token compromise does not, and no client-side design
+  can change that.
 
-The hostile workload is a file — or one hot 32KB byte range — rewritten
-and fsynced over and over (notebook autosave, a database WAL, checkpoint
-files). Immutable-object designs turn every fsynced version into new
-objects; without countermeasures, storage grows with write volume rather
-than live data. Four layers absorb it, ordered by how early they act:
+## Integrity and encryption
 
-1. **Die-young elimination (implemented, phase 1).** Every fsync of a hot
-   range creates a new JuiceFS slice; the chunk's slice stack triggers
-   compaction at just **5 slices**, which tombstones the stale versions'
-   blocks. Blocks tombstoned while still pending in the pack spool are
-   dropped at cut time: the pack uploads only live extents (re-based to
-   fresh offsets), so versions that die within the pack window — a
-   64MiB/snapshot-interval horizon — never reach the federation at all.
-   A same-range fsync loop thus costs one live version per pack cut, not
-   one per fsync.
+Two independent mechanisms, cleanly layered:
 
-   Sealing at snapshot cadence is *optimal* under the durability contract:
-   a block that survives until the snapshot is live at publish time and
-   must be uploaded regardless, so holding the active pack open longer can
-   never reduce garbage — the die-young window is automatically maximal.
-   The converse also holds: **there is no seal clock other than the
-   snapshot**, deliberately. Sealing more often than snapshotting buys
-   zero recoverable durability — the snapshot is the recovery point, and a
-   sealed block no snapshot references is an orphan after a crash — while
-   every early seal converts would-die-young bytes into sealed garbage
-   for repack. Unsealed bytes are bounded in *size* by the pack target
-   (the cut runs before an append that would exceed it; a lone
-   larger-than-target block seals immediately), and in *time* by the
-   snapshot interval. A session running --snapshot-interval 0 has opted
-   out of periodic durability entirely; its spool still respects the size
-   bound and seals at shutdown.
-   Conversely, sealed packs are never reworked on the snapshot path: seal
-   compaction is synchronous and cheap (a local sequential copy of live
-   bytes, bounded by the 64MiB target — it cannot fall behind the writer,
-   which blocks on cut), while sealed-pack cleanup is repack's job on its
-   own schedule. Repack is self-limiting in the adversarial case: the more
-   a pack's contents have died, the fewer live bytes a repack must move —
-   pathological churn makes repack cheaper per pack, not dearer.
-2. **Slice compaction (wired since v1).** JuiceFS merges a chunk's slice
-   stack into one slice (reading only the union of written ranges, so a
-   hot 32KB range compacts by reading 32KB, not the 64MiB chunk). This
-   bounds metadata growth and read fan-out between publishes; its
-   tombstones feed layer 1.
-3. **Repack (implemented).** Versions that survive a pack cut and die
-   later become dead entries inside immutable packs.
-   Per-pack liveness is exact and free (the bootstrap index knows every
-   entry; tombstones and shadowing mark the dead). Repack rewrites the
-   live entries of packs below a liveness threshold into the current
-   spool and then deletes the old packs whole. Three properties make it
-   simple: **cost is proportional to live bytes moved**, not pack size;
-   **no tombstones are needed** — the moved entries reappear in a newer
-   pack, and name-ordered shadowing already makes the newer copy
-   authoritative; and **crash mid-repack is idempotent** — duplicates
-   resolve newest-wins, and the old pack is deleted only after the new
-   one is durable (plus, in the v2 refs world, the GC grace window).
-   Policy: trigger on liveness ratio (default: condemn below 50% live)
-   with an age floor (default 10m) so the hot tail is never repacked, and
-   a total-garbage floor (default 256MiB) so small volumes are left alone.
-   In-session, repack runs opportunistically after each pre-snapshot flush
-   with a per-pass move budget (64MiB of live bytes) bounding the added
-   snapshot latency; `pelfs repack` drains everything offline under the
-   volume lease. **This bounds federation space against overwrite loops:**
-   with liveness threshold L and garbage floor G, steady-state usage is at
-   most live/L + G + one unsealed pack — a client looping overwrites
-   forever caps at roughly 2x its live data plus 256MiB, regardless of
-   write volume.
-4. **Content addressing (v2).** The endgame: identical content hashes to
-   the same chunk — a rewrite that changes nothing costs nothing — and
-   CDC re-chunking makes an edit cost proportional to the changed bytes,
-   not the file. Layers 1–3 then handle only genuinely novel dead data.
+- **Integrity: the hash tree, always on.** Signature over the superblock
+  -> root catalog identity -> catalog rows carry chunk and child
+  identities -> every byte verifies up a Merkle path to the signature.
+  This holds with or without encryption.
+- **Confidentiality: DEKs, optional and per-ref.** The superblock carries
+  a key table: key-id -> KEK-wrapped key. Every object reference records
+  the key-id its target was encrypted under (id 0 = plaintext). Catalogs
+  and shards are encrypted too — filenames leak otherwise. An unencrypted
+  volume simply has an empty key table.
 
-## Identity: inodes and hardlinks
+  Making the key-id per-reference rather than per-volume buys three
+  things: **encryption as a branch property** — a fork of an unencrypted
+  base can introduce a fresh DEK in its own superblock, and everything
+  written after the fork is protected while inherited plaintext objects
+  are read as-is; **key rotation** — new writes under a new key-id, old
+  objects readable under old ids, re-encryption deferred to repack; and
+  **honest declassify semantics** — an encrypted base can NOT be forked
+  into a public branch by pointer games, because the shared objects stay
+  ciphertext.
+
+**Chunk identity: keyed content addressing.** The tension: plaintext
+hashes give dedup but leak content-equality (the confirmation attack that
+plagues convergent encryption); ciphertext hashes with random nonces kill
+dedup. Resolution — separate the *identity key* from the *data keys*:
+
+- **Unencrypted volume:** identity = BLAKE3(plaintext). Anyone can verify
+  the Merkle path; maximal transparency.
+- **Encrypted volume:** identity = BLAKE3 in **keyed mode** with a
+  per-volume identity key stored in the key table alongside the DEKs.
+  Dedup works fully inside the volume and across its forks, since forks
+  inherit the identity key even when they introduce a fresh DEK. No party
+  without the identity key can test content presence, and cross-tenant
+  dedup — which we never wanted — is structurally impossible. Data
+  encryption stays DEK plus random nonce, fully independent of identity.
+- Identities appear only inside encrypted catalogs, shards and indexes;
+  federation-visible object names are never content-derived. Readers
+  verify integrity by decrypting a chunk and recomputing its keyed
+  identity — every reader of an encrypted volume holds the key table by
+  definition.
+
+**Chunking parameters:** FastCDC with min/avg/max = 1/4/16 MiB and
+normalization 2 (`internal/chunkid`). Rationale: scientific data dedups
+modestly, so the per-chunk costs — a catalog row and a pack fetch per
+chunk — argue for large chunks. Digests are 32 bytes. Note the
+interaction with the 2 MiB cut size: a chunk larger than the target seals
+into a pack of its own, so a large file is roughly one pack per chunk and
+a whole-pack fetch of it costs what the chunk costs.
+
+These parameters are compiled in. They are **not** recorded per volume in
+the superblock — `Params` carries the catalog thresholds and the retention
+window, and nothing else — so changing them changes chunk boundaries for
+every volume a build touches.
+
+## Inodes and hardlinks
 
 **Inodes are opaque, stable 64-bit values** allocated monotonically from
-the superblock's `next_inode` counter (sessions lease a range at mount and
+the superblock's `NextInode` counter (sessions lease a range at mount and
 publish their high-water mark; a crash burns numbers, which is fine in a
 64-bit space).
 
@@ -1002,164 +663,77 @@ location into identity means catalog splits renumber whole subtrees and a
 cross-catalog `mv` changes a file's inode — breaking POSIX rename
 semantics, open handles, NFS filehandles, and `tar`/`rsync` same-file
 detection. This is CVMFS's deepest scar (years of inode-translation
-workarounds), and a *writable* filesystem cannot dodge it the way read-only
-CVMFS does. With opaque inodes, a cross-catalog rename is just: row moves
-from catalog A to catalog B, both dirty, both republished in one
+workarounds), and a *writable* filesystem cannot dodge it the way
+read-only CVMFS does. With opaque inodes, a cross-catalog rename is just:
+row moves from catalog A to catalog B, both dirty, both republished in one
 superblock generation. The tree is the mapping; no registry exists.
 
-**Hardlinks (eager promotion).** The invariant is a single biconditional:
+**Hardlinks: eager promotion.** The invariant is a single biconditional:
 
-> dirent shared-flag set <=> nlink > 1 <=> record lives in an inode shard
+> dirent shared-flag set <=> nlink > 1 <=> content record lives in an
+> inode shard
 
-- `link()` taking nlink 1 -> 2 promotes the record from its path-catalog row
-  into a shard, leaving `(inode, shared-flag)` references in both dirents.
+- `link()` taking nlink 1 -> 2 promotes the record from its catalog into a
+  shard, leaving `(inode, shared-flag)` references in both dirents.
 - `unlink()` decrements in the shard; nlink 0 deletes the record.
 - Demotion when nlink returns to 1 is optional; if skipped, the invariant
-  relaxes one direction (`nlink > 1 => promoted`; `shared <=> in shard`).
-  If done, only opportunistically at publish while the referencing catalog
-  is being rewritten anyway.
+  relaxes one direction. If done, only opportunistically at publish while
+  the referencing catalog is being rewritten anyway.
 - Directories never promote (their nlink counts subdirectories); symlinks
   are ordinary rows. Shards hold regular files only.
+- Cross-catalog `link()` needs no EXDEV restriction: promotion handles it.
 
-Lazy promotion (promote only when a boundary would cut a link group) was
-considered and rejected for v1: it buys micro-locality for intra-catalog
-link groups — which barely exist in scratch workloads — at the price of a
-link-aware splitter and a delicate "unpromoted groups are catalog-local"
-invariant. The heavy hitters (conda/pnpm/uv package stores, `git clone` of
-local paths) span distant directories and promote under either policy.
-Eager promotion makes the "hardlink farms create unsplittable catalogs"
-problem structurally impossible rather than mitigated.
+**Validated against a real hardlink farm:** the miniconda tree carries
+23,598 hardlink groups and every one of them spans catalogs at any
+reasonable `S_max` — confirming both that eager promotion was the right
+call and that its cost is trivial: ~24K shard records, roughly 5 MB, for a
+full conda installation.
 
-Cross-catalog `link()` needs no EXDEV restriction: promotion handles it.
+## Publish
 
-## Integrity and encryption
+Publish turns a continuously-mutating volume into a consistent generation
+without pausing writers. The key inversion: **the cut is defined by a
+metadata snapshot taken first, and durability is reconciled against
+exactly that cut afterward** — not "flush everything, then snapshot",
+which races new writes into the snapshot between the flush and the cut.
 
-Two independent mechanisms, cleanly layered:
+One publish at a time, five phases. The session owns the first two;
+`internal/publish` owns the last three.
 
-- **Integrity: the hash tree, always on.** Signature over the superblock ->
-  root catalog hash -> catalog rows carry chunk/child hashes -> every byte
-  verifies up a Merkle path to the signature. This holds with or without
-  encryption. (Rejected: integrity via DEK/AEAD tags — with a public DEK,
-  anyone can forge valid tags; a signed-but-unencrypted DEK provides no
-  integrity at all. AEAD tags under a secret DEK are redundant with the
-  hash tree, which is strictly stronger.)
-- **Confidentiality: DEKs, optional and per-ref.** The superblock carries
-  a **key table**: key-id -> KEK-wrapped DEK. Every object reference
-  (catalog row, shard row, routing entry) records the key-id its target
-  was encrypted under (id 0 = plaintext). Catalogs and shards are
-  encrypted too — filenames leak otherwise. An unencrypted volume simply
-  has an empty key table.
-
-  Making the key-id per-reference rather than per-volume buys three things:
-  **encryption as a branch property** — a fork of an unencrypted base can
-  introduce a fresh DEK in its own superblock, and everything written
-  after the fork is protected while inherited plaintext objects are read
-  as-is (the confidentiality boundary is copy-on-write: what diverges is
-  protected, what stays shared stays at the base's level); **key
-  rotation** — new writes under a new key-id, old objects readable under
-  old ids, re-encryption deferred to repack; and **honest declassify
-  semantics** — an encrypted base can NOT be forked into a public branch
-  by pointer games, because the shared objects stay ciphertext; publishing
-  them requires an explicit re-encrypting repack, which is exactly the
-  operation a user should have to consciously invoke.
-
-**Chunk identity: keyed content addressing (decided).** The tension:
-plaintext hashes give dedup but leak content-equality (an adversary with
-a candidate file can test for its presence — the confirmation attack that
-plagues convergent encryption); ciphertext hashes with random nonces kill
-dedup. Resolution — separate the *identity key* from the *data keys*:
-
-- **Unencrypted volume:** identity = BLAKE3(plaintext). Anyone can verify
-  the Merkle path; maximal transparency.
-- **Encrypted volume:** identity = BLAKE3 in **keyed mode** with a
-  per-volume identity key stored in the superblock key table alongside
-  the DEKs. Dedup works fully inside the volume and across its forks
-  (forks inherit the identity key even when they introduce a fresh DEK,
-  so cross-branch dedup survives encryption changes; a declassify-style
-  fork rotates both). No party without the identity key can test content
-  presence, and cross-tenant dedup — which we never wanted — is
-  structurally impossible. Data encryption stays DEK + random nonce,
-  fully independent of identity.
-- Identities appear only inside encrypted catalogs/shards/indexes;
-  federation-visible object names are never content-derived. Readers
-  verify integrity by decrypting a chunk and recomputing its keyed
-  identity — every reader of an encrypted volume holds the key table by
-  definition, so the Merkle chain stays verifiable exactly where it needs
-  to be.
-- Rejected: convergent encryption (confirmation attacks by construction,
-  breaks rotation); plaintext hashes as object names (leaks equality to
-  the whole federation); pure ciphertext addressing (no dedup).
-
-**Chunking parameters (decided, recorded per-volume in the superblock):**
-FastCDC with min/avg/max = 1/4/16 MiB, inline threshold 4 KiB (well below
-the CDC minimum). Rationale: scientific data dedups modestly, so the
-per-chunk costs — a catalog row and a range-GET per chunk — argue for
-large chunks; 4 MiB average preserves continuity with the v1 block size.
-Hash digests are 32 bytes (BLAKE3 in both modes). Note the interaction
-with the 2 MiB cut size: a chunk larger than the target seals into a pack
-of its own, so a large file is roughly one pack per chunk and a whole-pack
-fetch of it costs what the chunk costs.
-
-## Read path / write path / publish
-
-The architecture splits **hot** (live session, local) from **cold**
-(published, federation). Packs and catalogs are publish-oriented; a live
-FUSE mount needs random writes at full POSIX semantics, and teaching a
-multi-catalog engine to be the live engine would rewrite the hottest code
-in JuiceFS while invalidating its battle-testing.
-
-- **Hot:** exactly today's runtime — live JuiceFS SQLite + local block
-  cache + FUSE/NFS frontends. Unmodified in phases 1-2.
-- **Publish:** the transactional pipeline below (replaces the v1 whole-DB
-  snapshot). Cost is proportional to churn, not volume size.
-- **Restore/read:** fetch superblock, verify signature; fetch root
-  catalog; hydrate (see the hydration decision below); chunk reads are
-  range-GETs into packs, served through federation caches.
-
-### Publish: the transactional pipeline
-
-Publish turns a continuously-mutating hot volume into a consistent
-generation without pausing writers. The key inversion: **the cut is
-defined by a metadata snapshot taken first, and durability is reconciled
-against exactly that cut afterward** — not "flush everything, then
-snapshot," which races new writes into the snapshot between the flush and
-the cut (a hole v1 carries).
-
-State machine, one publish at a time (single writer, single publisher):
-
-1. **CUT.** Take a consistent local snapshot of the hot metadata (SQLite
-   makes this cheap and instantaneous relative to I/O). This defines
+1. **CUT.** Take a consistent local view of the overlay. This defines
    generation N+1's contents; writes continuing during publish belong to
-   N+2 and are irrelevant.
-2. **RECONCILE.** For every chunk the cut references: if already sealed,
-   done; if pending in the spool, seal; if still in a JuiceFS writer,
-   flush that inode's writer and seal. Reconciliation touches only the
-   cut's dirty set, and force-seals at most one partial pack.
-3. **TRANSFORM.** From the cut, regenerate every dirty path catalog and
-   inode shard (dirty = owns a row changed since the last published cut —
-   in phase 2, a local indexed `changed-since` query; in phase 3 the
-   engine maintains the dirty set natively). Flatten slices into extent
-   lists; CDC-chunk; dedup against the chunk index; append new chunks,
-   small files, catalogs, shards, and the superblock backup into packs.
-   Ancestor catalogs of dirty catalogs are dirty too (transition hashes
-   change), up to the root. Content addressing makes this idempotent: a
-   regenerated-but-identical catalog hashes the same and is skipped.
-   **Repack folds in here** as one more transform: live entries of
-   condemned packs move into the open pack, and the condemned packs are
-   simply omitted from the new pack list — repack becomes
-   generation-atomic and grace-windowed by ref retention, rather than a
-   separate mutation as in phase 1.
-4. **UPLOAD.** All new packs, in parallel. Everything uploaded is
+   N+2 and are irrelevant. A mid-session **checkpoint** freezes the
+   overlay to get that instant, because it publishes while writers keep
+   working; the **seal at unmount** does not, because the mountpoint is
+   already gone and the live overlay *is* an instant. That distinction is
+   worth ~32 s of hardlinking plus ~6 s of unlinking on an 85k-file
+   session, all of it in front of a waiting user.
+2. **RECONCILE.** Everything the cut references must exist locally before
+   it can be packed.
+3. **TRANSFORM.** From the cut, regenerate every dirty catalog and inode
+   shard. Chunk with CDC; dedup against the chunk index and against the
+   previous generation; append new chunks, small files, catalogs, shards,
+   and the superblock backup into packs. Ancestor catalogs of dirty
+   catalogs are dirty too, up to the root. Content addressing makes this
+   idempotent: a regenerated-but-identical catalog hashes the same and is
+   skipped, and an unchanged subtree is carried forward without being
+   read.
+4. **UPLOAD.** New packs, four at a time. Everything uploaded is
    content-addressed and unreferenced until the flip.
-5. **FLIP.** Write the new superblock (root hash, routing, pack list,
-   allocator high-water, lineage pointer, signature) via ETag
-   compare-and-swap on the ref. CAS failure = concurrent writer: abort
-   loudly; uploaded objects are orphans, nothing corrupts.
+5. **FLIP.** Write the new superblock via the ref guard. A stale ref means
+   a concurrent writer: abort loudly; uploaded objects are orphans,
+   nothing corrupts.
 
-Crash analysis, by phase: before UPLOAD — nothing remote changed; during
-UPLOAD — complete or partial packs exist unreferenced (orphans; rescue can
-adopt, GC will sweep); after UPLOAD, before FLIP — a complete generation
-exists unreferenced (same); FLIP is atomic. Re-publishing after any crash
+The pack list is carried forward from the previous generation
+unconditionally, and content reuse depends on that: a carried-forward
+chunkref names bytes living in one of the previous generation's packs, and
+retention deletes any pack no live superblock lists. If that ever grows a
+filter, reuse must be gated on the surviving set in the same change.
+
+Crash analysis: before UPLOAD — nothing remote changed; during UPLOAD —
+complete or partial packs exist unreferenced (orphans; GC will sweep);
+after UPLOAD, before FLIP — a complete generation exists unreferenced
+(same); FLIP is a single small write. Re-publishing after any crash
 re-derives the same content hashes, skips what already uploaded, and
 completes — publish is idempotent end to end. If a publish overruns the
 interval, the next tick is skipped and its churn coalesces into the
@@ -1168,321 +742,624 @@ following cut; publishes never overlap.
 Readers observe generation N or N+1, never a mixture: the superblock is
 the sole entry point, and everything beneath it is immutable.
 
-### Hydration (phase-2 decision)
+A **superblock backup** rides in the last pack of each publish, stored
+raw, so a lost ref object can be recovered. It is built before the final
+seal, so its own pack list lacks the very pack that carries it.
 
-Phase 2 mounts hydrate the hot engine with **full metadata, lazy data**:
-download all catalogs/shards for the pinned generation (parallel,
-resumable — compressed metadata for a million files is a few hundred MB,
-tens of seconds on decent links, and batch jobs pay it once), build the
-hot DB, then fetch chunk data on demand through the block cache. True
-lazy *metadata* descent — mount instantly, fault catalogs in on first
-lookup — requires intercepting lookups inside the metadata engine and is
-deliberately deferred to phase 3, where the catalog-native engine reads
-catalogs directly and lazy descent is its natural mode, not a retrofit.
-This also restates the earlier read-only caveat: phase-2 refresh is
-remount; live generation swap arrives with phase 3.
+## The mount
 
-## Migration phases
+A full POSIX implementation — including kernel dentry caching done right —
+requires the RAW FUSE protocol layer, not a convenience wrapper: pelfs
+implements `fuse.RawFileSystem` on upstream `hanwen/go-fuse`, whose raw
+surface carries everything the binding needs — per-reply entry and attr
+validity, entry and inode notification, readdirplus, `Attr.Blksize`. The
+high-level layers hide exactly the knobs this design exists to exploit.
 
-1. **Pack store as ObjectStorage middleware.** — **SUPERSEDED** (the
-   middleware is deleted; internal/packstore keeps the pack container
-   itself, which phase 2 and 3 write and read directly). It shipped as
-   described below and bought the small-object fix a full format ahead of
-   the catalogs; nothing bootstraps by listing packs/ any more, because a
-   generation's pack list is the closure.
-   Writeback staging batched blocks locally;
-   drain-time packing plus indexed range-read GETs fixes small-object
-   overhead and read RTTs with zero metadata format change. Packs carry a
-   JSON index trailer (entries + tombstones); packs sort by name in
-   creation order and later tombstones shadow earlier entries, so a fresh
-   session bootstraps by listing packs/ and fetching trailers. Write-side
-   packing requires --writeback (Put defers durability to the pack flush;
-   flushes precede every metadata snapshot and run at shutdown after the
-   staging drain); the read side is always active, so any session — 
-   including gc/fsck and non-writeback restores — reads packed volumes.
-   Space from deleted entries is reclaimed by a future `pelfs repack`
-   (tombstoned entries remain in their packs until then); gc --delete of a
-   packed entry from a read-only session is non-durable (the entry
-   resurfaces at the next bootstrap — space, never correctness).
-2. **Cold format.** — **IMPLEMENTED** (internal/publish, internal/refs,
-   internal/retention). Publish turns a source tree into
-   catalogs/shards/packs and flips a signed ref. During this phase the
-   source was a cut of the v1 metadata and `internal/hydrate` rebuilt a
-   mountable v1 volume from a published generation; both are deleted now
-   that the runtime reads generations natively.
-3. **Catalog-native runtime.** — **THE LOOP IS CLOSED**. Landed:
-   internal/genfs (generation resolver), internal/rawfuse (raw kernel
-   binding, read and write), internal/overlay (crash-safe write path),
-   and seal (internal/publish reads a Source, so an overlay becomes a
-   generation directly). Every pelfs command now runs on this stack, and
-   the v1 engine is gone. The order was deliberate: v1 owned the default
-   mount path until the format had run real workloads, so what is
-   battle-tested is our format, not somebody else'"'"'s schema.
+The FUSE-agnostic core — generation resolver: catalog descent, residency,
+shard routing, chunk reads — is `internal/genfs`. The raw binding is
+`internal/rawfuse`, and the crash-safe write overlay is
+`internal/overlay`.
 
-   Measured on the phase-3 read path (M-series, 512-entry catalog,
-   loopback origin) after the prepared-statement, pooling, and
-   readdirplus-join work:
+### The immutability dividend
 
-   | op | before | after |
-   |---|---|---|
-   | Lookup, 1 thread | 19.1 us | 15.3 us |
-   | Lookup, 64 threads | 48.6 us | 15.7 us |
-   | GetAttr, 64 threads | 34.1 us | 5.7 us |
-   | Readdir (512 entries) | 12.6 ms | 0.78 ms |
-   | warm 1 MiB read | 24.5 GB/s | 33.9 GB/s |
-   | inline read | 32 ns, 0 allocs | unchanged |
+Within a generation, clean inodes never change — so Lookup and GetAttr
+replies for them carry effectively infinite entry and attr timeouts (ten
+years), and the kernel becomes the dentry and attr cache. Metadata storms
+(`git status`, build scans) hit userspace once per mount, not once per
+call. This single decision is why the custom VFS outperforms a generic
+engine.
 
-   Metadata latency is now FLAT under concurrency instead of degrading
-   2.5x, and a cold 1M-entry walk falls from ~25 s to ~1.5 s — the
-   phase-3 "usable in seconds" target, met by the resolver before the
-   kernel's infinite-TTL caching is even counted.
+Measured through a real Linux kernel (2000 files, stat walk):
 
-   **The immutability dividend, measured through a real Linux kernel**
-   (scripts/phase3-docker.sh --bench; 2000 files, stat walk):
+| stat walk, 2000 files | A: writable, all dirty | B: read-only, clean | C: writable over clean |
+|---|---|---|---|
+| cold | 0.87 s | 0.39 s | 0.42 s |
+| repeat | 1.03 s (no gain) | **0.14 s** | **0.25 s** |
+| read all | 0.37 s | 0.12 s | 0.18 s |
 
-   | stat walk, 2000 files | A: writable, all dirty | B: read-only, clean | C: writable over clean |
-   |---|---|---|---|
-   | cold | 0.87 s | 0.39 s | 0.42 s |
-   | repeat | 1.03 s (no gain) | **0.14 s** | **0.25 s** |
-   | read all | 0.37 s | 0.12 s | 0.18 s |
+C is the case that matters in practice — a writable mount over a large
+tree whose content is almost entirely untouched — and it performs close to
+the read-only mount, because clean inodes keep their infinite TTLs even
+when the mount is writable. Writability costs almost nothing on the parts
+you did not write. That only holds because the "is this inode dirty?"
+question, asked on every lookup, is answered from memory in ~15 ns; as a
+SQL query it cost 24 µs, more than a whole Lookup.
 
-   C is the case that matters in practice — a writable mount over a
-   large tree whose content is almost entirely untouched — and it
-   performs close to the read-only mount, because clean inodes keep
-   their infinite TTLs even when the mount is writable. Writability
-   costs almost nothing on the parts you did not write. That only holds
-   because the "is this inode dirty?" question, asked on every lookup,
-   is answered from memory in ~15 ns; as a SQL query it cost 24 us, more
-   than a whole Lookup.
+Dirty inodes reply with a **short** TTL — one second
+(`rawfuse.dirtyValidity`) — not zero. The TTL was originally zero, on the
+reasoning that an inode the overlay owns can change at any moment.
+Measurement showed what that cost: with no attribute cache the kernel
+re-asks about every change it just made itself, and an untar traced at
+14.1 FUSE operations per created file, six of them existing only because
+of the zero TTL. Raising it to one second cut the untar 1.57x (878 -> 1379
+files/s) and a walk over the dirty tree 1.87x.
 
-   The repeat walk over DIRTY inodes gains far less, because their
-   replies carry only a short TTL and most stats go back to userspace.
-   Over CLEAN inodes the kernel answers from its own dentry/attr cache
-   and the same walk is 5.5x faster. That gap is the design's central
-   claim, confirmed end to end rather than argued.
+The safety argument is exclusive ownership, not optimism: the overlay is
+opened `locking_mode EXCLUSIVE`, so the only mutations are ones the kernel
+itself issued, and the reply to each refreshes the very entry in question.
+The kernel can hold its own most recent view, never another writer's stale
+one. It stays short rather than infinite because one transition does move
+state out from under the kernel — a mid-session checkpoint returning
+inodes to clean — and a bounded TTL converges on its own if an
+invalidation is ever missed.
 
-   The dirty TTL was originally ZERO, on the reasoning that an inode the
-   overlay owns can change at any moment. Measurement showed what that
-   cost: with no attribute cache the kernel re-asks about every change it
-   just made itself, and an untar traced at 14.1 FUSE operations per
-   created file, six of them existing only because of the zero TTL.
-   Raising it to one second cut the untar 1.57x (878 -> 1379 files/s) and
-   a walk over the dirty tree 1.87x.
+The repeat walk over dirty inodes gains far less than over clean ones,
+where the kernel answers from its own caches and the same walk is 5.5x
+faster. That gap is the design's central claim, confirmed end to end
+rather than argued.
 
-   The safety argument is exclusive ownership, not optimism: the overlay
-   is opened locking_mode EXCLUSIVE, so the only mutations are ones the
-   kernel itself issued, and the reply to each refreshes the very entry
-   in question. The kernel can hold its own most recent view, never
-   another writer's stale one. It stays SHORT rather than infinite
-   because one transition does move state out from under the kernel — a
-   mid-session checkpoint returning inodes to clean — and a bounded TTL
-   converges on its own if an invalidation is ever missed.
+Resolver latency, measured on a 512-entry catalog against a loopback
+origin, before and after the prepared-statement, pooling and
+readdirplus-join work:
 
-   It also names the next bottleneck: in writable mounts every operation
-   pays a userspace round trip into an overlay that serializes on one
-   mutex and commits a SQLite transaction per op (~0.4 ms/stat). Finer
-   overlay locking is the phase-3 tuning lever, exactly as the v0
-   simplification predicted.
+| op | before | after |
+|---|---|---|
+| Lookup, 1 thread | 19.1 µs | 15.3 µs |
+| Lookup, 64 threads | 48.6 µs | 15.7 µs |
+| GetAttr, 64 threads | 34.1 µs | 5.7 µs |
+| Readdir (512 entries) | 12.6 ms | 0.78 ms |
+| warm 1 MiB read | 24.5 GB/s | 33.9 GB/s |
+| inline read | 32 ns, 0 allocs | unchanged |
 
-## Phase 3 VFS architecture
+Metadata latency is FLAT under concurrency instead of degrading 2.5x, and
+a cold 1M-entry walk falls from ~25 s to ~1.5 s.
 
-A full POSIX implementation — including kernel dentry caching done
-right — requires the RAW FUSE protocol layer, not a convenience
-wrapper: pelfs implements `fuse.RawFileSystem` on upstream
-hanwen/go-fuse, whose raw surface carries everything the binding needs
-— per-reply entry/attr validity, entry/inode notification, readdirplus,
-`Attr.Blksize`. The high-level layers hide exactly the knobs this
-design exists to exploit.
+The next bottleneck it names: in writable mounts every operation pays a
+userspace round trip into an overlay that serializes on one mutex and
+commits a SQLite transaction per op (~0.4 ms/stat). Finer overlay locking
+is the tuning lever.
 
-**The immutability dividend.** Within a generation, clean inodes never
-change — so Lookup and GetAttr replies for them carry effectively
-INFINITE entry/attr timeouts, and the kernel becomes the dentry/attr
-cache. Metadata storms (`git status`, build scans) hit userspace once
-per mount, not once per call. Dirty (overlay) inodes reply with zero
-TTLs. This single decision is why the custom VFS can outperform the
-generic engine it replaces.
+### Inode residency
 
-**Generation swap = enumerated invalidation.** Stable inodes mean the
-difference between two generations is exactly the catalog diff: swap
-atomically replaces the routing table, then issues EntryNotify for
-changed/removed dirents and InodeNotify for changed content — no TTL
-guessing, no cache flush. Open handles keep their generation's chunk
-lists (per-handle snapshot isolation, unchanged from the read-only
-design).
+The catalog is a locator by descent: the kernel always Lookups parent
+before child, so the VFS builds `inode -> (catalog, shard)` residency on
+the way down and holds it exactly for kernel-live inodes; FORGET and
+BatchForget (nlookup accounting) retire entries. Residency is a cache of
+the descent, never an authority — the CVMFS translation-machinery scar
+stays closed.
 
-**Inode residency from kernel lookup order.** The catalog is a locator
-by descent: the kernel always Lookups parent before child, so the VFS
-builds inode -> (catalog, shard) residency on the way down and holds it
-exactly for kernel-live inodes; FORGET/BatchForget (nlookup accounting)
-is what retires entries. Residency is a cache of the descent, never an
-authority — the CVMFS translation-machinery scar stays closed.
+### Read path
 
-**Read path.** ReaddirPlus fills entries and attributes in one pass
-from a catalog page. File reads resolve chunkrefs to the identity-keyed
-decoded-chunk cache, then to the pack holding the chunk, fetched whole
-("Whole packs, not ranges"); cache hits serve via
-splice (ReadResultFd) for zero-copy. FOPEN_KEEP_CACHE holds page cache
-across open/close of immutable files; kernel writeback-cache mode
-batches dirty pages for the overlay.
+ReaddirPlus fills entries and attributes in one pass from a catalog page.
+File reads resolve chunkrefs to the identity-keyed decoded-chunk cache,
+then to the pack holding the chunk, fetched whole. `FOPEN_KEEP_CACHE`
+holds the page cache across open and close of clean files on a read-only
+mount; kernel writeback-cache mode batches dirty pages for the overlay.
+Zero-copy `splice` from the cache file (`ReadResultFd`) is *not*
+implemented — reads copy through `ReadResultData`.
 
-**Write path = overlay + seal.** Writes never mutate a generation: a
-local overlay (dirty tree + staged chunks, WAL-backed) shadows the
-immutable base; publish seals the overlay into catalogs/packs and flips
-— the CUT/RECONCILE/TRANSFORM pipeline collapses to "seal", as the
-migration section promises. Overlay design details land with phase 3
-implementation.
+Open is stateless (`Fh 0`) and there is no per-handle snapshot isolation.
+Chunk lists live in a per-inode cache which a generation swap clears
+wholesale, so an open file re-resolves its chunks after a swap rather than
+keeping the generation it opened. What the resolver does guarantee is that
+no read is torn: catalog handles are refcounted and the swap takes a lock
+against readers.
 
-**Frontend caveat.** The low-level wins are Linux-FUSE (and macFUSE
-where present). The macOS Docker/NFS fallback keeps NFSv4 semantics —
-client-driven caching, no invalidation push — and stays the degraded
-path it already is in v1.
+### Generation swap
 
-The FUSE-agnostic core (generation resolver: catalog descent, residency,
-shard routing, chunk reads) is `internal/genfs`, built during phase 2 as
-independent groundwork; the raw FUSE binding and the overlay are the
-phase-3 work proper.
+Read-only clients ingest external updates by polling the superblock
+(`--poll`) and atomically swapping generations. Freshness comes from a
+conditional GET (`If-None-Match` plus ETag, direct-read) of one tiny
+object against the origin — a stream of 304s, no TTL guessing.
 
-## Ejecting JuiceFS: done
+The swap verifies the signature, verifies **lineage** (the new generation
+must chain, via previous-superblock hashes, to a known ancestor — a fork
+from a stolen lease is detected exactly here), then atomically replaces
+the in-memory routing table and issues `EntryNotify` for changed or
+removed dirents and `InodeNotify` for changed content. Stable inodes mean
+the difference between two generations is exactly the catalog diff: no TTL
+guessing, no cache flush. Verified on a real kernel with two independent
+processes — a reader following the branch picks up another writer's sealed
+generation with no remount, invalidating only what it holds.
 
-Audited by import, not by impression, and then carried out. Nothing in
-the tree imports JuiceFS.
+Refresh policy is per-mount, not architectural: batch jobs default to
+**pinned** — one generation for the job's lifetime, for reproducibility;
+`--poll` opts into following. No reader registration exists (readers stay
+invisible, no third mutable object); staleness bounds come from the
+time-based GC grace window instead.
 
-**Tier A — the v1 engine itself. Deleted, not ported:**
+CVMFS's propagation pain — often misdiagnosed — was never "caches served
+the wrong object"; their objects are content-addressed too. It was
+manifest freshness behind TTL'd squid hierarchies with no bypass, and live
+catalog reload renumbering inodes under the kernel, which broke open files
+and spawned years of translation machinery. Both are structurally absent
+here.
 
-| package | replaced by |
-|---|---|
-| `mountfs` | `rawfuse` + `mount-gen` |
-| `nfsmount/billyfs.go`, `handlecache.go` | `vfsbilly` |
-| `offline` (gc/fsck) | `retention` (the sweep) and `fsck` (the checker) |
-| `snapshot` | superblock generations |
-| `cutdb` | the overlay source under seal |
-| `hydrate` | OBSOLETE: it existed to mount a generation with the v1 engine, which the mount path now does natively |
-| `packstore`'s ObjectStorage middleware | the pack list; a generation names its own packs, so nothing replays trailers to find one |
-| `dockerrun` | the NFS backend, which is what macOS-without-macFUSE actually needs |
+### Write path
 
-**Tier B — the `object.ObjectStorage` interface.** Replaced by
-`pelicanobj.ObjectStore`: String, Get, Put, Delete, Head, ListAll, and a
-plain `Object` struct. Everything in this format is immutable and
-content-addressed, so there is nothing for rename, copy, multipart, or
-storage classes to abstract over. The client-side object encryptor went
-with it — volume encryption is the key table plus per-entry AEAD.
+Writes never mutate a generation: a local overlay — dirty tree plus staged
+chunks, SQLite-backed — shadows the immutable base, and each modified file
+gets a staging file keyed by inode. A **checkpoint** on a cadence
+(`--snapshot-interval`, default 5 minutes) or on write pressure (128 MiB
+of dirty bytes) seals a frozen view into a generation and rebases
+provably-unmodified inodes back to clean; the seal at unmount does the
+same without freezing. `--no-seal` keeps the overlay for a later remount
+instead.
 
-Consequences: one direct dependency and its whole transitive tree left
-`go.mod`, the three cgo-free shim modules that existed to keep that tree
-buildable are gone, and the build needs no tags at all. The go-fuse fork
-that outlived the engine is gone too — upstream hanwen/go-fuse v2.11.0
-serves the binding unchanged.
+`design-writepath.md` proposes replacing the staging directory with an
+LSM-shaped memtable so content leaves during the session. It is **not
+built**.
 
-**Migration for existing v1 volumes: drain, never convert.** This was
-settled in the table below and it is what shipped. `pelfs publish`,
-which promoted a v1 volume in place, is gone: keeping it would have
-meant keeping the v1 metadata engine and block reader — the heaviest
-part of the dependency — to serve volumes that are by charter scratch.
-A prefix holding v1 metadata is still RECOGNIZED (`classifyVolume` probes
-for it) and refused with instructions, because the alternative failure
-mode is reading it as an empty prefix and initializing a new volume over
-somebody's data. To move one: read it with the last release that had the
-v1 engine, and copy the tree into a fresh prefix served by this one.
+### Frontends
 
-## Settled decisions (with rejected alternatives)
+Two, both real. Native **FUSE** is the default wherever `/dev/fuse` or
+macFUSE is present. On macOS without either, a **loopback NFSv3 server**
+(`internal/nfsmount` over `internal/vfsbilly`) is mounted by the OS NFS
+client, unprivileged, with no kernel extension. `--backend auto|fuse|nfs`
+picks. The low-level caching wins are FUSE-only: NFS keeps client-driven
+caching with no invalidation push, and stays the degraded path. Hard links
+work over it, on a small go-nfs fork documented in `go-nfs-patches.md`.
+
+## Retention and GC
+
+Retention is expressed entirely in the ref and generation layer, and the
+pack list makes the sweep set arithmetic rather than tree traversal:
+
+- **Pack lists carry forward.** Publish appends new packs to the previous
+  generation's list; the only thing that would ever REMOVE a pack from the
+  list is repack. So a branch head's list covers every ancestor's packs.
+- **The condemned ledger covers the exception.** When repack drops a pack
+  from the list, the new superblock is to record it in a small `condemned`
+  ledger as (name, condemned-at); publish carries ledger entries forward
+  until they age past `T_grace`. GC honours the ledger today. **Nothing
+  writes it**, because there is no repack.
+- **Retained packs** = the union over every ref head and every tag of
+  (pack list + condemned entries younger than `T_grace`). No catalog
+  walking is needed for deletion safety — the pack list *is* the reachable
+  closure at pack granularity. `T_grace` defaults to 72h, is recorded in
+  the superblock `Params` so writers, readers and GC agree, and is
+  configurable per volume.
+- **Sweep** = delete packs that are (a) absent from the retained union AND
+  (b) older than `T_grace` by the timestamp in the pack name. Guard (b) is
+  what makes GC safe to run concurrently with writers, with no locking: a
+  writer's new packs are always younger than `T_grace`, so they are never
+  candidates regardless of when GC listed the refs. GC re-lists refs
+  immediately before issuing deletes as a cheap window-narrower, not a
+  correctness requirement. It **fails closed**: any unverifiable ref or
+  tag aborts the sweep, as does finding no refs and no tags at all.
+- **Granularity:** whole packs and ref debris only — never entries, which
+  would be repack's job. Deleting a branch or tag is how space is actually
+  released.
+- **Who runs it:** `pelfs gc`, which needs no lease and reports without
+  `--delete`.
+- **The reader contract:** a reader pinned to an untagged generation older
+  than `T_grace` may see "snapshot expired — refresh or remount". A
+  workflow that needs a longer pin tags first; tags pin exactly and
+  indefinitely. Nothing raises that error today; the grace window is
+  enforced only from the sweep side.
+
+## Codec marking
+
+The CVMFS scar to avoid: bytes whose compression algorithm is implied by
+convention rather than recorded. Every place the format transforms bytes,
+and where its algorithm lives:
+
+| bytes | compression | encryption | recorded where |
+|---|---|---|---|
+| chunk pack entries | zstd or none (store-if-smaller) | AES-256-GCM or none | `chunkref.alg` + `chunkref.keyid`, per entry |
+| catalog / shard pack entries | always zstd | one volume key or none | fixed by rule + `superblock.CatalogKeyID` (their references have no per-entry columns) |
+| superblock backup entries | none | none | stored raw; the superblock is signed and public |
+| pack trailer | zstd (`PELFSPK2`) or none (`PELFSPK1`) | never | footer magic versions the codec |
+| superblock | none | never (signed, public) | `FormatVersion` |
+| static catalog | n/a (self-describing header) | n/a | `format_major`/`format_minor` in the header; identity algo in the header and the meta section |
+| inline bytes | raw | ride inside the catalog entry | n/a |
+
+New algorithms are new ids, or a new footer magic; nothing is ever sniffed
+from magic bytes inside an entry.
+
+## Local caching
+
+One cache, under the volume's state directory (`gencache/`), with four
+kinds of thing in it:
+
+- `chunks/` — **decoded** chunk bytes (post-zstd, post-AES), keyed by
+  chunk identity. This is the only local data store.
+- `packs/` — whole packs, the unit of transfer.
+- `catalogs/` — catalog blobs by identity.
+- `trailers/` — verified pack trailers, so a resolved location map
+  survives a remount.
+
+`--prefetch all` fills the chunk cache for a whole generation before the
+mount starts and refuses to run if anything is unavailable; `--prefetch
+background` starts the same warmup without blocking. Prefetch walks
+catalogs rather than the pack list on purpose: the pack list includes
+catalogs, shards and backups, and can name packs holding chunks no live
+file references.
+
+## Overwrite churn
+
+The hostile workload is a file — or one hot byte range — rewritten and
+fsynced over and over (notebook autosave, a database WAL, checkpoint
+files). Immutable-object designs turn every fsynced version into new
+objects; without countermeasures, storage grows with write volume rather
+than live data. Three things absorb it, and the third does not exist yet:
+
+1. **Local overwrite in place.** A staging file is overwritten, not
+   appended to, so intermediate versions never become chunks and never
+   reach the federation. Only what survives to a checkpoint or a seal is
+   chunked at all. This is the largest effect and it is free.
+2. **Content addressing.** Identical content hashes to the same chunk — a
+   rewrite that changes nothing costs nothing — and CDC re-chunking makes
+   an edit cost proportional to the changed bytes, not to the file. A
+   chunk that a later generation stops referencing stays in its pack.
+3. **Repack — NOT IMPLEMENTED.** Versions that survive a seal and die
+   later are dead entries inside immutable packs, and nothing reclaims
+   them. `pelfs gc` deletes whole packs no retained generation lists; it
+   never rewrites one. So federation usage on a long-lived volume under an
+   overwrite loop grows without bound, and the `live/L + G + one pack`
+   bound this document once claimed is a property of a design, not of the
+   code.
+
+   What a repack would do: rewrite the live entries of packs below a
+   liveness threshold into the current spool, then delete the old packs
+   whole. Three properties make it simple: cost is proportional to live
+   bytes moved, not pack size; no tombstones are needed, since the moved
+   entries reappear in a newer pack and the pack list decides what is
+   live; and crash mid-repack is idempotent, because the old pack is
+   deleted only after the new one is durable and the grace window covers
+   the gap. It folds into TRANSFORM as one more transform — condemned
+   packs are simply omitted from the new pack list — which makes it
+   generation-atomic rather than a separate mutation. Repack is
+   self-limiting in the adversarial case: the more a pack's contents have
+   died, the fewer live bytes a repack must move. `design-writepath.md`
+   carries the policy work.
+
+## Disaster recovery
+
+The superblock is the only mutable object, which makes it the natural
+worry: what survives if it is lost or corrupted? Answer: everything except
+the map — packs contain the catalogs and inode shards as well as the data,
+so recovery is a scavenging problem, made tractable by three format
+provisions that are all in place:
+
+1. **Typed pack entries.** Every trailer entry carries a type (data chunk,
+   catalog, inode shard, superblock backup; absent = data). One byte of
+   JSON per entry; without it, recovery would have to sniff container
+   magic, which encryption makes impossible.
+2. **Self-identifying catalogs.** Each catalog embeds volume UUID, its
+   covered subtree root path, and its identity algorithm; because
+   transition-point rows carry child catalog identities, the tree is
+   *self-assembling* — find all catalog entries, descend by embedded child
+   identities, and a root candidate is any catalog covering "/" that no
+   other catalog references. A crash mid-publish legitimately leaves a
+   newer, incomplete set (packs upload before the flip), so recovery falls
+   back a generation when a closure has holes.
+3. **Superblock backups ride in packs.** Superblocks are tiny; each
+   publish writes the current one into its last pack as a typed entry.
+   Losing the mutable object then costs only the generations since the
+   last publish — recovery becomes "restore the newest embedded backup,
+   verify its signature, re-point the ref", recovering the allocator
+   counter, shard ranges, pack list, and the wrapped key table exactly. (A
+   lost KEK is still fatal for encrypted data, by design; the wrapped DEK
+   in a backup is harmless to expose.)
+
+`pelfs rescue` — enumerate packs, inventory trailers, assemble the newest
+complete generation, then report subtrees intact, files damaged by missing
+chunks, catalogs missing, and a hash-only lost+found for data reachable
+from no surviving catalog — is **specified here and not implemented**. The
+format prerequisites above all shipped, which was the point: retrofitting
+them would have left early volumes unrescuable.
+
+`pelfs fsck` does exist and verifies a published generation: it builds the
+full location map from the signed pack list, walks catalogs and shards,
+checks record order, and with `--deep` verifies chunk bytes against their
+identities.
+
+## Session control socket
+
+The primary interface is `pelfs shell` / `mount` / `umount`; publishing is
+a session activity, not a separate workflow. Each session listens on a
+Unix-domain socket in its state directory (`control.sock`, mode 0600)
+speaking plain HTTP — curl-able, no custom framing:
+
+- `GET  /v1/status` — mount point, prefix, generation, uptime
+- `GET  /v1/stats` — the live session-statistics JSON
+- `POST /v1/publish` — checkpoint now, keep serving (writable mounts only;
+  a read-only mount 404s it)
+- `GET  /v1/bugreport` — tar.gz: status, stats, goroutine dump, runtime
+  info, volume public key
+- `/debug/pprof/*` — the standard profiling surface
+
+`pelfs ctl <prefix-or-mountpoint> <verb>` is the CLI client. Possession of
+the state dir is already possession of the volume's local keys, so no
+further auth.
+
+## Fuzzing
+
+1. **Parser fuzzing — unrestricted.** Everything that parses untrusted
+   federation bytes has a native Go fuzz target: pack trailers
+   (`FuzzDecodeTrailer`, `FuzzParseTail`), superblock decode and verify
+   (`FuzzDecodeVerify` — mutations must never verify, `VerifyChain` must
+   never panic), the entry codec (`FuzzDecode`, GCM fails closed), the
+   chunker (`FuzzChunker` — termination, bounds, exact reassembly,
+   determinism), and the static catalog parser (`FuzzStaticCatalog`).
+   Pure functions on byte slices; run anywhere, run in CI. The first run
+   already forced a hardening fix (negative trailer extents reaching the
+   range-read path).
+2. **Op-sequence fuzzing — CONTAINED, ALWAYS.** `FuzzOps` drives random
+   filesystem operation sequences (the fsx/syzkaller shape) against the
+   overlay, checked against an in-memory reference model, plus a
+   concurrent stress mode under the race detector. This tier mutates real
+   files, so a bug under fuzz pressure could write ANYWHERE the process
+   can — containment is mandatory, never optional: the harness only builds
+   under the `opfuzz` tag, refuses to run unless the containment
+   launcher's environment is present, does its own path work through
+   `os.Root`, and the ONLY sanctioned entrypoint is
+   `scripts/opfuzz-docker.sh` — a network-less, cap-dropped, unprivileged,
+   read-only-rootfs container whose only writable space is a tmpfs.
+3. **Mounted-FS fuzzing — future, same containment.** Driving real
+   syscalls through the kernel against a mount, with the mountpoint as the
+   fuzzer's `os.Root`, so neither a VFS bug nor a fuzzer bug can traverse
+   out.
+
+## Benchmarks and acceptance criteria
+
+A fixed suite, run against a local federation and one real OSDF prefix;
+targets follow from the measurements above. The container-based gates live
+in `scripts/` (`mount-gate-docker.sh`, `bench-untar-docker.sh`,
+`bench-untar-nfs-docker.sh`, `e2e-docker.sh`).
+
+1. Kernel-source untar plus publish: publish cost proportional to churn;
+   republish after touching one file ≈ one catalog plus ancestors.
+2. `conda create` (the hardlink storm): completes; promotion adds ≤ ~10 MB
+   of shards; subsequent publish seconds, not minutes.
+3. `git clone` plus `git status`: correct, and status latency within 2x
+   local disk on a warm cache.
+4. 10 GB single-file write: ≥ 0.8x the raw upload throughput of the same
+   host (chunking and packing overhead budget: 20%).
+5. Cold mount of a 1M-entry volume: ≤ 3 s to usable. Measured at ~1.5 s.
+6. Overwrite-loop soak: federation usage bounded over hours. **Cannot
+   pass** until repack exists — see "Overwrite churn".
+
+## Settled decisions
 
 | decision | rejected alternative | why |
 |---|---|---|
-| opaque stable 64-bit inodes | (catalog ID, file ID) composition | splits/renames must not change identity; CVMFS scar |
+| opaque stable 64-bit inodes | (catalog ID, file ID) composition | splits and renames must not change identity; CVMFS scar |
 | catalog located by tree descent | inode -> catalog registry | no consumer needs reverse lookup for nlink==1; registry is pure liability |
-| eager promotion of nlink>1 to inode shards | intra-catalog-only hardlinks (EXDEV); lazy promotion | hardlink farms (conda!) make catalogs unsplittable; lazy needs link-aware splitter |
-| shards live as own object class, routed by superblock | in superblock; in a path catalog | superblock must stay tiny; path-catalog home re-couples location and rebuilds the hotspot |
+| eager promotion of nlink>1 to inode shards | intra-catalog-only hardlinks (EXDEV); lazy promotion | hardlink farms (conda) make catalogs unsplittable; lazy needs a link-aware splitter |
+| shards as their own object class, routed by superblock | in the superblock; in a path catalog | superblock must stay tiny; a path-catalog home re-couples location and rebuilds the hotspot |
 | range-friendly packs, CDC for edit sharing | literal git packfile with delta chains | filesystems serve range reads; delta chains force full reconstruction |
-| integrity from Merkle + signature | integrity from DEK/AEAD tags | public DEK forges tags; hash tree is stronger and encryption-independent |
-| boring small superblock (CBOR/SQLite) | mmap'd minimal perfect hash | wrong cardinality: thousands of rows, not millions |
-| 4KB inline threshold (configurable) | 512B | SQLite beats the filesystem below ~10KB; kills most dotfiles/configs |
-| hot/cold split; JuiceFS stays live engine until phase 3 | multi-catalog live engine | rewriting JuiceFS's hottest paths forfeits exactly the battle-testing we cited |
-| GC = set arithmetic on retained generations' pack lists | mark-sweep over catalog trees | pack lists ARE the closure at pack granularity; no walk, no marking state |
-| T_grace age guard makes GC lock-free | GC/writer/fork coordination via lease | new packs are always younger than the guard; fork sources are already retained |
+| integrity from Merkle plus signature | integrity from DEK/AEAD tags | a public DEK forges tags; the hash tree is stronger and encryption-independent |
+| boring small CBOR superblock | mmap'd minimal perfect hash | wrong cardinality: thousands of rows, not millions |
+| inline threshold 2048, configurable | 512; never inlining | inlining makes catalogs numerous, which is what makes an incremental seal cheap |
+| GC = set arithmetic on retained generations' pack lists | mark-sweep over catalog trees | pack lists ARE the closure at pack granularity |
+| `T_grace` age guard makes GC lock-free | GC/writer/fork coordination via the lease | new packs are always younger than the guard; fork sources are already retained |
 | separate Ed25519 signing key per volume | sign with the KEK | verification is public, decryption is not; unencrypted volumes still need authenticity |
-| TOFU + pinning for first-mount trust | mandatory pre-shared pubkey; registry attestation | SSH model works; pelfs stays a pure client, no registry integration (owner's call) |
-| time-ordered pack names, trailer hash in pack list | content-hash pack names | age guard + ordering come free; the list-recorded hash gives verification anyway |
+| TOFU plus pinning for first-mount trust | mandatory pre-shared pubkey; registry attestation | the SSH model works; pelfs stays a pure client, no registry integration |
+| time-ordered pack names, trailer hash in the pack list | content-hash pack names | the age guard and ordering come free; the list-recorded hash gives verification anyway |
 | no atime in catalogs | persisted atime | reads must never dirty metadata on a publish-what-changed filesystem |
-| migration = drain v1 read-only into fresh v2 prefix | in-place format conversion | dual-format readers forever, for volumes that are by charter scratch |
-| reader fetches whole packs, publisher cuts small (2 MiB) | promote a pack on consumption evidence (byte/entry ratios, speculation bound) | four constants tuned against an unnameable workload; the same read cost 10 KiB or 64 MiB depending on history |
+| reader fetches whole packs, publisher cuts small (2 MiB) | promote a pack on consumption evidence | four constants tuned against an unnameable workload; the same read cost 10 KiB or 64 MiB depending on history |
 | locations resolved on demand, newest pack first | index every trailer at mount | one round trip per pack before serving a byte, scaling with volume rather than with the question |
+| static packed catalogs, SQLite still readable | in-place conversion of every catalog | conversion re-identifies and re-uploads the whole namespace for no reader benefit |
+
+## Designed, not built
+
+Everything in this list is specified above and has no implementation.
+Nothing else in this document is aspirational.
+
+- **Repack.** No function, no command. `superblock.Condemned` is a field
+  nothing writes. This is the one gap with a user-visible consequence:
+  dead bytes inside retained packs are never reclaimed.
+- **`pelfs rescue`.** Fully specified; the format prerequisites shipped.
+- **Forks.** No command creates a ref from another generation.
+- **Tag creation.** `refs.Store.Tag` exists with no caller; tags can be
+  read (`--tag`) but not written.
+- **Key rotation.** `NextPub` is verified but never set.
+- **The LSM write path** of `design-writepath.md`, except its
+  `internal/memtable` prototype, which nothing imports.
+- **`splice`/`ReadResultFd`** on cache hits.
+- **The "snapshot expired" reader error.** The grace window is enforced
+  from the sweep side only.
 
 ## Open format questions
 
 One question is open, it is additive, and it is the owner's to decide.
 
-**Nothing in the signed superblock says where any identity lives.**
-`PackEntry` carries a name, a trailer hash, and a size; `RootCatalog`,
-`CatalogEntry.Identity`, and `ShardEntry.Identity` carry identities. There
-is no mapping from identity to pack anywhere except a pack trailer, so a
-cold mount cannot find its own root catalog without fetching at least one.
+**Nothing in the signed superblock says where any identity lives.** So a
+cold mount cannot find its own root catalog without fetching at least one
+trailer. Three candidates, cheapest first, measured on the Linux 6.6
+corpus:
 
-Three candidates, cheapest first, measured on the corpus above:
+1. **Record the root catalog's pack** (a `root_pack` string, omitempty).
+   Saves the one trailer probe a cold mount pays today: 1–2 GETs and
+   128–256 KiB, ~20–40 ms. Small on average. What it really buys is the
+   tail: the probe order is a heuristic — "the root catalog is in the
+   newest pack, because publish writes it last" — which held at every pack
+   size measured, but if it ever fails (a generation whose root catalog is
+   carried forward unchanged while later packs were appended, or a repack
+   that reorders the list) the probe budget runs out and the mount
+   resolves the whole map instead. At 1002 packs that is 1001 GETs and
+   125 MiB, at mount. This converts a 1-GET mount with a rare four-figure
+   tail into a 1-GET mount with no tail.
+2. **Record each catalog's pack** (a `pack` field on `CatalogEntry`, which
+   publish already maintains). Makes the whole namespace descent
+   location-free. Measured value is LOW on top of (1), because publish
+   already writes catalogs at the end of a seal. It buys determinism
+   rather than requests.
+3. **A per-generation location index**: one object holding every trailer's
+   entries merged, named from the superblock by identity and size. This is
+   the one that addresses the real cost. What forces a mount into
+   resolving the whole map is a CHUNK in an old pack, and no amount of
+   catalog metadata helps with that. On this corpus the merged trailers
+   are about 2.2 MiB — one GET — against 251 GETs and 32.1 MiB of tail
+   probes at 1 MiB packs, or 63 GETs and 7.9 MiB at 4 MiB. It is also what
+   would let the cut size go below 1 MiB, where the fixed 128 KiB probe
+   currently dominates. Backward compatible in both directions: a reader
+   that finds no such field falls back to trailers, and a reader that does
+   not understand the field ignores it.
 
-1. **Record the root catalog's pack** (a `root_pack` string on the
-   superblock, omitempty per the evolution rule). Saves the one trailer
-   probe a cold mount pays today: 1–2 GETs and 128–256 KiB, ~20–40 ms.
-   Small on average. What it really buys is the tail: the probe order is
-   a heuristic — "the root catalog is in the newest pack, because publish
-   writes it last" — which held at every pack size measured, but if it
-   ever fails (a generation whose root catalog is carried forward
-   unchanged while later packs were appended, or a repack that reorders
-   the list) the probe budget runs out and the mount resolves the whole
-   map instead. At 1002 packs that is 1001 GETs and 125 MiB, at mount.
-   This converts a 1-GET mount with a rare four-figure tail into a 1-GET
-   mount with no tail.
-2. **Record each catalog's pack** (a `pack` field on `CatalogEntry`,
-   which already exists and is already maintained by publish). Makes the
-   whole namespace descent location-free. Measured value is LOW on top of
-   (1), because publish already writes catalogs at the end of a seal, so
-   newest-first already finds them in one or two probes. It buys
-   determinism rather than requests.
-3. **A per-generation location index**: one object holding every
-   trailer's entries merged, named from the superblock by identity and
-   size. This is the one that addresses the real cost. What forces a
-   mount into resolving the whole map is a CHUNK in an old pack, and no
-   amount of catalog metadata helps with that. On this corpus the merged
-   trailers are about 2.2 MiB — one GET — against 251 GETs and 32.1 MiB
-   of tail probes at 1 MiB packs, or 63 GETs and 7.9 MiB at 4 MiB. It is
-   also what would let the cut size go below 1 MiB, where the fixed
-   128 KiB probe currently dominates. Backward compatible in both
-   directions: a reader that finds no such field falls back to trailers,
-   and a reader that does not understand the field ignores it.
+Deliberately deferred, needing external partners or production mileage
+rather than design: **POSIX ACLs** (out of scope; xattrs carry them
+opaquely) and **compression dictionaries** for small-chunk cohorts
+(measure first).
 
-None of these has been implemented; the format is unchanged.
+---
 
-## Open design work
+## Appendix A: the engine this replaced
 
-**The open list is empty.** Every item from earlier drafts is now settled
-in a section above: publish transactionality (CUT/RECONCILE/TRANSFORM/
-UPLOAD/FLIP, repack folded into TRANSFORM); chunk identity (keyed BLAKE3,
-FastCDC 1/4/16 MiB); phase-2 hydration; versioned pack lists; catalog
-split heuristics (measured: peel-largest-child, W = 200·entries +
-inline bytes, S_max 8 MiB / S_min 1 MiB); retention and GC (set
-arithmetic on pack lists, T_grace age guard replaces locking); signing
-and key management (Ed25519 volume identity separate from KEK, TOFU
-pinning, custody-chain rotation); federation namespace layout (refs/,
-tags/, leases/, packs/; time-ordered pack names, no manifest object);
-catalog schema (atime dropped, prefix-sum chunkrefs, JuiceFS
-session/trash/lock tables removed); benchmarks and acceptance criteria;
-and the migration decision (drain-and-copy, never in-place).
+pelfs v1 stored data as JuiceFS blocks and metadata as a whole-volume
+SQLite snapshot, with the JuiceFS metadata engine as the live filesystem.
+It is deleted — nothing in the tree imports it — and it is recorded here
+because the reasons it existed, and the reasons it stopped being enough,
+are the argument for everything above.
 
-Deliberately deferred, not open — these need external partners or
-production mileage, not more design:
+**Why it existed.** A live FUSE mount needs random writes at full POSIX
+semantics, and JuiceFS had a battle-tested engine for exactly that.
+Teaching a multi-catalog engine to be the live engine meant rewriting the
+hottest code in someone else's filesystem while invalidating its testing.
+So the split was hot (live session, local) versus cold (published,
+federation), with the borrowed engine on the hot side. It also meant the
+default mount path stayed on proven code until this format had run real
+workloads — deliberately, so that what is battle-tested now is our format
+rather than somebody else's schema.
 
-- **POSIX ACLs** (schema section): out of scope for v2.0; xattrs carry
-  them opaquely if a frontend ever needs them.
-- **`pelfs rescue` implementation.** Fully specified by the
-  disaster-recovery section; its format prerequisites (typed entries,
-  self-identifying catalogs, in-pack superblock backups) are pinned to
-  land with phase 2 because retrofitting leaves early volumes
-  unrescuable. What remains is code, not design.
-- **Compression dictionaries** for small-chunk cohorts: measure first.
+**Why it stopped being enough**, all three confirmed in real use:
 
-## Relationship to v1 components
+1. **Small objects.** Every JuiceFS slice became its own federation
+   object. Small files and fragmented writes produced storms of tiny
+   objects — uniform 32 KB objects from the NFS backend before the handle
+   cache — each costing an HTTP round trip, polluting the namespace, and
+   caching poorly.
+2. **Metadata scaling.** The entire SQLite catalog was re-uploaded every
+   snapshot interval, forever, no matter how little changed. Cost grew
+   with volume size, not churn: a million-file volume paid gigabytes of
+   upload per hour while idle.
+3. **Cache hostility.** Data blocks were keyed by mutable-looking names
+   and the metadata snapshot was overwritten in place, so mutable-object
+   reads had to bypass federation caches and the lease machinery guarded
+   several objects.
 
-Survived: the pelicanobj transports, preflight, the token machinery, the
-NFS and FUSE frontends, stats, prefetch (walks catalogs instead of
-ScanSlices), and the lease (a superblock ETag guard). Replaced and
-deleted: the block-per-object layout, whole-database snapshots, and the
-v1 runtime itself.
+**Two of its mechanisms are worth remembering.** Its packs bootstrapped by
+*listing* `packs/` and trusting name-ordered shadowing, with tombstones in
+the trailer marking dead entries — which is why the trailer schema still
+has a `"dead"` field. A generation's pack list replaced all of it: the
+superblock hands a fresh session the authoritative, generation-consistent
+pack set, with no listing and no race against a concurrent repack. And its
+snapshots were crash-recovery checkpoints rather than versions: older
+siblings rotted as later sessions tombstoned their blocks, so only the
+newest was guaranteed consistent. Versioning the pack set is what makes a
+tagged generation permanent instead.
+
+**Migration is drain, never convert.** A v1 volume is read with the last
+release that had the v1 engine and copied into a fresh prefix. In-place
+conversion was rejected: it would force every reader to carry v1's
+slice-name block layout and unversioned-snapshot semantics forever, for
+the convenience of volumes that are by charter scratch. `pelfs publish`,
+which promoted a v1 volume in place, is gone — keeping it meant keeping
+the v1 metadata engine and block reader, the heaviest part of the
+dependency. A prefix holding v1 metadata is still RECOGNIZED
+(`classifyVolume` probes for it) and refused with instructions, because
+the alternative failure mode is reading it as an empty prefix and
+initializing a new volume over somebody's data.
+
+**What ejecting it bought**, beyond the format: one direct dependency and
+its whole transitive tree left `go.mod`, the three cgo-free shim modules
+that existed to keep that tree buildable are gone, and the build needs no
+tags at all. The `object.ObjectStorage` abstraction went with it —
+everything here is immutable and content-addressed, so there is nothing
+for rename, copy, multipart, or storage classes to abstract over — and so
+did the go-fuse fork that had outlived the engine.
+
+**What survived:** the transports, preflight, the token machinery, the NFS
+and FUSE frontends, stats, prefetch (which walks catalogs instead of
+scanning slices), and the lease.
+
+## Appendix B: considered and not taken
+
+Recorded so they are not re-proposed. Decisions already summarised in the
+"Settled decisions" table are not repeated here.
+
+**The literal git packfile format.** Git packs are zlib streams with delta
+chains optimized for whole-object reconstruction; a filesystem serves
+range reads, and delta chains force reconstructing an object to serve any
+byte of it. The "edits share storage with the previous version" benefit
+comes instead from content-defined chunking: an edited large file
+re-chunks and shares unmodified chunks with its ancestor via content
+addressing, at zero read-path cost. True deltas, if ever wanted, are
+confined to small objects and are not in this design.
+
+**Whole-pack solid compression.** Rejected outright: one cold read would
+fetch and decompress everything before it. Per-entry compression is what
+makes an entry independently readable.
+
+**Alignment padding between pack entries.** HTTP ranges are byte-granular
+and the local cache reads whole entries, so alignment would pay only if
+packs were mmap'd locally. Revisit then, not before.
+
+**A pack promotion heuristic** — fetch a pack whole only after a reader
+had demonstrably started consuming it, via a byte ratio, an entry ratio, a
+floor on distinct entries, and a bound on how far ahead of the reader it
+would speculate. It worked, and it was unpredictable: the same read cost a
+kilobyte or sixty-four megabytes depending on what the mount had happened
+to read earlier, and tuning it meant tuning four constants against a
+workload nobody can name in advance. Bounding the transfer is the
+publisher's job instead, through the cut size.
+
+**Indexing every pack trailer at mount.** One round trip per pack before
+serving a byte, scaling with volume size rather than with the question
+asked. The numbers are in "Locations resolve on demand".
+
+**Walking lineage hashes to ancestors' pack lists** instead of carrying a
+condemned ledger forward. Rejected because anonymous ancestors'
+superblocks are not reliably fetchable once the ref moves — they live only
+as scattered in-pack backups. The head must state everything.
+
+**Content-derived pack names.** Buys nothing: the age guard and creation
+ordering come free from time-ordered names, and the pack list already
+records each trailer's hash.
+
+**Heartbeating through the superblock** to preserve a "one mutable object"
+purity claim. That conflates roles — re-signing every 30 s, lineage
+polluted or bypassed by heartbeats, and readers unable to distinguish "new
+generation" from "still alive" without parsing.
+
+**Convergent encryption** (confirmation attacks by construction, breaks
+rotation); **plaintext hashes as object names** (leaks content equality to
+the whole federation); **pure ciphertext addressing** (no dedup). Keyed
+BLAKE3 with a per-volume identity key is the resolution.
+
+**Lazy hardlink promotion** — promote only when a catalog boundary would
+cut a link group. It buys micro-locality for intra-catalog link groups,
+which barely exist in scratch workloads, at the price of a link-aware
+splitter and a delicate "unpromoted groups are catalog-local" invariant.
+The heavy hitters (conda, pnpm, uv package stores, `git clone` of local
+paths) span distant directories and promote under either policy. Eager
+promotion makes "hardlink farms create unsplittable catalogs"
+structurally impossible rather than mitigated.
+
+**Three writeback dispositions** — synchronous, writeback with a
+dirty-bytes cap, and an "accumulate" mode that uploaded nothing until job
+end. None was built, and the overlay plus checkpoint covers the ground
+they were meant to: content stays local until a checkpoint or the seal,
+which is the accumulate shape, and the checkpoint cadence is the dial. The
+one idea worth keeping is the cap — a session that fills local disk should
+push back on the writer rather than explode — and nothing enforces one
+today.
+
+**Full-metadata hydration at mount** — download every catalog and shard
+for a generation, rebuild a local database, then fetch data on demand.
+This was the bridge design for a runtime that could not read catalogs
+directly. The resolver reads them natively and descends lazily, so
+hydration was deleted rather than tuned; a cold 1M-entry walk is ~1.5 s
+without it.

@@ -2,6 +2,7 @@ package overlay
 
 import (
 	"context"
+	"os"
 
 	"github.com/bbockelm/pelfs/internal/genfs"
 	"github.com/bbockelm/pelfs/internal/memtable"
@@ -121,4 +122,43 @@ func (m *memtableContent) Packs(ctx context.Context) ([]packstore.SealedPack, er
 		m.seal = nil
 	}
 	return m.store.Packs(), nil
+}
+
+// OpenContentStore builds a memtable content store for an overlay
+// directory, journalled into that directory, and recovers whatever a
+// previous session left behind.
+//
+// It exists so a caller does not have to know the assembly order — the
+// journal must be opened before the store, because what it holds is what
+// the store is rebuilt FROM, and the ring file lives beside it. The
+// returned report is recovery's account of itself and must be shown to
+// the user whenever it reports loss.
+func OpenContentStore(dir string, opts memtable.Options) (*memtable.Store, *memtable.Report, func() error, error) {
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return nil, nil, nil, err
+	}
+	j, err := openContentJournal(dir)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	d, err := j.Load()
+	if err != nil {
+		j.Close() //nolint:errcheck
+		return nil, nil, nil, err
+	}
+	opts.Dir = dir
+	opts.Journal = j
+	store, rep, err := memtable.Recover(opts, d)
+	if err != nil {
+		j.Close() //nolint:errcheck
+		return nil, nil, nil, err
+	}
+	closeBoth := func() error {
+		err := store.Close()
+		if cerr := j.Close(); err == nil {
+			err = cerr
+		}
+		return err
+	}
+	return store, rep, closeBoth, nil
 }

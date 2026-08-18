@@ -1288,13 +1288,11 @@ remount; live generation swap arrives with phase 3.
 
 A full POSIX implementation — including kernel dentry caching done
 right — requires the RAW FUSE protocol layer, not a convenience
-wrapper: pelfs implements `fuse.RawFileSystem` (the go-fuse fork we
-vendor has the complete raw surface: per-reply entry/attr validity,
-entry/inode/delete notification, NotifyStore, readdirplus — the one
-JuiceFS dependency that outlived the engine, because upstream
-hanwen/go-fuse at the pinned version lacks pieces the binding uses and
-adopting a modern release is a separate migration). The high-level
-layers hide exactly the knobs this design exists to exploit.
+wrapper: pelfs implements `fuse.RawFileSystem` on upstream
+hanwen/go-fuse, whose raw surface carries everything the binding needs
+— per-reply entry/attr validity, entry/inode notification, readdirplus,
+`Attr.Blksize`. The high-level layers hide exactly the knobs this
+design exists to exploit.
 
 **The immutability dividend.** Within a generation, clean inodes never
 change — so Lookup and GetAttr replies for them carry effectively
@@ -1371,10 +1369,9 @@ with it — volume encryption is the key table plus per-entry AEAD.
 
 Consequences: one direct dependency and its whole transitive tree left
 `go.mod`, the three cgo-free shim modules that existed to keep that tree
-buildable are gone, and the build needs no tags at all. What remains is
-one replace directive for the go-fuse fork, whose raw surface the
-binding depends on; moving to a modern upstream release is its own piece
-of work.
+buildable are gone, and the build needs no tags at all. The go-fuse fork
+that outlived the engine is gone too — upstream hanwen/go-fuse v2.11.0
+serves the binding unchanged.
 
 **Migration for existing v1 volumes: drain, never convert.** This was
 settled in the table below and it is what shipped. `pelfs publish`,

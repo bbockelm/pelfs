@@ -5,7 +5,7 @@ go 1.26.0
 require (
 	github.com/fxamacker/cbor/v2 v2.9.2
 	github.com/go-git/go-billy/v5 v5.9.1
-	github.com/hanwen/go-fuse/v2 v2.1.1-0.20210611132105-24a1dfe6b4f8
+	github.com/hanwen/go-fuse/v2 v2.11.0
 	github.com/klauspost/compress v1.19.1
 	github.com/pelicanplatform/pelican v0.0.0-20260813210837-7a5e7ab292c3
 	github.com/willscott/go-nfs v0.0.4
@@ -126,13 +126,6 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
-
-// The raw FUSE surface pelfs binds to — per-reply entry/attr validity,
-// entry/inode/delete notification, NotifyStore, readdirplus — is complete
-// only in this fork at the version upstream pins here. Moving to upstream
-// hanwen/go-fuse means adopting a much newer release with its own API
-// changes; that is its own piece of work.
-replace github.com/hanwen/go-fuse/v2 v2.1.1-0.20210611132105-24a1dfe6b4f8 => github.com/juicedata/go-fuse/v2 v2.1.1-0.20260811090623-38a391aab45e
 
 // TEMPORARY fork replace: picks up the client fix that requests
 // storage.modify for uploads when Client.EnableOverwrites is set. The

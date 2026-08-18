@@ -127,13 +127,22 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 )
 
-// TEMPORARY fork replace: picks up the client fix that requests
-// storage.modify for uploads when Client.EnableOverwrites is set. The
-// fix is not upstream yet; it lives on branch pelfs-overwrite-scopes of
-// the fork https://github.com/bbockelm/pelican (commit 991d3b616). A
-// fork replace — not a local path — so CI runners can fetch it.
-// DROP this replace and bump the pinned pelicanplatform/pelican version
-// as soon as the fixes land on pelican main.
+// Fork replace, branch pelfs-overwrite-scopes of
+// https://github.com/bbockelm/pelican (commit 991d3b616). A fork replace
+// rather than a local path, so CI runners can fetch it.
+//
+// It carries more than the scope fix it was created for, and pelfs does
+// not merely prefer the fork — it does not COMPILE without it:
+//
+//   - uploads request storage.modify when Client.EnableOverwrites is set;
+//     upstream still hardcodes MethodPut with config.TokenWrite
+//   - TransferEngine.Walk and .List, called directly by fedstore.go
+//   - director-response cache keyed per flavor, so a writer is never
+//     handed the cache a reader populated
+//   - service-digest checksum defaults, and a LazyStat transfer option
+//
+// Dropping this therefore needs all of those upstream, not just the
+// first. Checked against pelican main on 2026-08-17: still required.
 replace github.com/pelicanplatform/pelican => github.com/bbockelm/pelican v0.0.0-20260816185645-991d3b61662d
 
 // Fork replace: LINK misparsed its own arguments and answered failures

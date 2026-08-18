@@ -1,10 +1,12 @@
 # go-nfs: the fork we carry, and what is left in it
 
 The loopback-NFS backend runs on [willscott/go-nfs](https://github.com/willscott/go-nfs).
-Three of its behaviors were wrong for us; two are fixed on a fork, one was
-fixed upstream, and one remains tolerated. This note records what the fork
-holds, why it exists rather than a set of local wrappers, and what is still
-open.
+Five of its behaviors were wrong for us: two are fixed on a fork, one was
+fixed upstream, one is worked around inside pelfs, and one is tolerated as
+it stands. This note records what the fork holds, why it exists rather
+than a set of local wrappers, and what is still open.
+
+The pin lives in `go.mod`:
 
     replace github.com/willscott/go-nfs => github.com/bbockelm/go-nfs <pseudo-version>
 
@@ -32,10 +34,6 @@ Every avenue for intercepting a handler is closed by design:
   EXCLUSIVE rejection happened while parsing the request, before the
   filesystem was ever consulted.
 
-Rewriting RPCs in a wrapping `net.Listener` would technically work and is
-far worse than a fork: it means re-implementing record marking and XDR, and
-the substitution changes message sizes.
-
 ## Fixed on the fork: LINK
 
 `ln`, and every hardlink entry in a tarball, used to come back as **EIO**.
@@ -56,9 +54,10 @@ The fork parses the message as defined and sizes both replies correctly.
 It also stops requiring the operation to arrive through `nfs.UnixChange`,
 whose `Link` takes two paths that the old parse had no way to produce: a
 filesystem can now implement `nfs.HardLinker` — the same two-path shape,
-on the filesystem itself — and `internal/vfsbilly` does. `internal/nfsmount`
-forwards it through the diagnostic wrapper only when the wrapped filesystem
-really has it, the same conditional-wrapping rule that governs
+on the filesystem itself — and `internal/vfsbilly` does
+(`vfsbilly.go:74`, `vfsbilly.go:473`). `internal/nfsmount` forwards it
+through the diagnostic wrapper only when the wrapped filesystem really has
+it (`diag.go:197-250`), the same conditional-wrapping rule that governs
 `billy.Change`.
 
 `onFSInfo` used to set `FSF3_LINK` for any filesystem satisfying
@@ -83,11 +82,8 @@ touching the file when the same verifier comes back (a retransmission), and
 `NFS3ERR_EXIST` when a different one does. `fs.Create` truncates, so it is
 skipped on a retransmission — re-running it would discard the data the
 original request's writes already put there. Verifiers are held in memory
-with a TTL rather than persisted in the file's timestamps as RFC 1813
-suggests; the property that matters — never truncating a file whose name
-someone else won — holds either way, and a verifier lost to a restart or
-the TTL merely turns a retransmission back into the EXIST error it was
-before.
+with a TTL; see the appendix for why they are not persisted in the file's
+timestamps as RFC 1813 suggests.
 
 **This is not a throughput win, and the measurement should be believed over
 the intuition.** Removing the wasted round trip drops CREATE from 2.00 to
@@ -111,20 +107,7 @@ Upstream `master` fixes this (`onRemoveObj` lists the directory and answers
 is based on master rather than on the v0.0.4 tag we used to pin. Gated in
 `scripts/bench-untar-nfs-docker.sh`.
 
-## Still tolerated: COMMIT is a no-op
-
-`onCommit` replies OK without flushing, documented as "we always push writes
-to the backing store". That is true for the filesystem we serve:
-`internal/vfsbilly` has no write-handle cache — the overlay commits each
-Write to its staging file before returning — so there is nothing buffered
-for a COMMIT to flush. Durability beyond that is the seal at exit, which is
-pelfs's actual promise.
-
-A patch honoring an optional `Sync() error` on the backend's `billy.File`
-is easy and was written once; it is not carried because nothing here needs
-it, and a fork should hold only what is load-bearing.
-
-## Still tolerated: an unrecognized error becomes NFS3ERR_IO
+## Worked around in pelfs: an unrecognized error becomes NFS3ERR_IO
 
 `onCreate`, `onMkdir`, `onSymlink`, `onRemove`, `onRename` and `onRead`
 answer `NFSStatusIO` for any billy error they cannot place, and they place
@@ -137,11 +120,39 @@ error raw. The response formatter then falls through to
 `ResponseCodeSystemError`: an RPC-level rejection rather than an NFS status,
 which is how a perfectly ordinary ENOENT reached a client as EIO.
 
-**What we do about it:** this one *is* fixable from outside, so it is.
-`internal/nfsmount/diag.go` wraps the served filesystem. Errors from the
-attribute setters come back as `*nfs.NFSStatusError` carrying the status
+This one *is* fixable from outside, so it is fixed there rather than on the
+fork. `internal/nfsmount/diag.go` wraps the served filesystem. Errors from
+the attribute setters come back as `*nfs.NFSStatusError` carrying the status
 that describes them, which fixes SETATTR outright and leaves Apply's own
 `os.ErrPermission` test working through the wrap. Everything else that is
 about to become NFS3ERR_IO is logged with its operation, path and cause,
 rate-limited, so a bare "Input/output error" on a client is always
 explained on the server.
+
+## Tolerated: COMMIT is a no-op
+
+`onCommit` replies OK without flushing, documented as "we always push writes
+to the backing store". That is true for the filesystem we serve:
+`internal/vfsbilly` has no write-handle cache — the overlay commits each
+Write to its staging file before returning — so there is nothing buffered
+for a COMMIT to flush. Durability beyond that is the seal at exit and the
+periodic checkpoint, which is pelfs's actual promise.
+
+## Appendix: considered and not taken
+
+Recorded so they are not re-proposed.
+
+- **Rewriting RPCs in a wrapping `net.Listener`.** Technically possible and
+  far worse than a fork: it means re-implementing record marking and XDR,
+  and the substitution changes message sizes. This is the last avenue left
+  once the four interception points above are closed, and it is why the
+  fork exists at all.
+- **A patch honoring an optional `Sync() error` on the backend's
+  `billy.File`.** Easy, and written once. Not carried, because nothing here
+  needs it — see "COMMIT is a no-op" — and a fork should hold only what is
+  load-bearing. Revisit if a backend ever buffers writes.
+- **Persisting EXCLUSIVE verifiers in the file's timestamps**, as RFC 1813
+  suggests. Rejected in favour of an in-memory table with a TTL: the
+  property that matters — never truncating a file whose name someone else
+  won — holds either way, and a verifier lost to a restart or the TTL
+  merely turns a retransmission back into the EXIST error it was before.

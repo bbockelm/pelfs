@@ -651,6 +651,75 @@ the superblock — `Params` carries the catalog thresholds and the retention
 window, and nothing else — so changing them changes chunk boundaries for
 every volume a build touches.
 
+## Locating things: trailers, and the multi-pack index
+
+A pack's trailer is its own index, so a reader that does not know which
+pack holds an object consults them all — one federation round trip per
+pack, before a mount can serve its first call. At 201 packs on a slow
+link that is a mount that appears to hang, and it is what a session
+report showed.
+
+Git reached the same place: per-pack `.idx` files, then a
+multi-pack-index once pack count made per-pack lookup the bottleneck. The
+asymmetry sharpens the case here. Git's `.idx` files are local and
+mapped, so consulting two hundred is microseconds of binary search; our
+trailers are REMOTE, so the identical structure costs two hundred round
+trips. Git added its index to save microseconds; we add ours to save
+minutes.
+
+**Both are the same structure** (`internal/packidx`): fixed-width records
+sorted by identity behind a 256-entry fanout, read in place. 81 ns per
+lookup against 50,000 entries, with nothing decompressed and nothing
+parsed — against a zstd-compressed JSON trailer, which has to be
+decompressed and parsed in full to answer one question.
+
+**An index is DERIVED, and that is the point.** Publish writes it, repack
+rewrites it, losing one costs speed and nothing else. Catalogs and
+chunkrefs go on naming identities alone, which is what lets a repack move
+bytes without rewriting anything that refers to them. Putting a pack name
+in a catalog entry would buy the same round trips and give that up —
+worse, the superblock's catalog list is carried forward between
+generations, so a repack would leave carried entries pointing at packs
+that no longer hold them, silently demoting the fast path with no signal.
+
+**Fetched in parallel, always.** A generation carrying several indexes
+must cost one round trip's latency rather than several; serial fetches
+would trade N round trips for a smaller N, still paid one after another,
+which is most of the problem rather than a fix. Eight indexes at 100 ms
+each load in 101 ms, and a test fails if that ever serialises.
+
+**A failed index is not a failed mount.** It is derived, the trailers
+still answer, and a reader that cannot verify one says so and carries on.
+
+### Sizing, merging and retiring
+
+At 53 bytes per entry, the 2 MiB target is about 40,000 entries — which
+at a 2 MiB pack cut and a 4 KiB average chunk is roughly 80 packs per
+index, so 201 packs is three indexes and one parallel fetch.
+
+  - **Target 2 MiB.** An index is fetched WHOLE, so its size is what
+    consulting it costs, and matching the pack cut keeps that comparable
+    to fetching one pack.
+  - **Merge at publish, bounded.** A publish writes an index for the
+    packs it created. If that index and the newest existing one are both
+    well under target, they are merged and the old one superseded — but
+    only while the rewrite stays within the target, so a small generation
+    never pays a large re-upload to tidy the index set.
+  - **Retire below liveness.** An index whose covered packs are mostly
+    deleted spends its bytes on entries that resolve to nothing. Under
+    50% live, a repack drops it and re-emits its live entries; an index
+    whose packs are all gone is deletable outright. Retention keeps an
+    index while any live superblock names it, exactly as for packs.
+
+### Root catalog hint
+
+Even with an index, a mount must locate the root catalog before it can
+consult anything. The superblock records where the root catalog object
+sits — as a HINT, not a fact: identity remains the truth, a repack may
+move the object, and a reader verifies what it finds against the identity
+the superblock already records and falls back to the index when it does
+not match. A stale hint costs a fallback, never a wrong answer.
+
 ## Inodes and hardlinks
 
 **Inodes are opaque, stable 64-bit values** allocated monotonically from

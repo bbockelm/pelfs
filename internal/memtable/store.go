@@ -43,6 +43,14 @@ type Options struct {
 	// PackTarget is the size packs are cut at. Zero takes
 	// DefaultPackTarget.
 	PackTarget int64
+	// UploadQueueBytes bounds how much cut-but-unsent pack data may
+	// accumulate before packing waits for the uplink. Zero takes
+	// DefaultUploadQueueBytes; the bound wants to be generous, because
+	// what it buys by being small is nothing a session benefits from.
+	UploadQueueBytes int64
+	// UploadWorkers is how many packs may be in flight at once. Zero takes
+	// DefaultUploadWorkers.
+	UploadWorkers int
 	// PromotionDistance is how far behind the head an extent must fall
 	// before the packer takes it. Zero packs whatever is there, which is
 	// what a flush wants; DefaultPromotionDistance is what a session
@@ -134,6 +142,10 @@ type Stats struct {
 	AdoptedBytes     int64
 	AdoptedInline    int64
 	AdoptedByReading int64
+	// UploadBacklog is bytes cut into packs and not yet sent. It is the
+	// measure of how far a session is running ahead of its uplink, and
+	// the thing that eventually applies backpressure.
+	UploadBacklog int64
 	// PackReadsLocal and PackReadsRemote split reads of packed content by
 	// where the bytes came from. The claim they check is the one that
 	// decides whether staging can go away: content this session wrote
@@ -185,6 +197,10 @@ type Store struct {
 	// what lets a seal re-chunk a rewrite without fetching back bytes it
 	// uploaded minutes ago.
 	cache *packCache
+	// uploads carries finished packs to the federation in the background,
+	// so a pack run ends when the pack EXISTS rather than when it lands
+	// (uploads.go).
+	uploads *uploadQueue
 
 	packing bool // a pack run is in flight
 	// reclaimTo is the furthest position a completed pack has asked the
@@ -263,6 +279,12 @@ func newStore(opts Options) (*Store, error) {
 	if opts.PackTarget == 0 {
 		opts.PackTarget = DefaultPackTarget
 	}
+	if opts.UploadQueueBytes == 0 {
+		opts.UploadQueueBytes = DefaultUploadQueueBytes
+	}
+	if opts.UploadWorkers == 0 {
+		opts.UploadWorkers = DefaultUploadWorkers
+	}
 	// A promotion distance at or above the ring's size is not a tuning
 	// choice, it is a store that never ages anything out: every pack run
 	// would start from a writer that has already stopped. The record cap
@@ -304,6 +326,7 @@ func newStore(opts Options) (*Store, error) {
 		chunkLoc:   make(map[string]PackLoc),
 	}
 	s.cond = sync.NewCond(&s.mu)
+	s.uploads = newUploadQueue(opts.Obj, opts.UploadQueueBytes, opts.UploadWorkers)
 	if opts.PackCacheBytes > 0 {
 		c, err := newPackCache(filepath.Join(opts.Dir, "packs"), opts.PackCacheBytes)
 		if err != nil {
@@ -579,7 +602,13 @@ func (s *Store) Flush(ctx context.Context) error {
 			return err
 		}
 		if s.ring == nil || s.ring.Used() == 0 {
-			return nil
+			// Packing is done; the uplink may not be. A flush is what a
+			// checkpoint and a seal call, and both mean "on the
+			// federation", not "in a local pack".
+			s.mu.Unlock()
+			err := s.uploads.drain()
+			s.mu.Lock()
+			return err
 		}
 		s.startPackLocked(ctx, 0)
 		if !s.packing {
@@ -612,8 +641,10 @@ func (s *Store) Packs() []packstore.SealedPack {
 // Stats returns a snapshot of the counters.
 func (s *Store) Stats() Stats {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.stats
+	st := s.stats
+	s.mu.Unlock()
+	st.UploadBacklog = s.uploads.backlog()
+	return st
 }
 
 // Close waits for in-flight flushes and unmaps everything. It does NOT
@@ -636,6 +667,12 @@ func (s *Store) Close() error {
 	if s.ring != nil {
 		err = s.ring.Close()
 		s.ring = nil
+	}
+	// The queue is closed last and not abandoned: packs in it are already
+	// named by a location map, so dropping them would leave a session's
+	// own content unreadable.
+	if cerr := s.uploads.close(); err == nil {
+		err = cerr
 	}
 	return err
 }

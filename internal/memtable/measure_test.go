@@ -231,7 +231,7 @@ func measureStaging(t *testing.T, plan []fileSpec, latency time.Duration) result
 	)
 
 	t3 := time.Now()
-	pk := newFlushPacker(obj, dir, DefaultPackTarget, nil, nil, 0, nil)
+	pk := newFlushPacker(obj, dir, DefaultPackTarget, nil, nil, 0, nil, newUploadQueue(obj, DefaultUploadQueueBytes, DefaultUploadWorkers))
 	hasher := chunkid.Hasher{}
 	for _, f := range plan {
 		fh, err := os.Open(filepath.Join(stage, strconv.FormatUint(f.ino, 10)))

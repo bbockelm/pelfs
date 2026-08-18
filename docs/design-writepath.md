@@ -536,6 +536,37 @@ overlay, because the seal at exit renders its records. It is retired
 alongside the spent overlay for the same reason the overlay is: its
 journal describes extents of a generation that is no longer the head.
 
+### Cutting a pack is local; only the queue is bounded
+
+"Queued for upload is the seal boundary" was in this document before the
+code was, and the first implementation did not honour it: the pack run
+uploaded synchronously, so the ring could not be reclaimed until bytes
+were on the wire. On a 2 MiB/s uplink that stopped the mount for the
+length of every upload.
+
+A pack is DURABLE the moment its file exists. So a run now cuts, retains
+the file locally, records where the chunks went, hands the pack to a
+queue, and returns; the uplink drains the backlog on its own time.
+Writing is paced by local disk, which is what the aging rule always
+assumed. Measured: 3 MiB of writes complete in 14 ms against an uplink
+charging 200 ms per pack.
+
+What still waits, and where:
+
+  - A SEAL drains the queue before it flips. A generation naming a pack
+    that never left would be signed and unreadable, so this wait is not
+    optional — but it is one wait at the end of a session rather than one
+    per pack throughout it.
+  - The JOURNAL record for a flush waits for that flush's packs. Reads
+    are already served from the location map and the pack cache; the
+    record is what a LATER session would publish from, so it must not
+    name a pack that is not there.
+  - PACKING waits when the backlog hits `UploadQueueBytes`, and the
+    writer waits behind it, through a ring that stops being reclaimed.
+    The bound is deliberately generous (1 GiB): small buys nothing a
+    session benefits from, and what it holds is bytes already written
+    once.
+
 ### The checkpoint freeze becomes a map copy
 
 A checkpoint needs a view of the content that does not change under it.

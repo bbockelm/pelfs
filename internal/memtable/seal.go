@@ -40,7 +40,7 @@ type Sealer struct {
 // NewSealer starts a seal. Every inode it renders may add chunks to the
 // same run of packs, so Finish must be called once at the end.
 func (s *Store) NewSealer() *Sealer {
-	return &Sealer{s: s, pk: newFlushPacker(s.obj, s.dir, s.packTarget, s.cache, s.dek, s.keyID, s.onUpload)}
+	return &Sealer{s: s, pk: newFlushPacker(s.obj, s.dir, s.packTarget, s.cache, s.dek, s.keyID, s.onUpload, s.uploads)}
 }
 
 // Inode renders one inode's live content as catalog rows.
@@ -161,6 +161,12 @@ func (sl *Sealer) rechunk(ctx context.Context, view *Frozen, ino uint64, from, t
 // same path everything else is.
 func (sl *Sealer) Finish(ctx context.Context) error {
 	if err := sl.pk.finish(ctx); err != nil {
+		return err
+	}
+	// A seal is the one thing that must not run ahead of the uplink: the
+	// generation it is about to sign names these packs.
+	sl.pk.outstanding.Wait()
+	if err := sl.s.uploads.drain(); err != nil {
 		return err
 	}
 	s := sl.s

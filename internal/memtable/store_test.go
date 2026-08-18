@@ -263,6 +263,14 @@ func TestCrashBetweenUploadAndPublish(t *testing.T) {
 	if err := s.Flush(ctx); !errors.Is(err, boom) {
 		t.Fatalf("flush error = %v, want the injected failure", err)
 	}
+	// The window moved when uploads stopped being synchronous with the
+	// pack run: BeforePublish now fires once the packs are CUT and
+	// queued, not once they have landed. Draining is what makes the
+	// assertion below about the same thing it always was — bytes on the
+	// federation, locations not yet installed.
+	if err := s.uploads.drain(); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
 	if puts, _ := obj.stats(); puts == 0 {
 		t.Fatal("the pack was never uploaded, so this is not the window under test")
 	}

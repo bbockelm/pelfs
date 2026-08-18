@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/bbockelm/pelfs/internal/chunkid"
@@ -31,6 +32,7 @@ type flushResult struct {
 	uploadedChunks int64
 	deadExtents    int64
 	deadBytes      int64
+	uploaded       *sync.WaitGroup
 }
 
 func (s *Store) runFlush(ctx context.Context, b *batch) {
@@ -49,6 +51,13 @@ func (s *Store) runFlush(ctx context.Context, b *batch) {
 		}
 	}
 	s.publish(b, res)
+	// The journal record waits for the uploads this batch queued. Reads
+	// are already served — the location map answers, and the pack cache
+	// holds the bytes — but a record naming a pack that never left is one
+	// a LATER session would publish from, and that generation would be
+	// signed and unreadable.
+	res.uploaded.Wait()
+	s.journalLocated(res)
 }
 
 // snapshot captures the frozen table's live set. The design calls this
@@ -103,7 +112,7 @@ func (s *Store) snapshot(b *batch) ([]inodePlan, *flushResult) {
 }
 
 func (s *Store) chunkAndPack(ctx context.Context, b *batch, plan []inodePlan, res *flushResult) error {
-	pk := newFlushPacker(s.obj, s.dir, s.packTarget, s.cache, s.dek, s.keyID, s.onUpload)
+	pk := newFlushPacker(s.obj, s.dir, s.packTarget, s.cache, s.dek, s.keyID, s.onUpload, s.uploads)
 	defer pk.abort()
 	for _, ip := range plan {
 		if err := s.chunkInode(ctx, b, ip.exts, pk, res); err != nil {
@@ -115,6 +124,7 @@ func (s *Store) chunkAndPack(ctx context.Context, b *batch, plan []inodePlan, re
 	}
 	res.chunkLoc = pk.locs
 	res.packs = pk.sealed
+	res.uploaded = &pk.outstanding
 	res.uploadedBytes = pk.bytes
 	res.uploadedChunks = pk.count
 	return nil
@@ -209,17 +219,6 @@ func (s *Store) publish(b *batch, res *flushResult) {
 	if n := len(b.recs); n > 0 && n <= len(s.order) {
 		s.order = s.order[n:]
 	}
-	if s.journal != nil {
-		if err := s.journal.Located(Location{
-			Handles: res.handleLoc, Chunks: res.chunkLoc, Packs: res.packs,
-		}); err != nil {
-			// The bytes are on the federation and the map is in memory;
-			// only the RECORD of the map failed. Reads keep working, and a
-			// crash now would lose content that is already durable — so it
-			// is a failed flush, retried, rather than a silent downgrade.
-			s.flushErr = err
-		}
-	}
 	if b.to > s.reclaimTo {
 		s.reclaimTo = b.to
 	}
@@ -238,6 +237,26 @@ func (s *Store) publish(b *batch, res *flushResult) {
 	s.packing = false
 	s.cond.Broadcast()
 	s.mu.Unlock()
+}
+
+// journalLocated records a landed batch. It runs after the uploads, off
+// the path a writer waits on.
+func (s *Store) journalLocated(res *flushResult) {
+	if s.journal == nil {
+		return
+	}
+	if err := s.journal.Located(Location{
+		Handles: res.handleLoc, Chunks: res.chunkLoc, Packs: res.packs,
+	}); err != nil {
+		// The bytes are on the federation and the map is in memory; only
+		// the RECORD of the map failed. Reads keep working, and a crash
+		// now would lose content that is already durable — so it is a
+		// failed flush, retried, rather than a silent downgrade.
+		s.mu.Lock()
+		s.flushErr = err
+		s.cond.Broadcast()
+		s.mu.Unlock()
+	}
 }
 
 // failFlush leaves the records in place. Until their locations are
@@ -264,6 +283,7 @@ type flushPacker struct {
 	dir      string
 	target   int64
 	cache    *packCache
+	uploads  *uploadQueue
 	dek      []byte
 	keyID    int64
 	onUpload func(string, int64, time.Duration)
@@ -276,6 +296,11 @@ type flushPacker struct {
 	sealed []packstore.SealedPack
 	bytes  int64
 	count  int64
+	// outstanding counts packs cut and not yet landed. A flush installs
+	// its locations without waiting on any of them; only the journal
+	// record waits, because that record is what a later session would
+	// publish from.
+	outstanding sync.WaitGroup
 }
 
 type pendingLoc struct {
@@ -287,9 +312,10 @@ type pendingLoc struct {
 }
 
 func newFlushPacker(obj pelicanobj.Store, dir string, target int64, cache *packCache, dek []byte, keyID int64,
-	onUpload func(string, int64, time.Duration)) *flushPacker {
+	onUpload func(string, int64, time.Duration), uploads *uploadQueue) *flushPacker {
 	return &flushPacker{
-		obj: obj, dir: dir, target: target, cache: cache, dek: dek, keyID: keyID, onUpload: onUpload,
+		obj: obj, dir: dir, target: target, cache: cache, dek: dek, keyID: keyID,
+		onUpload: onUpload, uploads: uploads,
 		pending: make(map[string]struct{}),
 		locs:    make(map[string]PackLoc),
 	}
@@ -355,6 +381,11 @@ func (p *flushPacker) cut(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// From here the pack EXISTS: its bytes are laid out, its trailer is
+	// written, and the file is about to be retained locally. Everything
+	// downstream — the location map, the ring region this came from — can
+	// proceed on that. Only publishing a generation has to wait for the
+	// upload, and that waits once, at the seal.
 	// The spool IS the pack, so it is handed to the local cache rather
 	// than deleted after the upload. Retaining BEFORE the upload is what
 	// makes it a rename of a file already on disk instead of a second
@@ -367,20 +398,8 @@ func (p *flushPacker) cut(ctx context.Context) error {
 		}
 		retained = true
 	}
-	started := time.Now()
-	if err := upload(ctx, p.obj); err != nil {
-		if retained {
-			// Nothing published references this pack, so the local copy is
-			// garbage rather than a cache entry.
-			p.cache.drop(sp.Name)
-		}
-		return err
-	}
 	if retained {
 		p.cache.admit(sp.Name, sp.Size)
-	}
-	if p.onUpload != nil {
-		p.onUpload(sp.Name, sp.Size, time.Since(started))
 	}
 	p.w = nil
 	p.sealed = append(p.sealed, sp)
@@ -392,7 +411,29 @@ func (p *flushPacker) cut(ctx context.Context) error {
 	}
 	p.pend = nil
 	clear(p.pending)
-	return nil
+
+	p.outstanding.Add(1)
+	started := time.Now()
+	err = p.uploads.add(uploadJob{
+		ctx: ctx, pack: sp, send: upload,
+		done: func(err error) {
+			if err != nil && retained {
+				// Nothing that survives references a pack that never
+				// landed, so the local copy is garbage rather than cache.
+				p.cache.drop(sp.Name)
+			}
+			p.outstanding.Done()
+		},
+		onSent: func(name string, size int64) {
+			if p.onUpload != nil {
+				p.onUpload(name, size, time.Since(started))
+			}
+		},
+	})
+	if err != nil {
+		p.outstanding.Done()
+	}
+	return err
 }
 
 func (p *flushPacker) finish(ctx context.Context) error { return p.cut(ctx) }

@@ -620,7 +620,17 @@ type readPart struct {
 // Read fills p from ino at off. Resolution happens under the lock and the
 // bytes are read outside it.
 func (s *Store) Read(ctx context.Context, ino uint64, off int64, p []byte) (int, error) {
-	parts, n, err := s.plan(ino, off, len(p))
+	s.mu.Lock()
+	c := s.content[ino]
+	s.mu.Unlock()
+	return s.readFrom(ctx, c, ino, off, p)
+}
+
+// readFrom is Read against a named content map, which is what lets a
+// frozen view (frozen.go) share every resolution path with the live one:
+// the maps differ, the places bytes can be do not.
+func (s *Store) readFrom(ctx context.Context, c *content, ino uint64, off int64, p []byte) (int, error) {
+	parts, n, err := s.plan(c, off, len(p))
 	if err != nil {
 		return 0, err
 	}
@@ -720,11 +730,10 @@ func (s *Store) countPackRead(local bool) {
 // table, flushing table, location map — is what makes a flush completing
 // mid-read invisible: whichever level answered, its bytes are already
 // final.
-func (s *Store) plan(ino uint64, off int64, n int) ([]readPart, int, error) {
+func (s *Store) plan(c *content, off int64, n int) ([]readPart, int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	c, ok := s.content[ino]
-	if !ok {
+	if c == nil {
 		return nil, 0, nil
 	}
 	if off >= c.size {

@@ -43,11 +43,21 @@ func (s *Store) NewSealer() *Sealer {
 	return &Sealer{s: s, pk: newFlushPacker(s.obj, s.dir, int64(s.tableSize), s.cache)}
 }
 
-// Inode renders one inode's content as catalog rows.
+// Inode renders one inode's live content as catalog rows.
 func (sl *Sealer) Inode(ctx context.Context, ino uint64) ([]catalog.ChunkRef, error) {
+	sl.s.mu.Lock()
+	c := sl.s.content[ino]
+	sl.s.mu.Unlock()
+	return sl.inodeFrom(ctx, nil, c, ino)
+}
+
+// inodeFrom renders a named content map. view is where re-chunking reads
+// from — nil means the live store — so a frozen render never picks up a
+// byte written after its instant.
+func (sl *Sealer) inodeFrom(ctx context.Context, view *Frozen, c *content, ino uint64) ([]catalog.ChunkRef, error) {
 	s := sl.s
 	s.mu.Lock()
-	ps, err := s.piecesLocked(ino)
+	ps, err := s.piecesOfLocked(c, ino)
 	s.mu.Unlock()
 	if err != nil {
 		return nil, err
@@ -83,7 +93,7 @@ func (sl *Sealer) Inode(ctx context.Context, ino uint64) ([]catalog.ChunkRef, er
 			out = append(out, seg.g.ref())
 			continue
 		}
-		refs, err := sl.rechunk(ctx, ino, seg.from, seg.to)
+		refs, err := sl.rechunk(ctx, view, ino, seg.from, seg.to)
 		if err != nil {
 			return nil, err
 		}
@@ -100,9 +110,9 @@ func (sl *Sealer) Inode(ctx context.Context, ino uint64) ([]catalog.ChunkRef, er
 // final chunk of any file does; the alternative is re-chunking to the end
 // of the file to let CDC re-converge, which is the O(file) cost this
 // whole path exists to avoid.
-func (sl *Sealer) rechunk(ctx context.Context, ino uint64, from, to int64) ([]catalog.ChunkRef, error) {
+func (sl *Sealer) rechunk(ctx context.Context, view *Frozen, ino uint64, from, to int64) ([]catalog.ChunkRef, error) {
 	s := sl.s
-	ch := chunkid.NewChunker(&spanReader{ctx: ctx, s: s, ino: ino, off: from, end: to}, s.chunkOpts)
+	ch := chunkid.NewChunker(&spanReader{ctx: ctx, s: s, view: view, ino: ino, off: from, end: to}, s.chunkOpts)
 	var out []catalog.ChunkRef
 	at := from
 	for at < to {
@@ -180,11 +190,12 @@ func (sl *Sealer) Abort() { sl.pk.abort() }
 // session's packs, or an earlier generation's, resolved the same way a
 // mount would resolve them.
 type spanReader struct {
-	ctx context.Context
-	s   *Store
-	ino uint64
-	off int64
-	end int64
+	ctx  context.Context
+	s    *Store
+	view *Frozen // nil reads the live store
+	ino  uint64
+	off  int64
+	end  int64
 }
 
 func (r *spanReader) Read(p []byte) (int, error) {
@@ -194,7 +205,15 @@ func (r *spanReader) Read(p []byte) (int, error) {
 	if int64(len(p)) > r.end-r.off {
 		p = p[:r.end-r.off]
 	}
-	n, err := r.s.Read(r.ctx, r.ino, r.off, p)
+	var (
+		n   int
+		err error
+	)
+	if r.view != nil {
+		n, err = r.view.Read(r.ctx, r.ino, r.off, p)
+	} else {
+		n, err = r.s.Read(r.ctx, r.ino, r.off, p)
+	}
 	r.off += int64(n)
 	if err != nil {
 		return n, err

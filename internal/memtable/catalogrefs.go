@@ -74,8 +74,13 @@ func (g group) ref() catalog.ChunkRef {
 // wants, in file order. It is the shared front half of both renderers:
 // the strict one below and the re-chunking one in seal.go.
 func (s *Store) piecesLocked(ino uint64) ([]piece, error) {
-	c, ok := s.content[ino]
-	if !ok {
+	return s.piecesOfLocked(s.content[ino], ino)
+}
+
+// piecesOfLocked is the same resolution against a named content map, so a
+// frozen view renders through exactly the code a live one does.
+func (s *Store) piecesOfLocked(c *content, ino uint64) ([]piece, error) {
+	if c == nil {
 		return nil, nil
 	}
 	var out []piece

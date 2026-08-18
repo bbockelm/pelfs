@@ -1196,6 +1196,20 @@ func (g *genSession) checkpointPeriodically(ctx context.Context, every time.Dura
 	// noticed while it is still being written rather than after it.
 	sample := time.NewTicker(pressureSampleInterval(every))
 	defer sample.Stop()
+	// A pressure checkpoint that fails must not be retried on the very
+	// next sample. The pressure that triggered it does not go away when it
+	// fails — the staged bytes are still there — so a federation refusing
+	// the flip turns into a full publish every few seconds, each one
+	// walking the tree and uploading packs before it is refused again.
+	// That is what one broken CAS looked like from the terminal: the same
+	// warning over and over, ~15 s apart, forever.
+	//
+	// Backing off doubles the wait to the checkpoint interval and stops
+	// there, because at that point the periodic tick governs anyway.
+	// Nothing is lost by waiting: every change is already durable in the
+	// overlay, and the seal at unmount publishes whatever this did not.
+	var retryAfter time.Time
+	backoff := time.Duration(0)
 	for {
 		select {
 		case <-ctx.Done():
@@ -1204,15 +1218,22 @@ func (g *genSession) checkpointPeriodically(ctx context.Context, every time.Dura
 			if n := g.stagedBytes(); n < checkpointBytes {
 				continue
 			}
+			if time.Now().Before(retryAfter) {
+				continue
+			}
 			start := time.Now()
 			summary, err := g.checkpoint(ctx)
 			switch {
 			case ctx.Err() != nil:
 				return
 			case err != nil:
-				ui.Warn("checkpoint under write pressure failed, retrying "+
-					"(your changes remain safe in the overlay): {error}", "error", err)
+				backoff = min(max(2*backoff, pressureSampleInterval(every)), every)
+				retryAfter = time.Now().Add(backoff)
+				ui.Warn("checkpoint under write pressure failed, retrying in {backoff} "+
+					"(your changes remain safe in the overlay): {error}",
+					"backoff", backoff.Round(time.Second), "error", err)
 			default:
+				backoff, retryAfter = 0, time.Time{}
 				ui.Info("checkpointed {staged} of staged content in {duration} ({summary})",
 					"staged", ui.ByteCount(checkpointBytes), "duration", time.Since(start), "summary", summary)
 			}

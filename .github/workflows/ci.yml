@@ -136,7 +136,7 @@ jobs:
       - name: Mount a published generation and benchmark it
         env:
           PELFS_MOUNT_TEST_OK: "1"
-        run: ./scripts/phase3-mount-test.sh
+        run: ./scripts/mount-gate-test.sh
 
   bench:
     # Benchmarks are not a pass/fail gate; they run to catch build rot in

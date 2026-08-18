@@ -7,7 +7,7 @@
 # Linux (or macFUSE) only — this is the coverage a macFUSE-less dev
 # machine cannot provide, so CI owns it.
 #
-# Usage: scripts/phase3-mount-test.sh [--bench]
+# Usage: scripts/mount-gate-test.sh [--bench]
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -23,10 +23,10 @@ if [ "${PELFS_MOUNT_TEST_OK:-}" != "1" ] && [ "${CI:-}" != "true" ]; then
   echo "or set PELFS_MOUNT_TEST_OK=1 on a Linux machine you own." >&2
   exit 2
 fi
-[ "$(uname -s)" = "Linux" ] || { echo "phase-3 mounts need Linux FUSE (macOS denies shell access to mounts)" >&2; exit 2; }
+[ "$(uname -s)" = "Linux" ] || { echo "a kernel mount needs Linux FUSE (macOS denies shell access to mounts)" >&2; exit 2; }
 
 # Scratch lives under the repo's own build area, never $HOME.
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/pelfs-phase3.XXXXXX")"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/pelfs-mount-gate.XXXXXX")"
 cleanup() {
   if mountpoint -q "$WORK/mnt" 2>/dev/null || mount | grep -q " $WORK/mnt "; then
     fusermount3 -u "$WORK/mnt" 2>/dev/null || fusermount -u "$WORK/mnt" 2>/dev/null || \
@@ -50,7 +50,7 @@ unmount_at() {
   return 0
 }
 
-[ -e /dev/fuse ] || { echo "no /dev/fuse; phase-3 mounts need FUSE" >&2; exit 1; }
+[ -e /dev/fuse ] || { echo "no /dev/fuse; a kernel mount needs FUSE" >&2; exit 1; }
 
 # Binaries are either prebuilt (the container launcher cross-compiles on
 # the host, since the test image has no toolchain) or built here.
@@ -133,7 +133,7 @@ MOUNT_PID=$!
 for _ in $(seq 100); do [ -e "$WORK/mnt/dir/small.txt" ] && break; sleep 0.1; done
 [ -e "$WORK/mnt/dir/small.txt" ] || { echo "rw mount did not come up" >&2; exit 1; }
 
-echo "phase-3 write" > "$WORK/mnt/dir/written.txt"
+echo "sealed write" > "$WORK/mnt/dir/written.txt"
 mkdir -p "$WORK/mnt/newdir"
 rm "$WORK/mnt/dir/small.txt"
 echo "appended" >> "$WORK/mnt/dir/sub/mid.bin"
@@ -147,7 +147,7 @@ echo "== remounting the SEALED generation read-only =="
 "$WORK/pelfs" mount-gen --state-dir "$WORK/state4" "$PREFIX" "$WORK/mnt" &
 MOUNT_PID=$!
 for _ in $(seq 100); do [ -e "$WORK/mnt/dir/written.txt" ] && break; sleep 0.1; done
-grep -q "phase-3 write" "$WORK/mnt/dir/written.txt" || { echo "sealed write missing" >&2; exit 1; }
+grep -q "sealed write" "$WORK/mnt/dir/written.txt" || { echo "sealed write missing" >&2; exit 1; }
 [ -d "$WORK/mnt/newdir" ] || { echo "sealed mkdir missing" >&2; exit 1; }
 [ ! -e "$WORK/mnt/dir/small.txt" ] || { echo "sealed deletion did not stick" >&2; exit 1; }
 cmp "$WORK/src/dir/big.bin" "$WORK/mnt/dir/big.bin"
@@ -381,7 +381,7 @@ if command -v mount.nfs >/dev/null 2>&1 || command -v mount >/dev/null 2>&1; the
     up=0
     for _ in $(seq 100); do [ -e "$WORK/nfsmnt/dir/written.txt" ] && { up=1; break; }; sleep 0.1; done
     if [ "$up" = "1" ]; then
-      grep -q "phase-3 write" "$WORK/nfsmnt/dir/written.txt"
+      grep -q "sealed write" "$WORK/nfsmnt/dir/written.txt"
       cmp "$WORK/src/dir/big.bin" "$WORK/nfsmnt/dir/big.bin"
       echo "NFS backend verified: content byte-exact through the OS NFS client"
       unmount_at "$WORK/nfsmnt"

@@ -19,7 +19,7 @@ e2e:
 	./scripts/e2e-docker.sh
 
 mount-gate:
-	./scripts/phase3-docker.sh
+	./scripts/mount-gate-docker.sh
 
 integration:
 	./scripts/integration-pelican.sh

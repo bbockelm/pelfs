@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # End-to-end filesystem benchmarks against ANY mounted pelfs path
-# (v1 shell/mount, the NFS fallback, or a phase-3 mount-gen mountpoint) —
-# the acceptance scenarios from docs/design-packfs.md: many-small-file
-# unpack (the kernel-untar shape), full-tree tar-up (sequential read of
-# everything), metadata walk (the git-status shape), and big-file I/O.
+# (a `pelfs shell` mount, the NFS fallback, or a `pelfs mount-gen`
+# mountpoint) — the acceptance scenarios from docs/design-packfs.md:
+# many-small-file unpack (the kernel-untar shape), full-tree tar-up
+# (sequential read of everything), metadata walk (the git-status shape),
+# and big-file I/O.
 #
 # Usage: scripts/bench-e2e.sh <mounted-dir> [source-tarball]
 #   The tarball defaults to a synthetic tree (8k files across 512 dirs,
@@ -57,4 +58,4 @@ sync
 t "big read"             sh -c "cat '$WORK/big.bin' > /dev/null"
 t "rm -rf"               rm -rf "$WORK"
 
-echo "== done; compare v1 (pelfs shell) vs phase-3 (pelfs mount-gen) runs =="
+echo "== done; compare the pelfs shell and pelfs mount-gen runs =="

@@ -22,8 +22,8 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-IMAGE="${PELFS_PHASE3_IMAGE:-debian:stable-slim}"
-ARCH="${PELFS_PHASE3_ARCH:-$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')}"
+IMAGE="${PELFS_DOCKER_IMAGE:-debian:stable-slim}"
+ARCH="${PELFS_DOCKER_ARCH:-$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')}"
 FILES="${1:-8000}"
 DIRS="${2:-400}"
 CHUNKS="${3:-4}"
@@ -34,7 +34,7 @@ trap 'rm -rf "$STAGE"' EXIT
 
 command -v docker >/dev/null || { echo "docker is required" >&2; exit 1; }
 
-IMAGE_TAG="pelfs-phase3-runner:1"
+IMAGE_TAG="pelfs-test-runner:1"
 if ! docker image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
   echo "== building the test image (once) =="
   docker build -q -t "$IMAGE_TAG" - <<DOCKERFILE

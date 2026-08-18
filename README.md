@@ -83,7 +83,7 @@ make e2e         # full mount loop in a container against a fake origin
 make integration # transport + publish/resolve against a real federation-in-a-box
                  # (pelican serve --module director,registry,origin; needs a
                  #  pelican binary via $PELICAN_BIN/$PELICAN_SRC)
-make mount-gate  # the kernel mount gate, in a container (see scripts/phase3-docker.sh)
+make mount-gate  # the kernel mount gate, in a container (see scripts/mount-gate-docker.sh)
 ```
 
 `cmd/fakeorigin` is a tiny origin-like HTTP server over a local directory,

@@ -148,13 +148,17 @@ func TestDeadExtentsAreNeverUploaded(t *testing.T) {
 	}
 }
 
-// Backpressure: the bound is two tables. A writer that fills the active
-// table while a flush is in flight waits, and never gets a third.
+// Backpressure: the ring is one preallocated file, so a writer that
+// outruns the packer waits rather than growing anything. The footprint is
+// the assertion that matters — a design that answered pressure by
+// allocating would still pass a timing check — and with a ring that is
+// "one file, and its size never moves".
 func TestBackpressureBlocksTheWriter(t *testing.T) {
 	ctx := context.Background()
 	release := make(chan struct{})
 	var seen atomic.Int64
-	s, _ := newTestStore(t, 128<<10, Hooks{
+	const ring = 128 << 10
+	s, _ := newTestStore(t, ring, Hooks{
 		BeforePublish: func(uint64) error {
 			<-release
 			return nil
@@ -162,34 +166,36 @@ func TestBackpressureBlocksTheWriter(t *testing.T) {
 		FlushStarted: func(uint64) { seen.Add(1) },
 	})
 
-	// Fill and rotate once; that flush parks in BeforePublish.
+	// Nearly fill the ring. Nothing packs yet: with no promotion distance
+	// the packer runs only when a writer cannot fit.
 	if err := s.Write(ctx, 1, 0, fill(120<<10, 1)); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Write(ctx, 1, 120<<10, fill(20<<10, 2)); err != nil {
-		t.Fatal(err)
-	}
-
+	want := fill(64<<10, 3)
 	blocked := make(chan error, 1)
 	go func() {
-		// Enough to fill the fresh table and demand a second rotation,
-		// which cannot proceed while the first flush is parked.
-		blocked <- s.Write(ctx, 2, 0, fill(200<<10, 3))
+		// This cannot fit, so it starts a pack run — which parks in
+		// BeforePublish, so no space comes back until the test says so.
+		blocked <- s.Write(ctx, 2, 0, want)
 	}()
 
-	// Wait for the writer to actually be parked, then check that it is
-	// still parked and that no third table appeared. Counting buffer
-	// files is the assertion that matters: the bound is two, and a
-	// design that grew a third would still pass a timing check.
 	waitForBlocked(t, s)
 	select {
 	case err := <-blocked:
-		t.Fatalf("writer finished (%v) while the only flush slot was occupied", err)
+		t.Fatalf("writer finished (%v) while the packer was parked", err)
 	default:
 	}
-	if n := bufferFiles(t, s); n > 2 {
-		t.Fatalf("%d buffer files while a writer waits; the bound is two", n)
+	if n := bufferFiles(t, s); n != 1 {
+		t.Fatalf("%d buffer files while a writer waits; a ring is one file", n)
 	}
+	fi, err := os.Stat(s.ring.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := fi.Size(), int64(ringFileHdr+ring); got != want {
+		t.Fatalf("the ring grew to %d bytes under pressure; it is fixed at %d", got, want)
+	}
+
 	close(release)
 	if err := <-blocked; err != nil {
 		t.Fatal(err)
@@ -201,7 +207,11 @@ func TestBackpressureBlocksTheWriter(t *testing.T) {
 		t.Error("no write was recorded as blocked")
 	}
 	if n := seen.Load(); n < 2 {
-		t.Errorf("%d flushes started, want at least 2", n)
+		t.Errorf("%d pack runs started, want at least 2", n)
+	}
+	// Waiting must not cost bytes: the write that blocked is still whole.
+	if got := readAll(t, s, 2); !bytes.Equal(got, want) {
+		t.Fatal("the write that waited for space does not read back byte-exact")
 	}
 }
 

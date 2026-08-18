@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/bbockelm/pelfs/internal/chunkid"
@@ -22,8 +23,13 @@ const DefaultTableSize = 64 << 20
 type Options struct {
 	// Dir is the state directory holding buffer files.
 	Dir string
-	// TableSize is one memtable's capacity in bytes, headers included.
+	// TableSize is the ring's capacity in bytes, headers included.
 	TableSize int
+	// PromotionDistance is how far behind the head an extent must fall
+	// before the packer takes it. Zero packs whatever is there, which is
+	// what a flush wants; DefaultPromotionDistance is what a session
+	// wants, so churn has a chance to die before anything is sent.
+	PromotionDistance uint64
 	// Obj is the federation. Flushes upload packs to packs/<name>.
 	Obj pelicanobj.Store
 	// Chunk configures the CDC pass. Zero fields take chunkid's defaults.
@@ -62,6 +68,10 @@ type Stats struct {
 	UploadedBytes  int64
 	UploadedChunks int64
 	Packs          int64
+	// ReclaimErrors counts ring regions a completed pack could not
+	// release. That costs space, never correctness, so it is a statistic
+	// rather than a failure.
+	ReclaimErrors int64
 	// BlockedWrites counts writes that had to wait for a flush to finish
 	// — the backpressure rule firing.
 	BlockedWrites int64
@@ -80,17 +90,30 @@ type Store struct {
 	hasher    chunkid.Hasher
 	hooks     Hooks
 
+	// promotion is how far behind the head an extent must fall before it
+	// is packed. Zero means pack everything, which is what a flush asks
+	// for.
+	promotion uint64
+
 	mu   sync.Mutex
 	cond *sync.Cond
 
-	active   *table
-	flushing *table
-	flushErr error
+	// ring is the whole write buffer. There is no active/frozen pair: a
+	// writer appends at the head while the packer consumes the tail, and
+	// the region a pack covered is reclaimed as soon as its locations are
+	// published.
+	ring  *Ring
+	index map[Handle]Record // handle -> its record, position absolute
+	live  map[Handle]int    // content references per handle
+	order []Handle          // handles in ring order, oldest first
 
-	// recovered holds tables a crash left behind. They are already frozen,
-	// so the set only shrinks: Flush drains them one at a time before the
-	// active table rotates, and reads consult them last.
-	recovered []*table
+	packing bool // a pack run is in flight
+	// reclaimTo is the furthest position a completed pack has asked the
+	// tail to reach. It is remembered because a reader's pin can hold the
+	// tail short of it, and nothing else would ever try again — a writer
+	// waiting for exactly that space would wait forever.
+	reclaimTo uint64
+	flushErr  error
 
 	nextHandle Handle
 	nextSeq    uint64
@@ -158,6 +181,9 @@ func newStore(opts Options) (*Store, error) {
 	s := &Store{
 		dir:       opts.Dir,
 		tableSize: opts.TableSize,
+		promotion: opts.PromotionDistance,
+		index:     make(map[Handle]Record),
+		live:      make(map[Handle]int),
 		obj:       opts.Obj,
 		chunkOpts: opts.Chunk,
 		hasher:    opts.Hasher,
@@ -171,23 +197,25 @@ func newStore(opts Options) (*Store, error) {
 }
 
 func (s *Store) openActive() error {
-	t, err := newTable(s.dir, s.nextSeq, s.tableSize)
+	r, err := CreateRing(filepath.Join(s.dir, bufferName(s.nextSeq)), s.tableSize)
 	if err != nil {
 		return err
 	}
 	s.nextSeq++
-	s.active = t
+	s.ring = r
 	return nil
 }
 
-// maxPayload is the largest extent a table can hold. A write larger than
-// this is split across extents rather than refused: the memtable size is
-// a resource decision and must not become a limit on write(2).
-func (s *Store) maxPayload() int { return s.tableSize - recordHeader }
+// maxPayload is the largest single record. A write longer than this is
+// split, which the write path must do regardless because one write() can
+// be arbitrarily large — and the ring refuses an oversized record with a
+// distinct error precisely so a caller cannot mistake it for something
+// waiting will fix.
+func (s *Store) maxPayload() int { return MaxRecord(s.tableSize) }
 
-// Write appends p at off in ino. It blocks only if the active table is
-// full and the previous flush has not finished — the design's
-// backpressure rule, and the only place a write waits on the network.
+// Write appends p at off in ino. It blocks only when the ring has no room
+// and the packer has not yet freed any — the design's backpressure rule,
+// and the only place a write waits on the network.
 func (s *Store) Write(ctx context.Context, ino uint64, off int64, p []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -196,25 +224,75 @@ func (s *Store) Write(ctx context.Context, ino uint64, off int64, p []byte) erro
 	}
 	for len(p) > 0 {
 		n := min(len(p), s.maxPayload())
-		if !s.active.buf.Room(n) {
-			if err := s.rotateLocked(ctx); err != nil {
-				return err
-			}
-		}
 		h := s.nextHandle
-		s.nextHandle++
 		rec := Record{Handle: h, Inode: ino, FileOff: off}
-		if err := s.active.append(&rec, p[:n]); err != nil {
+		pos, err := s.appendLocked(ctx, &rec, p[:n])
+		if err != nil {
 			return err
 		}
+		s.nextHandle++
+		rec.Off = int(pos)
+		rec.Length = n
+		s.index[h] = rec
+		s.order = append(s.order, h)
+		s.live[h]++
 		s.applyLocked(s.contentFor(ino).place(off, n, h))
-		s.active.acquire(h)
 		s.stats.WrittenBytes += int64(n)
 		s.stats.Extents++
 		off += int64(n)
 		p = p[n:]
 	}
+	// Promotion by AGE, checked on the write that made something old
+	// rather than on a timer: an extent more than PromotionDistance behind
+	// the head has survived long enough that rewriting it is unlikely, so
+	// it is packed and sent. Doing it here is what keeps the uplink busy
+	// during a session instead of leaving the whole cost to the seal, and
+	// it is what the runway between the distance and the ring's size buys
+	// — packing starts while the writer still has room.
+	if s.promotion > 0 && !s.packing && s.ring.Promotable(s.promotion) > 0 {
+		s.startPackLocked(ctx, s.promotion)
+	}
 	return nil
+}
+
+// appendLocked puts one record in the ring, waiting for the packer when
+// there is no room. This is the backpressure rule and the only place a
+// write waits: the ring refusing an append IS the signal, and it is
+// gradual rather than a cliff because the tail advances continuously
+// instead of in whole-table steps.
+func (s *Store) appendLocked(ctx context.Context, rec *Record, payload []byte) (uint64, error) {
+	waited := false
+	for {
+		pos, err := s.ring.Append(rec, payload)
+		if err == nil {
+			return pos, nil
+		}
+		if !errors.Is(err, ErrRingFull) {
+			// ErrRecordTooLarge and friends are not waitable. Returning
+			// here rather than looping is what stops a writer spinning
+			// forever on something no packer can fix.
+			return 0, err
+		}
+		if s.flushErr != nil {
+			return 0, s.flushErr
+		}
+		if !s.packing {
+			// Nothing is draining the ring, so start a run that takes
+			// everything: waiting on a packer that was never launched is
+			// the deadlock this branch exists to prevent.
+			s.startPackLocked(ctx, 0)
+		}
+		if !waited {
+			// Counted before the wait, not after: a caller watching for
+			// backpressure needs to see it while it is happening.
+			waited = true
+			s.stats.BlockedWrites++
+		}
+		s.cond.Wait()
+		if s.closed {
+			return 0, errors.New("memtable: store is closed")
+		}
+	}
 }
 
 // Truncate resizes ino, dropping content past the new size.
@@ -252,123 +330,125 @@ func (c *content) place(off int64, length int, h Handle) map[Handle]int {
 	return d
 }
 
-// applyLocked pushes reference-count deltas onto the tables that own the
-// handles. A handle below the oldest live table has already been
-// published; losing its last reference makes it garbage in a pack, which
-// is a repack's problem and not this path's.
+// applyLocked pushes reference-count deltas onto handles still in the
+// ring. A handle already packed and reclaimed is not here; losing its
+// last reference makes it garbage in a pack, which is a repack's problem
+// and not this path's.
 func (s *Store) applyLocked(d map[Handle]int) {
 	for h, delta := range d {
-		t := s.tableForLocked(h)
-		if t == nil {
+		if _, ok := s.index[h]; !ok {
 			continue
 		}
-		for ; delta > 0; delta-- {
-			t.acquire(h)
-		}
-		for ; delta < 0; delta++ {
-			t.release(h)
+		s.live[h] += delta
+		if s.live[h] <= 0 {
+			delete(s.live, h)
 		}
 	}
 }
 
-// levelsLocked lists the memory levels in resolution order: the active
-// table, then the flushing one, then anything a recovery left behind. A
-// handle found at an earlier level is the same bytes as at a later one —
-// there is no shadowing here, only a search — so the order is about cost,
-// not correctness.
-func (s *Store) levelsLocked() []*table {
-	out := make([]*table, 0, 2+len(s.recovered))
-	if s.active != nil {
-		out = append(out, s.active)
+// cutLocked takes the records at the tail that are old enough to pack.
+// distance is how far behind the head an extent must fall; zero takes
+// everything, which is what a flush asks for.
+//
+// It is a decision, not a copy: the records stay exactly where they are
+// in the ring until their locations are published, because until then the
+// ring is the only place they exist.
+func (s *Store) cutLocked(distance uint64) *batch {
+	_, to := s.ring.PromotableRange(distance)
+	if distance == 0 {
+		to = s.ring.Head()
 	}
-	if s.flushing != nil {
-		out = append(out, s.flushing)
+	b := &batch{
+		seq:    s.nextSeq,
+		live:   make(map[Handle]int),
+		inodes: make(map[uint64]struct{}),
+		from:   s.ring.Tail(),
+		to:     to,
 	}
-	return append(out, s.recovered...)
+	s.nextSeq++
+	for _, h := range s.order {
+		rec, ok := s.index[h]
+		if !ok {
+			continue
+		}
+		end := uint64(rec.Off) + uint64(ringRecHdr) + uint64(rec.Length)
+		if end > to {
+			break // ring order: everything after this is younger still
+		}
+		b.recs = append(b.recs, rec)
+		b.inodes[rec.Inode] = struct{}{}
+		if n := s.live[h]; n > 0 {
+			b.live[h] = n
+		}
+	}
+	if len(b.recs) > 0 {
+		last := b.recs[len(b.recs)-1]
+		b.to = uint64(last.Off) + uint64(ringRecHdr) + uint64(last.Length)
+	}
+	return b
 }
 
-// tableForLocked finds the table holding a handle.
-func (s *Store) tableForLocked(h Handle) *table {
-	for _, t := range s.levelsLocked() {
-		if _, ok := t.index[h]; ok {
-			return t
-		}
+// releaseLocked retries a reclaim a pin held off, and wakes anyone
+// waiting for the space. Reclaim clamps to the oldest pin rather than
+// failing, so a pack that published while a read was in flight leaves the
+// tail short of where its bytes actually died; this is the only thing
+// that ever picks that up again.
+func (s *Store) releaseLocked() {
+	if s.ring == nil || s.reclaimTo <= s.ring.Tail() {
+		return
 	}
-	return nil
+	if _, err := s.ring.Reclaim(s.reclaimTo); err != nil {
+		s.stats.ReclaimErrors++
+		return
+	}
+	s.cond.Broadcast()
 }
 
-// rotateLocked freezes the active table and starts its flush. It waits if
-// a flush is already in flight: the bound is two tables, and a session
-// that outruns the federation must slow down rather than accumulate
-// unbounded local state.
-func (s *Store) rotateLocked(ctx context.Context) error {
-	waited := false
-	for s.flushing != nil {
-		if s.flushErr != nil {
-			return s.flushErr
-		}
-		if !waited {
-			// Counted before the wait, not after: a caller watching for
-			// backpressure needs to see it while it is happening.
-			waited = true
-			s.stats.BlockedWrites++
-		}
-		s.cond.Wait()
+// startPackLocked launches a pack run over whatever is old enough.
+func (s *Store) startPackLocked(ctx context.Context, distance uint64) {
+	if s.packing {
+		return
 	}
-	if s.active.buf.Used() == 0 {
-		return nil
+	b := s.cutLocked(distance)
+	if b.empty() {
+		return
 	}
-	frozen := s.active
-	s.active = nil
-	if err := s.openActive(); err != nil {
-		s.active = frozen
-		return err
-	}
-	s.flushing = frozen
+	s.packing = true
 	s.stats.Flushes++
-	s.startFlushLocked(ctx, frozen)
-	return nil
+	s.wg.Go(func() { s.runFlush(ctx, b) })
 }
 
-func (s *Store) startFlushLocked(ctx context.Context, t *table) {
-	s.wg.Go(func() { s.runFlush(ctx, t) })
-}
-
-// Flush freezes the active table and waits for every flush to land. This
+// Flush packs everything in the ring and waits for it to land. This
 // is what a checkpoint or a seal calls, and it is the only user-visible
 // operation that blocks on the network by design.
 func (s *Store) Flush(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// A previous flush that failed left its table in place and still
-	// authoritative. Retrying it is the recovery, not discarding it.
-	if s.flushing != nil && s.flushErr != nil {
-		s.flushErr = nil
-		s.startFlushLocked(ctx, s.flushing)
-	}
-	// Tables a crash left behind go first: they are older than anything
-	// the active table holds, and leaving them behind a fresh flush would
-	// keep their buffer files pinned for no reason.
-	for len(s.recovered) > 0 {
-		if err := s.waitFlushLocked(); err != nil {
+	// A failed pack left its records in the ring and still authoritative.
+	// Retrying is the recovery; discarding would lose them.
+	s.flushErr = nil
+	for {
+		if err := s.waitPackLocked(); err != nil {
 			return err
 		}
-		t := s.recovered[0]
-		s.recovered = s.recovered[1:]
-		s.flushing = t
-		s.stats.Flushes++
-		s.startFlushLocked(ctx, t)
-	}
-	if s.active != nil && s.active.buf.Used() > 0 {
-		if err := s.rotateLocked(ctx); err != nil {
-			return err
+		if s.ring == nil || s.ring.Used() == 0 {
+			return nil
+		}
+		s.startPackLocked(ctx, 0)
+		if !s.packing {
+			// Nothing was eligible and nothing is running: the ring holds
+			// only records no content row references any more.
+			return nil
 		}
 	}
-	return s.waitFlushLocked()
 }
 
-func (s *Store) waitFlushLocked() error {
-	for s.flushing != nil && s.flushErr == nil {
+// waitPackLocked waits for any pack run in flight.
+func (s *Store) waitPackLocked() error {
+	for s.packing {
+		if s.flushErr != nil {
+			return s.flushErr
+		}
 		s.cond.Wait()
 	}
 	return s.flushErr
@@ -406,24 +486,33 @@ func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var err error
-	for _, t := range s.levelsLocked() {
-		if cerr := t.buf.Close(); err == nil {
-			err = cerr
-		}
+	if s.ring != nil {
+		err = s.ring.Close()
+		s.ring = nil
 	}
-	s.active, s.flushing, s.recovered = nil, nil, nil
 	return err
 }
 
 // source is where a range of bytes lives right now. It is produced under
-// the store's lock and consumed outside it. A memtable source holds a pin
-// on its table, because immutable bytes are still bytes that get unmapped
-// when the table is recycled.
+// the store's lock and consumed outside it. A ring source holds a PIN on
+// its position, because immutable bytes are still bytes the writer gets
+// handed back the moment the tail passes them.
 type source struct {
-	tab    *table
+	ring   bool
+	pos    uint64
 	off    int
 	length int
 	slices []packSlice
+}
+
+// ringAt reads a record's payload out of the ring. The caller holds a pin
+// on the position, so the region cannot be reclaimed underneath it.
+func (s *Store) ringAt(pos uint64, length int) []byte {
+	b, ok := s.ring.At(pos, length)
+	if !ok {
+		return make([]byte, length) // unreachable while pinned; never a wild read
+	}
+	return b
 }
 
 type packSlice struct {
@@ -445,17 +534,27 @@ func (s *Store) Read(ctx context.Context, ino uint64, off int64, p []byte) (int,
 		return 0, err
 	}
 	defer func() {
+		s.mu.Lock()
 		for _, part := range parts {
-			if part.src.tab != nil {
-				part.src.tab.unpin()
+			if part.src.ring {
+				s.ring.Unpin(part.src.pos)
 			}
 		}
+		// Dropping the last pin on a region a pack already published is
+		// what finally frees it, and a writer may be blocked on exactly
+		// those bytes.
+		s.releaseLocked()
+		s.mu.Unlock()
 	}()
 	clear(p[:n]) // holes and gaps read as zeros
 	for _, part := range parts {
 		dst := p[part.dst : part.dst+part.src.len()]
-		if part.src.tab != nil {
-			copy(dst, part.src.tab.buf.At(part.src.off, part.src.length))
+		if part.src.ring {
+			b, ok := s.ring.At(part.src.pos, part.src.off+part.src.length)
+			if !ok {
+				return 0, fmt.Errorf("memtable: pinned extent at %d vanished", part.src.pos)
+			}
+			copy(dst, b[part.src.off:part.src.off+part.src.length])
 			continue
 		}
 		at := 0
@@ -470,7 +569,7 @@ func (s *Store) Read(ctx context.Context, ino uint64, off int64, p []byte) (int,
 }
 
 func (src source) len() int {
-	if src.tab != nil {
+	if src.ring {
 		return src.length
 	}
 	n := 0
@@ -517,8 +616,8 @@ func (s *Store) plan(ino uint64, off int64, n int) ([]readPart, int, error) {
 		src, err := s.resolveLocked(r.Handle, r.Skip+int(lo-r.FileOff), int(hi-lo))
 		if err != nil {
 			for _, p := range parts {
-				if p.src.tab != nil {
-					p.src.tab.unpin()
+				if p.src.ring {
+					s.ring.Unpin(p.src.pos)
 				}
 			}
 			return nil, 0, err
@@ -530,11 +629,12 @@ func (s *Store) plan(ino uint64, off int64, n int) ([]readPart, int, error) {
 
 // resolveLocked turns a handle plus an intra-extent range into a source.
 func (s *Store) resolveLocked(h Handle, skip, length int) (source, error) {
-	for _, t := range s.levelsLocked() {
-		if rec, ok := t.index[h]; ok {
-			t.pin()
-			return source{tab: t, off: rec.Off + skip, length: length}, nil
-		}
+	if rec, ok := s.index[h]; ok {
+		// Pinning here is what makes reading outside the lock safe: the
+		// packer may reclaim while this read is in flight, and the ring
+		// refuses to let the tail pass a pinned position.
+		s.ring.Pin(uint64(rec.Off))
+		return source{ring: true, pos: uint64(rec.Off), off: skip, length: length}, nil
 	}
 	slices, ok := s.handleLoc[h]
 	if !ok {

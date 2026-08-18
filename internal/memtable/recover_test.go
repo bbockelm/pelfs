@@ -115,7 +115,7 @@ func TestRecoverFromTruncatedBufferReportsLoss(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	used := s.active.buf.Used()
+	used := int(s.ring.Used())
 	d := s.Durable()
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
@@ -187,7 +187,7 @@ func TestRecoverFlagsTornTail(t *testing.T) {
 		}
 	}
 	// Corrupt the third record's payload in place.
-	victim := s.active.index[2]
+	victim := s.index[2]
 	d := s.Durable()
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
@@ -196,7 +196,7 @@ func TestRecoverFlagsTornTail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.WriteAt([]byte{0xde, 0xad}, int64(victim.Off+7)); err != nil {
+	if _, err := f.WriteAt([]byte{0xde, 0xad}, int64(ringFileHdr+victim.Off+7)); err != nil {
 		t.Fatal(err)
 	}
 	f.Close() //nolint:errcheck

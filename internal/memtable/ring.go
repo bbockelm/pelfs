@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"os"
 
 	"golang.org/x/sys/unix"
@@ -40,6 +41,15 @@ type Ring struct {
 	// data, not a stale answer. The map is small by construction — it
 	// holds only positions with a reader in flight.
 	pins map[uint64]int
+
+	// What recovery found wrong with the file, for the report a user reads
+	// after a crash. Torn means the run ended at something that WANTED to
+	// be a record and was not; Truncated means the file was shorter than
+	// its own header says and was re-extended, with Missing bytes of the
+	// data region restored as zeros.
+	Torn      bool
+	Truncated bool
+	Missing   int64
 }
 
 const (
@@ -344,36 +354,63 @@ func OpenRing(path string) (*Ring, []Record, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	h := make([]byte, ringFileHdr)
+	if _, err := io.ReadFull(io.NewSectionReader(f, 0, ringFileHdr), h); err != nil {
+		f.Close() //nolint:errcheck
+		return nil, nil, fmt.Errorf("memtable: read ring header of %s: %w", path, err)
+	}
+	if string(h[0:8]) != ringMagic {
+		f.Close() //nolint:errcheck
+		return nil, nil, fmt.Errorf("memtable: %s is not a ring buffer", path)
+	}
+	if got := crc32.Checksum(h[0:40], crcTable); got != binary.LittleEndian.Uint32(h[40:]) {
+		f.Close() //nolint:errcheck
+		return nil, nil, fmt.Errorf("memtable: ring header of %s is corrupt", path)
+	}
+	size := binary.LittleEndian.Uint64(h[8:])
+	if size == 0 || size > 1<<40 {
+		f.Close() //nolint:errcheck
+		return nil, nil, fmt.Errorf("memtable: ring header of %s claims %d bytes", path, size)
+	}
+	// A ring is preallocated, so a file shorter than its own header says is
+	// a truncation. It is REPAIRED rather than refused: positions are
+	// modulo the declared size, so shrinking the mapping would silently
+	// move every record, while re-extending restores the missing region as
+	// zeros — which reads as unwritten space and simply ends the run. The
+	// caller is told, because bytes did go missing.
+	want := int64(ringFileHdr) + int64(size)
 	fi, err := f.Stat()
 	if err != nil {
 		f.Close() //nolint:errcheck
 		return nil, nil, err
 	}
-	if fi.Size() <= ringFileHdr {
-		f.Close() //nolint:errcheck
-		return nil, nil, fmt.Errorf("memtable: ring file %s is %d bytes", path, fi.Size())
+	truncated, missing := false, int64(0)
+	if fi.Size() != want {
+		if fi.Size() > want {
+			f.Close() //nolint:errcheck
+			return nil, nil, fmt.Errorf("memtable: ring %s says %d bytes, file holds %d", path, size, fi.Size()-ringFileHdr)
+		}
+		truncated, missing = true, want-fi.Size()
+		if err := f.Truncate(want); err != nil {
+			f.Close() //nolint:errcheck
+			return nil, nil, fmt.Errorf("memtable: re-extend truncated ring %s: %w", path, err)
+		}
 	}
-	r, err := mapRing(f, int(fi.Size())-ringFileHdr)
+	r, err := mapRing(f, int(size))
 	if err != nil {
 		return nil, nil, err
 	}
-	h := r.hdr()
-	if string(h[0:8]) != ringMagic {
-		r.Close() //nolint:errcheck
-		return nil, nil, fmt.Errorf("memtable: %s is not a ring buffer", path)
-	}
-	if got := crc32.Checksum(h[0:40], crcTable); got != binary.LittleEndian.Uint32(h[40:]) {
-		r.Close() //nolint:errcheck
-		return nil, nil, fmt.Errorf("memtable: ring header of %s is corrupt", path)
-	}
-	if size := binary.LittleEndian.Uint64(h[8:]); size != r.size {
-		r.Close() //nolint:errcheck
-		return nil, nil, fmt.Errorf("memtable: ring %s says %d bytes, file holds %d", path, size, r.size)
-	}
+	r.Truncated, r.Missing = truncated, missing
 	r.tail = binary.LittleEndian.Uint64(h[16:])
 	r.head = r.tail
 	r.seq = 1
 
+	// The two ways a run ends are worth telling apart. Unwritten space and
+	// a previous lap are CLEAN: that is simply where the head was. A record
+	// whose magic is intact but whose length or CRC is not is TORN — the
+	// crash caught a write in progress — and that is the shape a user has
+	// to be told about, because everything behind it is unreachable even if
+	// it is still on the disk.
 	var live []Record
 	pos := r.tail
 	for {
@@ -392,10 +429,8 @@ func OpenRing(path string) (*Ring, []Record, error) {
 			break // a previous lap: this is where our run ends
 		}
 		total := uint64(ringRecHdr) + n
-		if magic == ringPadMagic {
-			total = uint64(ringRecHdr) + n
-		}
 		if off+total > r.size || total > r.size {
+			r.Torn = true
 			break
 		}
 		crc := crc32.Checksum(rh[0:40], crcTable)
@@ -403,6 +438,7 @@ func OpenRing(path string) (*Ring, []Record, error) {
 			crc = crc32.Update(crc, crcTable, r.data[off+ringRecHdr:off+total])
 		}
 		if crc != binary.LittleEndian.Uint32(rh[40:]) {
+			r.Torn = true
 			break
 		}
 		if magic == ringRecMagic {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/bbockelm/pelfs/internal/catalog"
+	"github.com/bbockelm/pelfs/internal/chunkid"
 )
 
 // ErrNotTiled reports content that cannot be written into a catalog row.
@@ -44,9 +45,27 @@ func (s *Store) ChunkRefs(ino uint64) ([]catalog.ChunkRef, error) {
 		return nil, nil
 	}
 	var out []catalog.ChunkRef
+	// A chunk becomes a row only once the file has consumed the WHOLE of
+	// it, in order and with no gap. That accounting has to span content
+	// refs rather than live inside one: a write larger than the ring's
+	// record cap is split into several extents, the CDC pass runs over an
+	// inode's extents as one stream, and so a chunk routinely straddles
+	// the boundary between two of them. Judging each ref on its own would
+	// call that untileable when the file tiles perfectly.
+	var open struct {
+		live bool
+		id   chunkid.Identity
+		have int64 // bytes of the chunk the file has taken so far
+		want int64 // the chunk's length
+		at   int64 // file offset the chunk starts at
+	}
+	notTiled := func(cs ChunkSlice, chunkOff, take, at int64, total int64) error {
+		return fmt.Errorf("%w: inode %d wants bytes [%d,%d) of chunk %s (length %d) at file offset %d",
+			ErrNotTiled, ino, chunkOff, chunkOff+take, cs.ID, total, at)
+	}
 	for _, r := range c.refs {
-		if t := s.tableForLocked(r.Handle); t != nil {
-			return nil, fmt.Errorf("%w: inode %d extent %d is still in memtable %d", ErrNotFlushed, ino, r.Handle, t.seq)
+		if _, ok := s.index[r.Handle]; ok {
+			return nil, fmt.Errorf("%w: inode %d extent %d is still in the ring", ErrNotFlushed, ino, r.Handle)
 		}
 		slices, ok := s.handleLoc[r.Handle]
 		if !ok {
@@ -68,18 +87,34 @@ func (s *Store) ChunkRefs(ino uint64) ([]catalog.ChunkRef, error) {
 			}
 			delta := max(want-pos, 0)
 			take := min(cs.Length-delta, remaining)
-			// A catalog row can name this chunk only if the file wants all
-			// of it, starting at its first byte.
-			if cs.ChunkOff+delta != 0 || int64(take) != loc.Length {
-				return nil, fmt.Errorf("%w: inode %d wants bytes [%d,%d) of chunk %s (length %d) at file offset %d",
-					ErrNotTiled, ino, cs.ChunkOff+delta, cs.ChunkOff+delta+take, cs.ID, loc.Length, at)
+			chunkOff := int64(cs.ChunkOff + delta)
+			switch {
+			case !open.live:
+				// A catalog row can name this chunk only if the file takes
+				// it from its first byte.
+				if chunkOff != 0 {
+					return nil, notTiled(cs, chunkOff, int64(take), at, loc.Length)
+				}
+				open.live, open.id, open.have, open.want, open.at = true, cs.ID, 0, loc.Length, at
+			case cs.ID != open.id || chunkOff != open.have || at != open.at+open.have:
+				// The file jumped: either to a different chunk mid-way
+				// through this one, or over a hole inside it. Neither has a
+				// ChunkRef that can say so.
+				return nil, notTiled(cs, chunkOff, int64(take), at, open.want)
 			}
-			out = append(out, catalog.ChunkRef{
-				Identity:      append([]byte(nil), cs.ID[:]...),
-				LLen:          int64(take),
-				CLen:          loc.Length,
-				LogicalOffset: at,
-			})
+			open.have += int64(take)
+			if open.have > open.want {
+				return nil, notTiled(cs, chunkOff, int64(take), at, open.want)
+			}
+			if open.have == open.want {
+				out = append(out, catalog.ChunkRef{
+					Identity:      append([]byte(nil), open.id[:]...),
+					LLen:          open.want,
+					CLen:          open.want,
+					LogicalOffset: open.at,
+				})
+				open.live = false
+			}
 			at += int64(take)
 			want += take
 			remaining -= take
@@ -88,6 +123,12 @@ func (s *Store) ChunkRefs(ino uint64) ([]catalog.ChunkRef, error) {
 		if remaining != 0 {
 			return nil, fmt.Errorf("memtable: inode %d extent %d resolves %d bytes short", ino, r.Handle, remaining)
 		}
+	}
+	if open.live {
+		// The file ended part-way through a chunk: the rest of it belongs
+		// to bytes that were overwritten or truncated away.
+		return nil, fmt.Errorf("%w: inode %d ends %d bytes into chunk %s (length %d) at file offset %d",
+			ErrNotTiled, ino, open.have, open.id, open.want, open.at)
 	}
 	return out, nil
 }

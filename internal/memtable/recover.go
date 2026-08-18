@@ -93,6 +93,12 @@ type BufferReport struct {
 	Truncated bool
 	// Missing is how many bytes short of a full table the file is.
 	Missing int64
+	// Ignored means the file was found but not read. There is one ring, so
+	// a second buffer file is a stray from an older layout or a crashed
+	// rotation, and its absolute positions are meaningless against the
+	// ring that was adopted. It is reported because its records are gone
+	// and the content rows naming them will say so.
+	Ignored bool
 }
 
 // Report is recovery's account of itself. It must be shown to the user
@@ -115,11 +121,16 @@ func (r *Report) String() string {
 	for _, br := range r.Buffers {
 		recs += br.Records
 		bytes += br.Bytes
-		switch {
-		case br.Torn:
-			fmt.Fprintf(&b, "memtable: %s has a torn tail; %d records recovered before it\n", br.Path, br.Records)
-		case br.Truncated:
+		// A file can be both short AND torn — a truncation usually cuts
+		// through a record — so these are separate lines, not a switch.
+		if br.Ignored {
+			fmt.Fprintf(&b, "memtable: %s is a stray buffer file and was not read\n", br.Path)
+		}
+		if br.Truncated {
 			fmt.Fprintf(&b, "memtable: %s is short by %d bytes; %d records recovered\n", br.Path, br.Missing, br.Records)
+		}
+		if br.Torn {
+			fmt.Fprintf(&b, "memtable: %s has a torn tail; %d records recovered before it\n", br.Path, br.Records)
 		}
 	}
 	fmt.Fprintf(&b, "memtable: recovered %d extents (%d bytes) from %d buffer files\n", recs, bytes, len(r.Buffers))
@@ -155,38 +166,41 @@ func Recover(opts Options, d Durable) (*Store, *Report, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	found := make(map[Handle]*table)
-	for _, seq := range seqs {
+	// A ring recovers IN PLACE: the surviving run stays exactly where it
+	// is and the store adopts the file rather than copying its records
+	// into a fresh one. Positions are absolute and the reader resolves
+	// them modulo this ring's size, so copying would invalidate every one
+	// of them — which is also why an older stray file is reported and
+	// never read: its positions mean nothing in these coordinates.
+	found := make(map[Handle]struct{})
+	for i, seq := range seqs {
 		path := filepath.Join(opts.Dir, bufferName(seq))
-		buf, recs, err := OpenBuffer(path, seq)
+		if seq >= s.nextSeq {
+			s.nextSeq = seq + 1
+		}
+		if i != len(seqs)-1 {
+			rep.Buffers = append(rep.Buffers, BufferReport{Path: path, Seq: seq, Ignored: true})
+			continue
+		}
+		r, recs, err := OpenRing(path)
 		if err != nil {
 			return nil, nil, err
 		}
-		t := &table{
-			seq:    seq,
-			buf:    buf,
-			index:  make(map[Handle]Record, len(recs)),
-			live:   make(map[Handle]int),
-			inodes: make(map[uint64]struct{}),
+		br := BufferReport{
+			Path: path, Seq: seq, Records: len(recs),
+			Torn: r.Torn, Truncated: r.Truncated, Missing: r.Missing,
 		}
-		br := BufferReport{Path: path, Seq: seq, Records: len(recs), Torn: buf.Torn()}
-		if short := int64(s.tableSize - buf.Cap()); short > 0 {
-			br.Truncated, br.Missing = true, short
-		}
+		s.ring = r
 		for _, rec := range recs {
-			t.index[rec.Handle] = rec
-			t.inodes[rec.Inode] = struct{}{}
+			s.index[rec.Handle] = rec
+			s.order = append(s.order, rec.Handle)
 			br.Bytes += int64(rec.Length)
-			found[rec.Handle] = t
+			found[rec.Handle] = struct{}{}
 			if rec.Handle >= s.nextHandle {
 				s.nextHandle = rec.Handle + 1
 			}
 		}
 		rep.Buffers = append(rep.Buffers, br)
-		if seq >= s.nextSeq {
-			s.nextSeq = seq + 1
-		}
-		s.recovered = append(s.recovered, t)
 	}
 
 	s.handleLoc = make(map[Handle][]ChunkSlice, len(d.Handles))
@@ -206,9 +220,9 @@ func Recover(opts Options, d Durable) (*Store, *Report, error) {
 	for _, row := range d.Rows {
 		c := &content{size: row.Size}
 		for _, r := range row.Refs {
-			if t, ok := found[r.Handle]; ok {
+			if _, ok := found[r.Handle]; ok {
 				c.refs = append(c.refs, r)
-				t.acquire(r.Handle)
+				s.live[r.Handle]++
 				continue
 			}
 			if _, ok := s.handleLoc[r.Handle]; ok {
@@ -234,8 +248,13 @@ func Recover(opts Options, d Durable) (*Store, *Report, error) {
 		return rep.Lost[i].FileOff < rep.Lost[j].FileOff
 	})
 
-	if err := s.openActive(); err != nil {
-		return nil, nil, err
+	// Only when there was nothing to adopt: a recovered ring IS the active
+	// one, and creating a second would leave every recovered position
+	// pointing into a file nobody reads.
+	if s.ring == nil {
+		if err := s.openActive(); err != nil {
+			return nil, nil, err
+		}
 	}
 	return s, rep, nil
 }

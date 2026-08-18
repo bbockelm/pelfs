@@ -30,22 +30,22 @@ type flushResult struct {
 	deadBytes      int64
 }
 
-func (s *Store) runFlush(ctx context.Context, t *table) {
-	plan, res := s.snapshot(t)
+func (s *Store) runFlush(ctx context.Context, b *batch) {
+	plan, res := s.snapshot(b)
 	if s.hooks.FlushStarted != nil {
-		s.hooks.FlushStarted(t.seq)
+		s.hooks.FlushStarted(b.seq)
 	}
-	if err := s.chunkAndPack(ctx, t, plan, res); err != nil {
+	if err := s.chunkAndPack(ctx, b, plan, res); err != nil {
 		s.failFlush(err)
 		return
 	}
 	if s.hooks.BeforePublish != nil {
-		if err := s.hooks.BeforePublish(t.seq); err != nil {
+		if err := s.hooks.BeforePublish(b.seq); err != nil {
 			s.failFlush(err)
 			return
 		}
 	}
-	s.publish(t, res)
+	s.publish(b, res)
 }
 
 // snapshot captures the frozen table's live set. The design calls this
@@ -53,15 +53,19 @@ func (s *Store) runFlush(ctx context.Context, t *table) {
 // the inodes this table touched. That is still proportional to the flush
 // rather than to the tree, which is the property that matters, but the
 // claim as written is wrong.
-func (s *Store) snapshot(t *table) ([]inodePlan, *flushResult) {
+func (s *Store) snapshot(b *batch) ([]inodePlan, *flushResult) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	res := &flushResult{
 		handleLoc: make(map[Handle][]ChunkSlice),
 		chunkLoc:  make(map[string]PackLoc),
 	}
-	inodes := make([]uint64, 0, len(t.inodes))
-	for ino := range t.inodes {
+	byHandle := make(map[Handle]Record, len(b.recs))
+	for _, r := range b.recs {
+		byHandle[r.Handle] = r
+	}
+	inodes := make([]uint64, 0, len(b.inodes))
+	for ino := range b.inodes {
 		inodes = append(inodes, ino)
 	}
 	sort.Slice(inodes, func(i, j int) bool { return inodes[i] < inodes[j] })
@@ -73,31 +77,33 @@ func (s *Store) snapshot(t *table) ([]inodePlan, *flushResult) {
 		if c == nil {
 			continue
 		}
-		hs := c.handlesInOrder(func(h Handle) bool { _, ok := t.index[h]; return ok })
+		hs := c.handlesInOrder(func(h Handle) bool { _, ok := byHandle[h]; return ok })
 		if len(hs) == 0 {
 			continue
 		}
 		exts := make([]Record, 0, len(hs))
 		for _, h := range hs {
-			exts = append(exts, t.index[h])
+			exts = append(exts, byHandle[h])
 		}
 		live += len(exts)
 		plan = append(plan, inodePlan{ino: ino, exts: exts})
 	}
-	res.deadExtents = int64(len(t.index) - live)
-	for h, rec := range t.index {
-		if _, ok := t.live[h]; !ok {
+	// Whatever the content rows no longer reference died in the ring and
+	// is never uploaded, which is the design's central claim.
+	res.deadExtents = int64(len(b.recs) - live)
+	for _, rec := range b.recs {
+		if _, ok := b.live[rec.Handle]; !ok {
 			res.deadBytes += int64(rec.Length)
 		}
 	}
 	return plan, res
 }
 
-func (s *Store) chunkAndPack(ctx context.Context, t *table, plan []inodePlan, res *flushResult) error {
+func (s *Store) chunkAndPack(ctx context.Context, b *batch, plan []inodePlan, res *flushResult) error {
 	pk := newFlushPacker(s.obj, s.dir, int64(s.tableSize))
 	defer pk.abort()
 	for _, ip := range plan {
-		if err := s.chunkInode(ctx, t, ip.exts, pk, res); err != nil {
+		if err := s.chunkInode(ctx, b, ip.exts, pk, res); err != nil {
 			return err
 		}
 	}
@@ -120,7 +126,7 @@ func (s *Store) chunkAndPack(ctx context.Context, t *table, plan []inodePlan, re
 // modelled latency. Abandoning cannot skip hashing, because a pack
 // entry's key IS the chunk identity, so it trades a cheap gear-hash scan
 // for extra pack entries and comes out behind.
-func (s *Store) chunkInode(ctx context.Context, t *table, exts []Record, pk *flushPacker, res *flushResult) error {
+func (s *Store) chunkInode(ctx context.Context, b *batch, exts []Record, pk *flushPacker, res *flushResult) error {
 	starts := make([]int64, len(exts)+1)
 	for i, r := range exts {
 		starts[i+1] = starts[i] + int64(r.Length)
@@ -149,7 +155,7 @@ func (s *Store) chunkInode(ctx context.Context, t *table, exts []Record, pk *flu
 
 	readers := make([]io.Reader, len(exts))
 	for i, r := range exts {
-		readers[i] = bytes.NewReader(t.buf.At(r.Off, r.Length))
+		readers[i] = bytes.NewReader(s.ringAt(uint64(r.Off), r.Length))
 	}
 	ch := chunkid.NewChunker(io.MultiReader(readers...), s.chunkOpts)
 	var pos int64
@@ -174,7 +180,7 @@ func (s *Store) chunkInode(ctx context.Context, t *table, exts []Record, pk *flu
 // publish installs the flush's locations and releases the table. Both
 // happen under one lock hold: a reader must never observe a moment where
 // the memtable has been dropped and the location map does not yet answer.
-func (s *Store) publish(t *table, res *flushResult) {
+func (s *Store) publish(b *batch, res *flushResult) {
 	s.mu.Lock()
 	for h, sl := range res.handleLoc {
 		s.handleLoc[h] = sl
@@ -188,18 +194,38 @@ func (s *Store) publish(t *table, res *flushResult) {
 	s.stats.Packs += int64(len(res.packs))
 	s.stats.DeadExtents += res.deadExtents
 	s.stats.DeadBytes += res.deadBytes
-	s.flushing = nil
+
+	// Locations are installed BEFORE the ring space is released, and both
+	// happen under one lock hold. A reader must never observe a moment
+	// where the ring no longer holds an extent and the location map does
+	// not yet answer for it.
+	for _, r := range b.recs {
+		delete(s.index, r.Handle)
+		delete(s.live, r.Handle)
+	}
+	if n := len(b.recs); n > 0 && n <= len(s.order) {
+		s.order = s.order[n:]
+	}
+	if b.to > s.reclaimTo {
+		s.reclaimTo = b.to
+	}
+	s.releaseLocked()
+	s.packing = false
 	s.cond.Broadcast()
 	s.mu.Unlock()
-	t.retire()
 }
 
-// failFlush leaves the table in place. Until its locations are published
-// the memtable is the only copy, so a failed flush must not discard it —
-// it is retried by the next Flush.
+// failFlush leaves the records in place. Until their locations are
+// published the ring is the only copy, so a failed pack run must not
+// reclaim anything — it is retried by the next Flush.
+//
+// It must still clear the in-flight flag. The run IS over, and a flag
+// left set is a lock nobody holds: the next Flush would wait on a
+// broadcast that can never come.
 func (s *Store) failFlush(err error) {
 	s.mu.Lock()
 	s.flushErr = err
+	s.packing = false
 	s.cond.Broadcast()
 	s.mu.Unlock()
 }

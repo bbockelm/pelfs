@@ -49,15 +49,40 @@
 // live generation NAMES: a pack no live generation lists is already dead
 // by list arithmetic and needs no walk to prove it.
 //
-// Memory is proportional to the number of entries in the live pack set,
-// because the identity index is held whole — the same trade fsck makes.
-// At the hundred-million-object scale the design contemplates that index
-// is the thing to replace (with internal/mpi and the pack manifest), not
-// the sweep around it.
+// # Memory
+//
+// The sweep is a MERGE JOIN over two sorted streams — every (identity,
+// pack) placement the trailers describe, and every identity the walk
+// reaches — rather than a walk against a resident index.
+//
+// It used to be the latter, and that bounded this package to volumes
+// whose identity index fit in memory: a hundred million entries keyed by
+// hex string is tens of gigabytes before the reference set is counted at
+// all. Both sides are keyed by identity, so the question was never a
+// lookup; it only looked like one because a map was the easiest thing to
+// reach for. Sorting instead (sorter.go) makes the pass sequential, the
+// records fixed-width, the keys raw rather than hex, and the memory a
+// buffer the caller sizes (Options.SortBytes).
+//
+// What remains resident is proportional to the number of PACKS, the
+// number of CATALOGS and the number of hardlinked inodes — thousands
+// each, not hundreds of millions:
+//
+//   - per-pack liveness counters, which are the answer being computed;
+//   - the locations of catalog-class entries, which are the only entries
+//     this sweep ever reads back (sweeper.objLoc);
+//   - the set of catalogs already walked, and the promoted inodes whose
+//     content the shard pass still has to find.
+//
+// Persisting reachability instead of recomputing it — git's bitmap model,
+// which fits this format unusually well — is a larger change and is
+// written up in docs/design-reachability.md rather than built here.
 package reach
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -99,12 +124,24 @@ type Options struct {
 	// DEK is the unwrapped data-encryption key, needed when the
 	// generations encrypt their catalogs; nil for plaintext volumes.
 	DEK []byte
-	// CacheDir holds catalog spill files. Empty means a temporary
-	// directory removed on return. Spills are written fresh and deleted
-	// after use — a cached copy is a copy the sweep has not read.
+	// CacheDir holds catalog spill files and the sort runs the join
+	// streams over. Empty means a temporary directory removed on return.
+	// Spills are written fresh and deleted after use — a cached copy is a
+	// copy the sweep has not read.
+	//
+	// It must have room for the sweep's identity records: about 45 bytes
+	// per pack entry plus 32 per reference, so a hundred-million-object
+	// volume spills a few gigabytes there and a small one spills nothing
+	// at all.
 	CacheDir string
 	// Workers bounds concurrent object fetches (default 8).
 	Workers int
+	// SortBytes is how much either side of the join buffers before
+	// spilling a run (default 64 MiB). It is the sweep's memory bound in
+	// all but name: everything else it holds is proportional to the number
+	// of packs, catalogs and hardlinked inodes rather than to the number
+	// of objects.
+	SortBytes int
 }
 
 // Pack is one pack's liveness. Entries/Bytes describe what it holds,
@@ -229,16 +266,37 @@ func (e *Incomplete) Error() string {
 type entryLoc struct {
 	pack        int // index into sweeper.packs
 	off, length int64
-	// backup marks a superblock backup entry, which is live for as long
-	// as its generation is (see sweeper.readTrailers).
-	backup bool
 }
 
-// keyedLoc pairs an identity with one place it sits, so a worker can
-// accumulate a whole trailer's worth before taking the index lock once.
-type keyedLoc struct {
-	key string
+// The two record layouts the join streams over. Both are keyed by the raw
+// 32-byte identity — raw rather than the hex the sweep used to key its
+// maps by, which halves every byte moved and every byte compared.
+const (
+	idLen = 32
+	// placeLen: identity, pack index, stored length, flags. The OFFSET is
+	// deliberately absent. Only catalog-class entries are ever read back,
+	// and those are held resident (sweeper.objLoc); a chunk's placement is
+	// needed to attribute bytes and never to fetch them, so spilling eight
+	// bytes per entry that nothing reads would be the largest single line
+	// item in the sort for no purpose.
+	placeLen = idLen + 4 + 8 + 1
+	// flagBackup marks a superblock backup, already counted live at
+	// trailer time and skipped by the join so it cannot count twice.
+	flagBackup = 1
+)
+
+// objEntry is one catalog-class entry a worker found, held locally until
+// the whole trailer is read and merged into objLoc under one lock.
+type objEntry struct {
+	id  [32]byte
 	loc entryLoc
+}
+
+func putPlace(dst []byte, id [32]byte, pack int, length int64, flags byte) {
+	copy(dst[0:idLen], id[:])
+	binary.LittleEndian.PutUint32(dst[idLen:], uint32(pack))
+	binary.LittleEndian.PutUint64(dst[idLen+4:], uint64(length))
+	dst[idLen+12] = flags
 }
 
 type sweeper struct {
@@ -250,19 +308,32 @@ type sweeper struct {
 	packs  []Pack
 	hashes [][32]byte
 
+	// places is every (identity, pack) placement the trailers describe and
+	// refs is every identity the walk reaches. They are the two sides of
+	// the join, streamed rather than held (sorter.go).
+	places *sorter
+	refs   *sorter
+
 	mu sync.Mutex
-	// index maps identity -> every entry holding it, built from verified
-	// trailers.
-	index map[string][]entryLoc
-	// reachable is the identity set the walk accumulates.
-	reachable map[string]struct{}
+	// objLoc locates the catalog-class entries — catalogs, inode shards,
+	// superblock backups — which are the only ones this sweep ever READS.
+	// It is resident because the walk needs random access to it while it
+	// is still discovering what to look up, and it is affordable because a
+	// volume has thousands of catalogs and hundreds of millions of chunks.
+	//
+	// The consequence is that a catalog stored as an untyped entry cannot
+	// be found. That is a format violation — typed entries are what let
+	// rescue inventory a namespace from packs alone — and it lands in the
+	// safe direction: the catalog fails to resolve, which is a failure,
+	// which makes the whole sweep incomplete and every pack fully live.
+	objLoc map[[32]byte]entryLoc
 	// promoted are the nlink>1 inodes seen in path catalogs; their content
 	// records live in inode shards and are collected in a second pass.
 	promoted map[int64]struct{}
 	// walked guards against fetching a catalog twice: content addressing
 	// means many generations name the same one, and carrying catalogs
 	// forward is the common case rather than the exception.
-	walked   map[string]struct{}
+	walked   map[[32]byte]struct{}
 	failures []Failure
 	objects  int
 	trailers int
@@ -323,13 +394,16 @@ func Sweep(ctx context.Context, o Options) (*Report, error) {
 	defer os.RemoveAll(spillDir) //nolint:errcheck
 
 	s := &sweeper{
-		o:         o,
-		spillDir:  spillDir,
-		index:     make(map[string][]entryLoc),
-		reachable: make(map[string]struct{}),
-		promoted:  make(map[int64]struct{}),
-		walked:    make(map[string]struct{}),
+		o:        o,
+		spillDir: spillDir,
+		places:   newSorter(spillDir, "places", idLen, placeLen, o.SortBytes),
+		refs:     newSorter(spillDir, "refs", idLen, idLen, o.SortBytes),
+		objLoc:   make(map[[32]byte]entryLoc),
+		promoted: make(map[int64]struct{}),
+		walked:   make(map[[32]byte]struct{}),
 	}
+	defer s.places.Close() //nolint:errcheck
+	defer s.refs.Close()   //nolint:errcheck
 	s.collectPacks(ctx)
 	s.readTrailers(ctx)
 	s.walkCatalogs(ctx)
@@ -408,10 +482,14 @@ func (s *sweeper) collectPacks(ctx context.Context) {
 	}
 }
 
-// readTrailers builds the identity index and the per-pack totals from
-// every pack's verified trailer, concurrently. A pack whose trailer does
-// not read is a failure and stays unindexed: everything that lived in it
-// then fails to resolve, which is the same conservative direction.
+// readTrailers records every placement and the per-pack totals from every
+// pack's verified trailer, concurrently. A pack whose trailer does not
+// read is a failure and stays unindexed: everything that lived in it then
+// fails to resolve, which is the same conservative direction.
+//
+// A whole trailer's placements are built into one buffer and handed to
+// the sorter in a single call, so the cost paid per identity is a memcpy
+// into a slice rather than a lock, a map probe and an allocation.
 func (s *sweeper) readTrailers(ctx context.Context) {
 	each(ctx, s.o.Workers, len(s.packs), func(i int) {
 		p := &s.packs[i]
@@ -420,13 +498,22 @@ func (s *sweeper) readTrailers(ctx context.Context) {
 			s.fail(p.Name, "%v", err)
 			return
 		}
-		var ents, bytes, liveEnts, liveBytes int64
-		locs := make([]keyedLoc, 0, len(entries))
+		var ents, stored, liveEnts, liveBytes int64
+		batch := make([]byte, 0, len(entries)*placeLen)
+		var objs []objEntry
 		for _, e := range entries {
+			id, err := parseIdentity(e.Key)
+			if err != nil {
+				// A trailer key that is not an identity indexes nothing this
+				// sweep can join against, and one that a reader WOULD resolve
+				// would then look unreferenced. Refusing is the safe reading.
+				s.fail(p.Name, "entry key %q: %v", e.Key, err)
+				return
+			}
 			ents++
-			bytes += e.Length
-			backup := e.Type == packstore.EntrySuperblock
-			if backup {
+			stored += e.Length
+			var flags byte
+			if e.Type == packstore.EntrySuperblock {
 				// A generation's own superblock backup is live while the
 				// generation is, and nothing references it by identity —
 				// it is the disaster-recovery copy, reachable only by
@@ -436,38 +523,61 @@ func (s *sweeper) readTrailers(ctx context.Context) {
 				// publish and the safe direction.
 				liveEnts++
 				liveBytes += e.Length
+				flags |= flagBackup
 			}
-			locs = append(locs, keyedLoc{e.Key, entryLoc{pack: i, off: e.Off, length: e.Length, backup: backup}})
+			if e.Type != packstore.EntryData {
+				objs = append(objs, objEntry{id, entryLoc{pack: i, off: e.Off, length: e.Length}})
+			}
+			var rec [placeLen]byte
+			putPlace(rec[:], id, i, e.Length, flags)
+			batch = append(batch, rec[:]...)
+		}
+		if err := s.places.Add(batch); err != nil {
+			s.fail(p.Name, "recording placements: %v", err)
+			return
 		}
 		s.mu.Lock()
 		p.Indexed = true
-		p.Entries, p.Bytes = ents, bytes
+		p.Entries, p.Bytes = ents, stored
 		p.LiveEntries, p.LiveBytes = liveEnts, liveBytes
-		for _, kl := range locs {
-			s.index[kl.key] = append(s.index[kl.key], kl.loc)
+		for _, o := range objs {
+			// First writer wins: any copy will do, since they are the same
+			// bytes by construction.
+			if _, dup := s.objLoc[o.id]; !dup {
+				s.objLoc[o.id] = o.loc
+			}
 		}
 		s.trailers++
 		s.mu.Unlock()
 	})
 }
 
-// locate picks where to read an identity from. Any copy will do — they
-// are the same bytes by construction — so the first indexed one is taken.
-func (s *sweeper) locate(id string) (entryLoc, bool) {
+// parseIdentity reads a trailer key as the 32-byte identity everything
+// here is keyed by.
+func parseIdentity(key string) ([32]byte, error) {
+	var id [32]byte
+	if len(key) != 2*len(id) {
+		return id, fmt.Errorf("is %d chars, want %d hex", len(key), 2*len(id))
+	}
+	if _, err := hex.Decode(id[:], []byte(key)); err != nil {
+		return id, err
+	}
+	return id, nil
+}
+
+// locate picks where to read a catalog-class identity from.
+func (s *sweeper) locate(id [32]byte) (entryLoc, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	locs := s.index[id]
-	if len(locs) == 0 {
-		return entryLoc{}, false
-	}
-	return locs[0], true
+	loc, ok := s.objLoc[id]
+	return loc, ok
 }
 
 // fetchObject reads and decodes one catalog-class pack entry. Their
 // encoding is fixed by rule — always zstd, under the one key the
 // superblock names — and never sniffed (docs/design-packfs.md, "Codec
 // marking").
-func (s *sweeper) fetchObject(ctx context.Context, id string) ([]byte, error) {
+func (s *sweeper) fetchObject(ctx context.Context, id [32]byte) ([]byte, error) {
 	loc, ok := s.locate(id)
 	if !ok {
 		return nil, errors.New("resolves in no listed pack")
@@ -527,24 +637,19 @@ func (s *sweeper) spill(id string, plain []byte) (string, error) {
 // report totals the per-pack numbers after marking every reachable
 // identity live. Marking happens here rather than during the walk because
 // an identity is reachable once but may sit in several packs.
+//
+// It is a MERGE JOIN over two sorted streams — every placement the
+// trailers described, and every identity the walk reached — rather than
+// the map lookup it used to be. Both sides arrive sorted by identity, so
+// the whole attribution is one pass with a constant amount of state, and
+// the sweep's memory stops depending on how many objects the volume
+// holds. A stream that fails to read is recorded as a failure: a
+// truncated join would under-count liveness, which is the direction that
+// deletes data.
 func (s *sweeper) report() *Report {
 	rep := &Report{Generations: len(s.o.Live), Trailers: s.trailers, Objects: s.objects}
 	rep.Fetched = rep.Trailers + rep.Objects
-	for id := range s.reachable {
-		locs := s.index[id]
-		if len(locs) == 0 {
-			rep.Unresolved++
-			continue
-		}
-		for _, loc := range locs {
-			if loc.backup {
-				continue // already counted at trailer time
-			}
-			p := &s.packs[loc.pack]
-			p.LiveEntries++
-			p.LiveBytes += loc.length
-		}
-	}
+	s.join(rep)
 	rep.Packs = s.packs
 	for _, p := range rep.Packs {
 		rep.Entries += p.Entries
@@ -553,6 +658,69 @@ func (s *sweeper) report() *Report {
 		rep.LiveBytes += p.LiveBytes
 	}
 	return rep
+}
+
+// join walks the two sorted streams together and credits each pack for
+// the entries something still references.
+//
+// The reference side may hold an identity many times over — a chunk
+// shared by a thousand files is reached a thousand times, and nothing
+// upstream deduplicates it, because deduplicating is exactly what a
+// sorted stream does for free. It is counted once. The placement side may
+// also hold an identity many times, and each of THOSE is counted: the
+// same bytes in two packs keep both alive, since either may be the copy a
+// reader resolves.
+func (s *sweeper) join(rep *Report) {
+	places, err := s.places.Sorted()
+	if err != nil {
+		s.fail("sweep", "reading placements: %v", err)
+		return
+	}
+	defer places.Close() //nolint:errcheck
+	refs, err := s.refs.Sorted()
+	if err != nil {
+		s.fail("sweep", "reading references: %v", err)
+		return
+	}
+	defer refs.Close() //nolint:errcheck
+
+	place, more := places.Next()
+	var prev [idLen]byte
+	first := true
+	for {
+		id, ok := refs.Next()
+		if !ok {
+			break
+		}
+		if !first && bytes.Equal(id, prev[:]) {
+			continue
+		}
+		copy(prev[:], id)
+		first = false
+
+		for more && bytes.Compare(place[:idLen], id) < 0 {
+			place, more = places.Next()
+		}
+		found := false
+		for more && bytes.Equal(place[:idLen], id) {
+			found = true
+			if place[idLen+12]&flagBackup == 0 {
+				p := &s.packs[binary.LittleEndian.Uint32(place[idLen:])]
+				p.LiveEntries++
+				p.LiveBytes += int64(binary.LittleEndian.Uint64(place[idLen+4:]))
+			}
+			place, more = places.Next()
+		}
+		if !found {
+			rep.Unresolved++
+		}
+	}
+	if err := refs.Err(); err != nil {
+		s.fail("sweep", "reading references: %v", err)
+	}
+	if err := places.Err(); err != nil {
+		s.fail("sweep", "reading placements: %v", err)
+	}
 }
 
 // conservative rewrites a report as "every pack fully live", which is what

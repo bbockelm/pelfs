@@ -2,7 +2,6 @@ package reach
 
 import (
 	"context"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -15,16 +14,21 @@ import (
 // catJob is one catalog to open and scan: its identity, and the directory
 // inode it is rooted at.
 type catJob struct {
-	idHex string
-	ino   int64
+	id  [32]byte
+	ino int64
 }
 
 // found is what scanning one catalog discovered. It is accumulated
-// locally and merged under the lock once, rather than taking the lock per
-// chunkref: a catalog holds thousands of them and the merge is the only
-// part any other worker cares about.
+// locally and handed over once, rather than taking a lock per chunkref: a
+// catalog holds thousands of them and the hand-over is the only part any
+// other worker cares about.
+//
+// chunks is the raw concatenation of 32-byte identities rather than a
+// slice of them, because that is already the sorter's record layout — so
+// a catalog's references reach the spool as one append, with no per-chunk
+// allocation, no hex, and no second copy to build.
 type found struct {
-	chunks   []string
+	chunks   []byte
 	nested   []catJob
 	promoted []int64
 }
@@ -51,15 +55,20 @@ func (s *sweeper) walkCatalogs(ctx context.Context) {
 		})
 		s.mu.Lock()
 		pending = nil
+		var batch []byte
 		for _, j := range next {
-			if _, dup := s.walked[j.idHex]; dup {
+			if _, dup := s.walked[j.id]; dup {
 				continue
 			}
-			s.walked[j.idHex] = struct{}{}
-			s.reachable[j.idHex] = struct{}{}
+			s.walked[j.id] = struct{}{}
+			batch = append(batch, j.id[:]...)
 			pending = append(pending, j)
 		}
 		s.mu.Unlock()
+		if err := s.refs.Add(batch); err != nil {
+			s.fail("sweep", "recording catalog references: %v", err)
+			return
+		}
 	}
 }
 
@@ -69,24 +78,29 @@ func (s *sweeper) walkCatalogs(ctx context.Context) {
 // before anything is fetched, and stay live even if the fetch then fails.
 func (s *sweeper) seedCatalogs() []catJob {
 	var jobs []catJob
-	queue := func(id string, ino int64) {
+	var batch []byte
+	queue := func(id [32]byte, ino int64) {
 		if _, dup := s.walked[id]; dup {
 			return
 		}
 		s.walked[id] = struct{}{}
-		s.reachable[id] = struct{}{}
-		jobs = append(jobs, catJob{idHex: id, ino: ino})
+		batch = append(batch, id[:]...)
+		jobs = append(jobs, catJob{id: id, ino: ino})
 	}
 	for _, sb := range s.o.Live {
-		queue(idHex(sb.RootCatalog), rootInode)
+		queue(sb.RootCatalog, rootInode)
 		for _, ce := range sb.Catalogs {
-			queue(idHex(ce.Identity), int64(ce.Inode))
+			queue(ce.Identity, int64(ce.Inode))
 		}
 		for _, sh := range sb.Shards {
 			// Shard bytes are reachable; their CONTENT is collected in the
 			// second pass, once every promoted inode is known.
-			s.reachable[idHex(sh.Identity)] = struct{}{}
+			batch = append(batch, sh.Identity[:]...)
 		}
+	}
+	if err := s.refs.Add(batch); err != nil {
+		s.fail("sweep", "recording the catalog frontier: %v", err)
+		return nil
 	}
 	return jobs
 }
@@ -95,23 +109,24 @@ func (s *sweeper) seedCatalogs() []catJob {
 // failure is terminal for the sweep as a whole (see the package comment),
 // so it is recorded and the catalog abandoned rather than half-read.
 func (s *sweeper) scanCatalog(ctx context.Context, j catJob, next *[]catJob) {
-	cat, release, err := s.openObject(ctx, j.idHex)
+	cat, release, err := s.openObject(ctx, j.id)
 	if err != nil {
-		s.fail("catalog "+j.idHex, "%v", err)
+		s.fail("catalog "+idHex(j.id), "%v", err)
 		return
 	}
 	defer release()
 
 	var f found
 	if err := s.scanDir(cat, j.ino, &f, make(map[int64]bool)); err != nil {
-		s.fail("catalog "+j.idHex, "%v", err)
+		s.fail("catalog "+idHex(j.id), "%v", err)
+		return
+	}
+	if err := s.refs.Add(f.chunks); err != nil {
+		s.fail("catalog "+idHex(j.id), "recording references: %v", err)
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, id := range f.chunks {
-		s.reachable[id] = struct{}{}
-	}
 	for _, ino := range f.promoted {
 		s.promoted[ino] = struct{}{}
 	}
@@ -121,12 +136,12 @@ func (s *sweeper) scanCatalog(ctx context.Context, j catJob, next *[]catJob) {
 // openObject fetches one catalog-class object and opens it over a spill
 // file. The returned closure closes the reader and drops the spill: a
 // catalog is read exactly once, so nothing is kept.
-func (s *sweeper) openObject(ctx context.Context, id string) (catalog.Reader, func(), error) {
+func (s *sweeper) openObject(ctx context.Context, id [32]byte) (catalog.Reader, func(), error) {
 	plain, err := s.fetchObject(ctx, id)
 	if err != nil {
 		return nil, nil, err
 	}
-	fp, err := s.spill(id, plain)
+	fp, err := s.spill(idHex(id), plain)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -178,7 +193,9 @@ func (s *sweeper) scanDir(cat catalog.Reader, ino int64, f *found, seen map[int6
 				if len(id) != 32 {
 					return fmt.Errorf("nested locator under inode %d is %d bytes, want 32", ino, len(id))
 				}
-				f.nested = append(f.nested, catJob{idHex: hex.EncodeToString(id), ino: d.Inode})
+				var nested [32]byte
+				copy(nested[:], id)
+				f.nested = append(f.nested, catJob{id: nested, ino: d.Inode})
 				continue
 			}
 			if err := s.scanDir(cat, d.Inode, f, seen); err != nil {
@@ -222,7 +239,7 @@ func collectChunks(cat catalog.Reader, ino int64, f *found) error {
 		if len(id) != 32 {
 			return fmt.Errorf("chunkref %d of inode %d has a %d-byte identity", i, ino, len(id))
 		}
-		f.chunks = append(f.chunks, hex.EncodeToString(id))
+		f.chunks = append(f.chunks, id...)
 	}
 	return nil
 }
@@ -231,7 +248,7 @@ func collectChunks(cat catalog.Reader, ino int64, f *found) error {
 // route through it. One identity may be routed by several generations;
 // its bytes are the same, so it is fetched once and the ranges union.
 type shardJob struct {
-	idHex  string
+	id     [32]byte
 	ranges [][2]uint64
 }
 
@@ -258,9 +275,9 @@ func (s *sweeper) walkShards(ctx context.Context) {
 	covered := make(map[int64]bool, len(promoted))
 	each(ctx, s.o.Workers, len(jobs), func(i int) {
 		j := jobs[i]
-		cat, release, err := s.openObject(ctx, j.idHex)
+		cat, release, err := s.openObject(ctx, j.id)
 		if err != nil {
-			s.fail("shard "+j.idHex, "%v", err)
+			s.fail("shard "+idHex(j.id), "%v", err)
 			return
 		}
 		defer release()
@@ -272,20 +289,21 @@ func (s *sweeper) walkShards(ctx context.Context) {
 					if errors.Is(err, catalog.ErrNotExist) {
 						continue // another generation's shard holds it
 					}
-					s.fail("shard "+j.idHex, "stat inode %d: %v", ino, err)
+					s.fail("shard "+idHex(j.id), "stat inode %d: %v", ino, err)
 					return
 				}
 				got = append(got, ino)
 				if err := collectChunks(cat, ino, &f); err != nil {
-					s.fail("shard "+j.idHex, "%v", err)
+					s.fail("shard "+idHex(j.id), "%v", err)
 					return
 				}
 			}
 		}
-		s.mu.Lock()
-		for _, id := range f.chunks {
-			s.reachable[id] = struct{}{}
+		if err := s.refs.Add(f.chunks); err != nil {
+			s.fail("shard "+idHex(j.id), "recording references: %v", err)
+			return
 		}
+		s.mu.Lock()
 		for _, ino := range got {
 			covered[ino] = true
 		}
@@ -314,7 +332,7 @@ func (s *sweeper) shardJobs() []shardJob {
 			i, dup := at[idHex(sh.Identity)]
 			if !dup {
 				at[idHex(sh.Identity)] = len(jobs)
-				jobs = append(jobs, shardJob{idHex: idHex(sh.Identity), ranges: [][2]uint64{r}})
+				jobs = append(jobs, shardJob{id: sh.Identity, ranges: [][2]uint64{r}})
 				continue
 			}
 			if !slicesHasRange(jobs[i].ranges, r) {

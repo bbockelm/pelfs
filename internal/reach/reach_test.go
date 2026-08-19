@@ -686,3 +686,83 @@ func TestASweepRefusesAGenerationWhoseManifestIsUnreadable(t *testing.T) {
 	}
 	t.Logf("refused, with: %v", inc.Failures)
 }
+
+// sweepWith is sweep with the join's buffer set, so a test can force the
+// sort to spill.
+func sweepWith(t *testing.T, sortBytes int, inner pelicanobj.Store, live ...*superblock.Superblock) *reach.Report {
+	t.Helper()
+	rep, err := reach.Sweep(context.Background(), reach.Options{
+		Inner: inner, Live: live, CacheDir: t.TempDir(), Workers: 4, SortBytes: sortBytes,
+	})
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	return rep
+}
+
+// The join streams over two sorted files when it does not fit in memory
+// and over two slices when it does. Which one runs is an accident of how
+// much the caller let it buffer, and every number the sweep reports must
+// be the same either way — the whole point of the streaming rewrite is
+// that a volume too large to hold gets the SAME answer, not a cheaper
+// approximation of one.
+func TestASpilledSweepAgreesWithAResidentOne(t *testing.T) {
+	inner, _, gen0, res, _ := treeFixture(t, "9a9a9a9a-1111-2222-3333-444444444444")
+
+	resident := sweepWith(t, 1<<20, inner, gen0, res.Superblock)
+	// A placement is 45 bytes and a reference 32, so a hundred-byte budget
+	// is two records a run on one side and three on the other: the fixture
+	// spills several runs and the final merge is a real k-way one.
+	spilled := sweepWith(t, 100, inner, gen0, res.Superblock)
+
+	if resident.Entries < 8 {
+		t.Fatalf("the fixture holds %d entries, too few to have forced several runs; this test no longer proves anything",
+			resident.Entries)
+	}
+	if spilled.Entries != resident.Entries || spilled.LiveEntries != resident.LiveEntries ||
+		spilled.Bytes != resident.Bytes || spilled.LiveBytes != resident.LiveBytes ||
+		spilled.Unresolved != resident.Unresolved {
+		t.Fatalf("spilled: %d/%d entries, %d/%d bytes, %d unresolved; resident: %d/%d, %d/%d, %d",
+			spilled.LiveEntries, spilled.Entries, spilled.LiveBytes, spilled.Bytes, spilled.Unresolved,
+			resident.LiveEntries, resident.Entries, resident.LiveBytes, resident.Bytes, resident.Unresolved)
+	}
+	if len(spilled.Packs) != len(resident.Packs) {
+		t.Fatalf("spilled saw %d packs, resident %d", len(spilled.Packs), len(resident.Packs))
+	}
+	for i := range spilled.Packs {
+		a, b := spilled.Packs[i], resident.Packs[i]
+		if a != b {
+			t.Fatalf("pack %s: spilled %+v, resident %+v", a.Name, a, b)
+		}
+	}
+	t.Logf("%d entries / %d bytes, %.4f live, identical spilled and resident",
+		resident.Entries, resident.Bytes, resident.LiveFraction())
+}
+
+// A chunk many files share is REACHED many times and counted once, while
+// a chunk sitting in two packs is counted in both: the join dedups its
+// reference side and never its placement side, and mixing those up would
+// either over-count liveness (keeping garbage) or under-count it
+// (deleting data).
+func TestSharedContentIsCountedOncePerPlacement(t *testing.T) {
+	raw, _ := newInner(t)
+	inner := counted(raw)
+	v := testvol.New(t, inner, testvol.Options{VolumeID: testvol.ParseUUID(t, "5c5c5c5c-1111-2222-3333-444444444444")})
+	body := pseudorandom(3<<20, 99)
+	for i := range 8 {
+		v.WriteFile(rootIno, fmt.Sprintf("copy%d.bin", i), body)
+	}
+	res := v.Publish(publishOpts)
+	rep := sweep(t, inner, res.Superblock)
+
+	// Eight identical files dedup to one placement per chunk, so the live
+	// bytes are one copy's worth and not eight.
+	if rep.LiveBytes > 4<<20 {
+		t.Fatalf("eight copies of a 3 MiB body report %d live bytes; the join is counting a shared chunk once per reference",
+			rep.LiveBytes)
+	}
+	if rep.LiveFraction() < 0.99 {
+		t.Fatalf("a freshly published generation is %.4f live, want ~1", rep.LiveFraction())
+	}
+	dump(t, rep)
+}

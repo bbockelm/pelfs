@@ -262,15 +262,24 @@ func (ix *Index) Packs() []string {
 // Nothing is written to w until the merge has succeeded, so a failure
 // leaves an empty destination rather than a prefix of an index — except
 // for a failure inside Finish, which the caller discards.
-func MergeTo(w io.Writer, spool io.ReadWriteSeeker, indexes []*Index) error {
+// MergeTo streams a merge to w, reporting what it wrote so a caller can
+// name the object without reading it back — which would undo the point of
+// streaming it out.
+func MergeTo(w io.Writer, spool io.ReadWriteSeeker, indexes []*Index) (entries, packs int, err error) {
 	var blob []byte
 	offsets := map[string]uint32{}
+	// Distinct pack names, for the ref. The blob is keyed by the joined
+	// LIST a key resolves to, so its size is not the pack count.
+	packNames := map[string]struct{}{}
 	intern := func(s string) uint32 {
 		if off, ok := offsets[s]; ok {
 			return off
 		}
 		off := uint32(len(blob))
 		offsets[s] = off
+		for _, name := range strings.Split(s, ",") {
+			packNames[name] = struct{}{}
+		}
 		blob = binary.LittleEndian.AppendUint16(blob, uint16(len(s)))
 		blob = append(blob, s...)
 		return off
@@ -280,7 +289,7 @@ func MergeTo(w io.Writer, spool io.ReadWriteSeeker, indexes []*Index) error {
 		tables[i] = ix.table
 	}
 	sw := packidx.NewStreamWriter(spool, KeyLen, recordLen, 0)
-	err := packidx.MergeKeys(tables, func(from int, key, v []byte) error {
+	err = packidx.MergeKeys(tables, func(from int, key, v []byte) error {
 		// Later inputs win outright: a key found in a newer tier names the
 		// pack that placement is current, and an older tier's answer is at
 		// best redundant and at worst a deleted pack. The offset only means
@@ -300,7 +309,7 @@ func MergeTo(w io.Writer, spool io.ReadWriteSeeker, indexes []*Index) error {
 		return sw.Add(key, rec[:])
 	})
 	if err != nil {
-		return err
+		return 0, 0, err
 	}
 	head := make([]byte, headerLen+len(blob))
 	copy(head[0:8], magic)
@@ -308,10 +317,12 @@ func MergeTo(w io.Writer, spool io.ReadWriteSeeker, indexes []*Index) error {
 	binary.LittleEndian.PutUint32(head[12:], uint32(len(blob)))
 	copy(head[headerLen:], blob)
 	if _, err := w.Write(head); err != nil {
-		return err
+		return 0, 0, err
 	}
-	_, err = sw.Finish(w)
-	return err
+	if _, err := sw.Finish(w); err != nil {
+		return 0, 0, err
+	}
+	return sw.Len(), len(packNames), nil
 }
 
 // sortedUnique is what Builder.Add and Builder.Encode do between them —
@@ -338,7 +349,7 @@ func sortedUnique(names []string) []string {
 // file.
 func Merge(indexes []*Index) []byte {
 	var out bytes.Buffer
-	if err := MergeTo(&out, packidx.MemSpool(), indexes); err != nil {
+	if _, _, err := MergeTo(&out, packidx.MemSpool(), indexes); err != nil {
 		// Unreachable: a memory spool and a bytes.Buffer cannot fail to be
 		// written, and the merge itself only fails on a write. Returning
 		// nothing rather than a truncated index leaves the caller's Open to

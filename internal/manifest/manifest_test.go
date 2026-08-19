@@ -147,7 +147,7 @@ func TestSpooledAndInMemoryMergesAgreeByteForByte(t *testing.T) {
 	}
 	defer spool.Close() //nolint:errcheck
 	var streamed bytes.Buffer
-	if err := MergeTo(&streamed, spool, segments); err != nil {
+	if _, err := MergeTo(&streamed, spool, segments); err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(streamed.Bytes(), Merge(segments)) {

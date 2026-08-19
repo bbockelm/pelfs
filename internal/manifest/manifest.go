@@ -181,7 +181,10 @@ func trimName(k []byte) string {
 // This has no blob to hold, so unlike an index (mpi.MergeTo) the whole
 // object streams: its header is two fixed fields, and the records pass
 // through untouched.
-func MergeTo(w io.Writer, spool io.ReadWriteSeeker, segments []*Manifest) error {
+// MergeTo streams a merge to w, reporting how many packs it wrote so a
+// caller can name the object without reading it back — which would undo
+// the point of streaming it out.
+func MergeTo(w io.Writer, spool io.ReadWriteSeeker, segments []*Manifest) (packs int, err error) {
 	tables := make([]*packidx.Table, len(segments))
 	for i, m := range segments {
 		tables[i] = m.table
@@ -190,25 +193,26 @@ func MergeTo(w io.Writer, spool io.ReadWriteSeeker, segments []*Manifest) error 
 	// The keys arrive padded and the records unchanged, so nothing here
 	// re-encodes what a segment already accepted: a name too long for a
 	// key could not have got into one of these in the first place.
-	err := packidx.MergeKeys(tables, func(_ int, key, v []byte) error { return sw.Add(key, v) })
-	if err != nil {
-		return err
+	if err := packidx.MergeKeys(tables, func(_ int, key, v []byte) error { return sw.Add(key, v) }); err != nil {
+		return 0, err
 	}
 	head := make([]byte, headerLen)
 	copy(head[0:8], magic)
 	binary.LittleEndian.PutUint32(head[8:], 1)
 	if _, err := w.Write(head); err != nil {
-		return err
+		return 0, err
 	}
-	_, err = sw.Finish(w)
-	return err
+	if _, err := sw.Finish(w); err != nil {
+		return 0, err
+	}
+	return sw.Len(), nil
 }
 
 // Merge is MergeTo into memory, which is what a small merge wants. A
 // merge whose output does not fit should call MergeTo with a file.
 func Merge(segments []*Manifest) []byte {
 	var out bytes.Buffer
-	if err := MergeTo(&out, packidx.MemSpool(), segments); err != nil {
+	if _, err := MergeTo(&out, packidx.MemSpool(), segments); err != nil {
 		// Unreachable: a memory spool and a bytes.Buffer cannot fail to be
 		// written. Returning nothing rather than a truncated segment leaves
 		// the caller's Open to refuse it — and for a manifest that refusal

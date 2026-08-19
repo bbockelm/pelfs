@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"io"
+	"os"
 
 	"lukechampine.com/blake3"
 
@@ -218,15 +220,42 @@ func (p *pipeline) mergeManifests(ctx context.Context, refs []superblock.Manifes
 	if len(segments) != len(refs) {
 		return superblock.ManifestRef{}, fmt.Errorf("%d of %d manifests fetched", len(segments), len(refs))
 	}
-	// Oldest first, which is the order the list is already in:
-	// manifest.Merge lets later inputs win, and later here means newer.
-	raw := manifest.Merge(segments)
-	if len(raw) > refTargetBytes {
-		return superblock.ManifestRef{}, fmt.Errorf("merged manifest is %d bytes, past the %d-byte target", len(raw), refTargetBytes)
-	}
-	m, err := manifest.Open(raw)
+	// Oldest first, which is the order the list is already in: the merge
+	// lets later inputs win, and later here means newer. It streams to a
+	// file and is hashed on the way, for the reason mergeIndexes gives.
+	out, err := os.CreateTemp(p.tmpDir, "mergeman-*")
 	if err != nil {
 		return superblock.ManifestRef{}, err
 	}
-	return p.putManifest(ctx, raw, uint32(m.Len()))
+	defer os.Remove(out.Name()) //nolint:errcheck
+	defer out.Close()           //nolint:errcheck
+	spool, err := os.CreateTemp(p.tmpDir, "mergespool-*")
+	if err != nil {
+		return superblock.ManifestRef{}, err
+	}
+	defer os.Remove(spool.Name()) //nolint:errcheck
+	defer spool.Close()           //nolint:errcheck
+
+	h := blake3.New(32, nil)
+	packs, err := manifest.MergeTo(io.MultiWriter(out, h), spool, segments)
+	if err != nil {
+		return superblock.ManifestRef{}, err
+	}
+	size, err := out.Seek(0, io.SeekEnd)
+	if err != nil {
+		return superblock.ManifestRef{}, err
+	}
+	if size > refTargetBytes {
+		return superblock.ManifestRef{}, fmt.Errorf("merged manifest is %d bytes, past the %d-byte ceiling", size, refTargetBytes)
+	}
+	if _, err := out.Seek(0, io.SeekStart); err != nil {
+		return superblock.ManifestRef{}, err
+	}
+	var hash [32]byte
+	copy(hash[:], h.Sum(nil))
+	name := hex.EncodeToString(hash[:])
+	if err := p.o.Inner.Put(ctx, manifest.Dir+"/"+name, out); err != nil {
+		return superblock.ManifestRef{}, fmt.Errorf("%s: %w", name, err)
+	}
+	return superblock.ManifestRef{Name: name, Hash: hash, Size: size, Packs: uint32(packs)}, nil
 }

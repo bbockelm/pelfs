@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"io"
+	"os"
 
 	"lukechampine.com/blake3"
 
@@ -166,18 +168,55 @@ func (p *pipeline) mergeIndexes(ctx context.Context, refs []superblock.IndexRef)
 	if len(indexes) != len(refs) {
 		return superblock.IndexRef{}, fmt.Errorf("%d of %d indexes fetched", len(indexes), len(refs))
 	}
-	// Oldest first, which is the order the list is already in: mpi.Merge
+	// Oldest first, which is the order the list is already in: the merge
 	// lets later inputs win, and later here means newer.
-	raw := mpi.Merge(indexes)
-	if len(raw) > refTargetBytes {
-		// The summed input sizes said this would fit. If it ever does not,
-		// listing the inputs unmerged is cheaper than being wrong about the
-		// one number this whole policy is written in terms of.
-		return superblock.IndexRef{}, fmt.Errorf("merged index is %d bytes, past the %d-byte target", len(raw), refTargetBytes)
-	}
-	ix, err := mpi.Open(raw)
+	//
+	// It goes to a FILE rather than to memory, and is hashed as it is
+	// written. Materializing the result was what set the ceiling this
+	// policy merges up to: holding the inputs and the output at once
+	// doubles the peak for no reason, since the object is only ever
+	// hashed and uploaded. What remains in memory is the inputs, which
+	// FetchAll still reads whole — that is now the binding constraint,
+	// and it is what a larger ceiling would have to address next.
+	out, err := os.CreateTemp(p.tmpDir, "mergeidx-*")
 	if err != nil {
 		return superblock.IndexRef{}, err
 	}
-	return p.putIndex(ctx, raw, uint32(ix.Len()), uint32(len(ix.Packs())))
+	defer os.Remove(out.Name()) //nolint:errcheck
+	defer out.Close()           //nolint:errcheck
+	spool, err := os.CreateTemp(p.tmpDir, "mergespool-*")
+	if err != nil {
+		return superblock.IndexRef{}, err
+	}
+	defer os.Remove(spool.Name()) //nolint:errcheck
+	defer spool.Close()           //nolint:errcheck
+
+	h := blake3.New(32, nil)
+	entries, packs, err := mpi.MergeTo(io.MultiWriter(out, h), spool, indexes)
+	if err != nil {
+		return superblock.IndexRef{}, err
+	}
+	size, err := out.Seek(0, io.SeekEnd)
+	if err != nil {
+		return superblock.IndexRef{}, err
+	}
+	if size > refTargetBytes {
+		// The summed input sizes said this would fit. If it ever does not,
+		// listing the inputs unmerged is cheaper than being wrong about the
+		// one number this whole policy is written in terms of.
+		return superblock.IndexRef{}, fmt.Errorf("merged index is %d bytes, past the %d-byte ceiling", size, refTargetBytes)
+	}
+	if _, err := out.Seek(0, io.SeekStart); err != nil {
+		return superblock.IndexRef{}, err
+	}
+	var hash [32]byte
+	copy(hash[:], h.Sum(nil))
+	name := hex.EncodeToString(hash[:])
+	if err := p.o.Inner.Put(ctx, mpi.Dir+"/"+name, out); err != nil {
+		return superblock.IndexRef{}, fmt.Errorf("%s: %w", name, err)
+	}
+	return superblock.IndexRef{
+		Name: name, Hash: hash, Size: size,
+		Entries: uint32(entries), Packs: uint32(packs),
+	}, nil
 }

@@ -356,6 +356,10 @@ type StreamWriter struct {
 	err       error
 }
 
+// Len is how many records have been accepted so far, which is what a
+// caller naming the finished object records without reading it back.
+func (w *StreamWriter) Len() int { return w.count }
+
 // NewStreamWriter starts a table over spool, which must be empty and
 // positioned at its start: an os.File in the caller's spool directory, or
 // MemSpool for a merge small enough not to want a file. A zero stride

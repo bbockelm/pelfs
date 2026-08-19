@@ -52,6 +52,7 @@ import (
 
 	"github.com/bbockelm/pelfs/internal/packidx"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
+	"github.com/bbockelm/pelfs/internal/superblock"
 )
 
 const (
@@ -292,18 +293,14 @@ func Merge(indexes []*Index) []byte {
 	return out.Encode()
 }
 
-// Ref names one index object, as a superblock lists it.
-type Ref struct {
-	Name    string
-	Hash    [32]byte
-	Size    int64
-	Entries uint32
-	Packs   uint32
-}
+// The ref naming one index object is superblock.IndexRef: it is a field
+// of a signed document, so its encoding is defined where every other
+// signed field is (see superblock.IndexRef). This package builds and
+// verifies the object the ref names.
 
 // Fetch reads and verifies one index object whole. Right for a small
 // index; a large one should be range-read through packidx.Header.
-func Fetch(ctx context.Context, obj pelicanobj.Store, ref Ref) (*Index, error) {
+func Fetch(ctx context.Context, obj pelicanobj.Store, ref superblock.IndexRef) (*Index, error) {
 	rc, err := obj.Get(ctx, Dir+"/"+ref.Name, 0, -1)
 	if err != nil {
 		return nil, fmt.Errorf("mpi: fetch %s: %w", ref.Name, err)
@@ -331,7 +328,7 @@ func Fetch(ctx context.Context, obj pelicanobj.Store, ref Ref) (*Index, error) {
 //
 // A failed index is not a failed mount: an index is derived, the trailers
 // still answer, so what verified is returned alongside the error.
-func FetchAll(ctx context.Context, obj pelicanobj.Store, refs []Ref) ([]*Index, error) {
+func FetchAll(ctx context.Context, obj pelicanobj.Store, refs []superblock.IndexRef) ([]*Index, error) {
 	if len(refs) == 0 {
 		return nil, nil
 	}

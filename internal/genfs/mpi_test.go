@@ -35,8 +35,8 @@ func manyPackVolume(t *testing.T, uuid string) (*packGetStore, *superblock.Super
 		names = append(names, path.Join("d", name))
 	}
 	res := publishVolume(t, v, inner, publish.Options{TargetPackSize: 512 << 10})
-	if len(res.Superblock.PackList) < 24 {
-		t.Fatalf("volume has %d packs; the test needs a few dozen", len(res.Superblock.PackList))
+	if len(packsOf(t, inner, res.Superblock)) < 24 {
+		t.Fatalf("volume has %d packs; the test needs a few dozen", len(packsOf(t, inner, res.Superblock)))
 	}
 	if len(res.Superblock.PackIndexes) == 0 {
 		t.Fatal("publish listed no multi-pack index")
@@ -77,7 +77,7 @@ func walkAndRead(t *testing.T, fs *genfs.FS, files []string) []string {
 // here as no saving at all.
 func TestPackIndexCollapsesTheRoundTrips(t *testing.T) {
 	inner, sb, files := manyPackVolume(t, "9efe7c40-0000-4000-8000-0000000000c1")
-	packs := len(sb.PackList)
+	packs := len(packsOf(t, inner, sb))
 	read := files[:5]
 
 	inner.reset()
@@ -134,20 +134,20 @@ func TestUnverifiablePackIndexStillMounts(t *testing.T) {
 
 	for _, tc := range []struct {
 		name string
-		ref  func(mpi.Ref) mpi.Ref
+		ref  func(superblock.IndexRef) superblock.IndexRef
 	}{
-		{"a hash the index does not have", func(r mpi.Ref) mpi.Ref {
+		{"a hash the index does not have", func(r superblock.IndexRef) superblock.IndexRef {
 			r.Hash[0] ^= 0xff
 			return r
 		}},
-		{"an index object that is not there", func(r mpi.Ref) mpi.Ref {
+		{"an index object that is not there", func(r superblock.IndexRef) superblock.IndexRef {
 			r.Name = "0000000000000000000000000000000000000000000000000000000000000000"
 			return r
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cp := *sb
-			cp.PackIndexes = append([]mpi.Ref(nil), sb.PackIndexes...)
+			cp.PackIndexes = append([]superblock.IndexRef(nil), sb.PackIndexes...)
 			for i := range cp.PackIndexes {
 				cp.PackIndexes[i] = tc.ref(cp.PackIndexes[i])
 			}
@@ -177,12 +177,13 @@ func TestPackIndexNamingTheWrongPackFallsBack(t *testing.T) {
 	// key is claimed by the pack after the one that holds it.
 	b := mpi.NewBuilder()
 	entries := 0
-	for i, pe := range sb.PackList {
+	packs := packsOf(t, inner, sb)
+	for i, pe := range packs {
 		got, _, err := packstore.FetchTrailerStoredVerified(ctx, inner, pe.Name, pe.Size, pe.TrailerHash)
 		if err != nil {
 			t.Fatalf("trailer of %s: %v", pe.Name, err)
 		}
-		wrong := sb.PackList[(i+1)%len(sb.PackList)].Name
+		wrong := packs[(i+1)%len(packs)].Name
 		for _, e := range got {
 			var id [32]byte
 			if _, err := hex.Decode(id[:], []byte(e.Key)); err != nil {
@@ -203,7 +204,7 @@ func TestPackIndexNamingTheWrongPackFallsBack(t *testing.T) {
 	}
 
 	cp := *sb
-	cp.PackIndexes = []mpi.Ref{{
+	cp.PackIndexes = []superblock.IndexRef{{
 		Name: name, Hash: hash, Size: int64(len(raw)),
 		Entries: uint32(b.Len()), Packs: uint32(b.Packs()),
 	}}
@@ -246,7 +247,7 @@ func TestSwapPicksUpTheNewGenerationsIndexes(t *testing.T) {
 		t.Fatalf("swap: %v", err)
 	}
 
-	packs := len(second.Superblock.PackList)
+	packs := len(packsOf(t, inner, second.Superblock))
 	inner.reset()
 	// Everything the new generation added, read through the swapped mount.
 	for i := 12; i < 24; i++ {

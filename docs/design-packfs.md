@@ -803,6 +803,38 @@ already tolerates.
 The end state: a superblock names O(log N) index refs and O(log N)
 manifest refs, and stops depending on volume size at all.
 
+### One shape or the other, never both
+
+**A generation that records manifest refs stops writing the inline pack
+list.** Carrying both would keep every byte this removes, and would give a
+reader two lists that can disagree. So the rule is stated once, in the
+format: prefer the manifest, fall back to the inline list only when a
+generation names no manifest. Every generation written before this change
+has an inline list and no manifest refs, and keeps working forever — no
+migration, no rewrite, no flag day. The one migration that does happen is
+invisible: the first manifest-era generation folds its inline parent's
+packs into its own segment, which costs O(inherited packs) bytes once,
+exactly what the old code paid on *every* seal.
+
+The break runs the other way: **a reader older than this change cannot
+read a manifest-only generation.** It does not mount an empty volume — an
+old decoder drops the unknown field and `Verify` re-encodes what it
+decoded, so the signature fails and the reader refuses at the trust
+boundary. Accepted, the format being pre-release.
+
+What it is worth, measured (`TestSuperblockStopsGrowingWithPackCount`):
+
+| packs | superblock, inline | superblock, named | manifest object |
+| --- | --- | --- | --- |
+| 1,000 | 87 KB | 834 B | 72 KB |
+| 10,000 | 871 KB | 834 B | 720 KB |
+| 100,000 | **8.7 MB** | **836 B** | 7.2 MB |
+
+The bytes do not vanish; they move out of the object every mount reads
+and every seal rewrites, into one that is fetched only when something
+needs to enumerate or authenticate a trailer. The right-hand column is
+the honest half of the trade, and it is 72 bytes per pack either way.
+
 ### Liveness wants a reachability sweep, not a list
 
 The retirement rules above — retire an index whose packs are under half

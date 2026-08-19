@@ -2,7 +2,8 @@
 // "Retention and GC"): pure set arithmetic over verified superblocks.
 //
 // Retained packs are the union, over every branch head and every tag, of
-// the generation's pack list plus its condemned-ledger entries still
+// the generation's pack set — inline, or resolved through its manifest
+// segments (manifest.Packs) — plus its condemned-ledger entries still
 // inside the grace window. A pack is deleted only when it is (a) absent
 // from that union AND (b) older than the grace window by the timestamp in
 // its own name. Guard (b) is what makes the sweep safe to run against
@@ -26,22 +27,29 @@
 // time cannot be established is KEPT — keeping garbage costs bytes,
 // deleting a live index costs a mount.
 //
-// The limit to admit, on indexes: "live" here means named by a branch
+// The limit to admit, on both: "live" here means named by a branch
 // HEAD or a tag, which is all a sweep can enumerate — a retired
 // generation is not addressable, only hashed. So an index that only an
 // older generation inside the retain window still names — one
 // consolidation merged away and the head therefore stopped listing — is
 // swept once its object ages past the window, though a reader pinned to
-// that generation would still have used it. The cost is bounded and known:
-// an index is DERIVED, so that reader falls back to pack trailers and is
-// slow rather than broken. Closing it properly wants the ledger packs
-// already have — consolidation recording the refs it dropped, with a
-// timestamp, the way repack records condemned packs — and until that
-// exists this is the honest behaviour rather than a silent one.
+// that generation would still have used it. For an index the cost is
+// bounded and known: it is DERIVED, so that reader falls back to pack
+// trailers and is slow rather than broken. FOR A MANIFEST IT IS NOT — the
+// manifest is that generation's pack list, so sweeping one leaves the
+// generation unreadable, and the packs it alone named go on the sweep
+// after. Nothing addressable is harmed either way (the head and every tag
+// name their own), but the difference is why the ledger this wants —
+// consolidation recording the refs it dropped, with a timestamp, the way
+// repack records condemned packs — matters more now than it did. Until
+// that exists this is the honest behaviour rather than a silent one.
 //
 // The sweep fails closed: if any ref or tag cannot be fetched and
 // verified, nothing is deleted — an unreadable superblock means the
-// retained set is unknown, and guessing destroys data.
+// retained set is unknown, and guessing destroys data. An unreadable
+// MANIFEST counts as an unreadable superblock, for the same reason: a
+// generation whose pack set cannot be resolved retains nothing, and
+// acting on that would delete a volume.
 package retention
 
 import (
@@ -340,8 +348,18 @@ func retainedSet(ctx context.Context, o Options, rep *Report) (*liveSet, time.Du
 	}
 	grace := DefaultGrace
 
-	absorb := func(sb *superblock.Superblock) {
-		for _, pe := range sb.PackList {
+	absorb := func(sb *superblock.Superblock) error {
+		// The packs a generation names, from whichever shape it uses. A
+		// manifest that will not read is a hard error, not an empty pack
+		// set: this sweep DELETES on the strength of this answer, so an
+		// unreadable manifest has exactly the standing of an unverifiable
+		// superblock — the retained set is unknown, and guessing destroys
+		// data.
+		packs, err := manifest.Packs(ctx, o.Inner, sb)
+		if err != nil {
+			return err
+		}
+		for _, pe := range packs {
 			live.packs[pe.Name] = struct{}{}
 		}
 		// Every generation still reachable — the head AND every tag —
@@ -350,13 +368,15 @@ func retainedSet(ctx context.Context, o Options, rep *Report) (*liveSet, time.Du
 		for _, ix := range sb.PackIndexes {
 			live.indexes[ix.Name] = struct{}{}
 		}
-		// Manifests have no superblock field yet: nothing writes them, so
-		// the live set is empty and an unreferenced manifest is swept on
-		// the age guard alone, exactly like an unreferenced index. When
-		// the pack list does move out of the superblock (design-packfs
-		// "The pack list moves out of the superblock"), absorb its refs
-		// here — TestManifestRefsWouldNeedAbsorbing fails until someone
-		// does.
+		// And its manifests, for a stronger reason than an index's. An
+		// index is derived, so sweeping a live one costs speed; a manifest
+		// IS the generation's pack list, so sweeping one a live generation
+		// names would leave that generation unreadable and its packs
+		// unenumerable — every pack it alone referenced would go on the
+		// next sweep.
+		for _, mf := range sb.Manifests {
+			live.manifests[mf.Name] = struct{}{}
+		}
 		if g := time.Duration(sb.Params.TGraceSeconds) * time.Second; g > grace {
 			grace = g
 		}
@@ -365,6 +385,7 @@ func retainedSet(ctx context.Context, o Options, rep *Report) (*liveSet, time.Du
 				live.packs[c.Name] = struct{}{}
 			}
 		}
+		return nil
 	}
 
 	branches, err := listNames(ctx, o.Inner, refs.RefDirKey)
@@ -376,7 +397,9 @@ func retainedSet(ctx context.Context, o Options, rep *Report) (*liveSet, time.Du
 		if err != nil {
 			return nil, 0, fmt.Errorf("gc aborted (fail closed): branch %s: %w", b, err)
 		}
-		absorb(f.Superblock)
+		if err := absorb(f.Superblock); err != nil {
+			return nil, 0, fmt.Errorf("gc aborted (fail closed): branch %s: %w", b, err)
+		}
 		rep.Branches++
 	}
 	tags, err := listNames(ctx, o.Inner, refs.TagDirKey)
@@ -388,7 +411,9 @@ func retainedSet(ctx context.Context, o Options, rep *Report) (*liveSet, time.Du
 		if err != nil {
 			return nil, 0, fmt.Errorf("gc aborted (fail closed): tag %s: %w", tname, err)
 		}
-		absorb(sb)
+		if err := absorb(sb); err != nil {
+			return nil, 0, fmt.Errorf("gc aborted (fail closed): tag %s: %w", tname, err)
+		}
 		rep.Tags++
 	}
 	if rep.Branches+rep.Tags == 0 {

@@ -63,7 +63,7 @@ import (
 	"github.com/bbockelm/pelfs/internal/catalog"
 	"github.com/bbockelm/pelfs/internal/chunkid"
 	"github.com/bbockelm/pelfs/internal/entrycodec"
-	"github.com/bbockelm/pelfs/internal/mpi"
+	"github.com/bbockelm/pelfs/internal/manifest"
 	"github.com/bbockelm/pelfs/internal/overlay"
 	"github.com/bbockelm/pelfs/internal/packstore"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
@@ -409,12 +409,14 @@ func Publish(ctx context.Context, o Options) (*Result, error) {
 	}
 
 	// Superblock backup rides in the last pack (disaster recovery). It is
-	// built before the final seal, so its pack list lacks the very pack
-	// that carries it — rescue treats it as "the newest generation minus
-	// its tail", exactly the documented fall-back-a-step behavior. Stored
+	// built before the final seal, so the pack set it names lacks the very
+	// pack that carries it — rescue treats it as "the newest generation
+	// minus its tail", exactly the documented fall-back-a-step behavior.
+	// It names that set through a manifest of its own (backupManifests),
+	// since the refs it carries from its parent cover the parent. Stored
 	// raw (uncompressed, unencrypted): rescue must read it before holding
 	// any keys, and the KEK-wrapped key table is harmless to expose.
-	_, bkRaw, err := p.buildSuperblock(p.pk.sealedSoFar(), shards, rootID, p.prevPackIndexes())
+	_, bkRaw, err := p.buildSuperblock(p.pk.sealedSoFar(), shards, rootID, p.prevPackIndexes(), p.backupManifests(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -430,7 +432,11 @@ func Publish(ctx context.Context, o Options) (*Result, error) {
 	// After the last cut, because an entry is attributed to a pack only
 	// once that pack has a name; before the flip, because a reader that
 	// sees the new generation must be able to fetch what it names.
-	sb, raw, err := p.buildSuperblock(newPacks, shards, rootID, p.sealPackIndexes(ctx))
+	manifests, err := p.sealManifests(ctx, newPacks)
+	if err != nil {
+		return nil, err
+	}
+	sb, raw, err := p.buildSuperblock(newPacks, shards, rootID, p.sealPackIndexes(ctx), manifests)
 	if err != nil {
 		return nil, err
 	}
@@ -1384,30 +1390,34 @@ func encodeCatalog(cw catalog.Builder, hasher chunkid.Hasher, dek []byte) (chunk
 	return id, stored, nil
 }
 
-func (p *pipeline) buildSuperblock(newPacks []packstore.SealedPack, shards []superblock.ShardEntry, rootID chunkid.Identity, packIndexes []mpi.Ref) (*superblock.Superblock, []byte, error) {
+func (p *pipeline) buildSuperblock(newPacks []packstore.SealedPack, shards []superblock.ShardEntry, rootID chunkid.Identity,
+	packIndexes []superblock.IndexRef, manifests []superblock.ManifestRef) (*superblock.Superblock, []byte, error) {
+	// The pack set is stated ONE of two ways, never both: through the
+	// manifest refs when there are any, inline otherwise (see
+	// superblock.Manifests for why, and manifest.Packs for the reader
+	// side). Writing both would keep every byte the manifest exists to
+	// remove, and would give a reader two lists that can disagree.
+	//
+	// Either way the same three groups have to be named, because every one
+	// of them holds bytes something still references and retention deletes
+	// any pack no live superblock names:
+	//
+	//   - what the parent named, carried forward — TRANSFORM's content
+	//     reuse depends on it, since a carried chunkref points into one of
+	//     the parent's packs. Trimming dead packs is repack's job. In the
+	//     manifest shape this is the carried refs; if that ever grows a
+	//     filter, reuse must be gated on the surviving set in the same
+	//     change.
+	//   - the packs this seal wrote.
+	//   - the packs the SOURCE uploaded, holding content it provided
+	//     rather than content this seal chunked.
 	var packList []superblock.PackEntry
-	if p.o.Prev != nil {
-		// Carry the previous generation's whole pack set forward; trimming
-		// dead packs is repack's job, not publish's.
-		//
-		// Unconditional, and TRANSFORM's content reuse depends on it: a
-		// carried-forward chunkref names bytes that live in one of Prev's
-		// packs, and retention deletes any pack no live superblock lists.
-		// If this ever grows a filter, reuse must be gated on the surviving
-		// set (or dropped) in the same change.
-		packList = append(packList, p.o.Prev.PackList...)
-	}
-	for _, sp := range newPacks {
-		packList = append(packList, superblock.PackEntry{Name: sp.Name, TrailerHash: sp.TrailerHash, Size: sp.Size})
-	}
-	// Packs the SOURCE uploaded, holding content it provided rather than
-	// content this seal chunked. Listing them is not bookkeeping: a
-	// provided chunkref names bytes in one of these, and retention deletes
-	// any pack no live superblock names — so a generation that omitted
-	// them would be signed, valid-looking, and unreadable after the next
-	// sweep.
-	for _, sp := range p.providedPacks {
-		packList = append(packList, superblock.PackEntry{Name: sp.Name, TrailerHash: sp.TrailerHash, Size: sp.Size})
+	if len(manifests) == 0 {
+		if p.o.Prev != nil {
+			packList = append(packList, p.o.Prev.PackList...)
+		}
+		packList = append(packList, manifest.Entries(newPacks)...)
+		packList = append(packList, manifest.Entries(p.providedPacks)...)
 	}
 	// The high-water mark prefers the source's real allocator counter;
 	// max-inode-seen covers only sources that keep none (Source.NextInode
@@ -1431,6 +1441,7 @@ func (p *pipeline) buildSuperblock(newPacks []packstore.SealedPack, shards []sup
 		NextInode:       nextInode,
 		Catalogs:        p.catalogList(),
 		PackIndexes:     packIndexes,
+		Manifests:       manifests,
 		Params: superblock.Params{
 			SMaxBytes:     p.o.SMax,
 			SMinBytes:     catalog.SMin,

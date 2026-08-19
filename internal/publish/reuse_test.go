@@ -430,11 +430,11 @@ func TestCarriedChunksStayRetained(t *testing.T) {
 		t.Fatalf("nothing was carried forward; the test would prove nothing")
 	}
 
-	listed := make(map[string]bool, len(second.Superblock.PackList))
-	for _, pe := range second.Superblock.PackList {
+	listed := make(map[string]bool, len(packsOf(t, v.inner, second.Superblock)))
+	for _, pe := range packsOf(t, v.inner, second.Superblock) {
 		listed[pe.Name] = true
 	}
-	for _, pe := range first.Superblock.PackList {
+	for _, pe := range packsOf(t, v.inner, first.Superblock) {
 		if !listed[pe.Name] {
 			t.Errorf("pack %s holds carried-forward chunks but is not listed by the new generation", pe.Name)
 		}
@@ -457,8 +457,8 @@ func TestCarriedChunksStayRetained(t *testing.T) {
 	if rep.Deleted != 0 {
 		t.Errorf("GC deleted %d pack(s) the head still references: %v", rep.Deleted, rep.CandidateNames)
 	}
-	if rep.RetainedPacks != len(second.Superblock.PackList) {
-		t.Errorf("GC retained %d packs, the head lists %d", rep.RetainedPacks, len(second.Superblock.PackList))
+	if rep.RetainedPacks != len(packsOf(t, v.inner, second.Superblock)) {
+		t.Errorf("GC retained %d packs, the head lists %d", rep.RetainedPacks, len(packsOf(t, v.inner, second.Superblock)))
 	}
 	v.verifyBodies(second, body)
 }

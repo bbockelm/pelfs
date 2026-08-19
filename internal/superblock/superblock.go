@@ -26,8 +26,6 @@ import (
 
 	"github.com/fxamacker/cbor/v2"
 	"lukechampine.com/blake3"
-
-	"github.com/bbockelm/pelfs/internal/mpi"
 )
 
 // FormatV2 is the FormatVersion written by this package.
@@ -58,6 +56,53 @@ type PackEntry struct {
 	TrailerHash [32]byte `cbor:"trailer_hash"`
 	Size        int64    `cbor:"size"`
 }
+
+// IndexRef names one multi-pack index object (internal/mpi) and
+// ManifestRef one pack-manifest segment (internal/manifest), as a
+// superblock lists them.
+//
+// They live HERE, in the format package, rather than in the packages that
+// build the objects, for two reasons. A superblock field's encoding is
+// part of the signed wire format, so the struct tags that define it belong
+// beside every other struct that defines one — otherwise the shape of a
+// signed document is spread across packages that are free to refactor.
+// And the alternative made this pure format package depend transitively on
+// the object store: mpi imports pelicanobj, so `PackIndexes []mpi.Ref`
+// dragged the transport into a package that only encodes bytes. The
+// dependency now points the sane way — mpi and manifest import this.
+//
+// Entries and Packs are counters a consolidation policy reads WITHOUT
+// fetching the object; Hash is what a fetched object is verified against,
+// and it is the reason a hash-named derived object can be trusted at all:
+// the signature covers this ref, so it covers the object's contents.
+type IndexRef struct {
+	Name    string   `cbor:"name"`
+	Hash    [32]byte `cbor:"hash"`
+	Size    int64    `cbor:"size"`
+	Entries uint32   `cbor:"entries"`
+	Packs   uint32   `cbor:"packs"`
+}
+
+// ManifestRef names one segment of the generation's pack manifest. Packs
+// is how many packs the segment describes — the same "read the policy
+// without fetching the object" role Entries plays for an index.
+type ManifestRef struct {
+	Name  string   `cbor:"name"`
+	Hash  [32]byte `cbor:"hash"`
+	Size  int64    `cbor:"size"`
+	Packs uint32   `cbor:"packs"`
+}
+
+// RefName and RefSize are the two things a consolidation policy reads out
+// of a ref without fetching what it names: which object, and how big.
+// They exist as methods because publish applies ONE set of tiering rules
+// to both kinds of ref, and a Go type parameter can call a method but
+// cannot reach a field.
+func (r IndexRef) RefName() string { return r.Name }
+func (r IndexRef) RefSize() int64  { return r.Size }
+
+func (r ManifestRef) RefName() string { return r.Name }
+func (r ManifestRef) RefSize() int64  { return r.Size }
 
 // CondemnedPack records a pack repack removed from the pack list: the
 // name and when it was condemned. Publish carries entries forward until
@@ -173,12 +218,16 @@ type Superblock struct {
 	PrevHash        [32]byte `cbor:"prev_hash"` // BLAKE3 of the previous generation's encoding; zero for generation 0
 	CreatedUnixNano int64    `cbor:"created_unix_nano"`
 
-	RootCatalog [32]byte     `cbor:"root_catalog"`
-	PackList    []PackEntry  `cbor:"pack_list"`
-	Shards      []ShardEntry `cbor:"shards"`
-	NextInode   uint64       `cbor:"next_inode"`
-	Params      Params       `cbor:"params"`
-	KeyTable    []KeyEntry   `cbor:"key_table"`
+	RootCatalog [32]byte `cbor:"root_catalog"`
+	// PackList is the generation's pack set INLINE, and it is the older of
+	// two ways to say the same thing. A generation that records Manifests
+	// leaves this empty — see Manifests for why, and PacksAreInManifests
+	// for how a reader tells the two apart.
+	PackList  []PackEntry  `cbor:"pack_list"`
+	Shards    []ShardEntry `cbor:"shards"`
+	NextInode uint64       `cbor:"next_inode"`
+	Params    Params       `cbor:"params"`
+	KeyTable  []KeyEntry   `cbor:"key_table"`
 	// Condemned lists recently repacked-away packs still inside the GC
 	// grace window (omitempty per the evolution rule below).
 	Condemned []CondemnedPack `cbor:"condemned,omitempty"`
@@ -215,7 +264,44 @@ type Superblock struct {
 	// own, the way PackList is carried, so an index a live generation
 	// names stays live. Consolidating and retiring them is repack's job
 	// and is not implemented yet.
-	PackIndexes []mpi.Ref `cbor:"pack_indexes,omitempty"`
+	PackIndexes []IndexRef `cbor:"pack_indexes,omitempty"`
+	// Manifests names the segments of this generation's pack manifest:
+	// objects under manifest.Dir holding what PackList used to hold —
+	// every pack's name, trailer hash and size — as a derived, hash-named,
+	// segmented object instead of inline bytes (internal/manifest,
+	// docs/design-packfs.md "The pack list moves out of the superblock").
+	//
+	// UNLIKE PackIndexes, THESE ARE NOT HINTS. An index is derived from a
+	// pack set the superblock states some other way, so losing one costs
+	// speed; the manifest IS that statement, so a generation recording it
+	// here has no other record of what it references. A reader that cannot
+	// fetch these cannot enumerate and cannot authenticate a trailer, and
+	// must FAIL — never fall through to an empty pack set, which reads as
+	// "this volume has no data" and would let a sweep act on it.
+	//
+	// THE FORMAT DECISION, stated once, here: a generation that records
+	// manifest refs STOPS writing PackList. Not "as well as" — the point
+	// is that a superblock stops growing with pack count, and carrying
+	// both would keep every byte this removes. So:
+	//
+	//   - A reader prefers the manifest and falls back to PackList only
+	//     when Manifests is empty. Every generation written before this
+	//     change has an inline list and no manifest refs, so it keeps
+	//     working forever: no migration, no rewrite, no flag day.
+	//   - A reader OLDER than this change cannot read a manifest-only
+	//     generation. It does not silently mount an empty volume, which is
+	//     the one failure worth engineering against: this package's
+	//     decoder drops unknown map keys and Verify re-encodes what it
+	//     decoded, so an old binary loses "manifests" and fails the
+	//     SIGNATURE — a hard refusal at the trust boundary. An
+	//     ErrBadSignature on a generation newer than the binary is this
+	//     and nothing else.
+	//
+	// That break is ACCEPTED: the format is pre-release, and generations
+	// in the old shape exist in test fixtures rather than in the wild. It
+	// is the one-way door in this change, and it is written here because
+	// this is the struct someone reads when they hit it.
+	Manifests []ManifestRef `cbor:"manifests,omitempty"`
 
 	// SigningPub is informational — it names the key that produced
 	// Signature so tooling can report custody, but Verify never trusts it
@@ -226,6 +312,16 @@ type Superblock struct {
 	NextPub   *[32]byte `cbor:"next_pub,omitempty"`
 	Signature [64]byte  `cbor:"signature"`
 }
+
+// PacksAreInManifests reports which of the two shapes this generation
+// uses: true when the pack set lives in the manifest objects Manifests
+// names, false when it is inline in PackList.
+//
+// It is a method rather than a len() at each call site because it is the
+// predicate the whole fallback turns on, and one place to read is one
+// place to be wrong. Resolving the packs themselves is manifest.Packs,
+// which needs an object store and so cannot live here.
+func (sb *Superblock) PacksAreInManifests() bool { return len(sb.Manifests) > 0 }
 
 var (
 	encMode cbor.EncMode

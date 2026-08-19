@@ -30,7 +30,7 @@ func packEntryKeys(t *testing.T, inner pelicanobj.Store, pe superblock.PackEntry
 }
 
 // fetchIndex fetches and verifies one listed index the way a mount does.
-func fetchIndex(t *testing.T, inner pelicanobj.Store, ref mpi.Ref) *mpi.Index {
+func fetchIndex(t *testing.T, inner pelicanobj.Store, ref superblock.IndexRef) *mpi.Index {
 	t.Helper()
 	ix, err := mpi.Fetch(context.Background(), inner, ref)
 	if err != nil {
@@ -68,7 +68,7 @@ func TestPublishEmitsAnIndexOverItsOwnPacks(t *testing.T) {
 		t.Errorf("the index holds %d entries; the superblock says %d", ix.Len(), ref.Entries)
 	}
 	for _, sp := range res.NewPacks {
-		pe := listedPack(sb, sp.Name)
+		pe := listedPack(t, v.inner, sb, sp.Name)
 		if pe == nil {
 			t.Fatalf("this seal cut pack %s and the generation does not list it", sp.Name)
 		}
@@ -121,7 +121,7 @@ func TestPublishCarriesPreviousIndexesForward(t *testing.T) {
 	// Every carried ref names an object that fetches and verifies — a ref
 	// pointing at nothing is worse than no ref, since a reader pays a round
 	// trip to learn it.
-	carriesForward := func(res *publish.Result, prev []mpi.Ref) {
+	carriesForward := func(res *publish.Result, prev []superblock.IndexRef) {
 		t.Helper()
 		set := indexSet(t, v.inner, res.Superblock.PackIndexes)
 		for _, ref := range prev {

@@ -580,7 +580,10 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	startup.report("ready to serve in {total} ({packs} packs; discovery {discovery}, "+
 		"access {access}, lease {lease}, head {head}, root catalog {root catalog}, "+
 		"prefetch {prefetch}, overlay {overlay}, mount {mount})",
-		"packs", len(sb.PackList))
+		// From the mount rather than the superblock: a generation's packs
+		// may be named by a manifest instead of listed inline, and the FS
+		// is the thing that has already resolved which.
+		"packs", g.gfs.PackCount())
 	mode := "read-only"
 	if rw {
 		mode = "read-write (overlay; unmount seals)"

@@ -1,17 +1,33 @@
 package publish_test
 
 import (
+	"context"
 	"testing"
 
+	"github.com/bbockelm/pelfs/internal/manifest"
+	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/superblock"
 )
 
+// packsOf resolves a generation's pack set the way a reader does: through
+// the manifest segments it names, or through the inline list when it
+// names none (manifest.Packs).
+func packsOf(t *testing.T, inner pelicanobj.Store, sb *superblock.Superblock) []superblock.PackEntry {
+	t.Helper()
+	packs, err := manifest.Packs(context.Background(), inner, sb)
+	if err != nil {
+		t.Fatalf("resolve pack set: %v", err)
+	}
+	return packs
+}
+
 // listedPack returns the generation's entry for a pack, or nil when it
-// does not list one.
-func listedPack(sb *superblock.Superblock, name string) *superblock.PackEntry {
-	for i := range sb.PackList {
-		if sb.PackList[i].Name == name {
-			return &sb.PackList[i]
+// does not name one.
+func listedPack(t *testing.T, inner pelicanobj.Store, sb *superblock.Superblock, name string) *superblock.PackEntry {
+	packs := packsOf(t, inner, sb)
+	for i := range packs {
+		if packs[i].Name == name {
+			return &packs[i]
 		}
 	}
 	return nil
@@ -32,7 +48,7 @@ func TestPublishRecordsRootCatalogHint(t *testing.T) {
 	if h == nil {
 		t.Fatal("a seal that wrote the root catalog recorded no hint to where it put it")
 	}
-	pe := listedPack(first.Superblock, h.Pack)
+	pe := listedPack(t, v.inner, first.Superblock, h.Pack)
 	if pe == nil {
 		t.Fatalf("the hint names pack %q, which this generation does not list", h.Pack)
 	}
@@ -51,7 +67,7 @@ func TestPublishRecordsRootCatalogHint(t *testing.T) {
 	if h2 == nil || *h2 != *h {
 		t.Fatalf("a carried-forward root catalog lost its hint: %+v, want %+v", h2, h)
 	}
-	if listedPack(second.Superblock, h2.Pack) == nil {
+	if listedPack(t, v.inner, second.Superblock, h2.Pack) == nil {
 		t.Fatalf("the carried hint names pack %q, which the new generation no longer lists", h2.Pack)
 	}
 
@@ -69,7 +85,7 @@ func TestPublishRecordsRootCatalogHint(t *testing.T) {
 	if *h3 == *h {
 		t.Fatal("the hint still points at the previous generation's root catalog")
 	}
-	if pe := listedPack(third.Superblock, h3.Pack); pe == nil || h3.Off+h3.Length > pe.Size {
+	if pe := listedPack(t, v.inner, third.Superblock, h3.Pack); pe == nil || h3.Off+h3.Length > pe.Size {
 		t.Fatalf("the new hint is [%d,+%d) in pack %q", h3.Off, h3.Length, h3.Pack)
 	}
 }

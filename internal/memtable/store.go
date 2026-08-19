@@ -673,6 +673,23 @@ func (s *Store) CacheAdopted() (packs int, bytes int64) {
 	return s.cache.adopted()
 }
 
+// EachPlacedChunk reports every chunk this store has placed and the pack
+// holding it, so a seal can fold them into the generation's multi-pack
+// index.
+//
+// Without this the index covers only what the SEAL packed — catalogs,
+// shards, the superblock backup — and misses every content chunk, which
+// on a writable mount is nearly all of it. A reader would then find the
+// index answering for catalogs and falling back to per-pack trailers for
+// data, which is most of the round trips the index exists to remove.
+func (s *Store) EachPlacedChunk(fn func(identityHex, pack string)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, loc := range s.chunkLoc {
+		fn(id, loc.Pack)
+	}
+}
+
 // Packs returns the packs this store has uploaded, for a superblock's
 // pack list.
 func (s *Store) Packs() []packstore.SealedPack {

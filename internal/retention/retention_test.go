@@ -1,16 +1,19 @@
 package retention
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
+	"encoding/hex"
 	"fmt"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"lukechampine.com/blake3"
 
 	"github.com/bbockelm/pelfs/internal/fakeorigin"
 	"github.com/bbockelm/pelfs/internal/manifest"
@@ -91,7 +94,7 @@ func publishHead(t *testing.T, rs *refs.Store, priv ed25519.PrivateKey, gen uint
 		sb.PackList = append(sb.PackList, superblock.PackEntry{Name: p, Size: 1})
 	}
 	for _, ix := range indexes {
-		sb.PackIndexes = append(sb.PackIndexes, mpi.Ref{Name: ix, Size: 1, Entries: 1, Packs: 1})
+		sb.PackIndexes = append(sb.PackIndexes, superblock.IndexRef{Name: ix, Size: 1, Entries: 1, Packs: 1})
 	}
 	sb.Condemned = condemned
 	if err := sb.Sign(priv); err != nil {
@@ -414,22 +417,125 @@ func (s *timelessStore) StatKey(ctx context.Context, key string) (*pelicanobj.Ke
 	return s.Store.StatKey(ctx, key)
 }
 
-// TestManifestRefsWouldNeedAbsorbing guards the one asymmetry in the
-// sweep: manifests have no live set because no superblock field names
-// them, so they are deleted on age alone. The moment the pack list does
-// move out of the superblock, that becomes a way to delete a manifest a
-// live generation depends on — so fail here rather than there.
-func TestManifestRefsWouldNeedAbsorbing(t *testing.T) {
-	sbType := reflect.TypeOf(superblock.Superblock{})
-	refType := reflect.TypeOf(manifest.Ref{})
-	for i := 0; i < sbType.NumField(); i++ {
-		f := sbType.Field(i)
-		ft := f.Type
-		for ft.Kind() == reflect.Slice || ft.Kind() == reflect.Ptr || ft.Kind() == reflect.Array {
-			ft = ft.Elem()
+// A generation that keeps its pack list in a manifest must keep both:
+// the manifest object itself, and the packs it names. Sweeping either is
+// how this change could destroy a volume — the first leaves the
+// generation unreadable, the second deletes its content — so both are
+// checked against a real manifest object, parsed by the same code the
+// sweep uses.
+func TestGCRetainsAManifestAndThePacksItNames(t *testing.T) {
+	inner, root := newInner(t)
+	ctx := context.Background()
+	_, priv, _ := ed25519.GenerateKey(nil)
+	rs, err := refs.New(inner, t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now()
+	old := now.Add(-100 * time.Hour)
+	named := packName(old, "aaaa")   // named by the manifest -> kept
+	garbage := packName(old, "bbbb") // named by nothing -> deleted
+	putPack(t, inner, named, 100)
+	putPack(t, inner, garbage, 100)
+
+	ref := putManifest(t, inner, named)
+	stale := hashName('c') // an old manifest no generation names -> swept
+	putObj(t, inner, manifest.Dir+"/"+stale, 64)
+	age(t, root, manifest.Dir+"/"+stale, old)
+	age(t, root, manifest.Dir+"/"+ref.Name, old) // old too: only the live set may save it
+
+	publishManifestHead(t, rs, priv, ref)
+
+	rep, err := GC(ctx, Options{Inner: inner, Refs: rs, Delete: true, Now: now})
+	if err != nil {
+		t.Fatalf("GC: %v", err)
+	}
+	if !alive(t, inner, manifest.Dir+"/"+ref.Name) {
+		t.Error("swept the manifest the head names; that generation can no longer be read")
+	}
+	if alive(t, inner, manifest.Dir+"/"+stale) {
+		t.Error("kept a manifest no generation names")
+	}
+	if !alive(t, inner, packstore.PackDirKey+"/"+named) {
+		t.Error("deleted a pack the head's manifest names")
+	}
+	if alive(t, inner, packstore.PackDirKey+"/"+garbage) {
+		t.Error("kept a pack nothing names")
+	}
+	if rep.RetainedPacks != 1 || rep.Manifests.Retained != 1 {
+		t.Errorf("retained %d packs / %d manifests, want 1 / 1", rep.RetainedPacks, rep.Manifests.Retained)
+	}
+}
+
+// The sweep deletes on the strength of the retained set, so a manifest it
+// cannot read means it does not know that set. Fail closed, exactly as
+// for an unverifiable superblock.
+func TestGCRefusesWhenAManifestCannotBeRead(t *testing.T) {
+	inner, _ := newInner(t)
+	ctx := context.Background()
+	_, priv, _ := ed25519.GenerateKey(nil)
+	rs, err := refs.New(inner, t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	garbage := packName(now.Add(-100*time.Hour), "bbbb")
+	putPack(t, inner, garbage, 100)
+
+	ref := putManifest(t, inner, packName(now.Add(-100*time.Hour), "aaaa"))
+	// The ref stays, the object goes: a generation naming a manifest that
+	// is not there.
+	if err := inner.Delete(ctx, manifest.Dir+"/"+ref.Name); err != nil {
+		t.Fatal(err)
+	}
+	publishManifestHead(t, rs, priv, ref)
+
+	if _, err := GC(ctx, Options{Inner: inner, Refs: rs, Delete: true, Now: now}); err == nil {
+		t.Fatal("GC ran with an unresolvable pack set; it would have deleted every pack")
+	}
+	if !alive(t, inner, packstore.PackDirKey+"/"+garbage) {
+		t.Error("a pack was deleted by a sweep that could not read the retained set")
+	}
+}
+
+// putManifest writes a real manifest segment naming packs and returns the
+// ref a superblock lists it by.
+func putManifest(t *testing.T, inner pelicanobj.Store, packs ...string) superblock.ManifestRef {
+	t.Helper()
+	b := manifest.NewBuilder()
+	for _, p := range packs {
+		if err := b.Add(packstore.SealedPack{Name: p, Size: 1}); err != nil {
+			t.Fatal(err)
 		}
-		if ft == refType {
-			t.Fatalf("superblock.%s now names manifests: teach retainedSet's absorb to add them to live.manifests, or GC will sweep a manifest a live generation names", f.Name)
-		}
+	}
+	raw := b.Encode()
+	hash := blake3.Sum256(raw)
+	name := hex.EncodeToString(hash[:])
+	if err := inner.Put(context.Background(), manifest.Dir+"/"+name, bytes.NewReader(raw)); err != nil {
+		t.Fatal(err)
+	}
+	return superblock.ManifestRef{Name: name, Hash: hash, Size: int64(len(raw)), Packs: uint32(b.Len())}
+}
+
+// publishManifestHead flips a head in the new shape: no inline pack list,
+// the packs named by a manifest ref.
+func publishManifestHead(t *testing.T, rs *refs.Store, priv ed25519.PrivateKey, refsList ...superblock.ManifestRef) {
+	t.Helper()
+	sb := &superblock.Superblock{
+		FormatVersion:   superblock.FormatV2,
+		Generation:      0,
+		CreatedUnixNano: 1,
+		Manifests:       refsList,
+	}
+	if err := sb.Sign(priv); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := sb.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rs.Flip(context.Background(), "main", raw, ""); err != nil {
+		t.Fatalf("flip: %v", err)
 	}
 }

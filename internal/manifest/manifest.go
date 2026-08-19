@@ -55,6 +55,7 @@ import (
 	"github.com/bbockelm/pelfs/internal/packidx"
 	"github.com/bbockelm/pelfs/internal/packstore"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
+	"github.com/bbockelm/pelfs/internal/superblock"
 )
 
 const (
@@ -207,16 +208,12 @@ func Merge(segments []*Manifest) []byte {
 	return out.Encode()
 }
 
-// Ref names one manifest segment, as a superblock lists it.
-type Ref struct {
-	Name  string
-	Hash  [32]byte
-	Size  int64
-	Packs uint32
-}
+// The ref naming one segment is superblock.ManifestRef: it is a field of
+// a signed document, so its encoding is defined where every other signed
+// field is. This package builds and verifies the object it names.
 
 // Fetch reads and verifies one segment.
-func Fetch(ctx context.Context, obj pelicanobj.Store, ref Ref) (*Manifest, error) {
+func Fetch(ctx context.Context, obj pelicanobj.Store, ref superblock.ManifestRef) (*Manifest, error) {
 	rc, err := obj.Get(ctx, Dir+"/"+ref.Name, 0, -1)
 	if err != nil {
 		return nil, fmt.Errorf("manifest: fetch %s: %w", ref.Name, err)
@@ -244,7 +241,7 @@ func Fetch(ctx context.Context, obj pelicanobj.Store, ref Ref) (*Manifest, error
 // is returned with whatever succeeded, and the caller decides — retention
 // must refuse to sweep on a partial view, while a reader that only wanted
 // one pack may still find it.
-func FetchAll(ctx context.Context, obj pelicanobj.Store, refs []Ref) ([]*Manifest, error) {
+func FetchAll(ctx context.Context, obj pelicanobj.Store, refs []superblock.ManifestRef) ([]*Manifest, error) {
 	if len(refs) == 0 {
 		return nil, nil
 	}

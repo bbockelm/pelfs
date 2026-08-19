@@ -75,9 +75,11 @@ type packIndex struct {
 	indexed map[string]bool
 }
 
-// newPackIndex builds the empty index for a generation's pack list. It
-// makes no requests: the pack list alone gives every pack's signed size,
-// which is all the whole-pack cache needs to hold a local copy to account.
+// newPackIndex builds the empty index for a generation's RESOLVED pack
+// list — the rows the generation names, whether it stated them inline or
+// through a manifest (manifest.Packs). It makes no requests: the rows
+// alone give every pack's signed size, which is all the whole-pack cache
+// needs to hold a local copy to account.
 func newPackIndex(fs *FS, packs []superblock.PackEntry) *packIndex {
 	x := &packIndex{
 		fs:      fs,
@@ -94,6 +96,16 @@ func newPackIndex(fs *FS, packs []superblock.PackEntry) *packIndex {
 
 // size reports a pack's SIGNED length — the only whole-object check a
 // cached copy can be held to.
+func (x *packIndex) bytes() int64 {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	var total int64
+	for _, pe := range x.packs {
+		total += pe.Size
+	}
+	return total
+}
+
 func (x *packIndex) size(pack string) int64 {
 	x.mu.Lock()
 	defer x.mu.Unlock()
@@ -234,7 +246,7 @@ func (x *packIndex) locate(ctx context.Context, key string) (packLoc, error) {
 // generation lists, against one trailer fetch per pack. That is the trade
 // the whole thing exists for, and it is paid up front because the first
 // question a mount asks needs the answer.
-func (x *packIndex) loadHints(ctx context.Context, refs []mpi.Ref) {
+func (x *packIndex) loadHints(ctx context.Context, refs []superblock.IndexRef) {
 	if len(refs) == 0 {
 		return
 	}

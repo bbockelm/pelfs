@@ -41,6 +41,7 @@ import (
 	"github.com/bbockelm/pelfs/internal/catalog"
 	"github.com/bbockelm/pelfs/internal/chunkid"
 	"github.com/bbockelm/pelfs/internal/entrycodec"
+	"github.com/bbockelm/pelfs/internal/manifest"
 	"github.com/bbockelm/pelfs/internal/packstore"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/superblock"
@@ -61,6 +62,13 @@ const (
 	// KindMissingPack: a pack in the signed pack list is not in the
 	// federation (or cannot be stat'd).
 	KindMissingPack = "missing-pack"
+	// KindMissingManifest: the generation states its pack set through
+	// manifest segments (superblock.Manifests) and one could not be
+	// fetched or did not verify. Distinct from a missing pack because it
+	// is not damage to one object: nothing about the generation's contents
+	// can be checked without it, so every later problem is downstream of
+	// this one.
+	KindMissingManifest = "missing-manifest"
 	// KindPackTrailer: the pack exists but its trailer is unparseable, or
 	// the stored trailer bytes do not hash to the value the SIGNED pack
 	// list records — the location map does not match the generation.
@@ -292,7 +300,20 @@ func (c *checker) sortProblems() {
 // the index, so everything referencing them surfaces as missing rather
 // than aborting the sweep.
 func (c *checker) checkPacks(ctx context.Context) {
-	for _, pe := range c.o.SB.PackList {
+	// The pack set comes from the manifest when the generation has one and
+	// from the inline list otherwise (manifest.Packs). An unreadable
+	// manifest is reported as one problem and leaves the index empty, so
+	// everything downstream surfaces as missing — which is the truth: a
+	// generation whose pack set cannot be read is a generation whose
+	// content cannot be found. It is not a fatal error, because fsck's
+	// contract is to report every failure rather than to stop at the
+	// first.
+	packs, err := manifest.Packs(ctx, c.o.Inner, c.o.SB)
+	if err != nil {
+		c.problem(KindMissingManifest, manifest.Dir, "%v", err)
+		return
+	}
+	for _, pe := range packs {
 		key := packstore.PackDirKey + "/" + pe.Name
 		path := key
 		size := pe.Size

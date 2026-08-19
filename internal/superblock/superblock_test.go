@@ -7,8 +7,6 @@ import (
 	"testing"
 
 	"github.com/fxamacker/cbor/v2"
-
-	"github.com/bbockelm/pelfs/internal/mpi"
 )
 
 // testSuperblock populates every field so round-trip tests exercise the
@@ -445,7 +443,7 @@ func TestPackIndexesAreOptionalInBothDirections(t *testing.T) {
 	}
 
 	indexed := testSuperblock()
-	indexed.PackIndexes = []mpi.Ref{
+	indexed.PackIndexes = []IndexRef{
 		{Name: "aa11", Hash: [32]byte{0xaa, 0x11}, Size: 4096, Entries: 128, Packs: 3},
 		{Name: "bb22", Hash: [32]byte{0xbb, 0x22}, Size: 1 << 20, Entries: 65536, Packs: 200},
 	}
@@ -482,5 +480,51 @@ func TestPackIndexesAreOptionalInBothDirections(t *testing.T) {
 	}
 	if older.Generation != indexed.Generation || len(older.PackList) != len(indexed.PackList) {
 		t.Fatalf("the fields such a reader does know came back wrong: %+v", older)
+	}
+}
+
+// The manifest field is the one addition that is NOT optional in both
+// directions, and the compatibility story is the opposite of the index
+// list's: a generation that names manifests has no inline pack list, so a
+// reader that drops the field would mount a volume that looks empty. It
+// does not get the chance. Decoding drops unknown keys and Verify
+// re-encodes what it decoded, so an old binary's re-encoding is missing
+// signed content and the signature fails — a refusal at the trust
+// boundary rather than an empty tree.
+//
+// This test stands in for that old binary by dropping the field itself.
+func TestAManifestOnlyGenerationIsRefusedByAReaderThatDropsTheField(t *testing.T) {
+	pub, priv := genKey(t)
+
+	sb := testSuperblock()
+	sb.PackList = nil
+	sb.Manifests = []ManifestRef{
+		{Name: "aa11", Hash: [32]byte{0xaa, 0x11}, Size: 8192, Packs: 113},
+		{Name: "bb22", Hash: [32]byte{0xbb, 0x22}, Size: 1 << 20, Packs: 14000},
+	}
+	if err := sb.Sign(priv); err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	enc := mustEncode(t, sb)
+	dec, err := Decode(enc)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if err := dec.Verify(pub); err != nil {
+		t.Fatalf("a reader that knows the field could not verify: %v", err)
+	}
+	if len(dec.Manifests) != len(sb.Manifests) || !dec.PacksAreInManifests() {
+		t.Fatalf("manifest refs round-tripped as %+v", dec.Manifests)
+	}
+	for i, want := range sb.Manifests {
+		if dec.Manifests[i] != want {
+			t.Errorf("manifest ref %d round-tripped as %+v, want %+v", i, dec.Manifests[i], want)
+		}
+	}
+
+	dropped := *dec
+	dropped.Manifests = nil
+	if err := dropped.Verify(pub); !errors.Is(err, ErrBadSignature) {
+		t.Fatalf("a reader that dropped the manifest list verified anyway (%v); it would serve an empty volume", err)
 	}
 }

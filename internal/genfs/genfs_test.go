@@ -17,6 +17,7 @@ import (
 	"github.com/bbockelm/pelfs/internal/catalog"
 	"github.com/bbockelm/pelfs/internal/fakeorigin"
 	"github.com/bbockelm/pelfs/internal/genfs"
+	"github.com/bbockelm/pelfs/internal/manifest"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/publish"
 	"github.com/bbockelm/pelfs/internal/superblock"
@@ -54,6 +55,18 @@ func pseudorandom(n int, seed int64) []byte {
 }
 
 // publishVolume seals everything written into v since the last publish.
+// packsOf resolves a generation's pack set the way a mount does: through
+// the manifest segments it names, or through the inline list when it
+// names none (manifest.Packs).
+func packsOf(t testing.TB, inner pelicanobj.Store, sb *superblock.Superblock) []superblock.PackEntry {
+	t.Helper()
+	packs, err := manifest.Packs(context.Background(), inner, sb)
+	if err != nil {
+		t.Fatalf("resolve pack set: %v", err)
+	}
+	return packs
+}
+
 func publishVolume(t testing.TB, v *testvol.Volume, _ pelicanobj.Store, opts publish.Options) *publish.Result {
 	t.Helper()
 	return v.Publish(opts)

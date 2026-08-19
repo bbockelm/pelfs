@@ -33,6 +33,7 @@ import (
 	"github.com/bbockelm/pelfs/internal/catalog"
 	"github.com/bbockelm/pelfs/internal/chunkid"
 	"github.com/bbockelm/pelfs/internal/entrycodec"
+	"github.com/bbockelm/pelfs/internal/manifest"
 	"github.com/bbockelm/pelfs/internal/packstore"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/superblock"
@@ -246,7 +247,17 @@ func Open(ctx context.Context, o Options) (*FS, error) {
 		maxResident:  o.MaxResident,
 		fills:        make(map[string]*fillGate),
 	}
-	fs.packIndex = newPackIndex(fs, o.SB.PackList)
+	// The generation's pack set, from whichever shape it uses — the
+	// manifest objects it names, or the inline list an older generation
+	// carries (manifest.Packs). Failure is fatal and says why: a mount
+	// that fell through to an empty pack set would answer ENOENT for every
+	// byte in the volume and look like an empty tree rather than an
+	// unreadable one.
+	packs, err := manifest.Packs(ctx, o.Inner, o.SB)
+	if err != nil {
+		return nil, fmt.Errorf("genfs: %w", err)
+	}
+	fs.packIndex = newPackIndex(fs, packs)
 	// Before the root catalog, because the root is the first thing that
 	// might need locating and everything after it certainly does. Failure
 	// is not reported: the indexes are hints, and a mount without them is
@@ -495,17 +506,25 @@ func (fs *FS) NextInode() uint64 {
 }
 
 // Usage reports total stored bytes and the allocator high-water mark,
-// for synthesizing statfs. Bytes come from the generation's pack list
-// (the only size the format actually knows); inode counts are bounded by
-// NextInode, not counted — a true count would mean walking every
-// catalog.
+// for synthesizing statfs. Bytes come from the generation's pack set (the
+// only size the format actually knows), which the pack index already
+// holds resolved — reading it there rather than off the superblock is
+// what keeps this working for a generation whose packs live in a
+// manifest. Inode counts are bounded by NextInode, not counted — a true
+// count would mean walking every catalog.
 func (fs *FS) Usage() (bytes int64, inodes uint64) {
 	fs.swapMu.RLock()
 	defer fs.swapMu.RUnlock()
-	for _, pe := range fs.sb.PackList {
-		bytes += pe.Size
-	}
-	return bytes, fs.sb.NextInode
+	return fs.packIndex.bytes(), fs.sb.NextInode
+}
+
+// PackCount is how many packs the served generation names, for the
+// startup report. Same reason as Usage: the answer is no longer a field
+// of the superblock.
+func (fs *FS) PackCount() int {
+	fs.swapMu.RLock()
+	defer fs.swapMu.RUnlock()
+	return len(fs.packIndex.packs)
 }
 
 // GetAttr returns an inode's attributes from its residency catalog.

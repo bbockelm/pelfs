@@ -3,8 +3,6 @@ package superblock
 import (
 	"crypto/ed25519"
 	"testing"
-
-	"github.com/bbockelm/pelfs/internal/mpi"
 )
 
 // The superblock is fetched from mutable, attacker-writable federation
@@ -24,7 +22,8 @@ func FuzzDecodeVerify(f *testing.F) {
 		Condemned:       []CondemnedPack{{Name: "p-0-zz", CondemnedAtUnix: 99}},
 		// A ref names an object this reader will fetch on the strength of
 		// the superblock alone, so the seed carries one.
-		PackIndexes: []mpi.Ref{{Name: "ix", Hash: [32]byte{0x5a}, Size: 64, Entries: 2, Packs: 1}},
+		PackIndexes: []IndexRef{{Name: "ix", Hash: [32]byte{0x5a}, Size: 64, Entries: 2, Packs: 1}},
+		Manifests:   []ManifestRef{{Name: "mf", Hash: [32]byte{0xa5}, Size: 88, Packs: 1}},
 	}
 	if err := sb.Sign(priv); err != nil {
 		f.Fatal(err)

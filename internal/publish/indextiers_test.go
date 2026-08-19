@@ -8,10 +8,11 @@ import (
 	"github.com/bbockelm/pelfs/internal/mpi"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/publish"
+	"github.com/bbockelm/pelfs/internal/superblock"
 )
 
 // indexSet opens every index a generation lists, the way a mount does.
-func indexSet(t *testing.T, inner pelicanobj.Store, refs []mpi.Ref) *mpi.Set {
+func indexSet(t *testing.T, inner pelicanobj.Store, refs []superblock.IndexRef) *mpi.Set {
 	t.Helper()
 	indexes, err := mpi.FetchAll(context.Background(), inner, refs)
 	if err != nil {
@@ -78,7 +79,7 @@ func TestConsolidationKeepsEveryIdentityItsInputsAnswered(t *testing.T) {
 
 	// Every ref this volume ever listed, whether it survived into the
 	// current generation or was merged away.
-	ever := map[string]mpi.Ref{}
+	ever := map[string]superblock.IndexRef{}
 	record := func(res *publish.Result) {
 		for _, ref := range res.Superblock.PackIndexes {
 			ever[ref.Name] = ref

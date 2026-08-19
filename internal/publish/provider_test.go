@@ -242,7 +242,7 @@ func TestSealPublishesContentTheSourcePacked(t *testing.T) {
 	// Every pack the source made must be listed, or the chunkrefs name
 	// bytes that retention is entitled to delete.
 	listed := map[string]bool{}
-	for _, e := range res.Superblock.PackList {
+	for _, e := range packsOf(t, obj, res.Superblock) {
 		listed[e.Name] = true
 	}
 	for _, sp := range src.store.Packs() {

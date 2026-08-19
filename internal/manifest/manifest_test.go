@@ -13,6 +13,7 @@ import (
 
 	"github.com/bbockelm/pelfs/internal/packstore"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
+	"github.com/bbockelm/pelfs/internal/superblock"
 )
 
 // packName mirrors what packstore writes: p-<16 hex of unixnano>-<4 hex>,
@@ -199,7 +200,7 @@ func (r *sliceReader) Read(p []byte) (int, error) {
 func TestSegmentsAreFetchedInParallel(t *testing.T) {
 	ctx := context.Background()
 	store := &slowStore{objs: map[string][]byte{}, latency: 100 * time.Millisecond}
-	var refs []Ref
+	var refs []superblock.ManifestRef
 	for i := 0; i < 6; i++ {
 		b := NewBuilder()
 		if err := b.Add(pack(i)); err != nil {
@@ -208,7 +209,7 @@ func TestSegmentsAreFetchedInParallel(t *testing.T) {
 		raw := b.Encode()
 		name := "m-" + strconv.Itoa(i)
 		store.objs[Dir+"/"+name] = raw
-		refs = append(refs, Ref{Name: name, Hash: blake3.Sum256(raw), Size: int64(len(raw)), Packs: 1})
+		refs = append(refs, superblock.ManifestRef{Name: name, Hash: blake3.Sum256(raw), Size: int64(len(raw)), Packs: 1})
 	}
 	start := time.Now()
 	got, err := FetchAll(ctx, store, refs)
@@ -241,7 +242,7 @@ func TestAnUnverifiableSegmentIsReported(t *testing.T) {
 	raw := b.Encode()
 	store.objs[Dir+"/ok"] = raw
 	store.objs[Dir+"/bad"] = raw
-	refs := []Ref{
+	refs := []superblock.ManifestRef{
 		{Name: "ok", Hash: blake3.Sum256(raw)},
 		{Name: "bad", Hash: [32]byte{0xde, 0xad}},
 	}

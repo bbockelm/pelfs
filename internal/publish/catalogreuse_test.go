@@ -164,11 +164,11 @@ func TestCarriedCatalogsStayRetained(t *testing.T) {
 		t.Fatalf("every catalog came from this seal's own packs; nothing was carried")
 	}
 
-	listed := make(map[string]bool, len(second.Superblock.PackList))
-	for _, pe := range second.Superblock.PackList {
+	listed := make(map[string]bool, len(packsOf(t, v.inner, second.Superblock)))
+	for _, pe := range packsOf(t, v.inner, second.Superblock) {
 		listed[pe.Name] = true
 	}
-	for _, pe := range first.Superblock.PackList {
+	for _, pe := range packsOf(t, v.inner, first.Superblock) {
 		if !listed[pe.Name] {
 			t.Errorf("pack %s holds carried-forward catalogs but is not listed by the new generation", pe.Name)
 		}

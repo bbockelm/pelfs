@@ -4,13 +4,13 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/bbockelm/pelfs/internal/mpi"
+	"github.com/bbockelm/pelfs/internal/superblock"
 )
 
-func sizedRefs(sizes ...int64) []mpi.Ref {
-	refs := make([]mpi.Ref, len(sizes))
+func sizedRefs(sizes ...int64) []superblock.IndexRef {
+	refs := make([]superblock.IndexRef, len(sizes))
 	for i, s := range sizes {
-		refs[i] = mpi.Ref{Name: fmt.Sprintf("ref%d", i), Size: s}
+		refs[i] = superblock.IndexRef{Name: fmt.Sprintf("ref%d", i), Size: s}
 	}
 	return refs
 }
@@ -28,12 +28,12 @@ func TestMergeableSuffixRefusals(t *testing.T) {
 	}{
 		{"small refs all merge", []int64{4 * k, 4 * k, 4 * k}, 0},
 		{"a large tier is not re-downloaded to absorb a small one",
-			[]int64{4 * k, indexMergeMaxInput + 1, 4 * k, 4 * k}, 2},
+			[]int64{4 * k, refMergeMaxInput + 1, 4 * k, 4 * k}, 2},
 		// The scan stops at the newest ref, so the smaller ones behind it
 		// stay listed: merging them would reach past a newer ref, and
 		// lookups are newest-wins.
 		{"a large newest ref merges with nothing",
-			[]int64{4 * k, 4 * k, indexMergeMaxInput + 1}, 3},
+			[]int64{4 * k, 4 * k, refMergeMaxInput + 1}, 3},
 		{"the sum stops at the target",
 			[]int64{700 * k, 700 * k, 700 * k, 700 * k}, 2},
 		{"a sizeless ref stops the scan, since its cost is unknown",
@@ -62,7 +62,7 @@ func TestMergeableSuffixIsBoundedInBytes(t *testing.T) {
 	for _, r := range refs[mergeableSuffix(refs):] {
 		total += r.Size
 	}
-	if total > indexTargetBytes {
-		t.Errorf("a seal would fetch %d bytes of index; the target is %d", total, indexTargetBytes)
+	if total > refTargetBytes {
+		t.Errorf("a seal would fetch %d bytes of index; the target is %d", total, refTargetBytes)
 	}
 }

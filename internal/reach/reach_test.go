@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/bbockelm/pelfs/internal/fakeorigin"
+	"github.com/bbockelm/pelfs/internal/manifest"
 	"github.com/bbockelm/pelfs/internal/packstore"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/publish"
@@ -107,11 +108,23 @@ func treeFixture(t *testing.T, uuid string) (*countingStore, string, *superblock
 	v.Link(hard, dir, "hard2")
 
 	res := v.Publish(publishOpts)
-	if res.Stats.Catalogs < 2 || res.Stats.Shards < 1 || len(res.Superblock.PackList) < 2 {
+	if res.Stats.Catalogs < 2 || res.Stats.Shards < 1 || len(packsOf(t, inner, res.Superblock)) < 2 {
 		t.Fatalf("fixture is not representative: %d catalogs, %d shards, %d packs",
-			res.Stats.Catalogs, res.Stats.Shards, len(res.Superblock.PackList))
+			res.Stats.Catalogs, res.Stats.Shards, len(packsOf(t, inner, res.Superblock)))
 	}
 	return inner, volDir, gen0, res, v
+}
+
+// packsOf resolves a generation's pack set the way the sweep does:
+// through its manifest segments, or through the inline list when it has
+// none (manifest.Packs).
+func packsOf(t *testing.T, inner pelicanobj.Store, sb *superblock.Superblock) []superblock.PackEntry {
+	t.Helper()
+	packs, err := manifest.Packs(context.Background(), inner, sb)
+	if err != nil {
+		t.Fatalf("resolve pack set: %v", err)
+	}
+	return packs
 }
 
 func sweep(t *testing.T, inner pelicanobj.Store, live ...*superblock.Superblock) *reach.Report {
@@ -143,8 +156,8 @@ func TestFreshGenerationIsLive(t *testing.T) {
 
 	head := sweep(t, inner, res.Superblock)
 	dump(t, head)
-	if head.Generations != 1 || len(head.Packs) != len(res.Superblock.PackList) {
-		t.Fatalf("swept %d generations / %d packs, want 1 / %d", head.Generations, len(head.Packs), len(res.Superblock.PackList))
+	if head.Generations != 1 || len(head.Packs) != len(packsOf(t, inner, res.Superblock)) {
+		t.Fatalf("swept %d generations / %d packs, want 1 / %d", head.Generations, len(head.Packs), len(packsOf(t, inner, res.Superblock)))
 	}
 	for _, p := range head.Packs {
 		if !p.Indexed {
@@ -197,10 +210,10 @@ func TestGarbageAfterRewrite(t *testing.T) {
 	// inherited from the empty generation 0: those are the ones the
 	// rewrite condemns.
 	mine := map[string]bool{}
-	for _, pe := range first.Superblock.PackList {
+	for _, pe := range packsOf(t, inner, first.Superblock) {
 		mine[pe.Name] = true
 	}
-	for _, pe := range gen0.PackList {
+	for _, pe := range packsOf(t, inner, gen0) {
 		delete(mine, pe.Name)
 	}
 
@@ -586,7 +599,7 @@ func packEntries(t *testing.T, inner pelicanobj.Store, pe superblock.PackEntry) 
 func packHolding(t *testing.T, inner pelicanobj.Store, sb *superblock.Superblock,
 	want func(packstore.PackEntry) bool) (superblock.PackEntry, packstore.PackEntry) {
 	t.Helper()
-	for _, pe := range sb.PackList {
+	for _, pe := range packsOf(t, inner, sb) {
 		for _, e := range packEntries(t, inner, pe) {
 			if want(e) {
 				return pe, e
@@ -610,4 +623,66 @@ func scribble(t *testing.T, packPath string, off, length int64) {
 	if _, err := f.WriteAt(pseudorandom(int(length), 7), off); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// Liveness is a property of the packs and the references into them, not
+// of how a superblock happens to name them. The two shapes must produce
+// the same numbers, or the retirement thresholds the design states in
+// live fractions would mean different things for different generations.
+func TestLivenessIsTheSameThroughAManifestAndAnInlineList(t *testing.T) {
+	inner, _, _, res, _ := treeFixture(t, "aaaa1111-2222-3333-4444-555555555555")
+	sb := res.Superblock
+	if !sb.PacksAreInManifests() {
+		t.Fatal("fixture: publish did not name its packs through a manifest")
+	}
+
+	named := sweep(t, inner, sb)
+
+	// The same generation as a pre-manifest writer would have written it.
+	old := *sb
+	old.PackList = packsOf(t, inner, sb)
+	old.Manifests = nil
+	inline := sweep(t, inner, &old)
+
+	if len(named.Packs) != len(inline.Packs) {
+		t.Fatalf("swept %d packs through the manifest, %d through the inline list",
+			len(named.Packs), len(inline.Packs))
+	}
+	if named.Entries != inline.Entries || named.LiveEntries != inline.LiveEntries ||
+		named.Bytes != inline.Bytes || named.LiveBytes != inline.LiveBytes {
+		t.Fatalf("the two shapes disagree: manifest %d/%d entries %d/%d bytes, inline %d/%d entries %d/%d bytes",
+			named.LiveEntries, named.Entries, named.LiveBytes, named.Bytes,
+			inline.LiveEntries, inline.Entries, inline.LiveBytes, inline.Bytes)
+	}
+	for i := range named.Packs {
+		if named.Packs[i] != inline.Packs[i] {
+			t.Errorf("pack %d differs: %+v vs %+v", i, named.Packs[i], inline.Packs[i])
+		}
+	}
+	t.Logf("%d packs, %.4f live, identical through both shapes", len(named.Packs), named.LiveFraction())
+}
+
+// A sweep that cannot read a generation's manifest does not know that
+// generation's packs. It must report the sweep incomplete rather than
+// quietly leave those packs out — a pack missing from the report is a
+// pack a caller acting on the report may delete.
+func TestASweepRefusesAGenerationWhoseManifestIsUnreadable(t *testing.T) {
+	inner, volDir, _, res, _ := treeFixture(t, "bbbb1111-2222-3333-4444-555555555555")
+	sb := res.Superblock
+	for _, ref := range sb.Manifests {
+		if err := os.Remove(filepath.Join(volDir, manifest.Dir, ref.Name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rep, err := reach.Sweep(context.Background(), reach.Options{
+		Inner: inner, Live: []*superblock.Superblock{sb}, CacheDir: t.TempDir(), Workers: 4,
+	})
+	if rep != nil || err == nil {
+		t.Fatalf("a sweep over an unresolvable pack set returned a report: %+v", rep)
+	}
+	var inc *reach.Incomplete
+	if !errors.As(err, &inc) {
+		t.Fatalf("want an *Incomplete, got %T: %v", err, err)
+	}
+	t.Logf("refused, with: %v", inc.Failures)
 }

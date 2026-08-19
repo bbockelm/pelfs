@@ -73,6 +73,12 @@ type ContentRecords interface {
 	// the last Records: a store may still be cutting packs while it
 	// answers.
 	Packs(ctx context.Context) ([]packstore.SealedPack, error)
+	// EachEntry reports every identity this store placed and the pack
+	// holding it. A generation's multi-pack index is built from what the
+	// SEAL packed; content the source packed itself never passes through
+	// that, so without this the index answers for catalogs and shards and
+	// misses the data — which on a writable mount is nearly everything.
+	EachEntry(fn func(identityHex, pack string))
 }
 
 // ContentRecords reports whether this overlay's content is already

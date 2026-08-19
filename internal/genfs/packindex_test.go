@@ -54,7 +54,7 @@ func TestColdMountDoesNotIndexEveryPack(t *testing.T) {
 		v.Write(f, pseudorandom(600<<10, int64(i)+1))
 	}
 	res := publishVolume(t, v, inner, publish.Options{TargetPackSize: 512 << 10})
-	packs := len(res.Superblock.PackList)
+	packs := len(packsOf(t, inner, res.Superblock))
 	if packs < 8 {
 		t.Fatalf("volume has %d packs; the test needs many", packs)
 	}
@@ -87,8 +87,8 @@ func TestPackIndexReusesCachedTrailers(t *testing.T) {
 		v.Write(f, pseudorandom(600<<10, int64(i)+1))
 	}
 	res := publishVolume(t, v, inner, publish.Options{TargetPackSize: 512 << 10})
-	if len(res.Superblock.PackList) < 2 {
-		t.Fatalf("volume has %d packs; the test needs several", len(res.Superblock.PackList))
+	if len(packsOf(t, inner, res.Superblock)) < 2 {
+		t.Fatalf("volume has %d packs; the test needs several", len(packsOf(t, inner, res.Superblock)))
 	}
 
 	cache := t.TempDir()

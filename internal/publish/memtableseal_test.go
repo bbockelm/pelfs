@@ -97,7 +97,7 @@ func TestSealAnOverlayWhoseContentIsAMemtable(t *testing.T) {
 	// Every pack the session cut must be listed, or its chunkrefs name
 	// bytes retention is entitled to delete.
 	listed := map[string]bool{}
-	for _, e := range res.Superblock.PackList {
+	for _, e := range packsOf(t, obj, res.Superblock) {
 		listed[e.Name] = true
 	}
 	for _, sp := range store.Packs() {

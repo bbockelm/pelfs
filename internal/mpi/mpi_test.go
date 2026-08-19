@@ -13,6 +13,7 @@ import (
 	"lukechampine.com/blake3"
 
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
+	"github.com/bbockelm/pelfs/internal/superblock"
 )
 
 func id(n uint64) [32]byte {
@@ -187,14 +188,14 @@ func (r *sliceReader) Read(p []byte) (int, error) {
 func TestIndexesAreFetchedInParallel(t *testing.T) {
 	ctx := context.Background()
 	store := &slowStore{objs: map[string][]byte{}, latency: 100 * time.Millisecond}
-	var refs []Ref
+	var refs []superblock.IndexRef
 	for i := 0; i < 8; i++ {
 		b := NewBuilder()
 		b.Add(id(uint64(i)), "p-"+strconv.Itoa(i))
 		raw := b.Encode()
 		name := "mpi-" + strconv.Itoa(i)
 		store.objs[Dir+"/"+name] = raw
-		refs = append(refs, Ref{Name: name, Hash: blake3.Sum256(raw), Size: int64(len(raw))})
+		refs = append(refs, superblock.IndexRef{Name: name, Hash: blake3.Sum256(raw), Size: int64(len(raw))})
 	}
 
 	start := time.Now()
@@ -228,7 +229,7 @@ func TestACorruptIndexIsRejectedButNotFatal(t *testing.T) {
 	store.objs[Dir+"/ok"] = raw
 	store.objs[Dir+"/bad"] = append([]byte(nil), raw...)
 
-	refs := []Ref{
+	refs := []superblock.IndexRef{
 		{Name: "ok", Hash: blake3.Sum256(raw), Size: int64(len(raw))},
 		{Name: "bad", Hash: [32]byte{0xde, 0xad}, Size: int64(len(raw))},
 	}

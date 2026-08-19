@@ -69,6 +69,7 @@ import (
 	"sync"
 
 	"github.com/bbockelm/pelfs/internal/entrycodec"
+	"github.com/bbockelm/pelfs/internal/manifest"
 	"github.com/bbockelm/pelfs/internal/packstore"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/superblock"
@@ -329,7 +330,7 @@ func Sweep(ctx context.Context, o Options) (*Report, error) {
 		promoted:  make(map[int64]struct{}),
 		walked:    make(map[string]struct{}),
 	}
-	s.collectPacks()
+	s.collectPacks(ctx)
 	s.readTrailers(ctx)
 	s.walkCatalogs(ctx)
 	s.walkShards(ctx)
@@ -361,7 +362,7 @@ func (s *sweeper) fail(object, format string, args ...any) {
 // named by every generation that inherited it — pack lists carry forward
 // — so the union is much smaller than the sum, and it is the whole set
 // this sweep will ever account for.
-func (s *sweeper) collectPacks() {
+func (s *sweeper) collectPacks(ctx context.Context) {
 	type listed struct {
 		pack Pack
 		hash [32]byte
@@ -369,7 +370,19 @@ func (s *sweeper) collectPacks() {
 	var all []listed
 	seen := make(map[string]int)
 	for _, sb := range s.o.Live {
-		for _, pe := range sb.PackList {
+		// Inline list or manifest segments, whichever the generation uses
+		// (manifest.Packs). A generation whose manifest will not read is a
+		// FAILURE rather than a generation with no packs: the sweep would
+		// otherwise report the packs only that generation references as
+		// unreferenced, which is the one error this package is built not to
+		// make. Recorded and carried on, so the report names every
+		// generation that could not be read rather than the first.
+		packs, err := manifest.Packs(ctx, s.o.Inner, sb)
+		if err != nil {
+			s.fail(fmt.Sprintf("generation %d", sb.Generation), "pack set unreadable: %v", err)
+			continue
+		}
+		for _, pe := range packs {
 			i, dup := seen[pe.Name]
 			if !dup {
 				seen[pe.Name] = len(all)

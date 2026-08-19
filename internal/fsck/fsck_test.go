@@ -13,6 +13,7 @@ import (
 
 	"github.com/bbockelm/pelfs/internal/fakeorigin"
 	"github.com/bbockelm/pelfs/internal/fsck"
+	"github.com/bbockelm/pelfs/internal/manifest"
 	"github.com/bbockelm/pelfs/internal/packstore"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/publish"
@@ -78,11 +79,23 @@ func healthyFixtureVol(t *testing.T, uuid string, opts publish.Options) (pelican
 		opts.TargetPackSize = 2 << 20
 	}
 	res := v.Publish(publish.Options{SMax: opts.SMax, TargetPackSize: opts.TargetPackSize})
-	if res.Stats.Catalogs < 2 || res.Stats.Shards < 1 || len(res.Superblock.PackList) < 2 {
+	if res.Stats.Catalogs < 2 || res.Stats.Shards < 1 || len(packsOf(t, inner, res.Superblock)) < 2 {
 		t.Fatalf("fixture is not representative: %d catalogs, %d shards, %d packs",
-			res.Stats.Catalogs, res.Stats.Shards, len(res.Superblock.PackList))
+			res.Stats.Catalogs, res.Stats.Shards, len(packsOf(t, inner, res.Superblock)))
 	}
 	return inner, volDir, res, v
+}
+
+// packsOf resolves a generation's pack set the way every reader does:
+// through its manifest segments, or through the inline list when it has
+// none (manifest.Packs).
+func packsOf(t *testing.T, inner pelicanobj.Store, sb *superblock.Superblock) []superblock.PackEntry {
+	t.Helper()
+	packs, err := manifest.Packs(context.Background(), inner, sb)
+	if err != nil {
+		t.Fatalf("resolve pack set: %v", err)
+	}
+	return packs
 }
 
 func check(t *testing.T, inner pelicanobj.Store, sb *superblock.Superblock, o fsck.Options) *fsck.Report {
@@ -133,7 +146,7 @@ func packEntries(t *testing.T, inner pelicanobj.Store, pe superblock.PackEntry) 
 func packHolding(t *testing.T, inner pelicanobj.Store, sb *superblock.Superblock,
 	want func(packstore.PackEntry) bool) (superblock.PackEntry, packstore.PackEntry) {
 	t.Helper()
-	for _, pe := range sb.PackList {
+	for _, pe := range packsOf(t, inner, sb) {
 		for _, e := range packEntries(t, inner, pe) {
 			if want(e) {
 				return pe, e
@@ -168,8 +181,8 @@ func TestHealthyGeneration(t *testing.T) {
 	if rep.Chunks != st.ChunksAdded {
 		t.Fatalf("chunks = %d, publish uploaded %d", rep.Chunks, st.ChunksAdded)
 	}
-	if rep.Packs != len(res.Superblock.PackList) {
-		t.Fatalf("verified %d packs of %d", rep.Packs, len(res.Superblock.PackList))
+	if rep.Packs != len(packsOf(t, inner, res.Superblock)) {
+		t.Fatalf("verified %d packs of %d", rep.Packs, len(packsOf(t, inner, res.Superblock)))
 	}
 	if rep.Bytes != int64(6<<20+2<<20+3<<20+len("inline body, well under the threshold")) {
 		t.Fatalf("logical bytes = %d", rep.Bytes)
@@ -200,7 +213,7 @@ func TestMissingPack(t *testing.T) {
 	// Delete a pack holding only data: the catalogs survive, so the sweep
 	// must complete and report the whole tree alongside the damage.
 	victim, _ := packHolding(t, inner, sb, isData)
-	for _, pe := range sb.PackList {
+	for _, pe := range packsOf(t, inner, sb) {
 		if pe.Name != victim.Name {
 			continue
 		}
@@ -219,8 +232,8 @@ func TestMissingPack(t *testing.T) {
 		t.Fatal("no chunk was reported missing after deleting a data pack")
 	}
 	// Everything else still reported.
-	if rep.Packs != len(sb.PackList)-1 {
-		t.Fatalf("verified %d packs, want %d", rep.Packs, len(sb.PackList)-1)
+	if rep.Packs != len(packsOf(t, inner, sb))-1 {
+		t.Fatalf("verified %d packs, want %d", rep.Packs, len(packsOf(t, inner, sb))-1)
 	}
 	if rep.Files != res.Stats.Files || rep.Dirs != res.Stats.Dirs || rep.Catalogs != res.Stats.Catalogs {
 		t.Fatalf("the sweep stopped early: %d files, %d dirs, %d catalogs", rep.Files, rep.Dirs, rep.Catalogs)
@@ -419,7 +432,7 @@ func TestMultipleProblemsSorted(t *testing.T) {
 	sb := res.Superblock
 
 	var damaged []string
-	for _, pe := range sb.PackList {
+	for _, pe := range packsOf(t, inner, sb) {
 		for _, e := range packEntries(t, inner, pe) {
 			if !isData(e) {
 				continue
@@ -512,4 +525,59 @@ func TestHealthyGenerationWithCarriedCatalogs(t *testing.T) {
 	if rep.Catalogs != first.Stats.Catalogs {
 		t.Errorf("fsck reached %d catalogs; the tree has %d", rep.Catalogs, first.Stats.Catalogs)
 	}
+}
+
+// fsck's whole job is rooted in the pack set, so it has to reach that set
+// through both shapes. The manifest shape is what publish writes now and
+// is therefore what every other test here exercises; this one says so out
+// loud, so that coverage cannot quietly disappear if the default changes.
+// The inline shape is covered by structural_test.go, whose generations
+// are hand-built with a PackList.
+func TestFsckVerifiesAManifestOnlyGeneration(t *testing.T) {
+	inner, _, res := healthyFixture(t, "cccc1111-2222-3333-4444-555555555555", publish.Options{})
+	sb := res.Superblock
+	if !sb.PacksAreInManifests() || len(sb.PackList) != 0 {
+		t.Fatalf("fixture: %d manifest refs, %d inline packs — this test needs the manifest shape",
+			len(sb.Manifests), len(sb.PackList))
+	}
+	rep := check(t, inner, sb, fsck.Options{Deep: true, Workers: 4})
+	dumpProblems(t, rep)
+	if !rep.OK() {
+		t.Fatalf("a healthy manifest-only generation reported %d problems", len(rep.Problems))
+	}
+	if rep.Packs != len(packsOf(t, inner, sb)) {
+		t.Fatalf("verified %d packs of %d", rep.Packs, len(packsOf(t, inner, sb)))
+	}
+}
+
+// A generation whose manifest will not read is damage fsck must NAME. The
+// wrong behaviour is not an unreported problem — it is reporting the
+// content missing without saying why, which sends someone looking for
+// lost packs when the pack list is what is lost.
+func TestUnreadableManifestIsReported(t *testing.T) {
+	inner, volDir, res := healthyFixture(t, "dddd1111-2222-3333-4444-555555555555", publish.Options{})
+	sb := res.Superblock
+	for _, ref := range sb.Manifests {
+		if err := os.Remove(filepath.Join(volDir, manifest.Dir, ref.Name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The check aborts at the root catalog, as it does for any generation
+	// whose content cannot be located — but the partial report must still
+	// say WHY, or the abort reads as missing content.
+	rep, err := fsck.Check(context.Background(), fsck.Options{Inner: inner, SB: sb, CacheDir: t.TempDir()})
+	if err == nil {
+		t.Fatal("a generation with no readable pack set was checked anyway")
+	}
+	if rep == nil {
+		t.Fatal("no partial report")
+	}
+	got := problemsOf(rep, fsck.KindMissingManifest)
+	if len(got) != 1 {
+		t.Fatalf("missing-manifest problems = %+v", got)
+	}
+	if rep.Packs != 0 {
+		t.Errorf("verified %d packs without a pack list", rep.Packs)
+	}
+	t.Logf("reported: %s", got[0].Detail)
 }

@@ -59,8 +59,8 @@ func hintedVolume(t *testing.T, uuid string) (*packGetStore, *superblock.Superbl
 	for i := 0; i < 7; i++ {
 		res = publishVolume(t, v, inner, publish.Options{TargetPackSize: 512 << 10})
 	}
-	if len(res.Superblock.PackList) < 8 {
-		t.Fatalf("volume has %d packs; the test needs many", len(res.Superblock.PackList))
+	if len(packsOf(t, inner, res.Superblock)) < 8 {
+		t.Fatalf("volume has %d packs; the test needs many", len(packsOf(t, inner, res.Superblock)))
 	}
 	if res.Superblock.RootCatalogHint == nil {
 		t.Fatal("publish recorded no root-catalog hint")
@@ -112,7 +112,7 @@ func TestRootHintSkipsThePackIndex(t *testing.T) {
 	ctx := context.Background()
 	inner, hintedSB, _ := hintedVolume(t, "9efe7c40-0000-4000-8000-0000000000b1")
 	sb := withoutPackIndexes(hintedSB)
-	packs := len(sb.PackList)
+	packs := len(packsOf(t, inner, sb))
 
 	inner.gets.Store(0)
 	hinted := openFS(t, inner, sb, genfs.Options{CacheDir: t.TempDir()})
@@ -159,7 +159,7 @@ func TestWrongRootHintStillMounts(t *testing.T) {
 
 	real := sb.RootCatalogHint
 	other := ""
-	for _, pe := range sb.PackList {
+	for _, pe := range packsOf(t, inner, sb) {
 		if pe.Name != real.Pack {
 			other = pe.Name
 			break

@@ -253,12 +253,12 @@ func TestPublishEndToEnd(t *testing.T) {
 	if len(res.NewPacks) < 2 {
 		t.Fatalf("expected multiple packs at a 2 MiB target, got %d", len(res.NewPacks))
 	}
-	if len(sb.PackList) != len(res.NewPacks)+len(gen0.PackList) {
+	if len(packsOf(t, inner, sb)) != len(res.NewPacks)+len(packsOf(t, inner, gen0)) {
 		t.Fatalf("pack list has %d entries, new packs %d plus %d carried",
-			len(sb.PackList), len(res.NewPacks), len(gen0.PackList))
+			len(packsOf(t, inner, sb)), len(res.NewPacks), len(packsOf(t, inner, gen0)))
 	}
 	var packBytes int64
-	for _, pe := range sb.PackList {
+	for _, pe := range packsOf(t, inner, sb) {
 		info, err := inner.StatKey(ctx, packstore.PackDirKey+"/"+pe.Name)
 		if err != nil {
 			t.Fatalf("pack %s missing: %v", pe.Name, err)
@@ -469,10 +469,10 @@ func TestPublishSecondGeneration(t *testing.T) {
 
 	// The predecessor's packs carry forward; the new packs join them.
 	names := make(map[string]bool)
-	for _, pe := range sb2.PackList {
+	for _, pe := range packsOf(t, inner, sb2) {
 		names[pe.Name] = true
 	}
-	for _, pe := range res1.Superblock.PackList {
+	for _, pe := range packsOf(t, inner, res1.Superblock) {
 		if !names[pe.Name] {
 			t.Fatalf("pack %s dropped from the successor's list", pe.Name)
 		}

@@ -9,6 +9,7 @@ import (
 
 	"github.com/bbockelm/pelfs/internal/catalog"
 	"github.com/bbockelm/pelfs/internal/chunkid"
+	"github.com/bbockelm/pelfs/internal/manifest"
 	"github.com/bbockelm/pelfs/internal/superblock"
 )
 
@@ -95,7 +96,14 @@ func (fs *FS) Swap(ctx context.Context, sb *superblock.Superblock) (*SwapReport,
 	// what indexing every new trailer up front bought; the root catalog is
 	// the part of it that actually proves the new generation is servable,
 	// and the rest of the map fills in behind the reads that need it.
-	newIndex := newPackIndex(fs, sb.PackList)
+	packs, err := manifest.Packs(ctx, fs.inner, sb)
+	if err != nil {
+		// Same rule as Open, and it matters more here: a swap that fell
+		// through to an empty pack set would replace a generation this
+		// mount can serve with one it cannot read a byte of.
+		return nil, fmt.Errorf("genfs: swap: %w", err)
+	}
+	newIndex := newPackIndex(fs, packs)
 	// The incoming generation's own indexes, for the same reason Open
 	// takes them: the swap resolves a root catalog it has never located,
 	// and every read after it resolves against this map.

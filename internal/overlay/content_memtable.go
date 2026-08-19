@@ -116,6 +116,10 @@ func (f *frozenMemtableContent) Records(ctx context.Context, ino uint64) (genfs.
 	return genfs.Content{Length: size, Refs: refs}, true, nil
 }
 
+func (f *frozenMemtableContent) EachEntry(fn func(identityHex, pack string)) {
+	f.store.EachPlacedChunk(fn)
+}
+
 func (f *frozenMemtableContent) Packs(ctx context.Context) ([]packstore.SealedPack, error) {
 	if f.seal != nil {
 		if err := f.seal.Finish(ctx); err != nil {
@@ -197,6 +201,10 @@ func (m *memtableContent) Records(ctx context.Context, ino uint64) (genfs.Conten
 // All of them, not just this run's: a chunk row rendered above may name a
 // pack cut minutes ago, during the session, and the superblock has to
 // list that one too.
+func (m *memtableContent) EachEntry(fn func(identityHex, pack string)) {
+	m.store.EachPlacedChunk(fn)
+}
+
 func (m *memtableContent) Packs(ctx context.Context) ([]packstore.SealedPack, error) {
 	if m.seal != nil {
 		if err := m.seal.Finish(ctx); err != nil {

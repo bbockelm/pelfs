@@ -83,9 +83,21 @@ func cmdGC(args []string) int {
 	for _, n := range rep.CandidateNames {
 		fmt.Printf("  %s\n", n)
 	}
+	// The derived key spaces print only when they exist: an index or
+	// manifest sweep on a volume that has neither is noise.
+	printSpace := func(what string, sp retention.SpaceReport) {
+		if sp.Scanned == 0 && sp.Retained == 0 {
+			return
+		}
+		fmt.Printf("%-17s %d retained, %d scanned, %d too young, %d unreferenced (%d bytes)\n",
+			what+":", sp.Retained, sp.Scanned, sp.SkippedYoung, sp.Candidates, sp.CandidateBytes)
+	}
+	printSpace("pack indexes", rep.Indexes)
+	printSpace("pack manifests", rep.Manifests)
 	if o.gcDelete {
-		fmt.Printf("deleted:          %d\n", rep.Deleted)
-	} else if rep.Candidates > 0 {
+		fmt.Printf("deleted:          %d packs, %d indexes, %d manifests\n",
+			rep.Deleted, rep.Indexes.Deleted, rep.Manifests.Deleted)
+	} else if rep.Candidates+rep.Indexes.Candidates+rep.Manifests.Candidates > 0 {
 		fmt.Println("re-run with --delete to remove them")
 	}
 	return 0

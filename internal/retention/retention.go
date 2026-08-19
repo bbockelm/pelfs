@@ -9,6 +9,36 @@
 // live writers with no coordination: a writer's new packs are always
 // young, and a mid-sweep fork's closure is already retained.
 //
+// The DERIVED key spaces sweep under the same two rules. Multi-pack
+// indexes (internal/mpi, named by a superblock's PackIndexes) and pack
+// manifests (internal/manifest) are hash-named objects that no generation
+// removes on its own: an aborted publish leaves an index nothing names,
+// and consolidation will leave superseded ones behind. Both are listed
+// alongside packs and swept from the same live set, so an object any live
+// superblock names — head or tag — survives whatever its age.
+//
+// Guard (b) needs a different clock for them. A pack carries its creation
+// time in its NAME; an index or manifest name is a content hash and
+// carries no time at all, so the age comes from the object's mtime. That
+// guard is doing real work here, not bookkeeping: publish uploads its
+// index BEFORE it flips the ref, so there is a window in which a live
+// index exists that no live superblock has named yet. An object whose
+// time cannot be established is KEPT — keeping garbage costs bytes,
+// deleting a live index costs a mount.
+//
+// The limit to admit, on indexes: "live" here means named by a branch
+// HEAD or a tag, which is all a sweep can enumerate — a retired
+// generation is not addressable, only hashed. So an index that only an
+// older generation inside the retain window still names — one
+// consolidation merged away and the head therefore stopped listing — is
+// swept once its object ages past the window, though a reader pinned to
+// that generation would still have used it. The cost is bounded and known:
+// an index is DERIVED, so that reader falls back to pack trailers and is
+// slow rather than broken. Closing it properly wants the ledger packs
+// already have — consolidation recording the refs it dropped, with a
+// timestamp, the way repack records condemned packs — and until that
+// exists this is the honest behaviour rather than a silent one.
+//
 // The sweep fails closed: if any ref or tag cannot be fetched and
 // verified, nothing is deleted — an unreadable superblock means the
 // retained set is unknown, and guessing destroys data.
@@ -20,6 +50,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bbockelm/pelfs/internal/manifest"
+	"github.com/bbockelm/pelfs/internal/mpi"
 	"github.com/bbockelm/pelfs/internal/packstore"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/refs"
@@ -41,7 +73,20 @@ type Options struct {
 	Now    time.Time // injectable clock (zero = time.Now())
 }
 
-// Report summarizes one sweep.
+// SpaceReport summarizes the sweep of one key space.
+type SpaceReport struct {
+	Retained       int
+	Scanned        int
+	SkippedYoung   int
+	Candidates     int
+	CandidateBytes int64
+	Deleted        int
+	CandidateNames []string // capped sample
+}
+
+// Report summarizes one sweep. The pack counters stay flat for the
+// callers that already print them; the derived key spaces report through
+// SpaceReport.
 type Report struct {
 	Branches       int
 	Tags           int
@@ -52,103 +97,272 @@ type Report struct {
 	CandidateBytes int64
 	Deleted        int
 	CandidateNames []string // capped sample
+
+	// Indexes and Manifests cover the derived key spaces: multi-pack
+	// indexes (mpi.Dir) and pack manifests (manifest.Dir). Their
+	// SkippedYoung counts objects kept by the mtime guard, including any
+	// whose time could not be read at all.
+	Indexes   SpaceReport
+	Manifests SpaceReport
 }
 
-// GC computes (and with o.Delete, removes) unreferenced packs.
+// candidate is one object the sweep may delete.
+type candidate struct {
+	name string
+	size int64
+}
+
+// liveSet is what the verified superblocks name, per key space. Names are
+// kept apart by space rather than pooled: they are different namespaces
+// (a timestamped pack name, a hex content hash), and pooling them would
+// let a name in one space retain an unrelated object in another.
+type liveSet struct {
+	packs     map[string]struct{}
+	indexes   map[string]struct{}
+	manifests map[string]struct{}
+}
+
+// GC computes (and with o.Delete, removes) unreferenced packs, indexes
+// and manifests.
 func GC(ctx context.Context, o Options) (*Report, error) {
 	if o.Now.IsZero() {
 		o.Now = time.Now()
 	}
 	rep := &Report{}
-	retained, grace, err := retainedSet(ctx, o, rep)
+	live, grace, err := retainedSet(ctx, o, rep)
 	if err != nil {
 		return nil, err
 	}
 	if o.Grace > grace {
 		grace = o.Grace
 	}
-	rep.RetainedPacks = len(retained)
-
-	packs, err := o.Inner.ListDir(ctx, packstore.PackDirKey)
-	if err != nil {
-		return rep, fmt.Errorf("list packs: %w", err)
-	}
+	rep.RetainedPacks = len(live.packs)
+	rep.Indexes.Retained = len(live.indexes)
+	rep.Manifests.Retained = len(live.manifests)
 	cutoff := o.Now.Add(-grace)
-	var candidates []string
-	sizes := make(map[string]int64)
+
+	// Packs report through the flat fields callers already print. Copying
+	// on the way out (rather than at the end) keeps the counts honest on
+	// the error paths too, where a delete may have half finished.
+	var packRep SpaceReport
+	defer func() {
+		rep.ScannedPacks, rep.SkippedYoung = packRep.Scanned, packRep.SkippedYoung
+		rep.Candidates, rep.CandidateBytes = packRep.Candidates, packRep.CandidateBytes
+		rep.Deleted, rep.CandidateNames = packRep.Deleted, packRep.CandidateNames
+	}()
+
+	packCands, err := scanPacks(ctx, o, live.packs, cutoff, &packRep)
+	if err != nil {
+		return rep, err
+	}
+	idxCands, err := scanHashNamed(ctx, o, mpi.Dir, live.indexes, cutoff, &rep.Indexes)
+	if err != nil {
+		return rep, err
+	}
+	manCands, err := scanHashNamed(ctx, o, manifest.Dir, live.manifests, cutoff, &rep.Manifests)
+	if err != nil {
+		return rep, err
+	}
+
+	// Narrow the race window: a fork or publish that landed while we were
+	// scanning could have retained a candidate. Recompute against fresh
+	// heads immediately before acting. (Not needed for correctness — the
+	// age guard already covers coordination-free safety for young objects,
+	// and fork sources are ref-reachable — but it is cheap.) One recompute
+	// covers all three spaces, so the extra key spaces cost no extra ref
+	// fetches.
+	if len(packCands)+len(idxCands)+len(manCands) > 0 {
+		fresh, _, err := retainedSet(ctx, o, &Report{})
+		if err != nil {
+			return rep, fmt.Errorf("re-list before delete: %w", err)
+		}
+		packCands = dropRetained(packCands, fresh.packs)
+		idxCands = dropRetained(idxCands, fresh.indexes)
+		manCands = dropRetained(manCands, fresh.manifests)
+	}
+
+	if err := finish(ctx, o, packstore.PackDirKey, packCands, &packRep); err != nil {
+		return rep, err
+	}
+	if err := finish(ctx, o, mpi.Dir, idxCands, &rep.Indexes); err != nil {
+		return rep, err
+	}
+	if err := finish(ctx, o, manifest.Dir, manCands, &rep.Manifests); err != nil {
+		return rep, err
+	}
+	return rep, nil
+}
+
+// scanPacks selects packs no live superblock names and whose own name
+// dates them past the cutoff.
+func scanPacks(ctx context.Context, o Options, live map[string]struct{}, cutoff time.Time, sp *SpaceReport) ([]candidate, error) {
+	// An absent pack directory is an empty one, as for the derived spaces:
+	// a volume can hold a signed generation and no packs, and a listing
+	// that shows nothing can only make the sweep delete less.
+	packs, err := listDir(ctx, o.Inner, packstore.PackDirKey)
+	if err != nil {
+		return nil, fmt.Errorf("list packs: %w", err)
+	}
+	var cands []candidate
 	for _, p := range packs {
 		if p.IsDir || !strings.HasPrefix(p.Name, "p-") {
 			continue
 		}
-		rep.ScannedPacks++
-		if _, ok := retained[p.Name]; ok {
+		sp.Scanned++
+		if _, ok := live[p.Name]; ok {
 			continue
 		}
 		created, ok := packstore.PackNameTime(p.Name)
 		if !ok || created.After(cutoff) {
 			// Unparseable names are treated as young forever: a pack we
 			// cannot age is a pack we do not delete.
-			rep.SkippedYoung++
+			sp.SkippedYoung++
 			continue
 		}
-		candidates = append(candidates, p.Name)
-		sizes[p.Name] = p.Size
+		cands = append(cands, candidate{name: p.Name, size: p.Size})
 	}
-
-	// Narrow the race window: a fork or publish that landed while we were
-	// scanning could have retained a candidate. Recompute against fresh
-	// heads immediately before acting. (Not needed for correctness — the
-	// age guard already covers coordination-free safety for young packs,
-	// and fork sources are ref-reachable — but it is cheap.)
-	if len(candidates) > 0 {
-		fresh, _, err := retainedSet(ctx, o, &Report{})
-		if err != nil {
-			return rep, fmt.Errorf("re-list before delete: %w", err)
-		}
-		kept := candidates[:0]
-		for _, name := range candidates {
-			if _, ok := fresh[name]; !ok {
-				kept = append(kept, name)
-			}
-		}
-		candidates = kept
-	}
-
-	rep.Candidates = len(candidates)
-	for _, name := range candidates {
-		rep.CandidateBytes += sizes[name]
-	}
-	for _, name := range candidates {
-		if len(rep.CandidateNames) < 20 {
-			rep.CandidateNames = append(rep.CandidateNames, name)
-		}
-		if o.Delete {
-			if err := o.Inner.Delete(ctx, packstore.PackDirKey+"/"+name); err != nil {
-				return rep, fmt.Errorf("delete pack %s: %w", name, err)
-			}
-			rep.Deleted++
-		}
-	}
-	return rep, nil
+	return cands, nil
 }
 
-// retainedSet unions pack lists and grace-young condemned entries across
-// every verified branch head and tag, returning the set and the largest
-// stated grace window. Any unverifiable superblock is a hard error.
-func retainedSet(ctx context.Context, o Options, rep *Report) (map[string]struct{}, time.Duration, error) {
-	retained := make(map[string]struct{})
+// scanHashNamed selects objects in a hash-named key space (indexes,
+// manifests) that no live superblock names and that are older than the
+// cutoff by their mtime. A missing directory is an empty one: neither
+// space exists until something writes to it.
+func scanHashNamed(ctx context.Context, o Options, dir string, live map[string]struct{}, cutoff time.Time, sp *SpaceReport) ([]candidate, error) {
+	entries, err := listDir(ctx, o.Inner, dir)
+	if err != nil {
+		return nil, fmt.Errorf("list %s: %w", dir, err)
+	}
+	var cands []candidate
+	for _, e := range entries {
+		if e.IsDir || !isHashName(e.Name) {
+			// Only content-hash names are ours to delete. A future naming
+			// scheme (tiers, say) lands here as an unrecognized name and
+			// is kept, which is the safe direction to be wrong in.
+			continue
+		}
+		sp.Scanned++
+		if _, ok := live[e.Name]; ok {
+			continue
+		}
+		written, ok := objectTime(ctx, o.Inner, dir+"/"+e.Name, e.Mtime)
+		if !ok || written.After(cutoff) {
+			// No time, or too young: keep. The window between "publish
+			// uploaded its index" and "publish flipped the ref" is exactly
+			// a live object no superblock names yet, and it is only the
+			// age guard that saves it.
+			sp.SkippedYoung++
+			continue
+		}
+		cands = append(cands, candidate{name: e.Name, size: e.Size})
+	}
+	return cands, nil
+}
+
+// objectTime reports when an object was written. It prefers a HEAD to the
+// listing's mtime because a listing may omit the property entirely (the
+// PROPFIND response is the server's choice, not ours) and because a HEAD
+// answers about the object rather than about a directory listing that may
+// be cached; it falls back to the listing when the HEAD gives nothing.
+// The bool is false when neither yields a usable time, which the callers
+// read as "keep it".
+//
+// The round trip is only spent on objects no live superblock names, so it
+// scales with garbage rather than with volume size — which is why the age
+// guard can afford to be per-object here while packs read theirs out of a
+// name.
+func objectTime(ctx context.Context, inner pelicanobj.Store, key string, listed time.Time) (time.Time, bool) {
+	if ki, err := inner.StatKey(ctx, key); err == nil && !ki.Mtime.IsZero() {
+		return ki.Mtime, true
+	}
+	if !listed.IsZero() {
+		return listed, true
+	}
+	return time.Time{}, false
+}
+
+// isHashName reports whether a name is a hex content hash, which is how
+// publish names index and manifest objects.
+func isHashName(name string) bool {
+	if len(name) < 32 {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// dropRetained removes candidates a freshly read superblock now names.
+func dropRetained(cands []candidate, live map[string]struct{}) []candidate {
+	kept := cands[:0]
+	for _, c := range cands {
+		if _, ok := live[c.name]; !ok {
+			kept = append(kept, c)
+		}
+	}
+	return kept
+}
+
+// finish tallies the surviving candidates and, with o.Delete, removes
+// them.
+func finish(ctx context.Context, o Options, dir string, cands []candidate, sp *SpaceReport) error {
+	sp.Candidates = len(cands)
+	for _, c := range cands {
+		sp.CandidateBytes += c.size
+	}
+	for _, c := range cands {
+		if len(sp.CandidateNames) < 20 {
+			sp.CandidateNames = append(sp.CandidateNames, c.name)
+		}
+		if o.Delete {
+			if err := o.Inner.Delete(ctx, dir+"/"+c.name); err != nil {
+				return fmt.Errorf("delete %s/%s: %w", dir, c.name, err)
+			}
+			sp.Deleted++
+		}
+	}
+	return nil
+}
+
+// retainedSet unions pack lists, grace-young condemned entries and index
+// refs across every verified branch head and tag, returning the live set
+// and the largest stated grace window. Any unverifiable superblock is a
+// hard error.
+func retainedSet(ctx context.Context, o Options, rep *Report) (*liveSet, time.Duration, error) {
+	live := &liveSet{
+		packs:     make(map[string]struct{}),
+		indexes:   make(map[string]struct{}),
+		manifests: make(map[string]struct{}),
+	}
 	grace := DefaultGrace
 
 	absorb := func(sb *superblock.Superblock) {
 		for _, pe := range sb.PackList {
-			retained[pe.Name] = struct{}{}
+			live.packs[pe.Name] = struct{}{}
 		}
+		// Every generation still reachable — the head AND every tag —
+		// keeps its indexes, so an index the head has consolidated past
+		// stays alive as long as something still names it.
+		for _, ix := range sb.PackIndexes {
+			live.indexes[ix.Name] = struct{}{}
+		}
+		// Manifests have no superblock field yet: nothing writes them, so
+		// the live set is empty and an unreferenced manifest is swept on
+		// the age guard alone, exactly like an unreferenced index. When
+		// the pack list does move out of the superblock (design-packfs
+		// "The pack list moves out of the superblock"), absorb its refs
+		// here — TestManifestRefsWouldNeedAbsorbing fails until someone
+		// does.
 		if g := time.Duration(sb.Params.TGraceSeconds) * time.Second; g > grace {
 			grace = g
 		}
 		for _, c := range sb.Condemned {
 			if o.Now.Sub(time.Unix(c.CondemnedAtUnix, 0)) < grace {
-				retained[c.Name] = struct{}{}
+				live.packs[c.Name] = struct{}{}
 			}
 		}
 	}
@@ -180,15 +394,25 @@ func retainedSet(ctx context.Context, o Options, rep *Report) (map[string]struct
 	if rep.Branches+rep.Tags == 0 {
 		return nil, 0, fmt.Errorf("gc aborted: no refs or tags found (a v2 volume always has at least one branch; refusing to treat every pack as garbage)")
 	}
-	return retained, grace, nil
+	return live, grace, nil
 }
 
-func listNames(ctx context.Context, inner pelicanobj.Store, dir string) ([]string, error) {
+// listDir lists a key-space directory, treating an absent one as empty:
+// the derived key spaces do not exist until something writes to them.
+func listDir(ctx context.Context, inner pelicanobj.Store, dir string) ([]pelicanobj.DirEntry, error) {
 	entries, err := inner.ListDir(ctx, dir)
 	if err != nil {
 		if strings.Contains(err.Error(), "404") || strings.Contains(err.Error(), "not exist") {
-			return nil, nil // directory absent = empty
+			return nil, nil
 		}
+		return nil, err
+	}
+	return entries, nil
+}
+
+func listNames(ctx context.Context, inner pelicanobj.Store, dir string) ([]string, error) {
+	entries, err := listDir(ctx, inner, dir)
+	if err != nil {
 		return nil, err
 	}
 	var names []string

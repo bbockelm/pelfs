@@ -414,7 +414,7 @@ func Publish(ctx context.Context, o Options) (*Result, error) {
 	// its tail", exactly the documented fall-back-a-step behavior. Stored
 	// raw (uncompressed, unencrypted): rescue must read it before holding
 	// any keys, and the KEK-wrapped key table is harmless to expose.
-	_, bkRaw, err := p.buildSuperblock(p.pk.sealedSoFar(), shards, rootID, mpi.Ref{})
+	_, bkRaw, err := p.buildSuperblock(p.pk.sealedSoFar(), shards, rootID, p.prevPackIndexes())
 	if err != nil {
 		return nil, err
 	}
@@ -430,7 +430,7 @@ func Publish(ctx context.Context, o Options) (*Result, error) {
 	// After the last cut, because an entry is attributed to a pack only
 	// once that pack has a name; before the flip, because a reader that
 	// sees the new generation must be able to fetch what it names.
-	sb, raw, err := p.buildSuperblock(newPacks, shards, rootID, p.publishPackIndex(ctx))
+	sb, raw, err := p.buildSuperblock(newPacks, shards, rootID, p.sealPackIndexes(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -1384,11 +1384,9 @@ func encodeCatalog(cw catalog.Builder, hasher chunkid.Hasher, dek []byte) (chunk
 	return id, stored, nil
 }
 
-func (p *pipeline) buildSuperblock(newPacks []packstore.SealedPack, shards []superblock.ShardEntry, rootID chunkid.Identity, packIndex mpi.Ref) (*superblock.Superblock, []byte, error) {
-	var prevIndexes []mpi.Ref
+func (p *pipeline) buildSuperblock(newPacks []packstore.SealedPack, shards []superblock.ShardEntry, rootID chunkid.Identity, packIndexes []mpi.Ref) (*superblock.Superblock, []byte, error) {
 	var packList []superblock.PackEntry
 	if p.o.Prev != nil {
-		prevIndexes = p.o.Prev.PackIndexes
 		// Carry the previous generation's whole pack set forward; trimming
 		// dead packs is repack's job, not publish's.
 		//
@@ -1432,7 +1430,7 @@ func (p *pipeline) buildSuperblock(newPacks []packstore.SealedPack, shards []sup
 		Shards:          shards,
 		NextInode:       nextInode,
 		Catalogs:        p.catalogList(),
-		PackIndexes:     packIndexList(prevIndexes, packIndex),
+		PackIndexes:     packIndexes,
 		Params: superblock.Params{
 			SMaxBytes:     p.o.SMax,
 			SMinBytes:     catalog.SMin,

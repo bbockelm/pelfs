@@ -36,14 +36,24 @@ type countingStore struct {
 	// is how a test asks what a publish does when a write it does not
 	// depend on does not land.
 	failPuts atomic.Value
+	// failGets is the same question for reads a publish does not depend
+	// on — fetching the indexes it means to consolidate, say.
+	failGets atomic.Value
 }
 
 func (c *countingStore) Get(ctx context.Context, key string, off, limit int64) (io.ReadCloser, error) {
+	if p, _ := c.failGets.Load().(string); p != "" && strings.HasPrefix(key, p) {
+		return nil, fmt.Errorf("countingStore: refusing to read %s", key)
+	}
 	if strings.HasPrefix(key, packstore.PackDirKey+"/") {
 		c.packGets.Add(1)
 	}
 	return c.Store.Get(ctx, key, off, limit)
 }
+
+// failGetPrefix makes every subsequent Get under prefix fail; "" restores
+// the store.
+func (c *countingStore) failGetPrefix(prefix string) { c.failGets.Store(prefix) }
 
 // failPutPrefix makes every subsequent Put under prefix fail; "" restores
 // the store.

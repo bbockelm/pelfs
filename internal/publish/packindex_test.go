@@ -8,6 +8,7 @@ import (
 	"github.com/bbockelm/pelfs/internal/mpi"
 	"github.com/bbockelm/pelfs/internal/packstore"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
+	"github.com/bbockelm/pelfs/internal/publish"
 	"github.com/bbockelm/pelfs/internal/superblock"
 )
 
@@ -48,8 +49,9 @@ func TestPublishEmitsAnIndexOverItsOwnPacks(t *testing.T) {
 	res := v.checkpoint()
 	sb := res.Superblock
 
-	// Generation 0 published one of its own, so this generation lists it
-	// and the one this seal wrote.
+	// The newest ref is the one this seal wrote — or, once consolidation
+	// folds it together with generation 0's, the one that replaced them
+	// both, which is why the pack count is a floor rather than an equality.
 	if len(sb.PackIndexes) < 1 {
 		t.Fatal("a seal that cut packs listed no index")
 	}
@@ -57,7 +59,7 @@ func TestPublishEmitsAnIndexOverItsOwnPacks(t *testing.T) {
 	if ref.Name == "" || ref.Entries == 0 || ref.Size == 0 {
 		t.Fatalf("the index ref says nothing useful: %+v", ref)
 	}
-	if int(ref.Packs) != len(res.NewPacks) {
+	if int(ref.Packs) < len(res.NewPacks) {
 		t.Errorf("the index covers %d pack(s); this seal cut %d", ref.Packs, len(res.NewPacks))
 	}
 
@@ -93,11 +95,14 @@ func TestPublishEmitsAnIndexOverItsOwnPacks(t *testing.T) {
 	}
 }
 
-// Carrying the previous generation's refs forward is the same rule as the
-// pack list, for the same reason: the packs a carried index covers are the
-// packs this generation carried forward, so dropping the index would leave
-// most of the volume unindexed — silently, and permanently, because
+// Carrying the previous generation's coverage forward is the same rule as
+// the pack list, for the same reason: the packs a carried index covers are
+// the packs this generation carried forward, so losing that coverage would
+// leave most of the volume unindexed — silently, and permanently, because
 // nothing rebuilds an index that was merely forgotten.
+//
+// The carrying is by COVERAGE rather than by ref, since consolidation
+// folds small refs into one and lists that instead (see indextiers_test).
 func TestPublishCarriesPreviousIndexesForward(t *testing.T) {
 	v := newReuseVol(t, [16]byte{0x11, 0xd0, 0x02})
 	v.reuseTree(5)
@@ -110,34 +115,30 @@ func TestPublishCarriesPreviousIndexesForward(t *testing.T) {
 	v.create(publishRootInode, "later.bin", pseudorandom(300<<10, 9))
 	second := v.checkpoint()
 	got := second.Superblock.PackIndexes
-	if len(got) != len(firstRefs)+1 {
-		t.Fatalf("the second generation lists %d index(es), the first listed %d: refs are being dropped or duplicated",
-			len(got), len(firstRefs))
+	if len(got) == 0 {
+		t.Fatal("the second generation lists no index at all")
 	}
-	for i, want := range firstRefs {
-		if got[i] != want {
-			t.Errorf("carried ref %d came back as %+v, want %+v", i, got[i], want)
+	// Every carried ref names an object that fetches and verifies — a ref
+	// pointing at nothing is worse than no ref, since a reader pays a round
+	// trip to learn it.
+	carriesForward := func(res *publish.Result, prev []mpi.Ref) {
+		t.Helper()
+		set := indexSet(t, v.inner, res.Superblock.PackIndexes)
+		for _, ref := range prev {
+			fetchIndex(t, v.inner, ref).Each(func(key []byte, packs []string) {
+				if _, ok := set.Lookup(idOf(key)); !ok {
+					t.Fatalf("generation %d dropped %x, which %s answered with %v",
+						res.Superblock.Generation, key, ref.Name[:12], packs)
+				}
+			})
 		}
 	}
-	// And every carried ref still names an object that fetches and
-	// verifies — a ref pointing at nothing is worse than no ref, since a
-	// reader pays a round trip to learn it.
-	for _, ref := range got {
-		fetchIndex(t, v.inner, ref)
-	}
+	carriesForward(second, firstRefs)
 
 	// A seal that changes nothing still cuts one pack (its own superblock
-	// backup), so it emits an index for it and carries the rest.
+	// backup), so it emits an index for it and keeps the rest's coverage.
 	third := v.checkpoint()
-	if len(third.Superblock.PackIndexes) < len(got) {
-		t.Errorf("a no-op seal lost indexes: %d, was %d", len(third.Superblock.PackIndexes), len(got))
-	}
-	for i, want := range got {
-		if third.Superblock.PackIndexes[i] != want {
-			t.Errorf("a no-op seal rewrote carried ref %d: %+v, want %+v",
-				i, third.Superblock.PackIndexes[i], want)
-		}
-	}
+	carriesForward(third, got)
 }
 
 // The index is derived: publish must be able to write it, but a generation

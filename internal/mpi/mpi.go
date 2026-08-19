@@ -204,24 +204,34 @@ func (ix *Index) names(off uint32) ([]string, bool) {
 // Len is the number of entries.
 func (ix *Index) Len() int { return ix.table.Len() }
 
+// Each visits every entry in key order: the truncated key, and the packs
+// it names. It walks the table in place rather than materializing it, so
+// a caller can check that a merged index still answers for everything its
+// inputs did without holding either of them.
+func (ix *Index) Each(fn func(key []byte, packs []string)) {
+	for i := 0; i < ix.table.Len(); i++ {
+		k, v := ix.table.At(i)
+		names, ok := ix.names(binary.LittleEndian.Uint32(v))
+		if !ok {
+			continue
+		}
+		fn(k, names)
+	}
+}
+
 // Packs are the packs this index names, which is what a retention sweep
 // compares against the live set to decide whether to keep it.
 func (ix *Index) Packs() []string {
 	seen := map[string]struct{}{}
 	var out []string
-	for i := 0; i < ix.table.Len(); i++ {
-		_, v := ix.table.At(i)
-		names, ok := ix.names(binary.LittleEndian.Uint32(v))
-		if !ok {
-			continue
-		}
+	ix.Each(func(_ []byte, names []string) {
 		for _, p := range names {
 			if _, dup := seen[p]; !dup {
 				seen[p] = struct{}{}
 				out = append(out, p)
 			}
 		}
-	}
+	})
 	sort.Strings(out)
 	return out
 }

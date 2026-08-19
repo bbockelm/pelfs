@@ -14,6 +14,7 @@ pelfs umount pelican://.../scratch                         # stop it cleanly
 pelfs status                                               # list background mounts
 pelfs gc     [--delete] pelican://.../scratch              # sweep unreferenced packs
 pelfs fsck   [--deep] pelican://.../scratch                # verify a generation
+pelfs repack-plan pelican://.../scratch                    # what a repack would rewrite
 ```
 
 `shell` mounts the filesystem on a temporary mountpoint and drops you into a

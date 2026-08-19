@@ -9,6 +9,7 @@
 //	pelfs status                     list background mounts
 //	pelfs gc     [--delete] <prefix> find (remove) unreferenced pack objects
 //	pelfs fsck   <prefix>            verify a published generation
+//	pelfs repack-plan <prefix>       report what a repack would rewrite
 package main
 
 import (
@@ -47,6 +48,8 @@ func main() {
 		code = cmdMountGen(os.Args[2:])
 	case "fsck":
 		code = cmdFsck(os.Args[2:])
+	case "repack-plan":
+		code = cmdRepackPlan(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -76,6 +79,8 @@ Usage:
   pelfs ctl    <prefix-or-mountpoint> <verb>              control a running mount
                                                           (status|stats|publish|bugreport)
   pelfs fsck   [flags] [--deep] <prefix>                  verify a published generation
+  pelfs repack-plan [flags] <prefix>                      report what a repack would
+                                                          rewrite, and what it would cost
 
 Common flags:
 `)

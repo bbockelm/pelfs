@@ -539,3 +539,209 @@ func publishManifestHead(t *testing.T, rs *refs.Store, priv ed25519.PrivateKey, 
 		t.Fatalf("flip: %v", err)
 	}
 }
+
+// flipHead signs sb and makes it the branch head, for the tests that need
+// to shape a superblock publishHead's parameters do not cover.
+func flipHead(t *testing.T, rs *refs.Store, priv ed25519.PrivateKey, sb *superblock.Superblock, etag string) []byte {
+	t.Helper()
+	if err := sb.Sign(priv); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := sb.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rs.Flip(context.Background(), "main", raw, etag); err != nil {
+		t.Fatalf("flip gen %d: %v", sb.Generation, err)
+	}
+	return raw
+}
+
+// A consolidated-away index is named only by a generation the sweep
+// cannot enumerate, so the ledger is the only thing standing between it
+// and deletion. Inside the window it survives; past the window publish
+// has already stopped carrying the entry, and it sweeps like any other
+// orphan — which is the limit, not an oversight.
+func TestGCKeepsACondemnedIndexInsideTheWindow(t *testing.T) {
+	inner, root := newInner(t)
+	ctx := context.Background()
+	_, priv, _ := ed25519.GenerateKey(nil)
+	rs, err := refs.New(inner, t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	old := now.Add(-100 * time.Hour) // past the 72h default grace
+
+	ixHead := hashName('a')      // listed by the head -> kept
+	ixCondemned := hashName('b') // merged away an hour ago -> kept by the ledger
+	ixAgedOut := hashName('c')   // merged away 200h ago -> the entry is gone, so swept
+	ixOrphan := hashName('d')    // never named -> swept
+	for _, n := range []string{ixHead, ixCondemned, ixAgedOut, ixOrphan} {
+		putObj(t, inner, mpi.Dir+"/"+n, 64)
+		// Every object predates the window, so only liveness can save one.
+		age(t, root, mpi.Dir+"/"+n, old)
+	}
+
+	// The shape a seal leaves behind: one listed index, and a ledger of
+	// what consolidation stopped listing. The aged-out entry is written
+	// here anyway — publish would have dropped it, and a sweep must not
+	// honour it either way.
+	flipHead(t, rs, priv, &superblock.Superblock{
+		FormatVersion:   superblock.FormatV2,
+		Generation:      1,
+		CreatedUnixNano: 1,
+		PackIndexes:     []superblock.IndexRef{{Name: ixHead, Size: 1, Entries: 1, Packs: 1}},
+		CondemnedIndexes: []superblock.CondemnedRef{
+			{Name: ixCondemned, CondemnedAtUnix: now.Add(-1 * time.Hour).Unix()},
+			{Name: ixAgedOut, CondemnedAtUnix: now.Add(-200 * time.Hour).Unix()},
+		},
+	}, "")
+
+	rep, err := GC(ctx, Options{Inner: inner, Refs: rs, Delete: true, Now: now})
+	if err != nil {
+		t.Fatalf("GC: %v", err)
+	}
+	for _, want := range []struct {
+		name string
+		live bool
+	}{{ixHead, true}, {ixCondemned, true}, {ixAgedOut, false}, {ixOrphan, false}} {
+		if got := alive(t, inner, mpi.Dir+"/"+want.name); got != want.live {
+			t.Errorf("index %s...: alive=%v, want %v", want.name[:8], got, want.live)
+		}
+	}
+	if rep.Indexes.Retained != 2 || rep.Indexes.Deleted != 2 {
+		t.Errorf("Indexes = %+v, want Retained=2 Deleted=2", rep.Indexes)
+	}
+}
+
+// The manifest case, and the reason it needed this more than the index
+// did: a retired generation's manifest IS its pack list, so the test
+// asserts the consequence rather than the file. Inside the window that
+// generation still RESOLVES — same code path the sweep and a mount use —
+// and its packs are still there. Past the window it does not, which is
+// the honest limit of a ledger that ages.
+func TestACondemnedManifestKeepsARetiredGenerationReadable(t *testing.T) {
+	inner, root := newInner(t)
+	ctx := context.Background()
+	_, priv, _ := ed25519.GenerateKey(nil)
+	rs, err := refs.New(inner, t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	old := now.Add(-100 * time.Hour)
+
+	retiredPack := packName(old, "aaaa") // named by the retired generation
+	newPack := packName(old, "bbbb")     // added by the head
+	putPack(t, inner, retiredPack, 100)
+	putPack(t, inner, newPack, 100)
+
+	// The segment the retired generation names, the one a later seal
+	// merged it into, and a third that was condemned long enough ago that
+	// publish would have stopped carrying it.
+	retired := putManifest(t, inner, retiredPack)
+	merged := putManifest(t, inner, retiredPack, newPack)
+	agedOut := putManifest(t, inner, newPack)
+	for _, ref := range []superblock.ManifestRef{retired, merged, agedOut} {
+		age(t, root, manifest.Dir+"/"+ref.Name, old)
+	}
+
+	// Generation 0 is retired: reachable only by hash, so the sweep never
+	// sees it. Nothing but the head's ledger speaks for its manifest.
+	retiredSB := &superblock.Superblock{
+		FormatVersion: superblock.FormatV2, Generation: 0, CreatedUnixNano: 1,
+		Manifests: []superblock.ManifestRef{retired},
+	}
+	if err := retiredSB.Sign(priv); err != nil {
+		t.Fatal(err)
+	}
+	flipHead(t, rs, priv, &superblock.Superblock{
+		FormatVersion:   superblock.FormatV2,
+		Generation:      1,
+		CreatedUnixNano: 2,
+		Manifests:       []superblock.ManifestRef{merged},
+		CondemnedManifests: []superblock.CondemnedRef{
+			{Name: retired.Name, CondemnedAtUnix: now.Add(-1 * time.Hour).Unix()},
+			{Name: agedOut.Name, CondemnedAtUnix: now.Add(-200 * time.Hour).Unix()},
+		},
+	}, "")
+
+	if _, err := GC(ctx, Options{Inner: inner, Refs: rs, Delete: true, Now: now}); err != nil {
+		t.Fatalf("GC: %v", err)
+	}
+
+	// The consequence, not the object: the retired generation can still
+	// state what it references.
+	packs, err := manifest.Packs(ctx, inner, retiredSB)
+	if err != nil {
+		t.Fatalf("a generation inside the grace window can no longer resolve its pack set: %v", err)
+	}
+	if len(packs) != 1 || packs[0].Name != retiredPack {
+		t.Fatalf("the retired generation resolved to %+v, want just %s", packs, retiredPack)
+	}
+	if !alive(t, inner, packstore.PackDirKey+"/"+retiredPack) {
+		t.Error("the pack that generation names was deleted")
+	}
+	if !alive(t, inner, manifest.Dir+"/"+merged.Name) {
+		t.Error("the head's own manifest was swept")
+	}
+
+	// And the limit, asserted rather than implied: once the entry ages off
+	// the ledger, the object goes and a generation naming it is finished.
+	if alive(t, inner, manifest.Dir+"/"+agedOut.Name) {
+		t.Fatal("a manifest condemned 200h ago survived a 72h grace window")
+	}
+	lost := &superblock.Superblock{
+		FormatVersion: superblock.FormatV2, Generation: 0, CreatedUnixNano: 1,
+		Manifests: []superblock.ManifestRef{agedOut},
+	}
+	if _, err := manifest.Packs(ctx, inner, lost); err == nil {
+		t.Error("a generation whose manifest aged out of the ledger still resolved; the fixture proves nothing")
+	}
+}
+
+// A superblock written before the ledgers existed carries neither field.
+// It must decode, verify and sweep exactly as it always did — the sweep
+// reads the ledgers unconditionally, so a nil one has to mean "condemns
+// nothing" rather than "unknown".
+func TestGCSweepsASuperblockWithNoCondemnedRefs(t *testing.T) {
+	inner, root := newInner(t)
+	ctx := context.Background()
+	_, priv, _ := ed25519.GenerateKey(nil)
+	rs, err := refs.New(inner, t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	old := now.Add(-100 * time.Hour)
+
+	ixLive := hashName('a')
+	ixOrphan := hashName('b')
+	for _, n := range []string{ixLive, ixOrphan} {
+		putObj(t, inner, mpi.Dir+"/"+n, 64)
+		age(t, root, mpi.Dir+"/"+n, old)
+	}
+	raw := publishHead(t, rs, priv, 0, nil, "", nil, nil, ixLive)
+	pre, err := superblock.Decode(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pre.CondemnedIndexes != nil || pre.CondemnedManifests != nil {
+		t.Fatalf("the pre-ledger fixture is not one: %+v / %+v", pre.CondemnedIndexes, pre.CondemnedManifests)
+	}
+
+	rep, err := GC(ctx, Options{Inner: inner, Refs: rs, Delete: true, Now: now})
+	if err != nil {
+		t.Fatalf("GC on a pre-ledger superblock: %v", err)
+	}
+	if !alive(t, inner, mpi.Dir+"/"+ixLive) {
+		t.Error("swept an index the head lists")
+	}
+	if alive(t, inner, mpi.Dir+"/"+ixOrphan) {
+		t.Error("an empty ledger stopped the sweep deleting an orphan")
+	}
+	if rep.Indexes.Deleted != 1 {
+		t.Errorf("Indexes = %+v, want exactly one deleted", rep.Indexes)
+	}
+}

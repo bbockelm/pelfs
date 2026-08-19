@@ -116,6 +116,35 @@ type CondemnedPack struct {
 	CondemnedAtUnix int64  `cbor:"condemned_at_unix"`
 }
 
+// CondemnedRef is CondemnedPack for the DERIVED key spaces: a pack index
+// (internal/mpi) or a pack manifest (internal/manifest) that a generation
+// stopped listing, and when it stopped. Same two columns, same lifecycle
+// — publish carries an entry forward until it ages past
+// Params.TGraceSeconds, GC counts a young entry as live — because it is
+// the same problem. Consolidation merges several refs into one and simply
+// stops naming the inputs; the generation that still names them is
+// retired, and a retired generation is addressable only by hash, so
+// NOTHING A SWEEP CAN ENUMERATE speaks for those objects. Without a
+// ledger they are deleted the moment they age.
+//
+// The cost of losing one is not symmetric, which is why this arrived when
+// manifests did. An index is derived from a pack set stated elsewhere, so
+// a reader pinned to that generation falls back to pack trailers and is
+// slow. A manifest IS that statement, so the generation can no longer say
+// what packs it references: unreadable, and the packs it alone named go
+// on the sweep after.
+//
+// THE LIMIT, stated here because this narrows the hole rather than
+// closing it: the window is T_grace, not forever. A reader pinned to a
+// generation whose refs were condemned longer ago than that still loses
+// them, with exactly the consequences above. Retention's live set is
+// head-plus-tags and no ledger changes that — a workflow that needs a
+// longer pin must TAG, which pins exactly and indefinitely.
+type CondemnedRef struct {
+	Name            string `cbor:"name"`
+	CondemnedAtUnix int64  `cbor:"condemned_at_unix"`
+}
+
 // ShardEntry routes one inode-range shard holding promoted (nlink > 1)
 // records. Ranges are inclusive and must not overlap; the shard body is
 // the content-addressed blob named by Identity.
@@ -262,8 +291,10 @@ type Superblock struct {
 	//
 	// Publish carries the previous generation's refs forward alongside its
 	// own, the way PackList is carried, so an index a live generation
-	// names stays live. Consolidating and retiring them is repack's job
-	// and is not implemented yet.
+	// names stays live. A seal also CONSOLIDATES the newest of them into
+	// one, which drops the inputs off this list — see CondemnedIndexes for
+	// what keeps those objects alive afterwards. Retiring an index whose
+	// packs are mostly gone is repack's job and is not implemented yet.
 	PackIndexes []IndexRef `cbor:"pack_indexes,omitempty"`
 	// Manifests names the segments of this generation's pack manifest:
 	// objects under manifest.Dir holding what PackList used to hold —
@@ -302,6 +333,34 @@ type Superblock struct {
 	// is the one-way door in this change, and it is written here because
 	// this is the struct someone reads when they hit it.
 	Manifests []ManifestRef `cbor:"manifests,omitempty"`
+	// CondemnedIndexes and CondemnedManifests are the derived key spaces'
+	// ledgers: refs this generation STOPPED listing, with when it stopped,
+	// so retention keeps those objects for the grace window instead of
+	// deleting them the moment nothing addressable names them
+	// (CondemnedRef; docs/design-packfs.md, "Retention and GC").
+	//
+	// Two things get recorded here. Consolidation's inputs, which a seal
+	// merges into one ref and then stops naming. And the superblock
+	// BACKUP's in-flight manifest segment: the backup rides in the last
+	// pack and so must state its pack set before the seal finishes, and
+	// the final superblock supersedes that segment the instant it lands.
+	// Neither is deleted by publish — retention decides that, and these
+	// are what it decides it from.
+	//
+	// Both omitempty, per the evolution rule above, and purely additive: a
+	// superblock written before these existed decodes with empty ledgers
+	// and sweeps exactly as it always did.
+	//
+	// The cost to know about: unlike the pack ledger, whose entries a
+	// repack produces rarely, a consolidating seal condemns a ref or two
+	// EVERY time, and names here are 64-character content hashes. A mount
+	// checkpointing every few minutes therefore carries a few thousand
+	// entries — low hundreds of KB — for T_grace before they age off. That
+	// is a fraction of the inline pack list this design removed, and the
+	// alternative is deleting objects live generations still need, but it
+	// is the reason to keep T_grace honest rather than generous.
+	CondemnedIndexes   []CondemnedRef `cbor:"condemned_indexes,omitempty"`
+	CondemnedManifests []CondemnedRef `cbor:"condemned_manifests,omitempty"`
 
 	// SigningPub is informational — it names the key that produced
 	// Signature so tooling can report custody, but Verify never trusts it

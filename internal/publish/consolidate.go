@@ -28,19 +28,43 @@ type sizedRef interface {
 	RefSize() int64
 }
 
-// refTargetBytes is the size consolidation aims a merged object at.
+// refTargetBytes is the LARGEST object consolidation will build, and so
+// the most a single seal can be asked to download and upload per key
+// space. Tiers grow geometrically up to it and freeze there.
 //
-// It is the pack cut for a reason: an index or a manifest is fetched
-// WHOLE today, so its size is what consulting it costs, and holding it
-// near a pack keeps that comparable to fetching one pack. When these are
-// read through ranged windows instead, this is the number that should
-// grow.
-const refTargetBytes = 2 << 20
+// It is not the pack cut any more, and the reason it was — an index is
+// fetched WHOLE today, so its size is what consulting it costs — turns
+// out not to argue for small tiers at all: a mount fetches EVERY ref it
+// is listed, so the bytes it moves are the whole index set however that
+// set is cut up. What tiering changes is the number of round trips, and
+// there a large tier is strictly better.
+//
+// What the ceiling is really set by is the seal, in two ways. It is what
+// one seal may spend on a merge it did not ask for, and — until the
+// upload path streams — it is also the seal's peak memory, because
+// publish hashes and uploads a []byte (mergeIndexes, mergeManifests) even
+// though mpi.MergeTo and manifest.MergeTo can now spool. 64 MiB keeps
+// both of those in the range a seal already works in. Wiring the upload
+// through a spool file is what would let this grow, and with it the
+// frozen tail below.
+const refTargetBytes = 64 << 20
 
-// refMergeMaxInput is the largest ref consolidation will fold in: past
-// half the target a ref counts as a large tier rather than a small one
-// waiting to be absorbed. Half, so that two candidates always still fit.
-const refMergeMaxInput = refTargetBytes / 2
+// refTierBase is the size below which refs are dust: a run summing to
+// within it merges unconditionally, without waiting for the balance rule.
+//
+// Without a floor the rule below turns a volume's first hundred small
+// generations into a binary counter — several refs where one would do,
+// each of them kilobytes, which is round trips spent on nothing. With a
+// floor a volume whose whole index fits in one keeps the single-ref
+// behaviour it has today, and geometry starts where the sizes do.
+//
+// The floor is NOT free, and its cost is why it is 256 KiB rather than
+// the 2 MiB the old target was. Inside it the old policy is still in
+// force: every seal re-merges the whole run, so each byte below the floor
+// is rewritten about (floor / generation) times. Measured over 25,600
+// generations, a 2 MiB floor moved 59 GiB and a 256 KiB floor 19.5 GiB
+// for exactly the same ref counts (TestRefCountGrowsWithTheLogOfVolumeSize).
+const refTierBase = 256 << 10
 
 // consolidate merges the newest refs into one and returns the list the
 // superblock should record — refs it merged are simply no longer listed.
@@ -50,33 +74,54 @@ const refMergeMaxInput = refTargetBytes / 2
 // drops; deleting them here would break a generation that is still
 // perfectly live.
 //
-// BOUNDING THE WORK. A small generation must never pay a large re-upload
-// to tidy the list, so the rule is stated as what it refuses to do:
+// THE RULE, which is one sentence and three guards. Scanning from the
+// NEWEST ref backwards, a seal takes refs while:
 //
-//   - It refuses to touch a ref that is already large — past half the
-//     target. Absorbing a 4 KiB generation into a 2 MiB tier would
-//     re-download and re-upload 2 MiB to save one round trip, and a
-//     checkpointing mount would pay that every few minutes forever. The
-//     scan STOPS at such a ref rather than skipping past it.
-//   - It refuses to produce an object past the target. Inputs are taken
-//     newest-first only while their sizes sum to within it, and that sum
-//     is an upper bound on the result: a merge's keys are the union of
-//     its inputs' and its values a subset of theirs.
-//   - It refuses to merge anything but a SUFFIX of the list. Lookups are
-//     newest-wins in both key spaces (mpi.Set, manifest.Set), so a merge
-//     that reached past a ref would move older answers ahead of newer
-//     ones.
+//   - The older ref weighs NO MORE than everything newer than it in the
+//     scan already does. That is the tiering rule and the whole of it: a
+//     ref is only worth rewriting once the refs behind it are worth as
+//     much as it is. It leaves every surviving ref at least as large as
+//     the sum of all newer ones, so sizes at least DOUBLE from the newest
+//     end and the list is logarithmic in the volume rather than linear.
+//     Dust is exempt — a run summing to within refTierBase merges
+//     regardless, so a small volume still lists one ref.
+//   - The sum stays within refTargetBytes. That sum is an upper bound on
+//     the result: a merge's keys are the union of its inputs' and its
+//     values a subset of theirs.
+//   - The ref's size is KNOWN. A sizeless ref stops the scan, since the
+//     one thing this decides on is cost.
 //
-// So a seal downloads at most one target's worth — in parallel, one round
-// trip of latency — and uploads at most one more, per key space. That is
-// the cost a seal pays to tidy up after itself, and it is why the bound
-// is stated in bytes rather than in refs.
+// And it merges only a SUFFIX of the list, which is not policy but
+// correctness: lookups are newest-wins in both key spaces (mpi.Set,
+// manifest.Set), so a merge that reached past a ref would move older
+// answers ahead of newer ones — a resolvable identity pointing at a
+// swept pack.
 //
-// What this does NOT do: grow tiers geometrically. Once a ref reaches the
-// target it is frozen here, so the list stops growing with the number of
-// GENERATIONS and starts growing with the volume's size instead. Merging
-// those into larger tiers means a merge that outgrows memory, which wants
-// the spooling encoder neither mpi.Merge nor manifest.Merge has.
+// WHAT ONE SEAL PAYS, worst case: refTargetBytes downloaded — in
+// parallel, one round trip of latency — and at most refTargetBytes
+// uploaded, per key space, and it holds the merged object in memory
+// while doing it. That worst case is rare by construction: a merge that
+// large only happens when the refs behind a ceiling-sized tier have
+// themselves grown to a ceiling's worth, which is once per refTargetBytes
+// of index the volume writes. The steady state is a few kilobytes.
+//
+// Fewer refs did NOT have to mean more work, but it easily could have:
+// merging more means rewriting more. It does not here because the rule it
+// replaced spent most of its bytes below the target rather than above it
+// — re-merging the same sub-megabyte run on every seal until it froze.
+// Geometry rewrites each byte once per tier it climbs, about
+// log2(ceiling/floor) times in total, which measures out LOWER: 19.5 GiB
+// moved against 27.9 GiB over the same 25,600 generations, for 60x fewer
+// refs.
+//
+// What this does NOT do: keep the list logarithmic past the ceiling. A
+// ref that reaches refTargetBytes is frozen exactly as before, so a
+// volume larger than about a hundred million objects goes back to one ref
+// per ceiling — 25 of them at 1.6 GB of index, against the ~1,600 the old
+// rule left. Removing that last linear term means either a merge bigger
+// than a seal should perform inline (which wants a background compactor,
+// not a bigger constant) or an upload path that streams from a spool
+// rather than a []byte.
 func consolidate[T sizedRef](ctx context.Context, refs []T, what string, merge func(context.Context, []T) (T, error)) []T {
 	start := mergeableSuffix(refs)
 	if len(refs)-start < 2 {
@@ -98,16 +143,26 @@ func consolidate[T sizedRef](ctx context.Context, refs []T, what string, merge f
 }
 
 // mergeableSuffix is where the refs worth merging start: the newest run
-// that is all small and sums to within the target. It reads sizes alone,
-// so the decision costs nothing — the fetch only happens once the answer
-// says two or more refs are worth it.
+// the tiering rule accepts. It reads sizes alone, so the decision costs
+// nothing — the fetch only happens once the answer says two or more refs
+// are worth it.
+//
+// The scan runs newest-first because that is the only end a merge may
+// start from, and total is what the refs newer than refs[i] weigh.
 func mergeableSuffix[T sizedRef](refs []T) int {
 	start, total := len(refs), int64(0)
 	for i := len(refs) - 1; i >= 0; i-- {
-		if size := refs[i].RefSize(); size <= 0 || size > refMergeMaxInput || total+size > refTargetBytes {
+		size := refs[i].RefSize()
+		if size <= 0 || total+size > refTargetBytes {
 			break
 		}
-		total += refs[i].RefSize()
+		// The newest ref has nothing behind it to be balanced against, so it
+		// joins unconditionally; every older one must be worth no more than
+		// what the scan has already picked up, or be dust.
+		if i < len(refs)-1 && size > total && total+size > refTierBase {
+			break
+		}
+		total += size
 		start = i
 	}
 	return start

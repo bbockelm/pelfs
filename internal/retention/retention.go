@@ -27,22 +27,27 @@
 // time cannot be established is KEPT — keeping garbage costs bytes,
 // deleting a live index costs a mount.
 //
-// The limit to admit, on both: "live" here means named by a branch
-// HEAD or a tag, which is all a sweep can enumerate — a retired
-// generation is not addressable, only hashed. So an index that only an
-// older generation inside the retain window still names — one
-// consolidation merged away and the head therefore stopped listing — is
-// swept once its object ages past the window, though a reader pinned to
-// that generation would still have used it. For an index the cost is
-// bounded and known: it is DERIVED, so that reader falls back to pack
-// trailers and is slow rather than broken. FOR A MANIFEST IT IS NOT — the
-// manifest is that generation's pack list, so sweeping one leaves the
-// generation unreadable, and the packs it alone named go on the sweep
-// after. Nothing addressable is harmed either way (the head and every tag
-// name their own), but the difference is why the ledger this wants —
-// consolidation recording the refs it dropped, with a timestamp, the way
-// repack records condemned packs — matters more now than it did. Until
-// that exists this is the honest behaviour rather than a silent one.
+// "Live" here means named by a branch HEAD or a tag, which is all a sweep
+// can enumerate — a retired generation is not addressable, only hashed.
+// So an index or manifest that only an older generation inside the retain
+// window still names, one consolidation merged away and the head
+// therefore stopped listing, has nothing to speak for it. The CONDEMNED
+// LEDGERS are what speak for it: publish records the refs it stopped
+// listing, with the time it stopped (superblock.CondemnedRef), and this
+// sweep counts a ledger entry younger than the grace window as live —
+// exactly as it already does for a condemned pack.
+//
+// THE LIMIT TO ADMIT, and it is a window rather than a fix: T_grace, not
+// forever. Publish drops an entry once it ages out, so a reader pinned to
+// a generation whose refs were condemned longer ago than that loses them
+// after all. For an index the cost is bounded and known — it is DERIVED,
+// so that reader falls back to pack trailers and is slow rather than
+// broken. FOR A MANIFEST IT IS NOT: the manifest is that generation's
+// pack list, so sweeping one leaves the generation unreadable and the
+// packs it alone named go on the sweep after. Nothing addressable is ever
+// harmed (the head and every tag name their own), and a workflow that
+// needs a pin outliving the window must TAG, which pins exactly and
+// indefinitely.
 //
 // The sweep fails closed: if any ref or tag cannot be fetched and
 // verified, nothing is deleted — an unreadable superblock means the
@@ -383,6 +388,31 @@ func retainedSet(ctx context.Context, o Options, rep *Report) (*liveSet, time.Du
 		for _, c := range sb.Condemned {
 			if o.Now.Sub(time.Unix(c.CondemnedAtUnix, 0)) < grace {
 				live.packs[c.Name] = struct{}{}
+			}
+		}
+		// And the same ledger for the derived key spaces. A condemned ref
+		// is LIVE inside the window even though no live superblock lists it:
+		// consolidation merged it away, and the generation that still names
+		// it is retired and therefore not enumerable, so this entry is the
+		// only thing that speaks for the object. Publish carries entries
+		// forward until they age past the window and then drops them, so an
+		// aged-out ref simply stops appearing here and sweeps normally.
+		//
+		// A condemned MANIFEST needs no matching rescue of the packs it
+		// names, and that is a property of consolidation rather than luck:
+		// a merge is a union, so every pack a superseded segment named is
+		// named by the segment that replaced it, which a live superblock
+		// lists. If a future repack ever TRIMS a segment instead of merging
+		// it, the trimmed packs must go into sb.Condemned in the same
+		// change.
+		for _, c := range sb.CondemnedIndexes {
+			if o.Now.Sub(time.Unix(c.CondemnedAtUnix, 0)) < grace {
+				live.indexes[c.Name] = struct{}{}
+			}
+		}
+		for _, c := range sb.CondemnedManifests {
+			if o.Now.Sub(time.Unix(c.CondemnedAtUnix, 0)) < grace {
+				live.manifests[c.Name] = struct{}{}
 			}
 		}
 		return nil

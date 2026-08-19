@@ -3,7 +3,11 @@ package packidx
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
+	"io"
 	"math/rand/v2"
+	"os"
+	"runtime"
 	"testing"
 )
 
@@ -190,6 +194,160 @@ func TestMergeTakesTheNewestAndStreams(t *testing.T) {
 		}
 	}
 }
+
+// spoolFile is what a real caller passes: a file in its spool directory.
+func spoolFile(t *testing.T) *os.File {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "merge-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	return f
+}
+
+// The in-memory merge is the streaming one over a buffer, so the two must
+// not merely agree — they must produce the same bytes. Both are also
+// checked against an independent oracle: a Builder handed every entry
+// oldest-first, which is the encoder this merge exists to avoid using.
+func TestStreamingAndInMemoryMergesAgreeByteForByte(t *testing.T) {
+	older := NewBuilder(12, 4, 128)
+	newer := NewBuilder(12, 4, 128)
+	oracle := NewBuilder(12, 4, 128)
+	for i := 0; i < 3000; i++ {
+		if err := older.Add(key(uint64(i), 12), value(uint64(i), 4)); err != nil {
+			t.Fatal(err)
+		}
+		if err := oracle.Add(key(uint64(i), 12), value(uint64(i), 4)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 1500; i < 4500; i++ {
+		if err := newer.Add(key(uint64(i), 12), value(uint64(i)+1000000, 4)); err != nil {
+			t.Fatal(err)
+		}
+		// Later additions replace earlier ones, which is the same rule the
+		// merge follows for later inputs.
+		if err := oracle.Add(key(uint64(i), 12), value(uint64(i)+1000000, 4)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	o, err := Open(older.Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := Open(newer.Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	inMemory, err := Merge(12, 4, 128, []*Table{o, n})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var streamed bytes.Buffer
+	if err := MergeTo(&streamed, spoolFile(t), 12, 4, 128, []*Table{o, n}); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(streamed.Bytes(), inMemory) {
+		t.Fatalf("the spooled merge is %d bytes and the in-memory one %d; they must be the same table",
+			streamed.Len(), len(inMemory))
+	}
+	if !bytes.Equal(inMemory, oracle.Encode()) {
+		t.Fatal("the merge and a Builder over the same entries disagree")
+	}
+}
+
+// The point of spooling: memory becomes the SAMPLES, not the output. A
+// merge that allocated its result would be bounded by what one process
+// can hold, which is the bound tiers exist to escape.
+func TestAStreamingMergeDoesNotAllocateItsOutput(t *testing.T) {
+	const n = 200000
+	b := NewBuilder(12, 4, DefaultStride)
+	for i := 0; i < n; i++ {
+		if err := b.Add(key(uint64(i), 12), value(uint64(i), 4)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tbl, err := Open(b.Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := int64(headerLen) + int64(n/DefaultStride+1)*12 + int64(n)*16
+
+	// Written to a file, so nothing downstream of the merge holds it
+	// either — which is the shape a caller uploading the result wants.
+	out, allocated := spoolFile(t), int64(0)
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	if err := MergeTo(out, spoolFile(t), 12, 4, DefaultStride, []*Table{tbl}); err != nil {
+		t.Fatal(err)
+	}
+	runtime.ReadMemStats(&after)
+	allocated = int64(after.TotalAlloc - before.TotalAlloc)
+
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	raw, err := Merge(12, 4, DefaultStride, []*Table{tbl})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.ReadMemStats(&after)
+	inMemory := int64(after.TotalAlloc - before.TotalAlloc)
+	t.Logf("%d entries, %d bytes of table: spooled merge allocated %d bytes, in-memory %d (%d bytes of output)",
+		n, len(raw), allocated, inMemory, output)
+
+	if allocated > output/4 {
+		t.Errorf("a spooled merge of a %d-byte table allocated %d bytes; it should hold the samples, not the records",
+			output, allocated)
+	}
+}
+
+// A spool is a file, and a file can fill up. The merge must fail rather
+// than encode a table whose header promises records the spool never took.
+func TestASpoolThatCannotBeWrittenFailsTheMerge(t *testing.T) {
+	const n = 50000
+	b := NewBuilder(12, 4, DefaultStride)
+	for i := 0; i < n; i++ {
+		if err := b.Add(key(uint64(i), 12), value(uint64(i), 4)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tbl, err := Open(b.Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	spool := &fullSpool{limit: 100 << 10}
+	if err := MergeTo(&out, spool, 12, 4, DefaultStride, []*Table{tbl}); err == nil {
+		t.Fatal("a merge whose spool refused its records reported success")
+	}
+	if out.Len() != 0 {
+		t.Errorf("%d bytes were written to the destination of a failed merge; the caller would name a partial table",
+			out.Len())
+	}
+}
+
+// fullSpool accepts limit bytes and then behaves like a full disk.
+type fullSpool struct {
+	limit   int
+	written int
+}
+
+func (f *fullSpool) Write(p []byte) (int, error) {
+	if f.written+len(p) > f.limit {
+		n := max(f.limit-f.written, 0)
+		f.written = f.limit
+		return n, fmt.Errorf("no space left on device")
+	}
+	f.written += len(p)
+	return len(p), nil
+}
+
+func (f *fullSpool) Read([]byte) (int, error) { return 0, io.EOF }
+
+func (f *fullSpool) Seek(int64, int) (int64, error) { return 0, nil }
 
 func TestEmptyAndTruncated(t *testing.T) {
 	tbl, err := Open(NewBuilder(12, 4, 64).Encode())

@@ -43,6 +43,7 @@
 package manifest
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -168,44 +169,53 @@ func trimName(k []byte) string {
 	return string(k)
 }
 
-// Merge streams segments into one, newest LAST. As with an index, it
-// holds a cursor per input rather than their contents.
+// MergeTo merges segments into w, newest LAST, spooling the merged table
+// rather than holding it. As with an index, it holds a cursor per input
+// rather than their contents, so the memory a merge costs is set by the
+// number of segments and the samples — not by the number of packs.
 //
 // A pack appears in at most one segment in practice — it is written once
 // — so the later-wins rule is a tie-break rather than a policy. It
 // matters only after a repack has rewritten a segment.
-func Merge(segments []*Manifest) []byte {
-	out := NewBuilder()
-	at := make([]int, len(segments))
-	for {
-		best, bestKey := -1, ""
-		for i, m := range segments {
-			if at[i] >= m.Len() {
-				continue
-			}
-			k, _ := m.table.At(at[i])
-			if best < 0 || string(k) < bestKey {
-				best, bestKey = i, string(k)
-			}
-		}
-		if best < 0 {
-			break
-		}
-		var pack packstore.SealedPack
-		for i, m := range segments {
-			if at[i] >= m.Len() {
-				continue
-			}
-			if k, v := m.table.At(at[i]); string(k) == bestKey {
-				pack = decode(trimName(k), v)
-				at[i]++
-			}
-		}
-		// The builder refuses only over-long names, and these came from a
-		// manifest that already accepted them.
-		_ = out.Add(pack)
+//
+// This has no blob to hold, so unlike an index (mpi.MergeTo) the whole
+// object streams: its header is two fixed fields, and the records pass
+// through untouched.
+func MergeTo(w io.Writer, spool io.ReadWriteSeeker, segments []*Manifest) error {
+	tables := make([]*packidx.Table, len(segments))
+	for i, m := range segments {
+		tables[i] = m.table
 	}
-	return out.Encode()
+	sw := packidx.NewStreamWriter(spool, keyLen, recordLen, 0)
+	// The keys arrive padded and the records unchanged, so nothing here
+	// re-encodes what a segment already accepted: a name too long for a
+	// key could not have got into one of these in the first place.
+	err := packidx.MergeKeys(tables, func(_ int, key, v []byte) error { return sw.Add(key, v) })
+	if err != nil {
+		return err
+	}
+	head := make([]byte, headerLen)
+	copy(head[0:8], magic)
+	binary.LittleEndian.PutUint32(head[8:], 1)
+	if _, err := w.Write(head); err != nil {
+		return err
+	}
+	_, err = sw.Finish(w)
+	return err
+}
+
+// Merge is MergeTo into memory, which is what a small merge wants. A
+// merge whose output does not fit should call MergeTo with a file.
+func Merge(segments []*Manifest) []byte {
+	var out bytes.Buffer
+	if err := MergeTo(&out, packidx.MemSpool(), segments); err != nil {
+		// Unreachable: a memory spool and a bytes.Buffer cannot fail to be
+		// written. Returning nothing rather than a truncated segment leaves
+		// the caller's Open to refuse it — and for a manifest that refusal
+		// is the point, since a segment missing packs is worse than none.
+		return nil
+	}
+	return out.Bytes()
 }
 
 // The ref naming one segment is superblock.ManifestRef: it is a field of

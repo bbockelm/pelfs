@@ -589,6 +589,15 @@ type pipeline struct {
 	// TRANSFORM so the superblock can list what provided records name.
 	providedPacks []packstore.SealedPack
 
+	// droppedIndexes and droppedManifests are the derived refs this seal
+	// STOPPED listing — consolidation's inputs, and the backup's in-flight
+	// manifest segment. They accumulate as the seal runs and become the
+	// superblock's condemned ledgers (condemnedrefs.go), which is what
+	// stops retention deleting objects that only non-enumerable
+	// generations still name.
+	droppedIndexes   []string
+	droppedManifests []string
+
 	// rootLoc is where writeCatalogs appended the root catalog, or nil when
 	// this publish did not write one (the whole tree was carried forward).
 	// It becomes the superblock's root-catalog hint.
@@ -1451,6 +1460,16 @@ func (p *pipeline) buildSuperblock(newPacks []packstore.SealedPack, shards []sup
 		},
 		KeyTable: p.o.KeyTable,
 	}
+	// The condemned ledgers for the derived key spaces: what this seal
+	// stopped listing, plus the parent's entries still inside the grace
+	// window. The clock is the generation's own CreatedUnixNano, not
+	// time.Now(), so a superblock stays a pure function of its inputs.
+	// Grace is the window this superblock itself states, which is what
+	// retention floors its own window at.
+	now := time.Unix(0, p.o.CreatedUnixNano)
+	grace := time.Duration(sb.Params.TGraceSeconds) * time.Second
+	sb.CondemnedIndexes = condemnLedger(p.prevCondemnedIndexes(), p.droppedIndexes, packIndexes, now, grace)
+	sb.CondemnedManifests = condemnLedger(p.prevCondemnedManifests(), p.droppedManifests, manifests, now, grace)
 	sb.RootCatalogHint = p.rootCatalogHint(rootID)
 	if p.o.DEK != nil {
 		// Catalog/shard/backup entries have no per-entry keyid column;

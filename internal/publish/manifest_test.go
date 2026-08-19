@@ -5,7 +5,10 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"io"
+	"strings"
 	"testing"
+	"time"
 
 	"lukechampine.com/blake3"
 
@@ -203,6 +206,152 @@ func TestAnInlineParentsPacksSurviveIntoTheManifest(t *testing.T) {
 	for _, sp := range next.NewPacks {
 		if !got[sp.Name] {
 			t.Errorf("new pack %s is in no manifest", sp.Name)
+		}
+	}
+}
+
+// backupSuperblock digs the superblock backup out of the packs a seal
+// wrote. It is stored raw — rescue has to read it before it holds any
+// keys — so decoding it needs nothing but the bytes.
+func backupSuperblock(t *testing.T, v *reuseVol, res *publish.Result) *superblock.Superblock {
+	t.Helper()
+	ctx := context.Background()
+	for _, sp := range res.NewPacks {
+		entries, err := packstore.FetchTrailer(ctx, v.inner, sp.Name, sp.Size)
+		if err != nil {
+			t.Fatalf("trailer of %s: %v", sp.Name, err)
+		}
+		for _, e := range entries {
+			if e.Type != packstore.EntrySuperblock {
+				continue
+			}
+			rc, err := v.inner.Get(ctx, packstore.PackDirKey+"/"+sp.Name, e.Off, e.Length)
+			if err != nil {
+				t.Fatalf("read the backup out of %s: %v", sp.Name, err)
+			}
+			raw, err := io.ReadAll(rc)
+			rc.Close() //nolint:errcheck
+			if err != nil {
+				t.Fatalf("read the backup out of %s: %v", sp.Name, err)
+			}
+			sb, err := superblock.Decode(raw)
+			if err != nil {
+				t.Fatalf("decode the backup in %s: %v", sp.Name, err)
+			}
+			return sb
+		}
+	}
+	t.Fatal("no superblock backup rode in any pack this seal wrote")
+	return nil
+}
+
+// The backup rides in the LAST pack, so it must state its pack set before
+// the seal has finished cutting packs — through a manifest segment of its
+// own, which the final superblock's segment supersedes the instant the
+// seal completes. Nothing addressable names it after that, so without a
+// ledger entry it is swept once it ages and a rescue from this backup
+// recovers the generation's ancestors and not its tail.
+func TestASealCondemnsItsBackupsInFlightManifestSegment(t *testing.T) {
+	ctx := context.Background()
+	v := newReuseVol(t, [16]byte{0x11, 0xd0, 0x21})
+	v.create(publishRootInode, "a.bin", pseudorandom(6<<20, 41))
+	res := v.checkpoint()
+
+	listed := map[string]bool{}
+	for _, ref := range res.Superblock.Manifests {
+		listed[ref.Name] = true
+	}
+	condemned := map[string]bool{}
+	for _, c := range res.Superblock.CondemnedManifests {
+		condemned[c.Name] = true
+	}
+
+	inflight := 0
+	for _, ref := range backupSuperblock(t, v, res).Manifests {
+		if listed[ref.Name] {
+			// The backup and the final generation agreed on a segment,
+			// which happens when the seal cut nothing after the backup. The
+			// final superblock names it, so nothing is condemned and
+			// nothing is at risk.
+			continue
+		}
+		inflight++
+		if !condemned[ref.Name] {
+			t.Errorf("the backup names manifest %s, the generation does not, and nothing condemns it: "+
+				"a rescue from this backup stops working once that object ages out", ref.Name[:12])
+		}
+		if _, err := v.inner.StatKey(ctx, manifest.Dir+"/"+ref.Name); err != nil {
+			t.Errorf("the backup's manifest segment %s is not there: %v", ref.Name[:12], err)
+		}
+	}
+	if inflight == 0 {
+		t.Fatal("fixture: this seal's backup named no segment of its own, so it exercises nothing")
+	}
+}
+
+// The ledger is a window, not a promise, and this is the mechanism that
+// makes it one: an entry is carried forward until it is older than
+// T_grace and then simply stops being written. Without the fall-off the
+// ledger grows for the life of the volume — a consolidating seal condemns
+// refs every time — and with it, a reader pinned to a generation older
+// than the window is back to losing its index or its manifest. That is
+// the limit, and it lives here as much as in the comments.
+func TestCondemnedRefEntriesAgeOffTheSuperblock(t *testing.T) {
+	ctx := context.Background()
+	v := newReuseVol(t, [16]byte{0x11, 0xd0, 0x22})
+	v.create(publishRootInode, "a.bin", pseudorandom(2<<20, 42))
+	first := v.checkpoint()
+
+	now := time.Now()
+	fresh := strings.Repeat("a", 64) // condemned an hour ago -> carried
+	stale := strings.Repeat("b", 64) // condemned 200h ago -> dropped
+	ledger := []superblock.CondemnedRef{
+		{Name: fresh, CondemnedAtUnix: now.Add(-1 * time.Hour).Unix()},
+		{Name: stale, CondemnedAtUnix: now.Add(-200 * time.Hour).Unix()},
+	}
+	prev := *first.Superblock
+	prev.CondemnedIndexes = ledger
+	prev.CondemnedManifests = ledger
+	if err := prev.Sign(v.priv); err != nil {
+		t.Fatal(err)
+	}
+	prevRaw, err := prev.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := v.inner.Put(ctx, "refs/main", bytes.NewReader(prevRaw)); err != nil {
+		t.Fatal(err)
+	}
+
+	v.create(publishRootInode, "b.bin", pseudorandom(2<<20, 43))
+	next := v.sealOnly(&publish.Result{Superblock: &prev, Raw: prevRaw})
+
+	for _, space := range []struct {
+		what string
+		got  []superblock.CondemnedRef
+	}{
+		{"index", next.Superblock.CondemnedIndexes},
+		{"manifest", next.Superblock.CondemnedManifests},
+	} {
+		at := map[string]int64{}
+		for _, c := range space.got {
+			at[c.Name] = c.CondemnedAtUnix
+		}
+		if _, ok := at[stale]; ok {
+			t.Errorf("a %s condemned 200h ago is still on the ledger; a %s ledger that never sheds "+
+				"grows for the life of the volume", space.what, space.what)
+		}
+		when, ok := at[fresh]
+		if !ok {
+			t.Errorf("a %s condemned an hour ago fell off a 72h ledger; the object it names is now "+
+				"one sweep from deletion", space.what)
+			continue
+		}
+		// Carried, not re-stamped: refreshing the timestamp every seal
+		// would keep an entry alive forever and the window would never end.
+		if when != ledger[0].CondemnedAtUnix {
+			t.Errorf("%s ledger entry re-stamped %d -> %d; the clock must not restart on carry-forward",
+				space.what, ledger[0].CondemnedAtUnix, when)
 		}
 	}
 }

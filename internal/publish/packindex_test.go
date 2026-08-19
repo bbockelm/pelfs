@@ -3,6 +3,7 @@ package publish_test
 import (
 	"context"
 	"encoding/hex"
+	"fmt"
 	"testing"
 
 	"github.com/bbockelm/pelfs/internal/mpi"
@@ -169,4 +170,59 @@ func TestPublishSurvivesAnIndexUploadFailure(t *testing.T) {
 	}
 	// The generation is otherwise whole: it serves the tree it sealed.
 	v.verifyBodies(res, body)
+}
+
+// Consolidation drops the refs it merged, and the generations that still
+// name them are retired — reachable only by hash, so a sweep cannot
+// enumerate them. The condemned ledger is the only thing that keeps those
+// objects alive, so every ref that leaves the list has to arrive in it.
+//
+// Its own limit is that the entries age out, which is checked in
+// TestCondemnedRefEntriesAgeOffTheSuperblock; here the question is
+// whether they get written at all.
+func TestConsolidationCondemnsTheIndexesItDropped(t *testing.T) {
+	v := newReuseVol(t, [16]byte{0x11, 0xd0, 0x20})
+	v.reuseTree(24)
+	res := v.checkpoint()
+
+	ever := map[string]bool{}
+	for _, ref := range res.Superblock.PackIndexes {
+		ever[ref.Name] = true
+	}
+	for gen := 2; gen <= 8; gen++ {
+		v.create(publishRootInode, fmt.Sprintf("f%d.bin", gen), pseudorandom(200<<10, int64(gen)))
+		res = v.checkpoint()
+		for _, ref := range res.Superblock.PackIndexes {
+			ever[ref.Name] = true
+		}
+	}
+	listed := map[string]bool{}
+	for _, ref := range res.Superblock.PackIndexes {
+		listed[ref.Name] = true
+	}
+	if len(ever) <= len(listed) {
+		t.Fatalf("%d refs listed of %d ever written: nothing was consolidated, so this proves nothing",
+			len(listed), len(ever))
+	}
+	condemned := map[string]bool{}
+	for _, c := range res.Superblock.CondemnedIndexes {
+		if c.CondemnedAtUnix == 0 {
+			t.Errorf("condemned index %s carries no timestamp; retention cannot age it", c.Name[:12])
+		}
+		condemned[c.Name] = true
+	}
+	for name := range ever {
+		if listed[name] || condemned[name] {
+			continue
+		}
+		t.Errorf("index %s was listed by an earlier generation, is listed by none now, and is condemned by none: "+
+			"the next sweep past the grace window deletes it out from under a live generation", name[:12])
+	}
+	// The ledger names objects, not ghosts: publish must not have deleted
+	// what it condemned.
+	for _, c := range res.Superblock.CondemnedIndexes {
+		if _, err := v.inner.StatKey(context.Background(), mpi.Dir+"/"+c.Name); err != nil {
+			t.Errorf("condemned index %s is not there: %v", c.Name[:12], err)
+		}
+	}
 }

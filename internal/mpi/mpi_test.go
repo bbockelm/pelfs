@@ -1,10 +1,12 @@
 package mpi
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"sync/atomic"
 	"testing"
@@ -286,4 +288,61 @@ func TestMergeTakesTheNewestPlacement(t *testing.T) {
 		}
 	}
 	t.Logf("two 3000-entry indexes merged to %d entries", merged.Len())
+}
+
+// The in-memory merge is the spooling one over a buffer, so the two must
+// produce the same bytes — an index is content-addressed, and a merge
+// that named the same content differently depending on where its records
+// were parked would upload the same index twice.
+func TestSpooledAndInMemoryMergesAgreeByteForByte(t *testing.T) {
+	// Overlapping keys, colliding keys (two packs for one key), and packs
+	// whose name lists repeat, so the strings blob has something to intern.
+	older, newer := NewBuilder(), NewBuilder()
+	for i := uint64(0); i < 4000; i++ {
+		older.Add(id(i), "p-"+strconv.Itoa(int(i)/97))
+		if i%13 == 0 {
+			older.Add(id(i), "p-collide")
+		}
+	}
+	for i := uint64(2000); i < 7000; i++ {
+		newer.Add(id(i), "p-"+strconv.Itoa(int(i)/89))
+	}
+	o, err := Open(older.Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := Open(newer.Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	spool, err := os.CreateTemp(t.TempDir(), "merge-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer spool.Close() //nolint:errcheck
+	var streamed bytes.Buffer
+	if err := MergeTo(&streamed, spool, []*Index{o, n}); err != nil {
+		t.Fatal(err)
+	}
+	inMemory := Merge([]*Index{o, n})
+	if !bytes.Equal(streamed.Bytes(), inMemory) {
+		t.Fatalf("the spooled merge is %d bytes and the in-memory one %d; they must be the same index",
+			streamed.Len(), len(inMemory))
+	}
+
+	// And the bytes are an index that still answers, including for the
+	// collision, which is the entry a merge is likeliest to lose.
+	merged, err := Open(streamed.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if packs, ok := merged.Lookup(id(13)); !ok || len(packs) != 2 {
+		t.Fatalf("the colliding key resolved to %v, want both packs", packs)
+	}
+	for i := uint64(0); i < 7000; i++ {
+		if _, ok := merged.Lookup(id(i)); !ok {
+			t.Fatalf("entry %d is missing from the spooled merge", i)
+		}
+	}
 }

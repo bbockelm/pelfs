@@ -528,3 +528,61 @@ func TestAManifestOnlyGenerationIsRefusedByAReaderThatDropsTheField(t *testing.T
 		t.Fatalf("a reader that dropped the manifest list verified anyway (%v); it would serve an empty volume", err)
 	}
 }
+
+// The condemned-ref ledgers are additive, which is the whole basis for
+// adding them to a signed document: a superblock written before they
+// existed must still encode without the keys, decode with empty ledgers,
+// and verify. Get that wrong and every generation on disk stops
+// verifying, because Verify re-encodes what it decoded.
+func TestCondemnedRefLedgersAreAdditive(t *testing.T) {
+	pub, priv := genKey(t)
+
+	old := testSuperblock()
+	if err := old.Sign(priv); err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	enc := mustEncode(t, old)
+	for _, key := range []string{"condemned_indexes", "condemned_manifests"} {
+		if bytes.Contains(enc, []byte(key)) {
+			t.Fatalf("a superblock condemning nothing still wrote %q", key)
+		}
+	}
+	dec, err := Decode(enc)
+	if err != nil {
+		t.Fatalf("decode ledger-less superblock: %v", err)
+	}
+	if dec.CondemnedIndexes != nil || dec.CondemnedManifests != nil {
+		t.Fatalf("decoded ledgers out of a superblock that has none: %+v / %+v",
+			dec.CondemnedIndexes, dec.CondemnedManifests)
+	}
+	if err := dec.Verify(pub); err != nil {
+		t.Fatalf("a superblock written before the ledgers existed no longer verifies: %v", err)
+	}
+
+	ledgered := testSuperblock()
+	ledgered.CondemnedIndexes = []CondemnedRef{
+		{Name: "aa11", CondemnedAtUnix: 1755200000},
+		{Name: "bb22", CondemnedAtUnix: 1755300000},
+	}
+	ledgered.CondemnedManifests = []CondemnedRef{{Name: "cc33", CondemnedAtUnix: 1755400000}}
+	if err := ledgered.Sign(priv); err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	dec, err = Decode(mustEncode(t, ledgered))
+	if err != nil {
+		t.Fatalf("decode ledgered superblock: %v", err)
+	}
+	if err := dec.Verify(pub); err != nil {
+		t.Fatalf("verify ledgered superblock: %v", err)
+	}
+	for i, want := range ledgered.CondemnedIndexes {
+		if dec.CondemnedIndexes[i] != want {
+			t.Errorf("condemned index %d round-tripped as %+v, want %+v", i, dec.CondemnedIndexes[i], want)
+		}
+	}
+	for i, want := range ledgered.CondemnedManifests {
+		if dec.CondemnedManifests[i] != want {
+			t.Errorf("condemned manifest %d round-tripped as %+v, want %+v", i, dec.CondemnedManifests[i], want)
+		}
+	}
+}

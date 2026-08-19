@@ -440,6 +440,7 @@ the signature field zeroed.
 | `Params` | `SMaxBytes`, `SMinBytes`, `InlineMax`, `TGraceSeconds`, `RetainK` |
 | `Catalogs` | a seal-planning hint, not routing — see below |
 | `Condemned` | repack's ledger of dropped packs (no writer yet) |
+| `CondemnedIndexes`, `CondemnedManifests` | the same ledger for dropped index and manifest refs; publish writes it |
 | `PrevHash` | lineage: snapshot history, fork detection |
 | `SigningPub`, `NextPub`, `Signature` | trust root and rotation |
 
@@ -739,7 +740,7 @@ looks in each until a pack's own trailer confirms the full identity.
 Indexes are size-tiered, like the write path itself: a generation
 publishes a small index for the packs it created, and consolidation
 merges them into geometrically larger ones. A hundred million objects is
-then five to ten indexes rather than a few thousand.
+then a few dozen indexes rather than a few thousand.
 
   - **A lookup consults them newest-first**, which is exactly "the most
     recent pack holding this object" — an older tier's answer names a
@@ -749,10 +750,34 @@ then five to ten indexes rather than a few thousand.
     together describe a hundred million objects costs memory proportional
     to the number of TIERS. That is what makes a large index buildable at
     all: it is never built at once, only merged — and why a publish emits
-    a small index rather than maintaining a global one. The output
-    records are still assembled in memory, which bounds a merge to the
-    tier being written; a merge large enough to matter should spool, and
-    nothing needs that yet.
+    a small index rather than maintaining a global one. The OUTPUT
+    streams too: `mpi.MergeTo` spools its records to a file and holds only
+    the samples (293 KB at a hundred million entries) and the strings
+    blob, which is bounded by distinct pack-name lists rather than by
+    entries. The in-memory `Merge` is that same path over a buffer, since
+    most merges are kilobytes and should not need a file.
+  - **A ref absorbs the one ahead of it once they balance.** A seal
+    merges the newest run of refs in which each older ref weighs no more
+    than everything newer than it — so every surviving ref is at least as
+    large as the sum of all newer ones, sizes double from the newest end,
+    and the count is the LOG of the volume. Runs under 256 KiB merge
+    unconditionally, so a small volume still lists one. A merge is capped
+    at 64 MiB, which is what one seal may be asked to download and
+    upload; past that a ref freezes and the count goes back to linear, at
+    one ref per 64 MiB. Measured over 25,600 generations
+    (`TestRefCountGrowsWithTheLogOfVolumeSize`):
+
+| index bytes | objects | refs, frozen at the target | refs, tiered |
+| --- | --- | --- | --- |
+| 4 MB | 262,144 | 4 | 1 |
+| 64 MB | 4.2 M | 61 | 1 |
+| 256 MB | 16.8 M | 241 | 4 |
+| **1.6 GB** | **100 M** | **1,506** | **25** |
+
+    Fewer refs did not cost more work: the rule this replaced spent its
+    bytes below the target rather than above it, re-merging the same
+    sub-megabyte run on every seal, so tiering moves 19.5 GB against its
+    27.9 GB over the same generations.
   - **Retire below liveness.** An index whose packs are mostly deleted
     spends its bytes on entries resolving to nothing. Under 50% live, a
     repack drops it and re-emits its live entries; one whose packs are
@@ -1136,6 +1161,19 @@ pack list makes the sweep set arithmetic rather than tree traversal:
   ledger as (name, condemned-at); publish carries ledger entries forward
   until they age past `T_grace`. GC honours the ledger today. **Nothing
   writes it**, because there is no repack.
+- **Dropped index and manifest refs get the same ledger.** Consolidation
+  merges several refs into one and stops listing the inputs, and the
+  superblock backup's in-flight manifest segment is superseded the instant
+  the seal completes. In both cases the object is still named by a
+  generation that is no longer *addressable*, so nothing the sweep can
+  enumerate speaks for it. Publish records the dropped refs in
+  `condemned_indexes` / `condemned_manifests` as (name, condemned-at),
+  carries them forward until they age past `T_grace`, and GC counts a
+  young entry as live. **The window is `T_grace`, not forever**: a reader
+  pinned to a generation whose refs were condemned longer ago than that
+  still loses them — an index costs it the trailer fallback, a manifest
+  costs it the generation, because the manifest *is* that generation's
+  pack list. Tag to pin past the window.
 - **Retained packs** = the union over every ref head and every tag of
   (pack list + condemned entries younger than `T_grace`). No catalog
   walking is needed for deletion safety — the pack list *is* the reachable

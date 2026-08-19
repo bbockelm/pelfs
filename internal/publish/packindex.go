@@ -127,11 +127,30 @@ func (p *pipeline) prevPackIndexes() []superblock.IndexRef {
 	return p.o.Prev.PackIndexes
 }
 
+// prevCondemnedIndexes is the parent's ledger of dropped index refs,
+// which this generation carries forward until the entries age out
+// (condemnedrefs.go).
+func (p *pipeline) prevCondemnedIndexes() []superblock.CondemnedRef {
+	if p.o.Prev == nil {
+		return nil
+	}
+	return p.o.Prev.CondemnedIndexes
+}
+
 // sealPackIndexes publishes this generation's index and returns the refs
 // the superblock records: the carried set plus this one, consolidated
 // under the shared tiering policy (consolidate.go).
+//
+// It also records what consolidation stopped listing. A merged-away index
+// is still named by generations inside the retain window, and those
+// generations are not enumerable, so without the ledger the object is
+// swept as soon as it ages and those readers quietly lose the index they
+// were promised (condemnedrefs.go).
 func (p *pipeline) sealPackIndexes(ctx context.Context) []superblock.IndexRef {
-	return consolidate(ctx, carryForward(p.prevPackIndexes(), p.publishPackIndex(ctx)), "pack index", p.mergeIndexes)
+	before := carryForward(p.prevPackIndexes(), p.publishPackIndex(ctx))
+	after := consolidate(ctx, before, "pack index", p.mergeIndexes)
+	p.droppedIndexes = append(p.droppedIndexes, droppedRefs(before, after)...)
+	return after
 }
 
 // mergeIndexes fetches the given refs, merges them and uploads the result.

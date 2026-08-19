@@ -41,6 +41,16 @@ func (p *pipeline) prevManifests() []superblock.ManifestRef {
 	return p.o.Prev.Manifests
 }
 
+// prevCondemnedManifests is the parent's ledger of dropped manifest refs,
+// which this generation carries forward until the entries age out
+// (condemnedrefs.go).
+func (p *pipeline) prevCondemnedManifests() []superblock.CondemnedRef {
+	if p.o.Prev == nil {
+		return nil
+	}
+	return p.o.Prev.CondemnedManifests
+}
+
 // manifestPacks is what this generation's own segment must cover: every
 // pack it references that no CARRIED ref already names.
 //
@@ -133,7 +143,15 @@ func (p *pipeline) sealManifests(ctx context.Context, newPacks []packstore.Seale
 			"error", err)
 		return nil, nil
 	}
-	return consolidate(ctx, carryForward(p.prevManifests(), ref), "pack manifest", p.mergeManifests), nil
+	// What consolidation stops listing is condemned, not forgotten, and
+	// the stake is higher here than for an index: a generation inside the
+	// retain window names those segments, and a segment swept out from
+	// under it leaves it unable to state its own pack set. See
+	// condemnedrefs.go, including what the ledger still does not fix.
+	before := carryForward(p.prevManifests(), ref)
+	after := consolidate(ctx, before, "pack manifest", p.mergeManifests)
+	p.droppedManifests = append(p.droppedManifests, droppedRefs(before, after)...)
+	return after, nil
 }
 
 // backupManifests is sealManifests for the superblock backup that rides
@@ -157,13 +175,22 @@ func (p *pipeline) sealManifests(ctx context.Context, newPacks []packstore.Seale
 // this generation's own packs is worth less than a complete one and far
 // more than a seal that did not happen.
 //
-// The limit to admit: the final superblock lists a segment covering ALL
-// of this generation's packs, so the one written here is superseded the
-// moment the seal completes and nothing addressable names it. Retention
-// sweeps it once it ages past the grace window — the same gap the design
-// already records for a consolidated-away index — after which a rescue
-// from this backup recovers the ancestors and not the tail generation.
-// Closing it wants the ledger of dropped refs that does not exist yet.
+// The final superblock lists a segment covering ALL of this generation's
+// packs, so the one written here is superseded the moment the seal
+// completes and nothing addressable names it. That is why it is
+// CONDEMNED: the ledger is what keeps it through the grace window, so a
+// rescue from this backup can still resolve the tail generation's pack
+// set rather than recovering its ancestors alone (condemnedrefs.go).
+//
+// Condemning here and filtering later reads backwards and is not: the
+// backup superblock is built from the refs this returns, and
+// condemnLedger never condemns a name the generation still lists — so the
+// entry lands only on the FINAL superblock, which is the document that
+// supersedes the segment.
+//
+// The limit to admit: the window is T_grace, not forever. A rescue from a
+// backup older than that is back to recovering this generation's
+// ancestors and not its tail.
 func (p *pipeline) backupManifests(ctx context.Context) []superblock.ManifestRef {
 	ref, err := p.publishManifest(ctx, p.manifestPacks(p.pk.sealedSoFar()))
 	if err != nil {
@@ -171,6 +198,7 @@ func (p *pipeline) backupManifests(ctx context.Context) []superblock.ManifestRef
 			"a rescue from it recovers this generation's ancestors only", "error", err)
 		return p.prevManifests()
 	}
+	p.droppedManifests = append(p.droppedManifests, ref.Name)
 	return carryForward(p.prevManifests(), ref)
 }
 

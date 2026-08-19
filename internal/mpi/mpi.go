@@ -39,6 +39,7 @@
 package mpi
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -237,7 +238,8 @@ func (ix *Index) Packs() []string {
 	return out
 }
 
-// Merge streams several indexes into one, newest LAST.
+// MergeTo merges several indexes into w, newest LAST, spooling the merged
+// table rather than holding it.
 //
 // It advances a cursor per input rather than holding their contents, so
 // merging tiers that together describe a hundred million objects costs
@@ -246,51 +248,105 @@ func (ix *Index) Packs() []string {
 // it is why the write path publishes a small index per generation and
 // consolidates later rather than maintaining one global index.
 //
-// The output records are still assembled in memory, which bounds a merge
-// to the size of the tier being written rather than to the volume. A
-// merge large enough to matter should spool; nothing needs that yet, and
-// saying so is better than pretending the limit is not there.
-func Merge(indexes []*Index) []byte {
-	out := NewBuilder()
-	at := make([]int, len(indexes))
-	for {
-		best, bestKey := -1, ""
-		for i, ix := range indexes {
-			if at[i] >= ix.table.Len() {
-				continue
-			}
-			k, _ := ix.table.At(at[i])
-			if best < 0 || string(k) < bestKey {
-				best, bestKey = i, string(k)
-			}
+// THE STRINGS BLOB IS HELD while the table streams, and the asymmetry is
+// deliberate rather than an oversight. The records are bounded by
+// ENTRIES, which is the number this whole structure exists to survive;
+// the blob is bounded by the number of DISTINCT PACK-NAME LISTS, and
+// every entry in a pack names the same list — a 2 MiB pack holding five
+// hundred chunks costs one copy of its name. A hundred million entries
+// across 400,000 packs is tens of MB of blob against 1.6 GB of records.
+// It also cannot stream: the header states the blob's length and lands
+// before it, and that length is only known once the last entry has been
+// interned.
+//
+// Nothing is written to w until the merge has succeeded, so a failure
+// leaves an empty destination rather than a prefix of an index — except
+// for a failure inside Finish, which the caller discards.
+func MergeTo(w io.Writer, spool io.ReadWriteSeeker, indexes []*Index) error {
+	var blob []byte
+	offsets := map[string]uint32{}
+	intern := func(s string) uint32 {
+		if off, ok := offsets[s]; ok {
+			return off
 		}
-		if best < 0 {
-			break
-		}
-		var names []string
-		for i, ix := range indexes {
-			if at[i] >= ix.table.Len() {
-				continue
-			}
-			k, v := ix.table.At(at[i])
-			if string(k) != bestKey {
-				continue
-			}
-			// Later inputs win outright: a key found in a newer tier names
-			// the pack that placement is current, and an older tier's
-			// answer is at best redundant and at worst a deleted pack.
-			if got, ok := ix.names(binary.LittleEndian.Uint32(v)); ok {
-				names = got
-			}
-			at[i]++
-		}
-		var id [32]byte
-		copy(id[:], bestKey)
-		for _, p := range names {
-			out.Add(id, p)
-		}
+		off := uint32(len(blob))
+		offsets[s] = off
+		blob = binary.LittleEndian.AppendUint16(blob, uint16(len(s)))
+		blob = append(blob, s...)
+		return off
 	}
-	return out.Encode()
+	tables := make([]*packidx.Table, len(indexes))
+	for i, ix := range indexes {
+		tables[i] = ix.table
+	}
+	sw := packidx.NewStreamWriter(spool, KeyLen, recordLen, 0)
+	err := packidx.MergeKeys(tables, func(from int, key, v []byte) error {
+		// Later inputs win outright: a key found in a newer tier names the
+		// pack that placement is current, and an older tier's answer is at
+		// best redundant and at worst a deleted pack. The offset only means
+		// anything against the blob of the index that supplied it, which is
+		// why the walk reports which one that was.
+		names, ok := indexes[from].names(binary.LittleEndian.Uint32(v))
+		if !ok || len(names) == 0 {
+			// An offset that does not resolve is a corrupt index, not a
+			// reason to fail a merge of the others: the key is dropped and
+			// the reader falls back to the trailers for it, which is what it
+			// would have done had the index never existed.
+			return nil
+		}
+		names = sortedUnique(names)
+		var rec [recordLen]byte
+		binary.LittleEndian.PutUint32(rec[:], intern(strings.Join(names, ",")))
+		return sw.Add(key, rec[:])
+	})
+	if err != nil {
+		return err
+	}
+	head := make([]byte, headerLen+len(blob))
+	copy(head[0:8], magic)
+	binary.LittleEndian.PutUint32(head[8:], 1)
+	binary.LittleEndian.PutUint32(head[12:], uint32(len(blob)))
+	copy(head[headerLen:], blob)
+	if _, err := w.Write(head); err != nil {
+		return err
+	}
+	_, err = sw.Finish(w)
+	return err
+}
+
+// sortedUnique is what Builder.Add and Builder.Encode do between them —
+// duplicates dropped, then sorted — applied to a list a merge is passing
+// through rather than rebuilding, so the streaming and in-memory paths
+// produce the same bytes.
+func sortedUnique(names []string) []string {
+	out := append([]string(nil), names...)
+	sort.Strings(out)
+	kept := out[:0]
+	for i, n := range out {
+		if i > 0 && n == out[i-1] {
+			continue
+		}
+		kept = append(kept, n)
+	}
+	return kept
+}
+
+// Merge is MergeTo into memory, which is what a small merge wants: most
+// are one generation's index folded into the tier ahead of it, and
+// asking a caller for a temp file to move kilobytes would be the wrong
+// default. A merge whose output does not fit should call MergeTo with a
+// file.
+func Merge(indexes []*Index) []byte {
+	var out bytes.Buffer
+	if err := MergeTo(&out, packidx.MemSpool(), indexes); err != nil {
+		// Unreachable: a memory spool and a bytes.Buffer cannot fail to be
+		// written, and the merge itself only fails on a write. Returning
+		// nothing rather than a truncated index leaves the caller's Open to
+		// refuse it, which is the same treatment a merge that never ran
+		// gets.
+		return nil
+	}
+	return out.Bytes()
 }
 
 // The ref naming one index object is superblock.IndexRef: it is a field

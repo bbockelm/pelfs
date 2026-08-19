@@ -1,9 +1,11 @@
 package manifest
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"sync/atomic"
 	"testing"
@@ -129,6 +131,41 @@ func TestMergeStreamsSegmentsTogether(t *testing.T) {
 			t.Fatalf("pack %d is missing from the merge", i)
 		}
 		if got.TrailerHash != want.TrailerHash {
+			t.Fatalf("pack %d lost its trailer hash in the merge", i)
+		}
+	}
+}
+
+// The in-memory merge is the spooling one over a buffer, so the two must
+// produce the same bytes: a segment is content-addressed, and where its
+// records were parked must not change its name.
+func TestSpooledAndInMemoryMergesAgreeByteForByte(t *testing.T) {
+	segments := []*Manifest{build(t, 0, 300), build(t, 250, 700)}
+	spool, err := os.CreateTemp(t.TempDir(), "merge-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer spool.Close() //nolint:errcheck
+	var streamed bytes.Buffer
+	if err := MergeTo(&streamed, spool, segments); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(streamed.Bytes(), Merge(segments)) {
+		t.Fatal("the spooled merge and the in-memory one produced different segments")
+	}
+	merged, err := Open(streamed.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if merged.Len() != 700 {
+		t.Fatalf("merged manifest holds %d packs, want 700", merged.Len())
+	}
+	for _, i := range []int{0, 249, 250, 299, 300, 699} {
+		got, ok := merged.Lookup(packName(i))
+		if !ok {
+			t.Fatalf("pack %d is missing from the spooled merge", i)
+		}
+		if got.TrailerHash != pack(i).TrailerHash {
 			t.Fatalf("pack %d lost its trailer hash in the merge", i)
 		}
 	}

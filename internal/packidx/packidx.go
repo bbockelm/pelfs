@@ -30,9 +30,11 @@
 package packidx
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"sort"
 )
 
@@ -105,21 +107,34 @@ func (b *Builder) Encode() []byte {
 	return encodeRecords(b.keyLen, b.recordLen, b.stride, len(kept), func(i int) []byte { return kept[i] })
 }
 
-// encodeRecords writes a table from records already in sorted order. It
-// is shared with the streaming merge, which never holds them all.
-func encodeRecords(keyLen, recordLen, stride, count int, at func(int) []byte) []byte {
-	entryLen := keyLen + recordLen
-	samples := 0
-	if count > 0 {
-		samples = (count + stride - 1) / stride
-	}
-	out := make([]byte, headerLen+samples*keyLen+count*entryLen)
+// putHeader writes the fixed header into the front of out, which must be
+// at least headerLen bytes. It is shared with the streaming merge, whose
+// only difference is that it learns count last rather than first.
+func putHeader(out []byte, keyLen, recordLen, stride, count, samples int) {
 	copy(out[0:8], magic)
 	binary.LittleEndian.PutUint16(out[8:], uint16(keyLen))
 	binary.LittleEndian.PutUint16(out[10:], uint16(recordLen))
 	binary.LittleEndian.PutUint32(out[12:], uint32(count))
 	binary.LittleEndian.PutUint32(out[16:], uint32(stride))
 	binary.LittleEndian.PutUint32(out[20:], uint32(samples))
+}
+
+// sampleCount is how many samples a table of count records carries.
+func sampleCount(count, stride int) int {
+	if count <= 0 {
+		return 0
+	}
+	return (count + stride - 1) / stride
+}
+
+// encodeRecords writes a table from records already in sorted order, for
+// a caller that holds them all. A caller that does not holds a
+// StreamWriter instead.
+func encodeRecords(keyLen, recordLen, stride, count int, at func(int) []byte) []byte {
+	entryLen := keyLen + recordLen
+	samples := sampleCount(count, stride)
+	out := make([]byte, headerLen+samples*keyLen+count*entryLen)
+	putHeader(out, keyLen, recordLen, stride, count, samples)
 
 	sampleAt := out[headerLen:]
 	records := out[headerLen+samples*keyLen:]
@@ -264,28 +279,25 @@ func (t *Table) At(i int) (key, value []byte) {
 	return rec[:t.h.KeyLen], rec[t.h.KeyLen:]
 }
 
-// Merge streams several sorted tables into one, newest LAST: where a key
-// appears more than once the later table wins, which is what makes a
-// consolidation agree with the newest placement.
+// MergeKeys walks several sorted tables in key order, oldest FIRST,
+// calling fn once per distinct key with the record the LAST table holding
+// it gives — which is what makes a consolidation agree with the newest
+// placement.
 //
 // It holds one cursor per input rather than the inputs' contents, so
-// merging indexes that together describe a hundred million objects costs
-// memory proportional to the number of indexes. That is the property
-// that makes a global index buildable at all: it is never built at once,
-// only merged.
-func Merge(keyLen, recordLen, stride int, tables []*Table) ([]byte, error) {
-	for _, t := range tables {
-		if t.h.KeyLen != keyLen || t.h.RecordLen != recordLen {
-			return nil, fmt.Errorf("packidx: cannot merge a %d/%d table into a %d/%d one",
-				t.h.KeyLen, t.h.RecordLen, keyLen, recordLen)
-		}
-	}
-	if stride <= 0 {
-		stride = DefaultStride
-	}
+// walking indexes that together describe a hundred million objects costs
+// memory proportional to the number of indexes. That is the property that
+// makes a global index buildable at all: it is never built at once, only
+// merged.
+//
+// fn is told WHICH input supplied the record, for a caller whose values
+// mean something only relative to their own table — mpi's records are
+// offsets into that index's strings blob, so the winner's identity is not
+// a convenience there but the difference between a pack name and a wrong
+// one. Key and value alias the input table and stay valid only for the
+// call.
+func MergeKeys(tables []*Table, fn func(from int, key, value []byte) error) error {
 	at := make([]int, len(tables))
-	entry := keyLen + recordLen
-	var out [][]byte
 	for {
 		best, bestKey := -1, []byte(nil)
 		for i, t := range tables {
@@ -298,20 +310,220 @@ func Merge(keyLen, recordLen, stride int, tables []*Table) ([]byte, error) {
 			}
 		}
 		if best < 0 {
-			break
+			return nil
 		}
-		// Every input holding this key advances; the LAST one to hold it
+		// Every input holding this key advances; the last one to hold it
 		// supplies the record, since tables are given oldest first.
-		var rec []byte
+		from, key, value := -1, []byte(nil), []byte(nil)
 		for i, t := range tables {
 			if at[i] < t.Len() {
 				if k, v := t.At(at[i]); bytes.Equal(k, bestKey) {
-					rec = append(append(make([]byte, 0, entry), k...), v...)
+					from, key, value = i, k, v
 					at[i]++
 				}
 			}
 		}
-		out = append(out, rec)
+		if err := fn(from, key, value); err != nil {
+			return err
+		}
 	}
-	return encodeRecords(keyLen, recordLen, stride, len(out), func(i int) []byte { return out[i] }), nil
+}
+
+// StreamWriter encodes a table from records handed to it in ascending key
+// order, without holding them.
+//
+// The header must state the record COUNT, and a merge only knows it after
+// the last record — which is why the obvious encoder assembles the whole
+// output in memory, and why that bounds a merge to what one process can
+// hold. A StreamWriter instead parks the records in a SPOOL as they
+// arrive, keeps only the samples, and copies the spool through once the
+// header can be written.
+//
+// Memory is then O(samples): N/stride keys, 293 KB at a hundred million
+// entries, against the 1.6 GB the records themselves would be. The cost
+// is that the output is written twice — once to the spool, once to the
+// destination — which is the trade a merge that does not fit in memory
+// has to make.
+type StreamWriter struct {
+	keyLen    int
+	recordLen int
+	stride    int
+	spool     io.ReadWriteSeeker
+	buf       *bufio.Writer
+	count     int
+	samples   []byte
+	last      []byte
+	err       error
+}
+
+// NewStreamWriter starts a table over spool, which must be empty and
+// positioned at its start: an os.File in the caller's spool directory, or
+// MemSpool for a merge small enough not to want a file. A zero stride
+// takes DefaultStride.
+//
+// The spool is written and then read back from offset zero; nothing else
+// may write to it in between, and the caller owns closing and removing
+// it.
+func NewStreamWriter(spool io.ReadWriteSeeker, keyLen, recordLen, stride int) *StreamWriter {
+	if stride <= 0 {
+		stride = DefaultStride
+	}
+	return &StreamWriter{
+		keyLen: keyLen, recordLen: recordLen, stride: stride,
+		spool: spool,
+		// Records are 16 bytes; a write syscall each would make the spool
+		// the cost of the merge rather than a detail of it.
+		buf: bufio.NewWriterSize(spool, 64<<10),
+	}
+}
+
+// Add appends one record. Keys must ARRIVE SORTED and distinct: a
+// StreamWriter cannot sort what it has already spooled, so an out-of-order
+// key is refused here rather than encoded into a table that answers "not
+// found" for keys it holds.
+func (s *StreamWriter) Add(key, value []byte) error {
+	if s.err != nil {
+		return s.err
+	}
+	if len(key) != s.keyLen {
+		return fmt.Errorf("packidx: key is %d bytes, want %d", len(key), s.keyLen)
+	}
+	if len(value) != s.recordLen {
+		return fmt.Errorf("packidx: value is %d bytes, want %d", len(value), s.recordLen)
+	}
+	if s.count > 0 && bytes.Compare(key, s.last) <= 0 {
+		return fmt.Errorf("packidx: key %x arrived after %x; a streaming table cannot reorder", key, s.last)
+	}
+	if s.count%s.stride == 0 {
+		s.samples = append(s.samples, key...)
+	}
+	if _, err := s.buf.Write(key); err != nil {
+		s.err = err
+		return err
+	}
+	if _, err := s.buf.Write(value); err != nil {
+		s.err = err
+		return err
+	}
+	s.last = append(s.last[:0], key...)
+	s.count++
+	return nil
+}
+
+// Count is how many records have been added.
+func (s *StreamWriter) Count() int { return s.count }
+
+// Finish writes the header, the samples and then the spooled records to
+// w, and reports how many bytes that was.
+//
+// A failure leaves w holding a PREFIX of a table, which the caller must
+// discard: there is nothing here that can repair a half-written one, and
+// every caller writing to object storage is content-addressing the result
+// anyway, so a partial write is named differently and never confused for
+// the whole.
+func (s *StreamWriter) Finish(w io.Writer) (int64, error) {
+	if s.err != nil {
+		return 0, s.err
+	}
+	if err := s.buf.Flush(); err != nil {
+		return 0, err
+	}
+	head := make([]byte, headerLen+len(s.samples))
+	putHeader(head, s.keyLen, s.recordLen, s.stride, s.count, sampleCount(s.count, s.stride))
+	copy(head[headerLen:], s.samples)
+	n, err := w.Write(head)
+	if err != nil {
+		return int64(n), err
+	}
+	if _, err := s.spool.Seek(0, io.SeekStart); err != nil {
+		return int64(n), err
+	}
+	// CopyN rather than Copy: the record count is what the header just
+	// promised, so a spool that somehow holds more must not extend the
+	// table past it.
+	m, err := io.CopyN(w, s.spool, int64(s.count)*int64(s.keyLen+s.recordLen))
+	return int64(n) + m, err
+}
+
+// MergeTo merges sorted tables into w, newest LAST, spooling the records
+// rather than holding them. It is Merge for an output too large to keep.
+func MergeTo(w io.Writer, spool io.ReadWriteSeeker, keyLen, recordLen, stride int, tables []*Table) error {
+	for _, t := range tables {
+		if t.h.KeyLen != keyLen || t.h.RecordLen != recordLen {
+			return fmt.Errorf("packidx: cannot merge a %d/%d table into a %d/%d one",
+				t.h.KeyLen, t.h.RecordLen, keyLen, recordLen)
+		}
+	}
+	sw := NewStreamWriter(spool, keyLen, recordLen, stride)
+	if err := MergeKeys(tables, func(_ int, key, value []byte) error { return sw.Add(key, value) }); err != nil {
+		return err
+	}
+	_, err := sw.Finish(w)
+	return err
+}
+
+// Merge is MergeTo into memory, which is what a small merge wants: most
+// of them are one generation's index folded into the tier ahead of it,
+// kilobytes at a time, and asking a caller for a temp file to move
+// kilobytes would be the wrong default. It is a thin wrapper rather than
+// a second encoder so that the two cannot drift.
+func Merge(keyLen, recordLen, stride int, tables []*Table) ([]byte, error) {
+	var out bytes.Buffer
+	if err := MergeTo(&out, MemSpool(), keyLen, recordLen, stride, tables); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}
+
+// MemSpool is a spool backed by memory, for a merge small enough not to
+// want a file. Writing to it cannot fail, so a caller that uses one has
+// no new error to handle beyond the ones its inputs already produce.
+func MemSpool() io.ReadWriteSeeker { return &memSpool{} }
+
+type memSpool struct {
+	buf []byte
+	pos int64
+}
+
+func (m *memSpool) Write(p []byte) (int, error) {
+	// The append-at-the-end case is the only one a merge uses, and taking
+	// it directly leaves the growth to append rather than to a temporary
+	// per flush.
+	if m.pos == int64(len(m.buf)) {
+		m.buf = append(m.buf, p...)
+		m.pos += int64(len(p))
+		return len(p), nil
+	}
+	if end := m.pos + int64(len(p)); end > int64(len(m.buf)) {
+		m.buf = append(m.buf, make([]byte, end-int64(len(m.buf)))...)
+	}
+	copy(m.buf[m.pos:], p)
+	m.pos += int64(len(p))
+	return len(p), nil
+}
+
+func (m *memSpool) Read(p []byte) (int, error) {
+	if m.pos >= int64(len(m.buf)) {
+		return 0, io.EOF
+	}
+	n := copy(p, m.buf[m.pos:])
+	m.pos += int64(n)
+	return n, nil
+}
+
+func (m *memSpool) Seek(off int64, whence int) (int64, error) {
+	switch whence {
+	case io.SeekStart:
+		m.pos = off
+	case io.SeekCurrent:
+		m.pos += off
+	case io.SeekEnd:
+		m.pos = int64(len(m.buf)) + off
+	default:
+		return 0, fmt.Errorf("packidx: unknown seek whence %d", whence)
+	}
+	if m.pos < 0 {
+		return 0, fmt.Errorf("packidx: seek to %d, before the start of the spool", m.pos)
+	}
+	return m.pos, nil
 }

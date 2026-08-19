@@ -1,4 +1,34 @@
-package reach
+// Package extsort sorts more fixed-width records than fit in memory, and
+// hands them back as a stream or as a searchable table.
+//
+// Maintenance keeps asking questions about a hundred million objects, and
+// keeps reaching for a map to answer them. internal/reach needs to know
+// which identities something still references and where each one sits —
+// two sets keyed by identity, which is a MERGE and not a lookup.
+// internal/fsck needs to resolve every chunkref it walks past against
+// every entry the packs hold — which IS a lookup, but not one whose table
+// has to be resident. Both were bounded by the same wall: an identity map
+// at that scale is tens of gigabytes before anything is computed.
+//
+// Records are FIXED WIDTH and the key is their prefix. That is the whole
+// trick: a run sorts by swapping bytes in place with no per-record
+// allocation and no pointers to chase, which is what makes sorting a
+// hundred million of them a few seconds of CPU rather than a
+// garbage-collector problem.
+//
+// A Sorter accumulates into a buffer, sorts and spills a run when the
+// buffer fills, and offers two ways to read the result back:
+//
+//   - Sorted, a k-way merge — one pass, for a caller doing a merge join.
+//   - Table, the merge materialized into one file and MAPPED, so lookups
+//     are a binary search over pages rather than over a heap. Locally
+//     mapped, sort.Search over fixed-width records beats a sampled index
+//     (internal/packidx) precisely because there are no range requests to
+//     bound: packidx exists to make a REMOTE reader ask for a small
+//     window, and that cost does not apply here.
+//
+// Memory is the buffer plus one read buffer per run, either way.
+package extsort
 
 import (
 	"bufio"
@@ -12,28 +42,7 @@ import (
 	"sync"
 )
 
-// The external sort the sweep joins over.
-//
-// A sweep asks one question of two sets: which identities does some live
-// generation reference (the walk), and where does each identity sit (the
-// trailers). Holding either as a map is what bounded this package to
-// volumes that fit in memory — at a hundred million objects the identity
-// index alone is tens of gigabytes, and the package comment named it as
-// the thing to replace.
-//
-// Both sets are keyed by identity, so the join is a MERGE rather than a
-// lookup, and a merge needs its inputs sorted rather than resident. Each
-// side is accumulated into a fixed-width buffer, sorted and spilled as a
-// run when the buffer fills, and read back through a k-way merge. Memory
-// is then the buffer plus one small read buffer per run, whatever the
-// volume holds.
-//
-// Records are FIXED WIDTH and the key is their prefix, so a run is sorted
-// by swapping bytes in place with no per-record allocation and no
-// pointers to chase — the property that makes sorting a hundred million of
-// them a few seconds of CPU rather than a garbage-collector problem.
-
-// defaultSortBytes is how much a sorter buffers before spilling a run.
+// DefaultBytes is how much a sorter buffers before spilling a run.
 //
 // The memory a sort costs is the buffer plus one read buffer per run, and
 // runs are bytes/budget — so total is budget + runReadBytes*bytes/budget,
@@ -42,7 +51,7 @@ import (
 // and the cost curve flat around it; 64 MiB sits on that flat, at about
 // seventy runs and under 90 MiB held, and leaves headroom for a volume
 // several times larger before the fanout is worth thinking about again.
-const defaultSortBytes = 64 << 20
+const DefaultBytes = 64 << 20
 
 // runReadBytes is the read buffer given to each run in the final merge.
 // The merge is sequential per run, so this is about amortizing syscalls,
@@ -51,7 +60,7 @@ const runReadBytes = 256 << 10
 
 // sorter accumulates fixed-width records and streams them back in key
 // order. Safe for concurrent Add.
-type sorter struct {
+type Sorter struct {
 	dir    string
 	name   string
 	recLen int
@@ -69,16 +78,19 @@ type sorter struct {
 	done bool
 }
 
-func newSorter(dir, name string, keyLen, recLen, budget int) *sorter {
+// New starts a sorter over recLen-byte records keyed by their first
+// keyLen bytes, spilling runs into dir under names beginning with name. A
+// zero budget takes DefaultBytes.
+func New(dir, name string, keyLen, recLen, budget int) *Sorter {
 	if budget <= 0 {
-		budget = defaultSortBytes
+		budget = DefaultBytes
 	}
 	// Round the budget down to whole records so a flush never splits one.
 	if budget < recLen {
 		budget = recLen
 	}
 	budget -= budget % recLen
-	return &sorter{
+	return &Sorter{
 		dir: dir, name: name,
 		keyLen: keyLen, recLen: recLen, budget: budget,
 		buf: make([]byte, 0, budget),
@@ -89,18 +101,18 @@ func newSorter(dir, name string, keyLen, recLen, budget int) *sorter {
 // accumulate a whole trailer's or a whole catalog's worth locally and hand
 // them over once, so the lock is taken per object rather than per
 // identity.
-func (s *sorter) Add(recs []byte) error {
+func (s *Sorter) Add(recs []byte) error {
 	if len(recs) == 0 {
 		return nil
 	}
 	if len(recs)%s.recLen != 0 {
-		return fmt.Errorf("reach: %s batch is %d bytes, not a multiple of the %d-byte record",
+		return fmt.Errorf("extsort: %s batch is %d bytes, not a multiple of the %d-byte record",
 			s.name, len(recs), s.recLen)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.done {
-		return fmt.Errorf("reach: %s was added to after its merge began", s.name)
+		return fmt.Errorf("extsort: %s was added to after its merge began", s.name)
 	}
 	s.count += int64(len(recs) / s.recLen)
 	// A batch larger than the whole budget is spilled in budget-sized
@@ -121,7 +133,7 @@ func (s *sorter) Add(recs []byte) error {
 }
 
 // flushLocked sorts the buffer and writes it out as one run.
-func (s *sorter) flushLocked() error {
+func (s *Sorter) flushLocked() error {
 	if len(s.buf) == 0 {
 		return nil
 	}
@@ -145,12 +157,12 @@ func (s *sorter) flushLocked() error {
 	return nil
 }
 
-func (s *sorter) sortBuf() {
+func (s *Sorter) sortBuf() {
 	sort.Sort(&recSlice{b: s.buf, recLen: s.recLen, keyLen: s.keyLen, tmp: make([]byte, s.recLen)})
 }
 
 // Count is every record accepted, duplicates included.
-func (s *sorter) Count() int64 {
+func (s *Sorter) Count() int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.count
@@ -160,18 +172,18 @@ func (s *sorter) Count() int64 {
 // order. A sorter whose records never filled the buffer is served from
 // memory: most sweeps are small, and writing a run to spool a few hundred
 // records back would be the wrong default.
-func (s *sorter) Sorted() (*merged, error) {
+func (s *Sorter) Sorted() (*Merged, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.done = true
 	if len(s.runs) == 0 {
 		s.sortBuf()
-		return &merged{recLen: s.recLen, mem: s.buf}, nil
+		return &Merged{recLen: s.recLen, mem: s.buf}, nil
 	}
 	if err := s.flushLocked(); err != nil {
 		return nil, err
 	}
-	m := &merged{recLen: s.recLen, keyLen: s.keyLen}
+	m := &Merged{recLen: s.recLen, keyLen: s.keyLen}
 	m.heap.keyLen = s.keyLen
 	for _, fp := range s.runs {
 		f, err := os.Open(fp)
@@ -197,7 +209,7 @@ func (s *sorter) Sorted() (*merged, error) {
 // Close drops the runs. The sweep removes its whole spill directory too;
 // this is what keeps a long sweep's disk use bounded by the sorter that is
 // still in use rather than by every sorter it has ever opened.
-func (s *sorter) Close() error {
+func (s *Sorter) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.done = true
@@ -270,7 +282,7 @@ func (h *cursorHeap) Pop() any     { old := h.c; n := len(old); x := old[n-1]; h
 
 // merged streams records in key order, from memory when the sorter never
 // spilled and from a k-way merge over its runs when it did.
-type merged struct {
+type Merged struct {
 	recLen int
 	keyLen int
 
@@ -287,7 +299,7 @@ type merged struct {
 // it from Err, which the sweep turns into a failure — an incomplete sweep
 // rather than a short one, because a truncated join would under-count
 // liveness and that is the direction that deletes data.
-func (m *merged) Next() ([]byte, bool) {
+func (m *Merged) Next() ([]byte, bool) {
 	if m.err != nil {
 		return nil, false
 	}
@@ -321,9 +333,9 @@ func (m *merged) Next() ([]byte, bool) {
 }
 
 // Err is the read error that ended the merge early, if any.
-func (m *merged) Err() error { return m.err }
+func (m *Merged) Err() error { return m.err }
 
-func (m *merged) Close() error {
+func (m *Merged) Close() error {
 	var first error
 	for _, c := range m.heap.c {
 		if err := c.Close(); err != nil && first == nil {

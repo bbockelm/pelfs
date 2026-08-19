@@ -6,7 +6,6 @@ import (
 	"errors"
 	"math"
 	"path"
-	"sync"
 
 	"github.com/bbockelm/pelfs/internal/catalog"
 	"github.com/bbockelm/pelfs/internal/entrycodec"
@@ -252,7 +251,12 @@ func (c *checker) checkFile(ctx context.Context, cat catalog.Reader, j catJob, n
 // length, not that the bytes are the right bytes. Only Deep reads them.
 func (c *checker) checkChunkRef(r *catalog.ChunkRef, filePath string) {
 	idHex := hex.EncodeToString(r.Identity)
-	loc, ok := c.index[idHex]
+	var id [32]byte
+	copy(id[:], r.Identity)
+	// The chunkref's own clen picks between duplicate placements, so a
+	// chunk stored in two packs at two compressed lengths is checked
+	// against the one it claims to be rather than an arbitrary one.
+	loc, at, ok := c.locate(id, r.CLen)
 	if !ok {
 		// Report per file: the same lost chunk in ten files is ten damaged
 		// files, which is what a human needs to see.
@@ -263,26 +267,36 @@ func (c *checker) checkChunkRef(r *catalog.ChunkRef, filePath string) {
 		c.problem(KindChunkRefs, filePath, "chunk %s is %d stored bytes in pack %s, the chunkref says clen %d",
 			idHex, loc.length, loc.pack, r.CLen)
 	}
-	if c.seenChunk(idHex) {
+	if c.seenChunk(at) {
 		return
 	}
 	c.rep.Chunks++
 	if c.o.Deep {
-		c.jobs = append(c.jobs, chunkJob{idHex: idHex, alg: r.Alg, keyID: r.KeyID, llen: r.LLen, path: filePath})
+		c.verify <- chunkJob{
+			id: id, idHex: idHex, alg: r.Alg, keyID: r.KeyID, llen: r.LLen, clen: r.CLen, path: filePath,
+		}
 	}
 }
 
 // seenChunk reports (and records) whether a chunk identity has already
 // been counted. Content addressing means one identity backs many files;
 // fetching or counting it twice would misreport the generation.
-func (c *checker) seenChunk(idHex string) bool {
-	if c.chunks == nil {
-		c.chunks = make(map[string]struct{})
+//
+// The mark is a BIT PER INDEX POSITION rather than a set of identities.
+// Every chunk that gets this far resolved in the index, so the index
+// already holds each identity exactly where a lookup found it, and a
+// second copy of a hundred million 32-byte keys buys nothing over a
+// hundred million bits. At that scale it is the difference between 12 MB
+// and several gigabytes.
+func (c *checker) seenChunk(at int) bool {
+	word, bit := at/64, uint(at%64)
+	if c.seen == nil {
+		c.seen = make([]uint64, (c.index.Len()+63)/64)
 	}
-	if _, dup := c.chunks[idHex]; dup {
+	if c.seen[word]&(1<<bit) != 0 {
 		return true
 	}
-	c.chunks[idHex] = struct{}{}
+	c.seen[word] |= 1 << bit
 	return false
 }
 
@@ -297,45 +311,58 @@ func (c *checker) shardFor(ino uint64) *superblock.ShardEntry {
 	return nil
 }
 
-// verifyChunks is deep mode: fetch, decode, and (where identity is
-// recomputable) rehash every distinct chunk the namespace references.
-// Failures are per-chunk problems; only a cancelled context stops the
-// pass.
-func (c *checker) verifyChunks(ctx context.Context) error {
+// startVerifiers opens deep mode's worker pool. Chunks are verified AS
+// THE WALK FINDS THEM rather than collected into a work list and run
+// afterwards.
+//
+// The work list was the last structure here that grew with object count:
+// one entry per distinct chunk, each carrying a path, which at a hundred
+// million chunks is gigabytes held for the length of the walk. Streaming
+// it costs nothing — the pool is bounded, the walk blocks when every
+// worker is busy, which is exactly the backpressure a work list was
+// hiding — and it starts fetching during the walk instead of after it.
+func (c *checker) startVerifiers(ctx context.Context) {
+	if !c.o.Deep {
+		return
+	}
 	workers := c.o.Workers
 	if workers <= 0 {
 		workers = 8
 	}
-	work := make(chan chunkJob)
-	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := range work {
+	// The workers range over a LOCAL copy of the channel: stopVerifiers
+	// clears the field, and a worker that had not yet evaluated the range
+	// would otherwise be reading it as that write lands.
+	ch := make(chan chunkJob)
+	c.verify = ch
+	for range workers {
+		c.verifiers.Go(func() {
+			for j := range ch {
 				if ctx.Err() != nil {
-					return
+					// Drain rather than return: the walk is still sending, and
+					// a worker that stops reading would block it forever.
+					continue
 				}
 				c.verifyChunk(ctx, j)
 			}
-		}()
+		})
 	}
-	for _, j := range c.jobs {
-		select {
-		case work <- j:
-		case <-ctx.Done():
-			close(work)
-			wg.Wait()
-			return ctx.Err()
-		}
+}
+
+// stopVerifiers closes the pool and waits for it. Safe to call when deep
+// mode is off, and safe to call twice.
+func (c *checker) stopVerifiers() {
+	if c.verify == nil {
+		return
 	}
-	close(work)
-	wg.Wait()
-	return ctx.Err()
+	ch := c.verify
+	c.verify = nil
+	close(ch)
+	c.verifiers.Wait()
 }
 
 func (c *checker) verifyChunk(ctx context.Context, j chunkJob) {
-	loc := c.index[j.idHex] // present: checkChunkRef only queues indexed chunks
+	// Present: checkChunkRef only queues chunks that resolved.
+	loc, _, _ := c.locate(j.id, j.clen)
 	stored, err := c.readPackRange(ctx, loc)
 	if err != nil {
 		c.problem(KindChunk, j.path, "chunk %s: %v", j.idHex, err)

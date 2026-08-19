@@ -87,7 +87,7 @@ is counted at all.
 
 So both sides are accumulated as fixed-width records, sorted, spilled as
 runs when a buffer fills, and read back through a k-way merge
-(`internal/reach/sorter.go`).
+(`internal/extsort`).
 
 | side | record | width |
 |---|---|---|
@@ -127,8 +127,40 @@ a namespace from packs alone — and it lands in the safe direction: the
 catalog fails to resolve, which is a failure, which makes the sweep
 incomplete and every pack fully live.
 
-`internal/fsck` still holds its index whole. It has the same wall and the
-same fix available.
+## fsck: the same wall, a different shape
+
+`internal/fsck` had the same problem and could not take the same
+solution. It resolves a chunkref **inline**, as the walk passes it, so
+that the problem it reports carries the path the reference came from — a
+merge join would have to defer every finding to a second pass and reunite
+it with its path afterwards.
+
+What transfers is the sort, not the join. The index becomes a sorted,
+**mapped** table (`extsort.Table`): a lookup is a binary search over
+pages rather than a probe into a resident hash table, so what is resident
+is page cache the kernel can reclaim. At a hundred million entries that
+is 27 probes, nearly all landing in the same warm upper levels. A sampled
+index (`internal/packidx`) would be the wrong tool here — its samples
+exist to bound what a REMOTE reader asks for, and there are no range
+requests to bound over a local mapping.
+
+Two smaller structures fell out of having the table:
+
+- **The set of chunks already counted is a bit per index position.**
+  Every chunk that gets that far resolved in the index, so the index
+  already holds each identity exactly where the lookup found it; a second
+  copy of a hundred million keys buys nothing over a hundred million
+  bits. This is a small, local instance of the bitmap idea above — over
+  positions in a sorted table, computed rather than persisted.
+- **Deep mode's work list is gone.** Chunks are verified as the walk
+  finds them through a bounded pool, which also starts fetching during
+  the walk instead of after it. The work list was hiding the backpressure
+  a bounded pool makes explicit.
+
+Keeping every duplicate placement rather than letting the last writer win
+also fixed a latent false positive: the same identity in two packs may be
+stored at two compressed lengths, and checking a chunkref against an
+arbitrary one of them would report an intact file as damaged.
 
 ## Designed, not built: persisted reachability
 

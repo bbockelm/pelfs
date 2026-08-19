@@ -25,10 +25,35 @@
 // names, so an entry correctly encrypted but stored under the wrong key
 // in the pack index would pass. Every bit flip, truncation, and foreign
 // substitution is still caught.
+//
+// # Memory
+//
+// Three structures here used to grow with the number of OBJECTS, which
+// bounded fsck to volumes whose namespace fit in RAM. None of them does
+// now, and the volume's size shows up as disk and page cache instead:
+//
+//   - The identity index is a sorted, MAPPED table (internal/extsort)
+//     rather than a map. Unlike internal/reach, fsck cannot make this a
+//     merge join: it resolves a chunkref inline, as it walks past it, so
+//     that the problem it reports carries the path the reference came
+//     from. What it can do is give up the resident hash table for a
+//     binary search over pages — 27 probes at a hundred million entries,
+//     nearly all of them landing in the same warm upper levels.
+//   - The set of chunks already counted is a BIT PER INDEX POSITION.
+//     Every chunk that gets that far resolved in the index, so the index
+//     already holds each identity where the lookup found it; a second
+//     copy of a hundred million keys buys nothing over a hundred million
+//     bits.
+//   - Deep mode's work list is gone. Chunks are verified as the walk
+//     finds them, through a bounded pool, which also starts fetching
+//     during the walk rather than after it.
+//
+// What stays resident is proportional to packs, catalogs and shards.
 package fsck
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -41,6 +66,7 @@ import (
 	"github.com/bbockelm/pelfs/internal/catalog"
 	"github.com/bbockelm/pelfs/internal/chunkid"
 	"github.com/bbockelm/pelfs/internal/entrycodec"
+	"github.com/bbockelm/pelfs/internal/extsort"
 	"github.com/bbockelm/pelfs/internal/manifest"
 	"github.com/bbockelm/pelfs/internal/packstore"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
@@ -132,6 +158,11 @@ type Options struct {
 	Deep bool
 	// Workers bounds deep-mode concurrency (default 8).
 	Workers int
+	// SortBytes is how much the identity index buffers before spilling a
+	// run (default 64 MiB, internal/extsort). It is fsck's memory bound in
+	// all but name: the index is the one structure here that grows with
+	// object count rather than with pack, catalog or shard count.
+	SortBytes int
 }
 
 // Problem is one failure. Path locates it: a namespace path for tree
@@ -176,6 +207,23 @@ type packLoc struct {
 	length int64
 }
 
+// The identity index's record layout (internal/extsort). The pack is an
+// ORDINAL into checker.packNames rather than a name: names are 23 bytes
+// and there are thousands of them against hundreds of millions of
+// entries, so interning them is the difference between a 52-byte record
+// and a 63-byte one, and between a name compared per probe and an int.
+const (
+	idLen     = 32
+	locRecLen = idLen + 4 + 8 + 8
+)
+
+func putLoc(dst []byte, id [32]byte, pack int, off, length int64) {
+	copy(dst[0:idLen], id[:])
+	binary.LittleEndian.PutUint32(dst[idLen:], uint32(pack))
+	binary.LittleEndian.PutUint64(dst[idLen+4:], uint64(off))
+	binary.LittleEndian.PutUint64(dst[idLen+12:], uint64(length))
+}
+
 // errNotIndexed marks an identity that resolves in no listed pack, so the
 // caller can report "missing" rather than "corrupt".
 var errNotIndexed = errors.New("not present in any listed pack")
@@ -185,7 +233,14 @@ type checker struct {
 	rep      *Report
 	spillDir string
 
-	index map[string]packLoc
+	// index resolves an identity to where its bytes sit. It is a SORTED,
+	// MAPPED table rather than a map: fsck resolves a chunkref inline, as
+	// it walks past it, so that the problem it reports carries the path the
+	// reference came from — which rules out the merge join internal/reach
+	// uses, but not the sort underneath it. What is resident is page cache
+	// the kernel can reclaim rather than heap it cannot.
+	index     *extsort.Table
+	packNames []string
 
 	// verifyIdentity is set from the root catalog's identity algo:
 	// plain BLAKE3 is recomputable, keyed BLAKE3 is not (see the package
@@ -197,10 +252,15 @@ type checker struct {
 	// (one per inode range) and are revisited by every promoted inode.
 	shards map[string]catalog.Reader
 
-	// chunks records the distinct chunk identities the namespace
-	// references; jobs is the deep-mode work list, one entry per identity.
-	chunks map[string]struct{}
-	jobs   []chunkJob
+	// seen marks, one bit per index position, the chunks already counted.
+	// Content addressing means one identity backs many files, and counting
+	// or fetching it twice would misreport the generation (seenChunk).
+	seen []uint64
+
+	// verify carries deep mode's work to its pool, which runs FOR THE
+	// LENGTH OF THE WALK rather than after it. Nil when Deep is off.
+	verify    chan chunkJob
+	verifiers sync.WaitGroup
 
 	mu sync.Mutex
 }
@@ -209,10 +269,12 @@ type checker struct {
 // KeyID come from the chunkref that referenced it — never sniffed from the
 // bytes (docs/design-packfs.md, "Codec marking").
 type chunkJob struct {
+	id    [32]byte
 	idHex string
 	alg   int64
 	keyID int64
 	llen  int64
+	clen  int64
 	path  string
 }
 
@@ -249,12 +311,15 @@ func Check(ctx context.Context, o Options) (*Report, error) {
 		o:        o,
 		rep:      &Report{},
 		spillDir: spillDir,
-		index:    make(map[string]packLoc),
 		shards:   make(map[string]catalog.Reader),
 	}
 	defer c.closeShards()
 
-	c.checkPacks(ctx)
+	if err := c.checkPacks(ctx); err != nil {
+		c.sortProblems()
+		return c.rep, err
+	}
+	defer c.index.Close() //nolint:errcheck
 
 	root, rootHex, err := c.openRoot(ctx)
 	if err != nil {
@@ -262,16 +327,15 @@ func Check(ctx context.Context, o Options) (*Report, error) {
 		return c.rep, err
 	}
 	c.checkShards(ctx)
+	c.startVerifiers(ctx)
 	c.walk(ctx, root, rootHex)
 	c.releaseCatalog(root, rootHex)
+	c.stopVerifiers()
 
-	if o.Deep {
-		if err := c.verifyChunks(ctx); err != nil {
-			c.sortProblems()
-			return c.rep, err
-		}
-	}
 	c.sortProblems()
+	if err := ctx.Err(); err != nil {
+		return c.rep, err
+	}
 	return c.rep, nil
 }
 
@@ -299,7 +363,12 @@ func (c *checker) sortProblems() {
 // that fails is reported and skipped: its entries are simply absent from
 // the index, so everything referencing them surfaces as missing rather
 // than aborting the sweep.
-func (c *checker) checkPacks(ctx context.Context) {
+//
+// The returned error is reserved for a failure of the INDEX ITSELF — a
+// sort that cannot spill or map. That one is fatal where a bad pack is
+// not: a half-built index would report intact files as missing, which is
+// the report that gets a healthy volume restored from backup.
+func (c *checker) checkPacks(ctx context.Context) error {
 	// The pack set comes from the manifest when the generation has one and
 	// from the inline list otherwise (manifest.Packs). An unreadable
 	// manifest is reported as one problem and leaves the index empty, so
@@ -308,10 +377,20 @@ func (c *checker) checkPacks(ctx context.Context) {
 	// content cannot be found. It is not a fatal error, because fsck's
 	// contract is to report every failure rather than to stop at the
 	// first.
+	sorter := extsort.New(c.spillDir, "index", idLen, locRecLen, c.o.SortBytes)
+	defer sorter.Close() //nolint:errcheck
+
 	packs, err := manifest.Packs(ctx, c.o.Inner, c.o.SB)
 	if err != nil {
 		c.problem(KindMissingManifest, manifest.Dir, "%v", err)
-		return
+		// Not fatal, and the empty index is the point: everything
+		// downstream then surfaces as missing, which is the truth about a
+		// generation whose pack set cannot be read.
+		var terr error
+		if c.index, terr = sorter.Table(); terr != nil {
+			return fmt.Errorf("fsck: building the identity index: %w", terr)
+		}
+		return nil
 	}
 	for _, pe := range packs {
 		key := packstore.PackDirKey + "/" + pe.Name
@@ -335,13 +414,82 @@ func (c *checker) checkPacks(ctx context.Context) {
 			continue
 		}
 		c.rep.Packs++
+		ord := len(c.packNames)
+		c.packNames = append(c.packNames, pe.Name)
+		batch := make([]byte, 0, len(entries)*locRecLen)
 		for _, e := range entries {
-			// Identical content dedups at publish, so a key may appear in
-			// several packs naming the same bytes; last writer wins
-			// harmlessly (the genfs index rule).
-			c.index[e.Key] = packLoc{pack: pe.Name, off: e.Off, length: e.Length}
+			var id [32]byte
+			if n, derr := hex.Decode(id[:], []byte(e.Key)); derr != nil || n != len(id) {
+				// A trailer key that is not an identity indexes nothing any
+				// chunkref can name. Reported rather than skipped silently:
+				// it is damage in the one structure everything else trusts.
+				c.problem(KindPackTrailer, path, "entry key %q is not a 32-byte identity", e.Key)
+				continue
+			}
+			var rec [locRecLen]byte
+			putLoc(rec[:], id, ord, e.Off, e.Length)
+			batch = append(batch, rec[:]...)
+		}
+		if err := sorter.Add(batch); err != nil {
+			return fmt.Errorf("fsck: building the identity index: %w", err)
 		}
 	}
+	// Identical content dedups at publish, so a key may appear in several
+	// packs naming the same bytes. All of them are kept: they may differ in
+	// STORED length if they were compressed differently, and a chunkref
+	// matching any one of them is intact (locate).
+	c.index, err = sorter.Table()
+	if err != nil {
+		return fmt.Errorf("fsck: building the identity index: %w", err)
+	}
+	return nil
+}
+
+// locate resolves an identity, preferring a placement whose stored length
+// is the one the caller expected. wantLen of -1 takes the first.
+//
+// The preference is what keeps duplicate placements from inventing
+// problems: the same bytes in two packs may be stored at two lengths, and
+// checking a chunkref against an arbitrary one of them would report an
+// intact file as damaged.
+// The position returned is the FIRST record with that identity, which is
+// the stable name for the identity itself: duplicate placements share it,
+// so it is what seenChunk marks.
+func (c *checker) locate(id [32]byte, wantLen int64) (packLoc, int, bool) {
+	_, at, n := c.index.Lookup(id[:])
+	if n == 0 {
+		return packLoc{}, 0, false
+	}
+	for i := at; i < at+n; i++ {
+		if loc := c.decodeLoc(i); loc.length == wantLen {
+			return loc, at, true
+		}
+	}
+	return c.decodeLoc(at), at, true
+}
+
+func (c *checker) decodeLoc(i int) packLoc {
+	rec := c.index.At(i)
+	ord := binary.LittleEndian.Uint32(rec[idLen:])
+	loc := packLoc{
+		off:    int64(binary.LittleEndian.Uint64(rec[idLen+4:])),
+		length: int64(binary.LittleEndian.Uint64(rec[idLen+12:])),
+	}
+	if int(ord) < len(c.packNames) {
+		loc.pack = c.packNames[ord]
+	}
+	return loc
+}
+
+// locateHex is locate for a caller holding hex, which the catalog-class
+// paths do because they name spill files by it.
+func (c *checker) locateHex(idHex string) (packLoc, bool) {
+	var id [32]byte
+	if n, err := hex.Decode(id[:], []byte(idHex)); err != nil || n != len(id) {
+		return packLoc{}, false
+	}
+	loc, _, ok := c.locate(id, -1)
+	return loc, ok
 }
 
 // openRoot opens the root catalog and settles the identity mode. The root
@@ -465,7 +613,7 @@ func (c *checker) openCatalogObject(ctx context.Context, idHex, path, missingKin
 // superblock names — never sniffed (docs/design-packfs.md, "Codec
 // marking").
 func (c *checker) decodeObject(ctx context.Context, idHex string) ([]byte, error) {
-	loc, ok := c.index[idHex]
+	loc, ok := c.locateHex(idHex)
 	if !ok {
 		return nil, errNotIndexed
 	}

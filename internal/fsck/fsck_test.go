@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bbockelm/pelfs/internal/fakeorigin"
 	"github.com/bbockelm/pelfs/internal/fsck"
@@ -580,4 +581,67 @@ func TestUnreadableManifestIsReported(t *testing.T) {
 		t.Errorf("verified %d packs without a pack list", rep.Packs)
 	}
 	t.Logf("reported: %s", got[0].Detail)
+}
+
+// Deep mode verifies chunks AS THE WALK FINDS THEM, through a bounded
+// pool, rather than collecting a work list and running it afterwards. The
+// pool is the part that can deadlock: a walk blocked sending to workers
+// that have stopped reading would hang forever, and a cancelled context
+// is exactly when workers are tempted to stop reading.
+func TestDeepCancellationDoesNotHang(t *testing.T) {
+	inner, _, res := healthyFixture(t, "cdcdcdcd-3333-4444-5555-666666666666", publish.Options{})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// A one-worker pool makes the channel the narrowest it can be, so a
+		// walk that blocks on it blocks immediately.
+		//nolint:errcheck // the error is the point of the assertion below
+		rep, err := fsck.Check(ctx, fsck.Options{
+			Inner: inner, SB: res.Superblock, CacheDir: t.TempDir(), Deep: true, Workers: 1,
+		})
+		if rep == nil {
+			t.Error("a cancelled deep check returned no report at all")
+		}
+		if err == nil {
+			t.Error("a cancelled deep check reported success")
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("a cancelled deep check did not return; the verifier pool deadlocked the walk")
+	}
+}
+
+// Every distinct chunk is verified exactly once however many files share
+// it — the property the dedup bitset carries now that there is no
+// identity set to consult.
+func TestSharedChunksAreVerifiedOnce(t *testing.T) {
+	inner, _ := newInner(t)
+	v := testvol.New(t, inner, testvol.Options{VolumeID: testvol.ParseUUID(t, "abababab-3333-4444-5555-666666666666")})
+	body := pseudorandom(4<<20, 77)
+	for i := range 6 {
+		v.WriteFile(rootIno, fmt.Sprintf("copy%d.bin", i), body)
+	}
+	res := v.Publish(publish.Options{})
+
+	rep := check(t, inner, res.Superblock, fsck.Options{Deep: true, Workers: 4})
+	dumpProblems(t, rep)
+	if !rep.OK() {
+		t.Fatalf("a healthy generation reported %d problems", len(rep.Problems))
+	}
+	if rep.Files != 6 {
+		t.Fatalf("walked %d files, want 6", rep.Files)
+	}
+	if rep.ChunksVerified != rep.Chunks {
+		t.Fatalf("verified %d of %d chunks", rep.ChunksVerified, rep.Chunks)
+	}
+	// Six identical 4 MiB files dedup to one copy's worth of chunks.
+	if rep.Chunks > 8 {
+		t.Fatalf("six copies of one body counted %d distinct chunks; the dedup mark is not holding", rep.Chunks)
+	}
+	t.Logf("6 files, %d logical bytes, %d distinct chunks all verified once", rep.Bytes, rep.Chunks)
 }

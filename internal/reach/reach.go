@@ -60,8 +60,8 @@
 // hex string is tens of gigabytes before the reference set is counted at
 // all. Both sides are keyed by identity, so the question was never a
 // lookup; it only looked like one because a map was the easiest thing to
-// reach for. Sorting instead (sorter.go) makes the pass sequential, the
-// records fixed-width, the keys raw rather than hex, and the memory a
+// reach for. Sorting instead (internal/extsort) makes the pass sequential,
+// the records fixed-width, the keys raw rather than hex, and the memory a
 // buffer the caller sizes (Options.SortBytes).
 //
 // What remains resident is proportional to the number of PACKS, the
@@ -94,6 +94,7 @@ import (
 	"sync"
 
 	"github.com/bbockelm/pelfs/internal/entrycodec"
+	"github.com/bbockelm/pelfs/internal/extsort"
 	"github.com/bbockelm/pelfs/internal/manifest"
 	"github.com/bbockelm/pelfs/internal/packstore"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
@@ -311,8 +312,8 @@ type sweeper struct {
 	// places is every (identity, pack) placement the trailers describe and
 	// refs is every identity the walk reaches. They are the two sides of
 	// the join, streamed rather than held (sorter.go).
-	places *sorter
-	refs   *sorter
+	places *extsort.Sorter
+	refs   *extsort.Sorter
 
 	mu sync.Mutex
 	// objLoc locates the catalog-class entries — catalogs, inode shards,
@@ -396,8 +397,8 @@ func Sweep(ctx context.Context, o Options) (*Report, error) {
 	s := &sweeper{
 		o:        o,
 		spillDir: spillDir,
-		places:   newSorter(spillDir, "places", idLen, placeLen, o.SortBytes),
-		refs:     newSorter(spillDir, "refs", idLen, idLen, o.SortBytes),
+		places:   extsort.New(spillDir, "places", idLen, placeLen, o.SortBytes),
+		refs:     extsort.New(spillDir, "refs", idLen, idLen, o.SortBytes),
 		objLoc:   make(map[[32]byte]entryLoc),
 		promoted: make(map[int64]struct{}),
 		walked:   make(map[[32]byte]struct{}),

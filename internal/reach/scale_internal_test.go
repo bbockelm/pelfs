@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"runtime"
 	"testing"
+
+	"github.com/bbockelm/pelfs/internal/extsort"
 )
 
 // feed builds a synthetic volume's worth of placements and references —
@@ -12,8 +14,8 @@ import (
 func feed(t *testing.T, n, budget int) (heapMiB uint64) {
 	t.Helper()
 	dir := t.TempDir()
-	places := newSorter(dir, "places", idLen, placeLen, budget)
-	refs := newSorter(dir, "refs", idLen, idLen, budget)
+	places := extsort.New(dir, "places", idLen, placeLen, budget)
+	refs := extsort.New(dir, "refs", idLen, idLen, budget)
 	defer places.Close() //nolint:errcheck
 	defer refs.Close()   //nolint:errcheck
 

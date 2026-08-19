@@ -30,7 +30,11 @@ func isTable(stored []byte) bool {
 
 // encodeTable writes the table form, or reports why it cannot.
 func encodeTable(tr *trailer) ([]byte, error) {
-	b := packidx.NewBuilder(tableRecord)
+	// A pack's own trailer keeps the FULL identity and the full extent:
+	// inside a pack the offset is the answer, not a hint to check
+	// elsewhere. Truncation is for the multi-pack index, where a false
+	// positive costs one extra pack read.
+	b := packidx.NewBuilder(packidx.KeySize, tableRecord, 0)
 	for _, e := range tr.Entries {
 		id, err := hex.DecodeString(e.Key)
 		if err != nil || len(id) != packidx.KeySize {
@@ -42,13 +46,11 @@ func encodeTable(tr *trailer) ([]byte, error) {
 		if e.Off < 0 || e.Length < 0 {
 			return nil, fmt.Errorf("packstore: entry %q has extent [%d,+%d)", e.Key, e.Off, e.Length)
 		}
-		var key [packidx.KeySize]byte
-		copy(key[:], id)
 		var v [tableRecord]byte
 		binary.LittleEndian.PutUint64(v[0:], uint64(e.Off))
 		binary.LittleEndian.PutUint64(v[8:], uint64(e.Length))
 		v[16] = entryTypeCode(e.Type)
-		if err := b.Add(key, v[:]); err != nil {
+		if err := b.Add(id, v[:]); err != nil {
 			return nil, err
 		}
 	}
@@ -80,7 +82,7 @@ func decodeTable(stored []byte) (*trailer, error) {
 	for i := 0; i < tbl.Len(); i++ {
 		id, v := tbl.At(i)
 		tr.Entries = append(tr.Entries, PackEntry{
-			Key:    hex.EncodeToString(id[:]),
+			Key:    hex.EncodeToString(id),
 			Off:    int64(binary.LittleEndian.Uint64(v[0:])),
 			Length: int64(binary.LittleEndian.Uint64(v[8:])),
 			Type:   entryTypeName(v[16]),
@@ -135,7 +137,7 @@ func LookupStored(stored []byte, id [32]byte) (PackEntry, bool) {
 	if err != nil {
 		return PackEntry{}, false
 	}
-	v, ok := tbl.Lookup(id)
+	v, ok := tbl.Lookup(id[:])
 	if !ok {
 		return PackEntry{}, false
 	}

@@ -668,10 +668,26 @@ trips. Git added its index to save microseconds; we add ours to save
 minutes.
 
 **Both are the same structure** (`internal/packidx`): fixed-width records
-sorted by identity behind a 256-entry fanout, read in place. 81 ns per
-lookup against 50,000 entries, with nothing decompressed and nothing
+sorted by identity, read in place, with nothing decompressed and nothing
 parsed — against a zstd-compressed JSON trailer, which has to be
 decompressed and parsed in full to answer one question.
+
+Three details of it were each a correction of the last, and the reasons
+generalize:
+
+  - **Records interleave key and value.** Separate arrays are right for a
+    mapped local file, which is what git's `.idx` is, and wrong for a
+    table read by range request, where one lookup then needs two distant
+    reads instead of one contiguous one.
+  - **There is no fanout.** A fanout assumes the key distribution, which
+    for a cryptographic hash is safe but pointless: position is already
+    predictable from the key. What a remote reader needs is not a better
+    guess but a BOUND on the extent to ask for, so the table samples every
+    4,096th key instead. That costs `N/4096` keys — 293 KB at a hundred
+    million — and bounds a lookup to one window whatever the distribution.
+  - **Keys may be truncated.** A short key can only produce a false
+    positive, because the caller holds the full identity and checks what
+    it finds.
 
 **An index is DERIVED, and that is the point.** Publish writes it, repack
 rewrites it, losing one costs speed and nothing else. Catalogs and
@@ -691,25 +707,67 @@ each load in 101 ms, and a test fails if that ever serialises.
 **A failed index is not a failed mount.** It is derived, the trailers
 still answer, and a reader that cannot verify one says so and carries on.
 
-### Sizing, merging and retiring
+### An entry is 16 bytes, and what that costs at scale
 
-At 53 bytes per entry, the 2 MiB target is about 40,000 entries — which
-at a 2 MiB pack cut and a 4 KiB average chunk is roughly 80 packs per
-index, so 201 packs is three indexes and one parallel fetch.
+12 bytes of identity and 4 naming the pack — no offset, no length, no
+type. Those are redundant with the pack the reader is about to fetch:
+`genfs` takes packs whole, so the pack's own trailer says where
+everything inside it is. An index repeating them would be a second record
+to keep in agreement with the first, describing bytes the reader already
+has. The cost of that choice, stated plainly: the index cannot answer a
+RANGED read of one chunk without touching the pack, so this format and
+the whole-pack policy now depend on each other.
 
-  - **Target 2 MiB.** An index is fetched WHOLE, so its size is what
-    consulting it costs, and matching the pack cut keeps that comparable
-    to fetching one pack.
-  - **Merge at publish, bounded.** A publish writes an index for the
-    packs it created. If that index and the newest existing one are both
-    well under target, they are merged and the old one superseded — but
-    only while the rewrite stays within the target, so a small generation
-    never pays a large re-upload to tidy the index set.
-  - **Retire below liveness.** An index whose covered packs are mostly
-    deleted spends its bytes on entries that resolve to nothing. Under
-    50% live, a repack drops it and re-emits its live entries; an index
-    whose packs are all gone is deletable outright. Retention keeps an
-    index while any live superblock names it, exactly as for packs.
+| entries | index bytes | samples held |
+| --- | --- | --- |
+| 1 M | 16 MB | 3 KB |
+| 10 M | 160 MB | 29 KB |
+| 100 M | **1.6 GB** | **293 KB** |
+
+At a hundred million objects the index is not something to fetch, and it
+is not meant to be: a reader takes the header and samples once, then one
+~64 KB window per lookup. Fetching an index whole is an optimization for
+small ones, not the model.
+
+**Truncation is only ever a false positive.** At 96 bits and a hundred
+million entries a collision is a ~10^-13 event, and the index RECORDS one
+rather than resolving it: both pack names, comma-joined, and the reader
+looks in each until a pack's own trailer confirms the full identity.
+
+### Tiers, merging and retiring
+
+Indexes are size-tiered, like the write path itself: a generation
+publishes a small index for the packs it created, and consolidation
+merges them into geometrically larger ones. A hundred million objects is
+then five to ten indexes rather than a few thousand.
+
+  - **A lookup consults them newest-first**, which is exactly "the most
+    recent pack holding this object" — an older tier's answer names a
+    pack retention is likelier to have swept. The probes go out in
+    parallel, so ten tiers cost one round trip of latency, not ten.
+  - **Merging streams.** One cursor per input, so merging tiers that
+    together describe a hundred million objects costs memory proportional
+    to the number of TIERS. That is what makes a large index buildable at
+    all: it is never built at once, only merged — and why a publish emits
+    a small index rather than maintaining a global one. The output
+    records are still assembled in memory, which bounds a merge to the
+    tier being written; a merge large enough to matter should spool, and
+    nothing needs that yet.
+  - **Retire below liveness.** An index whose packs are mostly deleted
+    spends its bytes on entries resolving to nothing. Under 50% live, a
+    repack drops it and re-emits its live entries; one whose packs are
+    all gone is deletable outright. Retention keeps an index while any
+    live superblock names it, exactly as for packs.
+
+### The pack list is the bigger problem at that scale
+
+A hundred million objects at a 2 MiB cut is 200,000-400,000 packs, and
+every superblock carries the full pack list forward — name, trailer hash,
+size, roughly 64 bytes each. That is 12-25 MB of superblock, read on
+every mount and rewritten on every generation, which dwarfs a
+range-read index and sits on the critical path of everything. No index
+design fixes it; the cut size does, and a volume orders of magnitude
+larger than a source tree wants a proportionally larger one.
 
 ### Root catalog hint
 

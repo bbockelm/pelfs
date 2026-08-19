@@ -29,9 +29,7 @@ func buildIndex(t *testing.T, packs, perPack int) ([]byte, *Builder) {
 	for p := 0; p < packs; p++ {
 		pack := "p-" + strconv.Itoa(p)
 		for e := 0; e < perPack; e++ {
-			if err := b.Add(id(n), pack, int64(e*100), 100, ""); err != nil {
-				t.Fatal(err)
-			}
+			b.Add(id(n), pack)
 			n++
 		}
 	}
@@ -51,16 +49,13 @@ func TestLookupResolvesToTheRightPack(t *testing.T) {
 		t.Fatalf("%d packs, want 40", got)
 	}
 	for n := uint64(0); n < 2000; n++ {
-		loc, ok := ix.Lookup(id(n))
+		packs, ok := ix.Lookup(id(n))
 		if !ok {
 			t.Fatalf("entry %d is missing", n)
 		}
-		wantPack := "p-" + strconv.Itoa(int(n)/50)
-		if loc.Pack != wantPack {
-			t.Fatalf("entry %d resolved to %s, want %s", n, loc.Pack, wantPack)
-		}
-		if want := int64(int(n) % 50 * 100); loc.Off != want {
-			t.Fatalf("entry %d is at %d, want %d", n, loc.Off, want)
+		want := "p-" + strconv.Itoa(int(n)/50)
+		if len(packs) != 1 || packs[0] != want {
+			t.Fatalf("entry %d resolved to %v, want [%s]", n, packs, want)
 		}
 	}
 	if _, ok := ix.Lookup(id(999999)); ok {
@@ -69,24 +64,33 @@ func TestLookupResolvesToTheRightPack(t *testing.T) {
 	t.Logf("2000 entries across 40 packs in %d bytes (%d per entry)", len(raw), len(raw)/2000)
 }
 
-func TestEntryTypesSurvive(t *testing.T) {
-	b := NewBuilder()
-	for i, typ := range []string{"", "catalog", "shard", "sb"} {
-		if err := b.Add(id(uint64(i)), "p-0", int64(i), 1, typ); err != nil {
-			t.Fatal(err)
-		}
+// A truncated key can only be a false positive, so a collision is
+// RECORDED rather than resolved: both packs are named, and the caller
+// looks in each until one's trailer confirms the full identity.
+func TestATruncatedKeyCollisionNamesBothPacks(t *testing.T) {
+	var a, bID [32]byte
+	for i := 0; i < KeyLen; i++ {
+		a[i], bID[i] = 0x11, 0x11
 	}
+	a[31], bID[31] = 1, 2 // same 12-byte prefix, different identities
+
+	b := NewBuilder()
+	b.Add(a, "p-first")
+	b.Add(bID, "p-second")
 	ix, err := Open(b.Encode())
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i, want := range []string{"", "catalog", "shard", "sb"} {
-		loc, ok := ix.Lookup(id(uint64(i)))
+	if ix.Len() != 1 {
+		t.Fatalf("%d entries for one shared prefix, want 1", ix.Len())
+	}
+	for _, want := range [][32]byte{a, bID} {
+		packs, ok := ix.Lookup(want)
 		if !ok {
-			t.Fatalf("entry %d missing", i)
+			t.Fatal("the colliding prefix does not resolve")
 		}
-		if loc.Type != want {
-			t.Errorf("entry %d has type %q, want %q", i, loc.Type, want)
+		if len(packs) != 2 || packs[0] != "p-first" || packs[1] != "p-second" {
+			t.Fatalf("collision resolved to %v, want both packs", packs)
 		}
 	}
 }
@@ -107,13 +111,9 @@ func TestTruncatedIndexIsRefused(t *testing.T) {
 // still exist.
 func TestASetPrefersTheNewestIndex(t *testing.T) {
 	older := NewBuilder()
-	if err := older.Add(id(1), "p-old", 0, 10, ""); err != nil {
-		t.Fatal(err)
-	}
+	older.Add(id(1), "p-old")
 	newer := NewBuilder()
-	if err := newer.Add(id(1), "p-new", 0, 10, ""); err != nil {
-		t.Fatal(err)
-	}
+	newer.Add(id(1), "p-new")
 	o, err := Open(older.Encode())
 	if err != nil {
 		t.Fatal(err)
@@ -123,12 +123,12 @@ func TestASetPrefersTheNewestIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	set := NewSet([]*Index{o, n})
-	loc, ok := set.Lookup(id(1))
+	packs, ok := set.Lookup(id(1))
 	if !ok {
 		t.Fatal("missing")
 	}
-	if loc.Pack != "p-new" {
-		t.Errorf("resolved to %s, want the newest index's p-new", loc.Pack)
+	if len(packs) != 1 || packs[0] != "p-new" {
+		t.Errorf("resolved to %v, want the newest index's p-new", packs)
 	}
 	if !set.Covers("p-old") || !set.Covers("p-new") {
 		t.Error("the set does not report the packs it covers")
@@ -190,9 +190,7 @@ func TestIndexesAreFetchedInParallel(t *testing.T) {
 	var refs []Ref
 	for i := 0; i < 8; i++ {
 		b := NewBuilder()
-		if err := b.Add(id(uint64(i)), "p-"+strconv.Itoa(i), 0, 10, ""); err != nil {
-			t.Fatal(err)
-		}
+		b.Add(id(uint64(i)), "p-"+strconv.Itoa(i))
 		raw := b.Encode()
 		name := "mpi-" + strconv.Itoa(i)
 		store.objs[Dir+"/"+name] = raw
@@ -225,9 +223,7 @@ func TestACorruptIndexIsRejectedButNotFatal(t *testing.T) {
 	ctx := context.Background()
 	store := &slowStore{objs: map[string][]byte{}}
 	good := NewBuilder()
-	if err := good.Add(id(1), "p-0", 0, 10, ""); err != nil {
-		t.Fatal(err)
-	}
+	good.Add(id(1), "p-0")
 	raw := good.Encode()
 	store.objs[Dir+"/ok"] = raw
 	store.objs[Dir+"/bad"] = append([]byte(nil), raw...)
@@ -246,4 +242,47 @@ func TestACorruptIndexIsRejectedButNotFatal(t *testing.T) {
 	if _, ok := set[0].Lookup(id(1)); !ok {
 		t.Error("the index that verified does not answer")
 	}
+}
+
+// Merging is how a large index gets built without one ever being held:
+// a cursor per input, newest last. It is also what a consolidation does,
+// so the property that matters is that the newest placement wins.
+func TestMergeTakesTheNewestPlacement(t *testing.T) {
+	older := NewBuilder()
+	for i := uint64(0); i < 3000; i++ {
+		older.Add(id(i), "p-old")
+	}
+	newer := NewBuilder()
+	for i := uint64(1500); i < 4500; i++ {
+		newer.Add(id(i), "p-new")
+	}
+	o, err := Open(older.Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := Open(newer.Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	merged, err := Open(Merge([]*Index{o, n}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if merged.Len() != 4500 {
+		t.Fatalf("merged index holds %d entries, want 4500", merged.Len())
+	}
+	for i := uint64(0); i < 4500; i++ {
+		packs, ok := merged.Lookup(id(i))
+		if !ok {
+			t.Fatalf("entry %d is missing from the merge", i)
+		}
+		want := "p-old"
+		if i >= 1500 {
+			want = "p-new"
+		}
+		if len(packs) != 1 || packs[0] != want {
+			t.Fatalf("entry %d = %v, want [%s] (newest placement wins)", i, packs, want)
+		}
+	}
+	t.Logf("two 3000-entry indexes merged to %d entries", merged.Len())
 }

@@ -1,27 +1,41 @@
 // Package mpi is the multi-pack index: one object answering "which pack
-// holds this identity, and where" for many packs at once.
+// holds this identity" across many packs.
 //
-// It exists because locating anything currently costs one federation
-// round trip PER PACK. A pack's trailer is its own index, so a reader
-// with no idea which pack holds an object consults them all — and a
-// mount must locate the root catalog before it can serve a single call.
-// A user with 201 packs on a slow link watched a mount sit there doing
-// exactly that.
+// It exists because locating anything otherwise costs one federation
+// round trip PER PACK — a pack's trailer is its own index, so a reader
+// with no idea which pack to ask consults them all. Git reached the same
+// place and answered the same way, with per-pack .idx files and then a
+// multi-pack-index across them. The asymmetry sharpens it here: git's
+// .idx files are local and mapped, so consulting two hundred is
+// microseconds; ours are remote, so the identical structure costs two
+// hundred round trips.
 //
-// Git reached the same place and answered the same way: per-pack .idx
-// files, then a multi-pack-index across them once pack count made
-// per-pack lookup the bottleneck. The difference here sharpens the case.
-// Git's .idx files are local and mapped, so consulting two hundred of
-// them is microseconds of binary search; our trailers are REMOTE, so the
-// identical structure costs two hundred round trips. Git added its index
-// to save microseconds. We add ours to save minutes.
+// AN ENTRY IS 16 BYTES, and both halves of that are deliberate.
+//
+// 12 bytes of identity, not 32, because a truncated key can only produce
+// a FALSE POSITIVE: the caller holds the full identity and checks what it
+// finds. At 96 bits and a hundred million entries a collision is a
+// ~10^-13 event, and the answer to one is to look in both packs — which
+// is why a colliding entry stores both names rather than being refused.
+//
+// 4 bytes naming the pack, and NOTHING ELSE — no offset, no length, no
+// type. Those are redundant with the pack the reader is about to fetch:
+// genfs takes packs whole, so the pack's own trailer says where
+// everything inside it is. An index that repeated them would be a second
+// record to keep in agreement with the first, for bytes the reader
+// already has.
+//
+// At 16 bytes a hundred million objects is 1.6 GB rather than 5.3, which
+// still is not something to fetch. It is not meant to be: the table
+// carries samples so a reader takes the header once and one ~64 KB window
+// per lookup (see packidx). Fetching an index whole is an optimization
+// for small ones, not the model.
 //
 // What this is NOT: a place where identity binds to location. An index is
-// DERIVED — publish writes it, repack rewrites it, and deleting one costs
-// nothing but speed. Catalogs and chunkrefs go on naming identities
-// alone, which is what lets a repack move bytes without rewriting
-// anything that refers to them. The index is the fast way to answer a
-// question the trailers can always answer again.
+// DERIVED — publish writes it, repack rewrites it, deleting one costs
+// only speed. Catalogs and chunkrefs go on naming identities alone, which
+// is what lets a repack move bytes without rewriting anything that refers
+// to them.
 package mpi
 
 import (
@@ -30,6 +44,8 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+	"sort"
+	"strings"
 	"sync"
 
 	"lukechampine.com/blake3"
@@ -39,13 +55,13 @@ import (
 )
 
 const (
-	magic = "PELFSMPI"
-	// headerLen is 8-byte aligned, like the table it carries: this is
-	// meant to be mapped and read in place.
+	magic = "PELFSMP2"
+	// headerLen is 8-byte aligned, like the table it carries.
 	headerLen = 32
-	// recordLen is what one entry resolves to: which pack, where in it,
-	// how long, and what kind of thing it is.
-	recordLen = 4 + 8 + 8 + 1
+	// KeyLen is how much of an identity an entry holds.
+	KeyLen = 12
+	// recordLen is an offset into the strings blob, and nothing else.
+	recordLen = 4
 	// Dir is the key-space directory holding index objects.
 	Dir = "mpi"
 )
@@ -53,68 +69,90 @@ const (
 // ErrFormat reports bytes that are not an index this build understands.
 var ErrFormat = fmt.Errorf("mpi: unrecognized index")
 
-// Loc is where one identity lives.
-type Loc struct {
-	Pack   string
-	Off    int64
-	Length int64
-	Type   string
-}
-
-// Builder accumulates entries across packs.
+// Builder accumulates identity -> pack across packs.
 type Builder struct {
-	packs   []string
-	packIdx map[string]uint32
-	table   *packidx.Builder
+	// packs maps a truncated key to the packs claiming it. A key with more
+	// than one is a collision, which the index records rather than
+	// resolves: the reader looks in both.
+	packs map[string][]string
+	order []string
 }
 
-func NewBuilder() *Builder {
-	return &Builder{packIdx: map[string]uint32{}, table: packidx.NewBuilder(recordLen)}
-}
+func NewBuilder() *Builder { return &Builder{packs: map[string][]string{}} }
 
-// Add records one entry. typ is the pack trailer's entry type, kept so a
-// reader can tell a chunk from a catalog without fetching it.
-func (b *Builder) Add(id [32]byte, pack string, off, length int64, typ string) error {
-	i, ok := b.packIdx[pack]
-	if !ok {
-		i = uint32(len(b.packs))
-		b.packs = append(b.packs, pack)
-		b.packIdx[pack] = i
+// Add records that pack holds id.
+func (b *Builder) Add(id [32]byte, pack string) {
+	k := string(id[:KeyLen])
+	cur, seen := b.packs[k]
+	if !seen {
+		b.order = append(b.order, k)
+		b.packs[k] = []string{pack}
+		return
 	}
-	var v [recordLen]byte
-	binary.LittleEndian.PutUint32(v[0:], i)
-	binary.LittleEndian.PutUint64(v[4:], uint64(off))
-	binary.LittleEndian.PutUint64(v[12:], uint64(length))
-	v[20] = typeCode(typ)
-	return b.table.Add(id, v[:])
+	for _, p := range cur {
+		if p == pack {
+			return
+		}
+	}
+	b.packs[k] = append(cur, pack)
 }
 
-// Len is how many entries have been added, and Packs how many packs they
-// span — the two numbers a consolidation policy needs.
-func (b *Builder) Len() int   { return b.table.Len() }
-func (b *Builder) Packs() int { return len(b.packs) }
+// Len is how many distinct keys have been added, and Packs how many packs
+// they span — the two numbers a consolidation policy reads without
+// fetching anything.
+func (b *Builder) Len() int { return len(b.packs) }
 
-// Encode writes the index: a header, the pack names, then the table.
+func (b *Builder) Packs() int {
+	seen := map[string]struct{}{}
+	for _, ps := range b.packs {
+		for _, p := range ps {
+			seen[p] = struct{}{}
+		}
+	}
+	return len(seen)
+}
+
+// Encode writes the index: a header, the strings blob, then the table.
+//
+// Identical pack lists share one string, which matters more than it
+// sounds: every entry in a pack names the same list, so a 2 MiB pack
+// holding five hundred chunks costs one copy of its name.
 func (b *Builder) Encode() []byte {
-	names := make([]byte, 0, 32*len(b.packs))
-	for _, p := range b.packs {
-		names = binary.LittleEndian.AppendUint16(names, uint16(len(p)))
-		names = append(names, p...)
+	var blob []byte
+	offsets := map[string]uint32{}
+	intern := func(s string) uint32 {
+		if off, ok := offsets[s]; ok {
+			return off
+		}
+		off := uint32(len(blob))
+		offsets[s] = off
+		blob = binary.LittleEndian.AppendUint16(blob, uint16(len(s)))
+		blob = append(blob, s...)
+		return off
 	}
-	table := b.table.Encode()
-	out := make([]byte, headerLen+len(names)+len(table))
+	tbl := packidx.NewBuilder(KeyLen, recordLen, 0)
+	sort.Strings(b.order)
+	for _, k := range b.order {
+		names := b.packs[k]
+		sort.Strings(names)
+		var v [recordLen]byte
+		binary.LittleEndian.PutUint32(v[:], intern(strings.Join(names, ",")))
+		// The builder rejects nothing: a key is 12 bytes by construction.
+		_ = tbl.Add([]byte(k), v[:])
+	}
+	table := tbl.Encode()
+	out := make([]byte, headerLen+len(blob)+len(table))
 	copy(out[0:8], magic)
 	binary.LittleEndian.PutUint32(out[8:], 1)
-	binary.LittleEndian.PutUint32(out[12:], uint32(len(b.packs)))
-	binary.LittleEndian.PutUint32(out[16:], uint32(len(names)))
-	copy(out[headerLen:], names)
-	copy(out[headerLen+len(names):], table)
+	binary.LittleEndian.PutUint32(out[12:], uint32(len(blob)))
+	copy(out[headerLen:], blob)
+	copy(out[headerLen+len(blob):], table)
 	return out
 }
 
 // Index is one index read in place.
 type Index struct {
-	packs []string
+	blob  []byte
 	table *packidx.Table
 }
 
@@ -126,75 +164,122 @@ func Open(b []byte) (*Index, error) {
 	if v := binary.LittleEndian.Uint32(b[8:]); v != 1 {
 		return nil, fmt.Errorf("%w: version %d", ErrFormat, v)
 	}
-	packCount := int(binary.LittleEndian.Uint32(b[12:]))
-	nameBytes := int(binary.LittleEndian.Uint32(b[16:]))
-	if headerLen+nameBytes > len(b) {
-		return nil, fmt.Errorf("%w: %d bytes of pack names in a %d-byte index", ErrFormat, nameBytes, len(b))
+	blobLen := int(binary.LittleEndian.Uint32(b[12:]))
+	if headerLen+blobLen > len(b) {
+		return nil, fmt.Errorf("%w: %d bytes of pack names in a %d-byte index", ErrFormat, blobLen, len(b))
 	}
-	names := b[headerLen : headerLen+nameBytes]
-	packs := make([]string, 0, packCount)
-	for len(names) > 0 {
-		if len(names) < 2 {
-			return nil, ErrFormat
-		}
-		n := int(binary.LittleEndian.Uint16(names))
-		names = names[2:]
-		if n > len(names) {
-			return nil, ErrFormat
-		}
-		packs = append(packs, string(names[:n]))
-		names = names[n:]
-	}
-	if len(packs) != packCount {
-		return nil, fmt.Errorf("%w: header says %d packs, names hold %d", ErrFormat, packCount, len(packs))
-	}
-	table, err := packidx.Open(b[headerLen+nameBytes:])
+	table, err := packidx.Open(b[headerLen+blobLen:])
 	if err != nil {
 		return nil, err
 	}
-	return &Index{packs: packs, table: table}, nil
+	if table.KeyLen() != KeyLen || table.RecordLen() != recordLen {
+		return nil, fmt.Errorf("%w: %d/%d entries", ErrFormat, table.KeyLen(), table.RecordLen())
+	}
+	return &Index{blob: b[headerLen : headerLen+blobLen], table: table}, nil
 }
 
-// Lookup resolves one identity.
-func (ix *Index) Lookup(id [32]byte) (Loc, bool) {
-	v, ok := ix.table.Lookup(id)
+// Lookup returns the packs that may hold id, newest-preferring order
+// undefined WITHIN one index: more than one name means a truncated-key
+// collision, and the caller looks in each until the pack's own trailer
+// confirms the full identity.
+func (ix *Index) Lookup(id [32]byte) ([]string, bool) {
+	v, ok := ix.table.Lookup(id[:KeyLen])
 	if !ok {
-		return Loc{}, false
+		return nil, false
 	}
-	p := binary.LittleEndian.Uint32(v[0:])
-	if int(p) >= len(ix.packs) {
-		// A pack reference outside the name list is a corrupt index, and
-		// the caller's fallback is a correct answer to it.
-		return Loc{}, false
-	}
-	return Loc{
-		Pack:   ix.packs[p],
-		Off:    int64(binary.LittleEndian.Uint64(v[4:])),
-		Length: int64(binary.LittleEndian.Uint64(v[12:])),
-		Type:   typeName(v[20]),
-	}, true
+	return ix.names(binary.LittleEndian.Uint32(v))
 }
 
-// Packs are the packs this index covers, which is what a retention sweep
-// compares against the live set.
-func (ix *Index) Packs() []string { return ix.packs }
+func (ix *Index) names(off uint32) ([]string, bool) {
+	if int(off)+2 > len(ix.blob) {
+		return nil, false
+	}
+	n := int(binary.LittleEndian.Uint16(ix.blob[off:]))
+	if int(off)+2+n > len(ix.blob) {
+		return nil, false
+	}
+	return strings.Split(string(ix.blob[int(off)+2:int(off)+2+n]), ","), true
+}
 
 // Len is the number of entries.
 func (ix *Index) Len() int { return ix.table.Len() }
 
-// At enumerates the index, for a consolidation that merges several.
-func (ix *Index) At(i int) ([32]byte, Loc) {
-	id, v := ix.table.At(i)
-	p := binary.LittleEndian.Uint32(v[0:])
-	loc := Loc{
-		Off:    int64(binary.LittleEndian.Uint64(v[4:])),
-		Length: int64(binary.LittleEndian.Uint64(v[12:])),
-		Type:   typeName(v[20]),
+// Packs are the packs this index names, which is what a retention sweep
+// compares against the live set to decide whether to keep it.
+func (ix *Index) Packs() []string {
+	seen := map[string]struct{}{}
+	var out []string
+	for i := 0; i < ix.table.Len(); i++ {
+		_, v := ix.table.At(i)
+		names, ok := ix.names(binary.LittleEndian.Uint32(v))
+		if !ok {
+			continue
+		}
+		for _, p := range names {
+			if _, dup := seen[p]; !dup {
+				seen[p] = struct{}{}
+				out = append(out, p)
+			}
+		}
 	}
-	if int(p) < len(ix.packs) {
-		loc.Pack = ix.packs[p]
+	sort.Strings(out)
+	return out
+}
+
+// Merge streams several indexes into one, newest LAST.
+//
+// It advances a cursor per input rather than holding their contents, so
+// merging tiers that together describe a hundred million objects costs
+// memory proportional to the number of TIERS. That is what makes a large
+// index buildable at all: it is never built at once, only merged — and
+// it is why the write path publishes a small index per generation and
+// consolidates later rather than maintaining one global index.
+//
+// The output records are still assembled in memory, which bounds a merge
+// to the size of the tier being written rather than to the volume. A
+// merge large enough to matter should spool; nothing needs that yet, and
+// saying so is better than pretending the limit is not there.
+func Merge(indexes []*Index) []byte {
+	out := NewBuilder()
+	at := make([]int, len(indexes))
+	for {
+		best, bestKey := -1, ""
+		for i, ix := range indexes {
+			if at[i] >= ix.table.Len() {
+				continue
+			}
+			k, _ := ix.table.At(at[i])
+			if best < 0 || string(k) < bestKey {
+				best, bestKey = i, string(k)
+			}
+		}
+		if best < 0 {
+			break
+		}
+		var names []string
+		for i, ix := range indexes {
+			if at[i] >= ix.table.Len() {
+				continue
+			}
+			k, v := ix.table.At(at[i])
+			if string(k) != bestKey {
+				continue
+			}
+			// Later inputs win outright: a key found in a newer tier names
+			// the pack that placement is current, and an older tier's
+			// answer is at best redundant and at worst a deleted pack.
+			if got, ok := ix.names(binary.LittleEndian.Uint32(v)); ok {
+				names = got
+			}
+			at[i]++
+		}
+		var id [32]byte
+		copy(id[:], bestKey)
+		for _, p := range names {
+			out.Add(id, p)
+		}
 	}
-	return id, loc
+	return out.Encode()
 }
 
 // Ref names one index object, as a superblock lists it.
@@ -206,7 +291,8 @@ type Ref struct {
 	Packs   uint32
 }
 
-// Fetch reads and verifies one index object.
+// Fetch reads and verifies one index object whole. Right for a small
+// index; a large one should be range-read through packidx.Header.
 func Fetch(ctx context.Context, obj pelicanobj.Store, ref Ref) (*Index, error) {
 	rc, err := obj.Get(ctx, Dir+"/"+ref.Name, 0, -1)
 	if err != nil {
@@ -228,15 +314,13 @@ func Fetch(ctx context.Context, obj pelicanobj.Store, ref Ref) (*Index, error) {
 
 // FetchAll reads every listed index CONCURRENTLY.
 //
-// Serial fetches would trade N round trips for a smaller N, still paid
-// one after another — which is most of the problem rather than a fix. A
-// generation carrying several indexes should cost one round trip's
-// LATENCY, not several, so they are fetched in parallel and the caller
-// waits once.
+// Serial fetches would trade N round trips for a smaller N still paid one
+// after another, which is most of the problem rather than a fix. This is
+// also what makes TIERS affordable: a lookup that may have to consult
+// several indexes costs one round trip of latency, not one per tier.
 //
-// A failed index is not a failed mount: an index is derived, and the
-// trailers still answer. The error is returned alongside whatever
-// succeeded so the caller can say so and carry on.
+// A failed index is not a failed mount: an index is derived, the trailers
+// still answer, so what verified is returned alongside the error.
 func FetchAll(ctx context.Context, obj pelicanobj.Store, refs []Ref) ([]*Index, error) {
 	if len(refs) == 0 {
 		return nil, nil
@@ -285,62 +369,34 @@ func FetchAll(ctx context.Context, obj pelicanobj.Store, refs []Ref) ([]*Index, 
 	return live, firstErr
 }
 
-// Set is several indexes consulted as one, newest first.
+// Set is several indexes consulted as one, oldest first in the slice.
 type Set struct{ indexes []*Index }
 
 func NewSet(indexes []*Index) *Set { return &Set{indexes: indexes} }
 
-// Lookup asks each index in turn. Order matters when a chunk appears in
-// more than one pack — a re-upload under the same identity, which is
-// wasted bytes rather than corruption — and the later index is the one
-// whose pack is most likely to still exist.
-func (s *Set) Lookup(id [32]byte) (Loc, bool) {
+// Lookup asks the NEWEST index first and stops at the first hit, which is
+// "the most recent pack holding this object". Order matters because the
+// same identity is placed again by any generation that rewrites it, and
+// an older tier's answer names a pack retention is more likely to have
+// swept.
+func (s *Set) Lookup(id [32]byte) ([]string, bool) {
 	for i := len(s.indexes) - 1; i >= 0; i-- {
-		if loc, ok := s.indexes[i].Lookup(id); ok {
-			return loc, true
+		if packs, ok := s.indexes[i].Lookup(id); ok {
+			return packs, true
 		}
 	}
-	return Loc{}, false
+	return nil, false
 }
 
-// Covers reports whether some index in the set claims this pack, which is
-// how a reader knows a trailer fetch is unnecessary.
+// Covers reports whether some index claims this pack, which is how a
+// reader knows a trailer fetch is unnecessary.
 func (s *Set) Covers(pack string) bool {
 	for _, ix := range s.indexes {
-		for _, p := range ix.packs {
+		for _, p := range ix.Packs() {
 			if p == pack {
 				return true
 			}
 		}
 	}
 	return false
-}
-
-// Entry types are stored as a byte rather than the trailer's string. The
-// mapping is closed: an unknown code reads back as a data chunk, which is
-// what an absent type has always meant.
-func typeCode(t string) byte {
-	switch t {
-	case "catalog":
-		return 1
-	case "shard":
-		return 2
-	case "sb":
-		return 3
-	default:
-		return 0
-	}
-}
-
-func typeName(c byte) string {
-	switch c {
-	case 1:
-		return "catalog"
-	case 2:
-		return "shard"
-	case 3:
-		return "sb"
-	default:
-		return ""
-	}
 }

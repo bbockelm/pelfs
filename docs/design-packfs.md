@@ -759,15 +759,65 @@ then five to ten indexes rather than a few thousand.
     all gone is deletable outright. Retention keeps an index while any
     live superblock names it, exactly as for packs.
 
-### The pack list is the bigger problem at that scale
+### The pack list moves out of the superblock
 
-A hundred million objects at a 2 MiB cut is 200,000-400,000 packs, and
-every superblock carries the full pack list forward — name, trailer hash,
-size, roughly 64 bytes each. That is 12-25 MB of superblock, read on
-every mount and rewritten on every generation, which dwarfs a
-range-read index and sits on the critical path of everything. No index
-design fixes it; the cut size does, and a volume orders of magnitude
-larger than a source tree wants a proportionally larger one.
+A hundred million objects at a 2 MiB cut is 200,000-400,000 packs, and a
+superblock carrying that list is 12-25 MB — read on every mount,
+rewritten on every seal, growing forever, and on the critical path of
+everything.
+
+The list was serving three jobs, and the index takes over one of them:
+
+  - LOCATING. What a reader iterated the list for. The index answers it.
+  - AUTHENTICATING. Chunk data is self-verifying by identity; a pack
+    TRAILER is not, so a reader falling back to trailers needs a hash it
+    can trust, and the signature is what makes it trustworthy.
+  - ENUMERATING. Retention needs the packs a live generation names, and
+    rescue needs to find them with no index at all.
+
+Neither of the last two requires the list to be INSIDE the superblock. So
+it is a derived, hash-named object (`internal/manifest`), listed the way
+an index is: the signature covers a hash rather than the entries, and the
+manifest is fetched only when something needs enumeration or trailer
+authentication — which the index makes rare. 72 bytes per pack, segmented
+and merged like an index, so a generation writes its own packs rather
+than rewriting the set.
+
+Two things make it simpler than an index. Its key is the pack NAME, which
+is fixed-width, so there is no truncation and no collision to resolve.
+And a pack name begins with a zero-padded creation stamp, so sorted by
+name is sorted by AGE — the order retention already thinks in, which lets
+a sweep find packs older than a cutoff through the sampled windows
+without reading a segment whole.
+
+One thing makes it harder: it is the only structure here that needs
+DELETION. A stale index entry is harmless — it names a swept pack and the
+lookup falls back — but the manifest is the authority on what exists. The
+answer is the rule an index already uses rather than a new one: do not
+delete, rewrite the segment when it is mostly dead. Retention only
+deletes packs no LIVE generation names, so a stale entry can only survive
+in a retired generation's manifest, which nobody reads. The cost of that
+laziness is holding a few dead packs slightly longer, which the age guard
+already tolerates.
+
+The end state: a superblock names O(log N) index refs and O(log N)
+manifest refs, and stops depending on volume size at all.
+
+### Liveness wants a reachability sweep, not a list
+
+The retirement rules above — retire an index whose packs are under half
+live, repack a pack that is mostly garbage — ask a question no list can
+answer. Liveness of a PACK is what fraction of its entries are still
+referenced, and only reachability knows: generation, catalogs,
+chunkrefs, identities, packs. That is git's model, where packs are
+storage and reachability decides, and it is a capability this design
+needs regardless of where the pack list lives.
+
+It must walk every LIVE generation rather than the head alone: a pack
+referenced only by a retained generation or a tag has to survive. That is
+what makes it expensive at a hundred million objects, and why the age
+guard on young packs stays — it is what makes a sweep safe against
+concurrent writers without coordination.
 
 ### Root catalog hint
 

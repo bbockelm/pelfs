@@ -16,17 +16,27 @@ import (
 )
 
 // packGetStore counts requests against pack objects, which is what a mount
-// pays before it can serve anything.
+// pays before it can serve anything. all counts EVERY object read, so a
+// change that trades pack requests for requests of some other kind — a
+// multi-pack index, say — cannot look like a saving it is not.
 type packGetStore struct {
 	pelicanobj.Store
 	gets atomic.Int64
+	all  atomic.Int64
 }
 
 func (p *packGetStore) Get(ctx context.Context, key string, off, limit int64) (io.ReadCloser, error) {
+	p.all.Add(1)
 	if strings.HasPrefix(key, packstore.PackDirKey+"/") {
 		p.gets.Add(1)
 	}
 	return p.Store.Get(ctx, key, off, limit)
+}
+
+// reset zeroes both counters between the halves of a comparison.
+func (p *packGetStore) reset() {
+	p.gets.Store(0)
+	p.all.Store(0)
 }
 
 // A cold mount must not index the generation. Serving the first question

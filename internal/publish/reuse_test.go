@@ -32,6 +32,10 @@ import (
 type countingStore struct {
 	pelicanobj.Store
 	packGets atomic.Int64
+	// failPuts, when non-empty, makes uploads to that key prefix fail. It
+	// is how a test asks what a publish does when a write it does not
+	// depend on does not land.
+	failPuts atomic.Value
 }
 
 func (c *countingStore) Get(ctx context.Context, key string, off, limit int64) (io.ReadCloser, error) {
@@ -39,6 +43,17 @@ func (c *countingStore) Get(ctx context.Context, key string, off, limit int64) (
 		c.packGets.Add(1)
 	}
 	return c.Store.Get(ctx, key, off, limit)
+}
+
+// failPutPrefix makes every subsequent Put under prefix fail; "" restores
+// the store.
+func (c *countingStore) failPutPrefix(prefix string) { c.failPuts.Store(prefix) }
+
+func (c *countingStore) Put(ctx context.Context, key string, in io.Reader) error {
+	if p, _ := c.failPuts.Load().(string); p != "" && strings.HasPrefix(key, p) {
+		return fmt.Errorf("countingStore: refusing to write %s", key)
+	}
+	return c.Store.Put(ctx, key, in)
 }
 
 // reuseVol drives a volume the way a writable mount drives one: seal a

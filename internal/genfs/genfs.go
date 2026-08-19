@@ -247,6 +247,11 @@ func Open(ctx context.Context, o Options) (*FS, error) {
 		fills:        make(map[string]*fillGate),
 	}
 	fs.packIndex = newPackIndex(fs, o.SB.PackList)
+	// Before the root catalog, because the root is the first thing that
+	// might need locating and everything after it certainly does. Failure
+	// is not reported: the indexes are hints, and a mount without them is
+	// the mount this was before they existed (packindex.go).
+	fs.packIndex.loadHints(ctx, o.SB.PackIndexes)
 	if o.PackCacheBytes > 0 {
 		fs.sweepPackTmp()
 	}

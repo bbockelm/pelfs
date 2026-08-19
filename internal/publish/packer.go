@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bbockelm/pelfs/internal/mpi"
 	"github.com/bbockelm/pelfs/internal/packstore"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 )
@@ -38,6 +39,18 @@ type packer struct {
 	// them would be a location index nobody reads.
 	located map[string]*entryLoc
 	pending []*entryLoc
+
+	// idx accumulates identity -> pack for every entry this publish
+	// appends, which becomes the generation's multi-pack index. Entries
+	// are attributed at the CUT, because that is when a pack is named, so
+	// pendingKeys holds the keys written into the open pack until then.
+	//
+	// This is the map the note above says nobody reads — now something
+	// does, and it is 12 bytes per key rather than a full location: the
+	// index says only WHICH pack, since a reader that fetches the pack has
+	// its trailer anyway (see internal/mpi).
+	idx         *mpi.Builder
+	pendingKeys []string
 
 	// Uploads run in the background so building the next pack overlaps
 	// the current one's round trip. mu guards sealed and err against the
@@ -101,6 +114,7 @@ func newPacker(inner pelicanobj.Store, dir string, target, first int64, conc int
 		inner: inner, dir: dir, target: target, cur: first,
 		added:   make(map[string]struct{}),
 		located: make(map[string]*entryLoc),
+		idx:     mpi.NewBuilder(),
 		sem:     make(chan struct{}, conc),
 		started: time.Now(),
 	}
@@ -196,6 +210,7 @@ func (p *packer) addEntry(ctx context.Context, key, typ string, data []byte, not
 		return nil, err
 	}
 	p.added[key] = struct{}{}
+	p.pendingKeys = append(p.pendingKeys, key)
 	if !note {
 		return nil, nil
 	}
@@ -230,6 +245,14 @@ func (p *packer) cut(ctx context.Context) error {
 		loc.pack = sp.Name
 	}
 	p.pending = nil
+	// Same reason, for every entry rather than the noted few: the index
+	// maps identity to a pack name, and the name arrives here.
+	for _, key := range p.pendingKeys {
+		if id, ok := identityKey(key); ok {
+			p.idx.Add(id, sp.Name)
+		}
+	}
+	p.pendingKeys = p.pendingKeys[:0]
 	// Ramp toward the steady-state target. The early packs exist to get
 	// bytes onto the wire while the walk is still running; once the pipe
 	// is full there is nothing left to buy and per-object overhead —

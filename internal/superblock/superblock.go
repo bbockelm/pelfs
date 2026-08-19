@@ -26,6 +26,8 @@ import (
 
 	"github.com/fxamacker/cbor/v2"
 	"lukechampine.com/blake3"
+
+	"github.com/bbockelm/pelfs/internal/mpi"
 )
 
 // FormatV2 is the FormatVersion written by this package.
@@ -197,6 +199,23 @@ type Superblock struct {
 	// it omits it, and a reader that finds it absent — or finds it stale —
 	// resolves the root through the pack index instead.
 	RootCatalogHint *RootHint `cbor:"root_catalog_hint,omitempty"`
+	// PackIndexes names the multi-pack indexes covering this generation:
+	// objects under mpi.Dir that answer "which pack holds this identity"
+	// for many packs at once, instead of one round trip per pack trailer
+	// (internal/mpi, docs/design-packfs.md "Locating things").
+	//
+	// They are HINTS, exactly as RootCatalogHint is, and for the same
+	// reason: an index is DERIVED — publish writes it, repack rewrites it,
+	// losing one costs speed and nothing else — so a reader verifies what
+	// an index sends it to and falls back to pack trailers when the answer
+	// does not hold up. Nothing here may turn into a wrong read or a
+	// failed mount.
+	//
+	// Publish carries the previous generation's refs forward alongside its
+	// own, the way PackList is carried, so an index a live generation
+	// names stays live. Consolidating and retiring them is repack's job
+	// and is not implemented yet.
+	PackIndexes []mpi.Ref `cbor:"pack_indexes,omitempty"`
 
 	// SigningPub is informational — it names the key that produced
 	// Signature so tooling can report custody, but Verify never trusts it

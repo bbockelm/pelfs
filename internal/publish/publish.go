@@ -63,6 +63,7 @@ import (
 	"github.com/bbockelm/pelfs/internal/catalog"
 	"github.com/bbockelm/pelfs/internal/chunkid"
 	"github.com/bbockelm/pelfs/internal/entrycodec"
+	"github.com/bbockelm/pelfs/internal/mpi"
 	"github.com/bbockelm/pelfs/internal/overlay"
 	"github.com/bbockelm/pelfs/internal/packstore"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
@@ -413,7 +414,7 @@ func Publish(ctx context.Context, o Options) (*Result, error) {
 	// its tail", exactly the documented fall-back-a-step behavior. Stored
 	// raw (uncompressed, unencrypted): rescue must read it before holding
 	// any keys, and the KEK-wrapped key table is harmless to expose.
-	_, bkRaw, err := p.buildSuperblock(p.pk.sealedSoFar(), shards, rootID)
+	_, bkRaw, err := p.buildSuperblock(p.pk.sealedSoFar(), shards, rootID, mpi.Ref{})
 	if err != nil {
 		return nil, err
 	}
@@ -426,7 +427,10 @@ func Publish(ctx context.Context, o Options) (*Result, error) {
 	if err != nil {
 		return nil, fmt.Errorf("publish: seal pack: %w", err)
 	}
-	sb, raw, err := p.buildSuperblock(newPacks, shards, rootID)
+	// After the last cut, because an entry is attributed to a pack only
+	// once that pack has a name; before the flip, because a reader that
+	// sees the new generation must be able to fetch what it names.
+	sb, raw, err := p.buildSuperblock(newPacks, shards, rootID, p.publishPackIndex(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -1380,9 +1384,11 @@ func encodeCatalog(cw catalog.Builder, hasher chunkid.Hasher, dek []byte) (chunk
 	return id, stored, nil
 }
 
-func (p *pipeline) buildSuperblock(newPacks []packstore.SealedPack, shards []superblock.ShardEntry, rootID chunkid.Identity) (*superblock.Superblock, []byte, error) {
+func (p *pipeline) buildSuperblock(newPacks []packstore.SealedPack, shards []superblock.ShardEntry, rootID chunkid.Identity, packIndex mpi.Ref) (*superblock.Superblock, []byte, error) {
+	var prevIndexes []mpi.Ref
 	var packList []superblock.PackEntry
 	if p.o.Prev != nil {
+		prevIndexes = p.o.Prev.PackIndexes
 		// Carry the previous generation's whole pack set forward; trimming
 		// dead packs is repack's job, not publish's.
 		//
@@ -1426,6 +1432,7 @@ func (p *pipeline) buildSuperblock(newPacks []packstore.SealedPack, shards []sup
 		Shards:          shards,
 		NextInode:       nextInode,
 		Catalogs:        p.catalogList(),
+		PackIndexes:     packIndexList(prevIndexes, packIndex),
 		Params: superblock.Params{
 			SMaxBytes:     p.o.SMax,
 			SMinBytes:     catalog.SMin,

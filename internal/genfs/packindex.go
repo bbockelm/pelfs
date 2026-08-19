@@ -2,6 +2,7 @@ package genfs
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 
 	"lukechampine.com/blake3"
 
+	"github.com/bbockelm/pelfs/internal/mpi"
 	"github.com/bbockelm/pelfs/internal/packstore"
 	"github.com/bbockelm/pelfs/internal/superblock"
 )
@@ -38,9 +40,25 @@ import (
 // read, and a caller like fsck or a seal's carry-forward check would read
 // it as "this content is gone" — an incomplete map must never be able to
 // say it.
+//
+// Ahead of the probing sits the generation's MULTI-PACK INDEX (hints,
+// below), which answers "which pack" for many packs at once and turns the
+// bet into a fact for everything it covers.
 type packIndex struct {
 	fs    *FS
 	packs []superblock.PackEntry
+
+	// hints is the generation's multi-pack index, fetched once at Open —
+	// nil when the superblock lists none, when none verified, or when this
+	// build simply has not been given one. Read-only once set, which is
+	// before the FS is handed to anyone.
+	//
+	// It is a HINT in the same sense as the root-catalog hint: an index is
+	// derived and may be stale, so a name it produces is followed to a
+	// pack TRAILER, which is what actually confirms the identity. A wrong
+	// or unverifiable answer costs the ordinary fallback below and can
+	// never cost a wrong read or a failed mount.
+	hints *mpi.Set
 
 	// loadMu serializes the trailer work, so concurrent misses index a
 	// pack once between them rather than once each. localMerged and
@@ -53,7 +71,7 @@ type packIndex struct {
 
 	mu      sync.Mutex
 	byKey   map[string]packLoc
-	sizes   map[string]int64
+	listed  map[string]superblock.PackEntry
 	indexed map[string]bool
 }
 
@@ -65,11 +83,11 @@ func newPackIndex(fs *FS, packs []superblock.PackEntry) *packIndex {
 		fs:      fs,
 		packs:   packs,
 		byKey:   make(map[string]packLoc),
-		sizes:   make(map[string]int64, len(packs)),
+		listed:  make(map[string]superblock.PackEntry, len(packs)),
 		indexed: make(map[string]bool, len(packs)),
 	}
 	for _, pe := range packs {
-		x.sizes[pe.Name] = pe.Size
+		x.listed[pe.Name] = pe
 	}
 	return x
 }
@@ -79,7 +97,20 @@ func newPackIndex(fs *FS, packs []superblock.PackEntry) *packIndex {
 func (x *packIndex) size(pack string) int64 {
 	x.mu.Lock()
 	defer x.mu.Unlock()
-	return x.sizes[pack]
+	return x.listed[pack].Size
+}
+
+// entry returns the signed pack-list row for a pack name, and whether this
+// generation lists it at all. Anything naming a pack from OUTSIDE the
+// signed list — an index, a hint, a cache directory — has to come through
+// here: the row carries the trailer hash and the size every later check is
+// made against, and a name with no row is a name nothing authorizes
+// reading.
+func (x *packIndex) entry(pack string) (superblock.PackEntry, bool) {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	pe, ok := x.listed[pack]
+	return pe, ok
 }
 
 func (x *packIndex) lookup(key string) (packLoc, bool) {
@@ -151,6 +182,13 @@ func (x *packIndex) locate(ctx context.Context, key string) (packLoc, error) {
 	if loc, ok := x.lookup(key); ok {
 		return loc, nil
 	}
+	// The multi-pack index, before any guessing: it names the pack outright
+	// for everything it covers, which is one trailer fetch instead of a
+	// walk backwards through the pack list and, past the budget, instead of
+	// the whole generation.
+	if loc, ok := x.probeHints(ctx, key); ok {
+		return loc, nil
+	}
 	var failed error
 	for i, budget := len(x.packs)-1, lazyProbeBudget; i >= 0 && budget > 0; i-- {
 		pe := x.packs[i]
@@ -180,6 +218,81 @@ func (x *packIndex) locate(ctx context.Context, key string) (packLoc, error) {
 		return packLoc{}, failed
 	}
 	return packLoc{}, fmt.Errorf("genfs: %s not present in any listed pack", key)
+}
+
+// loadHints fetches the indexes a generation lists and attaches whatever
+// verified. It must be called before the index is shared, and it is the
+// only writer of x.hints.
+//
+// The error is deliberately DROPPED, and mpi.FetchAll is built to make
+// that safe: it returns the indexes that verified alongside it, so a
+// generation whose index is missing, truncated, or hashes wrong loads the
+// rest and mounts. An index cannot fail a mount — it is derived, and the
+// trailers still answer every question it would have.
+//
+// One fetch of a small object, in parallel across however many indexes the
+// generation lists, against one trailer fetch per pack. That is the trade
+// the whole thing exists for, and it is paid up front because the first
+// question a mount asks needs the answer.
+func (x *packIndex) loadHints(ctx context.Context, refs []mpi.Ref) {
+	if len(refs) == 0 {
+		return
+	}
+	indexes, _ := mpi.FetchAll(ctx, x.fs.inner, refs)
+	if len(indexes) > 0 {
+		x.hints = mpi.NewSet(indexes)
+	}
+}
+
+// probeHints asks the multi-pack index which pack holds key and indexes
+// the packs it names. Callers hold loadMu.
+//
+// An answer is a CANDIDATE LIST, not an answer: more than one name is a
+// truncated-key collision (12 bytes of identity, so a false positive is
+// possible and a false negative is not), so each is tried until the pack's
+// own trailer confirms the full identity. Three ways it can be wrong, all
+// of which fall through to the ordinary probing:
+//
+//   - a pack this generation does not list, which the signed pack list
+//     rejects before anything is fetched;
+//   - a listed pack that turns out not to hold the identity, which is
+//     either the collision case or an index a repack outdated;
+//   - a trailer that will not load, which is a transport failure and is
+//     the caller's problem to report, not this function's to hide.
+//
+// The trailers merged along the way are kept either way: they were fetched
+// and verified, so a wrong hint at least leaves the map larger than it
+// found it.
+func (x *packIndex) probeHints(ctx context.Context, key string) (packLoc, bool) {
+	if x.hints == nil {
+		return packLoc{}, false
+	}
+	var id [32]byte
+	if len(key) != 2*len(id) {
+		return packLoc{}, false
+	}
+	if _, err := hex.Decode(id[:], []byte(key)); err != nil {
+		return packLoc{}, false
+	}
+	names, ok := x.hints.Lookup(id)
+	if !ok {
+		return packLoc{}, false
+	}
+	for _, name := range names {
+		pe, listed := x.entry(name)
+		if !listed || x.isIndexed(name) {
+			continue
+		}
+		entries, err := x.fs.trailerEntries(ctx, pe)
+		if err != nil {
+			continue
+		}
+		x.merge(pe, entries)
+		if loc, ok := x.lookup(key); ok {
+			return loc, true
+		}
+	}
+	return packLoc{}, false
 }
 
 // mergeLocal folds in every pack whose trailer this mount can read without

@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/fxamacker/cbor/v2"
+
+	"github.com/bbockelm/pelfs/internal/mpi"
 )
 
 // testSuperblock populates every field so round-trip tests exercise the
@@ -409,6 +411,76 @@ func TestHintedSuperblockDecodesForAReaderThatIgnoresIt(t *testing.T) {
 	}
 	if older.Generation != sb.Generation || older.RootCatalog != sb.RootCatalog ||
 		len(older.PackList) != len(sb.PackList) {
+		t.Fatalf("the fields such a reader does know came back wrong: %+v", older)
+	}
+}
+
+// The multi-pack index list is optional in both directions, the same
+// compatibility story as the root-catalog hint and for the same reason: a
+// superblock written before indexes existed must still verify, and a
+// reader that ignores the field must still be able to read the document.
+// A nilable, omitempty field is what makes both true — an absent list
+// contributes nothing to the encoding, so it cannot change the bytes an
+// older generation was signed over.
+func TestPackIndexesAreOptionalInBothDirections(t *testing.T) {
+	pub, priv := genKey(t)
+
+	old := testSuperblock()
+	if err := old.Sign(priv); err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	enc := mustEncode(t, old)
+	if bytes.Contains(enc, []byte("pack_indexes")) {
+		t.Fatal("a superblock listing no index still wrote the key")
+	}
+	dec, err := Decode(enc)
+	if err != nil {
+		t.Fatalf("decode index-less superblock: %v", err)
+	}
+	if dec.PackIndexes != nil {
+		t.Fatalf("decoded indexes out of a superblock that lists none: %+v", dec.PackIndexes)
+	}
+	if err := dec.Verify(pub); err != nil {
+		t.Fatalf("a superblock written before indexes existed no longer verifies: %v", err)
+	}
+
+	indexed := testSuperblock()
+	indexed.PackIndexes = []mpi.Ref{
+		{Name: "aa11", Hash: [32]byte{0xaa, 0x11}, Size: 4096, Entries: 128, Packs: 3},
+		{Name: "bb22", Hash: [32]byte{0xbb, 0x22}, Size: 1 << 20, Entries: 65536, Packs: 200},
+	}
+	if err := indexed.Sign(priv); err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	dec, err = Decode(mustEncode(t, indexed))
+	if err != nil {
+		t.Fatalf("decode indexed superblock: %v", err)
+	}
+	if len(dec.PackIndexes) != len(indexed.PackIndexes) {
+		t.Fatalf("index list round-tripped as %+v", dec.PackIndexes)
+	}
+	for i, want := range indexed.PackIndexes {
+		if dec.PackIndexes[i] != want {
+			t.Errorf("index ref %d round-tripped as %+v, want %+v", i, dec.PackIndexes[i], want)
+		}
+	}
+	if err := dec.Verify(pub); err != nil {
+		t.Fatalf("verify indexed superblock: %v", err)
+	}
+
+	// A reader that does not know the field must still READ the document.
+	// It must not claim it verified — that is the standing rule for any
+	// dropped signed field — but the index list is a shortcut, and nothing
+	// a reader needs depends on seeing it.
+	var older struct {
+		Generation  uint64      `cbor:"generation"`
+		RootCatalog [32]byte    `cbor:"root_catalog"`
+		PackList    []PackEntry `cbor:"pack_list"`
+	}
+	if err := cbor.Unmarshal(mustEncode(t, indexed), &older); err != nil {
+		t.Fatalf("a reader that ignores the index list could not decode: %v", err)
+	}
+	if older.Generation != indexed.Generation || len(older.PackList) != len(indexed.PackList) {
 		t.Fatalf("the fields such a reader does know came back wrong: %+v", older)
 	}
 }

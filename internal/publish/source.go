@@ -108,6 +108,13 @@ type ContentProvider interface {
 	// Called once, after the last ProvidedContent, because a provider may
 	// still be cutting packs while it answers.
 	ProvidedPacks(ctx context.Context) ([]packstore.SealedPack, error)
+	// ProvidedEntries reports every identity the source placed and the
+	// pack holding it, for the generation's multi-pack index. Without it
+	// the index covers what the SEAL packed and misses the content, which
+	// on a writable mount is nearly all of it — leaving a reader to fall
+	// back to per-pack trailers for exactly the lookups the index exists
+	// to answer.
+	ProvidedEntries(fn func(identityHex, pack string))
 }
 
 // CatalogReuser is the optional Source capability that spares TRANSFORM
@@ -256,6 +263,12 @@ func (s *overlaySource) ProvidedContent(ctx context.Context, ino uint64) (genfs.
 		return genfs.Content{}, false, nil
 	}
 	return r.Records(ctx, ino)
+}
+
+func (s *overlaySource) ProvidedEntries(fn func(identityHex, pack string)) {
+	if r, ok := s.records(); ok {
+		r.EachEntry(fn)
+	}
 }
 
 func (s *overlaySource) ProvidedPacks(ctx context.Context) ([]packstore.SealedPack, error) {

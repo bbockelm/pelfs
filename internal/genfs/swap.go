@@ -96,6 +96,10 @@ func (fs *FS) Swap(ctx context.Context, sb *superblock.Superblock) (*SwapReport,
 	// the part of it that actually proves the new generation is servable,
 	// and the rest of the map fills in behind the reads that need it.
 	newIndex := newPackIndex(fs, sb.PackList)
+	// The incoming generation's own indexes, for the same reason Open
+	// takes them: the swap resolves a root catalog it has never located,
+	// and every read after it resolves against this map.
+	newIndex.loadHints(ctx, sb.PackIndexes)
 	newDEK := []byte(nil)
 	if sb.CatalogKeyID != 0 {
 		newDEK = fs.dek

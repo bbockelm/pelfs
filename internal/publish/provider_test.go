@@ -148,6 +148,12 @@ func (m *memSource) ProvidedContent(ctx context.Context, ino uint64) (genfs.Cont
 	return genfs.Content{Length: n.Length, Refs: refs}, true, nil
 }
 
+// ProvidedEntries reports what this source placed, so the generation's
+// index covers its content rather than only what the seal packed.
+func (m *memSource) ProvidedEntries(fn func(identityHex, pack string)) {
+	m.store.EachPlacedChunk(fn)
+}
+
 func (m *memSource) ProvidedPacks(ctx context.Context) ([]packstore.SealedPack, error) {
 	if m.sealer != nil {
 		if err := m.sealer.Finish(ctx); err != nil {

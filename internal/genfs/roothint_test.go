@@ -24,6 +24,16 @@ func withHint(sb *superblock.Superblock, h *superblock.RootHint) *superblock.Sup
 	return &cp
 }
 
+// withoutPackIndexes returns a copy of sb listing no multi-pack index, so
+// a test can measure what locating something costs from PACK TRAILERS
+// alone. Same standing as withHint: an index is a hint, and a mount is
+// handed a superblock its caller already verified.
+func withoutPackIndexes(sb *superblock.Superblock) *superblock.Superblock {
+	cp := *sb
+	cp.PackIndexes = nil
+	return &cp
+}
+
 // hintedVolume publishes a generation whose root catalog is NOT in one of
 // the newest packs, which is the case the hint is for.
 //
@@ -90,9 +100,18 @@ func treeOf(t *testing.T, fs *genfs.FS) []string {
 // not in a recently written pack costs a request per pack to locate it —
 // the whole location layer, built to answer one question — and that is what
 // a mount waits through before it can serve anything at all.
+//
+// Measured with the multi-pack index taken away, deliberately. The index
+// answers the same question for every pack at once, so where a generation
+// lists one the fallback is a trailer fetch rather than a walk and this
+// comparison would measure almost nothing (mpi_test.go measures that
+// case). What is being pinned here is the hint against the walk, which is
+// still what a generation without an index — an old one, or one whose
+// index did not verify — pays.
 func TestRootHintSkipsThePackIndex(t *testing.T) {
 	ctx := context.Background()
-	inner, sb, _ := hintedVolume(t, "9efe7c40-0000-4000-8000-0000000000b1")
+	inner, hintedSB, _ := hintedVolume(t, "9efe7c40-0000-4000-8000-0000000000b1")
+	sb := withoutPackIndexes(hintedSB)
 	packs := len(sb.PackList)
 
 	inner.gets.Store(0)

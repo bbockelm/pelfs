@@ -196,6 +196,31 @@ const HeaderSize = headerLen
 // SampleBytes is how many bytes the header and samples occupy.
 func (h *Header) SampleBytes() int64 { return h.base }
 
+// SampleExtent is SampleBytes read from the FIXED part alone — how much
+// of an object a reader must have before ParseHeader can succeed.
+//
+// It exists because the two are a chicken and an egg over a range
+// request: the sample count lives in the fixed header, and ParseHeader
+// refuses a prefix that does not already carry the samples it names. A
+// remote reader asks for a guess, calls this on what came back, and knows
+// exactly what a second request must ask for — so a blind fetch converges
+// in at most two round trips instead of doubling.
+//
+// The result is UNVALIDATED against any object: samples is a uint32 off
+// the wire, so a hostile or corrupt header can name an extent far larger
+// than the object. Callers hold it against the size they know.
+func SampleExtent(head []byte) (int64, error) {
+	if len(head) < headerLen || string(head[0:8]) != magic {
+		return 0, ErrFormat
+	}
+	keyLen := int64(binary.LittleEndian.Uint16(head[8:]))
+	samples := int64(binary.LittleEndian.Uint32(head[20:]))
+	if keyLen <= 0 {
+		return 0, ErrFormat
+	}
+	return int64(headerLen) + samples*keyLen, nil
+}
+
 // Window is the byte extent within the table that could hold key, or ok
 // false when the table cannot. The extent is at most Stride records.
 func (h *Header) Window(key []byte) (off, length int64, ok bool) {

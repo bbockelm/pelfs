@@ -28,8 +28,8 @@
 // At 16 bytes a hundred million objects is 1.6 GB rather than 5.3, which
 // still is not something to fetch. It is not meant to be: the table
 // carries samples so a reader takes the header once and one ~64 KB window
-// per lookup (see packidx). Fetching an index whole is an optimization
-// for small ones, not the model.
+// per lookup (Reader, remote.go). Fetching an index whole is an
+// optimization for small ones, not the model.
 //
 // What this is NOT: a place where identity binds to location. An index is
 // DERIVED — publish writes it, repack rewrites it, deleting one costs
@@ -192,16 +192,27 @@ func (ix *Index) Lookup(id [32]byte) ([]string, bool) {
 	return ix.names(binary.LittleEndian.Uint32(v))
 }
 
-func (ix *Index) names(off uint32) ([]string, bool) {
-	if int(off)+2 > len(ix.blob) {
+func (ix *Index) names(off uint32) ([]string, bool) { return names(ix.blob, off) }
+
+// names resolves one record — an offset into the strings blob — to the
+// pack list it interns. It takes the blob rather than an Index because the
+// windowed reader (remote.go) holds the blob without ever holding an
+// Index, and resolving a record must not mean two implementations of the
+// same three bounds checks.
+func names(blob []byte, off uint32) ([]string, bool) {
+	if int(off)+2 > len(blob) {
 		return nil, false
 	}
-	n := int(binary.LittleEndian.Uint16(ix.blob[off:]))
-	if int(off)+2+n > len(ix.blob) {
+	n := int(binary.LittleEndian.Uint16(blob[off:]))
+	if int(off)+2+n > len(blob) {
 		return nil, false
 	}
-	return strings.Split(string(ix.blob[int(off)+2:int(off)+2+n]), ","), true
+	return splitNames(string(blob[int(off)+2 : int(off)+2+n])), true
 }
+
+// splitNames is the one place that knows a record's pack list is comma
+// separated, since Builder.Encode and MergeTo both join it that way.
+func splitNames(s string) []string { return strings.Split(s, ",") }
 
 // Len is the number of entries.
 func (ix *Index) Len() int { return ix.table.Len() }
@@ -365,8 +376,14 @@ func Merge(indexes []*Index) []byte {
 // signed field is (see superblock.IndexRef). This package builds and
 // verifies the object the ref names.
 
-// Fetch reads and verifies one index object whole. Right for a small
-// index; a large one should be range-read through packidx.Header.
+// Fetch reads and verifies one index object whole.
+//
+// This is the WRITE path's reader: a merge needs every record, so it needs
+// every byte, and having them all is what makes the whole-object hash
+// checkable. A READER looking up one identity wants Reader (remote.go),
+// which takes the header once and a window per lookup and falls back to
+// this only for an index small enough that fetching it whole is cheaper
+// than not.
 func Fetch(ctx context.Context, obj pelicanobj.Store, ref superblock.IndexRef) (*Index, error) {
 	rc, err := obj.Get(ctx, Dir+"/"+ref.Name, 0, -1)
 	if err != nil {

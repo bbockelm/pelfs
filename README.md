@@ -15,6 +15,7 @@ pelfs status                                               # list background mou
 pelfs gc     [--delete] pelican://.../scratch              # sweep unreferenced packs
 pelfs tag    pelican://.../scratch v1.0                    # freeze the head under a name
 pelfs tag    --list pelican://.../scratch                  # what is pinned here
+pelfs tag    --rm pelican://.../scratch v1.0               # release the pin (gc reclaims)
 pelfs fsck   [--deep] pelican://.../scratch                # verify a generation
 pelfs repack-plan pelican://.../scratch                    # what a repack would rewrite
 pelfs repack [--apply] pelican://.../scratch               # rewrite it, publish a generation
@@ -222,16 +223,33 @@ a count of bytes, a duration a count of nanoseconds).
   drifted since the last one (`--no-auto-repack` turns that off), which
   condemns the mostly-dead packs. Removing them is still a separate,
   manual `pelfs gc --delete`, and only once the grace window (72h, not
-  configurable) has passed. `pelfs repack` with no flags reports what the
-  volume is currently carrying.
-- **The grace window is what an untagged old generation gets.** The sweep
-  can enumerate exactly two things — branch heads and tags — so a
-  generation that is no longer the head is protected only by the 72h
-  window; past it, a repack may collect what only that generation named.
-  `pelfs tag <prefix> <name>` is the escape and the only one: a tagged
-  generation is in the live set permanently, so nothing it references is
-  ever swept. Tags are immutable (creating one over a name in use is
-  refused, not overwritten) and are mounted with `pelfs mount --tag`.
-- There is no **fork** command, no way to **delete** a tag or a branch, and
-  no **key rotation**. Deleting a ref is how space is finally released, so
-  until then a tag holds its generation forever.
+  configurable) has passed AND the retain window has moved past the
+  generations that named them — so a repack immediately followed by a
+  sweep frees nothing until the branch has sealed `RetainK` more times.
+  `pelfs repack` with no flags reports what the volume is currently
+  carrying.
+- **A retired generation gets the grace window, and the last K
+  generations of its branch.** The sweep's root set is every branch head,
+  the last `Params.RetainK` generations behind each head (8 by default),
+  and every tag. The window is real but bounded: a retired generation
+  leaves no addressable record, so the sweep reconstructs it from the
+  disaster-recovery superblock a seal buries in its last pack, and a
+  generation whose backup has itself been collected is reported as not
+  retained rather than guessed at. `pelfs gc` prints how many generations
+  of the window it could establish; `--retain-k` states a different number
+  (it is the one retention knob that may narrow as well as widen, because
+  it is a claim about your own readers rather than a race against a live
+  writer).
+- **`pelfs tag <prefix> <name>` is the escape from both windows.** A
+  tagged generation is in the live set outright, so nothing it references
+  is swept while the tag is there. Tags are immutable (creating one over a
+  name in use is refused, not overwritten) and are mounted with
+  `pelfs mount --tag`. `pelfs tag --rm <prefix> <name>` releases the pin:
+  it names the generation it is retiring, and the space comes back on the
+  next `pelfs gc` after the grace window — deletion takes a root out of
+  the set, it does not itself free a byte. A name freed this way can be
+  tagged again; immutability is a property of the object, not the name.
+- There is no **fork** command, no way to **delete a branch**, and no **key
+  rotation**. Branch deletion is missing surface rather than a missing
+  feature: nothing in `pelfs` creates a second branch, so `main` is the
+  only ref any volume has.

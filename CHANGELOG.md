@@ -36,6 +36,19 @@ limitations*.
   it out — rewriting the packs that are mostly garbage into new ones and
   publishing a generation that condemns the old ones, after which `gc
   --delete` can reclaim them.
+- **Retention that keeps the last K generations.** The sweep's root set is
+  every branch head, the last `Params.RetainK` generations behind each head
+  (8 by default, stated in the superblock), and every tag — so a reader
+  still holding a recently retired generation keeps everything it names,
+  not just whatever the grace window happens to cover. A retired generation
+  has no address, so the sweep reads the disaster-recovery superblock a
+  seal buries in its last pack; a generation it cannot establish is
+  reported and warned about, and a read it cannot complete fails the sweep
+  closed rather than guessing.
+- **`pelfs tag`, and `pelfs tag --rm`.** Freeze a branch head under a name,
+  list what is pinned, and release a pin. Tags are immutable, so a name in
+  use never silently moves; deleting one takes its generation out of the
+  root set and the next sweep reclaims what it was holding.
 - **`pelfs version`**, and `pelfs ctl <prefix> bugreport` for a tarball with
   the build, the stats and every goroutine.
 - **Unprivileged by construction.** One static binary, no root, no setup;
@@ -80,10 +93,26 @@ and no end-to-end run.
 
 ### Known limitations
 
-- **Deleting the reclaimed packs is still manual.** A mount repacks on its
-  own, but nothing collects: `pelfs gc --delete` is a separate command, and
-  it only takes packs older than the grace window (72h, not configurable).
-  A volume nobody mounts is never maintained at all.
+- **Deleting the reclaimed packs is still manual, and now waits for two
+  windows.** A mount repacks on its own, but nothing collects: `pelfs gc
+  --delete` is a separate command, it only takes objects older than the
+  grace window (72h, not configurable), and — new in this release — it
+  keeps whatever the last `Params.RetainK` generations of the branch still
+  name. A repack followed straight away by a sweep therefore frees nothing:
+  the generations the repack retired are inside the retain window and they
+  name the condemned packs. Reclamation happens once the branch has sealed
+  K more times, or under `pelfs gc --retain-k 1`, which is the sweep as it
+  behaved before the window was enforced. A volume nobody mounts is never
+  maintained at all.
+- **The retain window is only as good as the superblock backups.** A
+  retired generation has no address, so the sweep reconstructs it from the
+  disaster-recovery superblock every seal buries in its last pack. Repack
+  carries those backups forward, so ordinary maintenance keeps them; a pack
+  collected by a sweep from BEFORE this release took its backup with it, so
+  the first sweeps on an existing volume may report a short window
+  (`retain window: branch main keeps N of 8 generations`). That is reported
+  and warned about, never silently assumed — and those generations age out
+  of the window within K seals.
 - **A repack cannot yet retire index or manifest objects on their own
   account.** Replacing the manifest already drops superseded segments, so
   what is missing is the narrower case of an index whose packs are mostly
@@ -92,11 +121,12 @@ and no end-to-end run.
   the transport has no compare-and-swap. A seal that would overwrite another
   writer's generation is refused, so the failure mode is a rejected seal
   rather than silent corruption.
-- **No ref deletion, no forks, no key rotation.** `pelfs tag` freezes a
-  branch head under a name and `--tag` mounts it, but nothing deletes a tag
-  or a branch — and deleting a ref is what finally releases its space, so a
-  tag pins its generation for good. `pelfs rescue` is specified and not
-  built.
+- **No forks and no key rotation.** Tag deletion has landed (`pelfs tag
+  --rm` removes a tag, and the next sweep reclaims what it was pinning), so
+  a pin is no longer one-way. BRANCH deletion is still absent and is
+  missing surface rather than a missing feature: nothing in `pelfs` creates
+  a second branch, so `main` is the only ref a volume has. `pelfs rescue`
+  is specified and not built.
 - The origin must permit GET/PUT/DELETE and listing on the prefix; `pelfs`
   checks this up front and names the missing scope.
 

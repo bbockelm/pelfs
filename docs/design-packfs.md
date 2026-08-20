@@ -720,6 +720,22 @@ a lost generation, and it is advisory.
   availability under token compromise does not, and no client-side design
   can change that.
 
+  **What DELETION can and cannot break, since `pelfs tag --rm` removes an
+  object and carries no signature.** Removing a tag is inside the
+  availability half and adds nothing to it: whoever can delete `tags/v1.0`
+  can already overwrite `refs/main`, which is strictly worse. Requiring a
+  signature on a delete would buy nothing against that attacker and would
+  cost the one case that matters most — a tag a rotated or compromised key
+  left behind, which no longer verifies and would become permanently
+  undeletable. So deletion verifies the tag only to REPORT which generation
+  it named, never to authorize the removal. What deletion cannot break is
+  integrity: no object it removes is ever served as data, and a reader
+  already holding a generation's superblock is unaffected by the
+  disappearance of a name it never consulted. The same reasoning is why the
+  retain window may read an unsigned pack trailer to FIND a backup but
+  verifies the backup itself before believing a word of it — a scavenged
+  document can only ever make the sweep keep MORE.
+
 ## Integrity and encryption
 
 Two independent mechanisms, cleanly layered:
@@ -1562,23 +1578,63 @@ with:
   that could narrow it would be an option to delete a concurrent writer's
   packs. There is no per-volume knob to set it, and the superblock field is
   written from a compiled-in constant.
-- **A workflow that needs a longer pin must TAG.** Tags pin exactly and
-  indefinitely, and they are the only thing that does. A reader pinned to
-  an untagged generation older than the window may lose it: an index costs
-  that reader the trailer fallback (slow), a manifest costs it the
-  generation (unreadable, and the packs it alone named go on the sweep
-  after).
-- **`Params.RetainK` is recorded and unenforced.** Nothing reads it. The
-  live set is head-plus-tags and nothing else; "the last K generations" is
-  not implemented anywhere, and this document previously implied it was.
+- **`Params.RetainK` is ENFORCED, and this is how.** The root set is every
+  branch head, the last K generations behind each head, and every tag. K
+  comes from the head's own `Params.RetainK` (8 today) and counts the head
+  as one of the K. `pelfs gc --retain-k` overrides it, and it is the one
+  retention knob that may NARROW as well as widen: `--grace` may only widen
+  because the grace window is what makes a coordination-free sweep safe
+  against a writer running right now, whereas K is a claim about readers
+  pinned to retired generations — an operator's assertion about their own
+  fleet, not a bet on a race.
+
+  The awkward part is that a retired generation has no address: its ref was
+  overwritten and nothing archives what was there. The sweep therefore
+  reads the DISASTER-RECOVERY SUPERBLOCK every seal buries in its last
+  pack. That document describes "the newest generation minus its tail", so
+  it is not a description of its own generation — but it is an exact
+  description of its PARENT, because it carries the parent's manifest and
+  index refs verbatim and publishes no segment of its own. So to retain
+  generations H-1 … H-K+1 the sweep reads the backups of generations H …
+  H-K+2, and each one says what the generation below it named.
+
+  A repack writes no backup, so nothing describes the generation a repack
+  grew from. What covers that one is the repack's own CONDEMNED LEDGER: a
+  ledger row is live if it is younger than `T_grace` **or** it was stamped
+  at or after the creation time of the oldest generation the window
+  resolved. Both halves say the same thing from opposite sides — an object
+  a generation inside the window still names stays live, whatever its age.
+
+  Failure modes, and which way each falls: a backup that is NOT THERE (its
+  pack was collected by an older sweep) means the generation can never be
+  described, so it is reported (`retain window: branch main keeps N of K
+  generations`) and drops out of the root set — failing the sweep would
+  protect nothing and would stop the volume reclaiming anything for as long
+  as the generation sat in the window. A backup that IS there and cannot be
+  READ is unknown state, and the sweep fails closed exactly as it does for
+  an unreadable head or tag. And a scan that hits its budget has stopped
+  looking rather than found nothing, which is also a hard error.
+- **A workflow that needs a pin outliving BOTH windows must TAG.** Tags pin
+  exactly, and for as long as the tag object exists. A reader pinned to an
+  untagged generation older than the grace window and outside the retain
+  window may lose it: an index costs that reader the trailer fallback
+  (slow), a manifest costs it the generation (unreadable, and the packs it
+  alone named go on the sweep after).
 - **The "snapshot expired" reader error does not exist.** The window is
   enforced from the sweep side only. A reader that loses a generation this
   way finds out by failing to fetch something.
-- **Tag creation is `pelfs tag`.** It fetches the branch head under the
-  ordinary trust policy and freezes those exact bytes, so the bullets above
-  name an escape a user can actually take. Tag DELETION still has no
-  command, so the escape is one-way: a tag holds its generation until
-  someone removes the object by hand.
+- **Tag creation is `pelfs tag`, and deletion is `pelfs tag --rm`.**
+  Creation fetches the branch head under the ordinary trust policy and
+  freezes those exact bytes, so the bullets above name an escape a user can
+  actually take; deletion removes the object, which takes the generation
+  out of the root set so the NEXT sweep reclaims what it was pinning.
+  Deletion is not itself a reclaim and the command says so.
+
+  Immutability survives deletion intact, because it is a property of the
+  OBJECT and not of the name: a tag in use is never overwritten, and a name
+  nothing is under any more is free to be used again. Deletion needs no
+  signature — see *Threat model* — and is deliberately unguarded: there is
+  no in-use check because nothing in the format refers to a tag.
 
 ## Codec marking
 

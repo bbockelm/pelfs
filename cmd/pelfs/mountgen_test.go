@@ -6,11 +6,14 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -828,4 +831,137 @@ func TestCheckpointFiresUnderWritePressure(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+// failPutsOn fails every Put whose key starts with a prefix, which is how
+// a seal fails in the field: the uplink dies partway through the packs
+// (a closed laptop, a reset connection, an origin restart).
+type failPutsOn struct {
+	pelicanobj.Store
+	prefix string
+	fail   *atomic.Bool
+}
+
+func (f failPutsOn) Put(ctx context.Context, key string, r io.Reader) error {
+	if f.fail.Load() && strings.HasPrefix(key, f.prefix) {
+		return errors.New("simulated uplink failure")
+	}
+	return f.Store.Put(ctx, key, r)
+}
+
+// Unwrap keeps the transport's capabilities visible through the
+// decorator, as countedStore does: refs and the lease probe for them, and
+// hiding them would change what the test exercises.
+func (f failPutsOn) Unwrap() pelicanobj.Store { return f.Store }
+
+// A seal that cannot reach the federation must lose NOTHING. The exit
+// path promises "the overlay is intact at ...; remount to retry", and
+// that promise is the only thing standing between a flaky uplink and a
+// discarded session — the exact failure a real run hit when a laptop
+// closed mid-seal.
+//
+// So: fail every pack upload, assert the session survives on disk, then
+// reopen the overlay the way a remount does and seal it for real.
+func TestAFailedSealKeepsTheOverlayAndARemountSealsIt(t *testing.T) {
+	g := newGenSession(t, true)
+	ctx := context.Background()
+	// Captured before anything seals: a successful seal advances g.sb, so
+	// comparing against it afterwards compares the new generation with
+	// itself.
+	startGen := g.sb.Generation
+	writeFile(t, g.ov, "survivor.txt", "this must outlive a failed seal")
+
+	good := g.inner
+	var failing atomic.Bool
+	failing.Store(true)
+	g.inner = failPutsOn{Store: good, prefix: "packs/", fail: &failing}
+
+	err := g.sealAtExit(ctx)
+	if err == nil {
+		t.Fatal("a seal whose pack uploads all failed reported success")
+	}
+	// The message has to say where the data is. A user who is told only
+	// that the seal failed has no reason to believe their work survived.
+	if !strings.Contains(err.Error(), g.overlayDir) {
+		t.Errorf("the failure does not name the overlay: %v", err)
+	}
+	if _, serr := os.Stat(g.overlayDir); serr != nil {
+		t.Fatalf("a failed seal removed the overlay: %v", serr)
+	}
+	if g.spent {
+		t.Error("a failed seal marked the overlay spent; the next mount would refuse to resume it")
+	}
+	ents, rerr := os.ReadDir(filepath.Join(g.stateDir, trashDirName))
+	if rerr == nil && len(ents) != 0 {
+		t.Errorf("a failed seal retired %d overlay(s) into the trash", len(ents))
+	}
+	// And the head must be unchanged: a generation was never published,
+	// so nothing may claim one was.
+	rstore, rerr := refs.New(good, t.TempDir(), nil)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	f, rerr := rstore.Fetch(ctx, "main")
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if f.Superblock.Generation != startGen {
+		t.Fatalf("the branch moved to generation %d despite a failed seal", f.Superblock.Generation)
+	}
+
+	// The remount: same state directory, same overlay on disk, a working
+	// uplink. Closing and reopening is the part that proves the session
+	// survived in the FILE rather than in this process's memory.
+	g.ovMu.Lock()
+	if cerr := g.ov.Close(); cerr != nil {
+		g.ovMu.Unlock()
+		t.Fatalf("close the overlay: %v", cerr)
+	}
+	reopened, oerr := overlay.Open(g.overlayDir, g.gfs, overlay.Options{
+		NextInode:      g.gfs.NextInode(),
+		BaseRoot:       g.gfs.RootCatalog(),
+		BaseGeneration: g.gfs.Generation(),
+	})
+	if oerr != nil {
+		g.ovMu.Unlock()
+		t.Fatalf("a later mount could not reopen the overlay a failed seal left: %v", oerr)
+	}
+	g.ov = reopened
+	g.ovMu.Unlock()
+	t.Cleanup(func() { _ = reopened.Close() })
+
+	st, serr := g.ov.Stats()
+	if serr != nil {
+		t.Fatal(serr)
+	}
+	if st.DirtyNodes == 0 && st.DirtyEdges == 0 {
+		t.Fatal("the reopened overlay reports nothing to seal; the session was lost")
+	}
+
+	failing.Store(false)
+	g.inner = good
+	if err := g.sealAtExit(ctx); err != nil {
+		t.Fatalf("the retry seal failed: %v", err)
+	}
+
+	// The file is in the published generation, which is the whole claim.
+	f2, rerr := rstore.Fetch(ctx, "main")
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if f2.Superblock.Generation <= startGen {
+		t.Fatalf("the retry published generation %d, which does not follow %d", f2.Superblock.Generation, startGen)
+	}
+	sealed, gerr := genfs.Open(ctx, genfs.Options{
+		Inner: good, SB: f2.Superblock, CacheDir: filepath.Join(g.stateDir, "gencache-retry"),
+	})
+	if gerr != nil {
+		t.Fatalf("open the retried generation: %v", gerr)
+	}
+	defer sealed.Close() //nolint:errcheck
+	if _, lerr := sealed.Lookup(ctx, overlay.RootInode, "survivor.txt"); lerr != nil {
+		t.Fatalf("the file written before the failed seal is not in the retried generation: %v", lerr)
+	}
+	t.Logf("failed seal kept %d dirty nodes; the retry published generation %d",
+		st.DirtyNodes, f2.Superblock.Generation)
 }

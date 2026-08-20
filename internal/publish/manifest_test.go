@@ -355,3 +355,45 @@ func TestCondemnedRefEntriesAgeOffTheSuperblock(t *testing.T) {
 		}
 	}
 }
+
+// Maintenance state belongs to the BRANCH, not to a seal: a repack
+// writes it and every ordinary publish afterwards must carry it forward
+// untouched.
+//
+// Dropping it is not a cosmetic loss. It is the state the cheap
+// auto-repack gate reads (repack.Worthwhile), so a seal that forgot it
+// would make the volume look like one that had never been repacked — and
+// the next quiescent moment would pay for a full reachability sweep that
+// had just been paid for.
+func TestMaintenanceStateSurvivesAnOrdinarySeal(t *testing.T) {
+	ctx := context.Background()
+	v := newReuseVol(t, [16]byte{0x11, 0xd0, 0x33})
+	v.create(publishRootInode, "a.bin", pseudorandom(2<<20, 42))
+	first := v.checkpoint()
+	if first.Superblock.Maint != nil {
+		t.Fatal("an ordinary seal invented maintenance state")
+	}
+
+	want := superblock.Maint{RepackGeneration: 7, RepackPacks: 42, RepackUnixNano: 1700000000000000000}
+	prev := *first.Superblock
+	prev.Maint = &want
+	if err := prev.Sign(v.priv); err != nil {
+		t.Fatal(err)
+	}
+	prevRaw, err := prev.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := v.inner.Put(ctx, "refs/main", bytes.NewReader(prevRaw)); err != nil {
+		t.Fatal(err)
+	}
+
+	v.create(publishRootInode, "b.bin", pseudorandom(2<<20, 43))
+	next := v.sealOnly(&publish.Result{Superblock: &prev, Raw: prevRaw})
+	if next.Superblock.Maint == nil {
+		t.Fatal("the seal dropped the maintenance state; the auto gate would re-sweep a volume just repacked")
+	}
+	if *next.Superblock.Maint != want {
+		t.Fatalf("the seal changed the maintenance state: %+v, want %+v", *next.Superblock.Maint, want)
+	}
+}

@@ -420,6 +420,10 @@ func repackedSuperblock(ctx context.Context, o ExecOptions, prev *superblock.Sup
 	}
 	mb := manifest.NewBuilder()
 	kept := 0
+	// listedPacks is what the new generation NAMES, which the ledger rule
+	// needs: a name still listed is never condemned, whatever this run
+	// thinks it dropped.
+	listedPacks := make([]string, 0, len(prevPacks)+len(res.NewPacks))
 	for _, pe := range prevPacks {
 		if condemn[pe.Name] {
 			continue
@@ -427,12 +431,14 @@ func repackedSuperblock(ctx context.Context, o ExecOptions, prev *superblock.Sup
 		if err := mb.Add(packstore.SealedPack{Name: pe.Name, TrailerHash: pe.TrailerHash, Size: pe.Size}); err != nil {
 			return nil, nil, err
 		}
+		listedPacks = append(listedPacks, pe.Name)
 		kept++
 	}
 	for _, sp := range res.NewPacks {
 		if err := mb.Add(sp); err != nil {
 			return nil, nil, err
 		}
+		listedPacks = append(listedPacks, sp.Name)
 	}
 	mref, err := putManifest(ctx, o.Inner, mb)
 	if err != nil {
@@ -445,7 +451,14 @@ func repackedSuperblock(ctx context.Context, o ExecOptions, prev *superblock.Sup
 	// change deleted.
 	sb.PackList = nil
 	sb.Manifests = []superblock.ManifestRef{mref}
-	sb.CondemnedManifests = condemnRefs(prev.CondemnedManifests, refNames(prev.Manifests), now, graceOf(prev))
+	// The ledger rule is the superblock's, not this file's: publish and
+	// repack write the same field and a reader cannot tell which of them
+	// wrote it (superblock.CarryCondemnedRefs). Passing the segment this
+	// generation LISTS matters here in particular — a repack that rebuilt
+	// the manifest into the same bytes produces the same content hash, and
+	// the old rule condemned the very segment sb.Manifests names.
+	sb.CondemnedManifests = condemnRefs(prev.CondemnedManifests, refNames(prev.Manifests),
+		[]string{mref.Name}, now, graceOf(prev), "manifest")
 
 	// One index segment for what moved, listed LAST so it wins: a Set
 	// asks the newest index first, and the older segments still name the
@@ -458,10 +471,19 @@ func repackedSuperblock(ctx context.Context, o ExecOptions, prev *superblock.Sup
 		sb.PackIndexes = append(append([]superblock.IndexRef{}, prev.PackIndexes...), iref)
 	}
 
+	// What this run did, so the next one can decide whether to bother
+	// without paying for a sweep (auto.go). Written here and nowhere
+	// else: an ordinary publish carries it forward untouched.
+	sb.Maint = &superblock.Maint{
+		RepackGeneration: sb.Generation,
+		RepackPacks:      uint32(mref.Packs),
+		RepackUnixNano:   now.UnixNano(),
+	}
+
 	// The condemned ledger for the packs themselves. This is the entry
 	// retention reads to keep a pack alive through the grace window for
 	// readers still pinned to a generation that names it.
-	sb.Condemned = condemnPacks(prev.Condemned, res.CondemnedPacks, now, graceOf(prev))
+	sb.Condemned = condemnPacks(prev.Condemned, res.CondemnedPacks, listedPacks, now, graceOf(prev))
 
 	// The root-catalog hint is a hint, verified against the identity and
 	// falling back to the index — but a hint pointing into a pack this
@@ -516,32 +538,33 @@ func refNames(refs []superblock.ManifestRef) []string {
 	return out
 }
 
-// condemnPacks carries the parent's ledger forward, dropping entries past
-// the grace window, and adds what this change stopped naming.
-func condemnPacks(prev []superblock.CondemnedPack, dropped []string, now time.Time, grace time.Duration) []superblock.CondemnedPack {
-	out := make([]superblock.CondemnedPack, 0, len(prev)+len(dropped))
-	for _, c := range prev {
-		if now.Sub(time.Unix(c.CondemnedAtUnix, 0)) < grace {
-			out = append(out, c)
-		}
-	}
-	for _, name := range dropped {
-		out = append(out, superblock.CondemnedPack{Name: name, CondemnedAtUnix: now.Unix()})
-	}
+// condemnPacks and condemnRefs are this writer's calls into the ONE
+// ledger rule (superblock.CarryCondemnedPacks / CarryCondemnedRefs). They
+// exist to warn: a repack that overflows a ledger has shortened the window
+// objects only a retired generation names are kept for, and nothing else
+// would say so.
+func condemnPacks(prev []superblock.CondemnedPack, dropped, listed []string,
+	now time.Time, grace time.Duration) []superblock.CondemnedPack {
+	out, overflow := superblock.CarryCondemnedPacks(prev, dropped, listed, now, grace)
+	warnLedgerOverflow("pack", overflow, grace)
 	return out
 }
 
-func condemnRefs(prev []superblock.CondemnedRef, dropped []string, now time.Time, grace time.Duration) []superblock.CondemnedRef {
-	out := make([]superblock.CondemnedRef, 0, len(prev)+len(dropped))
-	for _, c := range prev {
-		if now.Sub(time.Unix(c.CondemnedAtUnix, 0)) < grace {
-			out = append(out, c)
-		}
-	}
-	for _, name := range dropped {
-		out = append(out, superblock.CondemnedRef{Name: name, CondemnedAtUnix: now.Unix()})
-	}
+func condemnRefs(prev []superblock.CondemnedRef, dropped, listed []string,
+	now time.Time, grace time.Duration, what string) []superblock.CondemnedRef {
+	out, overflow := superblock.CarryCondemnedRefs(prev, dropped, listed, now, grace)
+	warnLedgerOverflow(what, overflow, grace)
 	return out
+}
+
+func warnLedgerOverflow(what string, overflow int, grace time.Duration) {
+	if overflow == 0 {
+		return
+	}
+	ui.Warn("repack: the condemned-{what} ledger is full at {cap} entries, so this generation dropped the "+
+		"{n} oldest; they are objects only a retired generation names, and they may now be swept before "+
+		"the {grace} grace window ends",
+		"what", what, "cap", superblock.MaxCondemnedEntries, "n", overflow, "grace", grace)
 }
 
 // movedRootHint follows the root catalog if this change moved it.

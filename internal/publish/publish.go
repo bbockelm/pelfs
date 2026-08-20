@@ -1466,6 +1466,13 @@ func (p *pipeline) buildSuperblock(newPacks []packstore.SealedPack, shards []sup
 		},
 		KeyTable: p.o.KeyTable,
 	}
+	// Maintenance state is the parent's, untouched: an ordinary publish
+	// does no maintenance, and forgetting to carry it would make every
+	// seal look like a volume that has never been repacked.
+	if p.o.Prev != nil && p.o.Prev.Maint != nil {
+		m := *p.o.Prev.Maint
+		sb.Maint = &m
+	}
 	// The condemned ledgers for the derived key spaces: what this seal
 	// stopped listing, plus the parent's entries still inside the grace
 	// window. The clock is the generation's own CreatedUnixNano, not
@@ -1474,8 +1481,8 @@ func (p *pipeline) buildSuperblock(newPacks []packstore.SealedPack, shards []sup
 	// retention floors its own window at.
 	now := time.Unix(0, p.o.CreatedUnixNano)
 	grace := time.Duration(sb.Params.TGraceSeconds) * time.Second
-	sb.CondemnedIndexes = condemnLedger(p.prevCondemnedIndexes(), p.droppedIndexes, packIndexes, now, grace)
-	sb.CondemnedManifests = condemnLedger(p.prevCondemnedManifests(), p.droppedManifests, manifests, now, grace)
+	sb.CondemnedIndexes = condemnLedger(p.prevCondemnedIndexes(), p.droppedIndexes, packIndexes, now, grace, "index")
+	sb.CondemnedManifests = condemnLedger(p.prevCondemnedManifests(), p.droppedManifests, manifests, now, grace, "manifest")
 	sb.RootCatalogHint = p.rootCatalogHint(rootID)
 	if p.o.DEK != nil {
 		// Catalog/shard/backup entries have no per-entry keyid column;

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	mrand "math/rand"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -24,6 +25,7 @@ import (
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/publish"
 	"github.com/bbockelm/pelfs/internal/refs"
+	"github.com/bbockelm/pelfs/internal/repack"
 	"github.com/bbockelm/pelfs/internal/stats"
 )
 
@@ -91,6 +93,7 @@ func newGenSession(t *testing.T, rw bool) *genSession {
 		sb:         f.Superblock,
 		prevRaw:    f.Raw,
 	}
+	g.refs = rstore
 	g.stats = stats.New(prefix, g.sessionID, g.statsPath)
 	// The session's own traffic goes through the counter, exactly as it
 	// does in runMountGen; the volume setup above deliberately does not,
@@ -964,4 +967,113 @@ func TestAFailedSealKeepsTheOverlayAndARemountSealsIt(t *testing.T) {
 	}
 	t.Logf("failed seal kept %d dirty nodes; the retry published generation %d",
 		st.DirtyNodes, f2.Superblock.Generation)
+}
+
+// Automatic repacking, from the mount that hosts it.
+//
+// The property being gated is not "a repack happened" — internal/repack
+// covers that — but that a LIVE MOUNT survives one. It runs while the
+// session is serving, the head moves under it, and the session has to
+// follow so that its own seal at unmount is still built on the right
+// parent. A mount that repacked and then failed its final seal would
+// have traded storage for the user's work.
+func TestAutoRepackRunsUnderALiveMountAndTheSessionFollows(t *testing.T) {
+	g := newGenSession(t, true)
+	ctx := context.Background()
+
+	// Two generations with content that mostly dies: enough for the
+	// planner to have something to condemn.
+	for i := range 4 {
+		writeFile(t, g.ov, fmt.Sprintf("f%d.bin", i), string(incompressible(1<<20, int64(i))))
+	}
+	if _, err := g.checkpoint(ctx); err != nil {
+		t.Fatalf("first checkpoint: %v", err)
+	}
+	for i := 1; i < 4; i++ {
+		n, err := g.ov.Lookup(ctx, overlay.RootInode, fmt.Sprintf("f%d.bin", i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := g.ov.Write(ctx, n.Inode, 0, incompressible(1<<20, int64(100+i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := g.checkpoint(ctx); err != nil {
+		t.Fatalf("second checkpoint: %v", err)
+	}
+	before := g.sb.Generation
+
+	// Packs: 1 forces the cheap gate open; the clock is moved past the
+	// grace window, which no real deployment can do and every test must.
+	err := g.autoRepackOnce(ctx, repack.AutoPolicy{Packs: 1, Now: time.Now().Add(200 * time.Hour)})
+	if err != nil {
+		t.Fatalf("autoRepackOnce: %v", err)
+	}
+	if g.sb.Generation <= before {
+		t.Fatalf("the session is still on generation %d; either nothing was repacked or it did not follow",
+			g.sb.Generation)
+	}
+	if g.sb.Maint == nil {
+		t.Error("the session followed onto a generation with no maintenance state")
+	}
+	// The namespace is untouched, which is what makes following cheap: no
+	// rebase, no inode invalidation, nothing to tell the kernel.
+	if _, err := g.ov.Lookup(ctx, overlay.RootInode, "f0.bin"); err != nil {
+		t.Fatalf("the tree is not readable through the overlay after a repack: %v", err)
+	}
+
+	// The whole point of following: the session can still seal its own
+	// work onto the branch the repack moved.
+	writeFile(t, g.ov, "after.txt", "written after the repack")
+	if err := g.sealAtExit(ctx); err != nil {
+		t.Fatalf("the seal at unmount was refused after an automatic repack: %v", err)
+	}
+	f, err := g.refs.Fetch(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := genfs.Open(ctx, genfs.Options{
+		Inner: g.inner, SB: f.Superblock, CacheDir: filepath.Join(g.stateDir, "gencache-final"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sealed.Close() //nolint:errcheck
+	if _, err := sealed.Lookup(ctx, overlay.RootInode, "after.txt"); err != nil {
+		t.Errorf("work written after the repack is not in the sealed generation: %v", err)
+	}
+	if _, err := sealed.Lookup(ctx, overlay.RootInode, "f0.bin"); err != nil {
+		t.Errorf("content that survived the repack is missing from the sealed generation: %v", err)
+	}
+	t.Logf("repacked to generation %d under a live mount, then sealed to %d",
+		g.sb.Generation, f.Superblock.Generation)
+}
+
+// The cheap gate must keep a quiet, small volume from ever paying for a
+// sweep: that is the whole reason it exists.
+func TestAutoRepackDoesNothingOnASmallVolume(t *testing.T) {
+	g := newGenSession(t, true)
+	ctx := context.Background()
+	writeFile(t, g.ov, "small.txt", "not much here")
+	if _, err := g.checkpoint(ctx); err != nil {
+		t.Fatal(err)
+	}
+	before := g.sb.Generation
+	if err := g.autoRepackOnce(ctx, repack.AutoPolicy{}); err != nil {
+		t.Fatalf("autoRepackOnce: %v", err)
+	}
+	if g.sb.Generation != before {
+		t.Fatalf("a small volume was repacked anyway: generation %d, was %d", g.sb.Generation, before)
+	}
+}
+
+// incompressible content, so that stored bytes track logical bytes and a
+// rewritten file really does strand the pack its old chunks sat in. A
+// compressible fixture packs four files into almost nothing and leaves
+// every pack comfortably live, which is a fixture that tests the planner
+// rather than the repack.
+func incompressible(n int, seed int64) []byte {
+	b := make([]byte, n)
+	mrand.New(mrand.NewSource(seed)).Read(b)
+	return b
 }

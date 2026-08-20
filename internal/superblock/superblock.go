@@ -111,6 +111,35 @@ func (r ManifestRef) RefSize() int64  { return r.Size }
 // recent anonymous generation keep their packs
 // (docs/design-packfs.md, "Retention and GC"). This replaces walking
 // lineage ancestors, whose superblocks are not reliably fetchable.
+// Maint is what MAINTENANCE has already done to this branch, carried
+// forward by every ordinary publish and written only by a repack.
+//
+// It exists so that "is a repack worth running" can be answered from the
+// head alone. Answering it truthfully costs a reachability sweep — a read
+// of every catalog and every trailer — which is far too much to pay on a
+// schedule just to be told there is nothing to do. This is the cheap
+// gate in front of that: git's `gc --auto` shape, where a COUNT that
+// accumulates decides whether to pay for the real analysis, and the real
+// analysis decides what to do.
+//
+// It deliberately does NOT estimate garbage. A generation cannot know
+// what it orphaned without asking what else still references it, which is
+// the sweep again; a field claiming to hold dead bytes would be a number
+// nobody could compute and everybody would trust. What is here is only
+// what is exactly knowable at zero cost: where the branch was when
+// maintenance last ran.
+type Maint struct {
+	// RepackGeneration is the generation a repack last published, and
+	// RepackPacks how many packs the branch held at that moment. The
+	// difference between that count and the current one is how much has
+	// accumulated since — the trigger.
+	RepackGeneration uint64 `cbor:"repack_generation"`
+	RepackPacks      uint32 `cbor:"repack_packs"`
+	// RepackUnixNano is when it ran, for a floor on how often a volume
+	// re-sweeps regardless of churn.
+	RepackUnixNano int64 `cbor:"repack_unix_nano"`
+}
+
 type CondemnedPack struct {
 	Name            string `cbor:"name"`
 	CondemnedAtUnix int64  `cbor:"condemned_at_unix"`
@@ -260,6 +289,10 @@ type Superblock struct {
 	// Condemned lists recently repacked-away packs still inside the GC
 	// grace window (omitempty per the evolution rule below).
 	Condemned []CondemnedPack `cbor:"condemned,omitempty"`
+	// Maint records what maintenance has done to this branch (see Maint).
+	// Absent on a volume no repack has touched, which reads as "never",
+	// and that is the correct starting point rather than a special case.
+	Maint *Maint `cbor:"maint,omitempty"`
 	// CatalogKeyID names the key-table entry that encrypts catalog,
 	// shard, and superblock-backup pack entries this generation (0 =
 	// plaintext). Catalog references (nested rows, RootCatalog, shard

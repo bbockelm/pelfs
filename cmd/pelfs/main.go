@@ -115,6 +115,7 @@ type cmdOpts struct {
 	gcDelete         bool
 	prefetch         string
 	statsFile        string
+	noAutoRepack     bool
 }
 
 func registerFlags(fs *flag.FlagSet, o *cmdOpts) {
@@ -132,6 +133,7 @@ func registerFlags(fs *flag.FlagSet, o *cmdOpts) {
 	fs.StringVar(&o.shellPath, "shell", "", "shell to launch (default: $SHELL, else /bin/sh)")
 	fs.StringVar(&o.prefetch, "prefetch", "none", "download the generation into the local cache at startup: none, all (blocking; refuse to start on any failure), or background")
 	fs.StringVar(&o.statsFile, "stats-file", "", "write a JSON session-statistics summary to this path (default: <state-dir>/pelfs-stats.json)")
+	fs.BoolVar(&o.noAutoRepack, "no-auto-repack", false, "do not repack in the background when the mount is idle and the branch has drifted")
 }
 
 func parseArgs(name string, args []string, minPos, maxPos int, extra func(*flag.FlagSet, *cmdOpts)) (*cmdOpts, []string, error) {

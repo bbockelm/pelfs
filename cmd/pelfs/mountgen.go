@@ -31,6 +31,7 @@ import (
 	"github.com/bbockelm/pelfs/internal/publish"
 	"github.com/bbockelm/pelfs/internal/rawfuse"
 	"github.com/bbockelm/pelfs/internal/refs"
+	"github.com/bbockelm/pelfs/internal/repack"
 	"github.com/bbockelm/pelfs/internal/stats"
 	"github.com/bbockelm/pelfs/internal/superblock"
 	"github.com/bbockelm/pelfs/internal/ui"
@@ -73,8 +74,12 @@ type genSession struct {
 
 	overlayDir string
 	inner      pelicanobj.Store // counted transport; see countedStore
-	gfs        *genfs.FS
-	ov         *overlay.FS // nil unless --rw
+	// refs is the verified ref store this session reads and flips through.
+	// Kept on the session because background maintenance publishes too
+	// (autorepack.go), and a second store would keep a second key pin.
+	refs *refs.Store
+	gfs  *genfs.FS
+	ov   *overlay.FS // nil unless --rw
 
 	stats     *stats.Collector
 	statsPath string
@@ -422,6 +427,7 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	startup.mark("lease")
 
 	rstore, err := refs.New(g.inner, stateDir, trusted)
+	g.refs = rstore
 	if err != nil {
 		return fail(err)
 	}
@@ -621,6 +627,12 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	// scales with the size of the namespace, not with the bytes in it.
 	if rw && o.snapshotInterval > 0 {
 		go g.checkpointPeriodically(sessionCtx, o.snapshotInterval)
+		if !o.noAutoRepack {
+			// Background maintenance, on the same session context: it holds
+			// the lease already and knows when the volume is idle, which a
+			// cron job has neither of.
+			go g.autoRepackPeriodically(sessionCtx, repack.AutoPolicy{})
+		}
 		ui.Info("checkpointing every {interval} (--snapshot-interval 0 disables)",
 			"interval", o.snapshotInterval)
 	}
@@ -1081,11 +1093,7 @@ func processCPU() time.Duration {
 // for a mid-session checkpoint, which keeps serving afterwards, and false
 // at unmount, where nothing will read the result.
 func (g *genSession) sealLocked(ctx context.Context, follow bool) (*publish.Result, error) {
-	keyPath := g.signingKeyPath
-	if keyPath == "" {
-		keyPath = filepath.Join(g.stateDir, "v2-signing.key")
-	}
-	signingKey, err := loadOrCreateSigningKey(keyPath, g.sb)
+	signingKey, err := loadOrCreateSigningKey(g.signingKeyFile(), g.sb)
 	if err != nil {
 		return nil, err
 	}
@@ -1748,4 +1756,14 @@ func (g *genSession) publishMountRecord() func() {
 			_ = os.Remove(path)
 		}
 	}
+}
+
+// signingKeyFile is where this session's volume signing key lives:
+// --signing-key when given, and the state directory's copy otherwise.
+// Shared by the seal and by background maintenance, which both publish.
+func (g *genSession) signingKeyFile() string {
+	if g.signingKeyPath != "" {
+		return g.signingKeyPath
+	}
+	return filepath.Join(g.stateDir, "v2-signing.key")
 }

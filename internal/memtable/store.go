@@ -171,10 +171,17 @@ type Store struct {
 	dir        string
 	tableSize  int
 	packTarget int64
-	obj        pelicanobj.Store
-	chunkOpts  chunkid.Options
-	hasher     chunkid.Hasher
-	hooks      Hooks
+	// promoteAt is how many aged bytes must accumulate before the write
+	// path starts a run. It is a pack's worth, so that a batch is worth an
+	// object to the federation, capped at half the runway between the
+	// promotion distance and the ring's size — a threshold larger than the
+	// runway could never be reached by aging, and packing would fall back
+	// to the blocked-writer path this whole mechanism exists to avoid.
+	promoteAt int64
+	obj       pelicanobj.Store
+	chunkOpts chunkid.Options
+	hasher    chunkid.Hasher
+	hooks     Hooks
 
 	// promotion is how far behind the head an extent must fall before it
 	// is packed. Zero means pack everything, which is what a flush asks
@@ -336,6 +343,10 @@ func newStore(opts Options) (*Store, error) {
 		handleLoc:  make(map[Handle][]ChunkSlice),
 		chunkLoc:   make(map[string]PackLoc),
 	}
+	s.promoteAt = s.packTarget
+	if runway := int64(opts.TableSize) - int64(opts.PromotionDistance); runway > 0 && s.promoteAt > runway/2 {
+		s.promoteAt = runway / 2
+	}
 	s.cond = sync.NewCond(&s.mu)
 	s.uploads = newUploadQueue(opts.Obj, opts.UploadQueueBytes, opts.UploadWorkers)
 	if opts.PackCacheBytes > 0 {
@@ -410,7 +421,17 @@ func (s *Store) Write(ctx context.Context, ino uint64, off int64, p []byte) erro
 	// during a session instead of leaving the whole cost to the seal, and
 	// it is what the runway between the distance and the ring's size buys
 	// — packing starts while the writer still has room.
-	if s.promotion > 0 && !s.packing && s.ring.Promotable(s.promotion) > 0 {
+	//
+	// A run starts only once a PACK'S WORTH has aged, never the moment
+	// anything has. Promotable is used-distance, so a run leaves the
+	// residue at zero and the very next write makes it exactly that
+	// write's size: triggering on "anything" cut ONE BATCH PER WRITE.
+	// A kernel untar against a real federation turned into 5,105
+	// concurrent flushes of 3-6 KiB each, every one a 7-second round
+	// trip, and a seal that should have moved 1.7 GB moved 25 MB in two
+	// minutes. Federation cost is per OBJECT before it is per byte, so a
+	// batch has to be worth an object.
+	if s.promotion > 0 && !s.packing && int64(s.ring.Promotable(s.promotion)) >= s.promoteAt {
 		s.startPackLocked(ctx, s.promotion)
 	}
 	return nil

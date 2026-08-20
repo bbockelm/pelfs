@@ -7,6 +7,7 @@ import (
 
 	"github.com/bbockelm/pelfs/internal/chunkid"
 	"github.com/bbockelm/pelfs/internal/entrycodec"
+	"github.com/bbockelm/pelfs/internal/superblock"
 )
 
 // The root-catalog hint: the one shortcut through the location layer.
@@ -28,13 +29,28 @@ import (
 // root, and nothing here can fail a mount that would otherwise have
 // worked.
 //
-// The limit worth naming: an ENCRYPTED volume's identities are keyed
+// AN ENCRYPTED VOLUME cannot make that check: its identities are keyed
 // BLAKE3 under a key genfs does not hold (see the package comment), so
-// this check cannot pass there and those mounts always take the fallback.
-// Publish still records the hint — it is true, and rescue tooling reads
-// it — but making it usable would mean authenticating the location some
-// other way, which is one pack trailer, which is what the hint exists to
-// avoid.
+// the hint used to be skipped outright there and every encrypted mount
+// took the fallback — which for the root catalog means fetching pack
+// trailers until one claims it, and with nothing to narrow the search
+// that is a request per pack of the generation. The one shortcut through
+// the location layer was unavailable to exactly the mounts that could
+// least afford to do without it.
+//
+// So those mounts confirm the hint a different way, and the way is the
+// same one the fallback would have used — the pack's own TRAILER, whose
+// hash the signed pack list records, which is the only record in the
+// format that binds an identity to an extent. Note what the GCM open does
+// NOT establish: it proves the bytes were sealed under this volume's DEK,
+// which any other catalog in the volume also was, so "it decrypted" is not
+// "it is the root".
+//
+// That confirmation is free where it matters. Following the hint reads the
+// pack, the whole-pack policy caches it entire, and a pack carries its own
+// trailer — so the check is a local read and zero requests. A mount that
+// has turned whole-pack caching off pays one trailer range read, against
+// one per pack for the fallback it replaces.
 
 // spillRootFromHint materializes the root catalog straight from the
 // superblock's location hint, returning the spill path and whether the
@@ -54,8 +70,8 @@ func (fs *FS) spillRootFromHint(ctx context.Context, rootHex string) (string, bo
 	// length matters more than it looks — it is a buffer size on the
 	// whole-pack path, so a hint that survived a truncated pack list or a
 	// bad edit would otherwise be an allocation request.
-	size := fs.packIndex.size(h.Pack)
-	if size <= 0 || h.Off+h.Length > size {
+	pe, listed := fs.packIndex.entry(h.Pack)
+	if !listed || pe.Size <= 0 || h.Off+h.Length > pe.Size {
 		return "", false
 	}
 	fp := filepath.Join(fs.catDir, rootHex+".db")
@@ -76,15 +92,33 @@ func (fs *FS) spillRootFromHint(ctx context.Context, rootHex string) (string, bo
 	if err != nil {
 		return "", false
 	}
-	// The check that makes following a hint safe. Identity is the truth
-	// about which bytes these are; the hint only ever proposed where to
-	// look, and a proposal that does not hash to the root the superblock
-	// signs is one this mount ignores.
-	if chunkid.NewHasher(nil).Sum(plain) != chunkid.Identity(fs.sb.RootCatalog) {
+	if !fs.hintHolds(ctx, pe, rootHex, loc, plain) {
 		return "", false
 	}
 	if err := writeAtomic(fp, plain); err != nil {
 		return "", false
 	}
 	return fp, true
+}
+
+// hintHolds is the check that makes following a hint safe, in the two
+// forms a volume can offer it.
+//
+// Identity first, because it is both the strongest answer and the cheapest
+// one: it is the truth about which bytes these are, it needs no request,
+// and the hint only ever proposed where to look. A plaintext volume ends
+// here in both directions — a proposal that does not hash to the root the
+// superblock signs is one this mount ignores.
+//
+// A keyed-identity volume cannot compute it, so the question moves to the
+// authenticated trailer: does the pack itself say this extent is the root
+// identity? Same guarantee, one local read (see the note above).
+func (fs *FS) hintHolds(ctx context.Context, pe superblock.PackEntry, rootHex string, loc packLoc, plain []byte) bool {
+	if chunkid.NewHasher(nil).Sum(plain) == chunkid.Identity(fs.sb.RootCatalog) {
+		return true
+	}
+	if len(fs.catalogDEK()) == 0 {
+		return false
+	}
+	return fs.packIndex.confirms(ctx, pe, rootHex, loc)
 }

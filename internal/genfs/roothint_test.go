@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/bbockelm/pelfs/internal/genfs"
+	"github.com/bbockelm/pelfs/internal/packstore"
 	"github.com/bbockelm/pelfs/internal/publish"
 	"github.com/bbockelm/pelfs/internal/superblock"
 	"github.com/bbockelm/pelfs/internal/testvol"
@@ -184,6 +185,135 @@ func TestWrongRootHintStillMounts(t *testing.T) {
 			}
 		})
 	}
+}
+
+// encryptedHintedVolume is hintedVolume over a volume whose identities are
+// keyed — the case the hint used to be unavailable for.
+func encryptedHintedVolume(t *testing.T, uuid string) (*packGetStore, *superblock.Superblock, []byte) {
+	t.Helper()
+	base, _ := newInner(t)
+	inner := &packGetStore{Store: base}
+	dek := pseudorandom(32, 91)
+	v := testvol.New(t, inner, testvol.Options{
+		VolumeID:    testvol.ParseUUID(t, uuid),
+		DEK:         dek,
+		IdentityKey: pseudorandom(32, 92),
+		KeyID:       7,
+		KeyTable: []superblock.KeyEntry{
+			{ID: 7, Kind: superblock.KeyKindDEK, Alg: superblock.KeyAlgRSAOAEPSHA256, Wrapped: []byte("wrapped-dek")},
+			{ID: 8, Kind: superblock.KeyKindIdentity, Alg: superblock.KeyAlgRSAOAEPSHA256, Wrapped: []byte("wrapped-idkey")},
+		},
+	})
+	dir := v.Mkdir(rootIno, "d")
+	for i := 0; i < 12; i++ {
+		f := v.Create(dir, string(rune('a'+i))+".bin")
+		v.Write(f, pseudorandom(600<<10, int64(i)+1))
+	}
+	var res *publish.Result
+	for i := 0; i < 7; i++ {
+		res = publishVolume(t, v, inner, publish.Options{TargetPackSize: 512 << 10})
+	}
+	if res.Superblock.RootCatalogHint == nil {
+		t.Fatal("publish recorded no root-catalog hint")
+	}
+	if len(packsOf(t, inner, res.Superblock)) < 8 {
+		t.Fatalf("volume has %d packs; the test needs many", len(packsOf(t, inner, res.Superblock)))
+	}
+	return inner, res.Superblock, dek
+}
+
+// An encrypted volume cannot recompute identity, so it used to skip the
+// hint and locate its root the long way — a trailer per pack, on every
+// mount, for exactly the volumes that can least afford it. It now confirms
+// the hint against the pack's own trailer, which the whole-pack policy has
+// already brought down.
+//
+// Measured without the multi-pack index for the same reason
+// TestRootHintSkipsThePackIndex is: the index answers the same question,
+// and what is being pinned here is the hint against the walk.
+func TestRootHintWorksOnAnEncryptedVolume(t *testing.T) {
+	ctx := context.Background()
+	inner, hintedSB, dek := encryptedHintedVolume(t, "9efe7c40-0000-4000-8000-0000000000b4")
+	sb := withoutPackIndexes(hintedSB)
+	packs := len(packsOf(t, inner, sb))
+
+	inner.reset()
+	hinted := openFS(t, inner, sb, genfs.Options{CacheDir: t.TempDir(), DEK: dek})
+	withHintGets := inner.gets.Load()
+	if _, err := hinted.Readdir(ctx, rootIno); err != nil {
+		t.Fatalf("root readdir: %v", err)
+	}
+
+	inner.reset()
+	blind := openFS(t, inner, withHint(sb, nil), genfs.Options{CacheDir: t.TempDir(), DEK: dek})
+	noHintGets := inner.gets.Load()
+	if _, err := blind.Readdir(ctx, rootIno); err != nil {
+		t.Fatalf("root readdir without the hint: %v", err)
+	}
+
+	t.Logf("mounting a %d-pack ENCRYPTED generation: %d pack request(s) with the hint, %d without",
+		packs, withHintGets, noHintGets)
+	if withHintGets > 2 {
+		t.Errorf("a hinted encrypted mount issued %d pack request(s); the pack the hint names carries the "+
+			"trailer that confirms it, so one read should do", withHintGets)
+	}
+	if withHintGets >= noHintGets {
+		t.Errorf("the hint saved nothing on an encrypted volume: %d request(s) with it, %d without",
+			withHintGets, noHintGets)
+	}
+	if !equalStrings(treeOf(t, hinted), treeOf(t, blind)) {
+		t.Error("the hinted encrypted mount and the fallback mount disagree about the tree")
+	}
+}
+
+// The check that has to hold for the above to be safe. On an encrypted
+// volume the GCM open proves only that the bytes were sealed under this
+// volume's DEK — every catalog in the volume was — so a hint pointing at a
+// DIFFERENT entry of the right pack decrypts perfectly and is not the
+// root. Only the pack's authenticated trailer can tell them apart.
+//
+// Every other entry of the root's pack is tried as the hint, because the
+// failure being ruled out is "believed the hint", and that has to be ruled
+// out for all of them.
+func TestAnEncryptedHintPointingAtAnotherEntryIsRejected(t *testing.T) {
+	ctx := context.Background()
+	inner, sb, dek := encryptedHintedVolume(t, "9efe7c40-0000-4000-8000-0000000000b5")
+	want := treeOf(t, openFS(t, inner, sb, genfs.Options{CacheDir: t.TempDir(), DEK: dek}))
+
+	real := sb.RootCatalogHint
+	pe, ok := packEntryNamed(packsOf(t, inner, sb), real.Pack)
+	if !ok {
+		t.Fatalf("the hint names %s, which the generation does not list", real.Pack)
+	}
+	entries, _, err := packstore.FetchTrailerStoredVerified(ctx, inner, pe.Name, pe.Size, pe.TrailerHash)
+	if err != nil {
+		t.Fatalf("trailer of %s: %v", pe.Name, err)
+	}
+	tried := 0
+	for _, e := range entries {
+		if e.Off == real.Off && e.Length == real.Length {
+			continue // the root itself
+		}
+		tried++
+		hint := &superblock.RootHint{Pack: pe.Name, Off: e.Off, Length: e.Length}
+		fs := openFS(t, inner, withHint(sb, hint), genfs.Options{CacheDir: t.TempDir(), DEK: dek})
+		if got := treeOf(t, fs); !equalStrings(got, want) {
+			t.Fatalf("a hint at entry %s of the root's own pack served a different tree: %v", e.Key, got)
+		}
+	}
+	if tried == 0 {
+		t.Fatal("the root's pack holds nothing but the root; there is no other entry to point at")
+	}
+	t.Logf("%d other entries of the root's pack rejected as the root", tried)
+}
+
+func packEntryNamed(packs []superblock.PackEntry, name string) (superblock.PackEntry, bool) {
+	for _, pe := range packs {
+		if pe.Name == name {
+			return pe, true
+		}
+	}
+	return superblock.PackEntry{}, false
 }
 
 // The old shape of the format: a superblock written before the hint

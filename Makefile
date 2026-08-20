@@ -1,6 +1,6 @@
 ARCH  := $(shell go env GOARCH)
 
-.PHONY: all build linux test e2e integration mount-gate opfuzz unprivileged vet clean
+.PHONY: all build linux test e2e integration mount-gate opfuzz unprivileged crash big-tree vet clean
 
 all: build
 
@@ -30,6 +30,15 @@ integration:
 
 opfuzz:
 	./scripts/opfuzz-docker.sh
+
+# kill -9 a mount mid-flush, remount, and hold recovery to its contract.
+crash:
+	./scripts/crash-recovery-docker.sh
+
+# 50k files through both frontends, two generations, with bounds on the
+# rates it measures. ~4 minutes.
+big-tree:
+	./scripts/bench-untar-nfs-docker.sh 50000 2500 4
 
 # The scenario a user actually has: a linux/amd64 binary on a host where
 # they are not root.

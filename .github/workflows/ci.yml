@@ -174,6 +174,35 @@ jobs:
       - name: Mount a published generation and benchmark it
         run: ./scripts/mount-gate-docker.sh
 
+  crash:
+    # kill -9 a read-write mount while it is mid-flush, remount the same
+    # state dir, and hold recovery to its contract. The repo had no test
+    # that PRODUCED a crash — the memtable's recovery tests construct
+    # post-crash state rather than produce it — and the write path is
+    # default-on. Measured 14s.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.0"
+      - name: Enable FUSE
+        run: |
+          sudo modprobe fuse
+          sudo chmod 666 /dev/fuse
+      - name: SIGKILL a mount mid-flush and recover it
+        env:
+          PELFS_CRASH_OUT: ${{ github.workspace }}/crash-out
+        run: ./scripts/crash-recovery-docker.sh
+      - name: Upload the crash logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-logs
+          path: crash-out/
+          if-no-files-found: warn
+
   big-tree:
     # The scale gate: 50,000 files (62,500 with the hard links) untarred
     # through BOTH frontends, diffed live, sealed, cold-remounted into a

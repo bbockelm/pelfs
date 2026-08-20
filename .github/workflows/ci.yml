@@ -3,10 +3,26 @@ name: CI
 on:
   push:
     branches: [main]
+    # Tags too. CI did not run on them at all, so the one commit whose
+    # results anyone will ever look up — the one a release was cut from —
+    # was the one commit nothing checked. The release job at the bottom is
+    # gated on this trigger and runs only after the gates pass.
+    tags: ["v*"]
   pull_request:
+
+# Every job carries a timeout-minutes, sized at roughly 2x its measured
+# runtime (measurements are in each job's comment; they were taken on
+# Docker for Mac, and the runners are slower, hence 2x rather than 1.5x).
+# The default is SIX HOURS: a stalled job holds a runner for a working day
+# and reports nothing, and a stall is the failure mode this whole
+# punchlist is hunting. A job that trips its timeout is a bug report.
+permissions:
+  contents: read
 
 jobs:
   unit:
+    # go vet + go test ./... + three cross-builds. 34s of tests locally.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -16,7 +32,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.26.x"
+          go-version: "1.26.0"
       - name: Vet
         run: CGO_ENABLED=0 go vet ./...
       # ./... rather than ./internal/...: cmd/pelfs holds the tests for the
@@ -32,26 +48,53 @@ jobs:
           CGO_ENABLED=0 GOOS=linux  GOARCH=arm64 go build -o /dev/null ./cmd/pelfs
           CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -o /dev/null ./cmd/pelfs
 
-  e2e:
-    # The whole user-facing workflow -- create, write, seal, read back,
-    # encrypt, prefetch, lease, gc, fsck -- in a container, because the
-    # gate mounts a real filesystem.
+  race:
+    # The whole suite under the race detector. Only the op-sequence stress
+    # was raced before, which left every OTHER concurrent thing in the
+    # tree — the memtable's promotion against its writers, genfs's caches,
+    # the overlay's checkpoint against reads, the NFS and FUSE frontends
+    # serving in parallel — checked by nothing.
+    #
+    # Measured 187s for ./... on a 12-core M-series box (694s of CPU), so
+    # a narrower lane was never needed: the guidance was to split it only
+    # if the full run passed 15 minutes, and it does not. A runner has
+    # fewer and slower cores, so budget generously and let the timeout be
+    # the thing that complains.
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.26.x"
+          go-version: "1.26.0"
+      - name: Race detector over the whole tree
+        run: go test -race -count=1 ./...
+
+  e2e:
+    # The whole user-facing workflow -- create, write, seal, read back,
+    # encrypt, prefetch, lease, gc, fsck -- in a container, because the
+    # gate mounts a real filesystem. Measured 10s.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.0"
       - name: Full workflow loop in a container against fakeorigin
         run: ./scripts/e2e-docker.sh
 
   integration:
+    # Builds a pelican server from source (web assets, then the binary)
+    # and runs transport/publish against a federation-in-a-box. Much the
+    # longest job, and almost all of it is building someone else's tree.
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.26.x"
+          go-version: "1.26.0"
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -84,17 +127,20 @@ jobs:
         run: PELICAN_BIN="$GITHUB_WORKSPACE/pelican-bin" ./scripts/integration-pelican.sh
 
   fuzz:
+    # Six targets at 30s each, plus the corpus replay. ~4 minutes.
+    #
     # Tier 1 (parsers): unrestricted — pure functions over untrusted
     # federation bytes, safe to run anywhere. Short smoke runs on top of
     # the checked-in corpus under each package's testdata/fuzz/, which
     # every ordinary `go test` replays as well — that is what carries a
     # finding forward once it has been found.
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.26.x"
+          go-version: "1.26.0"
       # The corpus is the point of the job: fail loudly if it went missing
       # rather than fuzzing from nothing and calling it a pass.
       - name: Check the committed corpus is there
@@ -140,13 +186,14 @@ jobs:
     # Tier 2 (filesystem operation sequences): CONTAINED, always. The
     # launcher cross-compiles on the host and runs the binary in a
     # sealed, network-less, read-only container — never on the runner
-    # filesystem directly.
+    # filesystem directly. Measured 122s + 34s.
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.26.x"
+          go-version: "1.26.0"
       - name: Op-sequence fuzzing (contained)
         run: ./scripts/opfuzz-docker.sh 120s FuzzOps
       - name: Concurrent op stress under -race (contained)
@@ -156,12 +203,14 @@ jobs:
     # A REAL kernel mount of a published generation through
     # genfs+rawfuse, exercised by the end-to-end mount script. Linux only
     # — this is the coverage a macFUSE-less dev machine cannot provide.
+    # Measured 24s, with the NFS leg now mandatory rather than skippable.
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.26.x"
+          go-version: "1.26.0"
       - name: Enable FUSE
         run: |
           sudo modprobe fuse
@@ -248,10 +297,132 @@ jobs:
     # Benchmarks are not a pass/fail gate; they run to catch build rot in
     # the harness and to leave numbers in the log for comparison.
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.26.x"
+          go-version: "1.26.0"
       - name: Microbenchmarks
         run: CGO_ENABLED=0 go test -run xxx -bench . -benchtime 0.3s ./internal/genfs/
+
+  # ---------------------------------------------------------------- release
+  # Tag-only. Everything above runs on the tag as well (that is what the
+  # `tags:` trigger is for), and these two jobs wait for the gates, so a
+  # release cannot be cut from a commit whose tests failed -- which was
+  # possible right up until now, CI having never run on a tag at all.
+
+  build-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [unit, race, e2e, integration, fuzz, opfuzz, mount-gate, crash, big-tree]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: true
+      matrix:
+        goos: [linux, darwin]
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.0"
+      # CGO_ENABLED=0 is the project's whole build story (pure-Go SQLite,
+      # pure-Go crypto), so a release binary is a single static file per
+      # platform and cross-compiling all four on one runner is honest.
+      #
+      # The -X path is internal/version.release, the fallback documented in
+      # version.go for builds with no VCS to read. It is a FALLBACK: a
+      # normal `go build` still reports the revision from runtime/debug,
+      # and the package deliberately refuses to call a pseudo-version a
+      # release. The verification step below is why this is not taken on
+      # trust -- a silently-wrong -X path produces a binary that reports
+      # "unknown" and nobody notices until a bug report arrives without a
+      # version in it.
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          dist="pelfs_${GITHUB_REF_NAME}_${GOOS}_${GOARCH}"
+          mkdir -p "$dist"
+          CGO_ENABLED=0 go build -trimpath \
+            -ldflags "-X github.com/bbockelm/pelfs/internal/version.release=${GITHUB_REF_NAME}" \
+            -o "$dist/pelfs" ./cmd/pelfs
+          cp README.md CHANGELOG.md LICENSE "$dist/"
+          tar -czf "${dist}.tar.gz" "$dist"
+          ls -l "${dist}.tar.gz"
+      # The runner is linux/amd64, so one of the four can actually be run.
+      # If the -X path ever drifts from the variable in version.go, this is
+      # the step that says so, at the moment it matters.
+      - name: Verify the version stamp took
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: |
+          set -euo pipefail
+          got=$("./pelfs_${GITHUB_REF_NAME}_linux_amd64/pelfs" version | head -1)
+          echo "$got"
+          case "$got" in
+            "pelfs ${GITHUB_REF_NAME}"*) echo "version stamp is correct" ;;
+            *) echo "the release build reports '$got', not ${GITHUB_REF_NAME}" >&2; exit 1 ;;
+          esac
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pelfs_${{ matrix.goos }}_${{ matrix.goarch }}
+          path: pelfs_*_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Scoped HERE and nowhere else: the workflow default is read-only, so
+    # the write, signing and attestation rights exist only in the one job
+    # that publishes, and only on a tag.
+    permissions:
+      contents: write      # create the release and upload its assets
+      id-token: write      # OIDC token the attestation is signed against
+      attestations: write  # record the provenance attestation
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      # Provenance over the tarballs themselves, so a downloader can ask
+      # GitHub which workflow, at which commit, produced this exact byte
+      # stream -- `gh attestation verify pelfs_*.tar.gz --repo <repo>`.
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*.tar.gz
+      # The release notes are the CHANGELOG's section for this tag, not a
+      # generated commit list. If there is no section, that is a release
+      # nobody wrote notes for, and it stops here rather than shipping an
+      # empty body.
+      - name: Release notes from the CHANGELOG
+        run: |
+          set -euo pipefail
+          awk -v tag="$GITHUB_REF_NAME" '
+            $0 ~ "^## " tag "([^0-9a-zA-Z.-]|$)" { inside = 1; next }
+            inside && /^## / { exit }
+            inside { print }
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "CHANGELOG.md has no '## $GITHUB_REF_NAME' section to release from" >&2
+            exit 1
+          fi
+          echo "--- notes ---"; head -20 notes.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          body_path: notes.md
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true

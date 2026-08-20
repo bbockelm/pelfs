@@ -176,7 +176,7 @@ func execute(ctx context.Context, o ExecOptions, res *Result, rep *reach.Report)
 	// and its liveness numbers are stale — a pack it calls dead may be one
 	// the new head references. Refused rather than rebased: rebasing means
 	// re-sweeping, which is the whole operation.
-	if !headMatches(o.Live, head.Superblock) {
+	if !headMatches(o.Head, head.Superblock) {
 		return fmt.Errorf("repack: %w: the branch moved to generation %d while this plan was computed",
 			refs.ErrStaleFlip, head.Superblock.Generation)
 	}
@@ -326,15 +326,39 @@ func trimToLedger(plan *Plan, prev []superblock.CondemnedPack, now time.Time, gr
 	return held
 }
 
-// headMatches reports whether the branch head is one of the generations
-// the plan was computed over.
-func headMatches(live []*superblock.Superblock, head *superblock.Superblock) bool {
-	for _, sb := range live {
-		if sb.Generation == head.Generation && sb.VolumeID == head.VolumeID {
-			return true
-		}
-	}
-	return false
+// headMatches reports whether the branch head is still the generation this
+// plan was computed against.
+//
+// IT COMPARES AGAINST o.Head, NOT AGAINST THE LIVE SET, and on a volume
+// with two branches that is the difference between a guard and a
+// formality. It used to scan Live for any generation with the same number
+// and volume id — which was sound while a volume had one branch, because
+// then a matching number could only be the branch itself. It is not sound
+// with two: generation numbers are per-lineage, so both children of
+// generation N seal N+1, and a SIBLING branch sitting at the same number
+// would answer for a head that had moved. The stale-plan check would pass,
+// and the repack would go on to condemn packs the new head references,
+// using liveness numbers measured before it existed.
+//
+// So the question is asked of the one generation whose answer means
+// anything: the head the plan was built from. Identity is (volume,
+// generation, root catalog, lineage) rather than a number — PrevHash pins
+// the exact parent and RootCatalog the exact content, so two documents
+// agreeing on all four are the same generation whatever ref names them,
+// which is precisely the case where proceeding is safe (a branch created
+// as a copy of another head is byte-identical to it).
+func headMatches(planned *superblock.Superblock, head *superblock.Superblock) bool {
+	return planned != nil && sameGeneration(planned, head)
+}
+
+// sameGeneration reports whether two superblocks describe one generation.
+// The generation NUMBER alone never does: it counts steps along a lineage,
+// and two branches of a volume count independently.
+func sameGeneration(a, b *superblock.Superblock) bool {
+	return a.VolumeID == b.VolumeID &&
+		a.Generation == b.Generation &&
+		a.RootCatalog == b.RootCatalog &&
+		a.PrevHash == b.PrevHash
 }
 
 // placement is where a moved identity ended up.

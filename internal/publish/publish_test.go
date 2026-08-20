@@ -22,6 +22,7 @@ import (
 	"github.com/bbockelm/pelfs/internal/packstore"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/publish"
+	"github.com/bbockelm/pelfs/internal/refs"
 	"github.com/bbockelm/pelfs/internal/superblock"
 	"github.com/bbockelm/pelfs/internal/testvol"
 )
@@ -674,5 +675,78 @@ func TestCrossGenerationDedupIndex(t *testing.T) {
 	res3 := v.Publish(publish.Options{DedupIndexPath: index})
 	if res3.Stats.DedupIndexChunks != 0 {
 		t.Fatalf("stale index was trusted: %d preloaded chunks", res3.Stats.DedupIndexChunks)
+	}
+}
+
+// THE DEDUP SIDECAR IS KEYED BY BRANCH, AND ON A MULTI-BRANCH VOLUME THAT
+// IS THE ONLY THING KEEPING IT HONEST.
+//
+// The sidecar records "these chunk identities are already stored", so a
+// publish that loads one SKIPS THE UPLOAD of anything it names. That is
+// sound while the entries describe packs the generation being built on
+// still carries forward, which is what the volume/branch/generation stamp
+// is checked for.
+//
+// Generation number alone cannot make that check, because a generation
+// number counts steps along ONE lineage: branch a volume and both children
+// seal N+1. Two branches at the same number over different content would
+// then read each other's sidecars, skip uploads for chunks that live in
+// packs the OTHER branch's pack list names, and publish chunkrefs that
+// resolve in no pack this generation lists — a generation that mounts and
+// then gives EIO on the files that took the shortcut.
+//
+// The state directory is per-PREFIX, not per-branch, so the two branches
+// genuinely share one sidecar file and this is not a hypothetical.
+func TestTheDedupSidecarIsRefusedAcrossBranches(t *testing.T) {
+	ctx := context.Background()
+	inner := newInner(t)
+	v := newTestVolume(t, inner, "5a5a5a5a-4444-4000-8000-121212121212")
+	rs, err := refs.New(inner, t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	content := pseudorandom(3<<20, 91)
+	dirIno := v.Mkdir(publishRootInode, "d")
+	v.WriteFile(dirIno, "big.bin", content)
+	index := filepath.Join(t.TempDir(), "dedup.db")
+	res1 := v.Publish(publish.Options{DedupIndexPath: index})
+	if res1.Stats.ChunksAdded == 0 {
+		t.Fatal("first publish added no chunks")
+	}
+
+	// A second branch at exactly that generation, created as `pelfs branch`
+	// creates one.
+	head, err := rs.Fetch(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rs.Flip(ctx, "dev", head.Raw, ""); err != nil {
+		t.Fatal(err)
+	}
+	v.SetBranch("dev")
+	v.Adopt(head.Superblock, head.Raw)
+
+	// dev publishes onto the SAME generation number, through the SAME
+	// sidecar file. The sidecar is stamped `main`, so it must be ignored.
+	v.Lookup(publishRootInode, "d")
+	copyIno := v.WriteFile(dirIno, "copy.bin", content)
+	res2 := v.Publish(publish.Options{DedupIndexPath: index})
+	if res2.Superblock.Generation != res1.Superblock.Generation+1 {
+		t.Fatalf("fixture: dev sealed generation %d on top of %d",
+			res2.Superblock.Generation, res1.Superblock.Generation)
+	}
+	if res2.Stats.DedupIndexChunks != 0 {
+		t.Fatalf("a sidecar written by branch main was loaded while publishing onto branch dev "+
+			"(%d chunks preloaded); the two branches share one state directory, so the branch stamp is "+
+			"the only thing that can tell them apart", res2.Stats.DedupIndexChunks)
+	}
+
+	// And the content still reads: refusing the sidecar costs an upload,
+	// never correctness.
+	env := newReadEnv(t, inner, nil, nil)
+	root := env.openCatalog(res2.Superblock.RootCatalog[:])
+	if got := env.readChunks(root, int64(copyIno)); !bytes.Equal(got, content) {
+		t.Fatalf("copy.bin does not read back through dev's generation (%d bytes)", len(got))
 	}
 }

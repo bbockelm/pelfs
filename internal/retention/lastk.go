@@ -185,12 +185,12 @@ func newWindowCache() *windowCache {
 }
 
 func (c *windowCache) get(ctx context.Context, o Options, branch string,
-	head *superblock.Superblock) (*cachedWindow, error) {
+	head *superblock.Superblock, branches int) (*cachedWindow, error) {
 	if w, ok := c.byBranch[branch]; ok {
 		return w, nil
 	}
 	w := &cachedWindow{}
-	roots, err := windowRoots(ctx, o, head, &w.rep)
+	roots, err := windowRoots(ctx, o, head, &w.rep, branches)
 	if err != nil {
 		return nil, err
 	}
@@ -207,7 +207,14 @@ func (c *windowCache) get(ctx context.Context, o Options, branch string,
 // absorb them into the live set exactly as they absorb a head, which is
 // the point — a generation is a generation, whatever produced the document
 // that describes it.
-func windowRoots(ctx context.Context, o Options, head *superblock.Superblock, rep *LastKReport) ([]*superblock.Superblock, error) {
+func windowRoots(ctx context.Context, o Options, head *superblock.Superblock, rep *LastKReport,
+	branches int) ([]*superblock.Superblock, error) {
+	// K comes from THIS BRANCH's own head, which is what makes the window
+	// per-branch rather than volume-wide: a branch created yesterday and a
+	// trunk with a thousand generations behind it each get the window their
+	// own Params.RetainK asks for, and a branch two generations old with
+	// K=8 retains its whole two-generation chain rather than eight of
+	// somebody else's.
 	k := head.Params.RetainK
 	if k == 0 {
 		k = DefaultRetainK
@@ -234,7 +241,7 @@ func windowRoots(ctx context.Context, o Options, head *superblock.Superblock, re
 	for g := oldest; g <= head.Generation; g++ {
 		want[g] = true
 	}
-	found, err := scavengeBackups(ctx, o, head, want, rep)
+	found, err := scavengeBackups(ctx, o, head, want, rep, branches)
 	if err != nil {
 		return nil, err
 	}
@@ -244,21 +251,23 @@ func windowRoots(ctx context.Context, o Options, head *superblock.Superblock, re
 	var roots []*superblock.Superblock
 	for i := uint64(0); i <= head.Generation-oldest; i++ {
 		g := head.Generation - i
-		sb, ok := found[g]
+		sbs, ok := found[g]
 		if !ok {
 			// The generation this backup would have described.
 			rep.Unresolved = append(rep.Unresolved, g-1)
 			continue
 		}
-		roots = append(roots, sb)
+		// Every candidate, not the first — see scavengeBackups. Extra roots
+		// can only retain more, and the count is of GENERATIONS resolved,
+		// which is what the report promises.
+		roots = append(roots, sbs...)
 		rep.Generations++
 	}
 	return roots, nil
 }
 
 // scavengeBackups reads pack trailers newest-first, pulling out every
-// superblock backup for a generation in want, and stops as soon as the set
-// is complete.
+// superblock backup for a generation in want.
 //
 // Newest-first is what makes the cost proportional to the WINDOW rather
 // than to the volume: a seal's backup rides in the last pack it cut, so
@@ -266,8 +275,52 @@ func windowRoots(ctx context.Context, o Options, head *superblock.Superblock, re
 // the correspondence between a backup's generation and its pack's name-age
 // by copying old backups into new packs, which only ever moves one EARLIER
 // in this order — never later — so nothing is missed by it.)
+//
+// ================= A GENERATION NUMBER IS NOT AN IDENTITY =============
+//
+// This is where a second branch makes a single-branch assumption
+// load-bearing, and the assumption was wrong the moment a volume could
+// have two.
+//
+// A backup is found by LOOKING, not by being pointed at, so the only thing
+// that says which generation it describes is the number inside it. That
+// number counts steps along ONE lineage: branch a volume at generation N
+// and both children seal N+1. Both write a backup. Both are signed by the
+// volume key and both carry the VolumeID — so every test this scan applied
+// passed for either of them, and whichever the newest-first walk reached
+// first won the slot (`if _, dup := found[g]; !dup`).
+//
+// The consequence is not over-retention, which would be harmless. It is
+// that the OTHER branch's generation silently leaves the root set: branch
+// dev's window fills with main's documents, and anything only dev's
+// retired generations named — a pack a repack on dev condemned, whose only
+// protection past the grace window is being named by a generation inside
+// the window — becomes a deletion candidate. A reader pinned to that
+// generation loses it.
+//
+// There is no way to attribute a backup to a branch. The lineage chain
+// authenticates exactly one step: a head's PrevHash names its parent's
+// wire bytes, and a backup's PrevHash names its own parent's, so nothing
+// links backup_G to backup_{G-1}. Attribution is not available from the
+// store, and this does not pretend otherwise.
+//
+// WHAT IT DOES INSTEAD IS KEEP EVERY CANDIDATE. A generation number maps
+// to every DISTINCT document claiming it, and the caller absorbs them all.
+// Retention is a union, so extra roots can only keep more: this converts
+// under-retention (data loss) into over-retention (bytes, until the window
+// moves past them), which is the asymmetry the whole sweep is built on.
+//
+// AND THE EARLY STOP GOES WITH IT — but only where it was wrong. On a
+// single-branch volume a number IS an identity, so the first document
+// found for a generation is the only one that can exist, and the scan
+// still stops the moment the set is complete: unchanged cost, unchanged
+// behaviour, and that is the overwhelmingly common volume. With two or
+// more branches the scan runs to the end of the pack space or to the
+// budget, because stopping at "every generation has A candidate" is
+// exactly what stops before the sibling's. The budget still bounds it and
+// still fails closed by name, with `--retain-k` as the documented escape.
 func scavengeBackups(ctx context.Context, o Options, head *superblock.Superblock,
-	want map[uint64]bool, rep *LastKReport) (map[uint64]*superblock.Superblock, error) {
+	want map[uint64]bool, rep *LastKReport, branches int) (map[uint64][]*superblock.Superblock, error) {
 
 	entries, err := listDir(ctx, o.Inner, packstore.PackDirKey)
 	if err != nil {
@@ -292,10 +345,22 @@ func scavengeBackups(ctx context.Context, o Options, head *superblock.Superblock
 		return ti.After(tj)
 	})
 
-	found := make(map[uint64]*superblock.Superblock, len(want))
+	found := make(map[uint64][]*superblock.Superblock, len(want))
+	// seen dedups by DOCUMENT, not by generation: a repack copies backups
+	// into the packs it writes, so the same bytes are reachable from
+	// several packs, and counting one twice would put one generation in the
+	// root set twice for nothing. Keyed on the wire hash because that is
+	// the only exact answer — two branches can agree on generation, parent
+	// and root catalog and still name different packs, since a pack's name
+	// carries the time it was cut.
+	seen := make(map[[32]byte]struct{}, len(want))
 	unread := 0
 	for _, p := range packs {
-		if len(found) == len(want) {
+		// The early stop is sound only where a generation number is an
+		// identity, which is to say on a volume with one branch. See the
+		// function comment: with siblings in play, "every generation has a
+		// candidate" is reached before the sibling's candidate is found.
+		if branches <= 1 && len(found) == len(want) {
 			break
 		}
 		if rep.TrailersRead >= scanBudget {
@@ -326,7 +391,7 @@ func scavengeBackups(ctx context.Context, o Options, head *superblock.Superblock
 			if e.Type != packstore.EntrySuperblock {
 				continue
 			}
-			sb, err := readBackup(ctx, o, p.Name, e)
+			sb, raw, err := readBackup(ctx, o, p.Name, e)
 			if err != nil {
 				if isAbsent(err) {
 					continue
@@ -342,9 +407,12 @@ func scavengeBackups(ctx context.Context, o Options, head *superblock.Superblock
 			if sb.VolumeID != head.VolumeID || !want[sb.Generation] {
 				continue
 			}
-			if _, dup := found[sb.Generation]; !dup {
-				found[sb.Generation] = sb
+			h := superblock.Hash(raw)
+			if _, dup := seen[h]; dup {
+				continue
 			}
+			seen[h] = struct{}{}
+			found[sb.Generation] = append(found[sb.Generation], sb)
 		}
 	}
 	if len(found) < len(want) && unread > 0 {
@@ -364,15 +432,20 @@ func scavengeBackups(ctx context.Context, o Options, head *superblock.Superblock
 // that the bytes are a superblock the volume's own writer produced — after
 // which a wrong one can only cost retention, never a wrong read, since the
 // sweep's only use for it is to keep MORE.
-func readBackup(ctx context.Context, o Options, pack string, e packstore.PackEntry) (*superblock.Superblock, error) {
+// The wire bytes come back with it because they are the only exact
+// identity a scavenged document has: the scan has to tell "the same backup
+// reached through two packs" (a repack copied it) from "two branches'
+// backups at the same generation number", and only the bytes distinguish
+// those.
+func readBackup(ctx context.Context, o Options, pack string, e packstore.PackEntry) (*superblock.Superblock, []byte, error) {
 	rc, err := o.Inner.Get(ctx, packstore.PackDirKey+"/"+pack, e.Off, e.Length)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	raw, err := io.ReadAll(rc)
 	rc.Close() //nolint:errcheck
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	sb, err := o.Refs.Verify(raw)
 	if err != nil {
@@ -381,9 +454,9 @@ func readBackup(ctx context.Context, o Options, pack string, e packstore.PackEnt
 		// pack is appendable by anyone who can write to the volume, so a
 		// planted entry that ABORTED every sweep would be a way to stop a
 		// volume ever reclaiming space.
-		return nil, fmt.Errorf("%w: %w", errNotOurs, err)
+		return nil, nil, fmt.Errorf("%w: %w", errNotOurs, err)
 	}
-	return sb, nil
+	return sb, raw, nil
 }
 
 // errNotOurs marks a scavenged document that is not this volume's, which
@@ -427,7 +500,7 @@ func isNotAPack(err error) bool {
 
 // missingList renders the generations still wanted, for an error a user
 // has to act on.
-func missingList(want map[uint64]bool, found map[uint64]*superblock.Superblock) string {
+func missingList(want map[uint64]bool, found map[uint64][]*superblock.Superblock) string {
 	var gens []uint64
 	for g := range want {
 		if _, ok := found[g]; !ok {

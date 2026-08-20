@@ -600,12 +600,20 @@ func objectTime(ctx context.Context, inner pelicanobj.Store, key string) (time.T
 // pointer case is the ordinary one; the value comparison catches a caller
 // that fetched the head twice, which is what a CLI listing branches and
 // then naming one does.
+//
+// The value comparison is by IDENTITY and not by generation number
+// (sameGeneration, execute.go). A number identifies a generation only
+// within one lineage — two branches of a volume both seal N+1 on top of
+// their own N — so on a multi-branch volume a number match would let a
+// SIBLING branch's head vouch for a head that is genuinely missing from
+// the live set, and the sweep would then report this branch's own packs as
+// unreferenced. That is the exact failure this check exists to prevent.
 func inLiveSet(head *superblock.Superblock, live []*superblock.Superblock) bool {
 	for _, sb := range live {
 		if sb == nil {
 			continue
 		}
-		if sb == head || (sb.VolumeID == head.VolumeID && sb.Generation == head.Generation) {
+		if sb == head || sameGeneration(sb, head) {
 			return true
 		}
 	}

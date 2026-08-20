@@ -480,7 +480,13 @@ func retainedSet(ctx context.Context, o Options, rep *Report, win *windowCache) 
 		// because the oldest of them dates the window — and the head's own
 		// ledger has to be read against that date, not only against the
 		// grace window.
-		w, err := win.get(ctx, o, b, f.Superblock)
+		// The branch COUNT goes with it, because it decides whether a
+		// generation number identifies a generation. With one branch it
+		// does, and the window scan may stop as soon as every number it
+		// wants has a document; with siblings it does not, and stopping
+		// there is how one branch's window comes to be filled with
+		// another's (lastk.go, "a generation number is not an identity").
+		w, err := win.get(ctx, o, b, f.Superblock, len(branches))
 		if err != nil {
 			return nil, 0, err
 		}

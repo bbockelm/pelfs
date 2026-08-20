@@ -15,11 +15,15 @@ pelfs status                                               # list background mou
 pelfs gc     [--delete] pelican://.../scratch              # sweep unreferenced packs
 pelfs fsck   [--deep] pelican://.../scratch                # verify a generation
 pelfs repack-plan pelican://.../scratch                    # what a repack would rewrite
+pelfs version                                              # which build this is
 ```
 
 `shell` mounts the filesystem on a temporary mountpoint and drops you into a
 subshell there; exiting unmounts and seals everything you changed into the
-next generation. A trailing `-- command [args...]` runs that instead of a
+next generation. If that seal cannot reach the federation — a dropped
+connection, a closed laptop — nothing is lost: the overlay is left intact,
+the branch does not move, and the next mount of the same prefix resumes it
+and seals again. A trailing `-- command [args...]` runs that instead of a
 shell and exits with its status. `mount` does the same as a background
 daemon with persistent per-prefix local state (`~/.local/state/pelfs/`).
 Everything runs unprivileged. Before mounting, a preflight probe checks the
@@ -185,6 +189,13 @@ a count of bytes, a duration a count of nanoseconds).
 - The origin must permit GET/PUT/DELETE and listing on the prefix (i.e. a
   token with read/modify scopes for the namespace); `pelfs` checks this up
   front and says which scope is missing.
-- Space held by deleted content is reclaimed when a future repack rewrites
-  its packs; `pelfs gc --delete` removes packs no retained generation
-  references.
+- **Space from rewritten or deleted content is not reclaimed yet.**
+  `pelfs gc --delete` removes packs that no retained generation
+  references, which covers aborted publishes and superseded indexes — but
+  a generation's pack list is carried forward wholesale, so a pack whose
+  contents are entirely dead stays listed and stays on disk. `pelfs
+  repack-plan` measures exactly what that costs on your volume; the
+  repack that would act on it is not built. Plan for storage that grows
+  with rewrites until it is.
+- Volume **tags cannot be created** yet (they can be read with `--tag`),
+  there is no **fork** command, and there is no **key rotation**.

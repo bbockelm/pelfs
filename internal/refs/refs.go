@@ -285,6 +285,55 @@ func (s *Store) Tag(ctx context.Context, name string, raw []byte) error {
 	return nil
 }
 
+// ErrNoSuchTag reports a tag operation naming something that is not there.
+//
+// It is a sentinel because deletion has to tell two situations apart that
+// a bare "delete failed" would blur: a name that was never a tag (a typo,
+// or a script's assumption about what this volume pins) and a name whose
+// object could not be removed. The store's Delete treats a missing key as
+// success — correct for an idempotent sweep, wrong for a verb a user typed
+// — so absence is checked before the removal rather than inferred from it.
+var ErrNoSuchTag = errors.New("no such tag")
+
+// DeleteTag removes tags/<name>.
+//
+// THIS IS THE VERB THAT MAKES A TAG'S PIN REVERSIBLE, and it is the only
+// one: a tag is immutable, so until it existed every retention limit ended
+// in "TAG the generation" with nothing on the other side — a pin, once
+// taken, held its generation's packs against every sweep for the life of
+// the volume.
+//
+// It is deliberately unguarded. There is no in-use check because there is
+// nothing a tag can be in use BY: it names a frozen generation, no object
+// refers to a tag, and a reader mounting one is holding the superblock it
+// already fetched, which no deletion here can reach. And it takes no
+// signature and needs none — see docs/design-packfs.md, "Threat model":
+// removing an object is available to anyone with write access to the
+// volume's key space, who could equally overwrite the ref it hangs off.
+// Requiring a signature would only mean that the one tag most worth
+// removing — the one a compromised or rotated key left behind, which no
+// longer verifies — could never be removed at all.
+//
+// WHAT DELETION IS NOT is a reclaim. Removing the object takes the
+// generation out of the sweep's ROOT SET; the objects it was pinning are
+// released by the next retention sweep, subject to the same age guard as
+// everything else. Callers must say so out loud: a user who deletes a tag,
+// looks at the volume's size and sees no change has either been told the
+// truth in advance or has been left to guess at a bug.
+func (s *Store) DeleteTag(ctx context.Context, name string) error {
+	if err := ValidateName(name); err != nil {
+		return fmt.Errorf("delete tag: %w", err)
+	}
+	key := TagDirKey + "/" + name
+	if _, err := s.inner.StatKey(ctx, key); err != nil {
+		return fmt.Errorf("%w: %s", ErrNoSuchTag, name)
+	}
+	if err := s.inner.Delete(ctx, key); err != nil {
+		return fmt.Errorf("delete tag %s: %w", name, err)
+	}
+	return nil
+}
+
 // Verify decodes and verifies a superblock the caller got from somewhere
 // that is neither a ref nor a tag — in practice a disaster-recovery backup
 // scavenged out of a pack, which is the only record a RETIRED generation

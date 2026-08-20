@@ -9,6 +9,7 @@
 //	pelfs status                     list background mounts
 //	pelfs gc     [--delete] <prefix> find (remove) unreferenced pack objects
 //	pelfs tag    <prefix> <name>     freeze the branch head under a name
+//	pelfs tag    --rm <prefix> <name> delete a tag; the next gc reclaims what it pinned
 //	pelfs fsck   <prefix>            verify a published generation
 //	pelfs repack-plan <prefix>       report what a repack would rewrite
 //	pelfs repack [--apply] <prefix>  rewrite mostly-dead packs, publish a generation
@@ -88,8 +89,10 @@ Usage:
   pelfs status                                            list background mounts
   pelfs gc     [flags] [--delete] <prefix>                sweep unreferenced packs
   pelfs tag    [flags] <prefix> <name>                    freeze the branch head under
-                                                          a name, retained forever
+                                                          a name, retained until --rm
   pelfs tag    --list <prefix>                            list this volume's tags
+  pelfs tag    --rm <prefix> <name>                       delete a tag; the next gc
+                                                          reclaims what it was pinning
   pelfs mount-gen [flags] [--rw] <prefix> <mountpoint>    mount one generation
                   [--subshell] [-- <command> [args...]]   run in the mount, then unmount
   pelfs ctl    <prefix-or-mountpoint> <verb>              control a running mount

@@ -16,12 +16,19 @@ import (
 // frozen.
 //
 // This is the verb every honest limit in the retention design ends with. A
-// sweep can enumerate exactly two things — branch heads and tags — so the
-// grace window is the whole of what an UNTAGGED older generation gets: past
-// it, the refs a retired generation alone named age off the condemned
-// ledger and the objects behind them are collected. A tag is the escape,
-// and the only one: it puts a generation into the live set permanently, so
-// nothing it names is ever a sweep candidate.
+// sweep enumerates a branch head, the last Params.RetainK generations
+// behind it (internal/retention/lastk.go), and every tag — so past the
+// grace window, and past the retain window, an UNTAGGED older generation
+// loses the refs it alone named and the objects behind them are collected.
+// A tag is the escape from BOTH windows: it puts a generation into the
+// live set outright, so nothing it names is a sweep candidate while the
+// tag is there.
+//
+// The pin is not permanent, and that is `--rm`: deleting a tag takes its
+// generation back out of the root set, after which the next sweep reclaims
+// whatever it alone was holding. Immutability is about the OBJECT — a name
+// in use never silently moves to another generation — not about the name,
+// which is free again once nothing is under it.
 //
 // It deliberately does not take the mount lease. The lease serializes
 // PUBLISHERS, because two of them race for one mutable ref; a tag writes an
@@ -30,26 +37,33 @@ import (
 // whoever happens to be writing.
 func cmdTag(args []string) int {
 	var branch, pubkeyHex string
-	var list bool
+	var list, rm bool
 	o, pos, err := parseArgs("tag", args, 1, 2, func(fs *flag.FlagSet, o *cmdOpts) {
 		fs.StringVar(&branch, "branch", "main", "branch whose head is frozen")
 		fs.StringVar(&pubkeyHex, "volume-pubkey", "", "hex Ed25519 volume key to trust (default: pin on first use)")
 		fs.BoolVar(&list, "list", false, "list this volume's tags instead of creating one")
+		fs.BoolVar(&rm, "rm", false, "delete a tag instead of creating one; the next gc reclaims what it pinned")
 	})
 	if err != nil {
 		return exitErr(err)
 	}
 	switch {
+	case list && rm:
+		return exitErr(errors.New("--list and --rm do different things; pick one"))
 	case list && len(pos) != 1:
 		return exitErr(errors.New("usage: pelfs tag --list <prefix>"))
 	case !list && len(pos) != 2:
-		return exitErr(errors.New("usage: pelfs tag [--branch b] <prefix> <name>, or pelfs tag --list <prefix>"))
+		return exitErr(errors.New("usage: pelfs tag [--branch b] <prefix> <name>, " +
+			"pelfs tag --rm <prefix> <name>, or pelfs tag --list <prefix>"))
 	}
 	prefix := pos[0]
 	ctx := context.Background()
 
 	if list {
 		return exitErr(listTags(ctx, o, prefix, pubkeyHex))
+	}
+	if rm {
+		return exitErr(removeTag(ctx, o, prefix, pos[1], pubkeyHex))
 	}
 
 	// Validate before anything is fetched: a name the key space cannot
@@ -74,10 +88,66 @@ func cmdTag(args []string) int {
 	if err := rstore.Tag(ctx, name, f.Raw); err != nil {
 		return exitErr(explainTagFailure(ctx, rstore, name, err))
 	}
-	ui.Info("tagged generation {generation} of branch {branch} as {tag}; the sweep now retains it permanently, "+
-		"and `pelfs mount --tag {tag}` reads it",
+	ui.Info("tagged generation {generation} of branch {branch} as {tag}; the sweep retains it until the tag "+
+		"is deleted (`pelfs tag --rm`), and `pelfs mount --tag {tag}` reads it",
 		"generation", f.Superblock.Generation, "branch", branch, "tag", name)
 	return 0
+}
+
+// removeTag deletes a tag, and says what that did and did not do.
+//
+// THIS IS THE OTHER HALF OF THE PIN. Creating one is what a workflow does
+// when it needs a generation to outlive the grace window; without a way to
+// undo it, "tag it" meant "hold these packs forever", and the retention
+// design's escape hatch was a one-way door. Deleting the object is what
+// finally lets the space go.
+//
+// It reports the generation, and that is the part worth building rather
+// than assuming. A tag name is a label a human chose; what it PINS is a
+// generation number, and the two questions a user has at this moment
+// ("is this the release I meant to retire?" and "how much am I about to
+// let go of?") are both about the number. So the tag is fetched and
+// verified BEFORE it is removed — not to authorize the removal, which
+// needs no signature (refs.Store.DeleteTag says why), but so the
+// confirmation can name what was there.
+//
+// And it says out loud that nothing has been reclaimed yet. Deletion takes
+// the generation out of the sweep's root set; the objects go on the next
+// `pelfs gc`, subject to the same age guard as everything else. A user who
+// deletes a tag, checks the volume's size and sees no change has either
+// been told this or has been handed a mystery.
+func removeTag(ctx context.Context, o *cmdOpts, prefix, name, pubkeyHex string) error {
+	if err := refs.ValidateName(name); err != nil {
+		return fmt.Errorf("tag --rm: %w", err)
+	}
+	_, rstore, _, err := volumeStore(ctx, o, prefix, pubkeyHex)
+	if err != nil {
+		return err
+	}
+	// Best effort, and deliberately not fatal: a tag whose signature no
+	// longer verifies — one a rotated or compromised key left behind — is
+	// among the ones most worth removing, so an unverifiable tag is
+	// reported without a generation rather than made undeletable.
+	gen, known := "", false
+	if sb, _, ferr := rstore.FetchTag(ctx, name); ferr == nil {
+		gen, known = fmt.Sprintf("%d", sb.Generation), true
+	}
+	if err := rstore.DeleteTag(ctx, name); err != nil {
+		if errors.Is(err, refs.ErrNoSuchTag) {
+			return fmt.Errorf("no tag named %s on this volume (`pelfs tag --list %s` shows what is pinned)",
+				name, prefix)
+		}
+		return err
+	}
+	if known {
+		ui.Info("deleted tag {tag}, which pinned generation {generation}; that generation is no longer a "+
+			"retention root — space is reclaimed by the next `pelfs gc` after the grace window",
+			"tag", name, "generation", gen)
+	} else {
+		ui.Info("deleted tag {tag} (its superblock does not verify, so the generation it pinned cannot be "+
+			"named); space is reclaimed by the next `pelfs gc` after the grace window", "tag", name)
+	}
+	return nil
 }
 
 // explainTagFailure turns the immutability refusal into advice. The bare

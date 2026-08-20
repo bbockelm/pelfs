@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	mrand "math/rand"
 	"net/http/httptest"
 	"strings"
@@ -256,5 +257,223 @@ func TestTagListReportsWhatIsPinned(t *testing.T) {
 	}
 	if out != "v1\nv2\n" {
 		t.Fatalf("--list printed %q, want the tags one per line in a stable order", out)
+	}
+}
+
+// THE MIRROR IMAGE OF THE RETENTION GUARANTEE ABOVE.
+//
+// TestTaggedGenerationSurvivesAnAdversarialSweep proves a tag holds its
+// generation against a sweep with every guard expired. That proof is only
+// half a feature: if the pin cannot be released, "tag it" means "hold these
+// packs for the life of the volume", and the escape hatch every retention
+// limit points at is a one-way door.
+//
+// So this drives the same arc and then removes the tag: write, seal, tag,
+// seal past it, repack, sweep (the generation survives — the tag is doing
+// the work), `pelfs tag --rm`, sweep again — and now the generation the tag
+// was pinning is GONE, byte-collected, unmountable. Same volume, same
+// clock, same sweep; the only difference is the tag object.
+//
+// The sweeps run at retain-k 1 deliberately. The last-K window is a second,
+// independent root set (internal/retention/lastk.go) and it covers this
+// young volume entirely, so leaving it in would answer "still retained" to
+// every question here and prove nothing about the tag. What the window does
+// is invariant 1's business in internal/repack/lifecycle_test.go.
+func TestDeletingATagReleasesWhatItPinned(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	srv := httptest.NewServer(fakeorigin.Handler(root))
+	t.Cleanup(srv.Close)
+	prefix := srv.URL + "/vol"
+	inner, err := pelicanobj.New(ctx, pelicanobj.Config{PrefixURL: prefix})
+	if err != nil {
+		t.Fatalf("pelicanobj.New: %v", err)
+	}
+	stateDir := t.TempDir()
+	v := testvol.New(t, inner, testvol.Options{})
+	rng := mrand.New(mrand.NewSource(11))
+	clock := time.Now()
+
+	want := map[string][]byte{}
+	for _, name := range []string{"a.bin", "b.bin", "c.bin"} {
+		body := make([]byte, 200<<10+rng.Intn(200<<10))
+		rng.Read(body)
+		v.WriteFile(testvol.RootInode, name, body)
+		want[name] = body
+	}
+	o := tagPublishOpts
+	o.CreatedUnixNano = clock.UnixNano()
+	tagged := v.Publish(o).Superblock
+
+	if _, code := captureLog(t, func() int {
+		return cmdTag([]string{"--state-dir", stateDir, prefix, "v1.0"})
+	}); code != 0 {
+		t.Fatalf("pelfs tag exited %d", code)
+	}
+
+	// The branch moves well past the tag, and a repack retires the
+	// generation the tag names rather than leaving it merely old.
+	for range 4 {
+		for _, name := range []string{"a.bin", "b.bin"} {
+			body := make([]byte, 200<<10+rng.Intn(200<<10))
+			rng.Read(body)
+			v.Write(v.Lookup(testvol.RootInode, name), body)
+		}
+		clock = clock.Add(time.Hour)
+		o := tagPublishOpts
+		o.CreatedUnixNano = clock.UnixNano()
+		v.Publish(o)
+	}
+	rstore, err := refs.New(inner, stateDir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, err := rstore.Fetch(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	aged := 400 * time.Hour
+	if _, err := repack.Execute(ctx, repack.ExecOptions{
+		Options: repack.Options{
+			Inner: inner, Live: []*superblock.Superblock{head.Superblock, tagged},
+			Head: head.Superblock, CacheDir: t.TempDir(), Workers: 4, Now: clock.Add(aged),
+		},
+		Refs: rstore, Branch: "main", SigningKey: v.SigningKey(), SpoolDir: t.TempDir(),
+	}); err != nil {
+		t.Fatalf("repack: %v", err)
+	}
+
+	sweep := func(at time.Time) *retention.Report {
+		t.Helper()
+		rep, err := retention.GC(ctx, retention.Options{
+			Inner: inner, Refs: rstore, Delete: true, RetainK: 1, Now: at,
+		})
+		if err != nil {
+			t.Fatalf("gc: %v", err)
+		}
+		return rep
+	}
+
+	// WITH the tag: the generation survives an adversarial sweep.
+	sweep(clock.Add(2 * aged))
+	if err := coldRead(t, inner, tagged, want); err != nil {
+		t.Fatalf("the tagged generation did not survive a sweep while its tag was in place: %v", err)
+	}
+
+	// THE VERB. It has to name the generation — a tag is a label, and what
+	// it pins is a number — and it has to say that nothing has been
+	// reclaimed yet, or a user who checks the volume's size next has been
+	// handed a mystery.
+	out, code := captureLog(t, func() int {
+		return cmdTag([]string{"--rm", "--state-dir", stateDir, prefix, "v1.0"})
+	})
+	if code != 0 {
+		t.Fatalf("pelfs tag --rm exited %d: %s", code, out)
+	}
+	for _, wantText := range []string{
+		fmt.Sprintf("generation %d", tagged.Generation),
+		"reclaimed by the next", "gc", "grace window",
+	} {
+		if !strings.Contains(out, wantText) {
+			t.Errorf("the confirmation does not say %q:\n%s", wantText, out)
+		}
+	}
+
+	// The tag is gone from the key space, so the sweep no longer counts it
+	// as a root...
+	listed, code := capture(t, func() int {
+		return cmdTag([]string{"--list", "--state-dir", stateDir, prefix})
+	})
+	if code != 0 || !strings.Contains(listed, "no tags") {
+		t.Fatalf("--list after --rm: exit %d, output %q", code, listed)
+	}
+
+	// ...and the same sweep that spared the generation a moment ago now
+	// collects it. THIS is what deletion buys; nothing else in the system
+	// releases a tagged generation's bytes.
+	rep := sweep(clock.Add(3 * aged))
+	if rep.Tags != 0 {
+		t.Errorf("the sweep still counted %d tags as roots after the tag was deleted", rep.Tags)
+	}
+	if rep.Deleted+rep.Indexes.Deleted+rep.Manifests.Deleted == 0 {
+		t.Fatal("the sweep after the deletion collected nothing, so the tag was not what had been holding " +
+			"those objects and this test proves nothing")
+	}
+	if err := coldRead(t, inner, tagged, want); err == nil {
+		t.Fatal("the generation the deleted tag had pinned is still fully readable after a sweep; " +
+			"deleting a tag released no space at all")
+	}
+	t.Logf("after --rm, the sweep collected %d packs, %d indexes, %d manifests",
+		rep.Deleted, rep.Indexes.Deleted, rep.Manifests.Deleted)
+
+	// And the NAME is free again. Immutability is a property of the object
+	// — a tag in use never silently moves to another generation — not of
+	// the name, which nothing is under any more. The refusal reads a fresh
+	// stat through the cache-bypassing store refs opens, so a re-tag does
+	// not trip over a remembered answer.
+	if _, code := captureLog(t, func() int {
+		return cmdTag([]string{"--state-dir", stateDir, prefix, "v1.0"})
+	}); code != 0 {
+		t.Error("a name freed by --rm could not be tagged again; immutability is being applied to the " +
+			"name rather than to the object")
+	}
+}
+
+// coldRead mounts a generation with an empty cache and compares every
+// byte, reporting rather than failing: this test needs both answers.
+func coldRead(t *testing.T, inner pelicanobj.Store, sb *superblock.Superblock, want map[string][]byte) error {
+	t.Helper()
+	ctx := context.Background()
+	fs, err := genfs.Open(ctx, genfs.Options{Inner: inner, SB: sb, CacheDir: t.TempDir()})
+	if err != nil {
+		return fmt.Errorf("mount generation %d: %w", sb.Generation, err)
+	}
+	defer fs.Close() //nolint:errcheck
+	for name, body := range want {
+		n, err := fs.Lookup(ctx, testvol.RootInode, name)
+		if err != nil {
+			return fmt.Errorf("resolve %s: %w", name, err)
+		}
+		got := make([]byte, len(body))
+		read, err := fs.Read(ctx, n.Inode, 0, got)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", name, err)
+		}
+		if read != len(body) || !bytes.Equal(got, body) {
+			return fmt.Errorf("%s came back different (%d of %d bytes)", name, read, len(body))
+		}
+	}
+	return nil
+}
+
+// Deleting something that is not there is a typo, not a no-op, and the
+// message has to be the kind a user can act on: the store's Delete treats a
+// missing key as success, so "deleted v1.0" for a name that never existed
+// would send someone looking for space that was never held.
+func TestTagRmRefusesANameThatIsNotThere(t *testing.T) {
+	prefix, _, _, _ := planVolume(t)
+	stateDir := t.TempDir()
+	out, code := captureLog(t, func() int {
+		return cmdTag([]string{"--rm", "--state-dir", stateDir, prefix, "never-existed"})
+	})
+	if code == 0 {
+		t.Fatal("deleting a tag that does not exist succeeded")
+	}
+	for _, wantText := range []string{"no tag named", "never-existed", "--list"} {
+		if !strings.Contains(out, wantText) {
+			t.Errorf("the refusal does not say %q:\n%s", wantText, out)
+		}
+	}
+}
+
+// --list and --rm ask different questions and take different arguments;
+// accepting both would have to pick one silently.
+func TestTagRefusesListAndRmTogether(t *testing.T) {
+	prefix, _, _, _ := planVolume(t)
+	out, code := captureLog(t, func() int {
+		return cmdTag([]string{"--list", "--rm", "--state-dir", t.TempDir(), prefix, "v1"})
+	})
+	if code == 0 || !strings.Contains(out, "pick one") {
+		t.Fatalf("--list --rm together: exit %d, output %q", code, out)
 	}
 }

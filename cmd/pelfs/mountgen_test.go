@@ -822,7 +822,7 @@ func TestCheckpointFiresUnderWritePressure(t *testing.T) {
 		writeFile(t, g.ov, fmt.Sprintf("big-%02d.bin", i), string(body))
 	}
 
-	deadline := time.Now().Add(60 * time.Second)
+	deadline := time.Now().Add(60 * time.Second * raceSlowdown)
 	for {
 		f, err := rstore.Fetch(ctx, "main")
 		if err == nil && f.Superblock.Generation >= 1 {

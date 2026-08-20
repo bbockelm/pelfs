@@ -89,12 +89,15 @@ func TestASealCapsTheCondemnedLedgerAndKeepsTheNewestEntries(t *testing.T) {
 	v.create(publishRootInode, "a.bin", body["a.bin"])
 	head := v.checkpoint()
 
-	// A parent whose ledger is already over the cap, entries stamped a
+	// A parent whose ledger is already over its byte share, rows stamped a
 	// minute apart the way a fast-checkpointing mount stamps them. All are
 	// inside the grace window, so nothing here falls off by age: what
-	// bounds this ledger is the cap and only the cap.
+	// bounds this ledger is the budget and only the budget.
 	now := time.Now()
-	over := superblock.MaxCondemnedEntries + 60
+	// The names are hash-shaped, which is what a derived ref really is, so
+	// "what fits" is the share divided by a 95-byte row.
+	fit := int(superblock.CondemnedPackRoom(nil) / superblock.CondemnedRowBytes(fmt.Sprintf("%064d", 0), now))
+	over := fit + 60
 	var ledger []superblock.CondemnedRef
 	for i := 0; i < over; i++ {
 		ledger = append(ledger, superblock.CondemnedRef{
@@ -127,9 +130,10 @@ func TestASealCapsTheCondemnedLedgerAndKeepsTheNewestEntries(t *testing.T) {
 		{"index", next.Superblock.CondemnedIndexes},
 		{"manifest", next.Superblock.CondemnedManifests},
 	} {
-		if len(space.got) > superblock.MaxCondemnedEntries {
-			t.Errorf("the %s ledger came out of the seal with %d entries against a cap of %d; "+
-				"unbounded, this is what fills the read cap", space.what, len(space.got), superblock.MaxCondemnedEntries)
+		if n := superblock.EncodedLen(space.got); n > superblock.CondemnedBudgetBytes {
+			t.Errorf("the %s ledger came out of the seal at %d bytes against a %d-byte share (%d rows); "+
+				"unbounded, this is what fills the read cap", space.what, n,
+				int64(superblock.CondemnedBudgetBytes), len(space.got))
 		}
 		at := map[string]int64{}
 		for _, c := range space.got {

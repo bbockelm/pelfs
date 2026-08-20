@@ -27,6 +27,34 @@ func TestTheWriteBudgetIsHalfTheReadCap(t *testing.T) {
 	}
 }
 
+// THE SHARES MUST SUM TO LESS THAN THE BUDGET, and it is written down as a
+// test because it is the thing that goes wrong silently: each share is
+// argued for on its own in size.go, so a later change that raises one has
+// no reason to look at the others — and a superblock whose named shares
+// already exceed the budget refuses every seal on a volume nobody did
+// anything wrong to.
+//
+// The named shares are the catalog list and the three condemned ledgers.
+// What is left over pays for the fields nothing bounds directly: the inode
+// shards (73 bytes a row), the key table, the manifest and index refs (130
+// and 143 bytes, ~25 of each at 100M objects), the 403 bytes of fixed
+// fields an empty superblock costs — and the headroom that makes a growing
+// volume a warning rather than a cliff.
+func TestTheBudgetSharesLeaveRoomForTheRest(t *testing.T) {
+	const ledgers = 3 // packs, indexes, manifests
+	named := int64(superblock.CatalogBudgetBytes) + ledgers*int64(superblock.CondemnedBudgetBytes)
+	left := int64(superblock.MaxEncodedBytes) - named
+	// An eighth of the budget is the smallest slack worth calling headroom:
+	// it is several times what size.go's table measures the unbounded
+	// fields at, and it is what a volume grows through while the warnings
+	// are still warnings.
+	if want := int64(superblock.MaxEncodedBytes) / 8; left < want {
+		t.Fatalf("the catalog share and the %d ledger shares come to %d bytes of a %d-byte budget, "+
+			"leaving %d for the shards, the key table, the refs and the fixed fields; size.go's "+
+			"arithmetic wants at least %d", ledgers, named, int64(superblock.MaxEncodedBytes), left, want)
+	}
+}
+
 func TestCheckSizeAcceptsWhatFits(t *testing.T) {
 	sb := &superblock.Superblock{Generation: 3}
 	if err := sb.CheckSize(superblock.MaxEncodedBytes); err != nil {

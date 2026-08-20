@@ -46,6 +46,44 @@ const (
 	// pack list, the key table and the ledgers room to be the reason a
 	// seal fails, which are the growths a user can actually act on.
 	CatalogBudgetBytes = 256 << 10
+
+	// CondemnedBudgetBytes is what ONE condemned ledger may weigh before
+	// its oldest rows fall off it (see condemn.go). There are three —
+	// packs, indexes, manifests — and they each get this, so the ledgers'
+	// share of the budget is 144 KiB.
+	//
+	// WHY BYTES, SINCE IT WAS ROWS FIRST. The two row shapes differ by
+	// 1.8x. A pack name is 23 characters (`p-<nanos>-<rand>`) and its row
+	// encodes to 53 bytes; a derived ref is named by a 64-character
+	// content hash and its row encodes to 95. One row count therefore
+	// spent 27 KiB on the pack ledger and 48 KiB on each ref ledger: a row
+	// cap is a byte budget wearing the wrong units. The units began to
+	// cost something real when repack started PACING a plan to the room
+	// its ledger has (repack.trimToLedger) — a volume was told to hold
+	// packs back for a later run, buying a second full sweep and rewrite,
+	// to protect a 27 KiB share of a budget it was allowed to spend 48 KiB
+	// of.
+	//
+	// 48 KiB IS WHAT A REF LEDGER ALREADY COST at the 512-row cap (512 x
+	// 95 = 48,640 bytes), so this is not a raise: no ledger's worst case
+	// moves above the largest one the budget was already sized for. What
+	// changes is that the pack ledger stops paying the ref ledger's row
+	// COUNT at half the ref ledger's row COST. In rows, this share is ~927
+	// pack rows or ~517 hash-named rows.
+	//
+	// THE SUM, which is the thing to re-check whenever a share moves:
+	//
+	//	catalogs (droppable)         256 KiB
+	//	three ledgers, 48 KiB each   144 KiB
+	//	manifests + pack indexes      ~8 KiB  (~25 refs each at 100M objects)
+	//	fixed fields, empty            403 B
+	//	                             --------
+	//	                            ~407 KiB  of the 512 KiB budget
+	//
+	// leaving ~105 KiB for the inode shards (73 bytes a row), the key
+	// table, and the headroom that keeps a full volume a warning rather
+	// than a cliff. TestTheBudgetSharesLeaveRoomForTheRest pins the sum.
+	CondemnedBudgetBytes = 48 << 10
 )
 
 // EncodedLen is how many bytes v adds to an encoding, near enough to

@@ -495,7 +495,7 @@ So a writer spends a **budget** before it spends the cap:
 | read cap | 1 MiB | any mutable object, at every reader |
 | write budget | **512 KiB** | the superblock a writer is about to FLIP |
 | catalog share | 256 KiB | `Catalogs`, which a writer may drop instead of failing |
-| ledger cap | 512 entries each | `Condemned`, `CondemnedIndexes`, `CondemnedManifests` |
+| ledger share | **48 KiB each**, 144 KiB for the three | `Condemned`, `CondemnedIndexes`, `CondemnedManifests` |
 
 Half the cap rather than nine tenths, because the quantity being guarded
 grows *monotonically* in what a volume accumulates. A volume at 90% is one
@@ -509,19 +509,37 @@ as it was.
 | field | bytes per row | at its bound |
 |---|---|---|
 | `catalogs` | 110 | 256 KiB = ~2,400 catalogs |
-| `condemned_indexes` | 95 | 512 rows = 48 KiB |
-| `condemned_manifests` | 95 | 512 rows = 48 KiB |
-| `condemned` (packs) | 53 | 512 rows = 27 KiB |
+| `condemned_indexes` | 95 | 48 KiB = ~517 rows |
+| `condemned_manifests` | 95 | 48 KiB = ~517 rows |
+| `condemned` (packs) | 53 | 48 KiB = ~927 rows |
 | `manifests` | 130 | ~25 refs at 100 M objects = 3 KiB |
 | `pack_indexes` | 143 | ~25 refs at 100 M objects = 4 KiB |
+| `shards` | 73 | grows with the hard-linked file count |
 | `pack_list` (inline shape only) | 87 | unbounded — this is what `manifests` exists to remove |
 | fixed fields, empty | — | 403 |
 
-The non-droppable rows come to about 130 KiB at every bound at once, and
-the catalog share to 256 KiB on top: ~385 KiB against a 512 KiB budget.
-**Those three shares must keep summing to less than the budget if any of
-them is ever raised**, and there is a test that pins the write budget to
-half the read cap so the two cannot drift apart.
+**The ledgers are budgeted in BYTES, not rows, and the row column is why.**
+A pack name is `p-<nanos>-<rand>`, 23 characters; a derived ref is named by
+a 64-character content hash. The two row shapes are 1.8x apart, so one row
+count spent 27 KiB on the pack ledger and 48 KiB on each ref ledger — a row
+cap is a byte budget wearing the wrong units. 48 KiB is what a ref ledger
+already cost at the old 512-row cap (512 x 95 = 48,640), so this raises no
+ledger's worst case above the largest one the budget was already sized for;
+what it changes is that the pack ledger stops paying the ref ledger's row
+COUNT at half the ref ledger's row COST.
+
+The named shares therefore come to 144 KiB of ledger plus 256 KiB of
+catalogs; add the refs and the fixed fields and it is **~407 KiB against a
+512 KiB budget**, leaving ~105 KiB for the inode shards, the key table and
+the headroom that keeps a growing volume a warning rather than a cliff.
+**Those shares must keep summing to less than the budget if any of them is
+ever raised** — `TestTheBudgetSharesLeaveRoomForTheRest` is that sum, and a
+second test pins the write budget to half the read cap so the two cannot
+drift apart.
+
+The unit is writer-side policy and not wire format: a reader is handed
+whatever rows the ledger holds and never sees the bound, so a volume
+written by either version mounts under the other.
 
 `Catalogs` is the field a writer SPENDS FIRST, and the reason it can be is
 a property worth stating once: it is optional in the format and both
@@ -1392,8 +1410,9 @@ that disagreed:
     seal and the row would never age off.
   - **Aged rows fall off.** Past `T_grace` a row stops being carried;
     retention has already stopped honouring it.
-  - **The ledger is capped**, which is the subject of "What the cap costs"
-    below.
+  - **The ledger is capped**, by BYTES — each gets a share of the
+    superblock's write budget — which is the subject of "What the cap
+    costs" below.
 
 ### The sweep
 
@@ -1454,7 +1473,7 @@ between.
 
 ### What the cap costs, honestly
 
-Each ledger holds at most 512 rows, and rows past that are dropped
+Each ledger gets **48 KiB of the superblock** and rows past that are dropped
 oldest-first. The bound is not tidiness: **ledger growth is checkpoint-rate
 times grace window and does not depend on volume size at all.** A
 consolidating seal condemns about one ref per key space every time, whether
@@ -1464,9 +1483,17 @@ KB per key space on an EMPTY volume; at `--snapshot-interval 1m` it is
 4,320 rows per space, which crosses the 1 MiB read cap and bricks the
 volume in about three days of ordinary operation.
 
-512 rows fills in about 43 hours at the default interval. **So the cap
-binds before the 72-hour window it is protecting closes**, and the honest
-question is who that hurts.
+48 KiB is ~517 hash-named rows, which fills in about 43 hours at the
+default interval. **So the bound binds before the 72-hour window it is
+protecting closes**, and the honest question is who that hurts.
+
+The share is spent in **bytes rather than rows** because the ledgers do not
+agree on what a row costs: 53 bytes for a pack name against 95 for a
+content hash. In rows the same number bought the pack ledger 27 KiB of a
+share it was allowed 48 KiB of, and — since repack paces a plan to the room
+its ledger has — that undercount was paid for in whole extra repack runs
+rather than in bytes. The cost is measured on the real encoding, the same
+way every other contributor in the budget table is measured.
 
 **For the derived-ref ledgers, almost nobody, and this is the arithmetic
 rather than a hope.** A ledger row is worth exactly the gap between when an
@@ -1488,16 +1515,16 @@ that halved the growth rate. And the diff is taken against the parent's
 list, which is the honest statement of what the ledger means: objects that
 stopped being named by an addressable generation.
 
-**For the pack ledger, the cap would have cost the whole window**, and the
+**For the pack ledger, the bound would have cost the whole window**, and the
 answer is different. A repacked-away pack is old by its own name, so rule 2
 has nothing left to give and the row is the entirety of its protection.
 Nothing bounded how many packs a plan could condemn, so a volume with more
-than 512 mostly-dead packs published a generation that condemned them all
-and protected 512 — and the rest went on the next sweep while readers
-pinned to the pre-repack generation were still resolving chunks out of
-them.
+mostly-dead packs than the ledger held published a generation that condemned
+them all and protected what fit — and the rest went on the next sweep while
+readers pinned to the pre-repack generation were still resolving chunks out
+of them.
 
-Raising the cap is not the fix: the three ledgers share a byte budget with
+Raising the share is not the fix: the three ledgers share a byte budget with
 everything else in the superblock, and two of them grow with checkpoint
 rate and are unbounded in time. What CAN move is the size of one run. A
 repack is resumable by construction — every run re-sweeps and re-plans — so
@@ -1508,14 +1535,24 @@ that builds the ledger refuses outright if a plan ever reaches it unpaced,
 because the cost of being wrong there is deleted data and the cost of
 refusing is the rewriting, which is unreferenced garbage a sweep collects.
 
+The pacer and the ledger builder therefore have to agree **to the byte**:
+one sums candidate rows before anything is rewritten and the other encodes
+the real ledger afterwards, and the second refuses rather than truncating.
+So they measure a row the same way (`superblock.CondemnedRowBytes`), the
+array header is charged flat so a ledger's weight is monotone in its rows,
+and both stop at the first row that will not fit rather than stepping over
+it to squeeze in a shorter name behind — skipping would drop a NEWER row to
+keep an OLDER one, which is the one thing oldest-first promises not to do.
+
 So the promise this format actually makes, stated so it can be disagreed
 with:
 
 > An object that a generation stopped naming is kept for `T_grace` from
 > that moment, EXCEPT that on the two derived-ref ledgers a very fast
-> checkpoint cadence can shorten that to the last 512 checkpoints — which
-> costs a dropped object one checkpoint interval of life, not the window.
-> Packs are never shortened; a repack paces itself instead.
+> checkpoint cadence can shorten that to the last 48 KiB of rows — about
+> 517 checkpoints, and it costs a dropped object one checkpoint interval of
+> life, not the window. Packs are never shortened; a repack paces itself
+> instead.
 
 ### The limits to admit
 

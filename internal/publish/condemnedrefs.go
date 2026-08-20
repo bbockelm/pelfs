@@ -115,10 +115,10 @@ func condemnPackLedger(prev []superblock.CondemnedPack, listed []string,
 	now time.Time, grace time.Duration) []superblock.CondemnedPack {
 	out, overflow := superblock.CarryCondemnedPacks(prev, nil, listed, now, grace)
 	if overflow > 0 {
-		ui.Warn("publish: the condemned-pack ledger arrived over its {cap}-entry cap and this generation "+
-			"dropped the {n} oldest; a seal adds nothing to this ledger, so it was already over — those "+
-			"packs may now be swept before the {grace} grace window ends",
-			"cap", superblock.MaxCondemnedEntries, "n", overflow, "grace", grace)
+		ui.Warn("publish: the condemned-pack ledger arrived over its {cap}-byte share of the superblock "+
+			"and this generation dropped the {n} oldest rows; a seal adds nothing to this ledger, so it "+
+			"was already over — those packs may now be swept before the {grace} grace window ends",
+			"cap", int64(superblock.CondemnedBudgetBytes), "n", overflow, "grace", grace)
 	}
 	return out
 }
@@ -129,7 +129,7 @@ func condemnPackLedger(prev []superblock.CondemnedPack, listed []string,
 //
 // The overflow warning is the only signal a user gets that their
 // checkpoint interval is short enough for the cap to bite
-// (superblock.MaxCondemnedEntries), and it is worth one line per seal
+// (superblock.CondemnedBudgetBytes), and it is worth one line per seal
 // because the alternative — silently shortening the grace window objects
 // are kept for — is invisible until something a pinned reader wanted is
 // already gone.
@@ -141,10 +141,11 @@ func condemnLedger[T sizedRef](prev []superblock.CondemnedRef, dropped []string,
 	}
 	out, overflow := superblock.CarryCondemnedRefs(prev, dropped, names, now, grace)
 	if overflow > 0 {
-		ui.Warn("publish: the condemned-{what} ledger is full at {cap} entries, so this generation dropped "+
-			"the {n} oldest; they are objects only a retired generation names, and they may now be swept "+
-			"before the {grace} grace window ends — checkpoint less often to keep the full window",
-			"what", what, "cap", superblock.MaxCondemnedEntries, "n", overflow, "grace", grace)
+		ui.Warn("publish: the condemned-{what} ledger has filled its {cap}-byte share of the superblock, "+
+			"so this generation dropped the {n} oldest rows; they are objects only a retired generation "+
+			"names, and they may now be swept before the {grace} grace window ends — checkpoint less "+
+			"often to keep the full window",
+			"what", what, "cap", int64(superblock.CondemnedBudgetBytes), "n", overflow, "grace", grace)
 	}
 	return out
 }

@@ -65,32 +65,139 @@ func TestCarryCondemnedDropsAgedEntries(t *testing.T) {
 	}
 }
 
+// hashName is the shape a derived ref really wears on the ledger: a
+// 64-character content hash. Row size is what the budget is spent in, so a
+// test that means "a full ledger" has to say it in rows of a stated shape.
+func hashName(i int) string { return fmt.Sprintf("%064d", i) }
+
+// packName is the other shape — `p-<nanos>-<rand>`, 23 characters — and
+// the whole reason the budget is bytes: it costs 53 bytes a row against a
+// hash name's 95.
+func packName(i int) string { return fmt.Sprintf("p-%016x-9999", i) }
+
+// rowsThatFit is how many rows of one shape a ledger's budget holds. Under
+// a row cap this was a constant; under a byte budget it is a consequence
+// of what the rows weigh, which is the point of the change.
+func rowsThatFit(name string, at time.Time) int {
+	return int(superblock.CondemnedPackRoom(nil) / superblock.CondemnedRowBytes(name, at))
+}
+
 // The cap is the brick guard: without it a short checkpoint interval fills
 // the 1 MiB read cap with ledger in about three days. Oldest first,
 // because those entries are the ones about to age off anyway.
 func TestCarryCondemnedCapsOldestFirst(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
+	fit := rowsThatFit(hashName(0), now)
 	var prev []superblock.CondemnedRef
-	total := superblock.MaxCondemnedEntries + 40
+	total := fit + 40
 	for i := 0; i < total; i++ {
 		// i == 0 is the oldest.
 		prev = append(prev, superblock.CondemnedRef{
-			Name:            fmt.Sprintf("ref-%05d", i),
+			Name:            hashName(i),
 			CondemnedAtUnix: now.Add(-time.Duration(total-i) * time.Minute).Unix(),
 		})
 	}
 	out, overflow := superblock.CarryCondemnedRefs(prev, nil, nil, now, testGrace)
-	if len(out) != superblock.MaxCondemnedEntries {
-		t.Fatalf("ledger kept %d entries, cap is %d", len(out), superblock.MaxCondemnedEntries)
+	if len(out) != fit {
+		t.Fatalf("ledger kept %d rows, and %d rows of this shape fit its %d-byte budget",
+			len(out), fit, int64(superblock.CondemnedBudgetBytes))
+	}
+	// The budget is spent in the encoding, so that is what has to be under
+	// it — not a count standing in for it.
+	if n := superblock.EncodedLen(out); n > superblock.CondemnedBudgetBytes {
+		t.Fatalf("the capped ledger encodes to %d bytes against a %d-byte budget",
+			n, int64(superblock.CondemnedBudgetBytes))
 	}
 	if overflow != 40 {
 		t.Fatalf("overflow reported as %d, want 40; nothing else tells a user their interval is too short", overflow)
 	}
-	if out[0].Name != fmt.Sprintf("ref-%05d", 40) {
+	if out[0].Name != hashName(40) {
 		t.Fatalf("oldest survivor is %s; the cap must drop from the OLD end", out[0].Name)
 	}
 	// Carried order preserved, so a seal that overflows does not re-encode
 	// entries nothing happened to.
+	for i := 1; i < len(out); i++ {
+		if out[i-1].CondemnedAtUnix > out[i].CondemnedAtUnix {
+			t.Fatalf("survivors were re-ordered at index %d", i)
+		}
+	}
+}
+
+// THE POINT OF BUDGETING IN BYTES. The two ledgers do not agree on what a
+// row costs — 53 bytes for a pack name, 95 for a content hash — so the
+// same share buys the pack ledger 1.8x the rows. Under a row cap the pack
+// ledger spent 27 KiB of a share it was allowed 48 KiB of, and repack
+// paced itself to the smaller number.
+func TestTheBudgetBuysMoreShortRowsThanLongOnes(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	packs, hashes := rowsThatFit(packName(0), now), rowsThatFit(hashName(0), now)
+	if packs <= hashes {
+		t.Fatalf("%d pack rows and %d hash rows fit the same budget; a 53-byte row must buy more "+
+			"of a byte budget than a 95-byte one, or the units have not actually changed", packs, hashes)
+	}
+	// Both really fill it: the ledger that holds more rows is not doing so
+	// by weighing less.
+	for _, c := range []struct {
+		what string
+		name func(int) string
+		n    int
+	}{{"pack", packName, packs}, {"hash", hashName, hashes}} {
+		prev := make([]superblock.CondemnedPack, c.n)
+		for i := range prev {
+			prev[i] = superblock.CondemnedPack{Name: c.name(i), CondemnedAtUnix: now.Add(-time.Minute).Unix()}
+		}
+		out, overflow := superblock.CarryCondemnedPacks(prev, nil, nil, now, testGrace)
+		if overflow != 0 || len(out) != c.n {
+			t.Errorf("%d %s rows were meant to fit exactly; %d dropped", c.n, c.what, overflow)
+		}
+		if n := superblock.EncodedLen(out); n > superblock.CondemnedBudgetBytes ||
+			n < superblock.CondemnedBudgetBytes-superblock.CondemnedRowBytes(c.name(0), now) {
+			t.Errorf("a full %s ledger encodes to %d bytes; it should fill the %d-byte budget to within "+
+				"one row", c.what, n, int64(superblock.CondemnedBudgetBytes))
+		}
+	}
+}
+
+// A ledger whose rows are not all one size still fills to its budget
+// rather than to some count derived from the largest row — the case a row
+// cap could not express at all. Repack writes pack names and the ref
+// ledgers write hash names, so a MIXED ledger is not a real document; what
+// is real is that the rule charges each row what it costs.
+func TestAMixedLedgerFillsItsByteBudget(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	// Alternating shapes, oldest first, well past the budget.
+	total := 2 * rowsThatFit(packName(0), now)
+	prev := make([]superblock.CondemnedPack, total)
+	for i := range prev {
+		name := packName(i)
+		if i%2 == 1 {
+			name = hashName(i)
+		}
+		prev[i] = superblock.CondemnedPack{Name: name,
+			CondemnedAtUnix: now.Add(-time.Duration(total-i) * time.Minute).Unix()}
+	}
+	out, overflow := superblock.CarryCondemnedPacks(prev, nil, nil, now, testGrace)
+	if overflow == 0 {
+		t.Fatal("nothing was dropped from a ledger built to be over budget")
+	}
+	n := superblock.EncodedLen(out)
+	if n > superblock.CondemnedBudgetBytes {
+		t.Fatalf("the capped ledger encodes to %d bytes against a %d-byte budget",
+			n, int64(superblock.CondemnedBudgetBytes))
+	}
+	// Filled, not merely under: the whole complaint about row units was
+	// that a ledger stopped well short of the bytes it was allowed. One
+	// long row of slack is the documented cost of stopping rather than
+	// skipping.
+	if slack := superblock.CondemnedBudgetBytes - n; slack > superblock.CondemnedRowBytes(hashName(0), now)+8 {
+		t.Errorf("a full ledger left %d bytes of its %d-byte budget unspent", slack,
+			int64(superblock.CondemnedBudgetBytes))
+	}
+	// Oldest-first survives the mixture: no short old row was kept by
+	// stepping over a long newer one.
+	if out[0].CondemnedAtUnix <= prev[0].CondemnedAtUnix {
+		t.Error("the oldest row survived a cap that had to drop something")
+	}
 	for i := 1; i < len(out); i++ {
 		if out[i-1].CondemnedAtUnix > out[i].CondemnedAtUnix {
 			t.Fatalf("survivors were re-ordered at index %d", i)
@@ -105,9 +212,9 @@ func TestCarryCondemnedCapsOldestFirst(t *testing.T) {
 func TestCarryCondemnedIsDeterministicAtTheCap(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	var prev []superblock.CondemnedRef
-	for i := 0; i < superblock.MaxCondemnedEntries; i++ {
+	for i := 0; i < rowsThatFit(hashName(0), now); i++ {
 		prev = append(prev, superblock.CondemnedRef{
-			Name:            fmt.Sprintf("old-%05d", i),
+			Name:            hashName(i),
 			CondemnedAtUnix: now.Add(-time.Duration(i+1) * time.Minute).Unix(),
 		})
 	}

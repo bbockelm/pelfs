@@ -440,6 +440,12 @@ func Publish(ctx context.Context, o Options) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	// This is the document that becomes the branch head, so it answers to
+	// the writer's invariants; the backup built above is exempt by
+	// construction and says why (superblock.Validate).
+	if err := sb.Validate(); err != nil {
+		return nil, fmt.Errorf("publish: %w", err)
+	}
 	if err := flip(ctx, o, raw); err != nil {
 		return nil, err
 	}

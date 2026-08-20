@@ -468,6 +468,13 @@ func repackedSuperblock(ctx context.Context, o ExecOptions, prev *superblock.Sup
 	// moved with the bytes or dropped.
 	sb.RootCatalogHint = movedRootHint(prev, condemn, moved)
 
+	// A repack rewrites the pack list wholesale, so it is the writer most
+	// able to leave a generation stating its pack set two ways (it starts
+	// from a copy of the parent, which may be the inline shape). Asked
+	// before signing, so an invalid document is never signed at all.
+	if err := sb.Validate(); err != nil {
+		return nil, nil, fmt.Errorf("repack: %w", err)
+	}
 	if err := sb.Sign(o.SigningKey); err != nil {
 		return nil, nil, fmt.Errorf("repack: %w", err)
 	}

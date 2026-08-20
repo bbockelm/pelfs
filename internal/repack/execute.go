@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"time"
 
 	"lukechampine.com/blake3"
@@ -188,6 +189,22 @@ func execute(ctx context.Context, o ExecOptions, res *Result, rep *reach.Report)
 	if err != nil {
 		return err
 	}
+	// What this run may condemn is bounded by what the ledger will carry,
+	// and the bound is applied HERE — before a byte is rewritten — because
+	// the alternative is discovering it after the expensive part.
+	if held := trimToLedger(res.Plan, head.Superblock.Condemned, o.Now, graceOf(head.Superblock)); held > 0 {
+		ui.Warn("repack: this plan proposed condemning {planned} packs and the condemned ledger carries "+
+			"{cap}; {held} of them are held back for a later run, newest-first, so that every pack this "+
+			"run does condemn keeps the full {grace} window",
+			"planned", len(res.Plan.Packs)+held, "cap", superblock.MaxCondemnedEntries, "held", held,
+			"grace", graceOf(head.Superblock))
+	}
+	if res.Plan.Empty() {
+		// Everything was held back: the ledger is already full of entries
+		// still inside their window, so there is no room to protect anything
+		// else. Doing nothing is the answer, and the note says why.
+		return nil
+	}
 	condemn := make(map[string]bool, len(res.Plan.Packs))
 	for _, c := range res.Plan.Packs {
 		condemn[c.Name] = true
@@ -205,6 +222,81 @@ func execute(ctx context.Context, o ExecOptions, res *Result, rep *reach.Report)
 	}
 	res.Generation = sb.Generation
 	return nil
+}
+
+// trimToLedger holds back the candidates the condemned-pack ledger has no
+// room for, and reports how many. It mutates the plan, so what the Result
+// reports is what was actually done.
+//
+// WHY A REPACK IS PACED RATHER THAN TRUNCATED. The ledger is the only
+// thing that keeps a repacked-away pack alive: the new generation does not
+// name it, and it is old by its own name, which is exactly the pair of
+// conditions retention deletes on — the age guard that protects a young
+// pack cannot help here, because a repack only ever touches old ones. So an
+// entry that does not fit is not a lost row in a log, it is a pack a reader
+// pinned to the pre-repack generation loses while it is still reading it.
+//
+// The ledger's cap cannot simply be raised to fit: the superblock has a
+// hard write budget (superblock.MaxEncodedBytes) and this ledger shares it
+// with two others whose growth is set by the CHECKPOINT RATE and is
+// unbounded in time. What can move is the size of one run. Repack is
+// resumable by construction — every run re-sweeps and re-plans — so a plan
+// larger than the ledger is not a failure to report, it is two runs: this
+// one takes what fits, the grace window passes, `pelfs gc` reclaims, the
+// entries age off, and the next run takes the rest.
+//
+// Held back NEWEST-FIRST (largest reclaim first among what is kept) for
+// two reasons. The bytes come back sooner, and the packs left for the next
+// run are the ones with the least to give — so a repack that is
+// interrupted forever still converges on the garbage that matters.
+func trimToLedger(plan *Plan, prev []superblock.CondemnedPack, now time.Time, grace time.Duration) int {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	// The room is what the cap leaves after the entries this generation
+	// must carry: the parent's, less the ones that have aged out. Asked
+	// through the ledger rule itself rather than recounted here, so the
+	// arithmetic cannot drift from the rule that enforces it.
+	//
+	// `listed` is nil, which is exact rather than conservative: a ledger
+	// entry names a pack its generation stopped listing, and a repack
+	// cannot re-create that name (pack names carry a creation stamp and a
+	// random suffix), so nothing on the carried ledger can be re-listed.
+	carried, _ := superblock.CarryCondemnedPacks(prev, nil, nil, now, grace)
+	room := superblock.MaxCondemnedEntries - len(carried)
+	if room < 0 {
+		room = 0
+	}
+	if len(plan.Packs) <= room {
+		return 0
+	}
+	held := len(plan.Packs) - room
+	sort.SliceStable(plan.Packs, func(i, j int) bool {
+		if plan.Packs[i].Reclaim != plan.Packs[j].Reclaim {
+			return plan.Packs[i].Reclaim > plan.Packs[j].Reclaim
+		}
+		return plan.Packs[i].Name < plan.Packs[j].Name
+	})
+	for _, c := range plan.Packs[room:] {
+		if len(plan.Notes) >= maxNames {
+			break
+		}
+		plan.Notes = append(plan.Notes, Note{Object: c.Name,
+			Detail: "held back: the condemned-pack ledger has no room; a later run takes it"})
+	}
+	plan.Packs = plan.Packs[:room]
+	// The estimate has to follow, or the report promises bytes this run
+	// will not move.
+	var move int64
+	for _, c := range plan.Packs {
+		move += c.Move
+	}
+	if move > 0 && plan.IntoPacks > 0 {
+		plan.IntoPacks = int((move + defaultTargetPackSize - 1) / defaultTargetPackSize)
+	} else if move == 0 {
+		plan.IntoPacks = 0
+	}
+	return held
 }
 
 // headMatches reports whether the branch head is one of the generations
@@ -483,7 +575,10 @@ func repackedSuperblock(ctx context.Context, o ExecOptions, prev *superblock.Sup
 	// The condemned ledger for the packs themselves. This is the entry
 	// retention reads to keep a pack alive through the grace window for
 	// readers still pinned to a generation that names it.
-	sb.Condemned = condemnPacks(prev.Condemned, res.CondemnedPacks, listedPacks, now, graceOf(prev))
+	sb.Condemned, err = condemnPacks(prev.Condemned, res.CondemnedPacks, listedPacks, now, graceOf(prev))
+	if err != nil {
+		return nil, nil, err
+	}
 
 	// The root-catalog hint is a hint, verified against the identity and
 	// falling back to the index — but a hint pointing into a pack this
@@ -539,15 +634,31 @@ func refNames(refs []superblock.ManifestRef) []string {
 }
 
 // condemnPacks and condemnRefs are this writer's calls into the ONE
-// ledger rule (superblock.CarryCondemnedPacks / CarryCondemnedRefs). They
-// exist to warn: a repack that overflows a ledger has shortened the window
-// objects only a retired generation names are kept for, and nothing else
-// would say so.
+// ledger rule (superblock.CarryCondemnedPacks / CarryCondemnedRefs).
+//
+// THE PACK LEDGER REFUSES; THE REF LEDGERS WARN, and the asymmetry is not
+// an oversight. A dropped REF entry costs at most the gap between when the
+// object was written and when it stopped being named, because retention
+// keeps every hash-named object for the grace window from its own mtime —
+// one checkpoint interval, in the steady state. A dropped PACK entry costs
+// the whole window: a repack only condemns packs already older than the
+// grace window, so the age guard has nothing left to give and the ledger is
+// the only thing between that pack and the next sweep.
+//
+// trimToLedger makes this unreachable by pacing the plan before anything
+// is rewritten. It is checked again here because the cost of being wrong is
+// deleted data, and a refused repack costs only the rewriting: the ref
+// never flips, and what was written is unreferenced garbage GC collects.
 func condemnPacks(prev []superblock.CondemnedPack, dropped, listed []string,
-	now time.Time, grace time.Duration) []superblock.CondemnedPack {
+	now time.Time, grace time.Duration) ([]superblock.CondemnedPack, error) {
 	out, overflow := superblock.CarryCondemnedPacks(prev, dropped, listed, now, grace)
-	warnLedgerOverflow("pack", overflow, grace)
-	return out
+	if overflow > 0 {
+		return nil, fmt.Errorf("repack: this generation would condemn %d packs more than the %d-entry "+
+			"condemned ledger carries, and a dropped entry is a pack the next gc deletes while readers "+
+			"pinned to the generation before this one are still reading it; refusing (the plan should have "+
+			"been paced to fit — see trimToLedger)", overflow, superblock.MaxCondemnedEntries)
+	}
+	return out, nil
 }
 
 func condemnRefs(prev []superblock.CondemnedRef, dropped, listed []string,

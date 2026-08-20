@@ -78,27 +78,34 @@ docker run --rm \
 # the same volume rather than two.
 SHARED="$(mktemp -d)"
 trap 'rm -rf "$STAGE" "$SHARED"' EXIT
-chmod 0777 "$SHARED"
+chmod 0770 "$SHARED"
+# Owned by the shared group, so both phases can reach it without it being
+# open to the world.
+chgrp 1001 "$SHARED" 2>/dev/null || chmod 0777 "$SHARED"
+# $1 uid, $2 gid, $3 phase. The two uids share a GROUP so that the volume
+# signing key can be handed over at 0640 rather than world-readable: this
+# script is the worked example of moving a volume between machines, and a
+# private key at 0644 is not the habit to model.
 uidphase() {
   docker run --rm \
     --device /dev/fuse \
     --cap-add SYS_ADMIN \
     --security-opt apparmor=unconfined \
-    --user "$1:$1" \
+    --user "$1:$2" \
     --network none \
     --platform "linux/$ARCH" \
     -v "$STAGE":/stage:ro \
     -v "$SHARED":/shared \
-    --tmpfs /work:rw,size=256m,exec,uid=$1,gid=$1 \
+    --tmpfs /work:rw,size=256m,exec,uid=$1,gid=$2 \
     -e HOME=/work/home \
     -e TMPDIR=/work \
     -w /work \
     "$IMAGE_TAG" \
-    /bin/sh /stage/uidmap.sh "$2"
+    /bin/sh /stage/uidmap.sh "$3"
 }
 echo "== one volume, two uids: the cluster-vs-laptop case =="
-uidphase 1001 create
-uidphase 1002 use
+uidphase 1001 1001 create
+uidphase 1002 1001 use
 
 echo "== running as uid 1001 with no privileges =="
 exec docker run --rm \

@@ -104,6 +104,23 @@ func (g *genSession) autoRepackOnce(ctx context.Context, policy repack.AutoPolic
 	if worth, _ := repack.Worthwhile(head, policy); !worth {
 		return nil
 	}
+	// Claimed for the length of the operation so the periodic checkpoint
+	// stands aside (checkpointPeriodically). Deliberately a FLAG and not a
+	// held lock: a repack runs for minutes, and holding mu across it would
+	// block reads, writes and the seal at unmount — the things this is
+	// supposed to be invisible to.
+	g.mu.Lock()
+	if g.repacking {
+		g.mu.Unlock()
+		return nil
+	}
+	g.repacking = true
+	g.mu.Unlock()
+	defer func() {
+		g.mu.Lock()
+		g.repacking = false
+		g.mu.Unlock()
+	}()
 
 	// The live set has to be every branch head and every tag, not just
 	// this session's branch: a pack only a tag references is live, and a
@@ -188,4 +205,12 @@ func (g *genSession) writtenBytes() int64 {
 		return -1
 	}
 	return g.content.Stats().WrittenBytes
+}
+
+// repackInFlight reports whether a background repack is between its sweep
+// and its flip.
+func (g *genSession) repackInFlight() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.repacking
 }

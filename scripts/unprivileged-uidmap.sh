@@ -40,13 +40,16 @@ create)
   KEY=$(find "$HOME/.local/state/pelfs" -name v2-signing.key | head -1)
   [ -n "$KEY" ] || fail "no signing key to hand to the second uid"
   cp "$KEY" /shared/key
-  chmod 0644 /shared/key
+  # 0640, group-readable only: the two phases share a group precisely so
+  # this does not have to be world-readable. On a real second machine this
+  # is an scp of a 0600 file, which is what the destination gets below.
+  chmod 0640 /shared/key
   # The state directory is per-prefix, so the path is the same on both
   # machines below HOME. Recording it is the stand-in for "scp the key to
   # the same place on the other host", which is what a user does --
   # `pelfs shell` has no --signing-key of its own to point at it with.
   basename "$(dirname "$KEY")" > /shared/voldir
-  chmod 0644 /shared/voldir
+  chmod 0640 /shared/voldir
   ;;
 use)
   echo "   mounting as uid $(id -u), which did NOT create it"

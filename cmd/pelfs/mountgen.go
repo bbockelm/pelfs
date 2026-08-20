@@ -108,6 +108,9 @@ type genSession struct {
 
 	overlayDir string
 	inner      pelicanobj.Store // counted transport; see countedStore
+	// repacking is set while a background repack is between its sweep and
+	// its flip, so the periodic checkpoint can stand aside. Guarded by mu.
+	repacking bool
 	// refs is the verified ref store this session reads and flips through.
 	// Kept on the session because background maintenance publishes too
 	// (autorepack.go), and a second store would keep a second key pin.
@@ -636,7 +639,7 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		return fail(fmt.Errorf("unknown --backend %q (want fuse or nfs)", backend))
 	}
 	if err != nil {
-		return fail(fmt.Errorf("mount: %w (fuse needs Linux FUSE or macFUSE; try --backend nfs)", err))
+		return fail(fmt.Errorf("mount: %w%s", err, mountAdvice(backend)))
 	}
 	startup.mark("mount")
 	// Reported after the mount, not after the generation opens: "ready to
@@ -1754,6 +1757,17 @@ func (g *genSession) checkpointPeriodically(ctx context.Context, every time.Dura
 		case <-t.C:
 			if ctx.Err() != nil {
 				return
+			}
+			// A background repack publishes generations too, and by the
+			// time it flips it has already paid for a whole reachability
+			// sweep and a rewrite. A checkpoint landing in the middle
+			// costs the repack all of that — it refuses on a moved head —
+			// while costing itself one interval. So the periodic one gives
+			// way; write PRESSURE does not, because the alternative there
+			// is an unbounded overlay, and a repack is worth less than
+			// that.
+			if g.repackInFlight() {
+				continue
 			}
 			start := time.Now()
 			summary, err := g.checkpoint(sealCtx)

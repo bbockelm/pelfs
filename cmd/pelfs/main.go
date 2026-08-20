@@ -300,3 +300,26 @@ func exitErr(err error) int {
 	}
 	return 1
 }
+
+// mountAdvice is what to try after the OS refused a mount, or "" when
+// there is nothing honest to suggest.
+//
+// The advice this replaced was "try --backend nfs", offered on every
+// platform. On Linux that is a dead end: the NFS backend attaches with
+// mount(2), which needs root, so an unprivileged user — the only kind
+// who reaches this line, since FUSE is what they were already using —
+// follows it to a second failure with a worse message. resolveBackend
+// stopped saying it; this call site had not.
+//
+// macOS is the exception, and the reason that backend exists: mount_nfs
+// there works with no privilege and no kernel extension, so it really is
+// the thing to try when macFUSE is absent.
+func mountAdvice(backend string) string {
+	if runtime.GOOS == "darwin" && backend != "nfs" {
+		return " (macFUSE is not installed or not loaded; try --backend nfs, which needs no kernel extension)"
+	}
+	if backend == "nfs" {
+		return " (the NFS backend attaches with mount(2), which requires root on Linux)"
+	}
+	return " (pelfs mounts with FUSE and has no fallback on this platform: the NFS backend needs root)"
+}

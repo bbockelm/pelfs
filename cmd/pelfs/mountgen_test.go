@@ -1400,3 +1400,78 @@ func TestSessionStatsCarryTheWritePath(t *testing.T) {
 		t.Errorf("published write statistics disagree with the store: %+v vs %+v", sum.Write, st)
 	}
 }
+
+// A background repack has already paid for a whole reachability sweep and
+// a rewrite by the time it flips, so a periodic checkpoint landing in the
+// middle costs the repack ALL of it — the repack refuses on a moved head
+// — while costing itself one interval. The periodic checkpoint therefore
+// gives way.
+//
+// Both directions are asserted, because a guard that never lifts is the
+// same bug from the other side: a mount that stopped checkpointing would
+// hand its whole session to the seal at unmount.
+func TestPeriodicCheckpointStandsAsideForARepack(t *testing.T) {
+	g := newGenSession(t, true)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rstore, err := refs.New(g.inner, t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, g.ov, "during-repack.txt", "written while a repack is in flight")
+
+	g.mu.Lock()
+	g.repacking = true
+	g.mu.Unlock()
+	go g.checkpointPeriodically(ctx, 10*time.Millisecond)
+
+	// Many intervals' worth. The overlay is dirty the whole time, so
+	// without the guard this publishes almost immediately.
+	time.Sleep(300 * time.Millisecond)
+	if f, err := rstore.Fetch(ctx, "main"); err == nil && f.Superblock.Generation > 0 {
+		t.Fatalf("a checkpoint published generation %d while a repack was in flight",
+			f.Superblock.Generation)
+	}
+
+	// And it resumes: the guard is a pause, not a stop.
+	g.mu.Lock()
+	g.repacking = false
+	g.mu.Unlock()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		f, err := rstore.Fetch(ctx, "main")
+		if err == nil && f.Superblock.Generation >= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("checkpointing never resumed after the repack finished")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// The reentrancy half: a second attempt while one is in flight does
+// nothing rather than racing it.
+func TestAutoRepackDoesNotRunTwiceAtOnce(t *testing.T) {
+	g := newGenSession(t, true)
+	ctx := context.Background()
+	writeFile(t, g.ov, "f.bin", string(incompressible(1<<20, 7)))
+	if _, err := g.checkpoint(ctx); err != nil {
+		t.Fatal(err)
+	}
+	before := g.sb.Generation
+
+	g.mu.Lock()
+	g.repacking = true
+	g.mu.Unlock()
+	// Thresholds that would certainly trigger, so only the in-flight guard
+	// can be what stops it.
+	if err := g.autoRepackOnce(ctx, repack.AutoPolicy{Packs: 1, Now: time.Now().Add(200 * time.Hour)}); err != nil {
+		t.Fatalf("autoRepackOnce: %v", err)
+	}
+	if g.sb.Generation != before {
+		t.Fatalf("a second repack ran while one was in flight: generation %d, was %d",
+			g.sb.Generation, before)
+	}
+}

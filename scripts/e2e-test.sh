@@ -197,4 +197,47 @@ grep -Eq "unreferenced: +0 " "$WORK/gc.log" || { echo "FAIL: gc found unreferenc
 "$PELFS" fsck --deep --state-dir "$WORK/state1" "$PREFIX" > "$WORK/fsck.log" 2>&1 || { echo "FAIL: fsck"; cat "$WORK/fsck.log"; exit 1; }
 grep -q "generation is consistent" "$WORK/fsck.log" || { echo "FAIL: fsck did not report consistency"; cat "$WORK/fsck.log"; exit 1; }
 
-echo "== PASS: create, write, seal, read back, encrypt, prefetch, lease, gc, fsck =="
+echo "== repack: measures, and refuses to touch packs inside the grace window =="
+# Make some content dead: write a file, seal, rewrite it, seal. The old
+# chunks are now garbage inside immutable packs, which is exactly what a
+# repack is for.
+"$PELFS" shell --state-dir "$WORK/state1" "$PREFIX" -- /bin/sh -c \
+  'head -c 400000 /dev/urandom > churn.bin' > "$WORK/repack-w1.log" 2>&1 \
+  || { echo "FAIL: write for repack"; cat "$WORK/repack-w1.log"; exit 1; }
+"$PELFS" shell --state-dir "$WORK/state1" "$PREFIX" -- /bin/sh -c \
+  'head -c 400000 /dev/urandom > churn.bin' > "$WORK/repack-w2.log" 2>&1 \
+  || { echo "FAIL: rewrite for repack"; cat "$WORK/repack-w2.log"; exit 1; }
+
+before=$(cat "$WORK/origin/e2e/ns/refs/main" | cksum)
+"$PELFS" repack --state-dir "$WORK/state1" "$PREFIX" > "$WORK/repack.log" 2>&1 \
+  || { echo "FAIL: repack (report)"; cat "$WORK/repack.log"; exit 1; }
+grep -q "grace window:" "$WORK/repack.log" || {
+  echo "FAIL: repack did not report the grace window it applied:"; cat "$WORK/repack.log"; exit 1; }
+# The assertion that keeps this from passing vacuously: the rewrite above
+# left a pack that is entirely dead, so the planner must have SEEN a
+# candidate and declined it for its age alone. A run that simply found
+# nothing would prove only that the command exits zero.
+grep -q "held back:" "$WORK/repack.log" || {
+  echo "FAIL: a rewritten file left no candidate for the age guard to hold back;"
+  echo "      this check would pass on a volume with nothing to repack:"; cat "$WORK/repack.log"; exit 1; }
+sed 's/^/    /' "$WORK/repack.log"
+
+# THE SAFETY ASSERTION. Every pack here is seconds old, and a young pack
+# is one a concurrent writer may be about to reference. --apply must
+# therefore do nothing at all and leave the branch where it was. A repack
+# that rewrote these would be a repack that races every other writer.
+"$PELFS" repack --apply --state-dir "$WORK/state1" "$PREFIX" > "$WORK/repack-apply.log" 2>&1 \
+  || { echo "FAIL: repack --apply"; cat "$WORK/repack-apply.log"; exit 1; }
+grep -q "published generation" "$WORK/repack-apply.log" && {
+  echo "FAIL: repack --apply published a generation from packs inside the grace window:"
+  cat "$WORK/repack-apply.log"; exit 1; }
+after=$(cat "$WORK/origin/e2e/ns/refs/main" | cksum)
+[ "$before" = "$after" ] || {
+  echo "FAIL: repack --apply moved the branch though it proposed nothing"; exit 1; }
+"$PELFS" fsck --deep --state-dir "$WORK/state1" "$PREFIX" > "$WORK/fsck2.log" 2>&1 \
+  || { echo "FAIL: fsck after repack"; cat "$WORK/fsck2.log"; exit 1; }
+grep -q "generation is consistent" "$WORK/fsck2.log" || {
+  echo "FAIL: fsck after repack did not report consistency"; cat "$WORK/fsck2.log"; exit 1; }
+echo "   measured the volume, held back every pack inside the grace window, changed nothing"
+
+echo "== PASS: create, write, seal, read back, encrypt, prefetch, lease, gc, fsck, repack =="

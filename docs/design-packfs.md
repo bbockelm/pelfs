@@ -31,7 +31,9 @@ and integrity does not need hash *names* — each generation's pack list
 records the trailer hash, so a fetched pack verifies against the list.
 Normal operation never lists the namespace: the superblock carries the
 pack set, and refs and tags are addressed by name. Listing is needed only
-by GC. No manifest object exists.
+by GC. The pack list itself lives under `manifests/` — one more key
+space of immutable, hash-named objects; see "The pack list moves out of
+the superblock".
 
 ## Packs
 
@@ -423,9 +425,13 @@ and old shards go cold and live in federation caches indefinitely.
 
 ## The superblock
 
-The single mutable object and the root of both trust and consistency. It
-is CBOR, encoded deterministically, loaded fully into RAM, and signed with
-the signature field zeroed.
+**One generation of a volume, in one signed object.** Everything else under
+the prefix is immutable and content-addressed, so this is the only object a
+reader must re-fetch to notice that anything changed, the only one an
+attacker could usefully rewrite, and the only one whose *size* anybody has
+to think about. It is CBOR in Core Deterministic encoding, signed with the
+signature field zeroed, and parent-linked by a BLAKE3 hash of its
+predecessor's wire bytes.
 
 | field | purpose |
 |---|---|
@@ -433,44 +439,139 @@ the signature field zeroed.
 | `VolumeID`, `CreatedUnixNano` | volume identity, timestamp |
 | `RootCatalog` | entry point of the namespace |
 | `Shards` | inode-shard ranges -> catalog identity |
-| `PackList` | name, size, trailer hash per pack: the generation's pack set |
 | `NextInode` | allocator high-water mark |
-| `KeyTable` | key-id -> KEK-wrapped DEK or identity key |
-| `CatalogKeyID` | the one key catalogs and shards are encrypted under |
+| `KeyTable`, `CatalogKeyID` | key-id -> KEK-wrapped key; the one key catalogs and shards use |
 | `Params` | `SMaxBytes`, `SMinBytes`, `InlineMax`, `TGraceSeconds`, `RetainK` |
+| `PackList` | the generation's pack set, INLINE — the older of two shapes |
+| `Manifests` | the generation's pack set, by reference — the newer one |
+| `PackIndexes` | multi-pack indexes: which pack holds an identity (a HINT) |
 | `Catalogs` | a seal-planning hint, not routing — see below |
-| `Condemned` | repack's ledger of dropped packs (no writer yet) |
-| `CondemnedIndexes`, `CondemnedManifests` | the same ledger for dropped index and manifest refs; publish writes it |
+| `RootCatalogHint` | where the root catalog's bytes sat when this was written (a HINT) |
+| `Condemned` | packs a repack dropped from the pack list, and when |
+| `CondemnedIndexes`, `CondemnedManifests` | the same, for derived refs a seal stopped listing |
+| `Maint` | what maintenance has already done to this branch |
 | `PrevHash` | lineage: snapshot history, fork detection |
 | `SigningPub`, `NextPub`, `Signature` | trust root and rotation |
 
+Five of those rows carry everything this volume references and everything
+it recently stopped referencing, and each gets a section of its own:
+`PackList`/`Manifests` under "The pack list moves out of the superblock",
+and the three condemned ledgers under "Retention and GC".
+
 **Nothing in the superblock says where any identity lives.** `Catalogs`
-carries `(inode, identity, path, weight, promoted)` for each catalog in
-the generation, and exists so the next seal can plan reuse; a reader needs
-nothing from it. There is no identity-to-pack map anywhere except a pack
-trailer, which is why a cold mount probes trailers newest-first. The
-options for changing that are under "Open format questions".
+carries `(inode, identity, path, weight, promoted)` per catalog so the NEXT
+seal can plan reuse; a reader needs nothing from it, and a writer may drop
+it (below). There is no identity-to-pack map anywhere except a pack trailer
+and the multi-pack index, which is why "Locating things" is its own
+section. A minimal-perfect-hash mmap structure was considered and rejected:
+the superblock has one row per catalog or shard, far below where MPH pays.
 
-A minimal-perfect-hash mmap structure was considered and rejected: the
-superblock has one row per catalog or shard, far below where MPH pays.
-
-Because everything else is immutable and content-addressed, the superblock
-is the only object a *reader* ever depends on that mutates, and the only
-thing a reader must re-fetch to observe a new generation. Federation
+Because it is the only mutable object a reader depends on, federation
 caches work at full strength for all data and all metadata; `?directread`
-is needed only for the superblock and for the advisory lease.
+is needed only here and for the advisory lease. That "only" is a trap, and
+we fell into it — see Appendix C.
 
-That "only" is a trap, and we fell into it. Because the direct-read
-requirement applies to just two objects, it was originally satisfied at
-each call site — and an audit found three of four `refs.New` callers
-passing a cache-served store, including the mount itself. The symptom on a
-real federation was not a stale read but an md5 mismatch on `refs/main`: a
-cache that mis-reports object length returns a truncated body, so a
-caching bug arrives disguised as corruption. The invariant now lives
-inside `refs.New` and `lease.Acquire`, which switch any store they are
-handed to its direct variant. Rule of thumb: an invariant that holds for
-exactly the objects one package owns belongs inside that package, not in
-its callers' heads.
+### The one hard limit: 1 MiB, and what it means for a writer
+
+**A mutable object is read through a 1 MiB ceiling**
+(`pelicanobj.MaxMutableObject`), enforced on every unverified read. Exactly
+three kinds of object are read that way: `refs/<branch>`, `tags/<name>`,
+and `meta/lease.json`. The ceiling is not tuning. It is the bound that
+makes it safe to read an object into memory before its signature has been
+checked, which every reader must do, because a signature cannot be checked
+on bytes nobody has read yet.
+
+**A superblock that crosses it is a volume nobody can recover.** Every
+reader refuses the object, so the volume cannot be mounted; and the next
+publish cannot read the parent it has to grow from, so it cannot be
+published either. There is no repair from inside the tool, because the tool
+is one of the readers. Until this was written down and checked, nothing
+looked at the size on the way out.
+
+So a writer spends a **budget** before it spends the cap:
+
+| bound | value | what it covers |
+|---|---|---|
+| read cap | 1 MiB | any mutable object, at every reader |
+| write budget | **512 KiB** | the superblock a writer is about to FLIP |
+| catalog share | 256 KiB | `Catalogs`, which a writer may drop instead of failing |
+| ledger cap | 512 entries each | `Condemned`, `CondemnedIndexes`, `CondemnedManifests` |
+
+Half the cap rather than nine tenths, because the quantity being guarded
+grows *monotonically* in what a volume accumulates. A volume at 90% is one
+ordinary seal away from unrecoverable; a volume at 50% has days of warning
+at the growth rates below. A refused seal costs nothing but the uploads it
+already did: the ref never flips, and the volume stays exactly as mountable
+as it was.
+
+**Who spends what**, measured on the real encoding rather than estimated:
+
+| field | bytes per row | at its bound |
+|---|---|---|
+| `catalogs` | 110 | 256 KiB = ~2,400 catalogs |
+| `condemned_indexes` | 95 | 512 rows = 48 KiB |
+| `condemned_manifests` | 95 | 512 rows = 48 KiB |
+| `condemned` (packs) | 53 | 512 rows = 27 KiB |
+| `manifests` | 130 | ~25 refs at 100 M objects = 3 KiB |
+| `pack_indexes` | 143 | ~25 refs at 100 M objects = 4 KiB |
+| `pack_list` (inline shape only) | 87 | unbounded — this is what `manifests` exists to remove |
+| fixed fields, empty | — | 403 |
+
+The non-droppable rows come to about 130 KiB at every bound at once, and
+the catalog share to 256 KiB on top: ~385 KiB against a 512 KiB budget.
+**Those three shares must keep summing to less than the budget if any of
+them is ever raised**, and there is a test that pins the write budget to
+half the read cap so the two cannot drift apart.
+
+`Catalogs` is the field a writer SPENDS FIRST, and the reason it can be is
+a property worth stating once: it is optional in the format and both
+consumers already handle its absence. A publisher that finds it missing
+rebuilds every catalog instead of carrying unchanged subtrees forward; a
+reachability sweep walks the tree from the root instead of seeding from the
+list. Neither reads a wrong answer; both do more work. So dropping it
+converts "this volume can no longer be sealed" into "this seal is slower",
+which is a trade worth taking every time.
+
+**Which objects the budget governs, and which it does not.** The budget
+exists because of the read cap, so it applies to the document that gets
+flipped to `refs/<branch>` and to nothing else. The disaster-recovery
+superblock backup is NOT governed: it is an entry inside a pack, reached
+through a trailer and a ranged read, with no cap anywhere on that path. It
+also has a different shape — the backup states its packs inline while the
+head states them by reference — so it grows with pack count while the head
+does not. Checking it was a real bug rather than harmless caution: it
+refused any first ingest past about 6,000 packs (~12 GB at the default
+cut), with a head of 1,106 bytes and a backup of 527,801, and the error
+message named a pack list that is not in the document anyone mounts.
+
+### The evolution rule: every new field must be `omitempty`
+
+`Verify` does not check the signature against the bytes that arrived. It
+**re-encodes the decoded struct**, with `Signature` zeroed, and checks
+Ed25519 over that. So what is verified is the canonical form of the parsed
+content, never an attacker's choice of byte layout — which is the property
+that makes a deterministic encoding worth its cost.
+
+Two consequences follow, and the second one is a rule about all future
+work:
+
+- **A reader older than a field it is sent refuses the document.** The
+  decoder drops unknown map keys deliberately (forward compatibility), so
+  an old binary re-encodes without them and the signature fails. That is
+  the safe direction: an old reader refuses a newer superblock instead of
+  silently mounting one whose signed content it cannot see. An
+  `ErrBadSignature` on a generation newer than the binary is this and
+  nothing else.
+- **Every field added from here on MUST be `omitempty`** — a pointer, or a
+  nilable type. A zero-valued non-omitempty addition would appear in the
+  re-encoding of every OLDER document too, changing bytes that were signed
+  years ago, and would break the signature of every generation ever
+  written. Not "on upgrade": retroactively, everywhere, at once.
+
+Lineage hashes are immune either way, being defined over the wire bytes of
+the predecessor rather than over a re-encoding (`VerifyChain`) — a decoder
+that tolerates unknown fields cannot reproduce a newer writer's exact bytes
+and must never try.
 
 ## Identity versus location
 
@@ -492,12 +593,16 @@ A snapshot must capture *what* every file's chunks are without freezing
 Consequences:
 
 - **Tagged generations never rot.** A generation pins its pack set; a
-  repack would emit a *new* generation whose list routes moved chunks to
-  the new pack, while retained older generations keep their old packs
-  alive. GC's pack-liveness question is simply "does any retained
-  generation's pack list name this pack", plus the reader grace window.
-- **Repack would be metadata-free**: catalogs never change; only the next
-  superblock's pack list does.
+  repack emits a *new* generation whose list routes moved chunks to the
+  new pack, while retained older generations keep their old packs alive.
+  GC's pack-liveness question is simply "does any retained generation's
+  pack set name this pack", plus the condemned ledger and the age guard
+  ("Retention and GC").
+- **Repack is metadata-free**, and this is what makes it a small
+  self-contained generation rather than a republish of the tree: catalogs
+  are not rewritten, not even touched. Only the structures that answer
+  "where does identity X live" change — the pack manifest and the
+  multi-pack index.
 - File versioning in the user-visible sense falls out: mount any tagged
   generation for its point-in-time tree; a file's versions across
   generations are different chunk lists in mostly-shared catalogs, with
@@ -648,9 +753,9 @@ into a pack of its own, so a large file is roughly one pack per chunk and
 a whole-pack fetch of it costs what the chunk costs.
 
 These parameters are compiled in. They are **not** recorded per volume in
-the superblock — `Params` carries the catalog thresholds and the retention
-window, and nothing else — so changing them changes chunk boundaries for
-every volume a build touches.
+the superblock — `Params` carries the catalog split thresholds, the inline
+threshold and the grace window, and nothing about chunking — so changing
+them changes chunk boundaries for every volume a build touches.
 
 ## Locating things: trailers, and the multi-pack index
 
@@ -786,66 +891,113 @@ then a few dozen indexes rather than a few thousand.
 
 ### The pack list moves out of the superblock
 
-A hundred million objects at a 2 MiB cut is 200,000-400,000 packs, and a
-superblock carrying that list is 12-25 MB — read on every mount,
-rewritten on every seal, growing forever, and on the critical path of
-everything.
+**The problem.** A hundred million small objects at a 2 MiB cut is
+200,000-400,000 packs. The inline pack list costs 87 bytes per pack
+(measured, not estimated), so that list alone is **17-35 MB** of superblock
+— read on every mount, rewritten on every seal, growing forever, and on the
+critical path of everything. It is also the field that would cross the 1
+MiB read cap and brick the volume, three hundred times over.
 
-The list was serving three jobs, and the index takes over one of them:
+**What the list is FOR.** It was serving three jobs, and the multi-pack
+index has taken over the first:
 
   - LOCATING. What a reader iterated the list for. The index answers it.
   - AUTHENTICATING. Chunk data is self-verifying by identity; a pack
-    TRAILER is not, so a reader falling back to trailers needs a hash it
-    can trust, and the signature is what makes it trustworthy.
-  - ENUMERATING. Retention needs the packs a live generation names, and
+    TRAILER is not, so a reader falling back to trailers needs a trailer
+    hash it can trust, and the signature is what makes it trustworthy.
+  - ENUMERATING. Retention needs the packs a live generation names, and a
     rescue needs to find them with no index at all.
 
-Neither of the last two requires the list to be INSIDE the superblock. So
-it is a derived, hash-named object (`internal/manifest`), listed the way
-an index is: the signature covers a hash rather than the entries, and the
-manifest is fetched only when something needs enumeration or trailer
-authentication — which the index makes rare. 72 bytes per pack, segmented
-and merged like an index, so a generation writes its own packs rather
-than rewriting the set.
+Neither of the last two requires the list to be INSIDE the superblock. Both
+require it to be *signed*. Those are different requirements, and separating
+them is the whole change: the list becomes a derived, hash-named object
+(`internal/manifest`), and the superblock names it the way it names an
+index. **The signature covers a hash, and the hash covers the entries**, so
+a fetched manifest is exactly as trustworthy as an inline list was, and the
+superblock stops growing with pack count.
 
-Two things make it simpler than an index. Its key is the pack NAME, which
-is fixed-width, so there is no truncation and no collision to resolve.
-And a pack name begins with a zero-padded creation stamp, so sorted by
-name is sorted by AGE — the order retention already thinks in, which lets
-a sweep find packs older than a cutoff through the sampled windows
-without reading a segment whole.
+Two things make a manifest simpler than an index. Its key is the pack NAME,
+fixed-width, so there is no truncation and no collision to resolve. And a
+pack name begins with a zero-padded creation stamp, so sorted by name is
+sorted by AGE — the order retention already thinks in, which lets a sweep
+find packs older than a cutoff through the sampled windows without reading
+a segment whole.
 
-One thing makes it harder: it is the only structure here that needs
-DELETION. A stale index entry is harmless — it names a swept pack and the
-lookup falls back — but the manifest is the authority on what exists. The
-answer is the rule an index already uses rather than a new one: do not
-delete, rewrite the segment when it is mostly dead. Retention only
-deletes packs no LIVE generation names, so a stale entry can only survive
-in a retired generation's manifest, which nobody reads. The cost of that
-laziness is holding a few dead packs slightly longer, which the age guard
-already tolerates.
+One thing makes it harder, and it is the thing that shapes everything
+below: **the manifest is not a hint.** An index is derived from a pack set
+the superblock states some other way, so losing one costs a reader speed
+and nothing else. The manifest IS that statement. A generation that cannot
+fetch its manifest cannot enumerate and cannot authenticate a trailer, and
+must FAIL rather than fall through to an empty pack set — which would read
+as "this volume has no data" and let a sweep act on it. Every code path
+that resolves a pack set goes through one function for exactly that reason.
 
-The end state: a superblock names O(log N) index refs and O(log N)
-manifest refs, and stops depending on volume size at all.
+#### Why append-only segments, and not a mutable manifest
+
+The obvious design is one manifest object per volume, rewritten by each
+seal. It loses, twice, and both losses are worth naming because they are
+the same two losses that shape the rest of this format.
+
+**A mutable manifest is `refs/main` again.** It would be a second object
+that must be overwritten in place, read-after-write, under concurrent
+writers, through federation caches that mis-report length. We already have
+exactly one object like that and it costs us `?directread`, an ETag guard,
+an advisory lease, and a rule enforced inside `refs.New` because callers
+kept forgetting it. Adding a second one would double a cost we work hard to
+keep at one — and unlike the ref, this one would be megabytes, so a
+truncated cached read would be a plausible-looking pack list rather than an
+obvious failure.
+
+**Rewriting the whole list per seal is the cost we are removing.** A
+generation that adds three packs should write about 216 bytes, not 35 MB.
+So a seal writes a SEGMENT covering the packs it created, carries its
+predecessor's segment refs forward beside it, and consolidation folds the
+newest run into one when they balance — the same size-tiering rule the
+index uses, written once and applied to both (`internal/publish/
+consolidate.go`). Sizes at least double from the newest end, so the ref
+count is logarithmic in the volume: ~25 refs at a hundred million objects
+against ~1,500 for a fixed-size rule.
+
+Segments are content-addressed and therefore immutable, which is what
+removes the whole class of problem: an interrupted upload is retried rather
+than left half-named, two publishes that produced the same segment write
+the same object, and nothing is ever modified in place.
+
+What that costs is the subject of "Retention and GC": consolidation stops
+LISTING its inputs, and something has to keep them alive for the readers
+still holding a generation that names them.
 
 ### One shape or the other, never both
 
 **A generation that records manifest refs stops writing the inline pack
-list.** Carrying both would keep every byte this removes, and would give a
-reader two lists that can disagree. So the rule is stated once, in the
-format: prefer the manifest, fall back to the inline list only when a
-generation names no manifest. Every generation written before this change
-has an inline list and no manifest refs, and keeps working forever — no
-migration, no rewrite, no flag day. The one migration that does happen is
-invisible: the first manifest-era generation folds its inline parent's
-packs into its own segment, which costs O(inherited packs) bytes once,
-exactly what the old code paid on *every* seal.
+list.** Carrying both would keep every byte this removes, and would hand a
+reader two lists that can disagree about what is live while only one of
+them is swept for. So the rule is stated once, in the format: prefer the
+manifest, fall back to the inline list only when a generation names no
+manifest. `superblock.Validate` refuses a head that states its pack set
+twice — as a WRITER's check, called by publish and by repack on the
+document they are about to flip, and by no reader.
 
-The break runs the other way: **a reader older than this change cannot
-read a manifest-only generation.** It does not mount an empty volume — an
-old decoder drops the unknown field and `Verify` re-encodes what it
-decoded, so the signature fails and the reader refuses at the trust
-boundary. Accepted, the format being pre-release.
+The one document that legitimately breaks the rule is the
+disaster-recovery backup. It rides inside the last pack, so it must state
+the packs its seal has cut before that seal has written a manifest covering
+them; it states those inline and carries its parent's refs for everything
+older, and a rescue reads its pack set as the union of the two. Nothing
+mounts a backup, and `Decode` cannot tell that document from a head — which
+is exactly why the check lives at the writers, who always can.
+
+Every generation written before this change has an inline list and no
+manifest refs, and keeps working forever: no migration, no rewrite, no flag
+day. The one migration that does happen is invisible — the first
+manifest-era generation folds its inline parent's packs into its own
+segment, costing O(inherited packs) bytes once, which is precisely what the
+old code paid on *every* seal.
+
+The break runs the other way: **a reader older than this change cannot read
+a manifest-only generation.** It does not mount an empty volume; an old
+decoder drops the unknown field, `Verify` re-encodes what it decoded, and
+the signature fails at the trust boundary (see the evolution rule under
+"The superblock"). Accepted, the format being pre-release.
 
 What it is worth, measured (`TestSuperblockStopsGrowingWithPackCount`):
 
@@ -855,10 +1007,10 @@ What it is worth, measured (`TestSuperblockStopsGrowingWithPackCount`):
 | 10,000 | 871 KB | 834 B | 720 KB |
 | 100,000 | **8.7 MB** | **836 B** | 7.2 MB |
 
-The bytes do not vanish; they move out of the object every mount reads
-and every seal rewrites, into one that is fetched only when something
-needs to enumerate or authenticate a trailer. The right-hand column is
-the honest half of the trade, and it is 72 bytes per pack either way.
+The bytes do not vanish; they move out of the object every mount reads and
+every seal rewrites, into one fetched only when something needs to
+enumerate or authenticate a trailer. The right-hand column is the honest
+half of the trade, and it is 72 bytes per pack either way.
 
 ### Liveness wants a reachability sweep, not a list
 
@@ -1134,9 +1286,10 @@ provably-unmodified inodes back to clean; the seal at unmount does the
 same without freezing. `--no-seal` keeps the overlay for a later remount
 instead.
 
-`design-writepath.md` proposes replacing the staging directory with an
-LSM-shaped memtable so content leaves during the session. It is **not
-built**.
+`design-writepath.md` describes replacing the staging directory with an
+LSM-shaped memtable so content leaves during the session. It is **built
+and default**: `internal/memtable` is the write path of every writable
+mount.
 
 ### Frontends
 
@@ -1148,56 +1301,244 @@ picks. The low-level caching wins are FUSE-only: NFS keeps client-driven
 caching with no invalidation push, and stays the degraded path. Hard links
 work over it, on a small go-nfs fork documented in `go-nfs-patches.md`.
 
-## Retention and GC
+## Retention and GC: condemn, then collect
 
-Retention is expressed entirely in the ref and generation layer, and the
-pack list makes the sweep set arithmetic rather than tree traversal:
+### The problem, stated exactly
 
-- **Pack lists carry forward.** Publish appends new packs to the previous
-  generation's list; the only thing that would ever REMOVE a pack from the
-  list is repack. So a branch head's list covers every ancestor's packs.
-- **The condemned ledger covers the exception.** When repack drops a pack
-  from the list, the new superblock is to record it in a small `condemned`
-  ledger as (name, condemned-at); publish carries ledger entries forward
-  until they age past `T_grace`. GC honours the ledger today. **Nothing
-  writes it**, because there is no repack.
-- **Dropped index and manifest refs get the same ledger.** Consolidation
-  merges several refs into one and stops listing the inputs, and the
-  superblock backup's in-flight manifest segment is superseded the instant
-  the seal completes. In both cases the object is still named by a
-  generation that is no longer *addressable*, so nothing the sweep can
-  enumerate speaks for it. Publish records the dropped refs in
-  `condemned_indexes` / `condemned_manifests` as (name, condemned-at),
-  carries them forward until they age past `T_grace`, and GC counts a
-  young entry as live. **The window is `T_grace`, not forever**: a reader
-  pinned to a generation whose refs were condemned longer ago than that
-  still loses them — an index costs it the trailer fallback, a manifest
-  costs it the generation, because the manifest *is* that generation's
-  pack list. Tag to pin past the window.
-- **Retained packs** = the union over every ref head and every tag of
-  (pack list + condemned entries younger than `T_grace`). No catalog
-  walking is needed for deletion safety — the pack list *is* the reachable
-  closure at pack granularity. `T_grace` defaults to 72h, is recorded in
-  the superblock `Params` so writers, readers and GC agree, and is
-  configurable per volume.
-- **Sweep** = delete packs that are (a) absent from the retained union AND
-  (b) older than `T_grace` by the timestamp in the pack name. Guard (b) is
-  what makes GC safe to run concurrently with writers, with no locking: a
-  writer's new packs are always younger than `T_grace`, so they are never
-  candidates regardless of when GC listed the refs. GC re-lists refs
-  immediately before issuing deletes as a cheap window-narrower, not a
-  correctness requirement. It **fails closed**: any unverifiable ref or
-  tag aborts the sweep, as does finding no refs and no tags at all.
-- **Granularity:** whole packs and ref debris only — never entries, which
-  would be repack's job. Deleting a branch or tag is how space is actually
-  released.
+Deleting is the only operation in this format that can lose data, and it is
+the only one that must decide about an object using information that is not
+in front of it. Everything else is additive.
+
+A sweep can enumerate exactly two things: **branch heads and tags**. That
+is not a simplification, it is the shape of the format. A retired
+generation — one that was the head and no longer is — is addressable only
+by its content hash, and nothing lists those hashes. So the question "is
+this object still needed?" cannot be answered by walking the volume's
+history, because the volume's history is not walkable.
+
+Three kinds of reader can still need an object that no enumerable
+generation names:
+
+  - A mount that read the head an hour ago and is still serving from it.
+    It resolves packs LAZILY over the whole session, so it is still
+    fetching objects named by a generation that has since been superseded.
+  - A mount part-way through starting up: it has the superblock and has not
+    yet fetched the manifest segments it names.
+  - A publish or a repack, which reads a head, computes for a while, and
+    then acts on it.
+
+### Why not just delete
+
+**Immediate deletion loses.** A seal that deleted the segments it merged
+away would break every reader still holding the generation that named them,
+with no window at all — and the mount case above is not exotic, it is the
+default state of every reader between checkpoints. Worse, it makes an
+interrupted writer destructive: a publish that deletes as it goes and then
+dies has already taken things away.
+
+**Rewrite-in-place loses** for the reasons under "One shape or the other":
+a mutable manifest is a second `refs/main`, and truncated cached reads of a
+megabyte-scale mutable object look like plausible data.
+
+So: **condemn, then collect.** A writer never deletes. It stops LISTING
+things, and it records what it stopped listing and when. A separate,
+unprivileged, restartable sweep does the deleting, later, on evidence.
+
+### The three things that keep an object alive
+
+An object survives a sweep if ANY of these holds. They are independent on
+purpose — each covers a case the others cannot see.
+
+1. **A live superblock names it.** The union, over every branch head and
+   every tag, of the pack set (inline, or resolved through the manifest
+   segments) plus the index refs and manifest refs. This is the whole of
+   ordinary liveness.
+
+2. **It is too young to judge.** A pack is skipped if the timestamp in its
+   own NAME is inside the grace window; an index or manifest is skipped if
+   its MTIME is. This guard is what makes the sweep safe against live
+   writers with **no coordination at all**: a writer's new objects are
+   always young, and there is always a window between "publish uploaded
+   this segment" and "publish flipped the ref" in which a live object
+   exists that no live superblock names. An object whose age cannot be
+   established is KEPT — keeping garbage costs bytes, deleting a live
+   segment costs a mount.
+
+3. **A condemned ledger names it, inside the window.** Three ledgers, one
+   per key space, each a list of `(name, condemned-at)`:
+   `Condemned` for packs, `CondemnedIndexes` and `CondemnedManifests` for
+   derived refs. A writer adds a row when it stops listing something; every
+   later generation carries the row forward until it ages past `T_grace`,
+   and the sweep counts a young row as live.
+
+Rule 3 is the interesting one, and it exists because rules 1 and 2 have a
+gap between them: an object that WAS named for a long time and then stopped
+being named is too old for rule 2 and no longer covered by rule 1, while
+readers pinned to the generation that named it are still reading.
+
+The ledger has **one rule and two writers**, deliberately in one place
+(`superblock/condemn.go`), because it previously had two implementations
+that disagreed:
+
+  - **Listed wins.** A name the generation still lists is never condemned,
+    whatever the parent said. These objects are content-addressed, so a
+    name that reappears is the same bytes. (Without this, a repack that
+    rebuilt a manifest into identical bytes condemned the very segment its
+    own superblock was listing.)
+  - **First timestamp wins.** A row already on the ledger keeps its
+    original `condemned-at`. Refreshing it would restart the clock every
+    seal and the row would never age off.
+  - **Aged rows fall off.** Past `T_grace` a row stops being carried;
+    retention has already stopped honouring it.
+  - **The ledger is capped**, which is the subject of "What the cap costs"
+    below.
+
+### The sweep
+
+**Retained** = the union over every branch head and every tag of (pack set
++ index refs + manifest refs + ledger rows younger than `T_grace`).
+**Delete** an object that is absent from that union AND older than the
+window by its own clock. Then:
+
+- **Granularity is whole objects.** Never entries — that is repack's job.
+  Deleting a branch or a tag is how space is actually released.
+- **It re-lists refs immediately before deleting**, as a cheap
+  window-narrower. Not a correctness requirement: the age guard already
+  covers coordination-free safety, and a mid-sweep fork's closure is
+  ref-reachable.
+- **It fails closed.** Any ref or tag that cannot be fetched and verified
+  aborts the sweep, as does finding no refs and no tags at all. An
+  unreadable MANIFEST counts as an unreadable superblock: a generation
+  whose pack set is unknown retains nothing, and acting on that would
+  delete the volume.
 - **Who runs it:** `pelfs gc`, which needs no lease and reports without
   `--delete`.
-- **The reader contract:** a reader pinned to an untagged generation older
-  than `T_grace` may see "snapshot expired — refresh or remount". A
-  workflow that needs a longer pin tags first; tags pin exactly and
-  indefinitely. Nothing raises that error today; the grace window is
-  enforced only from the sweep side.
+
+### The life of one pack, cut to collected
+
+1. A seal cuts pack `p-<ts>-<rand>` and uploads it. It is immutable
+   forever. Nothing else in the volume will ever be written to it.
+2. The seal's manifest segment names it; the superblock names the segment;
+   the ref flips. Now rule 1 covers it. Between the upload and the flip,
+   rule 2 covered it.
+3. Generations pass. Each one carries the segment ref forward, or
+   consolidates it into a larger segment that still names the pack — a
+   merge is a union, so **every pack a superseded segment named is named by
+   the segment that replaced it.** This is why condemning a manifest needs
+   no matching rescue of its packs. (If a future repack ever TRIMS a
+   segment instead of merging it, the trimmed packs must go onto the pack
+   ledger in the same change.)
+4. The file that referenced it is rewritten. The pack is now mostly dead
+   bytes, but it is still named, so it is still live. Nothing notices.
+5. `pelfs repack` sweeps reachability, finds the pack under the liveness
+   threshold and older than the grace window, copies its surviving entries
+   STORED into a new pack, rewrites the manifest without it, and publishes
+   a generation that puts the pack on the `Condemned` ledger. Rule 1 no
+   longer covers it; rule 3 does. Rule 2 does not — a repack only ever
+   condemns packs already older than the window.
+6. Every ordinary seal for the next `T_grace` carries the row forward.
+   Readers still pinned to the pre-repack generation keep reading the pack.
+7. The row ages off. The next `pelfs gc --delete` finds a pack that no live
+   superblock names and whose name dates it past the cutoff, and deletes
+   it.
+
+Step 6 is where this design was actually broken, and it is worth saying so
+plainly: publish built each superblock fresh and never mentioned
+`Condemned`, so the first ordinary checkpoint after a repack dropped the
+whole ledger. The window a repack promised was not 72 hours, it was one
+checkpoint interval — five minutes. The existing end-to-end test missed it
+by construction, sweeping immediately after the repack with no seal in
+between.
+
+### What the cap costs, honestly
+
+Each ledger holds at most 512 rows, and rows past that are dropped
+oldest-first. The bound is not tidiness: **ledger growth is checkpoint-rate
+times grace window and does not depend on volume size at all.** A
+consolidating seal condemns about one ref per key space every time, whether
+the volume holds ten files or a hundred million. At the defaults — a
+checkpoint every five minutes, a 72-hour window — that is 864 rows and ~82
+KB per key space on an EMPTY volume; at `--snapshot-interval 1m` it is
+4,320 rows per space, which crosses the 1 MiB read cap and bricks the
+volume in about three days of ordinary operation.
+
+512 rows fills in about 43 hours at the default interval. **So the cap
+binds before the 72-hour window it is protecting closes**, and the honest
+question is who that hurts.
+
+**For the derived-ref ledgers, almost nobody, and this is the arithmetic
+rather than a hope.** A ledger row is worth exactly the gap between when an
+object was WRITTEN and when it stopped being named, because rule 2 already
+protects every hash-named object for the full window from its own mtime. In
+the steady state a seal's segment is merged into the tier behind it within
+one checkpoint, so that gap — and therefore the row's entire marginal value
+— is one checkpoint interval. The rows the cap drops are the oldest, whose
+objects are correspondingly old, so dropping them advances collection by
+that same interval and no more. A row is only genuinely load-bearing when
+an object stayed listed for a long time before being merged away, which
+happens to the large frozen tiers — and those rows are the NEWEST, so the
+cap does not reach them.
+
+Two changes make that argument true rather than merely likely. A seal no
+longer spends a row on the segment it created and merged away in the same
+seal, which no generation ever named and which nothing can be pinned to;
+that halved the growth rate. And the diff is taken against the parent's
+list, which is the honest statement of what the ledger means: objects that
+stopped being named by an addressable generation.
+
+**For the pack ledger, the cap would have cost the whole window**, and the
+answer is different. A repacked-away pack is old by its own name, so rule 2
+has nothing left to give and the row is the entirety of its protection.
+Nothing bounded how many packs a plan could condemn, so a volume with more
+than 512 mostly-dead packs published a generation that condemned them all
+and protected 512 — and the rest went on the next sweep while readers
+pinned to the pre-repack generation were still resolving chunks out of
+them.
+
+Raising the cap is not the fix: the three ledgers share a byte budget with
+everything else in the superblock, and two of them grow with checkpoint
+rate and are unbounded in time. What CAN move is the size of one run. A
+repack is resumable by construction — every run re-sweeps and re-plans — so
+**a plan larger than the ledger is not a failure, it is two runs**: take
+what fits (largest reclaim first, so the bytes come back soonest), let the
+window pass, `gc`, and the rows age off and give the room back. The writer
+that builds the ledger refuses outright if a plan ever reaches it unpaced,
+because the cost of being wrong there is deleted data and the cost of
+refusing is the rewriting, which is unreferenced garbage a sweep collects.
+
+So the promise this format actually makes, stated so it can be disagreed
+with:
+
+> An object that a generation stopped naming is kept for `T_grace` from
+> that moment, EXCEPT that on the two derived-ref ledgers a very fast
+> checkpoint cadence can shorten that to the last 512 checkpoints — which
+> costs a dropped object one checkpoint interval of life, not the window.
+> Packs are never shortened; a repack paces itself instead.
+
+### The limits to admit
+
+- **`T_grace` is a window, not a pin, and it is hardcoded at 72 hours.**
+  It is recorded in `Params.TGraceSeconds` so writers, readers and GC agree
+  on the same number, and `pelfs gc --grace` may only WIDEN it — an option
+  that could narrow it would be an option to delete a concurrent writer's
+  packs. There is no per-volume knob to set it, and the superblock field is
+  written from a compiled-in constant.
+- **A workflow that needs a longer pin must TAG.** Tags pin exactly and
+  indefinitely, and they are the only thing that does. A reader pinned to
+  an untagged generation older than the window may lose it: an index costs
+  that reader the trailer fallback (slow), a manifest costs it the
+  generation (unreadable, and the packs it alone named go on the sweep
+  after).
+- **`Params.RetainK` is recorded and unenforced.** Nothing reads it. The
+  live set is head-plus-tags and nothing else; "the last K generations" is
+  not implemented anywhere, and this document previously implied it was.
+- **The "snapshot expired" reader error does not exist.** The window is
+  enforced from the sweep side only. A reader that loses a generation this
+  way finds out by failing to fetch something.
+- **Tag creation has no command.** `refs.Store.Tag` exists and works;
+  nothing user-facing calls it. Until that ships, the only pin the format
+  offers is one no user can create, which makes the two bullets above worse
+  than they read.
 
 ## Codec marking
 
@@ -1455,10 +1796,12 @@ the Linux 6.6 corpus, cheapest first:
    unchanged while later packs were appended, or a repack that reorders
    the list) the probe budget ran out and the mount resolved the whole
    map: 1001 GETs and 125 MiB at 1002 packs, at mount.
-2. **Record each catalog's pack.** SHIPPED, as the hints on
-   `CatalogEntry`, and measured LOW value on top of (1) exactly as
-   predicted — publish already writes catalogs at the end of a seal, so
-   it buys determinism rather than requests.
+2. **Record each catalog's pack.** NOT SHIPPED, and not planned:
+   measured LOW value on top of (1) exactly as predicted, since publish
+   already writes catalogs at the end of a seal, so it would buy
+   determinism rather than requests. `CatalogEntry` carries no location
+   fields, and adding them would recouple identity to location for a
+   whole list that a single repack invalidates wholesale.
 3. **A per-generation location index.** SHIPPED, and not in the shape
    described here. The measurement was right about the cost — what forces
    a mount into resolving the whole map is a CHUNK in an old pack, and no
@@ -1626,3 +1969,69 @@ This was the bridge design for a runtime that could not read catalogs
 directly. The resolver reads them natively and descends lazily, so
 hydration was deleted rather than tuned; a cold 1M-entry walk is ~1.5 s
 without it.
+
+## Appendix C: post-mortems
+
+Kept out of the sections they belong to, because a design document should
+say what is true, not how we found out.
+
+### The direct-read requirement that lived in its callers
+
+The superblock and the advisory lease are the only objects that must be
+read past a federation cache. Because that is only two objects, the
+requirement was originally satisfied at each call site — and an audit
+found three of four `refs.New` callers passing a cache-served store,
+including the mount itself.
+
+The symptom on a real federation was not a stale read. It was an md5
+mismatch on `refs/main`: a cache that mis-reports object length returns a
+truncated body, so a caching bug arrived disguised as corruption. The
+invariant now lives inside `refs.New` and `lease.Acquire`, which switch
+any store they are handed to its direct variant, unwrapping decorators to
+find the transport.
+
+Rule of thumb, since it generalizes: an invariant that holds for exactly
+the objects one package owns belongs inside that package, not in its
+callers' heads.
+
+### The condemned ledger that no seal carried
+
+`Condemned` is a repack's record of the packs it dropped from the pack
+list, and retention keeps a pack alive while a young row names it. Publish
+built each superblock as a fresh struct and never mentioned the field, so
+the first ordinary checkpoint after a repack published a generation with
+an empty ledger.
+
+The consequence was not a lost log line. A repacked-away pack is named by
+no live superblock AND is old by its own name, which is exactly the pair
+of conditions the sweep deletes on — and the age guard that protects a
+young pack cannot help, because a repack only ever condemns old ones. The
+72-hour window a repack promises a pinned reader ran until the next
+checkpoint: five minutes at the default interval. Since a mount resolves
+packs lazily over its whole session, the loss would have arrived as EIO on
+content nobody had touched.
+
+The end-to-end test that covers this loop missed it by construction: it
+swept immediately after the repack, with no seal in between. The general
+lesson is the one that produced the interleaving suite — a test that fixes
+an order can only find bugs that are not about order.
+
+### The size guard that measured the wrong document
+
+Two individually correct changes met and refused a first ingest of about
+12 GB. The write budget refuses to flip a superblock past half the 1 MiB
+read cap, and it was applied to every superblock a seal built; separately,
+the disaster-recovery backup stopped buying a manifest segment of its own
+and began stating its packs inline.
+
+The backup grows at ~90 bytes per pack while the head, which states its
+packs through manifest refs, stays near a kilobyte forever. Past ~6,000
+packs the backup crossed the budget and the seal failed — head 1,106
+bytes, backup 527,801 — with an error naming a pack list that is not in
+the document anyone mounts.
+
+The budget exists because `refs/<branch>` and `tags/<name>` are read
+through the cap. The backup is an entry inside a pack, with no cap
+anywhere on its path. A bound is only meaningful against the constraint
+that produced it, and copying it onto a document that does not face that
+constraint is not caution.

@@ -23,13 +23,22 @@ import (
 	"github.com/bbockelm/pelfs/internal/superblock"
 )
 
-// TestBigTreeSealCost is the measurement rig for "a one-file change must
-// not cost whole-tree work". It builds a tree shaped like a source
-// checkout (tens of thousands of inodes, most files small enough to live
-// inline in a catalog, which is what drives catalog COUNT), seals it,
-// reopens over the sealed generation the way a fresh mount does, touches
-// exactly one file, and seals again — reporting wall time, CPU, bytes
-// moved, and catalogs written for each phase.
+// TestBigTreeSealCost is the gate for "a one-file change must not cost
+// whole-tree work". It builds a tree shaped like a source checkout (tens
+// of thousands of inodes, most files small enough to live inline in a
+// catalog, which is what drives catalog COUNT), seals it, reopens over
+// the sealed generation the way a fresh mount does, touches exactly one
+// file, and seals again — reporting wall time, CPU, bytes moved, and
+// catalogs written for each phase.
+//
+// It reports those numbers AND holds them to a bound. For a long time it
+// only reported: it stated the claim in this comment and then t.Logf'd,
+// so a regression that made every seal rewrite the whole namespace would
+// have printed larger numbers and passed. Phase 5 exists to make the
+// bound checkable — it dirties every inode without staging a byte, so
+// what it costs IS whole-tree catalog construction, and the one-file
+// phases are measured against it. See sealCostBounds below for the
+// numbers and the headroom.
 //
 // It is skipped unless PELFS_BIGSEAL is set: the fixture alone is minutes
 // of work, which does not belong in the ordinary test run.
@@ -67,7 +76,11 @@ func TestBigTreeSealCost(t *testing.T) {
 	t.Logf("fixture: %d files in %d directories, built in %s",
 		files, len(dirs), time.Since(start).Round(time.Millisecond))
 
+	// What each phase cost, so the bound below compares measurements
+	// rather than restating the claim.
+	cost := map[string]publish.Stats{}
 	head = timedSeal(t, "initial seal", inner, ov, head, priv, index, "")
+	cost["initial"] = head.Stats
 
 	for phase := 2; phase <= 5; phase++ {
 		_ = ov.Close()
@@ -89,12 +102,14 @@ func TestBigTreeSealCost(t *testing.T) {
 		switch phase {
 		case 2:
 			head = timedSeal(t, "unchanged seal", inner, ov, head, priv, index, "")
+			cost["unchanged"] = head.Stats
 		case 3:
 			if _, err := ov.Create(ctx, 1, "no.txt", 0644, 0, 0); err != nil {
 				t.Fatalf("create no.txt: %v", err)
 			}
 			head = timedSeal(t, "one-file seal (root)", inner, ov, head, priv, index,
 				os.Getenv("PELFS_BIGSEAL_CPUPROFILE"))
+			cost["onefile-root"] = head.Stats
 		case 4:
 			// A change deep in the tree, which is the ordinary case: one
 			// leaf directory's catalog plus the chain to the root.
@@ -114,6 +129,7 @@ func TestBigTreeSealCost(t *testing.T) {
 				t.Fatalf("write deep.txt: %v", err)
 			}
 			head = timedSeal(t, "one-file seal (deep)", inner, ov, head, priv, index, "")
+			cost["onefile-deep"] = head.Stats
 		case 5:
 			// The untar shape: every inode dirty, no byte of content new.
 			// Whatever this seal costs is catalog construction and nothing
@@ -125,13 +141,110 @@ func TestBigTreeSealCost(t *testing.T) {
 			t.Logf("dirtied %d inodes in %s", n, time.Since(start).Round(time.Millisecond))
 			head = timedSeal(t, "whole-tree seal (no new content)", inner, ov, head, priv, index,
 				os.Getenv("PELFS_BIGSEAL_WHOLETREE_CPUPROFILE"))
+			cost["wholetree"] = head.Stats
 		}
 	}
 	_ = ov.Close()
 	_ = gfs.Close()
 
+	sealCostBounds(t, cost)
+
 	// The generation every phase built on must still read back whole.
 	verifyBigTree(t, inner, head.Superblock, dirs)
+}
+
+// sealCostBounds holds the phases to the claim the test is named for.
+//
+// Measured 2026-08-19 at the default 20,000 files / 16 per directory
+// (1,250 leaf directories, 12 catalogs in the sealed namespace):
+//
+//	phase             catalogs written  reused  dirs walked  subtrees pruned
+//	initial                         12       0         1286                0
+//	unchanged                        0      12          890               11
+//	one-file (root)                  1      11          890               11
+//	one-file (deep)                  2      10          926               10
+//	whole-tree                      12       0         1286                0
+//
+// The bounds below sit at roughly 2x the measured values, which is loose
+// enough to survive a catalog-splitting tweak and tight enough that
+// losing reuse entirely — the regression worth catching, where a one-file
+// seal rewrites all 12 — fails every one of them.
+func sealCostBounds(t *testing.T, cost map[string]publish.Stats) {
+	t.Helper()
+	whole, ok := cost["wholetree"]
+	if !ok {
+		t.Fatal("no whole-tree seal was recorded; there is nothing to bound against")
+	}
+
+	// The comparison is only meaningful if the fixture actually splits
+	// into several catalogs. Below about 8,000 files the whole namespace
+	// is ONE catalog, every phase writes it, and every ratio below is
+	// trivially 1 — a bound that cannot fail. Say so instead of passing:
+	// a gate that silently stops discriminating is the failure mode this
+	// assertion was added to end.
+	if whole.Catalogs < 4 {
+		t.Fatalf("fixture too small to bound anything: the whole-tree seal wrote %d catalogs, "+
+			"so a one-file seal cannot write measurably fewer. Raise PELFS_BIGSEAL_FILES "+
+			"(20000 splits into 12).", whole.Catalogs)
+	}
+	// And the whole-tree phase must really have done whole-tree work,
+	// or it is the wrong yardstick.
+	if whole.CatalogsReused != 0 || whole.SubtreesPruned != 0 {
+		t.Fatalf("the whole-tree seal reused %d catalogs and pruned %d subtrees; "+
+			"it did not do whole-tree work, so it cannot serve as the bound",
+			whole.CatalogsReused, whole.SubtreesPruned)
+	}
+
+	// A seal over an unchanged tree must write no catalog at all. This is
+	// the strongest of the three and needs no ratio.
+	if unch, ok := cost["unchanged"]; ok {
+		if unch.Catalogs != 0 {
+			t.Errorf("a seal over an UNCHANGED tree wrote %d catalogs; it must reuse all %d",
+				unch.Catalogs, whole.Catalogs)
+		}
+		if unch.CatalogsReused != whole.Catalogs {
+			t.Errorf("a seal over an unchanged tree reused %d of %d catalogs",
+				unch.CatalogsReused, whole.Catalogs)
+		}
+	}
+
+	// The claim itself: one changed file costs a chain to the root, not
+	// the namespace. Measured 1 and 2 catalogs of 12; the bound is a
+	// third, and it does not scale with tree size — the fan-out is two
+	// levels deep however many files hang off it, while the whole-tree
+	// number grows.
+	limit := whole.Catalogs / 3
+	if limit < 1 {
+		limit = 1
+	}
+	for _, phase := range []string{"onefile-root", "onefile-deep"} {
+		one, ok := cost[phase]
+		if !ok {
+			t.Fatalf("no %q seal was recorded", phase)
+		}
+		if one.Catalogs > limit {
+			t.Errorf("%s: wrote %d catalogs, want <= %d — a one-file change is costing "+
+				"whole-tree work (the whole-tree seal writes %d)",
+				phase, one.Catalogs, limit, whole.Catalogs)
+		}
+		// Reuse is the other half of the same fact, and it fails
+		// differently: a seal could write few catalogs because it
+		// DROPPED the rest rather than carrying them forward.
+		if want := whole.Catalogs - limit; one.CatalogsReused < want {
+			t.Errorf("%s: reused %d catalogs, want >= %d of %d",
+				phase, one.CatalogsReused, want, whole.Catalogs)
+		}
+		// And the walk must stop at the subtrees it is carrying forward,
+		// which is the difference between "did not rewrite the tree" and
+		// "did not look at the tree".
+		if one.SubtreesPruned == 0 {
+			t.Errorf("%s: pruned no subtrees, so the seal read the whole namespace "+
+				"even though it rewrote almost none of it", phase)
+		}
+	}
+	t.Logf("seal cost bound: one-file writes %d/%d and %d/%d catalogs against a whole-tree %d",
+		cost["onefile-root"].Catalogs, whole.Catalogs,
+		cost["onefile-deep"].Catalogs, whole.Catalogs, whole.Catalogs)
 }
 
 // chmodTree touches the mode of every inode below root, which dirties the

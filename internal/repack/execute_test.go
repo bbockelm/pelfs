@@ -247,7 +247,16 @@ func TestSuperblockBackupsSurviveARepack(t *testing.T) {
 	}
 	was := backupsIn(head)
 	if was == 0 {
-		t.Skip("this fixture published no superblock backups")
+		// Not a skip. The whole test is "a repack must not drop the
+		// disaster-recovery copy", and with no backup in the fixture there
+		// is nothing to drop — so the skip made the test vacate ITSELF the
+		// moment the fixture stopped publishing backups, which is exactly
+		// when this coverage would be needed and exactly when nobody would
+		// notice it was gone. If the fixture legitimately changes, this
+		// test needs a new one, and the failure is how that gets decided.
+		t.Fatalf("the fixture published no superblock backups, so this test would "+
+			"verify nothing: rewrittenVolume must produce at least one %v entry",
+			packstore.EntrySuperblock)
 	}
 
 	rstore, err := refs.New(inner, t.TempDir(), nil)
@@ -440,4 +449,59 @@ func TestPartlyLivePacksHaveTheirSurvivorsCarried(t *testing.T) {
 	}
 	t.Logf("fsck deep: %d chunks verified; %d index refs (was %d)",
 		rep.ChunksVerified, len(f.Superblock.PackIndexes), len(head.PackIndexes))
+}
+
+// The cheap gate is only cheap because the state it reads is maintained.
+// A repack must stamp it, and every ordinary publish afterwards must
+// carry it forward — a seal that dropped it would make the volume look
+// like one that had never been repacked, and it would sweep again on the
+// next tick.
+func TestARepackStampsMaintenanceStateAndSealsCarryIt(t *testing.T) {
+	inner, v, head, _ := rewrittenVolume(t, "ffff1111-2222-3333-4444-555555555555")
+	ctx := context.Background()
+	if head.Maint != nil {
+		t.Fatal("an ordinary seal invented maintenance state")
+	}
+
+	rstore, err := refs.New(inner, t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := repack.Execute(ctx, repack.ExecOptions{
+		Options: repack.Options{
+			Inner: inner, Live: []*superblock.Superblock{head}, Head: head,
+			CacheDir: t.TempDir(), Workers: 4, Now: time.Now().Add(aged),
+		},
+		Refs: rstore, Branch: "main", SigningKey: v.SigningKey(), SpoolDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	f, err := rstore.Fetch(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := f.Superblock.Maint
+	if m == nil {
+		t.Fatal("the repack published no maintenance state; the auto gate would sweep again immediately")
+	}
+	if m.RepackGeneration != res.Generation {
+		t.Errorf("maintenance state names generation %d, the repack published %d", m.RepackGeneration, res.Generation)
+	}
+	if m.RepackUnixNano == 0 {
+		t.Error("maintenance state carries no timestamp; the interval floor cannot be applied")
+	}
+	if int(m.RepackPacks) != len(packsOf(t, inner, f.Superblock)) {
+		t.Errorf("maintenance state records %d packs, the generation holds %d",
+			m.RepackPacks, len(packsOf(t, inner, f.Superblock)))
+	}
+	// And the gate now says so, from the head alone.
+	if worth, why := repack.Worthwhile(f.Superblock, repack.AutoPolicy{}); worth {
+		t.Errorf("a volume repacked a moment ago is still worth sweeping: %s", why)
+	}
+
+	// That an ordinary seal carries this forward is asserted in
+	// internal/publish, where a two-generation fixture already exists:
+	// this volume handle is pinned to the generation the repack
+	// superseded, so it cannot publish on top of it.
 }

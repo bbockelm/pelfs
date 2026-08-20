@@ -35,6 +35,44 @@ type mountInfo struct {
 	Started  time.Time `json:"started"`
 }
 
+// daemonLogCap is the size at which daemon.log is rolled aside. It is the
+// mount's only voice — checkpoint-failure warnings land nowhere else — so
+// it must survive a long absence, and it lives in a state dir a user is
+// entitled to assume does not grow without end.
+//
+// 10 MiB is where those two meet. A checkpoint failing every 5 minutes
+// writes on the order of 40 KB a day, so a cap of 10 MiB holds most of a
+// year of the worst case pelfs has, while two generations of it are a
+// rounding error beside the 4 GiB pack cache in the same directory.
+const daemonLogCap = 10 << 20
+
+// openDaemonLog opens <dir>/daemon.log as the detached daemon's stdout and
+// stderr, rolling the existing log aside first if it has reached the cap.
+//
+// One generation of history, bounded at 2x the cap, and the whole policy
+// runs at open: a mount that is already running owns its descriptor, and
+// renaming the file under it would neither free the bytes nor move the
+// writer. That leaves a single session able to exceed the cap, which is
+// the right trade for a single-user tool — a session that talkative is a
+// bug to read, not a file to truncate — and every remount collects it.
+func openDaemonLog(dir string) (*os.File, string, error) {
+	path := filepath.Join(dir, "daemon.log")
+	if fi, err := os.Stat(path); err == nil && fi.Size() >= daemonLogCap {
+		// The .1 this replaces belongs to the mount before last. Rotation
+		// is best-effort: failing to rename is no reason to refuse to
+		// mount, but the user should know their log is about to be longer
+		// than they were promised.
+		if err := os.Rename(path, path+".1"); err != nil {
+			ui.Warn("could not rotate {log} ({error}); it will keep growing", "log", path, "error", err)
+		}
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		return nil, path, err
+	}
+	return f, path, nil
+}
+
 func stateRoot() string {
 	if d := os.Getenv("XDG_STATE_HOME"); d != "" {
 		return filepath.Join(d, "pelfs")
@@ -101,8 +139,7 @@ func cmdMount(args []string) int {
 	if err != nil {
 		return exitErr(err)
 	}
-	logPath := filepath.Join(dir, "daemon.log")
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	logFile, logPath, err := openDaemonLog(dir)
 	if err != nil {
 		return exitErr(err)
 	}

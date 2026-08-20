@@ -150,9 +150,9 @@ func (p *pipeline) sealManifests(ctx context.Context, newPacks []packstore.Seale
 	// retain window names those segments, and a segment swept out from
 	// under it leaves it unable to state its own pack set. See
 	// condemnedrefs.go, including what the ledger still does not fix.
-	before := carryForward(p.prevManifests(), ref)
-	after := consolidate(ctx, before, "pack manifest", p.mergeManifests)
-	p.droppedManifests = append(p.droppedManifests, droppedRefs(before, after)...)
+	prev := p.prevManifests()
+	after := consolidate(ctx, carryForward(prev, ref), "pack manifest", p.mergeManifests)
+	p.droppedManifests = append(p.droppedManifests, droppedRefs(prev, after)...)
 	return after, nil
 }
 

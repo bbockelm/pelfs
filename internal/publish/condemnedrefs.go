@@ -36,6 +36,18 @@ import (
 // caller does not have to be told what a merge consumed, it can see what
 // stopped being listed, which is the property that actually matters to
 // retention.
+//
+// `before` IS THE PARENT'S LIST, not the parent's plus this seal's own new
+// ref, and the difference is a ledger row per seal. A ledger entry buys an
+// object protection from the moment it stops being named until the grace
+// window closes; retention's age guard already keeps every hash-named
+// object for that same window from the moment it was WRITTEN
+// (retention.scanHashNamed). So an entry is worth exactly the gap between
+// those two instants, and for the segment a seal both uploads and
+// immediately merges away that gap is zero: no published generation ever
+// named it, and its own mtime protects it for longer than the entry would.
+// Charging the ledger for it halved the time a fast-checkpointing mount
+// took to reach the cap, in exchange for nothing.
 func droppedRefs[T sizedRef](before, after []T) []string {
 	if len(before) == 0 {
 		return nil

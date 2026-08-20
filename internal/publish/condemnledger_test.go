@@ -3,6 +3,7 @@ package publish_test
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -72,4 +73,53 @@ func TestASealCarriesTheCondemnedPackLedgerForward(t *testing.T) {
 		}
 	}
 	v.verifyBodies(next, body)
+}
+
+// INVARIANT: a ledger row is only ever spent on an object some published
+// generation named.
+//
+// The ledger buys an object protection from the moment it stops being
+// named until the grace window closes. Retention already keeps every
+// hash-named object for that same window from its own mtime, so a row is
+// worth exactly the gap between those two instants — and for the segment a
+// seal uploads and consolidation merges away within the same seal, that gap
+// is zero: no generation ever named it, and nothing can be pinned to it.
+//
+// This is the growth rate that decides when the cap bites. Charging for the
+// in-flight segment doubled it, which halved the time a fast-checkpointing
+// mount took to reach the cap, in exchange for protecting nothing.
+func TestASealSpendsALedgerRowOnlyOnObjectsAGenerationNamed(t *testing.T) {
+	v := newReuseVol(t, [16]byte{0xc0, 0x11, 0x02})
+	const seals = 6
+
+	// Every manifest name any head has ever listed. A ledger entry naming
+	// anything outside this set is a row bought for an object no reader
+	// could have been pinned to.
+	everListed := map[string]bool{}
+	for _, ref := range v.head.Superblock.Manifests {
+		everListed[ref.Name] = true
+	}
+
+	var head = v.head
+	for i := range seals {
+		v.create(publishRootInode, fmt.Sprintf("f%d.bin", i), pseudorandom(256<<10, int64(i)))
+		head = v.checkpoint()
+		for _, c := range head.Superblock.CondemnedManifests {
+			if !everListed[c.Name] {
+				t.Errorf("seal %d condemned manifest %s, which no generation ever listed: the seal created "+
+					"it and merged it away itself, so the row protects an object nothing can be pinned to "+
+					"and only brings the ledger cap forward", i, c.Name[:12])
+			}
+		}
+		for _, ref := range head.Superblock.Manifests {
+			everListed[ref.Name] = true
+		}
+	}
+
+	// And the rate that follows from it: at most one row per seal per key
+	// space, because a seal stops listing only what its parent listed.
+	if got := len(head.Superblock.CondemnedManifests); got > seals {
+		t.Errorf("%d seals left %d rows on the condemned-manifest ledger; more than one per seal means the "+
+			"ledger fills in half the time the cap was sized for", seals, got)
+	}
 }

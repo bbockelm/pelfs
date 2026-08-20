@@ -149,9 +149,9 @@ func (p *pipeline) prevCondemnedIndexes() []superblock.CondemnedRef {
 // swept as soon as it ages and those readers quietly lose the index they
 // were promised (condemnedrefs.go).
 func (p *pipeline) sealPackIndexes(ctx context.Context) []superblock.IndexRef {
-	before := carryForward(p.prevPackIndexes(), p.publishPackIndex(ctx))
-	after := consolidate(ctx, before, "pack index", p.mergeIndexes)
-	p.droppedIndexes = append(p.droppedIndexes, droppedRefs(before, after)...)
+	prev := p.prevPackIndexes()
+	after := consolidate(ctx, carryForward(prev, p.publishPackIndex(ctx)), "pack index", p.mergeIndexes)
+	p.droppedIndexes = append(p.droppedIndexes, droppedRefs(prev, after)...)
 	return after
 }
 

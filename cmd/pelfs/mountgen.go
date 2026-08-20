@@ -875,6 +875,7 @@ func (g *genSession) follow(ctx context.Context, r *rawfuse.Refresher, every tim
 func (g *genSession) refresh() {
 	gen := g.gfs.Generation()
 	cache := cacheStats(g.gfs)
+	write := writeStats(g.content)
 	var st overlay.Stats
 	var live bool
 	g.ovMu.RLock()
@@ -887,6 +888,9 @@ func (g *genSession) refresh() {
 	g.stats.Update(func(sum *stats.Summary) {
 		sum.Generation = gen
 		sum.Cache = cache
+		if write != nil {
+			sum.Write = write
+		}
 		if !live {
 			return
 		}
@@ -895,6 +899,28 @@ func (g *genSession) refresh() {
 		sum.OverlayStagedFiles = int64(st.StagedFiles)
 		sum.OverlayStagedBytes = st.StagedBytes
 	})
+}
+
+// writeStats publishes the write path's backpressure counters. They were
+// all being kept and none of them was reachable from a running mount:
+// Store.Stats had one caller, which read one field of it. Without these a
+// session pacing against a slow uplink and a session that has hung are the
+// same observation from outside the process.
+func writeStats(store *memtable.Store) *stats.WriteStats {
+	if store == nil {
+		return nil
+	}
+	st := store.Stats()
+	return &stats.WriteStats{
+		BlockedWrites:  st.BlockedWrites,
+		UploadBacklog:  st.UploadBacklog,
+		RingUsed:       st.RingUsed,
+		RingFree:       st.RingFree,
+		Packs:          st.Packs,
+		UploadedBytes:  st.UploadedBytes,
+		UploadedChunks: st.UploadedChunks,
+		DedupedChunks:  st.DedupedChunks,
+	}
 }
 
 // cacheStats converts what the generation cache reports into the shape

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -1110,5 +1111,60 @@ func TestCheckpointTriggersCoverBothMeters(t *testing.T) {
 			t.Errorf("%s (%d bytes, %d inodes): checkpointDue = %v, want %v",
 				c.what, c.staged, c.nodes, got, c.want)
 		}
+	}
+}
+
+// TestSessionStatsCarryTheWritePath is the monitoring claim behind C5:
+// the write path's counters have to be readable from a RUNNING mount.
+// Every one of them was already being kept, and Store.Stats had exactly
+// one caller reading exactly one field — so from outside the process a
+// session pacing its writes against a slow uplink and a session that had
+// hung produced the same observation, which is none.
+func TestSessionStatsCarryTheWritePath(t *testing.T) {
+	g := newGenSession(t, true)
+	ctx := context.Background()
+	store, err := g.openContent(ctx, false)
+	if err != nil {
+		t.Fatalf("openContent: %v", err)
+	}
+	t.Cleanup(func() { _ = g.closeContent() })
+	c := serve(t, g)
+
+	body := bytes.Repeat([]byte("write path visibility"), 4096)
+	for ino := uint64(100); ino < 110; ino++ {
+		if err := store.Write(ctx, ino, 0, body); err != nil {
+			t.Fatalf("write inode %d: %v", ino, err)
+		}
+	}
+
+	raw, err := c.Do(ctx, "GET", "/v1/stats")
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	var sum stats.Summary
+	if err := json.Unmarshal(raw, &sum); err != nil {
+		t.Fatalf("stats body %s: %v", raw, err)
+	}
+	if sum.Write == nil {
+		t.Fatal("a writable session with a live content store reported no write-path statistics")
+	}
+	// The ring is the leading indicator: a mount whose free space is
+	// falling is a mount that is about to block, and that has to be
+	// visible BEFORE the blocked writes are.
+	if sum.Write.RingUsed < int64(len(body)) {
+		t.Errorf("ring reports %d bytes used after writing %d", sum.Write.RingUsed, 10*len(body))
+	}
+	if sum.Write.RingFree <= 0 {
+		t.Errorf("ring reports %d bytes free; the write buffer is not being read", sum.Write.RingFree)
+	}
+	// And the whole set agrees with the store it came from, which is what
+	// makes the counter a blocked write increments (memtable, tested
+	// there) reachable through this document.
+	st := store.Stats()
+	if sum.Write.BlockedWrites != st.BlockedWrites ||
+		sum.Write.UploadBacklog != st.UploadBacklog ||
+		sum.Write.Packs != st.Packs ||
+		sum.Write.UploadedChunks != st.UploadedChunks {
+		t.Errorf("published write statistics disagree with the store: %+v vs %+v", sum.Write, st)
 	}
 }

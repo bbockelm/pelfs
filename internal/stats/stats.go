@@ -125,6 +125,11 @@ type Summary struct {
 	PrefetchChunks int64 `json:"prefetch_chunks,omitempty"`
 	PrefetchBytes  int64 `json:"prefetch_bytes,omitempty"`
 
+	// Write is the write path's backpressure picture: how far the session
+	// is running ahead of its uplink, and whether that has begun to cost
+	// writers. Nil on a read-only mount.
+	Write *WriteStats `json:"write,omitempty"`
+
 	// Cache is the LOCAL disk this mount is using — decoded chunks,
 	// spilled catalogs, pack trailers, whole packs — against the budget
 	// they are held to. Without it "the disk filled up" was unanswerable
@@ -156,6 +161,32 @@ type Summary struct {
 	// and the final snapshot all succeeded.
 	CleanShutdown bool `json:"clean_shutdown"`
 	ExitCode      int  `json:"exit_code"`
+}
+
+// WriteStats is what the memtable knows about pressure, published so a
+// supervisor — or a person watching a copy get slower — can tell a mount
+// that is pacing against its uplink from a mount that has hung. Every
+// field here was already counted and was reachable from nowhere: Stats
+// had one caller, reading one field.
+type WriteStats struct {
+	// BlockedWrites counts writes that had to wait for the packer. Nonzero
+	// means the session is producing faster than the uplink sends.
+	BlockedWrites int64 `json:"blocked_writes"`
+	// UploadBacklog is bytes cut into packs and not yet sent — the size of
+	// what is behind, where BlockedWrites is only the fact that it is.
+	UploadBacklog int64 `json:"upload_backlog"`
+	// RingUsed and RingFree are the write buffer, the leading indicator
+	// for the two above: a ring at 5% free is about to block.
+	RingUsed int64 `json:"ring_used"`
+	RingFree int64 `json:"ring_free"`
+	// What has actually gone out, for the ratio against the session total.
+	Packs          int64 `json:"packs"`
+	UploadedBytes  int64 `json:"uploaded_bytes"`
+	UploadedChunks int64 `json:"uploaded_chunks"`
+	// DedupedChunks is content the store already had a location for, so it
+	// was neither encoded nor sent — the part of the write that cost
+	// nothing.
+	DedupedChunks int64 `json:"deduped_chunks,omitempty"`
 }
 
 // CacheStats is the local generation cache, per directory, against its

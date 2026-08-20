@@ -163,6 +163,14 @@ type Stats struct {
 	// stays readable — and re-chunkable at seal — without the network.
 	PackReadsLocal  int64
 	PackReadsRemote int64
+	// RingUsed and RingFree are the write buffer itself: how much a writer
+	// may still append before it must wait for the packer. They are the
+	// leading indicator BlockedWrites is the lagging one for — a ring
+	// running at 5% free is a session about to pace against its uplink,
+	// and until both were reportable neither was visible from outside the
+	// process.
+	RingUsed int64
+	RingFree int64
 }
 
 // Store is the write path: one active memtable, at most one flushing
@@ -469,6 +477,11 @@ func (s *Store) appendLocked(ctx context.Context, rec *Record, payload []byte) (
 			// backpressure needs to see it while it is happening.
 			waited = true
 			s.stats.BlockedWrites++
+			// And SAID, once, because a counter nobody reads is not
+			// visibility. A mount whose writes have started pacing against
+			// the uplink looks exactly like a mount that has hung, and
+			// this is the only place that knows the difference.
+			reportBlockedWrite(s.uploads.backlog())
 		}
 		s.cond.Wait()
 		if s.closed {
@@ -723,6 +736,10 @@ func (s *Store) Packs() []packstore.SealedPack {
 func (s *Store) Stats() Stats {
 	s.mu.Lock()
 	st := s.stats
+	if s.ring != nil {
+		st.RingUsed = int64(s.ring.Used())
+		st.RingFree = int64(s.ring.Free())
+	}
 	s.mu.Unlock()
 	st.UploadBacklog = s.uploads.backlog()
 	return st

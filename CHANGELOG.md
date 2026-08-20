@@ -38,6 +38,13 @@ limitations*.
   --delete` can reclaim them.
 - **`pelfs version`**, and `pelfs ctl <prefix> bugreport` for a tarball with
   the build, the stats and every goroutine.
+- **Unprivileged by construction.** One static binary, no root, no setup;
+  state under `$HOME`. The only thing it needs from the host is the ability
+  to open `/dev/fuse`.
+- **Automatic repacking.** A writable mount repacks itself once it has been
+  idle for a while and the branch has drifted since the last one — `git gc
+  --auto`'s shape, where a counter read from the head decides whether to
+  pay for a reachability sweep. `--no-auto-repack` turns it off.
 
 ### Scale
 
@@ -54,11 +61,10 @@ kernel-source-sized: ~90,000 files, ~1.5 GB.
 
 ### Known limitations
 
-- **Reclaiming space is manual, and takes two steps.** Nothing repacks or
-  collects on a schedule. `pelfs repack --apply` rewrites mostly-dead packs
-  and condemns the originals; `pelfs gc --delete` removes them once the
-  grace window (72h, not configurable) has passed. Until both are run, dead
-  content stays on disk — `pelfs repack` with no flags says how much.
+- **Deleting the reclaimed packs is still manual.** A mount repacks on its
+  own, but nothing collects: `pelfs gc --delete` is a separate command, and
+  it only takes packs older than the grace window (72h, not configurable).
+  A volume nobody mounts is never maintained at all.
 - **A repack cannot yet retire index or manifest objects on their own
   account.** Replacing the manifest already drops superseded segments, so
   what is missing is the narrower case of an index whose packs are mostly

@@ -76,6 +76,29 @@ scopes up front.
   mutable objects must never be served stale, while immutable packs keep
   enjoying cache-served reads.
 
+## Unprivileged, on a host you do not own
+
+Build for the target, copy one binary, run it as yourself:
+
+```
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o pelfs ./cmd/pelfs
+scp pelfs worker:~/ && ssh worker './pelfs shell pelican://.../scratch'
+```
+
+No root, no sudo, no package to install, no setup step. State, caches and
+the volume signing key go under `$HOME/.local/state/pelfs`. `make
+unprivileged` gates exactly this: a linux/amd64 binary run in a container
+as uid 1001 with an empty supplementary group set and nothing writable
+outside its scratch, mounting, writing, sealing, re-reading, and then
+running `fsck --deep`, `gc` and `repack`.
+
+The one thing pelfs cannot supply is FUSE itself. It needs to open
+`/dev/fuse`, which is a property of the host — usually mode 0666 and
+usable by anyone, but not on a locked-down machine. When it cannot, the
+error says which of the possible reasons applies and does not send you
+looking for a fallback: on Linux there is none, because the NFS backend
+mounts with `mount(2)` and that needs root.
+
 ## Pure Go, no cgo
 
 Everything builds with `CGO_ENABLED=0` and no build tags. SQLite is
@@ -192,11 +215,12 @@ a count of bytes, a duration a count of nanoseconds).
 - The origin must permit GET/PUT/DELETE and listing on the prefix (i.e. a
   token with read/modify scopes for the namespace); `pelfs` checks this up
   front and says which scope is missing.
-- **Reclaiming space takes two steps, and both are manual.** `pelfs
-  repack --apply` rewrites the packs that are mostly garbage and stops
-  naming the old ones; `pelfs gc --delete` removes them once the grace
-  window (72h) has passed. Neither runs on its own. Until you run them, a
-  pack whose contents are entirely dead stays on disk — `pelfs repack`
-  with no flags reports exactly what that is costing.
+- **Reclaiming space still needs `gc` to be run.** A writable mount
+  repacks by itself when it has been idle for a while and the branch has
+  drifted since the last one (`--no-auto-repack` turns that off), which
+  condemns the mostly-dead packs. Removing them is still a separate,
+  manual `pelfs gc --delete`, and only once the grace window (72h, not
+  configurable) has passed. `pelfs repack` with no flags reports what the
+  volume is currently carrying.
 - Volume **tags cannot be created** yet (they can be read with `--tag`),
   there is no **fork** command, and there is no **key rotation**.

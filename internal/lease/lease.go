@@ -35,6 +35,27 @@ const (
 	// DefaultTTL is how long a lease stays live without renewal.
 	DefaultTTL = 2 * time.Minute
 	opTimeout  = 30 * time.Second
+
+	// stealRetryBackoff is the first pause between a steal's attempts, and
+	// it doubles from there — 100ms, 200ms, 400ms, so a steal that loses
+	// every race still returns inside a second.
+	//
+	// It is a fixed, short quantity ON PURPOSE. It used to be
+	// opts.RenewInterval/2, which is the STEALER's own renew cadence and
+	// has nothing whatever to do with the race being retried: the pause
+	// exists only to let a renewal that is already in flight land before
+	// we write again, and that takes one round trip, not a fraction of an
+	// unrelated timer.
+	//
+	// Tying it to the caller's interval made the wait grow without bound
+	// as the caller renewed less often. At the production default
+	// (RenewInterval = TTL/4 = 30s) a steal that lost one race stalled 15
+	// SECONDS for nothing; in lease_test.go, where slowOpts sets an hour
+	// to keep the renewal loop quiet, it became a THIRTY MINUTE sleep,
+	// which outlived Go's test deadline and hung the package. That is what
+	// took out the unit lane: not a failure, a stall, and the goroutine
+	// dump pointed straight at this select.
+	stealRetryBackoff = 100 * time.Millisecond
 )
 
 // ErrHeld indicates another live client holds the lease.
@@ -144,9 +165,12 @@ func Acquire(ctx context.Context, opts Options) (*Lease, error) {
 	//
 	// A STEAL retries that, because the writer it races is not contesting
 	// the acquisition at all: the current holder rewrites the record every
-	// RenewInterval, so a single attempt loses to routine renewal and
-	// reports a conflict that is not one. Retrying converges quickly,
-	// since the holder's own verify sees our record and stops renewing.
+	// renewal, so a single attempt loses to routine renewal and reports a
+	// conflict that is not one. Retrying converges quickly, since the
+	// holder's own verify sees our record and stops renewing — and each
+	// attempt is an independent race over a window only as wide as our own
+	// write-then-read, so the pause between them is short and fixed
+	// (stealRetryBackoff) rather than a function of anybody's timer.
 	//
 	// A plain acquisition does NOT retry. Losing means another client
 	// acquired the volume, and yielding is the point — two simultaneous
@@ -156,13 +180,15 @@ func Acquire(ctx context.Context, opts Options) (*Lease, error) {
 		attempts = 4
 	}
 	var lost error
+	backoff := stealRetryBackoff
 	for i := 0; i < attempts; i++ {
 		if i > 0 {
 			select {
-			case <-time.After(opts.RenewInterval / 2):
+			case <-time.After(backoff):
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			}
+			backoff *= 2
 		}
 		if err := l.write(ctx); err != nil {
 			return nil, fmt.Errorf("write lease: %w", err)

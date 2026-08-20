@@ -40,8 +40,15 @@ jobs:
       # FAILED seal leaves behind. Every one of them stands up its own
       # httptest fakeorigin and needs nothing but loopback, so the paths
       # closest to a user were being left out of CI for no reason at all.
+      # -timeout well under the job's timeout-minutes, and deliberately
+      # so. A hung package is the failure mode that actually happened
+      # (internal/lease, run 32363030647): a job cap kills the runner and
+      # leaves a red X with no evidence, whereas Go's own deadline panics
+      # with a goroutine dump naming the test and the exact select it is
+      # parked on. That dump is what made the lease bug a ten-minute
+      # diagnosis instead of a hunt. Always let Go's timeout fire first.
       - name: Unit tests
-        run: CGO_ENABLED=0 go test -count=1 ./...
+        run: CGO_ENABLED=0 go test -count=1 -timeout 8m ./...
       - name: Cross-builds (cgo-free)
         run: |
           CGO_ENABLED=0 GOOS=linux  GOARCH=amd64 go build -o /dev/null ./cmd/pelfs
@@ -67,8 +74,12 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26.0"
+      # 20m against a 30m job cap: the race detector makes everything
+      # several times slower, so the per-package deadline is looser than
+      # the unit lane's — but it still fires first, and still hands back a
+      # goroutine dump rather than a killed runner.
       - name: Race detector over the whole tree
-        run: go test -race -count=1 ./...
+        run: go test -race -count=1 -timeout 20m ./...
 
   e2e:
     # The whole user-facing workflow -- create, write, seal, read back,

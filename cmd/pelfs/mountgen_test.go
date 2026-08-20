@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -91,8 +92,11 @@ func newGenSession(t *testing.T, rw bool) *genSession {
 		rw:         rw,
 		overlayDir: filepath.Join(stateDir, "overlay"),
 		statsPath:  filepath.Join(stateDir, "pelfs-stats.json"),
-		sb:         f.Superblock,
-		prevRaw:    f.Raw,
+		// As runMountGen builds it: inert until beginTeardown, so a test
+		// that exercises the exit path gets the same breakdown a user does.
+		down:    &phaseClock{},
+		sb:      f.Superblock,
+		prevRaw: f.Raw,
 	}
 	g.refs = rstore
 	g.stats = stats.New(prefix, g.sessionID, g.statsPath)
@@ -835,6 +839,234 @@ func TestCheckpointFiresUnderWritePressure(t *testing.T) {
 				"only the hour-long timer could publish it", staged, nodes)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// gatePutsOn holds every Put whose key starts with a prefix until release
+// is closed, and announces the first one it holds. It is how a test puts
+// a checkpoint genuinely IN FLIGHT — parked inside sealLocked with the
+// seal lock held — instead of hoping to catch one by timing.
+type gatePutsOn struct {
+	pelicanobj.Store
+	prefix  string
+	once    sync.Once
+	held    chan struct{}
+	release chan struct{}
+}
+
+func (g *gatePutsOn) Put(ctx context.Context, key string, r io.Reader) error {
+	if strings.HasPrefix(key, g.prefix) {
+		g.once.Do(func() { close(g.held) })
+		<-g.release
+	}
+	return g.Store.Put(ctx, key, r)
+}
+
+// Unwrap keeps the transport's capabilities visible through the
+// decorator, for the reason failPutsOn does.
+func (g *gatePutsOn) Unwrap() pelicanobj.Store { return g.Store }
+
+// phaseDuration reads one phase back out of a clock, so a test can assert
+// on the breakdown a user reads rather than on log output.
+func phaseDuration(c *phaseClock, name string) (time.Duration, bool) {
+	if c == nil {
+		return 0, false
+	}
+	for i := 0; i+1 < len(c.parts); i += 2 {
+		if n, ok := c.parts[i].(string); ok && n == name {
+			d, _ := c.parts[i+1].(time.Duration)
+			return d, true
+		}
+	}
+	return 0, false
+}
+
+// Teardown must JOIN the periodic checkpointer, not race it.
+//
+// The nil-map panic (a16b948) made the collision survivable in
+// internal/overlay, but survivable is not done: a checkpoint cut off by
+// teardown publishes NOTHING, and the changes it was sealing stay in an
+// overlay whose state directory a batch-system wrapper is entitled to
+// wipe the moment the process exits. So the property is not "no crash",
+// it is "the seal that was in flight LANDED before the overlay was
+// touched" — asserted here as the published ref advancing and the mount
+// following it, with the overlay still open underneath.
+func TestExitDrainsAnInFlightCheckpoint(t *testing.T) {
+	g := newGenSession(t, true)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	g.reclaimFn = func(string) {}
+
+	// A ref store on the ungated transport: the test must be able to read
+	// the branch head while the checkpoint's packs are held.
+	rstore, err := refs.New(g.inner, t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := &gatePutsOn{
+		Store:   g.inner,
+		prefix:  "packs/",
+		held:    make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	g.inner = gate
+
+	writeFile(t, g.ov, "in-flight.txt", "written before the user typed exit")
+	g.startCheckpointer(ctx, 10*time.Millisecond)
+
+	select {
+	case <-gate.held:
+	case <-time.After(30 * time.Second * raceSlowdown):
+		t.Fatal("no checkpoint ever reached the federation; there is nothing in flight to drain")
+	}
+
+	// The user exits here, with a checkpoint parked mid-seal.
+	g.beginTeardown()
+	drained := make(chan struct{})
+	go func() {
+		g.drainCheckpoints()
+		close(drained)
+	}()
+	const held = 500 * time.Millisecond
+	select {
+	case <-drained:
+		t.Fatal("teardown walked past a checkpoint that was still sealing; the next step closes the overlay")
+	case <-time.After(held):
+	}
+	close(gate.release)
+	select {
+	case <-drained:
+	case <-time.After(60 * time.Second * raceSlowdown):
+		t.Fatal("the drain never returned")
+	}
+
+	// The generation landed and the ref advanced: the checkpoint ran to
+	// completion rather than being abandoned at the stop.
+	f, err := rstore.Fetch(ctx, "main")
+	if err != nil {
+		t.Fatalf("fetch after the drain: %v", err)
+	}
+	if f.Superblock.Generation < 1 {
+		t.Fatalf("the branch is still at generation %d; the drained checkpoint published nothing",
+			f.Superblock.Generation)
+	}
+	// Following is the second half of a checkpoint — the rebase that drops
+	// the redundant overlay rows — and it is the half that was being cut
+	// off. If the mount is on the published generation, the whole
+	// checkpoint completed, not just its uploads.
+	if got := g.gfs.Generation(); got != f.Superblock.Generation {
+		t.Errorf("the mount is serving generation %d against a head of %d; the drained checkpoint stopped halfway",
+			got, f.Superblock.Generation)
+	}
+	// And it completed while the overlay was still open, which is the
+	// ordering the whole change is about.
+	if _, err := g.ov.Stats(); err != nil {
+		t.Errorf("the overlay was already unusable when the drain returned: %v", err)
+	}
+	sealed, err := genfs.Open(ctx, genfs.Options{
+		Inner: gate.Store, SB: f.Superblock, CacheDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("open the drained checkpoint's generation: %v", err)
+	}
+	defer sealed.Close() //nolint:errcheck
+	if _, err := sealed.Lookup(ctx, genfs.RootInode, "in-flight.txt"); err != nil {
+		t.Errorf("the drained checkpoint's generation does not carry the write: %v", err)
+	}
+
+	// The wait is attributable: it is its own phase in the teardown line,
+	// not time smeared into the seal that follows it.
+	d, ok := phaseDuration(g.down, "checkpoint drain")
+	if !ok {
+		t.Fatalf("the teardown breakdown has no drain phase: %q", g.down.sentence("torn down"))
+	}
+	if d < held {
+		t.Errorf("the drain phase reports %v for a checkpoint held %v; the wait is being charged elsewhere", d, held)
+	}
+	if s := g.down.sentence("torn down"); !strings.Contains(s, "checkpoint drain {checkpoint drain}") {
+		t.Errorf("the teardown line does not name the drain: %s", s)
+	}
+	t.Logf("teardown line: %s (drain %v)", g.down.sentence("torn down"), d)
+}
+
+// The drain is a join, not a delay: a session with nothing in flight
+// must pay for it in microseconds, and a session that never started a
+// checkpointer must not even name the phase — the teardown line only
+// lists phases that actually ran.
+func TestCheckpointDrainCostsNothingWithNothingInFlight(t *testing.T) {
+	noCheckpointer := newGenSession(t, true)
+	noCheckpointer.beginTeardown()
+	start := time.Now()
+	noCheckpointer.drainCheckpoints()
+	if d := time.Since(start); d > time.Second {
+		t.Errorf("draining a session that never checkpointed took %v", d)
+	}
+	if d, ok := phaseDuration(noCheckpointer.down, "checkpoint drain"); ok {
+		t.Errorf("a session with no checkpointer reported a drain phase of %v", d)
+	}
+
+	// An idle checkpointer: the phase is reported, because one ran, and
+	// it costs about nothing, because nothing was sealing.
+	idle := newGenSession(t, true)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	idle.startCheckpointer(ctx, time.Hour) // never ticks during this test
+	idle.beginTeardown()
+	start = time.Now()
+	idle.drainCheckpoints()
+	waited := time.Since(start)
+	if waited > checkpointDrainNotice {
+		t.Errorf("draining an idle checkpointer took %v, past the point where it announces a wait", waited)
+	}
+	d, ok := phaseDuration(idle.down, "checkpoint drain")
+	if !ok {
+		t.Fatalf("a session that ran a checkpointer has no drain phase: %q", idle.down.sentence("torn down"))
+	}
+	t.Logf("idle drain: %v (phase %v)", waited, d)
+}
+
+// The drain and the exit seal must not both publish the same work. When
+// the checkpoint that teardown waited for already sealed everything, the
+// seal at exit has nothing to do and has to say so — no second
+// generation, and the overlay left where the "nothing changed" path
+// leaves it rather than retired behind an empty publish.
+func TestExitSealAfterACheckpointPublishesNothingNew(t *testing.T) {
+	g := newGenSession(t, true)
+	ctx := context.Background()
+	g.reclaimFn = func(string) {}
+	writeFile(t, g.ov, "everything.txt", "the checkpoint published this")
+	if _, err := g.checkpoint(ctx); err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	rstore, err := refs.New(g.inner, t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := rstore.Fetch(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpointed := f.Superblock.Generation
+
+	g.beginTeardown()
+	if err := g.sealAtExit(ctx); err != nil {
+		t.Fatalf("sealAtExit after a checkpoint: %v", err)
+	}
+	f2, err := rstore.Fetch(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f2.Superblock.Generation != checkpointed {
+		t.Errorf("the exit seal published generation %d over a checkpoint at %d; it double-sealed",
+			f2.Superblock.Generation, checkpointed)
+	}
+	var sum stats.Summary
+	g.stats.Update(func(s *stats.Summary) { sum = *s })
+	if sum.Seals != 1 {
+		t.Errorf("%d seals recorded; the checkpoint is the only one that had anything to publish", sum.Seals)
+	}
+	if sum.TeardownPhase.Seals != 0 {
+		t.Errorf("teardown recorded %d seals with a clean overlay", sum.TeardownPhase.Seals)
 	}
 }
 

@@ -146,6 +146,21 @@ type genSession struct {
 	// makes the clock's fields safe as well as the boundary singular.
 	downOnce sync.Once
 
+	// The periodic checkpointer's lifecycle, so the exit path can JOIN it
+	// instead of racing it. Stopping is two signals rather than one:
+	// checkpointStop tells the loop to stop TICKING, and a checkpoint
+	// already running seals on a context nothing here cancels, so it runs
+	// to completion. Cutting one off mid-seal is not untidiness — the
+	// generation it was building goes unpublished, and a batch wrapper is
+	// entitled to delete the state directory the instant this process
+	// exits, taking the unsealed overlay with it.
+	checkpointStop context.CancelFunc
+	checkpointWG   sync.WaitGroup
+	// drainOnce keeps the join single: the exit path calls it explicitly
+	// so the wait is timed where it belongs, and a defer registered at
+	// startup calls it on every other way out of runMountGen.
+	drainOnce sync.Once
+
 	// content is the write path's store, when this session has one. The
 	// checkpoint policy asks it how far behind the uplink is.
 	content *memtable.Store
@@ -671,7 +686,12 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	// tree walk and the catalog rebuild are still whole-tree, so the cost
 	// scales with the size of the namespace, not with the bytes in it.
 	if rw && o.snapshotInterval > 0 {
-		go g.checkpointPeriodically(sessionCtx, o.snapshotInterval)
+		g.startCheckpointer(sessionCtx, o.snapshotInterval)
+		// Registered AFTER the overlay's close defer, so LIFO runs it
+		// BEFORE: no path out of this function may close the overlay with
+		// a checkpoint still sealing into it. The exit path below calls it
+		// explicitly too, to time the wait where a reader can see it.
+		defer g.drainCheckpoints()
 		if !o.noAutoRepack {
 			// Background maintenance, on the same session context: it holds
 			// the lease already and knows when the volume is idle, which a
@@ -754,6 +774,11 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 
 	stopSession()
 	g.down.mark("session stop")
+	// Stopping the session told the checkpointer to stop ticking; this
+	// waits for the one that may already be sealing. It marks its own
+	// phase, so a user who exits into a slow checkpoint reads WHY exit
+	// took time instead of finding it buried in the seal.
+	g.drainCheckpoints()
 	sealErr := g.sealAtExit(ctx)
 	g.down.mark("seal")
 	if sealErr != nil {
@@ -1567,9 +1592,92 @@ func (g *genSession) pressure() (bytes int64, nodes int) {
 	return st.StagedBytes, st.DirtyNodes
 }
 
+// checkpointDrainNotice is how long the exit path waits for a checkpoint
+// in flight before saying out loud that it is waiting. Below it the join
+// is invisible, which is right: the common case is a session with nothing
+// in flight, and it must not narrate a wait it did not do.
+const checkpointDrainNotice = 250 * time.Millisecond
+
+// startCheckpointer runs the periodic checkpointer under a lifecycle the
+// exit path can join, which is the only reason it is not a bare `go`.
+//
+// The cancel is the session's own, derived from the session context: the
+// drain must be able to stop the loop by itself, because it also runs
+// from a defer, and defers unwind in an order that puts it BEFORE the
+// deferred stopSession it would otherwise be waiting on.
+func (g *genSession) startCheckpointer(ctx context.Context, every time.Duration) {
+	ckCtx, stop := context.WithCancel(ctx)
+	g.checkpointStop = stop
+	g.checkpointWG.Add(1)
+	go func() {
+		defer g.checkpointWG.Done()
+		g.checkpointPeriodically(ckCtx, every)
+	}()
+}
+
+// drainCheckpoints stops the checkpointer and waits for it, and it is the
+// step that must come before anything closes the overlay.
+//
+// The nil-map panic that used to come out of a checkpoint's Rebase was
+// made survivable in internal/overlay — a checkpoint caught by teardown
+// now reports a failed rebase instead of crashing — but survivable is not
+// the same as done. The work is still abandoned: the seal that was in
+// flight publishes nothing, and the changes it was publishing stay in an
+// overlay whose state directory a batch-system wrapper may wipe as soon
+// as the process exits. Waiting is correctness.
+//
+// A second Ctrl+C during the wait is answered with a line, not with an
+// abort. There is no force-abort here on purpose: the only thing an abort
+// could do is throw away the seal this is waiting for.
+func (g *genSession) drainCheckpoints() {
+	g.drainOnce.Do(func() {
+		if g.checkpointStop == nil {
+			return // no checkpointer: read-only, or --snapshot-interval 0
+		}
+		g.checkpointStop()
+		done := make(chan struct{})
+		go func() {
+			g.checkpointWG.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+			g.down.mark("checkpoint drain")
+			return
+		case <-time.After(checkpointDrainNotice):
+		}
+		ui.Info("waiting for the checkpoint in flight to finish sealing before unmounting; " +
+			"stopping it here would publish nothing and leave the work in the overlay")
+		// Absorbed rather than acted on, and only for as long as the wait
+		// lasts. In `pelfs shell` the subshell's handler has already been
+		// removed by the time teardown runs, so without this a keyboard
+		// interrupt during the drain kills the process mid-seal — the
+		// exact outcome the drain exists to prevent.
+		sigs := make(chan os.Signal, 1)
+		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+		defer signal.Stop(sigs)
+		for {
+			select {
+			case <-done:
+				g.down.mark("checkpoint drain")
+				return
+			case s := <-sigs:
+				ui.Warn("{signal} while a checkpoint is still sealing; still waiting, "+
+					"because interrupting it now would lose the generation it is publishing",
+					"signal", s)
+			}
+		}
+	})
+}
+
 func (g *genSession) checkpointPeriodically(ctx context.Context, every time.Duration) {
 	t := time.NewTicker(every)
 	defer t.Stop()
+	// A checkpoint that has STARTED runs on a context the session's stop
+	// does not reach. Cancelling mid-seal would abandon uploads that are
+	// already on the wire and leave the branch where it was, which is the
+	// one outcome worse than exit taking a few seconds longer.
+	sealCtx := context.WithoutCancel(ctx)
 	// Sampling is far more frequent than the interval so a burst is
 	// noticed while it is still being written rather than after it.
 	sample := time.NewTicker(pressureSampleInterval(every))
@@ -1593,6 +1701,13 @@ func (g *genSession) checkpointPeriodically(ctx context.Context, every time.Dura
 		case <-ctx.Done():
 			return
 		case <-sample.C:
+			// A ready timer and a cancelled context are both ready cases,
+			// and select picks between them at random. Re-checking here is
+			// what makes "no NEW checkpoint starts after the stop" a
+			// property rather than a coin toss the exit path pays for.
+			if ctx.Err() != nil {
+				return
+			}
 			staged, nodes := g.pressure()
 			if !checkpointDue(staged, nodes) {
 				continue
@@ -1606,10 +1721,17 @@ func (g *genSession) checkpointPeriodically(ctx context.Context, every time.Dura
 				continue
 			}
 			start := time.Now()
-			summary, err := g.checkpoint(ctx)
+			summary, err := g.checkpoint(sealCtx)
+			// Whatever it did, it FINISHED, so it gets reported: this is
+			// the checkpoint the exit path may have just spent seconds
+			// waiting for, and a silent return would leave the "checkpoint
+			// started" line above as the last word.
+			stopping := ctx.Err() != nil
 			switch {
-			case ctx.Err() != nil:
-				return
+			case err != nil && stopping:
+				ui.Warn("the checkpoint that was running when the session ended failed "+
+					"(your changes remain safe in the overlay, and the seal at exit publishes them): {error}",
+					"error", err)
 			case err != nil:
 				backoff = min(max(2*backoff, pressureSampleInterval(every)), every)
 				retryAfter = time.Now().Add(backoff)
@@ -1626,18 +1748,33 @@ func (g *genSession) checkpointPeriodically(ctx context.Context, every time.Dura
 					"duration", time.Since(start).Round(time.Millisecond),
 					"summary", summary)
 			}
-		case <-t.C:
-			start := time.Now()
-			summary, err := g.checkpoint(ctx)
-			elapsed := time.Since(start)
-			switch {
-			case ctx.Err() != nil:
+			if stopping {
 				return
+			}
+		case <-t.C:
+			if ctx.Err() != nil {
+				return
+			}
+			start := time.Now()
+			summary, err := g.checkpoint(sealCtx)
+			elapsed := time.Since(start)
+			stopping := ctx.Err() != nil
+			switch {
+			case err != nil && stopping:
+				ui.Warn("the checkpoint that was running when the session ended failed "+
+					"(your changes remain safe in the overlay, and the seal at exit publishes them): {error}",
+					"error", err)
 			case err != nil:
 				ui.Warn("periodic checkpoint failed, retrying next interval "+
 					"(your changes remain safe in the overlay): {error}", "error", err)
-			case elapsed > slowCheckpoint:
+			// Reported when it was slow, and always when the exit path was
+			// waiting on it: there the duration IS the explanation for the
+			// drain phase in the teardown line.
+			case elapsed > slowCheckpoint || stopping:
 				ui.Info("checkpoint took {duration} ({summary})", "duration", elapsed, "summary", summary)
+			}
+			if stopping {
+				return
 			}
 		}
 	}

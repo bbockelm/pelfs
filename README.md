@@ -16,6 +16,10 @@ pelfs gc     [--delete] pelican://.../scratch              # sweep unreferenced 
 pelfs tag    pelican://.../scratch v1.0                    # freeze the head under a name
 pelfs tag    --list pelican://.../scratch                  # what is pinned here
 pelfs tag    --rm pelican://.../scratch v1.0               # release the pin (gc reclaims)
+pelfs branch pelican://.../scratch dev                     # a second line of history
+pelfs branch --from-tag v1.0 pelican://.../scratch v1-fix  # ...starting at a pinned generation
+pelfs branch --list pelican://.../scratch                  # what branches exist
+pelfs branch --rm pelican://.../scratch dev                # delete one (never the last)
 pelfs fsck   [--deep] pelican://.../scratch                # verify a generation
 pelfs repack-plan pelican://.../scratch                    # what a repack would rewrite
 pelfs repack [--apply] pelican://.../scratch               # rewrite it, publish a generation
@@ -211,10 +215,15 @@ a count of bytes, a duration a count of nanoseconds).
 
 ## Caveats (prototype)
 
-- **Single writer.** The advisory lease is detection, not mutual exclusion:
-  the transport has no compare-and-swap. A seal that would overwrite
-  another writer's generation is refused, so the failure mode is a rejected
-  seal rather than silent corruption.
+- **Single writer, and that is per VOLUME rather than per branch.** The
+  advisory lease is detection, not mutual exclusion: the transport has no
+  compare-and-swap. A seal that would overwrite another writer's generation
+  is refused, so the failure mode is a rejected seal rather than silent
+  corruption. `meta/lease.json` is one object for the whole prefix, so two
+  writable mounts on DIFFERENT branches of one volume still exclude each
+  other even though they would never touch the same ref. The refusal names
+  the holder. A per-branch lease is a v0.2 change; branches share one write
+  lease in v0.1.0.
 - The origin must permit GET/PUT/DELETE and listing on the prefix (i.e. a
   token with read/modify scopes for the namespace); `pelfs` checks this up
   front and says which scope is missing.
@@ -249,7 +258,24 @@ a count of bytes, a duration a count of nanoseconds).
   next `pelfs gc` after the grace window — deletion takes a root out of
   the set, it does not itself free a byte. A name freed this way can be
   tagged again; immutability is a property of the object, not the name.
-- There is no **fork** command, no way to **delete a branch**, and no **key
-  rotation**. Branch deletion is missing surface rather than a missing
-  feature: nothing in `pelfs` creates a second branch, so `main` is the
-  only ref any volume has.
+- **`pelfs branch` gives a volume more than one line of history.** A branch
+  is a NAME over a generation — nothing in the format records one — so
+  `pelfs branch <prefix> <name>` copies the verified head of `--from`
+  (default `main`), or of `--from-tag <tag>`, under a second name, and from
+  that instant the two advance independently: each seal reads the head of
+  the branch it publishes onto and flips that one ref. Creation is
+  create-if-absent and a branch is never moved by this verb, because
+  repointing one out from under a writer would strand its next publish and
+  reparent its work; moving a branch is what publishing does, through the
+  CAS guard. `--list` shows what exists. `--rm` deletes one, names the
+  generation it is letting go, and — exactly as for a tag — frees nothing
+  until the next `pelfs gc` past the grace window. Deleting the LAST branch
+  is refused: every object in a volume is reachable from a ref, so a volume
+  with none has no head to mount, nothing for a new branch to start from,
+  and no way back from the CLI.
+- There is no **merge**, and no **key rotation**. Two branches that have
+  diverged stay diverged; what exists is branching, tagging and deleting,
+  not reconciling. Key rotation is a format feature (custody-chain
+  verification) with no writer behind it — and note that when one does
+  land, rotating on one branch retires the volume-wide pin and siblings
+  still signed by the old key fail until they are republished.

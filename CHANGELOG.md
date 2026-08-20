@@ -49,6 +49,20 @@ limitations*.
   list what is pinned, and release a pin. Tags are immutable, so a name in
   use never silently moves; deleting one takes its generation out of the
   root set and the next sweep reclaims what it was holding.
+- **`pelfs branch` — more than one line of history per volume.** Create a
+  branch at the current head of `--from` (default `main`) or at a pinned
+  generation with `--from-tag`, list them, and delete one. A branch is a
+  NAME over a generation: creating one copies the VERIFIED head's bytes
+  under a second name, after which the two advance independently, each seal
+  reading and flipping its own ref. Creation is create-if-absent — this verb
+  never moves a branch, because repointing one out from under a writer would
+  strand its next publish and reparent its work. Deleting the last branch is
+  refused: every object in a volume is reachable from a ref, so a volume
+  with none has no head to mount and no way back from the CLI.
+  Every `--branch` flag in the tool finally means something, and every
+  "every branch head" in the retention design is now a claim with more than
+  one branch behind it. The single-branch assumptions that had gone
+  untested are named under *Known limitations* and in the design doc.
 - **`pelfs version`**, and `pelfs ctl <prefix> bugreport` for a tarball with
   the build, the stats and every goroutine.
 - **Unprivileged by construction.** One static binary, no root, no setup;
@@ -117,16 +131,34 @@ and no end-to-end run.
   account.** Replacing the manifest already drops superseded segments, so
   what is missing is the narrower case of an index whose packs are mostly
   gone: it costs fetch time, never correctness.
-- **Single writer.** The advisory lease is detection, not mutual exclusion —
-  the transport has no compare-and-swap. A seal that would overwrite another
-  writer's generation is refused, so the failure mode is a rejected seal
-  rather than silent corruption.
-- **No forks and no key rotation.** Tag deletion has landed (`pelfs tag
-  --rm` removes a tag, and the next sweep reclaims what it was pinning), so
-  a pin is no longer one-way. BRANCH deletion is still absent and is
-  missing surface rather than a missing feature: nothing in `pelfs` creates
-  a second branch, so `main` is the only ref a volume has. `pelfs rescue`
-  is specified and not built.
+- **Single writer, per VOLUME rather than per branch.** The advisory lease
+  is detection, not mutual exclusion — the transport has no
+  compare-and-swap. A seal that would overwrite another writer's generation
+  is refused, so the failure mode is a rejected seal rather than silent
+  corruption. `meta/lease.json` is one object for the whole prefix, so two
+  writable mounts on DIFFERENT branches of one volume exclude each other
+  even though they would never touch the same ref. The refusal names the
+  holder; branches share one write lease in v0.1.0, and a per-branch lease
+  is a v0.2 change.
+- **Two branches that have diverged stay diverged.** There is no merge, and
+  none is planned for this release. What exists is branching, tagging and
+  deleting.
+- **The retain window over-retains on a multi-branch volume, deliberately.**
+  A retired generation is described only by the superblock backup its seal
+  buried in a pack, and a backup carries a generation NUMBER — which counts
+  steps along one lineage, so both children of generation N seal N+1 and
+  their backups are indistinguishable. Nothing in the store can attribute
+  one to a branch (the lineage chain authenticates a single step). The sweep
+  therefore keeps EVERY candidate for a wanted generation number, which
+  retains more than one branch strictly needs rather than dropping a
+  generation out of the root set. The scan runs to the end of the pack space
+  or to its budget on such volumes, instead of stopping at the first
+  complete answer; single-branch volumes are unaffected in both respects.
+- **No key rotation.** It is a format feature (custody-chain verification)
+  with no writer behind it. When one lands, note that the volume key pin is
+  volume-wide by design, so rotating on one branch will retire the pin and
+  siblings still signed by the old key will fail until republished.
+  `pelfs rescue` is specified and not built.
 - The origin must permit GET/PUT/DELETE and listing on the prefix; `pelfs`
   checks this up front and names the missing scope.
 

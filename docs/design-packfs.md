@@ -635,40 +635,111 @@ graph. Refs add the missing distinction between a commit and the *name*
 pointing at it:
 
 - **Branch** — a mutable ref object (`refs/<name>`), advanced by publish.
-  Each is independently guarded and covered by the advisory lease. A bare
-  prefix mounts `refs/main`.
+  Each is independently guarded. A bare prefix mounts `refs/main`.
 - **Tag** — an immutable ref: a frozen superblock under a name, never
   overwritten. Costs one tiny object; everything it references is shared.
-  Read-only tag mounts are the pinned-generation mounts. Both ends are
-  wired: `pelfs tag <prefix> <name>` freezes a verified branch head (and
-  `--list` shows what is frozen), `--tag` mounts one. Creation refuses to
-  overwrite, which is the property the pin rests on. What is still missing
-  is DELETING a tag, so a pin is currently forever.
+  Read-only tag mounts are the pinned-generation mounts. All ends are
+  wired: `pelfs tag <prefix> <name>` freezes a verified branch head,
+  `--list` shows what is frozen, `--tag` mounts one, `--rm` releases the
+  pin. Creation refuses to overwrite, which is the property the pin rests
+  on; deletion is what makes the pin reversible, and it frees nothing
+  itself — it takes a root out of the sweep's set and the next `gc` past the
+  grace window does the rest.
 - **Fork** — a new ref whose first superblock's parent is the forked
-  generation, giving copy-on-write over the whole volume. **Not
-  implemented.** The rules below are the design it would have to obey.
+  generation, giving copy-on-write over the whole volume. This is what
+  `pelfs branch` does, and the rules below are the ones it obeys.
+
+### Branching semantics
+
+Nothing in the format records a branch. A generation is a document; a
+branch is a NAME pointing at one. So `pelfs branch <prefix> <name>` writes
+the source's bytes under a second name, and everything else follows:
+
+- **The bytes are the VERIFIED ones.** Creation goes through
+  `refs.Store.Fetch` (pinned key or TOFU, plus the rollback check) or
+  `FetchTag`, never a raw read. A branch is something a writer will build
+  on, so rooting one in whatever the origin happened to serve matters more
+  here than it does for a tag.
+- **Create-if-absent, never move.** `Flip` with an empty expect-ETag refuses
+  a ref that already exists. Repointing a branch someone is publishing onto
+  would strand their next publish — it would fail its own CAS check having
+  already uploaded everything — and reparent their work under a generation
+  that never contained it. Moving a branch is what publishing does, through
+  the guard.
+- **Fork rule (GC soundness), now structural.** A branch may start only at a
+  ref-reachable generation, because the only two things `pelfs branch` will
+  read are a branch head (`--from`) and a tag (`--from-tag`). To branch
+  something older, tag it first. This closes the race between branching a
+  generation and GC condemning it.
+- **Deletion mirrors tag deletion**, including the absence of a signature
+  requirement (see *Threat model*): it removes the object, reports the
+  generation being let go, and frees nothing until the next sweep past the
+  grace window. It also drops this client's local record of the branch's
+  last accepted generation, so the name can be re-created from an OLDER
+  generation — the ordinary result of branching from a tag — instead of
+  being refused as a stale read by the one client that deleted it.
+- **Deleting the last branch is refused.** Every object in a volume is
+  reachable from a ref: a branch starts at a branch head or a tag, a mount
+  opens one, and the sweep refuses outright to run on a volume with no refs
+  ("refusing to treat every pack as garbage"). A volume whose last branch is
+  gone has every pack still in place and nothing able to name them.
 
 Consequences, deliberate and otherwise:
 
-- **Single-writer becomes single-writer per branch.** Writers on different
-  branches never conflict: disjoint superblocks, shared immutable objects,
-  and content-addressed pack uploads collide only on identical content.
-  This enables the fan-out batch pattern — one tagged base environment, N
-  jobs each forking a private writable branch and publishing results as
-  tags.
-- **Fork rule (GC soundness):** forking is allowed only from ref-reachable
-  generations — a branch's history within the GC grace window, or any tag.
-  To fork something older, tag it first. This closes the race between
-  forking a generation and GC condemning it.
-- **Inode uniqueness is per-lineage.** Fork descendants allocate from the
+- **Single-writer is per VOLUME, not per branch — v0.1.0's honest limit.**
+  Writers on different branches conflict in nothing the FORMAT cares about:
+  disjoint superblocks, shared immutable objects, and content-addressed
+  uploads that collide only on identical content. But the advisory lease is
+  one object for the whole prefix (`meta/lease.json`), so two writable
+  mounts on different branches of one volume still exclude each other. The
+  failure mode is the clean one — a refusal naming the holder, at mount,
+  before any work is done. A per-branch lease is a v0.2 change, not a design
+  position; until then the fan-out batch pattern (one tagged base
+  environment, N jobs each on a private branch) needs N volumes or
+  `--no-lease`.
+- **A GENERATION NUMBER IS NOT AN IDENTITY.** This is the rule a second
+  branch makes load-bearing, and it is easy to get wrong because a number
+  looks like a name. Numbers count steps along ONE lineage, so both children
+  of generation N seal N+1, and anything treating a number as identifying a
+  generation is wrong the moment a volume forks:
+  - The repack's stale-plan guard compares the head against the generation
+    the plan was computed from by volume, number, root catalog AND lineage
+    hash. By number alone, a sibling at the same number answered for a head
+    that had moved, and the repack went on to condemn packs measured against
+    a volume that no longer existed.
+  - The local dedup sidecar is stamped with the branch as well as the volume
+    and generation. Without the branch, two branches sharing a state
+    directory read each other's sidecars, skip uploads for chunks that live
+    in packs the OTHER branch's pack list names, and publish chunkrefs that
+    resolve in no pack this generation lists.
+  - The retain window is resolved from superblock backups scavenged out of
+    packs, and a backup carries a number and nothing else that could
+    attribute it to a branch. The lineage chain authenticates one step and
+    no more — a head's `PrevHash` names its parent's wire bytes, and a
+    backup's names its own parent's, so nothing links `backup_G` to
+    `backup_{G-1}`. Attribution is not available from the store, so the
+    sweep keeps EVERY candidate for a wanted number rather than the first it
+    finds. It over-retains on a forked volume, which is bytes; the
+    alternative was one branch's window filling with the other's documents
+    and the loser's retired generations dropping out of the root set, which
+    is data. The scan's early stop survives only where a number IS an
+    identity — one branch — so single-branch volumes are unchanged in cost
+    and in behaviour.
+- **Inode uniqueness is per-lineage.** Branch descendants allocate from the
   same counter and may assign equal inode values to different files —
   harmless, since inodes need uniqueness only within a mounted tree and
   branches mount separately. A future cross-branch *merge* would need to
   renumber one side; merge is explicitly out of scope, and this rule is
   why.
-- Retention becomes explicit: tags are the user-controlled form of keeping
-  a generation; anonymous generations get the `T_grace` window. Keep what
-  you name, grace-window the rest.
+- **The volume key pin stays volume-wide.** A per-branch pin would hand an
+  attacker a fresh trust-on-first-use for every branch name they can invent,
+  so a branch signed by an unknown key is refused rather than pinned. The
+  cost is the other half of the same rule: when key rotation lands,
+  advancing the pin on one branch retires the old key, and siblings still
+  signed by it fail until they are republished.
+- Retention becomes explicit: tags are the user-controlled form of keeping a
+  generation; anonymous generations get the `T_grace` window and the last-K
+  window of their own branch. Keep what you name, grace-window the rest.
 
 ## Concurrency: the ref guard, and the lease as a courtesy
 
@@ -1597,6 +1668,17 @@ with:
   index refs verbatim and publishes no segment of its own. So to retain
   generations H-1 … H-K+1 the sweep reads the backups of generations H …
   H-K+2, and each one says what the generation below it named.
+
+  **On a volume with more than one branch, that lookup is by a number two
+  lineages share** — see *Branching semantics*, "a generation number is not
+  an identity". Nothing in the store attributes a backup to a branch, so the
+  sweep keeps every distinct document claiming a wanted number and absorbs
+  them all. The window is a union either way, so extra roots only ever keep
+  more; and the scan gives up its early stop on such volumes, because
+  "every number has a candidate" is reached before the sibling's candidate
+  is found. K is still read from each branch head's own `Params`, so a
+  branch started in the past keeps its own short chain rather than K
+  generations of the trunk's.
 
   A repack writes no backup, so nothing describes the generation a repack
   grew from. What covers that one is the repack's own CONDEMNED LEDGER: a

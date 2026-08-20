@@ -1082,3 +1082,63 @@ func TestSnapshotCostAtScale(t *testing.T) {
 	}
 	t.Logf("SNAPSHOT release %s", time.Since(start).Round(time.Millisecond))
 }
+
+// TestFailedCheckpointsDoNotAccumulateSnapshotEdges is the memory claim
+// C4 rests on: a checkpoint that never reaches its rebase — the federation
+// refusing the flip, a seal that errors, a swap that fails — must not
+// leave its namespace behind. The mount retries every five minutes for as
+// long as the outage lasts, so a per-attempt map is an out-of-memory kill
+// during exactly the failure this design is supposed to survive.
+func TestFailedCheckpointsDoNotAccumulateSnapshotEdges(t *testing.T) {
+	ctx := context.Background()
+	fx := newFixture(t, "5a405a40-000c-4000-8000-00000000000c")
+	ov := openOverlay(t, fx, "")
+
+	// A namespace worth remembering: every write names another inode in
+	// the edge map a snapshot records.
+	for i := 0; i < 20; i++ {
+		n, err := ov.Create(ctx, rootIno, fmt.Sprintf("f%02d.txt", i), 0600, 0, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ov.Write(ctx, n.Inode, 0, []byte("body")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prev := 0
+	for round := 1; round <= 8; round++ {
+		// The session keeps writing between attempts, which is what makes
+		// each snapshot a distinct SEQUENCE and therefore a distinct map.
+		// Without a write in between, every snapshot lands on the same seq
+		// and overwrites its predecessor — and the test would pass against
+		// the very leak it exists to catch.
+		w, err := ov.Create(ctx, rootIno, fmt.Sprintf("r%02d.txt", round), 0600, 0, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ov.Write(ctx, w.Inode, 0, []byte("more")); err != nil {
+			t.Fatal(err)
+		}
+		// The shape of a failed checkpoint: freeze, then discover the seal
+		// cannot publish, release the frozen view, and never rebase.
+		snap := takeSnapshot(t, ov)
+		if err := snap.Close(); err != nil {
+			t.Fatalf("round %d: Close: %v", round, err)
+		}
+		st, err := ov.Stats()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st.ResidentSnapEdges == 0 {
+			t.Fatalf("round %d: the snapshot recorded no namespace at all", round)
+		}
+		// One namespace, which grows only by the file this round added.
+		// Accumulating would show as a multiple of it.
+		if want := prev + 1; round > 1 && st.ResidentSnapEdges != want {
+			t.Fatalf("round %d holds %d resident snapshot edges, want %d: "+
+				"failed checkpoints are accumulating namespaces",
+				round, st.ResidentSnapEdges, want)
+		}
+		prev = st.ResidentSnapEdges
+	}
+}

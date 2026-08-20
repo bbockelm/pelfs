@@ -235,8 +235,45 @@ func (fs *FS) freezeLocked(ctx context.Context, snap *Snapshot, dir, stagingDir 
 	}
 	snap.cost.Open = time.Since(start)
 	snap.view = view
+	fs.retireSnapEdgesLocked()
 	fs.snapEdges[snap.seq] = edges
 	return nil
+}
+
+// retireSnapEdgesLocked drops the edge maps of every earlier snapshot,
+// because taking a new one proves none of them can still be rebased.
+//
+// Each map is the whole merged namespace at an instant — one entry per
+// inode the overlay names — so it is the largest single thing this struct
+// holds, and until this existed one was kept per snapshot FOREVER unless a
+// rebase consumed it. Rebase is the only other place that deletes
+// (rebase.go), and it runs only after a seal SUCCEEDS. A checkpoint that
+// fails — the federation refusing the flip, the seal erroring out, the
+// swap or the rebase itself failing — therefore leaked a whole namespace,
+// and a writable mount retries every five minutes by design: the outage
+// this is built to ride out was the exact condition that grew the process
+// without bound.
+//
+// The rule is safe because a rebase always names the snapshot just
+// sealed. Snapshots are taken under fs.mu and seq only increases, so an
+// earlier map could only be wanted by a caller that froze a NEWER snapshot
+// and then rebased an older sequence — which the documented order
+// (snapshot, seal, swap, rebase; rebase.go) does not permit and Rebase
+// already refuses once rebasedSeq has passed it. Such a caller now gets
+// "no snapshot was taken at sequence N" rather than a rebase against a
+// namespace that is a generation stale.
+//
+// Releasing the snapshot is deliberately NOT the hook, however tempting:
+// a checkpoint releases the frozen view as soon as the publish is done and
+// rebases AFTERWARDS, on purpose, so the mount stops paying the snapshot's
+// copy-on-write cost while the rebase drops staging files by the thousand
+// (cmd/pelfs/mountgen.go). Dropping the map in release() fails every
+// checkpoint's rebase — measured, not assumed: it fails
+// TestRebaseCleanDirtyCleanCycle with "no snapshot was taken at sequence".
+func (fs *FS) retireSnapEdgesLocked() {
+	for seq := range fs.snapEdges {
+		delete(fs.snapEdges, seq)
+	}
 }
 
 // readEdgeMap collects the overlay's live namespace as child -> the edge

@@ -157,13 +157,26 @@ type Stats struct {
 	StagedFiles int
 	// StagedBytes sums the staging files' sizes.
 	StagedBytes int64
+	// ResidentProv and ResidentSnapEdges are the two per-inode maps this
+	// struct holds in MEMORY rather than in SQLite, reported because a
+	// mount that grows without its dirty set growing is otherwise
+	// undiagnosable from outside the process. Both are ~66 B/entry: prov
+	// caches one base descent step per inode the session has named
+	// (overlay.go), snap edges hold the merged namespace a snapshot
+	// published and are bounded to the newest snapshot's (snapshot.go).
+	ResidentProv      int
+	ResidentSnapEdges int
 }
 
-// Stats reports dirty counts and staged bytes.
+// Stats reports dirty counts, staged bytes, and the resident map sizes.
 func (fs *FS) Stats() (Stats, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	var s Stats
+	s.ResidentProv = len(fs.prov)
+	for _, edges := range fs.snapEdges {
+		s.ResidentSnapEdges += len(edges)
+	}
 	if err := fs.q.QueryRow(`SELECT count(*) FROM onode`).Scan(&s.DirtyNodes); err != nil {
 		return Stats{}, err
 	}

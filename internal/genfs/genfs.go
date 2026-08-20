@@ -74,13 +74,25 @@ type Options struct {
 	// The pinned root catalog does not count against it.
 	MaxOpenCatalogs int
 	// MaxResident bounds the residency map, evicting least-recently-used
-	// entries past the cap. Zero means unbounded, which is correct for a
-	// FUSE binding: there the kernel owns the lifetime and tells us via
-	// FORGET, so evicting behind its back would answer ESTALE for an
-	// inode it still holds. Set it only for a PATH-based frontend (the
-	// NFS adapter), which re-descends from the root on every operation
-	// and therefore cannot be hurt by eviction — without it, residency
-	// grows for the life of a long-running mount over a large tree.
+	// entries past the cap. Zero means unbounded.
+	//
+	// What the right value is depends entirely on who owns the inode
+	// lifetime, and the two frontends answer differently:
+	//
+	//   - A PATH-based frontend (the NFS adapter) re-descends from the
+	//     root on every operation, so eviction cannot hurt it at all and
+	//     the cap can be a WORKING bound — 100,000 there.
+	//   - A FUSE binding cannot be bounded that way. The kernel owns the
+	//     lifetime and tells us when it is done via FORGET, so evicting an
+	//     entry it still holds answers ESTALE for an inode it is entitled
+	//     to use. A cap there is a BACKSTOP against a pathological descent
+	//     — the memory this map costs versus the OOM killer — not a
+	//     working set policy, and it must be set far above anything a
+	//     kernel dcache will really hold.
+	//
+	// Evicted counts entries the cap has actually dropped, so a caller
+	// that set a backstop can tell whether it ever fired: on a FUSE mount
+	// a nonzero count is the explanation for an ESTALE a user just saw.
 	MaxResident int
 	// PackCacheBytes decides whether packs are cached WHOLE. A NEGATIVE
 	// value disables whole-pack caching entirely, leaving reads on
@@ -214,6 +226,9 @@ type FS struct {
 	// front is most recently used.
 	resLRU      *list.List
 	maxResident int
+	// resEvicted counts residency entries the cap dropped. It is under
+	// mu, like the map it describes.
+	resEvicted int64
 
 	fillMu sync.Mutex
 	fills  map[string]*fillGate
@@ -407,6 +422,7 @@ func (fs *FS) retain(ino uint64, catHex string, parent uint64, name string) {
 	if fs.maxResident > 0 {
 		r.elem = fs.resLRU.PushFront(ino)
 		for fs.resLRU.Len() > fs.maxResident {
+			fs.resEvicted++
 			back := fs.resLRU.Back()
 			evict := back.Value.(uint64)
 			fs.resLRU.Remove(back)
@@ -572,6 +588,20 @@ func (fs *FS) PackCount() int {
 	fs.swapMu.RLock()
 	defer fs.swapMu.RUnlock()
 	return len(fs.packIndex.packs)
+}
+
+// Residency reports how many inodes this mount is holding resolved, and
+// how many the cap has evicted.
+//
+// Both numbers are for the outside: the first is the largest per-inode
+// structure genfs keeps (~110 B each), so it is what a mount growing
+// without reading anything is growing; the second is zero on every mount
+// that never hit its cap, and on a FUSE mount a nonzero value is the
+// explanation for an ESTALE the user just saw.
+func (fs *FS) Residency() (resident int, evicted int64) {
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+	return len(fs.res), fs.resEvicted
 }
 
 // GetAttr returns an inode's attributes from its residency catalog.

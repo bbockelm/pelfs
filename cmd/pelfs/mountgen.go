@@ -41,6 +41,40 @@ import (
 // statsInterval is how often a live session rewrites its statistics file.
 const statsInterval = 30 * time.Second
 
+// nfsMaxResident bounds residency on the loopback-NFS backend. That
+// frontend re-descends from the root on every operation, so an evicted
+// entry costs a re-descent and nothing else, and the cap is a genuine
+// working-set bound.
+const nfsMaxResident = 100_000
+
+// fuseMaxResident bounds residency on the FUSE backend, and it is a
+// BACKSTOP rather than a working set — which is why it is twenty times
+// the NFS number.
+//
+// Under FUSE the kernel owns inode lifetime. It hands out a nodeid at
+// LOOKUP and releases it with FORGET, and between those two points it is
+// entitled to send operations for that inode; genfs answering ErrStale
+// for one becomes ESTALE in the application (internal/rawfuse). So a cap
+// that fires during ordinary work is a correctness regression, not a
+// memory saving, and residency must be allowed to track whatever the
+// kernel's dcache is holding. That is why this was zero.
+//
+// Zero is still the wrong answer, because "track the kernel" has no
+// bound at all: a descent over a very large tree — a find(1) over a
+// hundred million inodes, or a seal walking one — grows the map at about
+// 110 B/inode with nothing to stop it, and the process dies. Between an
+// ESTALE and the OOM killer, the ESTALE is recoverable and the kill is
+// not: the killed mount takes the unsealed overlay's session with it.
+//
+// 2,000,000 entries is ~220 MB, which is where that trade tips on a
+// laptop. It is far above any dcache a kernel keeps for a working set
+// (the kernel evicts under its own memory pressure long before this, and
+// sends the FORGETs that free these entries the correct way), so on real
+// workloads it never fires — genfs.Residency reports whether it ever did,
+// and the session statistics publish that, so an ESTALE seen in the field
+// has a number to check rather than a theory.
+const fuseMaxResident = 2_000_000
+
 // newSessionID names one mount session uniquely; it identifies the lease
 // holder to any other client that finds the prefix busy.
 func newSessionID() string {
@@ -473,11 +507,12 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	}
 
 	// A path-based frontend re-descends from the root on every operation,
-	// so its residency can be bounded; a FUSE binding's cannot, because
-	// the kernel owns those lifetimes and tells us when to drop them.
-	maxResident := 0
+	// so its residency can be bounded as a WORKING set; a FUSE binding's
+	// cannot, because the kernel owns those lifetimes and tells us when to
+	// drop them (see fuseMaxResident).
+	maxResident := fuseMaxResident
 	if backend == "nfs" {
-		maxResident = 100000
+		maxResident = nfsMaxResident
 	}
 	cacheBytes, err := o.cacheBudget()
 	if err != nil {
@@ -876,6 +911,7 @@ func (g *genSession) refresh() {
 	gen := g.gfs.Generation()
 	cache := cacheStats(g.gfs)
 	write := writeStats(g.content)
+	resident, evicted := g.gfs.Residency()
 	var st overlay.Stats
 	var live bool
 	g.ovMu.RLock()
@@ -888,6 +924,8 @@ func (g *genSession) refresh() {
 	g.stats.Update(func(sum *stats.Summary) {
 		sum.Generation = gen
 		sum.Cache = cache
+		sum.ResidentInodes = int64(resident)
+		sum.ResidencyEvicted = evicted
 		if write != nil {
 			sum.Write = write
 		}
@@ -1256,6 +1294,23 @@ func (g *genSession) sealLocked(ctx context.Context, follow bool) (*publish.Resu
 	}
 	phases.mark("freeze")
 
+	// MEMORY BUDGET of the seal below, documented here because this is
+	// where its input is chosen and there is no knob for it.
+	//
+	// publish holds one `rec` per inode in the walked set for the whole
+	// seal — node attrs, xattrs, symlink target, chunk refs, and any
+	// INLINE body verbatim (internal/publish, pipeline.recs). The audit
+	// measured ~266 B/file plus inline bodies, and the set is O(dirty
+	// subtree), not O(volume): a seal walks what changed.
+	//
+	// So the bound on this is the bound on the dirty set, and that is
+	// checkpointInodes: at 200,000 dirty inodes the recs map is ~53 MB,
+	// plus inline bodies for the small files among them. A session that
+	// ingests a whole tree in one go — first seal, nothing published yet —
+	// is the case with no ceiling but the tree's own size, and it is the
+	// one a streaming walk would fix. Not today: restructuring the walk is
+	// a change to the format's producer, and the number above is small
+	// enough that the trigger, not the walk, is the honest lever for now.
 	opts := publish.Options{
 		Inner:          g.inner,
 		SpoolDir:       g.stateDir,

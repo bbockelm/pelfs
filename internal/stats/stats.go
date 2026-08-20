@@ -125,6 +125,14 @@ type Summary struct {
 	PrefetchChunks int64 `json:"prefetch_chunks,omitempty"`
 	PrefetchBytes  int64 `json:"prefetch_bytes,omitempty"`
 
+	// ResidentInodes is how many inodes the mount is holding resolved, and
+	// ResidencyEvicted how many a residency cap has dropped. The second is
+	// zero on every mount that never reached its cap; on a FUSE mount a
+	// nonzero value is the explanation for an ESTALE, since there the
+	// kernel still believes it holds what was dropped.
+	ResidentInodes   int64 `json:"resident_inodes,omitempty"`
+	ResidencyEvicted int64 `json:"residency_evicted,omitempty"`
+
 	// Write is the write path's backpressure picture: how far the session
 	// is running ahead of its uplink, and whether that has begun to cost
 	// writers. Nil on a read-only mount.

@@ -3,6 +3,7 @@ package genfs_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -300,5 +301,60 @@ func TestCacheBudgetSurvivesRemount(t *testing.T) {
 	// And it still serves.
 	if got := readPath(t, tight, f.path(0), 1<<20); !bytes.Equal(got, f.body[f.names[0]]) {
 		t.Fatal("the first read after a budget-shrinking remount is wrong")
+	}
+}
+
+// TestResidencyReportsItsBound is what makes a residency cap operable: a
+// mount that never reaches its bound says so with a zero, and one that
+// does say so with a number. On a FUSE mount that number is the
+// explanation for an ESTALE, because there the kernel still believes it
+// holds what the cap dropped — which is why the FUSE backstop is set
+// twenty times higher than the NFS working bound (cmd/pelfs/mountgen.go).
+func TestResidencyReportsItsBound(t *testing.T) {
+	f := newCacheFixture(t, "cac1e000-0006-4000-8000-000000000006", 12, 4<<10)
+	ctx := context.Background()
+
+	// Unbounded: every descent stays resident and nothing is ever dropped.
+	free := f.open(t, genfs.Options{})
+	for i := range f.names {
+		readPath(t, free, f.path(i), 4<<10)
+	}
+	resident, evicted := free.Residency()
+	if resident == 0 {
+		t.Fatal("an unbounded mount reports no resident inodes after reading every file")
+	}
+	if evicted != 0 {
+		t.Errorf("an unbounded mount evicted %d residency entries", evicted)
+	}
+	_ = free.Close()
+
+	// Bounded hard, the way the NFS frontend is: entries go, the count
+	// says so, and — because a path frontend re-descends — reads are still
+	// correct afterwards.
+	tight := f.open(t, genfs.Options{MaxResident: 4})
+	for i := range f.names {
+		if got := readPath(t, tight, f.path(i), 4<<10); !bytes.Equal(got, f.body[f.names[i]]) {
+			t.Fatalf("%s is wrong under residency eviction", f.names[i])
+		}
+	}
+	resident, evicted = tight.Residency()
+	if evicted == 0 {
+		t.Fatalf("a 4-entry residency cap over %d files evicted nothing", len(f.names))
+	}
+	if resident > 4 {
+		t.Errorf("residency holds %d entries against a cap of 4", resident)
+	}
+	// The stale inode is the documented consequence, and it has to be
+	// exactly that rather than a wrong answer: an inode dropped by the cap
+	// answers ErrStale until something descends to it again.
+	n, err := tight.LookupPath(ctx, f.path(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range f.names {
+		readPath(t, tight, f.path(i), 4<<10) // push it back out
+	}
+	if _, err := tight.GetAttr(ctx, n.Inode); err != nil && !errors.Is(err, genfs.ErrStale) {
+		t.Fatalf("an evicted inode answered %v, want ErrStale or a live answer", err)
 	}
 }

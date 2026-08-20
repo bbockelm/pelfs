@@ -187,17 +187,42 @@ func parseArgsWithCommand(name string, args []string, minPos, maxPos int, extra 
 	return o, pos, tail, nil
 }
 
-// fuseUsable reports whether this host can plausibly mount FUSE.
-func fuseUsable() bool {
+// fuseUsable reports whether this host can mount FUSE, and says why not
+// when it cannot.
+//
+// On Linux it OPENS /dev/fuse rather than stat-ing it. The difference is
+// the whole unprivileged story: on a locked-down host the device node
+// exists and is root-only, so a stat says yes, the mount is attempted,
+// and the user gets a permission error from three layers down with no
+// idea which of the several things it could mean actually happened. The
+// probe costs one open and one close, and it is the same syscall the
+// mount will make.
+//
+// The reason is returned rather than logged because it is the only useful
+// thing this function knows: "no" without it sends a user to install a
+// package they already have.
+func fuseUsable() (bool, string) {
 	switch runtime.GOOS {
 	case "darwin":
-		_, err := os.Stat("/Library/Filesystems/macfuse.fs")
-		return err == nil
+		if _, err := os.Stat("/Library/Filesystems/macfuse.fs"); err != nil {
+			return false, "macFUSE is not installed"
+		}
+		return true, ""
 	case "linux":
-		_, err := os.Stat("/dev/fuse")
-		return err == nil
+		f, err := os.OpenFile("/dev/fuse", os.O_RDWR, 0)
+		switch {
+		case err == nil:
+			f.Close() //nolint:errcheck
+			return true, ""
+		case os.IsNotExist(err):
+			return false, "/dev/fuse does not exist (the fuse module is not loaded, or this is a container without --device /dev/fuse)"
+		case os.IsPermission(err):
+			return false, "/dev/fuse exists but this user cannot open it (it is usually mode 0666; ask an administrator, or use a host that permits FUSE)"
+		default:
+			return false, fmt.Sprintf("/dev/fuse cannot be opened: %v", err)
+		}
 	default:
-		return false
+		return false, runtime.GOOS + " has no supported FUSE backend"
 	}
 }
 
@@ -207,20 +232,30 @@ func fuseUsable() bool {
 func resolveBackend(o *cmdOpts) (string, error) {
 	switch o.backend {
 	case "fuse":
-		if !fuseUsable() {
-			return "", errors.New("--backend fuse: FUSE is not available on this host")
+		if ok, why := fuseUsable(); !ok {
+			return "", fmt.Errorf("--backend fuse: %s", why)
 		}
 		return "fuse", nil
 	case "nfs":
 		return "nfs", nil
 	case "", "auto":
-		if fuseUsable() {
+		ok, why := fuseUsable()
+		if ok {
 			return "fuse", nil
 		}
 		if runtime.GOOS == "darwin" {
 			return "nfs", nil
 		}
-		return "", errors.New("no usable mount backend: install FUSE, or use --backend nfs")
+		// NOT "or use --backend nfs". On Linux the loopback-NFS backend
+		// needs mount(2), which needs CAP_SYS_ADMIN, so advising it here
+		// sends an unprivileged user — the only kind that reaches this
+		// line — to a second failure with a worse message. macOS is the
+		// exception, and it is handled above: mount_nfs there works
+		// without privilege or a kext, which is why that backend exists.
+		return "", fmt.Errorf("cannot mount: %s. "+
+			"pelfs needs FUSE on Linux and has no fallback -- the NFS backend mounts with mount(2), "+
+			"which requires root. Nothing else about pelfs needs privileges: "+
+			"the binary is static, the state directory is under $HOME, and no step wants sudo", why)
 	default:
 		return "", fmt.Errorf("unknown --backend %q (want auto, fuse, or nfs)", o.backend)
 	}

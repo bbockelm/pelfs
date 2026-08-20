@@ -92,6 +92,7 @@ make integration # transport + publish/resolve against a real federation-in-a-bo
                  #  pelican binary via $PELICAN_BIN/$PELICAN_SRC)
 make mount-gate  # the kernel mount gate, in a container (see scripts/mount-gate-docker.sh)
 make opfuzz      # the overlay op-sequence fuzzer, in its sealed container
+make unprivileged # a linux/amd64 binary, run as a non-root user with no setup
 ```
 
 `cmd/fakeorigin` is a tiny origin-like HTTP server over a local directory,

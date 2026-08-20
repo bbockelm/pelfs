@@ -1,6 +1,6 @@
 ARCH  := $(shell go env GOARCH)
 
-.PHONY: all build linux test e2e integration mount-gate opfuzz vet clean
+.PHONY: all build linux test e2e integration mount-gate opfuzz unprivileged vet clean
 
 all: build
 
@@ -30,6 +30,11 @@ integration:
 
 opfuzz:
 	./scripts/opfuzz-docker.sh
+
+# The scenario a user actually has: a linux/amd64 binary on a host where
+# they are not root.
+unprivileged:
+	./scripts/unprivileged-docker.sh
 
 vet:
 	CGO_ENABLED=0 go vet ./...

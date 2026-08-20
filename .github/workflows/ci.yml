@@ -174,6 +174,47 @@ jobs:
       - name: Mount a published generation and benchmark it
         run: ./scripts/mount-gate-docker.sh
 
+  big-tree:
+    # The scale gate: 50,000 files (62,500 with the hard links) untarred
+    # through BOTH frontends, diffed live, sealed, cold-remounted into a
+    # state dir that has never existed, fsck'd, gc'd, and then done again
+    # as a second generation carrying adds, a modify and a delete.
+    #
+    # Until this existed, the largest tree CI put through a real mount was
+    # a handful of files, and the only big-tree numbers anyone had came
+    # from running a benchmark by hand and reading it.
+    #
+    # Measured 3.9 minutes end to end (Docker on an M-series Mac). The
+    # in-script cap is set below the job cap on purpose: it fails with a
+    # sentence about which phase stalled, where the job cap just kills the
+    # runner.
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.0"
+      - name: Enable FUSE
+        run: |
+          sudo modprobe fuse
+          sudo chmod 666 /dev/fuse
+      - name: 50k files, both frontends, two generations
+        env:
+          PELFS_GATE_TIMEOUT: "1200"
+          # Measured 1.46x at this size; the extra room is for a noisy
+          # shared runner, not for a slower write path.
+          PELFS_MAX_DECAY: "2.5"
+          PELFS_BENCH_OUT: ${{ github.workspace }}/bigtree-out
+        run: ./scripts/bench-untar-nfs-docker.sh 50000 2500 4
+      - name: Upload the gate's logs and diffs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: big-tree-logs
+          path: bigtree-out/
+          if-no-files-found: warn
+
   bench:
     # Benchmarks are not a pass/fail gate; they run to catch build rot in
     # the harness and to leave numbers in the log for comparison.

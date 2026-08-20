@@ -32,8 +32,14 @@ cleanup() {
     fusermount3 -u "$WORK/mnt" 2>/dev/null || fusermount -u "$WORK/mnt" 2>/dev/null || \
       umount "$WORK/mnt" 2>/dev/null || true
   fi
+  # The NFS leg is a real kernel mount too, and a leaked one makes the
+  # rm -rf below hang on a server that is already dead.
+  if mount | grep -q " $WORK/nfsmnt "; then
+    umount "$WORK/nfsmnt" 2>/dev/null || umount -l "$WORK/nfsmnt" 2>/dev/null || true
+  fi
   [ -n "${ORIGIN_PID:-}" ] && kill "$ORIGIN_PID" 2>/dev/null || true
   [ -n "${MOUNT_PID:-}" ] && kill "$MOUNT_PID" 2>/dev/null || true
+  [ -n "${NFS_PID:-}" ] && kill "$NFS_PID" 2>/dev/null || true
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -390,28 +396,46 @@ echo "strict prefetch verified: generation warmed, content byte-exact"
 echo "== NFS backend: the same stack, no FUSE in the data path =="
 unmount_at "$WORK/mnt"
 wait "$MOUNT_PID" 2>/dev/null || true
-if command -v mount.nfs >/dev/null 2>&1 || command -v mount >/dev/null 2>&1; then
-  mkdir -p "$WORK/nfsmnt"
-  if "$WORK/pelfs" mount-gen --backend nfs --state-dir "$WORK/state8" "$PREFIX" "$WORK/nfsmnt" 2>"$WORK/nfs.log" &
-  then
-    NFS_PID=$!
-    up=0
-    for _ in $(seq 100); do [ -e "$WORK/nfsmnt/dir/written.txt" ] && { up=1; break; }; sleep 0.1; done
-    if [ "$up" = "1" ]; then
-      grep -q "sealed write" "$WORK/nfsmnt/dir/written.txt"
-      cmp "$WORK/src/dir/big.bin" "$WORK/nfsmnt/dir/big.bin"
-      echo "NFS backend verified: content byte-exact through the OS NFS client"
-      unmount_at "$WORK/nfsmnt"
-      kill "$NFS_PID" 2>/dev/null || true
-    else
-      echo "NFS backend did not come up (container may lack NFS client support):"
-      sed 's/^/    /' "$WORK/nfs.log" | head -3
-      kill "$NFS_PID" 2>/dev/null || true
-    fi
-  fi
-else
-  echo "no NFS client in this image; skipping the NFS backend check"
-fi
+# No soft skip here. This script already refuses to run anywhere but
+# Linux, and the NFS backend is not a curiosity: it is the mount a macOS
+# box without macFUSE gets, so it is the path the project is developed on.
+#
+# The old guard asked `command -v mount.nfs || command -v mount`, and
+# /bin/mount exists in every image ever built — so the condition was
+# always true, the real requirement (mount.nfs, from nfs-common) went
+# unchecked, and when the client was absent the mount simply failed to
+# come up and the leg printed a note and PASSED. A gate that reports
+# success when it tested nothing is worse than no gate at all.
+command -v mount.nfs >/dev/null 2>&1 || {
+  echo "no mount.nfs on this host: the NFS leg needs a kernel NFS client" >&2
+  echo "(Debian/Ubuntu: nfs-common). scripts/mount-gate-docker.sh builds" >&2
+  echo "an image that has one — run the gate through that." >&2
+  exit 1
+}
+mkdir -p "$WORK/nfsmnt"
+"$WORK/pelfs" mount-gen --backend nfs --state-dir "$WORK/state8" "$PREFIX" "$WORK/nfsmnt" 2>"$WORK/nfs.log" &
+NFS_PID=$!
+up=0
+for _ in $(seq 100); do
+  [ -e "$WORK/nfsmnt/dir/written.txt" ] && { up=1; break; }
+  # A server that has already exited will never come up: say so now rather
+  # than after ten more seconds of polling a dead process.
+  kill -0 "$NFS_PID" 2>/dev/null || break
+  sleep 0.1
+done
+[ "$up" = "1" ] || {
+  echo "NFS backend did not come up:" >&2
+  sed 's/^/    /' "$WORK/nfs.log" >&2
+  kill "$NFS_PID" 2>/dev/null || true
+  exit 1
+}
+grep -q "sealed write" "$WORK/nfsmnt/dir/written.txt"
+cmp "$WORK/src/dir/big.bin" "$WORK/nfsmnt/dir/big.bin"
+echo "NFS backend verified: content byte-exact through the OS NFS client"
+unmount_at "$WORK/nfsmnt"
+kill "$NFS_PID" 2>/dev/null || true
+wait "$NFS_PID" 2>/dev/null || true
+NFS_PID=
 
 echo "== live refresh: a read-only mount follows the branch =="
 unmount_at "$WORK/mnt"

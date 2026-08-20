@@ -1406,6 +1406,40 @@ const slowCheckpoint = 10 * time.Second
 // path — and half of that was the follow phase, with the mount blocked.
 const checkpointBytes = 1 << 30
 
+// checkpointInodes is how many dirty inodes trigger a checkpoint
+// regardless of bytes or clock.
+//
+// Bytes are the wrong meter for a metadata-heavy session, and the failure
+// is the mirror image of the one that put the byte trigger here. A tree of
+// small files can dirty a million inodes without ever staging a gigabyte,
+// so neither of the other two triggers fires — and per-inode session state
+// grows the whole time: modSeq and the dirty set in the overlay, prov,
+// genfs residency, the memtable's location map, and, at the seal, an edge
+// map of the whole namespace. The audit measured about 600 B per file
+// across those, unbounded between checkpoints.
+//
+// A checkpoint is the only thing that gives that memory back: rebase drops
+// the overlay rows, modSeq, the dirty set and the provenance of every
+// inode it returns to clean, and the content store drops the extents those
+// rows named. So the trigger belongs where the memory does.
+//
+// 200,000 is ~120 MB at the measured per-inode cost — a fifth of what a
+// million-file session was carrying — and it is deliberately well above
+// the ~90k-file kernel tree the byte and time triggers already handle, so
+// no workload that checkpoints sensibly today starts checkpointing more
+// often because of this. It is the metadata equivalent of checkpointBytes:
+// pressure, not the clock, decides.
+const checkpointInodes = 200_000
+
+// checkpointDue reports whether what the overlay is holding justifies a
+// checkpoint on its own, without waiting for the interval. Either meter
+// alone is enough: they measure different resources — the uplink and the
+// machine's memory — and a session can sit at the limit of one while
+// nowhere near the other.
+func checkpointDue(staged int64, nodes int) bool {
+	return staged >= checkpointBytes || nodes >= checkpointInodes
+}
+
 // checkpointBacklogHold skips a pressure checkpoint while the uplink is
 // still working through what the session already produced.
 //
@@ -1431,19 +1465,25 @@ func pressureSampleInterval(every time.Duration) time.Duration {
 	return d
 }
 
-// stagedBytes reports how much content is waiting to be published, or -1
-// when the overlay cannot be sampled (it is being sealed, or is gone).
-func (g *genSession) stagedBytes() int64 {
+// pressure reports what the overlay is holding that a checkpoint would
+// publish: staged content bytes, and dirty inodes. Both are -1 when the
+// overlay cannot be sampled (it is being sealed, or is gone).
+//
+// The two are sampled together, from one Stats call, because they are two
+// meters on the same thing and a session can be at the limit of either
+// without approaching the other: a video file is bytes without inodes, an
+// unpacked source tree is inodes without bytes.
+func (g *genSession) pressure() (bytes int64, nodes int) {
 	g.ovMu.RLock()
 	defer g.ovMu.RUnlock()
 	if g.ov == nil || g.spent {
-		return -1
+		return -1, -1
 	}
 	st, err := g.ov.Stats()
 	if err != nil {
-		return -1
+		return -1, -1
 	}
-	return st.StagedBytes
+	return st.StagedBytes, st.DirtyNodes
 }
 
 func (g *genSession) checkpointPeriodically(ctx context.Context, every time.Duration) {
@@ -1472,8 +1512,8 @@ func (g *genSession) checkpointPeriodically(ctx context.Context, every time.Dura
 		case <-ctx.Done():
 			return
 		case <-sample.C:
-			staged := g.stagedBytes()
-			if staged < checkpointBytes {
+			staged, nodes := g.pressure()
+			if !checkpointDue(staged, nodes) {
 				continue
 			}
 			if backlog := g.uploadBacklog(); backlog > checkpointBacklogHold {
@@ -1497,8 +1537,12 @@ func (g *genSession) checkpointPeriodically(ctx context.Context, every time.Dura
 					"backoff", backoff.Round(time.Second), "error", err)
 			default:
 				backoff, retryAfter = 0, time.Time{}
-				ui.Info("checkpointed {staged} of staged content in {duration} ({summary})",
-					"staged", ui.ByteCount(staged), "duration", time.Since(start).Round(time.Millisecond),
+				// Which meter tripped is worth saying: a checkpoint that
+				// fired on inodes with almost nothing staged reads as
+				// pointless work unless the line names the reason.
+				ui.Info("checkpointed {staged} of staged content across {inodes} in {duration} ({summary})",
+					"staged", ui.ByteCount(staged), "inodes", ui.Count(nodes, "dirty inode"),
+					"duration", time.Since(start).Round(time.Millisecond),
 					"summary", summary)
 			}
 		case <-t.C:

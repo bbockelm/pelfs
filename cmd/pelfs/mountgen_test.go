@@ -829,8 +829,9 @@ func TestCheckpointFiresUnderWritePressure(t *testing.T) {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("staged %d bytes without a checkpoint; only the hour-long timer could publish it",
-				g.stagedBytes())
+			staged, nodes := g.pressure()
+			t.Fatalf("staged %d bytes across %d dirty inodes without a checkpoint; "+
+				"only the hour-long timer could publish it", staged, nodes)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -1076,4 +1077,38 @@ func incompressible(n int, seed int64) []byte {
 	b := make([]byte, n)
 	mrand.New(mrand.NewSource(seed)).Read(b)
 	return b
+}
+
+// TestCheckpointTriggersCoverBothMeters pins the rule a metadata-heavy
+// session depends on: bytes are not the only pressure. A tree of small
+// files can dirty hundreds of thousands of inodes without ever staging a
+// gigabyte, and until the inode meter existed nothing but the clock
+// published it — while per-inode session state (overlay modSeq and dirty
+// set, provenance, residency, the location map, the seal's edge map;
+// ~600 B/file measured) grew the whole time.
+func TestCheckpointTriggersCoverBothMeters(t *testing.T) {
+	cases := []struct {
+		what   string
+		staged int64
+		nodes  int
+		want   bool
+	}{
+		{what: "an idle session", staged: 0, nodes: 0, want: false},
+		{what: "bytes alone", staged: checkpointBytes, nodes: 12, want: true},
+		{what: "inodes alone", staged: 4 << 10, nodes: checkpointInodes, want: true},
+		{what: "just under both", staged: checkpointBytes - 1, nodes: checkpointInodes - 1, want: false},
+		// The unsampled overlay reports -1 for both, which must never read
+		// as pressure.
+		{what: "an overlay being sealed", staged: -1, nodes: -1, want: false},
+		// The workload the byte and time triggers already handle well: a
+		// kernel-tree extraction. It must NOT start checkpointing on the
+		// inode meter, or this trigger has made those sessions slower.
+		{what: "a 90k-file source tree", staged: 400 << 20, nodes: 90_000, want: false},
+	}
+	for _, c := range cases {
+		if got := checkpointDue(c.staged, c.nodes); got != c.want {
+			t.Errorf("%s (%d bytes, %d inodes): checkpointDue = %v, want %v",
+				c.what, c.staged, c.nodes, got, c.want)
+		}
+	}
 }

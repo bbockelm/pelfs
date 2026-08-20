@@ -1463,6 +1463,15 @@ func (p *pipeline) buildSuperblock(packList []superblock.PackEntry, shards []sup
 	grace := time.Duration(sb.Params.TGraceSeconds) * time.Second
 	sb.CondemnedIndexes = condemnLedger(p.prevCondemnedIndexes(), p.droppedIndexes, packIndexes, now, grace, "index")
 	sb.CondemnedManifests = condemnLedger(p.prevCondemnedManifests(), p.droppedManifests, manifests, now, grace, "manifest")
+	// And the pack ledger, which a seal only ever CARRIES — repack is its
+	// sole writer. A seal that forgot it left a repack's packs protected
+	// until the next checkpoint instead of for the grace window; see
+	// condemnPackLedger for what that cost. The packs this document ADDS
+	// are what listed-wins needs, and sealedSoFar answers that for both
+	// documents this builds — the packs cut so far for the backup, all of
+	// them for the head — without either caller having to say which it is.
+	sb.Condemned = condemnPackLedger(p.prevCondemnedPacks(),
+		addedPackNames(p.pk.sealedSoFar(), p.providedPacks), now, grace)
 	sb.RootCatalogHint = p.rootCatalogHint(rootID)
 	if p.o.DEK != nil {
 		// Catalog/shard/backup entries have no per-entry keyid column;

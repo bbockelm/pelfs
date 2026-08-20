@@ -3,6 +3,7 @@ package publish
 import (
 	"time"
 
+	"github.com/bbockelm/pelfs/internal/packstore"
 	"github.com/bbockelm/pelfs/internal/superblock"
 	"github.com/bbockelm/pelfs/internal/ui"
 )
@@ -48,6 +49,64 @@ func droppedRefs[T sizedRef](before, after []T) []string {
 		if _, ok := kept[r.RefName()]; !ok {
 			out = append(out, r.RefName())
 		}
+	}
+	return out
+}
+
+// prevCondemnedPacks is the parent's pack ledger, which this generation
+// carries forward until the entries age out.
+func (p *pipeline) prevCondemnedPacks() []superblock.CondemnedPack {
+	if p.o.Prev == nil {
+		return nil
+	}
+	return p.o.Prev.Condemned
+}
+
+// addedPackNames names the packs a document lists that its parent did not:
+// the only input the pack ledger's listed-wins rule needs from a seal.
+func addedPackNames(groups ...[]packstore.SealedPack) []string {
+	var out []string
+	for _, g := range groups {
+		for _, sp := range g {
+			out = append(out, sp.Name)
+		}
+	}
+	return out
+}
+
+// condemnPackLedger carries the condemned-PACK ledger forward. Publish
+// never ADDS to it — only a repack drops a pack from the pack list — so
+// every entry here came from a repack, and this seal's whole job is not to
+// lose them.
+//
+// IT USED TO LOSE ALL OF THEM. buildSuperblock assembled a fresh
+// superblock and simply never mentioned Condemned, so the first ordinary
+// checkpoint after a repack published a generation with an empty ledger.
+// The effect is not a tidiness bug: those packs are named by no live
+// superblock and are old by their own name, which is the exact pair of
+// conditions retention deletes on. The 72-hour window a repack promises a
+// pinned reader lasted until the next checkpoint — five minutes at the
+// default interval — and a mount still on the pre-repack generation reads
+// its packs LAZILY for the whole session, so the loss surfaces as EIO on
+// content nobody changed.
+//
+// `listed` is only the packs this generation ADDED, which is enough for
+// listed-wins: this generation's set is its parent's plus those, and the
+// parent applied the same rule, so nothing already on the ledger can be in
+// the carried part.
+//
+// Overflow cannot happen here and is reported rather than assumed away:
+// this call adds nothing, and repack paces a plan to what the ledger will
+// carry (repack.trimToLedger), so a ledger arriving over the cap means one
+// of those two statements has stopped being true.
+func condemnPackLedger(prev []superblock.CondemnedPack, listed []string,
+	now time.Time, grace time.Duration) []superblock.CondemnedPack {
+	out, overflow := superblock.CarryCondemnedPacks(prev, nil, listed, now, grace)
+	if overflow > 0 {
+		ui.Warn("publish: the condemned-pack ledger arrived over its {cap}-entry cap and this generation "+
+			"dropped the {n} oldest; a seal adds nothing to this ledger, so it was already over — those "+
+			"packs may now be swept before the {grace} grace window ends",
+			"cap", superblock.MaxCondemnedEntries, "n", overflow, "grace", grace)
 	}
 	return out
 }

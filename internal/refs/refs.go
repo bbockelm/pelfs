@@ -220,15 +220,64 @@ func (s *Store) Flip(ctx context.Context, branch string, raw []byte, expectETag 
 	return nil
 }
 
+// ErrTagExists reports an attempt to write a tag that is already there.
+//
+// It is a sentinel rather than a bare error because refusing is the
+// FEATURE: a tag is what a workflow pins a generation with when it needs
+// to outlive the grace window, so a tag that could be repointed would
+// silently unpin whatever a reader — or the retention sweep, which counts
+// tags as roots — was relying on. Callers surface it as advice ("pick
+// another name"), never as something to retry through.
+var ErrTagExists = errors.New("tag already exists")
+
+// ValidateName checks a ref or tag name against the rules both key spaces
+// share. It is exported so a command can refuse a bad name before it
+// spends a round trip on the head it was about to freeze.
+//
+// The rules are about what the KEY SPACE can represent, not taste:
+//
+//   - A separator would nest the object one level down, where the flat
+//     listing that enumerates branches and tags never sees it.
+//   - "." and ".." address the directory itself, or its parent.
+//   - A ".tmp" suffix is skipped by every listing that enumerates refs and
+//     tags (they are how a partial write announces itself), so such a tag
+//     would exist, verify, and mount — and be invisible to the retention
+//     sweep, which would then collect the packs it alone was pinning. That
+//     is the one rule here whose absence is silent data loss rather than a
+//     confusing error.
+//   - A control character in a name reaches a log line, a terminal, and an
+//     HTTP request line.
+func ValidateName(name string) error {
+	switch {
+	case name == "":
+		return errors.New("empty name")
+	case strings.ContainsAny(name, "/\\"):
+		return fmt.Errorf("invalid name %q: a ref or tag name cannot contain a path separator", name)
+	case name == "." || name == "..":
+		return fmt.Errorf("invalid name %q: that names a directory, not a ref", name)
+	case strings.HasSuffix(name, ".tmp"):
+		return fmt.Errorf("invalid name %q: a .tmp suffix marks a partial write, so listings skip it — "+
+			"a tag named this way would be invisible to the retention sweep and would pin nothing", name)
+	case len(name) > 255:
+		return fmt.Errorf("invalid name (%d bytes): a ref or tag name must fit in 255", len(name))
+	}
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("invalid name %q: it contains a control character", name)
+		}
+	}
+	return nil
+}
+
 // Tag freezes raw under tags/<name>. Tags are immutable: an existing tag
-// is never overwritten.
+// is never overwritten (ErrTagExists).
 func (s *Store) Tag(ctx context.Context, name string, raw []byte) error {
-	if strings.ContainsAny(name, "/\\") {
-		return fmt.Errorf("invalid tag name %q", name)
+	if err := ValidateName(name); err != nil {
+		return fmt.Errorf("tag: %w", err)
 	}
 	key := TagDirKey + "/" + name
 	if _, err := s.inner.StatKey(ctx, key); err == nil {
-		return fmt.Errorf("tag %s already exists", name)
+		return fmt.Errorf("%w: %s", ErrTagExists, name)
 	}
 	if err := s.inner.Put(ctx, key, strings.NewReader(string(raw))); err != nil {
 		return fmt.Errorf("create tag %s: %w", name, err)

@@ -621,9 +621,11 @@ pointing at it:
   prefix mounts `refs/main`.
 - **Tag** — an immutable ref: a frozen superblock under a name, never
   overwritten. Costs one tiny object; everything it references is shared.
-  Read-only tag mounts are the pinned-generation mounts. *Reading* a tag
-  is wired up (`--tag`); `refs.Store.Tag` exists but no command calls it,
-  so tags cannot currently be created through the CLI.
+  Read-only tag mounts are the pinned-generation mounts. Both ends are
+  wired: `pelfs tag <prefix> <name>` freezes a verified branch head (and
+  `--list` shows what is frozen), `--tag` mounts one. Creation refuses to
+  overwrite, which is the property the pin rests on. What is still missing
+  is DELETING a tag, so a pin is currently forever.
 - **Fork** — a new ref whose first superblock's parent is the forked
   generation, giving copy-on-write over the whole volume. **Not
   implemented.** The rules below are the design it would have to obey.
@@ -1535,10 +1537,11 @@ with:
 - **The "snapshot expired" reader error does not exist.** The window is
   enforced from the sweep side only. A reader that loses a generation this
   way finds out by failing to fetch something.
-- **Tag creation has no command.** `refs.Store.Tag` exists and works;
-  nothing user-facing calls it. Until that ships, the only pin the format
-  offers is one no user can create, which makes the two bullets above worse
-  than they read.
+- **Tag creation is `pelfs tag`.** It fetches the branch head under the
+  ordinary trust policy and freezes those exact bytes, so the bullets above
+  name an escape a user can actually take. Tag DELETION still has no
+  command, so the escape is one-way: a tag holds its generation until
+  someone removes the object by hand.
 
 ## Codec marking
 
@@ -1763,8 +1766,9 @@ counts match on both sides of it.
   about objects whose only cost is fetch time.
 - **`pelfs rescue`.** Fully specified; the format prerequisites shipped.
 - **Forks.** No command creates a ref from another generation.
-- **Tag creation.** `refs.Store.Tag` exists with no caller; tags can be
-  read (`--tag`) but not written.
+- **Ref deletion.** `pelfs tag` creates tags and publish creates branches;
+  nothing removes either, so the one operation that finally releases space
+  has no command.
 - **Key rotation.** `NextPub` is verified but never set.
 - **`splice`/`ReadResultFd`** on cache hits.
 - **The "snapshot expired" reader error.** The grace window is enforced

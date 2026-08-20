@@ -92,8 +92,11 @@ and no end-to-end run.
   the transport has no compare-and-swap. A seal that would overwrite another
   writer's generation is refused, so the failure mode is a rejected seal
   rather than silent corruption.
-- **No tag creation, no forks, no key rotation.** Tags can be read
-  (`--tag`) but not written. `pelfs rescue` is specified and not built.
+- **No ref deletion, no forks, no key rotation.** `pelfs tag` freezes a
+  branch head under a name and `--tag` mounts it, but nothing deletes a tag
+  or a branch — and deleting a ref is what finally releases its space, so a
+  tag pins its generation for good. `pelfs rescue` is specified and not
+  built.
 - The origin must permit GET/PUT/DELETE and listing on the prefix; `pelfs`
   checks this up front and names the missing scope.
 

@@ -13,6 +13,8 @@ pelfs mount  [--rw] pelican://.../scratch [mountpoint]     # background mount
 pelfs umount pelican://.../scratch                         # stop it cleanly
 pelfs status                                               # list background mounts
 pelfs gc     [--delete] pelican://.../scratch              # sweep unreferenced packs
+pelfs tag    pelican://.../scratch v1.0                    # freeze the head under a name
+pelfs tag    --list pelican://.../scratch                  # what is pinned here
 pelfs fsck   [--deep] pelican://.../scratch                # verify a generation
 pelfs repack-plan pelican://.../scratch                    # what a repack would rewrite
 pelfs repack [--apply] pelican://.../scratch               # rewrite it, publish a generation
@@ -222,5 +224,14 @@ a count of bytes, a duration a count of nanoseconds).
   manual `pelfs gc --delete`, and only once the grace window (72h, not
   configurable) has passed. `pelfs repack` with no flags reports what the
   volume is currently carrying.
-- Volume **tags cannot be created** yet (they can be read with `--tag`),
-  there is no **fork** command, and there is no **key rotation**.
+- **The grace window is what an untagged old generation gets.** The sweep
+  can enumerate exactly two things — branch heads and tags — so a
+  generation that is no longer the head is protected only by the 72h
+  window; past it, a repack may collect what only that generation named.
+  `pelfs tag <prefix> <name>` is the escape and the only one: a tagged
+  generation is in the live set permanently, so nothing it references is
+  ever swept. Tags are immutable (creating one over a name in use is
+  refused, not overwritten) and are mounted with `pelfs mount --tag`.
+- There is no **fork** command, no way to **delete** a tag or a branch, and
+  no **key rotation**. Deleting a ref is how space is finally released, so
+  until then a tag holds its generation forever.

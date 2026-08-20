@@ -8,6 +8,7 @@
 //	pelfs umount <prefix|mnt>        stop a background mount cleanly
 //	pelfs status                     list background mounts
 //	pelfs gc     [--delete] <prefix> find (remove) unreferenced pack objects
+//	pelfs tag    <prefix> <name>     freeze the branch head under a name
 //	pelfs fsck   <prefix>            verify a published generation
 //	pelfs repack-plan <prefix>       report what a repack would rewrite
 //	pelfs repack [--apply] <prefix>  rewrite mostly-dead packs, publish a generation
@@ -44,6 +45,8 @@ func main() {
 		code = cmdStatus(os.Args[2:])
 	case "gc":
 		code = cmdGC(os.Args[2:])
+	case "tag":
+		code = cmdTag(os.Args[2:])
 	case "ctl":
 		code = cmdCtl(os.Args[2:])
 	case "init":
@@ -84,6 +87,9 @@ Usage:
   pelfs umount <prefix-or-mountpoint>                     stop a background mount
   pelfs status                                            list background mounts
   pelfs gc     [flags] [--delete] <prefix>                sweep unreferenced packs
+  pelfs tag    [flags] <prefix> <name>                    freeze the branch head under
+                                                          a name, retained forever
+  pelfs tag    --list <prefix>                            list this volume's tags
   pelfs mount-gen [flags] [--rw] <prefix> <mountpoint>    mount one generation
                   [--subshell] [-- <command> [args...]]   run in the mount, then unmount
   pelfs ctl    <prefix-or-mountpoint> <verb>              control a running mount

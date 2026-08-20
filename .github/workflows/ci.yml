@@ -19,8 +19,13 @@ jobs:
           go-version: "1.26.x"
       - name: Vet
         run: CGO_ENABLED=0 go vet ./...
+      # ./... rather than ./internal/...: cmd/pelfs holds the tests for the
+      # mount session itself -- the exit seal, the checkpoint cadence, what a
+      # FAILED seal leaves behind. Every one of them stands up its own
+      # httptest fakeorigin and needs nothing but loopback, so the paths
+      # closest to a user were being left out of CI for no reason at all.
       - name: Unit tests
-        run: CGO_ENABLED=0 go test -count=1 ./internal/...
+        run: CGO_ENABLED=0 go test -count=1 ./...
       - name: Cross-builds (cgo-free)
         run: |
           CGO_ENABLED=0 GOOS=linux  GOARCH=amd64 go build -o /dev/null ./cmd/pelfs

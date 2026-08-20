@@ -383,7 +383,23 @@ func Open(dir string, base *genfs.FS, opts Options) (*FS, error) {
 
 // Close releases the database. Staging files and all dirty state persist
 // for the next Open.
+//
+// It takes the operation lock, because closing is not exempt from the
+// serialization every other method here runs under. Without it a teardown
+// could land in the MIDDLE of an operation and pull the statement cache
+// and the connection pool out from under a query already in flight — a
+// session closing its overlay while a background checkpoint was inside
+// Rebase, which is where this was found. Close now waits for the
+// operation to finish, as any other operation would.
+//
+// Waiting is bounded by the operation ahead of it, and Rebase — the long
+// one — releases the lock between batches by design, so a Close can still
+// land mid-rebase. What it cannot do any more is land mid-QUERY: the
+// batch after it finds the pool closed and returns an error, and a failed
+// rebase costs performance, never correctness (see Rebase).
 func (fs *FS) Close() error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
 	if fs.q != nil {
 		fs.q.close()
 	}

@@ -30,6 +30,24 @@ type stmtCache struct {
 	// cannot be compiled costs one failed attempt rather than one per
 	// transaction forever.
 	uncachable map[string]struct{}
+	// closed is set by close and never cleared. It is the reason the maps
+	// above may be nil, and every method below consults it FIRST.
+	//
+	// A closed cache still gets called. FS.Close drops the statements and
+	// THEN closes the pool, so for the instant between those two the maps
+	// are gone while db.Prepare still works — and a caller landing there
+	// used to take prep's compile path and assign into a map close had
+	// just nilled. That is "assignment to entry in nil map", and it is how
+	// a background checkpoint's Rebase died when the session tore the
+	// overlay down underneath it. Nothing about it is a data race: every
+	// access here is already under mu, which is exactly why the race
+	// detector never named it.
+	//
+	// Closed means one thing everywhere: compile nothing, remember
+	// nothing, and let the caller fall back to the pool — which reports
+	// "sql: database is closed" once the pool is gone. An error, never a
+	// panic.
+	closed bool
 }
 
 func newStmtCache(db *sql.DB) *stmtCache {
@@ -52,14 +70,18 @@ func newStmtCache(db *sql.DB) *stmtCache {
 func (c *stmtCache) prep(query string) *sql.Stmt {
 	c.mu.RLock()
 	st, ok := c.m[query]
+	closed := c.closed
 	c.mu.RUnlock()
 	if ok {
 		return st
 	}
+	if closed {
+		return nil
+	}
 	st, err := c.db.Prepare(query)
 	if err != nil {
 		c.mu.Lock()
-		if c.uncachable != nil {
+		if !c.closed {
 			c.uncachable[query] = struct{}{}
 		}
 		c.mu.Unlock()
@@ -70,6 +92,15 @@ func (c *stmtCache) prep(query string) *sql.Stmt {
 		c.mu.Unlock()
 		st.Close() //nolint:errcheck
 		return existing
+	}
+	if c.closed {
+		// close ran while this was compiling. The statement belongs to
+		// nobody now — the cache will never be read again and the pool is
+		// on its way out — so it is released here rather than handed to a
+		// caller who would execute it against a closing connection.
+		c.mu.Unlock()
+		st.Close() //nolint:errcheck
+		return nil
 	}
 	c.m[query] = st
 	delete(c.pending, query)
@@ -84,12 +115,13 @@ func (c *stmtCache) lookup(query string) *sql.Stmt {
 	c.mu.RLock()
 	st, ok := c.m[query]
 	_, bad := c.uncachable[query]
+	closed := c.closed
 	c.mu.RUnlock()
-	if ok || bad {
+	if ok || bad || closed {
 		return st
 	}
 	c.mu.Lock()
-	if c.pending != nil {
+	if !c.closed {
 		c.pending[query] = struct{}{}
 	}
 	c.mu.Unlock()
@@ -101,11 +133,16 @@ func (c *stmtCache) lookup(query string) *sql.Stmt {
 func (c *stmtCache) warm() {
 	c.mu.RLock()
 	n := len(c.pending)
+	closed := c.closed
 	c.mu.RUnlock()
-	if n == 0 {
+	if n == 0 || closed {
 		return
 	}
 	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
 	queries := make([]string, 0, len(c.pending))
 	for q := range c.pending {
 		queries = append(queries, q)
@@ -138,9 +175,12 @@ func (c *stmtCache) Exec(query string, args ...any) (sql.Result, error) {
 	return c.db.Exec(query, args...)
 }
 
+// close releases every compiled statement. Calls that arrive afterwards
+// are answered uncached (see closed); it is idempotent.
 func (c *stmtCache) close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.closed = true
 	for _, st := range c.m {
 		st.Close() //nolint:errcheck
 	}

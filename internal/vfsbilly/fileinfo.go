@@ -10,6 +10,7 @@ import (
 
 	"github.com/bbockelm/pelfs/internal/catalog"
 	"github.com/bbockelm/pelfs/internal/genfs"
+	"github.com/bbockelm/pelfs/internal/idmap"
 )
 
 // info presents a genfs.Node as os.FileInfo.
@@ -27,7 +28,11 @@ type info struct {
 
 var _ os.FileInfo = (*info)(nil)
 
-func newInfo(name string, n genfs.Node) *info {
+func newInfo(name string, n genfs.Node, ids idmap.Map) *info {
+	// Whose name to put on it. The NFS backend serves the same volumes the
+	// FUSE one does, from the same machines, so it answers the ownership
+	// question the same way (internal/idmap).
+	uid, gid := ids.Apply(n.UID, n.GID)
 	nlink := n.Nlink
 	if nlink == 0 {
 		nlink = 1
@@ -36,8 +41,8 @@ func newInfo(name string, n genfs.Node) *info {
 	// scratch volume, and splitting rdev portably needs x/sys/unix.
 	return &info{name: name, node: n, sys: nfsfile.FileInfo{
 		Nlink:  nlink,
-		UID:    n.UID,
-		GID:    n.GID,
+		UID:    uid,
+		GID:    gid,
 		Fileid: n.Inode,
 	}}
 }

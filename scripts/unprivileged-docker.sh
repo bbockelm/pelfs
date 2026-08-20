@@ -32,7 +32,7 @@ trap 'rm -rf "$STAGE"' EXIT
 
 command -v docker >/dev/null || { echo "docker is required" >&2; exit 1; }
 
-IMAGE_TAG="pelfs-unpriv-runner:1"
+IMAGE_TAG="pelfs-unpriv-runner:2"
 if ! docker image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
   echo "== building the test image (once) =="
   # fuse3 only. Deliberately NO nfs-common and NO curl: the point is what
@@ -42,7 +42,10 @@ if ! docker image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
 FROM --platform=linux/$ARCH ${IMAGE}
 RUN apt-get -qq update && apt-get -qq install -y fuse3 \
  && rm -rf /var/lib/apt/lists/*
-RUN useradd -m -u 1001 nobody-ish
+# Two ordinary users, because fusermount3 refuses to mount for a uid it
+# cannot map to a name ("could not determine username") -- which a real
+# login node always can, and a bare container cannot.
+RUN useradd -m -u 1001 first-user && useradd -m -u 1002 second-user
 DOCKERFILE
 fi
 
@@ -51,7 +54,8 @@ echo "== cross-compiling for linux/$ARCH =="
 (cd "$REPO" && CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" go build -o "$STAGE/fakeorigin" ./cmd/fakeorigin)
 cp "$REPO/scripts/unprivileged-test.sh" "$STAGE/test.sh"
 cp "$REPO/scripts/unprivileged-nofuse.sh" "$STAGE/nofuse.sh"
-chmod 0755 "$STAGE"/pelfs "$STAGE"/fakeorigin "$STAGE"/test.sh "$STAGE"/nofuse.sh
+cp "$REPO/scripts/unprivileged-uidmap.sh" "$STAGE/uidmap.sh"
+chmod 0755 "$STAGE"/pelfs "$STAGE"/fakeorigin "$STAGE"/test.sh "$STAGE"/nofuse.sh "$STAGE"/uidmap.sh
 
 # The DIAGNOSIS half, in a container with no /dev/fuse at all. This is
 # what a locked-down host looks like, and the message it produces is the
@@ -68,6 +72,33 @@ docker run --rm \
   -w /work \
   "$IMAGE_TAG" \
   /bin/sh /stage/nofuse.sh
+
+# One volume, two uids: created by 1001 and then mounted and written by
+# 1002. The origin is a shared bind mount because that is what makes them
+# the same volume rather than two.
+SHARED="$(mktemp -d)"
+trap 'rm -rf "$STAGE" "$SHARED"' EXIT
+chmod 0777 "$SHARED"
+uidphase() {
+  docker run --rm \
+    --device /dev/fuse \
+    --cap-add SYS_ADMIN \
+    --security-opt apparmor=unconfined \
+    --user "$1:$1" \
+    --network none \
+    --platform "linux/$ARCH" \
+    -v "$STAGE":/stage:ro \
+    -v "$SHARED":/shared \
+    --tmpfs /work:rw,size=256m,exec,uid=$1,gid=$1 \
+    -e HOME=/work/home \
+    -e TMPDIR=/work \
+    -w /work \
+    "$IMAGE_TAG" \
+    /bin/sh /stage/uidmap.sh "$2"
+}
+echo "== one volume, two uids: the cluster-vs-laptop case =="
+uidphase 1001 create
+uidphase 1002 use
 
 echo "== running as uid 1001 with no privileges =="
 exec docker run --rm \

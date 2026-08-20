@@ -34,6 +34,7 @@ import (
 
 	"github.com/bbockelm/pelfs/internal/catalog"
 	"github.com/bbockelm/pelfs/internal/genfs"
+	"github.com/bbockelm/pelfs/internal/idmap"
 	"github.com/bbockelm/pelfs/internal/overlay"
 )
 
@@ -57,10 +58,14 @@ type reader interface {
 // every mutating call is refused with a permission error, the op
 // understood and denied rather than unimplemented.
 type billyFS struct {
-	rd   reader
-	ov   *overlay.FS
-	uid  uint32
-	gid  uint32
+	rd  reader
+	ov  *overlay.FS
+	uid uint32
+	gid uint32
+	// ids translates the volume's own identity onto this process, so a
+	// volume made under one uid is writable when mounted under another
+	// (internal/idmap).
+	ids  idmap.Map
 	dirs *dirCache
 }
 
@@ -78,12 +83,26 @@ var (
 // creates are owned by the invoking user: the volume is a single-user
 // scratch space and the mount must be able to write what it made.
 func New(ov *overlay.FS) billy.Filesystem {
-	return &billyFS{rd: ov, ov: ov, uid: uint32(os.Getuid()), gid: uint32(os.Getgid()), dirs: newDirCache()}
+	return &billyFS{rd: ov, ov: ov, uid: uint32(os.Getuid()), gid: uint32(os.Getgid()),
+		ids: volumeOwner(ov), dirs: newDirCache()}
 }
 
 // NewReadOnly returns a billy.Filesystem over an immutable generation.
 func NewReadOnly(fs *genfs.FS) billy.Filesystem {
-	return &billyFS{rd: fs, uid: uint32(os.Getuid()), gid: uint32(os.Getgid()), dirs: newDirCache()}
+	return &billyFS{rd: fs, uid: uint32(os.Getuid()), gid: uint32(os.Getgid()),
+		ids: volumeOwner(fs), dirs: newDirCache()}
+}
+
+// volumeOwner reads the identity a volume was created under, from its
+// root. A root that will not stat leaves the zero map, which translates
+// uid 0 -- the identity most worth mapping, and the one a volume rooted
+// at root would otherwise be stuck with.
+func volumeOwner(rd reader) idmap.Map {
+	n, err := rd.GetAttr(ctx(), genfs.RootInode)
+	if err != nil {
+		return idmap.Owner(0, 0)
+	}
+	return idmap.Owner(n.UID, n.GID)
 }
 
 // ctx is the request context. billy carries none, and neither layer
@@ -317,7 +336,7 @@ func (b *billyFS) Stat(filename string) (os.FileInfo, error) {
 	if err != nil {
 		return nil, pe("stat", filename, err)
 	}
-	return newInfo(path.Base(clean(filename)), n), nil
+	return newInfo(path.Base(clean(filename)), n, b.ids), nil
 }
 
 func (b *billyFS) Lstat(filename string) (os.FileInfo, error) {
@@ -325,7 +344,7 @@ func (b *billyFS) Lstat(filename string) (os.FileInfo, error) {
 	if err != nil {
 		return nil, pe("lstat", filename, err)
 	}
-	return newInfo(path.Base(clean(filename)), n), nil
+	return newInfo(path.Base(clean(filename)), n, b.ids), nil
 }
 
 func (b *billyFS) Rename(oldpath, newpath string) error {
@@ -411,7 +430,7 @@ func (b *billyFS) ReadDir(p string) ([]os.FileInfo, error) {
 	}
 	out := make([]os.FileInfo, 0, len(entries))
 	for _, e := range entries {
-		out = append(out, newInfo(e.Name, e.Node))
+		out = append(out, newInfo(e.Name, e.Node, b.ids))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name() < out[j].Name() })
 	return out, nil

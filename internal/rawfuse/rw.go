@@ -326,7 +326,7 @@ func (r *raw) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse.A
 	if err != nil {
 		return errStatus(err)
 	}
-	fillAttr(&n, &out.Attr)
+	r.fillAttr(&n, &out.Attr)
 	out.SetTimeout(r.validity(input.NodeId))
 	return fuse.OK
 }

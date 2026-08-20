@@ -30,6 +30,7 @@ import (
 
 	"github.com/bbockelm/pelfs/internal/catalog"
 	"github.com/bbockelm/pelfs/internal/genfs"
+	"github.com/bbockelm/pelfs/internal/idmap"
 	"github.com/bbockelm/pelfs/internal/overlay"
 	"github.com/bbockelm/pelfs/internal/ui"
 )
@@ -92,6 +93,19 @@ func newRaw(rd reader, ov *overlay.FS) *raw {
 	if ov != nil {
 		r.dirty = newDirtySet(ov)
 	}
+	// The volume's own identity, read from its root, is what gets mapped
+	// onto this process (internal/idmap). Asked once, here, because the
+	// root's ownership is a property of the volume rather than of any
+	// request — and because doing it per attr would be a lookup per
+	// readdir entry.
+	//
+	// A root that will not stat leaves the zero map, which translates uid
+	// 0 and gid 0. That is the right accident: a volume nobody can read
+	// the root of is one this cannot help, and uid 0 is the identity most
+	// worth mapping anyway.
+	if n, err := rd.GetAttr(context.Background(), genfs.RootInode); err == nil {
+		r.ids = idmap.Owner(n.UID, n.GID)
+	}
 	return r
 }
 
@@ -140,6 +154,10 @@ type dirHandle struct {
 type raw struct {
 	fuse.RawFileSystem
 	fs reader
+	// ids is whose name this mount puts on what it serves. A volume is
+	// mounted from machines where the same person has different uids, so
+	// the stored owner is reported only when asked for (internal/idmap).
+	ids idmap.Map
 	// ov is the write half; nil means a read-only binding.
 	ov *overlay.FS
 	// dirty is the TTL predicate, nil alongside ov.
@@ -269,14 +287,13 @@ func typeBits(t uint8) uint32 {
 
 // fillAttr projects a genfs node onto a FUSE Attr. Catalogs carry no atime
 // (by design); mtime stands in.
-func fillAttr(n *genfs.Node, a *fuse.Attr) {
+func (r *raw) fillAttr(n *genfs.Node, a *fuse.Attr) {
 	a.Ino = n.Inode
 	a.Size = uint64(n.Length)
 	a.Blocks = uint64(n.Length+511) / 512
 	a.Mode = typeBits(n.Type) | (n.Mode &^ uint32(syscall.S_IFMT))
 	a.Nlink = n.Nlink
-	a.Uid = n.UID
-	a.Gid = n.GID
+	a.Uid, a.Gid = r.ids.Apply(n.UID, n.GID)
 	a.Rdev = n.Rdev
 	a.Blksize = 4096
 	a.Mtime = uint64(n.MtimeNS / 1e9)
@@ -310,7 +327,7 @@ func (r *raw) isDirty(ino uint64) bool {
 func (r *raw) fillEntry(n *genfs.Node, out *fuse.EntryOut) {
 	out.NodeId = n.Inode
 	out.Generation = 0
-	fillAttr(n, &out.Attr)
+	r.fillAttr(n, &out.Attr)
 	v := r.validity(n.Inode)
 	out.SetEntryTimeout(v)
 	out.SetAttrTimeout(v)
@@ -336,7 +353,7 @@ func (r *raw) GetAttr(cancel <-chan struct{}, input *fuse.GetAttrIn, out *fuse.A
 	if err != nil {
 		return errStatus(err)
 	}
-	fillAttr(&n, &out.Attr)
+	r.fillAttr(&n, &out.Attr)
 	out.SetTimeout(r.validity(input.NodeId))
 	return fuse.OK
 }

@@ -127,9 +127,23 @@ func (sb *Superblock) Contributors() []Contributor {
 // CheckSize refuses an encoding that has eaten its budget, naming what ate
 // it. encoded is the length of what Encode returned.
 //
-// Both writers call it on every superblock they build, the backup
-// included: a backup over budget is a final superblock over budget one
-// step later, and failing at the earlier one costs the seal less.
+// WHICH DOCUMENTS IT GOVERNS, because getting this wrong costs seals that
+// were never in danger. The budget exists because a MUTABLE object is read
+// through pelicanobj.ReadMutable's 1 MiB ceiling, and exactly two kinds of
+// object are read that way: refs/<branch> and tags/<name>. So every writer
+// calls this on the document it is about to FLIP, and on nothing else.
+//
+// The disaster-recovery backup is the document this does NOT govern, and
+// the reason is not leniency. It is an entry inside a pack, reached by a
+// whole-pack fetch through a trailer, with no cap anywhere on that path.
+// It also has a different SHAPE from the head it accompanies: the backup
+// states its packs inline (publish.backupPackList) while the head states
+// them through manifest refs, so the backup grows with pack count and the
+// head does not. Checking it refused seals whose head was under a kilobyte
+// — a first ingest past about 6,000 packs, which at the default cut is any
+// tree over ~12 GB. "A backup over budget is a head over budget one step
+// later" was true while both documents carried the list inline, and stopped
+// being true when the backup started carrying it alone.
 func (sb *Superblock) CheckSize(encoded int) error {
 	if int64(encoded) <= MaxEncodedBytes {
 		return nil

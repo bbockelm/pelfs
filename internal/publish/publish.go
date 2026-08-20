@@ -441,9 +441,19 @@ func Publish(ctx context.Context, o Options) (*Result, error) {
 		return nil, err
 	}
 	// This is the document that becomes the branch head, so it answers to
-	// the writer's invariants; the backup built above is exempt by
-	// construction and says why (superblock.Validate).
+	// the writer's invariants; the backup built above is exempt from both of
+	// them by construction and each says why (superblock.Validate,
+	// superblock.CheckSize).
+	//
+	// The size is checked on the way OUT, which is the only place it can be
+	// checked at all: nothing about the fields says how many bytes they came
+	// to, and a superblock past the read cap is unreadable by the very
+	// publish that would fix it. A refused seal costs the uploads it already
+	// did and leaves the volume exactly as mountable as it was.
 	if err := sb.Validate(); err != nil {
+		return nil, fmt.Errorf("publish: %w", err)
+	}
+	if err := sb.CheckSize(len(raw)); err != nil {
 		return nil, fmt.Errorf("publish: %w", err)
 	}
 	if err := flip(ctx, o, raw); err != nil {
@@ -1498,14 +1508,14 @@ func (p *pipeline) buildSuperblock(packList []superblock.PackEntry, shards []sup
 	if err != nil {
 		return nil, nil, fmt.Errorf("publish: encode superblock: %w", err)
 	}
-	// Checked on the way OUT, which is the only place it can be checked at
-	// all: nothing about the fields above says how many bytes they came to,
-	// and a superblock past the ceiling is unreadable by the very publish
-	// that would fix it. A refused seal costs the uploads it already did
-	// and leaves the volume exactly as mountable as it was.
-	if err := sb.CheckSize(len(raw)); err != nil {
-		return nil, nil, fmt.Errorf("publish: %w", err)
-	}
+	// NO SIZE CHECK HERE. The write budget governs the object a reader
+	// fetches through pelicanobj.ReadMutable — refs/<branch> and
+	// tags/<name>, which are capped at 1 MiB — and this function builds two
+	// documents, only one of which ever lands there. The caller that flips
+	// a head checks it (Seal); the disaster-recovery backup is an entry
+	// inside a pack, read by whole-pack fetch with no cap at all, and
+	// checking it would refuse seals that are perfectly sound. See
+	// superblock.CheckSize.
 	return sb, raw, nil
 }
 

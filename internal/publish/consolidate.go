@@ -40,13 +40,19 @@ type sizedRef interface {
 // there a large tier is strictly better.
 //
 // What the ceiling is really set by is the seal, in two ways. It is what
-// one seal may spend on a merge it did not ask for, and — until the
-// upload path streams — it is also the seal's peak memory, because
-// publish hashes and uploads a []byte (mergeIndexes, mergeManifests) even
-// though mpi.MergeTo and manifest.MergeTo can now spool. 64 MiB keeps
-// both of those in the range a seal already works in. Wiring the upload
-// through a spool file is what would let this grow, and with it the
-// frozen tail below.
+// one seal may spend — download, merge, upload — on work it did not ask
+// for, in the middle of a checkpoint a user is waiting on. And it is the
+// seal's peak memory, though no longer because of the OUTPUT: mergeIndexes
+// and mergeManifests spool the merged object to a file, hash it on the way
+// through and upload from that file, so the result never sits in memory
+// whatever size it reaches. What does sit in memory is the INPUTS, because
+// mpi.FetchAll and manifest.FetchAll read each segment whole to verify it
+// against the hash the superblock signed — a merge therefore holds up to
+// refTargetBytes of inputs at once, and that is the binding constraint on
+// raising this number. Verifying a segment without holding it (a windowed,
+// incrementally-checked read, which the packidx form already supports for
+// LOOKUPS) is what a larger ceiling would have to address first, and with
+// it the frozen tail below.
 const refTargetBytes = 64 << 20
 
 // refTierBase is the size below which refs are dust: a run summing to

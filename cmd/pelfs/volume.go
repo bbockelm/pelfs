@@ -40,7 +40,13 @@ func loadOrCreateSigningKey(path string, prev *superblock.Superblock) (ed25519.P
 		if prev != nil {
 			pub := priv.Public().(ed25519.PublicKey)
 			if !strings.EqualFold(hex.EncodeToString(pub), hex.EncodeToString(prev.SigningPub[:])) {
-				return nil, fmt.Errorf("signing key %s does not match the branch head's key %x (readers would reject the generation; import the volume key or rotate via NextPub)",
+				// The advice has to be advice a user can take. This used to
+				// offer "or rotate via NextPub", which is not a thing anyone
+				// can do: the format carries a successor-key announcement and
+				// nothing in this tool writes one, so the only way forward is
+				// the key that signed the branch.
+				return nil, fmt.Errorf("signing key %s does not match the branch head's key %x — readers would "+
+					"reject the generation, so import the key that signed this volume (key rotation is not supported yet)",
 					path, prev.SigningPub[:8])
 			}
 		}

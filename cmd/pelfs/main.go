@@ -10,6 +10,8 @@
 //	pelfs gc     [--delete] <prefix> find (remove) unreferenced pack objects
 //	pelfs tag    <prefix> <name>     freeze the branch head under a name
 //	pelfs tag    --rm <prefix> <name> delete a tag; the next gc reclaims what it pinned
+//	pelfs branch <prefix> <name>     start a second line of history at a head
+//	pelfs branch --rm <prefix> <name> delete a branch (never the last one)
 //	pelfs fsck   <prefix>            verify a published generation
 //	pelfs repack-plan <prefix>       report what a repack would rewrite
 //	pelfs repack [--apply] <prefix>  rewrite mostly-dead packs, publish a generation
@@ -48,6 +50,8 @@ func main() {
 		code = cmdGC(os.Args[2:])
 	case "tag":
 		code = cmdTag(os.Args[2:])
+	case "branch":
+		code = cmdBranch(os.Args[2:])
 	case "ctl":
 		code = cmdCtl(os.Args[2:])
 	case "init":
@@ -93,6 +97,11 @@ Usage:
   pelfs tag    --list <prefix>                            list this volume's tags
   pelfs tag    --rm <prefix> <name>                       delete a tag; the next gc
                                                           reclaims what it was pinning
+  pelfs branch [--from b|--from-tag t] <prefix> <name>    start a second line of history
+                                                          at that head, advancing on its own
+  pelfs branch --list <prefix>                            list this volume's branches
+  pelfs branch --rm <prefix> <name>                       delete a branch; never the last
+                                                          one, and gc reclaims later
   pelfs mount-gen [flags] [--rw] <prefix> <mountpoint>    mount one generation
                   [--subshell] [-- <command> [args...]]   run in the mount, then unmount
   pelfs ctl    <prefix-or-mountpoint> <verb>              control a running mount

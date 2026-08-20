@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
@@ -332,6 +333,101 @@ func (s *Store) DeleteTag(ctx context.Context, name string) error {
 		return fmt.Errorf("delete tag %s: %w", name, err)
 	}
 	return nil
+}
+
+// ErrNoSuchBranch reports a branch operation naming a ref that is not
+// there. It exists for ErrNoSuchTag's reason: the store's Delete treats a
+// missing key as success, which is right for an idempotent sweep and wrong
+// for a verb a user typed, so absence is established before the removal
+// rather than inferred from it.
+var ErrNoSuchBranch = errors.New("no such branch")
+
+// ListBranches names every branch of the volume, sorted.
+//
+// The two exclusions are the ones every enumeration of a ref key space
+// applies, and they are not cosmetic: a directory is not a ref, and a
+// ".tmp" suffix marks a partial write, so a listing that showed either
+// would report a branch that no reader can fetch. The retention sweep
+// applies exactly these (retention.listNames), which is what makes "how
+// many branches does this volume have" the same question here and there.
+//
+// An absent refs directory is an empty listing rather than an error: it is
+// what a prefix that holds no volume looks like, and the callers — a
+// listing verb, and the check that refuses to delete the last branch —
+// both read zero as "nothing here" rather than as a failure.
+func (s *Store) ListBranches(ctx context.Context) ([]string, error) {
+	entries, err := s.inner.ListDir(ctx, RefDirKey)
+	if err != nil {
+		if isAbsent(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("list %s: %w", RefDirKey, err)
+	}
+	var names []string
+	for _, e := range entries {
+		if e.IsDir || strings.HasSuffix(e.Name, ".tmp") {
+			continue
+		}
+		names = append(names, e.Name)
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// DeleteBranch removes refs/<name> and forgets the branch locally.
+//
+// It mirrors DeleteTag, including the part that looks like an omission: no
+// signature is required. Removing an object is inside the availability half
+// of the threat model (docs/design-packfs.md, "Threat model") — whoever can
+// delete refs/dev can overwrite refs/main — and requiring one would make
+// the branch most worth removing, the one a rotated key left behind, the
+// one branch that could never be removed.
+//
+// WHAT IT ALSO DOES, and DeleteTag does not, is drop this client's record
+// of the branch's last accepted generation (lastPath). That record is the
+// rollback check's entire memory: it says "this client has already seen
+// generation N on this name". Once the name has no ref under it the
+// statement is about nothing, and leaving it behind sets a trap — a branch
+// re-created at an older generation, which is the ordinary result of
+// branching from a tag, would be refused as a stale read by the one client
+// that deleted it. The pin is untouched, because the pin is VOLUME-level
+// (pinPath) and a deleted branch says nothing about the volume's identity.
+//
+// THE LIMIT, since it is local state: only the client that runs this
+// forgets. Another client that had fetched the old branch still holds its
+// record, and a re-created branch at a lower generation reads to that
+// client as exactly what the check is for. There is no way around it from
+// here — the record is local by design, so that a stale read can be caught
+// without trusting the origin to admit one.
+//
+// WHAT DELETION IS NOT is a reclaim, again as for a tag: the generation
+// leaves the sweep's root set, and its objects go on the next `pelfs gc`
+// past the grace window.
+func (s *Store) DeleteBranch(ctx context.Context, name string) error {
+	if err := ValidateName(name); err != nil {
+		return fmt.Errorf("delete branch: %w", err)
+	}
+	key := refKey(name)
+	if _, err := s.inner.StatKey(ctx, key); err != nil {
+		return fmt.Errorf("%w: %s", ErrNoSuchBranch, name)
+	}
+	if err := s.inner.Delete(ctx, key); err != nil {
+		return fmt.Errorf("delete branch %s: %w", name, err)
+	}
+	// Best effort, and after the object is gone: the branch is deleted
+	// whatever the local filesystem thinks, and a stale record is a
+	// confusing refusal rather than damage.
+	os.Remove(s.lastPath(name)) //nolint:errcheck
+	return nil
+}
+
+// isAbsent reports a listing error meaning "the directory is not there",
+// as opposed to "the answer is unknown". The transports do not model it as
+// a type, so this is the same string test the sweep uses.
+func isAbsent(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "404") || strings.Contains(msg, "not exist") ||
+		strings.Contains(msg, "no such file")
 }
 
 // Verify decodes and verifies a superblock the caller got from somewhere

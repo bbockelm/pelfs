@@ -202,6 +202,19 @@ func (v *Volume) Publish(o publish.Options) *publish.Result {
 	return res
 }
 
+// SetBranch points the volume's next Publish at another ref.
+//
+// It is deliberately separate from Adopt, because the two halves are
+// separate in reality: a branch is a NAME over a generation, so publishing
+// onto one means both building on that branch's head (Adopt) and flipping
+// that branch's ref (this). A test that did one without the other would be
+// describing something the tool cannot do, and would prove nothing about
+// it.
+func (v *Volume) SetBranch(name string) { v.opts.Branch = name }
+
+// Branch is the ref the next Publish flips.
+func (v *Volume) Branch() string { return v.opts.Branch }
+
 // Adopt re-seats the volume on a generation SOMEONE ELSE published — a
 // repack, or a second writer — exactly as a mount does when it notices the
 // branch has moved (genfs.Swap).

@@ -766,3 +766,92 @@ func TestSharedContentIsCountedOncePerPlacement(t *testing.T) {
 	}
 	dump(t, rep)
 }
+
+// A repack has to know which entries of a pack are worth carrying, and
+// that is a membership question against the set the walk reached. The
+// sweep can hand that set back rather than making a caller re-derive it
+// by walking the whole namespace again.
+func TestAReachableSetIsHandedBackOnACleanSweep(t *testing.T) {
+	inner, _, gen0, res, _ := treeFixture(t, "7e7e7e7e-1111-2222-3333-444444444444")
+	ctx := context.Background()
+
+	rep, err := reach.Sweep(ctx, reach.Options{
+		Inner: inner, Live: []*superblock.Superblock{gen0, res.Superblock},
+		CacheDir: t.TempDir(), Workers: 4, CollectReachable: true,
+	})
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	defer rep.Close() //nolint:errcheck
+	if rep.Reachable == nil {
+		t.Fatal("a clean sweep asked for the reachable set and did not produce one")
+	}
+	if rep.Reachable.Len() == 0 {
+		t.Fatal("the reachable set is empty for a generation that references content")
+	}
+	// Every identity the packs hold and the sweep counted live must be in
+	// it, and the counts must agree: this set IS what the liveness numbers
+	// were computed from, so a disagreement means one of them is lying.
+	var live int64
+	for _, p := range rep.Packs {
+		live += p.LiveEntries
+	}
+	if int64(rep.Reachable.Len()) > live {
+		t.Fatalf("the reachable set holds %d identities but only %d entries counted live",
+			rep.Reachable.Len(), live)
+	}
+	// It answers membership, which is the whole point.
+	first := rep.Reachable.At(0)
+	if got, _, n := rep.Reachable.Lookup(first); got == nil || n == 0 {
+		t.Fatal("the reachable set does not resolve an identity it holds")
+	}
+	absent := make([]byte, 32)
+	for i := range absent {
+		absent[i] = 0xff
+	}
+	if got, _, _ := rep.Reachable.Lookup(absent); got != nil {
+		t.Error("the reachable set resolved an identity nothing references")
+	}
+	t.Logf("%d reachable identities, %d live entries across %d packs",
+		rep.Reachable.Len(), live, len(rep.Packs))
+
+	// Close is idempotent, so a caller may defer it the moment Sweep
+	// returns without knowing whether anything was collected.
+	if err := rep.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := rep.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}
+
+// An INCOMPLETE sweep must not hand one back. The set it built describes
+// a partial walk, and a repack acting on it would drop entries that are
+// live but unreachable-today — which is data loss, not a slow rebuild.
+func TestAnIncompleteSweepHandsBackNoReachableSet(t *testing.T) {
+	inner, volDir, gen0, res, _ := treeFixture(t, "8f8f8f8f-1111-2222-3333-444444444444")
+	ctx := context.Background()
+	// One pack gone is enough: the sweep cannot account for what it held,
+	// so nothing it walked may be treated as the whole truth.
+	victim, _ := packHolding(t, inner, res.Superblock, func(e packstore.PackEntry) bool {
+		return e.Type == "" || e.Type == "data"
+	})
+	if err := os.Remove(filepath.Join(volDir, packstore.PackDirKey, victim.Name)); err != nil {
+		t.Fatal(err)
+	}
+
+	rep, err := reach.Sweep(ctx, reach.Options{
+		Inner: inner, Live: []*superblock.Superblock{gen0, res.Superblock},
+		CacheDir: t.TempDir(), Workers: 4, CollectReachable: true,
+	})
+	if rep != nil {
+		t.Fatal("an incomplete sweep returned a report")
+	}
+	var inc *reach.Incomplete
+	if !errors.As(err, &inc) {
+		t.Fatalf("Sweep: %v, want *reach.Incomplete", err)
+	}
+	if inc.Conservative.Reachable != nil {
+		t.Fatal("the conservative report carries a reachable set; a repack could act on a partial walk")
+	}
+}

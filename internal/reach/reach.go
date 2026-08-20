@@ -137,6 +137,15 @@ type Options struct {
 	CacheDir string
 	// Workers bounds concurrent object fetches (default 8).
 	Workers int
+	// CollectReachable keeps the identity set the walk reached, as a
+	// sorted mapped table on Report.Reachable, for a caller that intends
+	// to REWRITE packs: a repack has to know which entries of a pack are
+	// worth carrying, and that is a membership question against exactly
+	// this set.
+	//
+	// It costs a materialized copy of the references — 32 bytes each — in
+	// CacheDir, which the caller frees with Report.Close.
+	CollectReachable bool
 	// SortBytes is how much either side of the join buffers before
 	// spilling a run (default 64 MiB). It is the sweep's memory bound in
 	// all but name: everything else it holds is proportional to the number
@@ -192,12 +201,45 @@ type Report struct {
 	// These count logical objects, not HTTP requests: reading a trailer
 	// may cost a probe and a follow-up range.
 	Trailers, Objects, Fetched int
+	// Reachable is the identity set some live generation still references,
+	// sorted and mapped, when Options.CollectReachable asked for it and
+	// the sweep was CLEAN. It is nil otherwise — and it can only ever be
+	// non-nil on a complete sweep, because an incomplete one produces no
+	// *Report at all.
+	//
+	// The caller frees it with Report.Close.
+	Reachable *extsort.Table
+	// spillDir is the directory Reachable's file lives in, held so Close
+	// can remove it. Empty when nothing was collected.
+	spillDir string
+
 	// Unresolved counts referenced chunk identities that resolve in no
 	// listed pack. It is damage — fsck's business, not this sweep's — and
 	// it does not make the result unsafe: an identity present in no pack
 	// contributes to no pack's liveness, so nothing here can be
 	// undercounted by it.
 	Unresolved int
+}
+
+// Close frees what the report holds open. It is safe on a report that
+// collected nothing, and safe to call twice, so a caller can defer it the
+// moment Sweep returns.
+func (r *Report) Close() error {
+	if r == nil {
+		return nil
+	}
+	var first error
+	if r.Reachable != nil {
+		first = r.Reachable.Close()
+		r.Reachable = nil
+	}
+	if r.spillDir != "" {
+		if err := os.RemoveAll(r.spillDir); err != nil && first == nil {
+			first = err
+		}
+		r.spillDir = ""
+	}
+	return first
 }
 
 // LiveFraction is the share of stored bytes across every swept pack still
@@ -376,13 +418,18 @@ func Sweep(ctx context.Context, o Options) (*Report, error) {
 			return nil, fmt.Errorf("reach: live set mixes catalog key ids (%d and %d)", o.Live[0].CatalogKeyID, sb.CatalogKeyID)
 		}
 	}
+	// The spill directory is normally removed on the way out. When the
+	// caller asked to KEEP the reachable set, the file backing it lives
+	// here too, so removal moves to Report.Close instead — and only on the
+	// path that actually hands a report back.
+	var cleanup []string
 	spillRoot := o.CacheDir
 	if spillRoot == "" {
 		tmp, err := os.MkdirTemp("", "pelfs-reach-*")
 		if err != nil {
 			return nil, err
 		}
-		defer os.RemoveAll(tmp) //nolint:errcheck
+		cleanup = append(cleanup, tmp)
 		spillRoot = tmp
 	}
 	// A subdirectory of its own, for fsck's reason: a genfs spill under
@@ -392,7 +439,16 @@ func Sweep(ctx context.Context, o Options) (*Report, error) {
 	if err := os.MkdirAll(spillDir, 0700); err != nil {
 		return nil, fmt.Errorf("reach: spill dir: %w", err)
 	}
-	defer os.RemoveAll(spillDir) //nolint:errcheck
+	cleanup = append(cleanup, spillDir)
+	kept := false
+	defer func() {
+		if kept {
+			return
+		}
+		for _, d := range cleanup {
+			os.RemoveAll(d) //nolint:errcheck
+		}
+	}()
 
 	s := &sweeper{
 		o:        o,
@@ -414,6 +470,23 @@ func Sweep(ctx context.Context, o Options) (*Report, error) {
 	}
 
 	rep := s.report()
+	if rep.Reachable != nil {
+		if len(s.failures) > 0 {
+			// An incomplete sweep hands nothing back, so the set it built
+			// is not a set anyone may act on. Dropped here rather than
+			// left for the caller: there is no caller — Sweep is about to
+			// return an error and no report at all.
+			rep.Reachable.Close() //nolint:errcheck
+			rep.Reachable = nil
+		} else {
+			rep.spillDir, kept = spillDir, true
+			// The temp root, when there is one, is the parent of spillDir
+			// and goes with it.
+			if len(cleanup) > 1 {
+				rep.spillDir = cleanup[0]
+			}
+		}
+	}
 	if len(s.failures) > 0 {
 		sort.Slice(s.failures, func(i, j int) bool {
 			a, b := s.failures[i], s.failures[j]
@@ -678,18 +751,24 @@ func (s *sweeper) join(rep *Report) {
 		return
 	}
 	defer places.Close() //nolint:errcheck
-	refs, err := s.refs.Sorted()
+
+	// The reference side is read either as a one-pass merge or, when the
+	// caller wants to keep it, as a materialized table walked in the same
+	// order. One join body, two ways of feeding it: a repack needs to ask
+	// this set membership questions afterwards, and re-deriving it would
+	// mean walking the whole namespace a second time.
+	nextRef, closeRefs, err := s.references(rep)
 	if err != nil {
 		s.fail("sweep", "reading references: %v", err)
 		return
 	}
-	defer refs.Close() //nolint:errcheck
+	defer closeRefs()
 
 	place, more := places.Next()
 	var prev [idLen]byte
 	first := true
 	for {
-		id, ok := refs.Next()
+		id, ok := nextRef()
 		if !ok {
 			break
 		}
@@ -716,12 +795,47 @@ func (s *sweeper) join(rep *Report) {
 			rep.Unresolved++
 		}
 	}
-	if err := refs.Err(); err != nil {
-		s.fail("sweep", "reading references: %v", err)
-	}
 	if err := places.Err(); err != nil {
 		s.fail("sweep", "reading placements: %v", err)
 	}
+}
+
+// references opens the reference side of the join. When the caller asked
+// to keep it, the sorter is materialized into a mapped table hung on the
+// report and walked from there; otherwise it streams and is discarded.
+//
+// The table is attached to the report BEFORE the join runs, and the
+// report is thrown away by Sweep if the sweep turns out to be
+// incomplete — so a caller can only ever receive a reachable set that a
+// clean sweep produced.
+func (s *sweeper) references(rep *Report) (next func() ([]byte, bool), closeFn func(), err error) {
+	if !s.o.CollectReachable {
+		m, err := s.refs.Sorted()
+		if err != nil {
+			return nil, nil, err
+		}
+		return func() ([]byte, bool) {
+			rec, ok := m.Next()
+			if !ok && m.Err() != nil {
+				s.fail("sweep", "reading references: %v", m.Err())
+			}
+			return rec, ok
+		}, func() { m.Close() }, nil //nolint:errcheck
+	}
+	tbl, err := s.refs.Table()
+	if err != nil {
+		return nil, nil, err
+	}
+	rep.Reachable = tbl
+	i := 0
+	return func() ([]byte, bool) {
+		if i >= tbl.Len() {
+			return nil, false
+		}
+		rec := tbl.At(i)
+		i++
+		return rec, true
+	}, func() {}, nil
 }
 
 // conservative rewrites a report as "every pack fully live", which is what

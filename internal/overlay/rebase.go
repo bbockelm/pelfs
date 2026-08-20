@@ -301,6 +301,34 @@ func (fs *FS) Rebase(ctx context.Context, sealedSeq uint64, sealed Options) (*Re
 			continue
 		}
 		delete(fs.modSeq, ino)
+		// And its cached base descent step, for the same reason and by
+		// the same rule as the obase row the transaction above just
+		// deleted for this exact set.
+		//
+		// prov is a CACHE of "the base resolves parent/name to this
+		// inode" (overlay.go), filled by every descent and — until now —
+		// deleted by nothing, so it grew for the life of a session at
+		// ~66 B per inode ever named: 6.6 GB at a hundred million.
+		//
+		// An inode that has gone CLEAN is one the new base serves at its
+		// own path, with no overlay row and no overlay edge left to name
+		// it. That is precisely the standing of an inode this session
+		// never touched, and the seal path already draws that conclusion
+		// for the PERSISTED copy of the same fact: the obase chain is
+		// dropped here for this set, on the stated grounds that "a plain
+		// merged descent now finds it exactly where the base has it".
+		// Dropping the in-memory cache of that same descent step is the
+		// same decision, so it can cost only what a cache miss costs — a
+		// lookup that runs again.
+		//
+		// The two sets that must NOT be swept are excluded by the branch
+		// above rather than by a rule of their own: an inode still named
+		// by a surviving overlay edge is still dirty, and its edge answers
+		// lookups WITHOUT descending the base, so nothing else would ever
+		// make it resident. Everything the snapshot's namespace named and
+		// the base could not resolve stayed dirty too (blocked), and keeps
+		// the provenance replaySnapshotNamespaceLocked just re-pinned.
+		delete(fs.prov, ino)
 		rep.Clean = append(rep.Clean, ino)
 	}
 	rep.Dirty = len(fs.dirtySet)

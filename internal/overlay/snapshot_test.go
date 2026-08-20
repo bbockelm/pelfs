@@ -1142,3 +1142,88 @@ func TestFailedCheckpointsDoNotAccumulateSnapshotEdges(t *testing.T) {
 		prev = st.ResidentSnapEdges
 	}
 }
+
+// TestRebaseSweepsProvenance is the other half of the resident-map
+// burn-down: prov caches one base descent step per inode the session has
+// ever named, at ~66 B each, and nothing deleted from it — 6.6 GB at a
+// hundred million inodes. A rebase is where that memory becomes
+// redundant, and it must come back there, exactly like modSeq and the
+// dirty set.
+//
+// The correctness half is in the same test on purpose: what a checkpoint
+// returns to clean has to keep reading and keep being writable
+// afterwards. A sweep that made a published inode unreachable would be
+// trading an out-of-memory kill for an ESTALE.
+func TestRebaseSweepsProvenance(t *testing.T) {
+	ctx := context.Background()
+	fx := newFixture(t, "5a405a40-000d-4000-8000-00000000000d")
+	ov := openOverlay(t, fx, "")
+
+	// Touch the whole base tree, so provenance is recorded for every
+	// inode in it, and dirty a few of them.
+	for _, p := range []string{"base.txt", "dir/child.txt", "dir/inner/leaf.txt", "tagged.txt"} {
+		mustBody(t, ov, p, fx.body[p])
+	}
+	for i, p := range []string{"base.txt", "dir/child.txt"} {
+		ino := lookupPath(t, ov, p).Inode
+		if err := truncWrite(ctx, ov, ino, []byte(fmt.Sprintf("rewritten %d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before, err := ov.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.ResidentProv == 0 {
+		t.Fatal("no provenance was recorded by descending the tree")
+	}
+
+	snap := takeSnapshot(t, ov)
+	seq := snap.Seq()
+	res := sealAndSwap(t, fx, ov)
+	if err := snap.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rep := rebase(t, ov, seq, res)
+	if len(rep.Clean) == 0 {
+		t.Fatal("nothing went clean; the sweep had nothing to sweep")
+	}
+
+	after, err := ov.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.ResidentProv >= before.ResidentProv {
+		t.Errorf("provenance held %d entries before the rebase and %d after; "+
+			"a rebase must give back what it published", before.ResidentProv, after.ResidentProv)
+	}
+	// What went is a subset of what went clean: every dropped entry
+	// belongs to a cleaned inode, and some cleaned inodes never had a
+	// descent step to drop (the root, and anything the overlay named
+	// without ever descending the base to it).
+	if dropped := before.ResidentProv - after.ResidentProv; dropped > len(rep.Clean) {
+		t.Errorf("the rebase dropped %d provenance entries but cleaned only %d inodes; "+
+			"the sweep is reaching inodes that are still resolved through the base",
+			dropped, len(rep.Clean))
+	}
+
+	// And it all still works: the published files read back, the base
+	// tree is still reachable, and a cleaned inode can be written again.
+	mustBody(t, ov, "base.txt", []byte("rewritten 0"))
+	mustBody(t, ov, "dir/child.txt", []byte("rewritten 1"))
+	mustBody(t, ov, "dir/inner/leaf.txt", fx.body["dir/inner/leaf.txt"])
+	mustBody(t, ov, "tagged.txt", fx.body["tagged.txt"])
+
+	again := lookupPath(t, ov, "base.txt").Inode
+	if err := truncWrite(ctx, ov, again, []byte("written after the sweep")); err != nil {
+		t.Fatalf("a swept inode could not be written again: %v", err)
+	}
+	mustBody(t, ov, "base.txt", []byte("written after the sweep"))
+	// Xattrs go through the base too, which is the path that needs the
+	// descent step the sweep dropped.
+	if got, err := ov.GetXattr(ctx, lookupPath(t, ov, "tagged.txt").Inode, "user.color"); err != nil {
+		t.Fatalf("xattr through a swept base inode: %v", err)
+	} else if string(got) != "blue" {
+		t.Errorf("xattr through a swept base inode = %q, want blue", got)
+	}
+}

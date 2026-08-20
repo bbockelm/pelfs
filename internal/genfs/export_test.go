@@ -6,6 +6,10 @@ package genfs
 // caller could shrink is a cap a caller could shrink to something that
 // makes every read a re-derivation.
 
+// HotPackLocationCap is the shipped cap, for a measurement that states
+// what it comes to rather than repeating the constant.
+func HotPackLocationCap() int { return hotCapEntries }
+
 // SetHotPackLocationCap shrinks the location cache so a test can drive
 // eviction without a fixture the size of the real cap, and restores it.
 func SetHotPackLocationCap(n int) func() {

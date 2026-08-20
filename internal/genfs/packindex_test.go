@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -518,5 +519,122 @@ func TestTrailerFromCachedPackIsVerified(t *testing.T) {
 	}
 	if got := readAll(t, fs2, n.Inode, int(n.Length), 64<<10); len(got) != int(n.Length) {
 		t.Fatalf("read %d bytes of a %d-byte file", len(got), n.Length)
+	}
+}
+
+// What the cap saves, measured rather than argued.
+//
+// A location is a fact of about 16 bytes — pack, offset, length — and it
+// used to be kept in a Go map, keyed by a 64-character hex identity,
+// forever, for every entry of every pack a mount ever touched. This
+// measures what one of those costs in a real heap and states what that
+// comes to at the design's target.
+//
+// It also answers the trailer question (docs/TODO C3). Trailers are zstd
+// JSON and are parsed at every fold; if any of that stayed resident it
+// would show up here as heap per PACK rather than per location, and a
+// parsed trailer is orders of magnitude more than the locations it
+// carries.
+//
+//	PELFS_LOCATION_HEAP=1 go test ./internal/genfs -run LocationHeap -v
+//
+// PELFS_LOCATION_FILES sets how many files (and so how many locations) the
+// fixture holds; PELFS_LOCATION_PACK the cut size.
+func TestLocationHeap(t *testing.T) {
+	if os.Getenv("PELFS_LOCATION_HEAP") == "" {
+		t.Skip("set PELFS_LOCATION_HEAP=1 to measure what the location cap saves")
+	}
+	ctx := context.Background()
+	files, body := envInt(t, "PELFS_LOCATION_FILES", 20_000), envInt(t, "PELFS_LOCATION_BODY", 4<<10)
+	target := int64(envInt(t, "PELFS_LOCATION_PACK", 1<<20))
+
+	base, _ := newInner(t)
+	inner := &packGetStore{Store: base}
+	v := newTestVolume(t, inner, "9efe7c40-0000-4000-8000-00000000beef")
+	const perDir = 256
+	dirs := map[string]uint64{}
+	var paths []string
+	for i := 0; i < files; i++ {
+		dirName := fmt.Sprintf("d%04d", i/perDir)
+		dirIno, made := dirs[dirName]
+		if !made {
+			dirIno = v.Mkdir(1, dirName)
+			dirs[dirName] = dirIno
+		}
+		name := fmt.Sprintf("f%06d.bin", i)
+		f := v.Create(dirIno, name)
+		// Incompressible and over the inline threshold, so every file is an
+		// entry in a pack rather than a row in a catalog.
+		v.Write(f, pseudorandom(body, int64(i)+1))
+		paths = append(paths, dirName+"/"+name)
+	}
+	res := publishVolume(t, v, inner, publish.Options{TargetPackSize: target, FirstPackSize: target})
+	packs := len(packsOf(t, inner, res.Superblock))
+
+	heap := func() uint64 {
+		runtime.GC()
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		return m.HeapAlloc
+	}
+
+	// The cost of a location, isolated: a fresh mount, then the whole map
+	// and nothing else. Reading would mix in catalogs, extents and chunk
+	// buffers, which is what the second half measures on purpose.
+	idx := openFS(t, inner, res.Superblock, genfs.Options{CacheDir: t.TempDir()})
+	empty := heap()
+	if err := idx.LoadPackIndex(ctx); err != nil {
+		t.Fatalf("LoadPackIndex: %v", err)
+	}
+	whole, wholeHeld := heap(), idx.HeldPackLocations()
+	perLoc := float64(whole-empty) / float64(wholeHeld)
+	_ = idx.Close()
+
+	// And what an ordinary read path accumulates under the shipped cap,
+	// over the same generation, reading every byte of it.
+	rd := openFS(t, inner, res.Superblock, genfs.Options{CacheDir: t.TempDir()})
+	readEmpty := heap()
+	for _, p := range paths {
+		n, err := rd.LookupPath(ctx, p)
+		if err != nil {
+			t.Fatalf("lookup %s: %v", p, err)
+		}
+		readAll(t, rd, n.Inode, int(n.Length), 64<<10)
+	}
+	read, readHeld, readPacks := heap(), rd.HeldPackLocations(), rd.IndexedPacks()
+
+	t.Logf("%d packs, %d entries:", packs, wholeHeld)
+	t.Logf("  whole map:  %d location(s), %s of heap, %.0f bytes each",
+		wholeHeld, humanBytes(int64(whole-empty)), perLoc)
+	t.Logf("  read path:  every file read, %d location(s) across %d pack(s) held, %s of heap in all",
+		readHeld, readPacks, humanBytes(int64(read-readEmpty)))
+	t.Logf("  at 100M objects: %s unbounded, %s at the shipped cap of %d",
+		humanBytes(int64(perLoc*100e6)), humanBytes(int64(perLoc*float64(genfs.HotPackLocationCap()))),
+		genfs.HotPackLocationCap())
+}
+
+func envInt(t *testing.T, name string, def int) int {
+	t.Helper()
+	spec := os.Getenv(name)
+	if spec == "" {
+		return def
+	}
+	n, err := strconv.Atoi(spec)
+	if err != nil || n <= 0 {
+		t.Fatalf("%s=%q", name, spec)
+	}
+	return n
+}
+
+func humanBytes(n int64) string {
+	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%.1f GB", float64(n)/(1<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1f MB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1f KB", float64(n)/(1<<10))
+	default:
+		return strconv.FormatInt(n, 10) + " B"
 	}
 }

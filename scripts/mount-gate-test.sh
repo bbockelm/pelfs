@@ -275,10 +275,20 @@ echo "$flat" | grep -Eq '"teardown_phase":\{"get":\{[^}]*\},"put":\{"ops":[0-9]+
 
 # Case 2: a cadence short enough to fire while the payload is still
 # running. The same two numbers must now come out the other way round.
+#
+# The payload WAITS FOR THE CHECKPOINT rather than sleeping a fixed six
+# seconds. The old form raced: a checkpoint here costs 0.5-1.2s of
+# publish, but on a loaded machine — another gate running, a fuzzer
+# saturating the CPU — it stretches past 4s, and if it has not COMPLETED
+# when the payload exits the session reads "0 seals while mounted" and
+# the gate fails on a machine rather than on a defect. Waiting for the
+# event it is actually asserting makes it deterministic, and faster in
+# the common case than the sleep it replaces.
 phase_status=0
 "$WORK/pelfs" mount-gen --rw --snapshot-interval 1s \
   --stats-file "$WORK/phase-ckpt.json" --state-dir "$WORK/state" "$PREFIX" "$WORK/mnt" \
-  -- /bin/sh -c 'head -c 4000000 /dev/urandom > checkpointed.bin; sleep 6' \
+  -- /bin/sh -c "head -c 4000000 /dev/urandom > checkpointed.bin; \
+    for _ in \$(seq 300); do grep -q 'checkpoint: sealed generatio[n]' '$WORK/phase-ckpt.log' && break; sleep 0.1; done" \
   > "$WORK/phase-ckpt.log" 2>&1 || phase_status=$?
 [ "$phase_status" = "0" ] || { echo "checkpointing session failed ($phase_status):" >&2; sed 's/^/    /' "$WORK/phase-ckpt.log"; exit 1; }
 grep -q "checkpoint started: publishing what this session has written so far" "$WORK/phase-ckpt.log" || {
@@ -289,7 +299,14 @@ grep -Eq "uploaded [1-9][0-9.]* [KMG]iB during the session and .*\([1-9][0-9]* s
   grep "during the session and" "$WORK/phase-ckpt.log" | sed 's/^/    /'; exit 1; }
 # Print the lines a user would actually read. Half of what is being
 # gated here is that they stay legible, which no grep can assert.
-grep -h "publishing: the first pack\|checkpoint started\|during the session and" \
+#
+# The seal-cost and phase-breakdown lines go out too, because this is the
+# only place in the gate where a CHECKPOINT's cost is visible at all. A
+# checkpoint publishes while the user is still working, so where its time
+# goes — freeze against publish — is the number that decides whether the
+# mount goes unresponsive, and it belongs in the transcript of every run
+# rather than only in the wreckage of a failing one.
+grep -h "publishing: the first pack\|checkpoint started\|during the session and\|seal took\|sealed in " \
   "$WORK/phase-exit.log" "$WORK/phase-ckpt.log" | sed 's/^/    /'
 echo "phase split verified: exit-only seal reads 0 during the session; a checkpoint reads the reverse"
 

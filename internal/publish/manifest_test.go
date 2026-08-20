@@ -245,49 +245,10 @@ func backupSuperblock(t *testing.T, v *reuseVol, res *publish.Result) *superbloc
 	return nil
 }
 
-// The backup rides in the LAST pack, so it must state its pack set before
-// the seal has finished cutting packs — through a manifest segment of its
-// own, which the final superblock's segment supersedes the instant the
-// seal completes. Nothing addressable names it after that, so without a
-// ledger entry it is swept once it ages and a rescue from this backup
-// recovers the generation's ancestors and not its tail.
-func TestASealCondemnsItsBackupsInFlightManifestSegment(t *testing.T) {
-	ctx := context.Background()
-	v := newReuseVol(t, [16]byte{0x11, 0xd0, 0x21})
-	v.create(publishRootInode, "a.bin", pseudorandom(6<<20, 41))
-	res := v.checkpoint()
-
-	listed := map[string]bool{}
-	for _, ref := range res.Superblock.Manifests {
-		listed[ref.Name] = true
-	}
-	condemned := map[string]bool{}
-	for _, c := range res.Superblock.CondemnedManifests {
-		condemned[c.Name] = true
-	}
-
-	inflight := 0
-	for _, ref := range backupSuperblock(t, v, res).Manifests {
-		if listed[ref.Name] {
-			// The backup and the final generation agreed on a segment,
-			// which happens when the seal cut nothing after the backup. The
-			// final superblock names it, so nothing is condemned and
-			// nothing is at risk.
-			continue
-		}
-		inflight++
-		if !condemned[ref.Name] {
-			t.Errorf("the backup names manifest %s, the generation does not, and nothing condemns it: "+
-				"a rescue from this backup stops working once that object ages out", ref.Name[:12])
-		}
-		if _, err := v.inner.StatKey(ctx, manifest.Dir+"/"+ref.Name); err != nil {
-			t.Errorf("the backup's manifest segment %s is not there: %v", ref.Name[:12], err)
-		}
-	}
-	if inflight == 0 {
-		t.Fatal("fixture: this seal's backup named no segment of its own, so it exercises nothing")
-	}
-}
+// The backup's in-flight manifest segment is GONE (see backupPackList):
+// the backup states its own packs inline, so there is no extra object per
+// seal and no ledger entry keeping one alive. What replaced this test is
+// the DR property itself, in backupsb_test.go.
 
 // The ledger is a window, not a promise, and this is the mechanism that
 // makes it one: an entry is carried forward until it is older than

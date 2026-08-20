@@ -63,7 +63,6 @@ import (
 	"github.com/bbockelm/pelfs/internal/catalog"
 	"github.com/bbockelm/pelfs/internal/chunkid"
 	"github.com/bbockelm/pelfs/internal/entrycodec"
-	"github.com/bbockelm/pelfs/internal/manifest"
 	"github.com/bbockelm/pelfs/internal/overlay"
 	"github.com/bbockelm/pelfs/internal/packstore"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
@@ -412,11 +411,11 @@ func Publish(ctx context.Context, o Options) (*Result, error) {
 	// built before the final seal, so the pack set it names lacks the very
 	// pack that carries it — rescue treats it as "the newest generation
 	// minus its tail", exactly the documented fall-back-a-step behavior.
-	// It names that set through a manifest of its own (backupManifests),
-	// since the refs it carries from its parent cover the parent. Stored
-	// raw (uncompressed, unencrypted): rescue must read it before holding
-	// any keys, and the KEK-wrapped key table is harmless to expose.
-	_, bkRaw, err := p.buildSuperblock(p.pk.sealedSoFar(), shards, rootID, p.prevPackIndexes(), p.backupManifests(ctx))
+	// It states that tail INLINE and everything older through the refs it
+	// carries from its parent (backupPackList). Stored raw (uncompressed,
+	// unencrypted): rescue must read it before holding any keys, and the
+	// KEK-wrapped key table is harmless to expose.
+	_, bkRaw, err := p.buildSuperblock(p.backupPackList(), shards, rootID, p.prevPackIndexes(), p.prevManifests())
 	if err != nil {
 		return nil, err
 	}
@@ -436,7 +435,8 @@ func Publish(ctx context.Context, o Options) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	sb, raw, err := p.buildSuperblock(newPacks, shards, rootID, p.sealPackIndexes(ctx), manifests)
+	sb, raw, err := p.buildSuperblock(p.sealedPackList(newPacks, manifests), shards, rootID,
+		p.sealPackIndexes(ctx), manifests)
 	if err != nil {
 		return nil, err
 	}
@@ -1405,35 +1405,15 @@ func encodeCatalog(cw catalog.Builder, hasher chunkid.Hasher, dek []byte) (chunk
 	return id, stored, nil
 }
 
-func (p *pipeline) buildSuperblock(newPacks []packstore.SealedPack, shards []superblock.ShardEntry, rootID chunkid.Identity,
+// buildSuperblock assembles and signs one superblock. The pack list is the
+// CALLER's decision, because the two documents this builds state their
+// pack sets differently and only the caller knows which one it is holding:
+// a branch head says it once, either inline or through manifest refs
+// (sealedPackList), while the disaster-recovery backup says the tail
+// inline and the rest through carried refs (backupPackList). Both rules
+// live in manifest.go, next to the format decision they implement.
+func (p *pipeline) buildSuperblock(packList []superblock.PackEntry, shards []superblock.ShardEntry, rootID chunkid.Identity,
 	packIndexes []superblock.IndexRef, manifests []superblock.ManifestRef) (*superblock.Superblock, []byte, error) {
-	// The pack set is stated ONE of two ways, never both: through the
-	// manifest refs when there are any, inline otherwise (see
-	// superblock.Manifests for why, and manifest.Packs for the reader
-	// side). Writing both would keep every byte the manifest exists to
-	// remove, and would give a reader two lists that can disagree.
-	//
-	// Either way the same three groups have to be named, because every one
-	// of them holds bytes something still references and retention deletes
-	// any pack no live superblock names:
-	//
-	//   - what the parent named, carried forward — TRANSFORM's content
-	//     reuse depends on it, since a carried chunkref points into one of
-	//     the parent's packs. Trimming dead packs is repack's job. In the
-	//     manifest shape this is the carried refs; if that ever grows a
-	//     filter, reuse must be gated on the surviving set in the same
-	//     change.
-	//   - the packs this seal wrote.
-	//   - the packs the SOURCE uploaded, holding content it provided
-	//     rather than content this seal chunked.
-	var packList []superblock.PackEntry
-	if len(manifests) == 0 {
-		if p.o.Prev != nil {
-			packList = append(packList, p.o.Prev.PackList...)
-		}
-		packList = append(packList, manifest.Entries(newPacks)...)
-		packList = append(packList, manifest.Entries(p.providedPacks)...)
-	}
 	// The high-water mark prefers the source's real allocator counter;
 	// max-inode-seen covers only sources that keep none (Source.NextInode
 	// reports 0). Never regress below the previous generation's

@@ -156,52 +156,78 @@ func (p *pipeline) sealManifests(ctx context.Context, newPacks []packstore.Seale
 	return after, nil
 }
 
-// backupManifests is sealManifests for the superblock backup that rides
-// in the last pack — best effort, and deliberately so.
+// sealedPackList is what the BRANCH HEAD states inline: nothing at all
+// when this generation records manifest refs, the whole pack set
+// otherwise.
 //
-// The backup is built before the final pack is sealed, so it can only
-// ever describe the generation minus its tail; that is the documented
-// contract and is not new. What is new is that it must name its packs
-// through a manifest of its own, since the refs it carries from its
-// parent cover the parent's packs and nothing this seal wrote. A small
-// extra object, then — and usually not even that: a seal whose content
-// fits in one pack has sealed nothing yet at this point, so there is
-// nothing to cover and nothing to upload.
+// The rule is superblock.Manifests': one way or the other, never both.
+// Writing both would keep every byte the manifest exists to remove and
+// would hand a reader two lists that can disagree — superblock.Validate
+// refuses a head shaped that way.
 //
-// It does not consolidate. Merging is a tidy-up for the list a mount
-// reads, and nothing mounts a backup; paying a download and an upload to
-// shorten a list inside a disaster-recovery artifact would be spending
-// the seal's time on the wrong document.
+// In the inline shape the same three groups have to be named, because
+// every one of them holds bytes something still references and retention
+// deletes any pack no live superblock names:
 //
-// A failure here warns rather than failing the seal: a backup missing
-// this generation's own packs is worth less than a complete one and far
-// more than a seal that did not happen.
-//
-// The final superblock lists a segment covering ALL of this generation's
-// packs, so the one written here is superseded the moment the seal
-// completes and nothing addressable names it. That is why it is
-// CONDEMNED: the ledger is what keeps it through the grace window, so a
-// rescue from this backup can still resolve the tail generation's pack
-// set rather than recovering its ancestors alone (condemnedrefs.go).
-//
-// Condemning here and filtering later reads backwards and is not: the
-// backup superblock is built from the refs this returns, and
-// condemnLedger never condemns a name the generation still lists — so the
-// entry lands only on the FINAL superblock, which is the document that
-// supersedes the segment.
-//
-// The limit to admit: the window is T_grace, not forever. A rescue from a
-// backup older than that is back to recovering this generation's
-// ancestors and not its tail.
-func (p *pipeline) backupManifests(ctx context.Context) []superblock.ManifestRef {
-	ref, err := p.publishManifest(ctx, p.manifestPacks(p.pk.sealedSoFar()))
-	if err != nil {
-		ui.Warn("publish: superblock backup's pack manifest not uploaded ({error}); "+
-			"a rescue from it recovers this generation's ancestors only", "error", err)
-		return p.prevManifests()
+//   - what the parent named, carried forward — TRANSFORM's content reuse
+//     depends on it, since a carried chunkref points into one of the
+//     parent's packs. Trimming dead packs is repack's job. In the manifest
+//     shape this is the carried refs; if that ever grows a filter, reuse
+//     must be gated on the surviving set in the same change.
+//   - the packs this seal wrote.
+//   - the packs the SOURCE uploaded, holding content it provided rather
+//     than content this seal chunked.
+func (p *pipeline) sealedPackList(newPacks []packstore.SealedPack, manifests []superblock.ManifestRef) []superblock.PackEntry {
+	if len(manifests) > 0 {
+		return nil
 	}
-	p.droppedManifests = append(p.droppedManifests, ref.Name)
-	return carryForward(p.prevManifests(), ref)
+	var out []superblock.PackEntry
+	if p.o.Prev != nil {
+		out = append(out, p.o.Prev.PackList...)
+	}
+	out = append(out, manifest.Entries(newPacks)...)
+	out = append(out, manifest.Entries(p.providedPacks)...)
+	return out
+}
+
+// backupPackList is what the DISASTER-RECOVERY BACKUP states inline: the
+// packs this seal has cut so far, the source's, and an inline parent list
+// if the parent kept one.
+//
+// THE BACKUP IS THE ONE DOCUMENT THAT STATES ITS PACK SET BOTH WAYS, and
+// saying why is most of the reason this function exists. It rides in the
+// last pack, so it is built before the seal has finished cutting packs and
+// long before a manifest covering them could exist; what it carries from
+// its parent (prevManifests) names the parent's packs and nothing this
+// seal wrote. So a rescue reads its pack set as the UNION of the inline
+// list and the carried refs. Nothing mounts a backup, and
+// superblock.Validate — which refuses that shape for a branch head, where
+// two lists can disagree about what is live — is a writer's check this
+// document is deliberately not put through.
+//
+// WHAT IT REPLACED, because it was a whole mechanism and its absence
+// should not read as an oversight: the backup used to publish a manifest
+// segment of its own covering exactly these packs. That was an upload on
+// every seal for an object the final superblock superseded the instant it
+// landed, and since nothing addressable named it afterwards it also had to
+// be CONDEMNED — one ledger entry per seal, on the ledger whose growth is
+// already what fills a superblock. Both are gone. The DR property is not:
+// the backup still names the tail generation's packs, it just says so
+// inline instead of buying an object to say it in.
+//
+// The limit, unchanged: the backup describes the generation minus the pack
+// that carries it, so a rescue from it is "the newest generation minus its
+// tail".
+func (p *pipeline) backupPackList() []superblock.PackEntry {
+	var out []superblock.PackEntry
+	// A parent that kept its packs inline has nothing else naming them —
+	// its carried refs are empty — so the backup carries that list too.
+	if p.o.Prev != nil && !p.o.Prev.PacksAreInManifests() {
+		out = append(out, p.o.Prev.PackList...)
+	}
+	out = append(out, manifest.Entries(p.pk.sealedSoFar())...)
+	out = append(out, manifest.Entries(p.providedPacks)...)
+	return out
 }
 
 // mergeManifests fetches the given refs, merges them and uploads the

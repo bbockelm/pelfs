@@ -82,12 +82,25 @@ type Options struct {
 	// and therefore cannot be hurt by eviction — without it, residency
 	// grows for the life of a long-running mount over a large tree.
 	MaxResident int
-	// PackCacheBytes bounds the whole-pack cache under CacheDir; zero
-	// selects DefaultPackCacheBytes. A NEGATIVE value disables whole-pack
-	// caching entirely, leaving reads on coalesced ranges — the right
-	// setting where local space is scarcer than bandwidth, and the only
-	// configuration in which a pack is read in pieces at all.
+	// PackCacheBytes decides whether packs are cached WHOLE. A NEGATIVE
+	// value disables whole-pack caching entirely, leaving reads on
+	// coalesced ranges — the right setting where local space is scarcer
+	// than bandwidth, and the only configuration in which a pack is read
+	// in pieces at all. A positive value also sets the cache budget when
+	// CacheBytes does not, which is what it meant back when packs were
+	// the only bounded directory.
 	PackCacheBytes int64
+	// CacheBytes bounds EVERYTHING under CacheDir — decoded chunks,
+	// spilled catalogs, pack trailers, whole packs — as ONE budget,
+	// evicting least-recently-used files across all of it (gencache.go).
+	// Zero selects DefaultCacheBytes.
+	//
+	// One budget rather than four because the four directories are
+	// substitutes for one another: a cached pack makes the chunks in it
+	// and its trailer free to re-derive, and a decoded chunk makes its
+	// pack expendable. Any split of the disk between them is a guess that
+	// starves one use to protect another.
+	CacheBytes int64
 }
 
 // Node is one inode's attributes: catalog.Node with a kernel-shaped uint64
@@ -147,6 +160,7 @@ type FS struct {
 	inner      pelicanobj.Store
 	sb         *superblock.Superblock
 	dek        []byte
+	cacheDir   string
 	chunkDir   string
 	catDir     string
 	packDir    string
@@ -161,9 +175,18 @@ type FS struct {
 	// filling itself from pack trailers on demand (packindex.go).
 	packIndex *packIndex
 
-	// packCacheCap bounds the whole-pack cache (packfetch.go).
+	// packCacheCap is the whole-pack POLICY switch: at or below zero,
+	// packs are never fetched whole and reads stay on coalesced ranges
+	// (packfetch.go). Above zero it is the cache budget, because a pack
+	// larger than the whole cache would be evicted by its own arrival.
 	packCacheCap int64
-	evictMu      sync.Mutex
+	// cacheCap is that budget over the WHOLE of CacheDir — chunks,
+	// catalogs, trailers and packs together — and cache is the eviction
+	// bookkeeping behind it (gencache.go). evictMu serializes the
+	// scan-and-sweep and is never held across a fetch.
+	cacheCap int64
+	cache    cacheState
+	evictMu  sync.Mutex
 
 	cats *catCache
 	ext  *extentCache
@@ -216,15 +239,31 @@ func Open(ctx context.Context, o Options) (*FS, error) {
 	if o.SB.CatalogKeyID != 0 && len(o.DEK) == 0 {
 		return nil, errors.New("genfs: volume catalogs are encrypted but no DEK was provided")
 	}
-	if o.PackCacheBytes == 0 {
-		o.PackCacheBytes = DefaultPackCacheBytes
+	// Two questions, one of which used to be answered by the other: may a
+	// pack be cached whole, and how much disk may the cache use in total.
+	// A negative PackCacheBytes still means "do not cache whole packs";
+	// a positive one still sets the budget, for callers written before
+	// the budget covered anything else.
+	cacheCap := o.CacheBytes
+	if cacheCap <= 0 {
+		cacheCap = DefaultCacheBytes
+		if o.PackCacheBytes > 0 {
+			cacheCap = o.PackCacheBytes
+		}
+	}
+	// The pack policy keeps its own field because it IS a policy: a
+	// negative PackCacheBytes still means "never fetch a pack whole",
+	// which is a different statement from "the cache may hold this much".
+	packCacheCap := cacheCap
+	if o.PackCacheBytes < 0 {
+		packCacheCap = -1
 	}
 	catDir := filepath.Join(o.CacheDir, "catalogs")
 	chunkDir := filepath.Join(o.CacheDir, "chunks")
 	packDir := filepath.Join(o.CacheDir, "packs")
 	trailerDir := filepath.Join(o.CacheDir, "trailers")
 	dirs := []string{catDir, chunkDir, trailerDir}
-	if o.PackCacheBytes > 0 {
+	if packCacheCap > 0 {
 		dirs = append(dirs, packDir)
 	}
 	for _, d := range dirs {
@@ -236,11 +275,13 @@ func Open(ctx context.Context, o Options) (*FS, error) {
 		inner:        o.Inner,
 		sb:           o.SB,
 		dek:          o.DEK,
+		cacheDir:     o.CacheDir,
 		chunkDir:     chunkDir,
 		catDir:       catDir,
 		packDir:      packDir,
 		trailerDir:   trailerDir,
-		packCacheCap: o.PackCacheBytes,
+		packCacheCap: packCacheCap,
+		cacheCap:     cacheCap,
 		ext:          newExtentCache(extentCacheCap),
 		res:          make(map[uint64]*residency),
 		resLRU:       list.New(),
@@ -263,7 +304,7 @@ func Open(ctx context.Context, o Options) (*FS, error) {
 	// is not reported: the indexes are hints, and a mount without them is
 	// the mount this was before they existed (packindex.go).
 	fs.packIndex.loadHints(o.SB.PackIndexes)
-	if o.PackCacheBytes > 0 {
+	if packCacheCap > 0 {
 		fs.sweepPackTmp()
 	}
 
@@ -307,6 +348,12 @@ func Open(ctx context.Context, o Options) (*FS, error) {
 		return nil, fmt.Errorf("genfs: unknown identity algo %q", algo)
 	}
 	fs.cats = newCatCache(fs, o.MaxOpenCatalogs, rootHex, root)
+	// Now, and not before the root catalog is open and pinned: this is
+	// what enforces the budget on a cache an earlier session left behind
+	// — a cache filled under a larger cap, or under a version that
+	// bounded only the packs — and the root's own spill file must be
+	// pinned before a sweep can consider it (gencache.go).
+	fs.evictCache()
 	return fs, nil
 }
 
@@ -939,6 +986,10 @@ func (fs *FS) spillCatalogFrom(ctx context.Context, idx *packIndex, dek []byte, 
 	if err := writeAtomic(fp, plain); err != nil {
 		return "", err
 	}
+	// A spilled catalog is a cache file like any other and counts against
+	// the same budget — but it is the one kind a sweep may have to skip,
+	// because SQLite holds the open ones by path (gencache.go).
+	fs.noteCached(int64(len(plain)))
 	return fp, nil
 }
 

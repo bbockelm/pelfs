@@ -52,7 +52,10 @@ import (
 //     bandwidth) and the fallback when a download fails. Neither may
 //     become a read error.
 //   - The pack cache is bounded and evicts, because a large volume does
-//     not fit on a client.
+//     not fit on a client. It shares ONE budget with the decoded chunks,
+//     the spilled catalogs and the trailers (gencache.go): a cached pack
+//     makes the chunks in it free to re-derive, so the four directories
+//     are substitutes and a split between them would be a guess.
 //
 // Integrity is unchanged. A cached pack is not trusted as a unit: only its
 // LENGTH is checked against the signed pack list, and every entry taken out
@@ -76,10 +79,11 @@ const (
 	// carrying one enormous entry does, and falls back to ranged reads.
 	maxWholePackBytes = 256 << 20
 
-	// DefaultPackCacheBytes bounds the whole-pack cache on disk. Packs are
-	// large and a big volume will not fit; past the cap the least recently
-	// used ones go.
-	DefaultPackCacheBytes = 4 << 30
+	// DefaultPackCacheBytes is what the pack cache alone used to be
+	// bounded to. The budget it names now covers the whole of CacheDir —
+	// see DefaultCacheBytes and gencache.go, which is where evictPacks
+	// went when the other three directories stopped being unbounded.
+	DefaultPackCacheBytes = DefaultCacheBytes
 )
 
 // packTmpMaxAge is how long a leftover download temp file is tolerated. A
@@ -259,7 +263,9 @@ func (fs *FS) wholePackWanted(idx *packIndex, pack string) bool {
 		return false
 	}
 	size := idx.size(pack)
-	return size > 0 && size <= maxWholePackBytes && size <= fs.packCacheCap
+	// A pack larger than the whole cache budget would be evicted by its
+	// own arrival, one chunk read at a time, forever.
+	return size > 0 && size <= maxWholePackBytes && size <= fs.cacheCap
 }
 
 func (fs *FS) packPath(pack string) string { return filepath.Join(fs.packDir, pack) }
@@ -359,51 +365,14 @@ func (fs *FS) downloadPack(ctx context.Context, pack string, size int64) error {
 		os.Remove(tmpName) //nolint:errcheck
 		return err
 	}
-	fs.evictPacks()
+	// A pack is the largest single thing this cache takes, so it is the
+	// one most likely to put the budget over on its own. Eviction is no
+	// longer the pack directory's private business: one budget covers
+	// every directory under CacheDir, and this pack now competes for it
+	// with the decoded chunks, the spilled catalogs and the trailers
+	// (gencache.go, which is where evictPacks went).
+	fs.noteCached(size)
 	return nil
-}
-
-// evictPacks trims the whole-pack cache to its byte cap, least recently
-// used first. Removing a pack another goroutine is reading is safe: the
-// open descriptor keeps the bytes alive, and the next reader that misses
-// falls back to a ranged read.
-func (fs *FS) evictPacks() {
-	fs.evictMu.Lock()
-	defer fs.evictMu.Unlock()
-	entries, err := os.ReadDir(fs.packDir)
-	if err != nil {
-		return
-	}
-	type cached struct {
-		name string
-		size int64
-		age  time.Time
-	}
-	var files []cached
-	var total int64
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		fi, err := e.Info()
-		if err != nil {
-			continue
-		}
-		files = append(files, cached{name: e.Name(), size: fi.Size(), age: fi.ModTime()})
-		total += fi.Size()
-	}
-	if total <= fs.packCacheCap {
-		return
-	}
-	sort.Slice(files, func(i, j int) bool { return files[i].age.Before(files[j].age) })
-	for _, f := range files {
-		if total <= fs.packCacheCap {
-			return
-		}
-		if err := os.Remove(filepath.Join(fs.packDir, f.name)); err == nil {
-			total -= f.size
-		}
-	}
 }
 
 // packRead returns one pack entry's stored bytes, out of a local copy of

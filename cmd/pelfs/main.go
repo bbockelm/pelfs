@@ -11,6 +11,7 @@
 //	pelfs fsck   <prefix>            verify a published generation
 //	pelfs repack-plan <prefix>       report what a repack would rewrite
 //	pelfs repack [--apply] <prefix>  rewrite mostly-dead packs, publish a generation
+//	pelfs cache  [clear] <prefix>    show, or free, the local cache
 package main
 
 import (
@@ -55,6 +56,8 @@ func main() {
 		code = cmdRepackPlan(os.Args[2:])
 	case "repack":
 		code = cmdRepack(os.Args[2:])
+	case "cache":
+		code = cmdCache(os.Args[2:])
 	case "version", "--version":
 		fmt.Println(version.Get())
 	case "-h", "--help", "help":
@@ -90,6 +93,8 @@ Usage:
                                                           rewrite, and what it would cost
   pelfs repack [--apply] [flags] <prefix>                 rewrite those packs and
                                                           publish a generation
+  pelfs cache  [clear] [flags] <prefix>                   show (or free) the local
+                                                          cache this volume is using
   pelfs version                                           which build this is (quote it
                                                           in bug reports)
 
@@ -116,6 +121,7 @@ type cmdOpts struct {
 	gcDelete         bool
 	prefetch         string
 	statsFile        string
+	cacheSize        string
 	noAutoRepack     bool
 }
 
@@ -146,6 +152,7 @@ func registerFlags(fs *flag.FlagSet, o *cmdOpts) {
 	fs.StringVar(&o.shellPath, "shell", "", "shell to launch (default: $SHELL, else /bin/sh)")
 	fs.StringVar(&o.prefetch, "prefetch", "none", "download the generation into the local cache at startup: none, all (blocking; refuse to start on any failure), or background")
 	fs.StringVar(&o.statsFile, "stats-file", "", "write a JSON session-statistics summary to this path (default: <state-dir>/pelfs-stats.json)")
+	fs.StringVar(&o.cacheSize, "cache-size", "", "byte budget for the local cache of packs, chunks, catalogs and trailers (e.g. 8G); default 4G")
 	fs.BoolVar(&o.noAutoRepack, "no-auto-repack", false, "do not repack in the background when the mount is idle and the branch has drifted")
 }
 

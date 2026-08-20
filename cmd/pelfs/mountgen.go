@@ -479,12 +479,22 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	if backend == "nfs" {
 		maxResident = 100000
 	}
+	cacheBytes, err := o.cacheBudget()
+	if err != nil {
+		return fail(err)
+	}
 	g.gfs, err = genfs.Open(ctx, genfs.Options{
 		Inner:       g.inner,
 		SB:          sb,
 		DEK:         g.dek,
 		CacheDir:    filepath.Join(stateDir, "gencache"),
 		MaxResident: maxResident,
+		// One budget over the whole gencache — decoded chunks, spilled
+		// catalogs, trailers and whole packs — because three of those four
+		// directories used to have no bound at all, and a day of reading
+		// filled the disk (genfs/gencache.go). `pelfs cache` shows what it
+		// holds; --cache-size moves the number.
+		CacheBytes: cacheBytes,
 		// PackCacheBytes is left at its default: the whole-pack cache lives
 		// under the state directory's gencache and outlives the session
 		// deliberately, because packs are immutable and content-addressed —
@@ -864,6 +874,7 @@ func (g *genSession) follow(ctx context.Context, r *rawfuse.Refresher, every tim
 // keeps its last sample — that is the work the seal consumed, not zero.
 func (g *genSession) refresh() {
 	gen := g.gfs.Generation()
+	cache := cacheStats(g.gfs)
 	var st overlay.Stats
 	var live bool
 	g.ovMu.RLock()
@@ -875,6 +886,7 @@ func (g *genSession) refresh() {
 	g.ovMu.RUnlock()
 	g.stats.Update(func(sum *stats.Summary) {
 		sum.Generation = gen
+		sum.Cache = cache
 		if !live {
 			return
 		}
@@ -883,6 +895,31 @@ func (g *genSession) refresh() {
 		sum.OverlayStagedFiles = int64(st.StagedFiles)
 		sum.OverlayStagedBytes = st.StagedBytes
 	})
+}
+
+// cacheStats converts what the generation cache reports into the shape
+// the statistics file publishes. It is sampled on the same tick as the
+// overlay pressure because it answers the same kind of question — what is
+// this mount consuming on the machine it runs on — and because the walk
+// behind it is amortized against exactly that interval (genfs.CacheUsage).
+func cacheStats(fs *genfs.FS) *stats.CacheStats {
+	if fs == nil {
+		return nil
+	}
+	u := fs.CacheUsage()
+	cs := &stats.CacheStats{
+		Bytes:        u.Bytes,
+		Files:        u.Files,
+		Limit:        fs.CacheLimit(),
+		EvictedFiles: u.EvictedFiles,
+		EvictedBytes: u.EvictedBytes,
+		Pinned:       u.Pinned,
+		Dirs:         make(map[string]int64, len(u.Dirs)),
+	}
+	for _, d := range u.Dirs {
+		cs.Dirs[d.Name] = d.Bytes
+	}
+	return cs
 }
 
 func (g *genSession) sample(ctx context.Context, every time.Duration) {

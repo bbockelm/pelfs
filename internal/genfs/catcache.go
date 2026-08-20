@@ -117,6 +117,28 @@ func (c *catCache) evictLocked() {
 	}
 }
 
+// openSet is the identities this cache currently holds OPEN, the pinned
+// root included.
+//
+// Cache eviction consults it and skips those spill files. Every other file
+// under CacheDir is safe to unlink under a reader — an open descriptor
+// keeps the bytes alive on POSIX, and every reader treats a missing cache
+// file as a miss and refills — but a catalog is opened by PATH, and by
+// SQLite, which is entitled to reopen it for its own reasons. The handles
+// listed here are exactly the ones a reader can still reach without going
+// back through the spill path, so they are exactly the ones a sweep must
+// leave alone.
+func (c *catCache) openSet() map[string]struct{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make(map[string]struct{}, len(c.byID)+1)
+	out[c.rootHex] = struct{}{}
+	for id := range c.byID {
+		out[id] = struct{}{}
+	}
+	return out
+}
+
 // closeAll closes every handle including the pinned root.
 func (c *catCache) closeAll() error {
 	c.mu.Lock()

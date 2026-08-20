@@ -281,6 +281,10 @@ func (fs *FS) readChunkAt(ctx context.Context, r *catalog.ChunkRef, chunkOff int
 	if err := writeAtomic(fp, plain); err != nil {
 		return err
 	}
+	// Decoded plaintext, one file per chunk ever read, and the reason the
+	// cache needed a budget at all: reading an N-byte volume used to cost
+	// N bytes of local disk permanently (gencache.go).
+	fs.noteCached(int64(len(plain)))
 	copy(window, plain[chunkOff:chunkOff+int64(len(window))])
 	return nil
 }
@@ -323,7 +327,9 @@ func (fs *FS) storeChunk(idHex string, r *catalog.ChunkRef, stored []byte) {
 	if err != nil {
 		return
 	}
-	writeAtomic(filepath.Join(fs.chunkDir, idHex), plain) //nolint:errcheck
+	if err := writeAtomic(filepath.Join(fs.chunkDir, idHex), plain); err == nil {
+		fs.noteCached(int64(len(plain)))
+	}
 }
 
 // readAtFile serves window from a cache file; any failure (missing,

@@ -125,6 +125,14 @@ type Summary struct {
 	PrefetchChunks int64 `json:"prefetch_chunks,omitempty"`
 	PrefetchBytes  int64 `json:"prefetch_bytes,omitempty"`
 
+	// Cache is the LOCAL disk this mount is using — decoded chunks,
+	// spilled catalogs, pack trailers, whole packs — against the budget
+	// they are held to. Without it "the disk filled up" was unanswerable
+	// without attaching to the process, and a cache sitting at its limit
+	// with a large eviction count (a working set that does not fit, which
+	// costs bandwidth) was indistinguishable from one that simply grew.
+	Cache *CacheStats `json:"cache,omitempty"`
+
 	// Overlay pressure: unsealed work, i.e. exactly what is lost if the
 	// session dies without a seal.
 	OverlayDirtyNodes  int64 `json:"overlay_dirty_nodes,omitempty"`
@@ -148,6 +156,20 @@ type Summary struct {
 	// and the final snapshot all succeeded.
 	CleanShutdown bool `json:"clean_shutdown"`
 	ExitCode      int  `json:"exit_code"`
+}
+
+// CacheStats is the local generation cache, per directory, against its
+// budget. Directories are named rather than fielded because the cache is
+// genfs's to define and this file should not have to be edited when it
+// grows a fifth one.
+type CacheStats struct {
+	Bytes        int64            `json:"bytes"`
+	Files        int              `json:"files"`
+	Limit        int64            `json:"limit,omitempty"`
+	Dirs         map[string]int64 `json:"dirs,omitempty"`
+	EvictedFiles int64            `json:"evicted_files,omitempty"`
+	EvictedBytes int64            `json:"evicted_bytes,omitempty"`
+	Pinned       int              `json:"pinned,omitempty"`
 }
 
 const maxErrorSamples = 20

@@ -8,6 +8,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
@@ -48,6 +50,15 @@ func volumeStore(ctx context.Context, o *cmdOpts, prefix, pubkeyHex string) (pel
 	return inner, rstore, stateDir, nil
 }
 
+// joinGenerations renders a generation list for a report line.
+func joinGenerations(gens []uint64) string {
+	parts := make([]string, len(gens))
+	for i, g := range gens {
+		parts[i] = strconv.FormatUint(g, 10)
+	}
+	return strings.Join(parts, ", ")
+}
+
 // cmdGC sweeps pack objects no retained generation references. The sweep
 // is set arithmetic over verified superblocks and fails closed: a ref that
 // cannot be verified means the retained set is unknown, and nothing is
@@ -55,10 +66,12 @@ func volumeStore(ctx context.Context, o *cmdOpts, prefix, pubkeyHex string) (pel
 func cmdGC(args []string) int {
 	var pubkeyHex string
 	var grace string
+	var retainK uint
 	o, pos, err := parseArgs("gc", args, 1, 1, func(fs *flag.FlagSet, o *cmdOpts) {
 		fs.BoolVar(&o.gcDelete, "delete", false, "delete unreferenced packs (default: report only)")
 		fs.StringVar(&pubkeyHex, "volume-pubkey", "", "hex Ed25519 volume key to trust (default: pin on first use)")
 		fs.StringVar(&grace, "grace", "", "widen the age guard past what the superblocks state (e.g. 168h)")
+		fs.UintVar(&retainK, "retain-k", 0, "how many generations of each branch to retain (default: the head's Params.RetainK)")
 	})
 	if err != nil {
 		return exitErr(err)
@@ -73,6 +86,9 @@ func cmdGC(args []string) int {
 		if opts.Grace, err = time.ParseDuration(grace); err != nil {
 			return exitErr(fmt.Errorf("--grace: %w", err))
 		}
+	}
+	if retainK > 0 {
+		opts.RetainK = uint32(retainK)
 	}
 	rep, err := retention.GC(ctx, opts)
 	if err != nil {
@@ -94,6 +110,18 @@ func cmdGC(args []string) int {
 	}
 	printSpace("pack indexes", rep.Indexes)
 	printSpace("pack manifests", rep.Manifests)
+	// The retain window, per branch. It prints the two numbers that can
+	// differ — what the head asked for and what the sweep could establish
+	// — because a short window is a silent outcome otherwise: the run
+	// succeeds, and the generations it could not describe are the ones
+	// whose objects were just collected.
+	for _, w := range rep.Windows {
+		fmt.Printf("retain window:    branch %s keeps %d of %d generations\n", w.Branch, w.Generations, w.K)
+		if len(w.Unresolved) > 0 {
+			fmt.Printf("  not retained:   generation(s) %s (no readable superblock backup)\n",
+				joinGenerations(w.Unresolved))
+		}
+	}
 	if o.gcDelete {
 		fmt.Printf("deleted:          %d packs, %d indexes, %d manifests\n",
 			rep.Deleted, rep.Indexes.Deleted, rep.Manifests.Deleted)

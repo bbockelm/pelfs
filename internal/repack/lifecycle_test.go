@@ -74,10 +74,14 @@ type world struct {
 	want  map[string][]byte
 	files []string
 	// pinned are the generations a reader may still be holding: every tag,
-	// plus the head. Only these are RETAINED — retention's live set is
-	// head-plus-tags, because a retired generation is addressable only by
-	// hash and a sweep cannot enumerate it.
+	// plus the head, plus whatever the RETAIN WINDOW still covers.
 	pinned []pin
+	// chain is every generation this world published, oldest first. A
+	// retired generation is addressable only by hash, so a sweep cannot
+	// enumerate it — but Params.RetainK says the last K of these stay in
+	// the root set anyway (internal/retention/lastk.go), and holding the
+	// superblocks here is how a test can be a reader that still has one.
+	chain []pin
 	// clock is the seal clock, advanced explicitly so ledger ageing can be
 	// driven rather than waited for.
 	clock time.Time
@@ -182,6 +186,7 @@ func (w *world) seal() *publish.Result {
 	o.CreatedUnixNano = w.clock.UnixNano()
 	res := w.v.Publish(o)
 	w.count("seal")
+	w.record(res.Superblock, fmt.Sprintf("generation %d", res.Superblock.Generation))
 	w.logf("seal -> generation %d (%d manifest refs, %d condemned-manifest rows, %d condemned packs)",
 		res.Superblock.Generation, len(res.Superblock.Manifests),
 		len(res.Superblock.CondemnedManifests), len(res.Superblock.Condemned))
@@ -213,6 +218,7 @@ func (w *world) repack() *repack.Result {
 	after := w.head()
 	w.v.Adopt(after.Superblock, after.Raw)
 	w.count("repack")
+	w.record(after.Superblock, fmt.Sprintf("generation %d (repack)", after.Superblock.Generation))
 	if len(res.CondemnedPacks) > 0 {
 		w.count("repack-condemned")
 	}
@@ -226,8 +232,17 @@ func (w *world) repack() *repack.Result {
 // so the only thing left protecting an object is a live superblock naming
 // it.
 func (w *world) gc(at time.Time, del bool) *retention.Report {
+	return w.gcK(at, del, 0)
+}
+
+// gcK is gc with the retain window stated rather than taken from the head.
+// k=0 means "whatever Params.RetainK says", which is what a real run does;
+// k=1 narrows the root set to heads and tags, which is what the sweep did
+// before RetainK was enforced and is how a property about the LEDGERS
+// alone takes the window out of the picture.
+func (w *world) gcK(at time.Time, del bool, k uint32) *retention.Report {
 	rep, err := retention.GC(context.Background(), retention.Options{
-		Inner: w.inner, Refs: w.rs, Delete: del, Now: at,
+		Inner: w.inner, Refs: w.rs, Delete: del, Now: at, RetainK: k,
 	})
 	if err != nil {
 		w.fatalf("gc: %v", err)
@@ -258,6 +273,34 @@ func (w *world) tag(name string) {
 	w.pinned = append(w.pinned, pin{label: "tag " + name, sb: head.Superblock, want: snapshot})
 	w.count("tag")
 	w.logf("tag %s at generation %d", name, head.Superblock.Generation)
+}
+
+// record keeps a generation and the tree it showed, so a later assertion
+// can be a reader still holding a superblock the branch has moved past.
+func (w *world) record(sb *superblock.Superblock, label string) {
+	snapshot := make(map[string][]byte, len(w.want))
+	for k, v := range w.want {
+		snapshot[k] = v
+	}
+	w.chain = append(w.chain, pin{label: label, sb: sb, want: snapshot})
+}
+
+// retained returns the generations the retain window still covers, newest
+// first and INCLUDING the head — which is what "the last K generations"
+// means, K counted on the branch's own chain with the head as one of them.
+func (w *world) retained() []pin {
+	k := 1
+	if n := w.chain[len(w.chain)-1].sb.Params.RetainK; n > 1 {
+		k = int(n)
+	}
+	if k > len(w.chain) {
+		k = len(w.chain)
+	}
+	out := make([]pin, 0, k)
+	for i := 0; i < k; i++ {
+		out = append(out, w.chain[len(w.chain)-1-i])
+	}
+	return out
 }
 
 func (w *world) head() *refs.Fetched {
@@ -343,15 +386,22 @@ func (w *world) step() {
 // INVARIANT: no object a RETAINED generation references is ever condemned
 // and then collected.
 //
-// Retained means what a sweep can enumerate — the branch head and every tag
-// — because a retired generation is addressable only by its hash. The gc
-// here runs on a FAR-FUTURE clock, which is the adversarial setting: every
-// pack's name-age guard has expired, every derived object's mtime guard has
-// expired, and every condemned-ledger row has aged out. Nothing is left
-// protecting an object except a live superblock naming it. If the pack
-// list, the manifest refs, or the arithmetic that maintains them is wrong
-// anywhere, the sweep deletes something the head still needs and the head
-// stops reading.
+// Retained means three things, and the third is the one this file used to
+// say was impossible: the branch head, every tag, and THE LAST
+// Params.RetainK GENERATIONS OF THE BRANCH. A retired generation is
+// addressable only by its hash, so a sweep cannot enumerate it from the key
+// space — it reads the superblock backup the seal buried in a pack instead
+// (internal/retention/lastk.go), which is what turns "an untagged
+// generation a repack retired is not retained" into "retired but inside the
+// window IS retained".
+//
+// The gc here runs on a FAR-FUTURE clock, which is the adversarial setting:
+// every pack's name-age guard has expired, every derived object's mtime
+// guard has expired, and every condemned-ledger row has aged out. Nothing
+// is left protecting an object except a superblock in the root set naming
+// it. If the pack list, the manifest refs, the window arithmetic, or
+// anything that maintains them is wrong, the sweep deletes something a
+// retained generation still needs and that generation stops reading.
 func TestNoRetainedGenerationLosesAnObjectToTheSweep(t *testing.T) {
 	for _, seed := range seeds(t) {
 		t.Run(fmt.Sprintf("seed-%x", seed), func(t *testing.T) {
@@ -378,11 +428,21 @@ func TestNoRetainedGenerationLosesAnObjectToTheSweep(t *testing.T) {
 				w.repack()
 			}
 			w.mustHaveRun(map[string]int{"seal": 4, "repack": 1, "tag": 1, "write": 6})
-			head := w.head()
-			w.pinned = append(w.pinned, pin{label: "head", sb: head.Superblock, want: w.want})
 
-			// The adversarial sweep: delete everything not named by a live
-			// superblock, with every window long expired.
+			// The head, and every generation the retain window still covers
+			// — including the one the repack RETIRED, which is the case this
+			// invariant could not previously make. They are pinned here,
+			// after everything that can retire a generation has happened, so
+			// the window is the one the sweep will compute.
+			window := w.retained()
+			if len(window) < 4 {
+				w.fatalf("fixture: the retain window covers only %d generations, so this proves little "+
+					"beyond the head", len(window))
+			}
+			w.pinned = append(w.pinned, window...)
+
+			// The adversarial sweep: delete everything not named by a
+			// superblock in the root set, with every window long expired.
 			w.gc(w.clock.Add(aged), true)
 
 			for _, p := range w.pinned {
@@ -561,7 +621,16 @@ func TestTheCondemnedLedgersConverge(t *testing.T) {
 
 			// And the objects those rows named are settled: still listed, or
 			// actually deleted. Nothing lingers unreferenced and unswept.
-			w.gc(w.clock.Add(grace+time.Hour), true)
+			//
+			// The sweep runs at retain-k=1 — heads and tags — which is not a
+			// dodge but the only way to ask this question. The retain window
+			// keeps the objects the last K generations name, and those
+			// generations are precisely the ones whose merged-away segments
+			// this ledger is full of, so a windowed sweep would answer "still
+			// needed" to every row and prove nothing about whether a row that
+			// ages off leaves a settled object behind. That the window DOES
+			// hold them is invariant 1's business.
+			w.gcK(w.clock.Add(grace+time.Hour), true, 1)
 			listed := map[string]bool{}
 			for _, ref := range w.head().Superblock.Manifests {
 				listed[ref.Name] = true
@@ -577,7 +646,7 @@ func TestTheCondemnedLedgersConverge(t *testing.T) {
 			}
 			// Convergence has to be a floor, not a trend: sweeping again
 			// changes nothing.
-			if again := w.gc(w.clock.Add(2*grace), true); again.Manifests.Deleted != 0 {
+			if again := w.gcK(w.clock.Add(2*grace), true, 1); again.Manifests.Deleted != 0 {
 				w.errorf("a second sweep deleted %d more manifests", again.Manifests.Deleted)
 			}
 			w.mustHaveRun(map[string]int{"seal": 13, "gc-delete": 1, "gc-collected": 1, "write": 13})
@@ -608,6 +677,13 @@ func objectExists(w *world, key string) bool {
 // sets overlap the head's, a repack moves bytes out from under them, and
 // nothing rewrites what they name. They read because identity is not
 // location.
+//
+// The retain window is the other kind of pin, and it is asserted here on
+// the same terms: the last Params.RetainK generations of the branch, which
+// nobody tagged and nothing names, must resolve everything they name too.
+// A tag survives arbitrary time and the window does not — that is the whole
+// difference between them — so what this proves about the window is that
+// while it holds, it holds completely.
 func TestEveryRetainedGenerationStillResolvesEverythingItNames(t *testing.T) {
 	for _, seed := range seeds(t) {
 		t.Run(fmt.Sprintf("seed-%x", seed), func(t *testing.T) {
@@ -634,13 +710,12 @@ func TestEveryRetainedGenerationStillResolvesEverythingItNames(t *testing.T) {
 			w.repack()
 			w.gc(w.clock.Add(aged), true)
 
-			// The head pin is taken HERE, after everything that can retire a
-			// generation has happened. An untagged generation that a repack
-			// superseded is not retained and the design does not claim it is
-			// — pinning one earlier would be asserting a promise this format
-			// deliberately does not make.
-			head := w.head()
-			w.pinned = append(w.pinned, pin{label: "head", sb: head.Superblock, want: w.want})
+			// The head and the window are taken HERE, after everything that
+			// can retire a generation has happened, so the window is the one
+			// the sweep computed rather than one this test wished for. An
+			// untagged generation OLDER than the window is still not
+			// retained, and the design still does not claim it is.
+			w.pinned = append(w.pinned, w.retained()...)
 
 			for _, p := range w.pinned {
 				w.reads(p.sb, p.want, p.label)

@@ -27,15 +27,23 @@
 // time cannot be established is KEPT — keeping garbage costs bytes,
 // deleting a live index costs a mount.
 //
-// "Live" here means named by a branch HEAD or a tag, which is all a sweep
-// can enumerate — a retired generation is not addressable, only hashed.
-// So an index or manifest that only an older generation inside the retain
-// window still names, one consolidation merged away and the head
-// therefore stopped listing, has nothing to speak for it. The CONDEMNED
-// LEDGERS are what speak for it: publish records the refs it stopped
-// listing, with the time it stopped (superblock.CondemnedRef), and this
-// sweep counts a ledger entry younger than the grace window as live —
-// exactly as it already does for a condemned pack.
+// "Live" means named by a branch HEAD, by a tag, or by one of the last
+// Params.RetainK generations of a branch. The first two a sweep can
+// enumerate; the third it cannot, because a retired generation is not
+// addressable, only hashed — so lastk.go reconstructs those generations
+// from the disaster-recovery superblock every seal buries in a pack, and
+// that file is where the whole of that argument lives, including which
+// failures fail closed and which are reported.
+//
+// Even with the window, an index or manifest that only an older
+// generation still names — one consolidation merged away and the head
+// therefore stopped listing — needs something to speak for it. The
+// CONDEMNED LEDGERS do: publish records the refs it stopped listing, with
+// the time it stopped (superblock.CondemnedRef), and this sweep counts a
+// ledger entry as live when it is younger than the grace window OR when
+// it was stamped inside the retain window — exactly as it does for a
+// condemned pack. The second half of that test is what covers the one
+// generation the backups cannot describe, the parent of a repack.
 //
 // THE LIMIT TO ADMIT, and it is a window rather than a fix: T_grace, not
 // forever. Publish drops an entry once it ages out, so a reader pinned to
@@ -45,9 +53,9 @@
 // broken. FOR A MANIFEST IT IS NOT: the manifest is that generation's
 // pack list, so sweeping one leaves the generation unreadable and the
 // packs it alone named go on the sweep after. Nothing addressable is ever
-// harmed (the head and every tag name their own), and a workflow that
-// needs a pin outliving the window must TAG, which pins exactly and
-// indefinitely.
+// harmed (the head, every tag and every generation inside the retain
+// window name their own), and a workflow that needs a pin outliving both
+// windows must TAG, which pins exactly for as long as the tag exists.
 //
 // The sweep fails closed: if any ref or tag cannot be fetched and
 // verified, nothing is deleted — an unreadable superblock means the
@@ -60,6 +68,7 @@ package retention
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -81,9 +90,14 @@ type Options struct {
 	// Grace overrides the grace window; zero derives it from the largest
 	// Params.TGraceSeconds across verified superblocks (DefaultGrace floor
 	// — the window may only ever widen, never narrow, from options).
-	Grace  time.Duration
-	Delete bool      // false = report only
-	Now    time.Time // injectable clock (zero = time.Now())
+	Grace time.Duration
+	// RetainK overrides how many generations of each branch stay in the
+	// root set; zero takes each branch's own head's Params.RetainK. Unlike
+	// Grace this may narrow as well as widen — lastk.go argues why the two
+	// are not the same kind of window.
+	RetainK uint32
+	Delete  bool      // false = report only
+	Now     time.Time // injectable clock (zero = time.Now())
 }
 
 // SpaceReport summarizes the sweep of one key space.
@@ -117,6 +131,12 @@ type Report struct {
 	// whose time could not be read at all.
 	Indexes   SpaceReport
 	Manifests SpaceReport
+
+	// Windows reports the last-K root set, one entry per branch: how many
+	// generations Params.RetainK asked for and how many the sweep could
+	// actually establish (lastk.go). A short window is the one outcome a
+	// successful-looking report would otherwise hide.
+	Windows []LastKReport
 }
 
 // candidate is one object the sweep may delete.
@@ -142,7 +162,14 @@ func GC(ctx context.Context, o Options) (*Report, error) {
 		o.Now = time.Now()
 	}
 	rep := &Report{}
-	live, grace, err := retainedSet(ctx, o, rep)
+	// The last-K window costs pack-trailer reads, so it is resolved once
+	// and shared with the pre-delete recompute below. Reusing it there is
+	// safe in the only direction that matters: if the branch moved while
+	// this sweep was scanning, the window this holds is the OLDER one,
+	// which names at least as much as the new one does — and the
+	// recompute exists to shrink the candidate list, never to grow it.
+	win := newWindowCache()
+	live, grace, err := retainedSet(ctx, o, rep, win)
 	if err != nil {
 		return nil, err
 	}
@@ -185,7 +212,7 @@ func GC(ctx context.Context, o Options) (*Report, error) {
 	// covers all three spaces, so the extra key spaces cost no extra ref
 	// fetches.
 	if len(packCands)+len(idxCands)+len(manCands) > 0 {
-		fresh, _, err := retainedSet(ctx, o, &Report{})
+		fresh, _, err := retainedSet(ctx, o, &Report{}, win)
 		if err != nil {
 			return rep, fmt.Errorf("re-list before delete: %w", err)
 		}
@@ -345,7 +372,7 @@ func finish(ctx context.Context, o Options, dir string, cands []candidate, sp *S
 // refs across every verified branch head and tag, returning the live set
 // and the largest stated grace window. Any unverifiable superblock is a
 // hard error.
-func retainedSet(ctx context.Context, o Options, rep *Report) (*liveSet, time.Duration, error) {
+func retainedSet(ctx context.Context, o Options, rep *Report, win *windowCache) (*liveSet, time.Duration, error) {
 	live := &liveSet{
 		packs:     make(map[string]struct{}),
 		indexes:   make(map[string]struct{}),
@@ -353,7 +380,23 @@ func retainedSet(ctx context.Context, o Options, rep *Report) (*liveSet, time.Du
 	}
 	grace := DefaultGrace
 
-	absorb := func(sb *superblock.Superblock) error {
+	// absorb unions one generation's objects into the live set.
+	//
+	// sinceUnixNano is the retain window's floor: a condemned-ledger row
+	// stamped at or after it was dropped by a generation INSIDE the window,
+	// so a generation still in the window names the object and it stays
+	// live whatever its age. Zero disables it, which is what a tag gets —
+	// a tag is one frozen generation, not a window, so its rows follow the
+	// grace rule alone.
+	//
+	// This is the half of the rule the backups cannot supply, and it is
+	// what makes a REPACK's parent readable. A repack writes no superblock
+	// backup, so nothing describes the generation it grew from; what does
+	// exist is the repack's own ledger, which names every manifest, index
+	// and pack it stopped listing. Retaining those rows for as long as the
+	// window covers the generation that named them is the same statement
+	// the backups make, arrived at from the other side.
+	absorb := func(sb *superblock.Superblock, sinceUnixNano int64) error {
 		// The packs a generation names, from whichever shape it uses. A
 		// manifest that will not read is a hard error, not an empty pack
 		// set: this sweep DELETES on the strength of this answer, so an
@@ -385,8 +428,14 @@ func retainedSet(ctx context.Context, o Options, rep *Report) (*liveSet, time.Du
 		if g := time.Duration(sb.Params.TGraceSeconds) * time.Second; g > grace {
 			grace = g
 		}
+		inWindow := func(condemnedAtUnix int64) bool {
+			if o.Now.Sub(time.Unix(condemnedAtUnix, 0)) < grace {
+				return true
+			}
+			return sinceUnixNano != 0 && condemnedAtUnix >= sinceUnixNano/int64(time.Second)
+		}
 		for _, c := range sb.Condemned {
-			if o.Now.Sub(time.Unix(c.CondemnedAtUnix, 0)) < grace {
+			if inWindow(c.CondemnedAtUnix) {
 				live.packs[c.Name] = struct{}{}
 			}
 		}
@@ -406,12 +455,12 @@ func retainedSet(ctx context.Context, o Options, rep *Report) (*liveSet, time.Du
 		// it, the trimmed packs must go into sb.Condemned in the same
 		// change.
 		for _, c := range sb.CondemnedIndexes {
-			if o.Now.Sub(time.Unix(c.CondemnedAtUnix, 0)) < grace {
+			if inWindow(c.CondemnedAtUnix) {
 				live.indexes[c.Name] = struct{}{}
 			}
 		}
 		for _, c := range sb.CondemnedManifests {
-			if o.Now.Sub(time.Unix(c.CondemnedAtUnix, 0)) < grace {
+			if inWindow(c.CondemnedAtUnix) {
 				live.manifests[c.Name] = struct{}{}
 			}
 		}
@@ -427,10 +476,48 @@ func retainedSet(ctx context.Context, o Options, rep *Report) (*liveSet, time.Du
 		if err != nil {
 			return nil, 0, fmt.Errorf("gc aborted (fail closed): branch %s: %w", b, err)
 		}
-		if err := absorb(f.Superblock); err != nil {
+		// The K-1 generations below the head (lastk.go) are resolved FIRST,
+		// because the oldest of them dates the window — and the head's own
+		// ledger has to be read against that date, not only against the
+		// grace window.
+		w, err := win.get(ctx, o, b, f.Superblock)
+		if err != nil {
+			return nil, 0, err
+		}
+		since := windowFloor(w.roots)
+		if err := absorb(f.Superblock, since); err != nil {
 			return nil, 0, fmt.Errorf("gc aborted (fail closed): branch %s: %w", b, err)
 		}
 		rep.Branches++
+
+		// And the generations themselves, as roots exactly as the head is —
+		// the same absorb, so a retired generation inside the window keeps
+		// its packs, its manifests and its indexes on identical terms. The
+		// only differences are where the document came from and what an
+		// unreadable one means.
+		lk := w.rep.clone(b)
+		for _, sb := range w.roots {
+			// A window root DESCRIBES ITS PARENT (lastk.go), so the
+			// generation at stake is one below the document's own.
+			gen := sb.Generation - 1
+			if err := absorb(sb, since); err != nil {
+				if isAbsent(err) {
+					// Its manifest is gone, so that generation was already
+					// unreadable before this sweep started. Failing closed
+					// would protect nothing and would stop the volume
+					// reclaiming anything for as long as the generation sat
+					// inside the window.
+					lk.Generations--
+					lk.Unresolved = append(lk.Unresolved, gen)
+					continue
+				}
+				return nil, 0, fmt.Errorf("gc aborted (fail closed): branch %s, generation %d inside the "+
+					"retain-%d window: %w", b, gen, lk.K, err)
+			}
+		}
+		sort.Slice(lk.Unresolved, func(i, j int) bool { return lk.Unresolved[i] > lk.Unresolved[j] })
+		warnUnresolved(b, &lk)
+		rep.Windows = append(rep.Windows, lk)
 	}
 	tags, err := listNames(ctx, o.Inner, refs.TagDirKey)
 	if err != nil {
@@ -441,7 +528,9 @@ func retainedSet(ctx context.Context, o Options, rep *Report) (*liveSet, time.Du
 		if err != nil {
 			return nil, 0, fmt.Errorf("gc aborted (fail closed): tag %s: %w", tname, err)
 		}
-		if err := absorb(sb); err != nil {
+		// Zero floor: a tag is one frozen generation, not a window, so its
+		// ledger rows follow the grace rule and nothing else.
+		if err := absorb(sb, 0); err != nil {
 			return nil, 0, fmt.Errorf("gc aborted (fail closed): tag %s: %w", tname, err)
 		}
 		rep.Tags++

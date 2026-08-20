@@ -336,9 +336,30 @@ func TestGCReclaimsWhatARepackCondemned(t *testing.T) {
 		}
 	}
 
-	// Past the window, they go.
-	after, err := retention.GC(ctx, retention.Options{
+	// Past the grace window they STILL do not go, and that is the retain
+	// window rather than a bug: this volume is four generations old, so
+	// every generation the repack retired is inside Params.RetainK and each
+	// of them names the condemned packs. Reclamation waits for the window
+	// to move past the repack, which is exactly what the sweep promises
+	// when it says it keeps the last K generations
+	// (internal/retention/lastk.go).
+	windowed, err := retention.GC(ctx, retention.Options{
 		Inner: inner, Refs: rstore, Delete: true, Now: time.Now().Add(aged),
+	})
+	if err != nil {
+		t.Fatalf("GC past the grace window: %v", err)
+	}
+	if windowed.Deleted != 0 {
+		t.Errorf("GC deleted %d objects while every generation the repack retired is still inside the "+
+			"retain-%d window; those generations name the condemned packs and must keep them",
+			windowed.Deleted, windowed.Windows[0].K)
+	}
+
+	// With the window narrowed to the head alone — the sweep's behaviour
+	// before RetainK was enforced, and what an operator states when no
+	// reader is pinned to a retired generation — the loop closes.
+	after, err := retention.GC(ctx, retention.Options{
+		Inner: inner, Refs: rstore, Delete: true, RetainK: 1, Now: time.Now().Add(aged),
 	})
 	if err != nil {
 		t.Fatalf("GC past the grace window: %v", err)

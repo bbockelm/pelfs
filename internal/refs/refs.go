@@ -285,6 +285,39 @@ func (s *Store) Tag(ctx context.Context, name string, raw []byte) error {
 	return nil
 }
 
+// Verify decodes and verifies a superblock the caller got from somewhere
+// that is neither a ref nor a tag — in practice a disaster-recovery backup
+// scavenged out of a pack, which is the only record a RETIRED generation
+// leaves behind (internal/retention's last-K window).
+//
+// It never pins and never rotates. TOFU exists so a reader can start
+// trusting a volume from its branch head, a mutable object the writer
+// chose to publish; a document dug out of a pack was chosen by whoever
+// could append a pack, so letting one establish trust would hand the pin
+// to anyone who can write. A caller with no key yet gets an error, not a
+// new pin.
+func (s *Store) Verify(raw []byte) (*superblock.Superblock, error) {
+	sb, err := superblock.Decode(raw)
+	if err != nil {
+		return nil, err
+	}
+	key := s.trusted
+	if key == nil {
+		pinned, err := s.readPin()
+		if err != nil {
+			return nil, err
+		}
+		if pinned == nil {
+			return nil, fmt.Errorf("%w (no volume key pinned; fetch a branch first or supply --volume-pubkey)", ErrUntrusted)
+		}
+		key = pinned
+	}
+	if err := sb.Verify(key); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrUntrusted, err)
+	}
+	return sb, nil
+}
+
 // FetchTag reads and verifies tags/<name> under the same trust policy as
 // branches, except that a tag never advances a pin (it is a frozen
 // generation of some branch whose key the reader already trusts).

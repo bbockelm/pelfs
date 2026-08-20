@@ -125,6 +125,12 @@ type Options struct {
 	// Workers bounds concurrent fetches during the sweep.
 	Workers int
 
+	// collectReachable asks the sweep to keep the identity set, which only
+	// the executor needs. Unexported: a caller asking for a PLAN has no
+	// use for it and would pay a materialized copy of the references for
+	// nothing.
+	collectReachable bool
+
 	// Now is an injectable clock for the age guard (zero: time.Now()).
 	Now time.Time
 	// Grace widens the age guard past what the superblocks state. It may
@@ -306,20 +312,34 @@ type swept struct{ rep *reach.Report }
 // request itself was bad (no store, no live set, a head outside it), and
 // then there is no plan at all.
 func Compute(ctx context.Context, o Options) (*Plan, error) {
+	plan, rep, err := compute(ctx, o)
+	rep.Close() //nolint:errcheck
+	return plan, err
+}
+
+// compute is Compute plus the sweep's report, for the executor, which
+// needs the reachable set the report carries. The report is nil for a
+// refused plan and for a bad request, and Report.Close is safe on nil, so
+// every caller can defer it unconditionally.
+//
+// This is deliberately not "Compute with an out-parameter": the swept
+// value that authorizes building a plan is still constructed at exactly
+// one site below, on the branch where Sweep returned a report.
+func compute(ctx context.Context, o Options) (*Plan, *reach.Report, error) {
 	if o.Inner == nil {
-		return nil, errors.New("repack: Inner is required")
+		return nil, nil, errors.New("repack: Inner is required")
 	}
 	if o.Head == nil {
-		return nil, errors.New("repack: Head is required")
+		return nil, nil, errors.New("repack: Head is required")
 	}
 	if len(o.Live) == 0 {
 		// Deliberately not "then plan nothing": an empty live set means
 		// every pack looks dead, and answering that would be answering the
 		// most dangerous question with the most dangerous answer.
-		return nil, errors.New("repack: no live generations were supplied")
+		return nil, nil, errors.New("repack: no live generations were supplied")
 	}
 	if !inLiveSet(o.Head, o.Live) {
-		return nil, fmt.Errorf("repack: head generation %d is not in the live set, so its own packs would sweep as unreferenced", o.Head.Generation)
+		return nil, nil, fmt.Errorf("repack: head generation %d is not in the live set, so its own packs would sweep as unreferenced", o.Head.Generation)
 	}
 	if o.Now.IsZero() {
 		o.Now = time.Now()
@@ -334,27 +354,28 @@ func Compute(ctx context.Context, o Options) (*Plan, error) {
 	// live, which is pure cost. Refused rather than clamped: a caller that
 	// passed 50 meaning 50% should hear about it.
 	if o.PackLive > 1 || o.RefLive > 1 {
-		return nil, fmt.Errorf("repack: liveness thresholds are fractions in (0, 1], got %g and %g", o.PackLive, o.RefLive)
+		return nil, nil, fmt.Errorf("repack: liveness thresholds are fractions in (0, 1], got %g and %g", o.PackLive, o.RefLive)
 	}
 	if o.TargetPackSize <= 0 {
 		o.TargetPackSize = defaultTargetPackSize
 	}
 
 	rep, err := reach.Sweep(ctx, reach.Options{
-		Inner:    o.Inner,
-		Live:     o.Live,
-		DEK:      o.DEK,
-		CacheDir: o.CacheDir,
-		Workers:  o.Workers,
+		Inner:            o.Inner,
+		Live:             o.Live,
+		DEK:              o.DEK,
+		CacheDir:         o.CacheDir,
+		Workers:          o.Workers,
+		CollectReachable: o.collectReachable,
 	})
 	var inc *reach.Incomplete
 	if errors.As(err, &inc) {
-		return refused(inc), nil
+		return refused(inc), nil, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return build(ctx, o, swept{rep}), nil
+	return build(ctx, o, swept{rep}), rep, nil
 }
 
 // refused turns an incomplete sweep into the only plan it entitles anyone

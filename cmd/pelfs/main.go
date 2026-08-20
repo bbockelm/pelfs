@@ -10,6 +10,7 @@
 //	pelfs gc     [--delete] <prefix> find (remove) unreferenced pack objects
 //	pelfs fsck   <prefix>            verify a published generation
 //	pelfs repack-plan <prefix>       report what a repack would rewrite
+//	pelfs repack [--apply] <prefix>  rewrite mostly-dead packs, publish a generation
 package main
 
 import (
@@ -51,6 +52,8 @@ func main() {
 		code = cmdFsck(os.Args[2:])
 	case "repack-plan":
 		code = cmdRepackPlan(os.Args[2:])
+	case "repack":
+		code = cmdRepack(os.Args[2:])
 	case "version", "--version":
 		fmt.Println(version.Get())
 	case "-h", "--help", "help":
@@ -84,6 +87,8 @@ Usage:
   pelfs fsck   [flags] [--deep] <prefix>                  verify a published generation
   pelfs repack-plan [flags] <prefix>                      report what a repack would
                                                           rewrite, and what it would cost
+  pelfs repack [--apply] [flags] <prefix>                 rewrite those packs and
+                                                          publish a generation
   pelfs version                                           which build this is (quote it
                                                           in bug reports)
 

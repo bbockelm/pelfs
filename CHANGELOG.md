@@ -32,7 +32,10 @@ limitations*.
 - **Maintenance.** `pelfs fsck [--deep]` verifies a generation end to end;
   `pelfs gc [--delete]` sweeps packs, multi-pack indexes and manifests no
   retained generation references; `pelfs repack-plan` reports what a repack
-  would rewrite and what it would cost.
+  would rewrite and what it would cost, and `pelfs repack --apply` carries
+  it out — rewriting the packs that are mostly garbage into new ones and
+  publishing a generation that condemns the old ones, after which `gc
+  --delete` can reclaim them.
 - **`pelfs version`**, and `pelfs ctl <prefix> bugreport` for a tarball with
   the build, the stats and every goroutine.
 
@@ -51,13 +54,15 @@ kernel-source-sized: ~90,000 files, ~1.5 GB.
 
 ### Known limitations
 
-- **Space from rewritten or deleted content is not reclaimed.** `gc
-  --delete` removes packs no retained generation references, which covers
-  aborted publishes and superseded indexes. But a generation's pack list is
-  carried forward wholesale, so a pack whose contents are *entirely* dead
-  stays listed and stays on disk. `repack-plan` measures this exactly; the
-  repack that would act on it is **not built**. Plan for storage that grows
-  with rewrites.
+- **Reclaiming space is manual, and takes two steps.** Nothing repacks or
+  collects on a schedule. `pelfs repack --apply` rewrites mostly-dead packs
+  and condemns the originals; `pelfs gc --delete` removes them once the
+  grace window (72h, not configurable) has passed. Until both are run, dead
+  content stays on disk — `pelfs repack` with no flags says how much.
+- **A repack cannot yet retire index or manifest objects on their own
+  account.** Replacing the manifest already drops superseded segments, so
+  what is missing is the narrower case of an index whose packs are mostly
+  gone: it costs fetch time, never correctness.
 - **Single writer.** The advisory lease is detection, not mutual exclusion —
   the transport has no compare-and-swap. A seal that would overwrite another
   writer's generation is refused, so the failure mode is a rejected seal

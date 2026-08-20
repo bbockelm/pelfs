@@ -1,10 +1,10 @@
 # Reachability: measuring liveness, and the case for persisting it
 
-Status: **partly shipped**. The streaming sweep is built (`internal/reach`)
-and the planner that consumes it is built (`internal/repack`). Persisted
+Status: **shipped**, except the last section. The streaming sweep
+(`internal/reach`), the planner and the executor that consumes it
+(`internal/repack`, `pelfs repack --apply`) are all built. Persisted
 reachability bitmaps — the last section — are **designed, not built**, and
-this document exists mainly to record why they fit and what they would
-cost.
+that part exists to record why they fit and what they would cost.
 
 In one sentence: **liveness is a measurement, not a list**, and everything
 maintenance wants to do is a question about that measurement.
@@ -17,6 +17,10 @@ nothing used to compute:
 - retire an index whose packs are under half live,
 - repack a pack that is mostly garbage,
 - rewrite a manifest segment that is mostly dead.
+
+The second and third are now acted on: a repack rewrites the packs and
+replaces the manifest wholesale. The first — retiring an index on its own
+account — is still only measured.
 
 A pack list cannot answer any of them. It says which packs a generation
 *may* read from, never which bytes inside them anyone still wants. Only a
@@ -236,3 +240,12 @@ why it was done first. Bitmaps become worth building when sweep
 *frequency* is the complaint — which is really a question about the
 planner: if `pelfs repack-plan` should run routinely rather than as a
 batch job, this is what makes that possible.
+
+One thing the executor added is worth noting here, because it is the
+smallest possible version of the same idea. `reach` can now hand back the
+identity set it reached (`Options.CollectReachable`), as a sorted mapped
+table, because a repack has to ask it membership questions. That set is
+computed and discarded on every run. Persisting it *per catalog* — which
+is what the bitmap design is — is the difference between recomputing the
+whole namespace and reading back what an unchanged directory contributed
+last time.

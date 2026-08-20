@@ -1409,24 +1409,17 @@ in `scripts/` (`mount-gate-docker.sh`, `bench-untar-docker.sh`,
 Everything in this list is specified above and has no implementation.
 Nothing else in this document is aspirational.
 
-- **Repack execution.** MEASURING and PLANNING now exist —
-  `internal/reach` computes per-pack liveness and `pelfs repack-plan`
-  reports what is worth rewriting and what it would cost — but nothing
-  carries a plan out. `superblock.Condemned` is still a field nothing
-  writes.
+Repack used to head this list, and it is now built end to end:
+`internal/reach` measures per-pack liveness, `internal/repack` plans and
+executes, and `pelfs repack --apply` publishes a generation that condemns
+what it rewrote. The loop closes with GC — a repack condemns, the grace
+window passes, `pelfs gc --delete` reclaims — and a test asserts the byte
+counts match on both sides of it.
 
-  This remains the one gap with a user-visible consequence, and it is
-  worse than "dead bytes are not reclaimed": publish carries pack lists
-  forward wholesale and consolidation is a union, so a pack whose
-  contents are entirely dead stays named by every later generation and
-  `pelfs gc` will never delete it. Space from rewritten or deleted
-  content is not reclaimed at all today.
-
-  Whoever builds it must honour the contract in `internal/retention`: a
-  repack that TRIMS a manifest segment rather than merging it must put
-  the trimmed packs into `sb.Condemned` in the same change, or readers
-  pinned to a generation inside the retain window lose packs they were
-  promised.
+- **Retiring index and manifest objects on their own account**
+  (`Plan.Refs`). A repack replacing the manifest wholesale already drops
+  every superseded segment, so what is missing is the narrower decision
+  about objects whose only cost is fetch time.
 - **`pelfs rescue`.** Fully specified; the format prerequisites shipped.
 - **Forks.** No command creates a ref from another generation.
 - **Tag creation.** `refs.Store.Tag` exists with no caller; tags can be

@@ -15,6 +15,7 @@ pelfs status                                               # list background mou
 pelfs gc     [--delete] pelican://.../scratch              # sweep unreferenced packs
 pelfs fsck   [--deep] pelican://.../scratch                # verify a generation
 pelfs repack-plan pelican://.../scratch                    # what a repack would rewrite
+pelfs repack [--apply] pelican://.../scratch               # rewrite it, publish a generation
 pelfs version                                              # which build this is
 ```
 
@@ -190,13 +191,11 @@ a count of bytes, a duration a count of nanoseconds).
 - The origin must permit GET/PUT/DELETE and listing on the prefix (i.e. a
   token with read/modify scopes for the namespace); `pelfs` checks this up
   front and says which scope is missing.
-- **Space from rewritten or deleted content is not reclaimed yet.**
-  `pelfs gc --delete` removes packs that no retained generation
-  references, which covers aborted publishes and superseded indexes — but
-  a generation's pack list is carried forward wholesale, so a pack whose
-  contents are entirely dead stays listed and stays on disk. `pelfs
-  repack-plan` measures exactly what that costs on your volume; the
-  repack that would act on it is not built. Plan for storage that grows
-  with rewrites until it is.
+- **Reclaiming space takes two steps, and both are manual.** `pelfs
+  repack --apply` rewrites the packs that are mostly garbage and stops
+  naming the old ones; `pelfs gc --delete` removes them once the grace
+  window (72h) has passed. Neither runs on its own. Until you run them, a
+  pack whose contents are entirely dead stays on disk — `pelfs repack`
+  with no flags reports exactly what that is costing.
 - Volume **tags cannot be created** yet (they can be read with `--tag`),
   there is no **fork** command, and there is no **key rotation**.

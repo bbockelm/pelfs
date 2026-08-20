@@ -172,6 +172,17 @@ func retryOnSized(ctx context.Context, op string, bytes int64, attempts int, fn 
 					ui.Warn("slow operation: {op} took {duration} ({attempts})",
 						"op", op, "duration", d, "attempts", ui.Count(i, "attempt"))
 				}
+			} else if bytes > 0 {
+				// Under --debug every federation transfer is accounted
+				// for, slow or not: a run that felt wrong is explained by
+				// the shape of ALL of its transfers, and the warning above
+				// deliberately reports only the outliers.
+				ui.Debug("{op}: {bytes} in {duration} at {rate} MiB/s ({attempts})",
+					"op", op, "bytes", ui.ByteCount(bytes), "duration", d,
+					"rate", mibPerSecond(bytes, d), "attempts", ui.Count(i, "attempt"))
+			} else {
+				ui.Debug("{op}: {duration} ({attempts})",
+					"op", op, "duration", d, "attempts", ui.Count(i, "attempt"))
 			}
 			return nil
 		}

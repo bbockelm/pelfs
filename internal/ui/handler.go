@@ -16,9 +16,14 @@ import (
 // the same level a person reads on the terminal -- and so that no call
 // site has to shout WARNING in its own message text.
 const (
-	prefix     = "pelfs: "
-	warnPrefix = "pelfs: warning: "
-	errPrefix  = "pelfs: error: "
+	prefix = "pelfs: "
+	// A debug line says so in the lead for the same reason a warning
+	// does: the reader who turned the channel on is reading it mixed in
+	// with the messages meant for them, and must be able to tell which
+	// of the two a line is -- and to grep one out of the other.
+	debugPrefix = "pelfs: debug: "
+	warnPrefix  = "pelfs: warning: "
+	errPrefix   = "pelfs: error: "
 )
 
 func linePrefix(l slog.Level) string {
@@ -27,6 +32,8 @@ func linePrefix(l slog.Level) string {
 		return errPrefix
 	case l >= slog.LevelWarn:
 		return warnPrefix
+	case l < slog.LevelInfo:
+		return debugPrefix
 	default:
 		return prefix
 	}
@@ -92,6 +99,8 @@ func levelName(l slog.Level) string {
 		return "ERROR"
 	case l >= slog.LevelWarn:
 		return "WARN"
+	case l < slog.LevelInfo:
+		return "DEBUG"
 	default:
 		return "INFO"
 	}

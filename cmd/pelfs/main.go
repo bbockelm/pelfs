@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strconv"
 	"time"
 
 	"github.com/bbockelm/pelfs/internal/ui"
@@ -128,7 +129,19 @@ func registerFlags(fs *flag.FlagSet, o *cmdOpts) {
 	fs.BoolVar(&o.stealLease, "steal-lease", false, "take over a live lease held by another client (use only when that client is known dead)")
 	fs.BoolVar(&o.noAcquireToken, "no-acquire-token", false, "never run interactive token-acquisition flows; rely on discovered tokens only")
 	fs.BoolVar(&o.insecure, "insecure", false, "skip TLS verification (test federations only)")
-	fs.BoolVar(&o.debug, "debug", false, "verbose logging")
+	// --debug opens a channel, so it is wired where it is defined rather
+	// than at a use site: it used to reach only the FUSE library's
+	// protocol tracing, which left it a silent no-op on the NFS backend
+	// and on every command that never mounts anything.
+	fs.BoolFunc("debug", "log what pelfs is doing internally (federation transfers, daemon startup) and, on the fuse backend, trace the FUSE kernel protocol", func(v string) error {
+		on, err := strconv.ParseBool(v)
+		if err != nil {
+			return err
+		}
+		o.debug = on
+		ui.SetDebug(on)
+		return nil
+	})
 	fs.StringVar(&o.backend, "backend", "auto", "how to attach the filesystem: auto, fuse, or nfs (loopback NFS server + the OS NFS client; no kext or macFUSE needed on macOS)")
 	fs.StringVar(&o.shellPath, "shell", "", "shell to launch (default: $SHELL, else /bin/sh)")
 	fs.StringVar(&o.prefetch, "prefetch", "none", "download the generation into the local cache at startup: none, all (blocking; refuse to start on any failure), or background")

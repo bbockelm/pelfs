@@ -91,6 +91,18 @@
 // that way: it is the literal words of a template that scripts match, so a
 // message must carry the words its readers look for OUTSIDE its
 // placeholders.
+//
+// # One channel is addressed to us instead
+//
+// Everything above is written for the user. Debug is the exception: it is
+// the internal detail that answers "why did that take four minutes" once
+// a report arrives, and it is silent unless --debug asks for it. It is a
+// channel, not a volume knob — a line belongs there when a maintainer
+// would ask for it and a user never would, not when the author was unsure
+// whether a message was worth printing. Everything else about it is
+// unchanged: it is a sentence, it carries its values as attributes, and
+// it wears the same prefix, because the reader who turned it on is
+// reading it in the same terminal as the rest.
 package ui
 
 import (
@@ -109,7 +121,16 @@ import (
 // mutex-guarded variable.
 var current atomic.Pointer[slog.Logger]
 
-func init() { current.Store(newLogger(os.Stderr, FormatFor(os.Stderr))) }
+// level is the lowest level any sink emits: Info, or Debug once --debug
+// says so. It lives beside the logger rather than inside a handler
+// because SetOutput builds a new handler, and a test (or a redirect)
+// must not silently undo the channel the user asked for.
+var level atomic.Int64
+
+func init() {
+	current.Store(newLogger(os.Stderr, FormatFor(os.Stderr)))
+	level.Store(int64(slog.LevelInfo))
+}
 
 // Format is how a sink renders a record. See the package comment for what
 // each one is for and who reads it.
@@ -135,6 +156,23 @@ func Warn(msg string, args ...any) { current.Load().Warn(msg, args...) }
 // Error reports a failure. It does not exit; the caller owns the exit
 // status.
 func Error(msg string, args ...any) { current.Load().Error(msg, args...) }
+
+// Debug is addressed to whoever maintains pelfs rather than to whoever
+// runs it: what the program did internally, for the run someone is trying
+// to explain. It is silent unless SetDebug turns it on.
+func Debug(msg string, args ...any) { current.Load().Debug(msg, args...) }
+
+// SetDebug opens or closes the debug channel for the whole process. It is
+// what --debug is wired to, and it is process-wide because the question
+// --debug asks ("what is this run doing") is not one any single package
+// can answer alone.
+func SetDebug(on bool) {
+	if on {
+		level.Store(int64(slog.LevelDebug))
+		return
+	}
+	level.Store(int64(slog.LevelInfo))
+}
 
 // FormatFor picks the format for w: whatever PELFS_LOG_FORMAT names, else
 // Plain for a terminal and Text for anything else. Only a human's two
@@ -190,10 +228,12 @@ type handler struct {
 	with []slog.Attr
 }
 
-// Enabled: pelfs has no debug channel. Everything it says is addressed
-// to the user running it, and anything below Info would be addressed to
-// us instead.
-func (h *handler) Enabled(_ context.Context, l slog.Level) bool { return l >= slog.LevelInfo }
+// Enabled gates the one channel that is not addressed to the user.
+// Everything at Info and above is; Debug is addressed to us, and stays
+// off until --debug (SetDebug) asks for it.
+func (h *handler) Enabled(_ context.Context, l slog.Level) bool {
+	return l >= slog.Level(level.Load())
+}
 
 func (h *handler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	if len(attrs) == 0 {

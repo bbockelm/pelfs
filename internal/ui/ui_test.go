@@ -347,3 +347,58 @@ func TestFormatSelection(t *testing.T) {
 type countingWriter struct{ n int }
 
 func (c *countingWriter) Write(p []byte) (int, error) { c.n++; return len(p), nil }
+
+// debugOn opens the debug channel for one test and closes it after,
+// because the channel is process-wide by design.
+func debugOn(t *testing.T) {
+	t.Helper()
+	SetDebug(true)
+	t.Cleanup(func() { SetDebug(false) })
+}
+
+// Debug is addressed to us, so a user who did not ask for it never sees
+// it -- and asking is not undone by redirecting the output, which is what
+// SetOutput does on every mount and in every test.
+func TestDebugIsSilentUntilAskedFor(t *testing.T) {
+	if out := say(t, Plain, func() { Debug("probing {key}", "key", "roots/main") }); out != "" {
+		t.Fatalf("the debug channel spoke without being asked: %q", out)
+	}
+	debugOn(t)
+	out := say(t, Plain, func() {
+		Debug("probing {key}", "key", "roots/main")
+		Info("mounted {prefix}", "prefix", "pelican://x/y")
+	})
+	want := "pelfs: debug: probing roots/main\n" +
+		"pelfs: mounted pelican://x/y\n"
+	if out != want {
+		t.Fatalf("debug output:\n%q\nwant:\n%q", out, want)
+	}
+}
+
+// A debug line is a pelfs message like any other: it says which of the
+// two channels it belongs to, in whichever format its reader chose.
+func TestDebugNamesItsLevelInEveryFormat(t *testing.T) {
+	debugOn(t)
+	text := say(t, Text, func() { Debug("fetched {key} in {duration}", "key", "packs/p-1", "duration", 12*time.Millisecond) })
+	if !strings.Contains(text, " DEBUG pelfs: fetched packs/p-1 in 12ms") {
+		t.Errorf("text sink did not level the line: %q", text)
+	}
+	line := say(t, JSON, func() { Debug("fetched {key} in {duration}", "key", "packs/p-1", "duration", 12*time.Millisecond) })
+	m := decode(t, line)
+	if m["level"] != "DEBUG" {
+		t.Errorf("json level is %v, want DEBUG: %q", m["level"], line)
+	}
+	if m["msg"] != "fetched {key} in {duration}" {
+		t.Errorf("a debug record must carry the template like any other: %q", line)
+	}
+}
+
+// Closing the channel again is what --debug=false means, and what every
+// process that never passed the flag lives in.
+func TestSetDebugCloses(t *testing.T) {
+	SetDebug(true)
+	SetDebug(false)
+	if out := say(t, Plain, func() { Debug("still here") }); out != "" {
+		t.Errorf("the channel stayed open after being closed: %q", out)
+	}
+}

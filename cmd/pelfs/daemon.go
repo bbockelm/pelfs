@@ -64,6 +64,13 @@ func openDaemonLog(dir string) (*os.File, string, error) {
 		// than they were promised.
 		if err := os.Rename(path, path+".1"); err != nil {
 			ui.Warn("could not rotate {log} ({error}); it will keep growing", "log", path, "error", err)
+		} else {
+			// Silent on a normal run: a user reading their own log to find
+			// out why a mount failed does not need to be told about
+			// housekeeping. Someone wondering where the older half of the
+			// log went does.
+			ui.Debug("rotated {log} at {size}; the previous log is now {rolled}",
+				"log", path, "size", ui.ByteCount(fi.Size()), "rolled", path+".1")
 		}
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
@@ -128,6 +135,9 @@ func cmdMount(args []string) int {
 		// The daemon child IS the mount: runMountGen publishes the record
 		// this command's parent is waiting on, serves until SIGTERM, and
 		// seals on the way out.
+		ui.Debug("mount daemon (pid {pid}) starting: {prefix} on {mountpoint}, state {statedir}, backend {backend}",
+			"pid", os.Getpid(), "prefix", prefix, "mountpoint", mountpoint,
+			"statedir", o.stateDir, "backend", a.backend)
 		return runMountGen(o, prefix, mountpoint, nil, a)
 	}
 
@@ -156,11 +166,17 @@ func cmdMount(args []string) int {
 	}
 	pid := child.Process.Pid
 	_ = child.Process.Release()
+	// The two facts a startup timeout is diagnosed from: which process to
+	// look at, and which file it must write before this command believes
+	// it. Both are gone by the time the timeout is reported.
+	ui.Debug("spawned mount daemon (pid {pid}); waiting for {record}", "pid", pid, "record", infoPath)
 
 	// Wait for the daemon to publish its mount info (or die).
-	deadline := time.Now().Add(60 * time.Second)
+	start := time.Now()
+	deadline := start.Add(60 * time.Second)
 	for time.Now().Before(deadline) {
 		if info, err := readMountInfo(infoPath); err == nil && info.PID == pid {
+			ui.Debug("mount daemon published its record after {duration}", "duration", time.Since(start))
 			ui.Info("mounted {prefix} on {mountpoint} (pid {pid}, log {log})",
 				"prefix", prefix, "mountpoint", info.MountPoint, "pid", pid, "log", logPath)
 			return 0
@@ -195,6 +211,10 @@ func cmdUmount(args []string) int {
 			return exitErr(fmt.Errorf("signal pid %d: %w", e.info.PID, err))
 		}
 		ui.Info("waiting for {mountpoint} to unmount and flush...", "mountpoint", e.info.MountPoint)
+		// A umount that hangs is a seal that is still uploading, and the
+		// log to read is the daemon's own, not this command's.
+		ui.Debug("sent SIGTERM to pid {pid}; its own log is under {statedir}",
+			"pid", e.info.PID, "statedir", e.info.StateDir)
 		deadline := time.Now().Add(120 * time.Second)
 		for time.Now().Before(deadline) {
 			if !pidAlive(e.info.PID) {

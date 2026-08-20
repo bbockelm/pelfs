@@ -202,6 +202,21 @@ func (v *Volume) Publish(o publish.Options) *publish.Result {
 	return res
 }
 
+// Adopt re-seats the volume on a generation SOMEONE ELSE published — a
+// repack, or a second writer — exactly as a mount does when it notices the
+// branch has moved (genfs.Swap).
+//
+// A test that repacks and then goes on writing needs it: without it the
+// volume keeps growing from a generation that is no longer the head, and
+// the next seal either loses the repack or is refused for it. Pending
+// overlay writes are discarded, so adopt at a point where there are none.
+func (v *Volume) Adopt(sb *superblock.Superblock, raw []byte) {
+	v.t.Helper()
+	v.closeLayers()
+	v.sb, v.raw = sb, raw
+	v.openLayers()
+}
+
 // ---- tree mutation ----
 
 // Lookup resolves one name and returns its inode. The overlay establishes

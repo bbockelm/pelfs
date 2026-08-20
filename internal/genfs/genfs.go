@@ -262,7 +262,7 @@ func Open(ctx context.Context, o Options) (*FS, error) {
 	// might need locating and everything after it certainly does. Failure
 	// is not reported: the indexes are hints, and a mount without them is
 	// the mount this was before they existed (packindex.go).
-	fs.packIndex.loadHints(ctx, o.SB.PackIndexes)
+	fs.packIndex.loadHints(o.SB.PackIndexes)
 	if o.PackCacheBytes > 0 {
 		fs.sweepPackTmp()
 	}

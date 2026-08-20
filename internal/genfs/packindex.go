@@ -48,32 +48,76 @@ type packIndex struct {
 	fs    *FS
 	packs []superblock.PackEntry
 
-	// hints is the generation's multi-pack index, fetched once at Open —
-	// nil when the superblock lists none, when none verified, or when this
-	// build simply has not been given one. Read-only once set, which is
-	// before the FS is handed to anyone.
+	// hints is the generation's multi-pack index set — nil when the
+	// superblock lists none, or when this build has not been given one.
+	// Read-only once set, which is before the FS is handed to anyone; the
+	// index objects behind it are fetched lazily and never whole (mpi's
+	// Reader), so naming them costs nothing.
 	//
 	// It is a HINT in the same sense as the root-catalog hint: an index is
 	// derived and may be stale, so a name it produces is followed to a
 	// pack TRAILER, which is what actually confirms the identity. A wrong
 	// or unverifiable answer costs the ordinary fallback below and can
 	// never cost a wrong read or a failed mount.
-	hints *mpi.Set
+	hints *mpi.Hints
+	// warmed loads every tier's header at once on the first consult, so a
+	// generation with several indexes costs one round trip of latency
+	// rather than one per tier.
+	warmed sync.Once
 
 	// loadMu serializes the trailer work, so concurrent misses index a
-	// pack once between them rather than once each. localMerged and
-	// complete are under it: each sweep is worth doing once, and a read
-	// for content that genuinely is not here would otherwise re-walk the
-	// whole pack list to rediscover that on every attempt.
+	// pack once between them rather than once each. localMerged is under
+	// it: that sweep is worth doing once, and a read for content that
+	// genuinely is not here would otherwise re-walk every local trailer to
+	// rediscover that on every attempt.
 	loadMu      sync.Mutex
 	localMerged bool
-	complete    bool
 
-	mu      sync.Mutex
-	byKey   map[string]packLoc
-	listed  map[string]superblock.PackEntry
-	indexed map[string]bool
+	mu    sync.Mutex
+	byKey map[string]packLoc
+	// keysOf records which keys each pack contributed to byKey, and its
+	// key set IS the set of packs folded in — the old separate `indexed`
+	// map said the same thing twice and could disagree with the map after
+	// an eviction.
+	keysOf map[string][]string
+	// order is the packs in the order they were folded in, oldest first:
+	// the eviction queue.
+	order  []string
+	listed map[string]superblock.PackEntry
+	// unbounded is set by the callers that ask for the WHOLE location map
+	// and by nobody else. See hotCapEntries.
+	unbounded bool
 }
+
+// hotCapEntries bounds byKey, and the unit of both insertion and eviction
+// is a PACK rather than a key.
+//
+// The map was unbounded, and its size is set by what a mount happens to
+// read: one trailer's worth of locations per pack touched, forever. At a
+// hundred million objects a mount that resolved everything held 13.4 GB of
+// it — the largest resident structure in the tree, holding a fact (which
+// pack) that is re-derivable from a local file in microseconds.
+//
+// So it is a CACHE now, and the things that made it not one are gone.
+// Nothing answers "absent" out of it: every absence comes from a sweep
+// that examined trailer entries directly, so an evicted key costs a
+// re-derivation and never a wrong answer. And evicting a whole pack at a
+// time keeps the map's accounting exact — keysOf names the packs folded
+// in, so dropping one drops its claim to be folded in with it.
+//
+// 131,072 locations is about 20 MB, and at the shipped cut size that is
+// the entries of roughly 250 packs: far more than the working set of any
+// sequential read, which is what the whole-pack policy makes the common
+// case.
+//
+// FIFO, not LRU. The whole-pack policy means locations arrive in bursts
+// and are consumed in bursts, so recency at the KEY level says almost
+// nothing; the pack a mount finished with is the right victim, and
+// tracking per-key recency would cost more than the eviction saves.
+//
+// A var only so that tests can drive eviction without a fixture the size
+// of the cap. Nothing in the tree writes it.
+var hotCapEntries = 1 << 17
 
 // newPackIndex builds the empty index for a generation's RESOLVED pack
 // list — the rows the generation names, whether it stated them inline or
@@ -82,11 +126,11 @@ type packIndex struct {
 // needs to hold a local copy to account.
 func newPackIndex(fs *FS, packs []superblock.PackEntry) *packIndex {
 	x := &packIndex{
-		fs:      fs,
-		packs:   packs,
-		byKey:   make(map[string]packLoc),
-		listed:  make(map[string]superblock.PackEntry, len(packs)),
-		indexed: make(map[string]bool, len(packs)),
+		fs:     fs,
+		packs:  packs,
+		byKey:  make(map[string]packLoc),
+		keysOf: make(map[string][]string),
+		listed: make(map[string]superblock.PackEntry, len(packs)),
 	}
 	for _, pe := range packs {
 		x.listed[pe.Name] = pe
@@ -125,6 +169,9 @@ func (x *packIndex) entry(pack string) (superblock.PackEntry, bool) {
 	return pe, ok
 }
 
+// lookup answers out of the hot cache alone. A miss here means "not
+// cached", never "not present" — the two were the same answer while the
+// map held everything, and telling them apart is what lets it stop.
 func (x *packIndex) lookup(key string) (packLoc, bool) {
 	x.mu.Lock()
 	defer x.mu.Unlock()
@@ -132,30 +179,110 @@ func (x *packIndex) lookup(key string) (packLoc, bool) {
 	return loc, ok
 }
 
-// merge folds one pack's trailer into the map. Identical content dedups at
-// publish, so a key appearing in several packs names the same bytes; the
-// first merge wins, and callers merge newest-first, so the winner is the
-// most recently written copy no matter which order the fetches completed
-// in.
-func (x *packIndex) merge(pe superblock.PackEntry, entries []packstore.PackEntry) {
+// merge folds one pack's trailer into the map and reports where `want`
+// sits IF this pack holds it — from the entries themselves, not from the
+// map, so an answer cannot be lost to the eviction the merge may trigger.
+// A want of "" asks nothing.
+//
+// Identical content dedups at publish, so a key appearing in several packs
+// names the same bytes and either copy is a correct read. Which one wins
+// is decided by the pack NAME, which begins with a zero-padded creation
+// stamp: the newest placement, the one a retention sweep is least likely
+// to have taken. That used to be a property of the ORDER callers merged
+// in, which meant a concurrent sweep had to collect every trailer before
+// merging any — len(packs) parsed trailers resident at once, which is
+// gigabytes at target scale. Deciding it by name instead lets each worker
+// merge and drop its trailer as it goes.
+func (x *packIndex) merge(pe superblock.PackEntry, entries []packstore.PackEntry, want string) (packLoc, bool) {
 	x.mu.Lock()
 	defer x.mu.Unlock()
-	if x.indexed[pe.Name] {
-		return
+	var (
+		found packLoc
+		hit   bool
+	)
+	_, folded := x.keysOf[pe.Name]
+	if !folded {
+		x.keysOf[pe.Name] = nil
+		x.order = append(x.order, pe.Name)
 	}
-	x.indexed[pe.Name] = true
 	for _, e := range entries {
-		if _, dup := x.byKey[e.Key]; dup {
+		loc := packLoc{pack: pe.Name, off: e.Off, length: e.Length}
+		if want != "" && e.Key == want {
+			found, hit = loc, true
+		}
+		if folded {
 			continue
 		}
-		x.byKey[e.Key] = packLoc{pack: pe.Name, off: e.Off, length: e.Length}
+		if cur, dup := x.byKey[e.Key]; dup && cur.pack >= pe.Name {
+			continue
+		}
+		x.byKey[e.Key] = loc
+		// Recorded against this pack even when it took the key from
+		// another: eviction deletes a key only when the entry still names
+		// the pack being evicted, so both claims are safe and neither
+		// stranded.
+		x.keysOf[pe.Name] = append(x.keysOf[pe.Name], e.Key)
+	}
+	x.evictLocked()
+	return found, hit
+}
+
+// evictLocked drops whole packs, oldest folded first, until the map is
+// back within its cap. Callers hold mu.
+//
+// One pack is always kept however large its trailer: a cap that could
+// empty the map would make the merge that just ran pointless, and the
+// caller has the location it came for either way.
+func (x *packIndex) evictLocked() {
+	if x.unbounded {
+		return
+	}
+	for len(x.byKey) > hotCapEntries && len(x.order) > 1 {
+		victim := x.order[0]
+		copy(x.order, x.order[1:])
+		x.order = x.order[:len(x.order)-1]
+		for _, k := range x.keysOf[victim] {
+			// Only if the entry still belongs to the victim: a later pack
+			// may have taken the key, and that pack records its own claim.
+			if loc, ok := x.byKey[k]; ok && loc.pack == victim {
+				delete(x.byKey, k)
+			}
+		}
+		delete(x.keysOf, victim)
 	}
 }
 
+// isIndexed reports whether a pack's trailer is folded into the map right
+// now. It can go back to false: that is the point of the cap.
 func (x *packIndex) isIndexed(pack string) bool {
 	x.mu.Lock()
 	defer x.mu.Unlock()
-	return x.indexed[pack]
+	_, ok := x.keysOf[pack]
+	return ok
+}
+
+// indexedAll reports whether every listed pack is folded in — the one
+// condition under which a miss in the map means the generation genuinely
+// does not hold the key.
+//
+// It is derived rather than remembered. A `complete` flag was true until
+// something set it false, and nothing did when a pack was evicted; asking
+// the map is exact by construction and cannot drift.
+func (x *packIndex) indexedAll() bool {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	return len(x.keysOf) == len(x.listed)
+}
+
+// holdEverything lifts the cap for the callers that have asked for the
+// WHOLE location map (all, below). It is one-way: a caller that needed the
+// generation's every location once will need it again, and re-fetching
+// every trailer to rebuild what was just dropped is the cost the cap
+// exists to avoid, not one to introduce.
+func (x *packIndex) holdEverything() {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	x.unbounded = true
 }
 
 // lazyProbeBudget is how many packs a miss probes one at a time before it
@@ -172,6 +299,18 @@ const lazyProbeBudget = 4
 
 // locate resolves one entry identity, indexing packs on demand until it
 // finds one that holds it.
+//
+// The order is by cost, and each step answers out of the ENTRIES it just
+// examined rather than out of the map, so nothing here can be lost to an
+// eviction that the same step's merge triggered:
+//
+//  1. the hot cache;
+//  2. trailers already on disk, which cost no requests;
+//  3. the multi-pack index, which names the pack outright — one trailer
+//     fetch, and the step this whole structure exists for;
+//  4. a short backwards walk of the pack list, betting on recency;
+//  5. every listed pack, which is the answer of last resort and the only
+//     thing that may say "not present".
 //
 // A trailer that will not load is remembered as an ERROR, not as an
 // absence: reporting "not present" for a pack that could not be read would
@@ -190,8 +329,7 @@ func (x *packIndex) locate(ctx context.Context, key string) (packLoc, error) {
 	// has read this volume before has most of them. Doing it first means a
 	// remount resolves out of local state instead of guessing its way
 	// backwards through the pack list over the network.
-	x.mergeLocal()
-	if loc, ok := x.lookup(key); ok {
+	if loc, ok := x.mergeLocal(key); ok {
 		return loc, nil
 	}
 	// The multi-pack index, before any guessing: it names the pack outright
@@ -215,16 +353,16 @@ func (x *packIndex) locate(ctx context.Context, key string) (packLoc, error) {
 			}
 			continue
 		}
-		x.merge(pe, entries)
-		if loc, ok := x.lookup(key); ok {
+		if loc, ok := x.merge(pe, entries, key); ok {
 			return loc, nil
 		}
 	}
-	if err := x.allLocked(ctx); err != nil {
-		return packLoc{}, err
-	}
-	if loc, ok := x.lookup(key); ok {
+	loc, ok, err := x.indexAll(ctx, key)
+	if ok {
 		return loc, nil
+	}
+	if err != nil {
+		return packLoc{}, err
 	}
 	if failed != nil {
 		return packLoc{}, failed
@@ -232,28 +370,26 @@ func (x *packIndex) locate(ctx context.Context, key string) (packLoc, error) {
 	return packLoc{}, fmt.Errorf("genfs: %s not present in any listed pack", key)
 }
 
-// loadHints fetches the indexes a generation lists and attaches whatever
-// verified. It must be called before the index is shared, and it is the
-// only writer of x.hints.
+// loadHints attaches the indexes a generation lists. It must be called
+// before the index is shared, and it is the only writer of x.hints.
 //
-// The error is deliberately DROPPED, and mpi.FetchAll is built to make
-// that safe: it returns the indexes that verified alongside it, so a
-// generation whose index is missing, truncated, or hashes wrong loads the
-// rest and mounts. An index cannot fail a mount — it is derived, and the
-// trailers still answer every question it would have.
+// IT MAKES NO REQUESTS, which is the whole change. It used to fetch every
+// listed index whole and hold it: 1.6 GB moved and 1.6 GB resident at a
+// hundred million objects, before the mount answered anything, for a
+// structure the ordinary mount then never consults — the superblock's
+// root-catalog hint resolves the first question, and everything after it
+// comes out of the trailer of a pack the mount has already pulled.
 //
-// One fetch of a small object, in parallel across however many indexes the
-// generation lists, against one trailer fetch per pack. That is the trade
-// the whole thing exists for, and it is paid up front because the first
-// question a mount asks needs the answer.
-func (x *packIndex) loadHints(ctx context.Context, refs []superblock.IndexRef) {
-	if len(refs) == 0 {
-		return
-	}
-	indexes, _ := mpi.FetchAll(ctx, x.fs.inner, refs)
-	if len(indexes) > 0 {
-		x.hints = mpi.NewSet(indexes)
-	}
+// So the indexes are named here and read when something asks (mpi.Reader):
+// the header and samples once, a ~64 KB window per lookup, and nothing at
+// all for the mount that never has a miss the trailers cannot answer.
+//
+// A failure remains invisible on purpose. An index is derived, the
+// trailers still answer every question it would have, so a generation
+// whose index is missing, truncated, or hashes wrong mounts and serves —
+// it just pays the fallback.
+func (x *packIndex) loadHints(refs []superblock.IndexRef) {
+	x.hints = mpi.NewHints(x.fs.inner, refs)
 }
 
 // probeHints asks the multi-pack index which pack holds key and indexes
@@ -275,6 +411,14 @@ func (x *packIndex) loadHints(ctx context.Context, refs []superblock.IndexRef) {
 // The trailers merged along the way are kept either way: they were fetched
 // and verified, so a wrong hint at least leaves the map larger than it
 // found it.
+//
+// A pack already folded in is probed AGAIN rather than skipped. That looks
+// wasteful and is the opposite: the map is a bounded cache now, so
+// "already folded in" and "still holds this key" are different statements,
+// and the trailer that answers the second one is a local file this mount
+// wrote the first time round. Skipping it would mean an evicted key fell
+// through to the pack-list walk and then to the sweep — the exact cost
+// this step exists to remove.
 func (x *packIndex) probeHints(ctx context.Context, key string) (packLoc, bool) {
 	if x.hints == nil {
 		return packLoc{}, false
@@ -286,35 +430,64 @@ func (x *packIndex) probeHints(ctx context.Context, key string) (packLoc, bool) 
 	if _, err := hex.Decode(id[:], []byte(key)); err != nil {
 		return packLoc{}, false
 	}
-	names, ok := x.hints.Lookup(id)
+	// Every tier's header at once, on the first consult: a lookup that may
+	// have to ask several indexes should cost one round trip of latency,
+	// not one per tier.
+	x.warmed.Do(func() { x.hints.Warm(ctx) })
+	names, ok := x.hints.Lookup(ctx, id)
 	if !ok {
 		return packLoc{}, false
 	}
 	for _, name := range names {
 		pe, listed := x.entry(name)
-		if !listed || x.isIndexed(name) {
+		if !listed {
 			continue
 		}
 		entries, err := x.fs.trailerEntries(ctx, pe)
 		if err != nil {
 			continue
 		}
-		x.merge(pe, entries)
-		if loc, ok := x.lookup(key); ok {
+		if loc, ok := x.merge(pe, entries, key); ok {
 			return loc, true
 		}
 	}
 	return packLoc{}, false
 }
 
+// confirms checks a location proposed from OUTSIDE the trailers against
+// the pack's own trailer, which is the record the signed pack list
+// authenticates and therefore the only thing that binds an identity to an
+// extent. It folds the trailer in while it is here, since it has it.
+//
+// The one caller is the root-catalog hint on an encrypted volume, where
+// identity cannot be recomputed from the bytes (roothint.go).
+func (x *packIndex) confirms(ctx context.Context, pe superblock.PackEntry, key string, loc packLoc) bool {
+	entries, err := x.fs.trailerEntries(ctx, pe)
+	if err != nil {
+		return false
+	}
+	got, ok := x.merge(pe, entries, key)
+	return ok && got.off == loc.off && got.length == loc.length
+}
+
 // mergeLocal folds in every pack whose trailer this mount can read without
-// a request — a saved copy, or a pack already cached whole. Callers hold
-// loadMu.
-func (x *packIndex) mergeLocal() {
+// a request — a saved copy, or a pack already cached whole — and reports
+// where key sits if one of them holds it. Callers hold loadMu.
+//
+// It runs once per generation because it is O(local trailers): worth
+// paying to turn a remount into local work, not worth repeating on every
+// miss. What makes running it once safe under a bounded map is that it
+// answers for key out of the entries it reads, so a location it found and
+// then evicted is still the location it returns.
+func (x *packIndex) mergeLocal(key string) (packLoc, bool) {
 	if x.localMerged {
-		return
+		return packLoc{}, false
 	}
 	x.localMerged = true
+	var (
+		found packLoc
+		hit   bool
+	)
 	// Newest-first, like every other merge here, so a key in several packs
 	// resolves the same way whichever path found it.
 	for i := len(x.packs) - 1; i >= 0; i-- {
@@ -323,9 +496,12 @@ func (x *packIndex) mergeLocal() {
 			continue
 		}
 		if entries, ok := x.fs.localTrailerEntries(pe); ok {
-			x.merge(pe, entries)
+			if loc, got := x.merge(pe, entries, key); got && !hit {
+				found, hit = loc, true
+			}
 		}
 	}
+	return found, hit
 }
 
 // LoadPackIndex resolves the location of every entry the generation holds,
@@ -357,47 +533,92 @@ const indexWorkers = 8
 // Those callers must ask for it — no read path builds it, and one that
 // consulted a partial map would answer "missing" for content that is
 // merely un-probed.
+//
+// They are also the only callers that ask for the cap to be lifted, and
+// asking is the point: a caller that wants every location has asked for
+// the memory every location takes, out loud, in one place, instead of a
+// read path accumulating it silently. What would let this be bounded too
+// is spilling the map to a local packidx table and searching THAT — the
+// structure exists (fixed width, sorted, windowed) and this is the caller
+// that wants it.
 func (x *packIndex) all(ctx context.Context) error {
 	x.loadMu.Lock()
 	defer x.loadMu.Unlock()
-	return x.allLocked(ctx)
+	x.holdEverything()
+	_, _, err := x.indexAll(ctx, "")
+	return err
 }
 
-func (x *packIndex) allLocked(ctx context.Context) error {
-	if x.complete {
-		return nil
+// indexAll folds in every listed pack not already accounted for, and
+// reports where want sits if one of them holds it. Callers hold loadMu.
+//
+// This is the answer of last resort and the ONLY thing entitled to say a
+// key is present in no listed pack — the rule at the top of this file,
+// which is not negotiable because a false absence fails a read, re-uploads
+// content that exists, or deletes live data.
+//
+// Two things about it changed with the cap. It merges each trailer as its
+// fetch completes instead of collecting them all first: the collected form
+// was len(packs) parsed trailers resident at once, ~11 GB in transit at
+// target scale, and the only reason for it was to control which pack won a
+// duplicate key — which merge now decides by name (see merge). And it
+// reports `want` out of the entries rather than leaving the caller to look
+// in a map that a later merge may have evicted from.
+func (x *packIndex) indexAll(ctx context.Context, want string) (packLoc, bool, error) {
+	if x.indexedAll() {
+		// Every listed pack is folded in and nothing has been dropped, so
+		// the map is the whole truth and a miss in it is an absence.
+		loc, ok := x.lookup(want)
+		return loc, ok, nil
 	}
-	x.mergeLocal()
-	results := make([][]packstore.PackEntry, len(x.packs))
-	errs := make([]error, len(x.packs))
+	if loc, ok := x.mergeLocal(want); ok {
+		return loc, true, nil
+	}
+	var (
+		mu       sync.Mutex
+		found    packLoc
+		hit      bool
+		firstErr error
+	)
 	sem := make(chan struct{}, indexWorkers)
 	var wg sync.WaitGroup
-	for i, pe := range x.packs {
+	for _, pe := range x.packs {
 		if x.isIndexed(pe.Name) {
 			continue
 		}
 		wg.Add(1)
-		go func(i int, pe superblock.PackEntry) {
+		go func(pe superblock.PackEntry) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			results[i], errs[i] = x.fs.trailerEntries(ctx, pe)
-		}(i, pe)
+			entries, err := x.fs.trailerEntries(ctx, pe)
+			if err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = fmt.Errorf("genfs: index pack %s: %w", pe.Name, err)
+				}
+				mu.Unlock()
+				return
+			}
+			loc, ok := x.merge(pe, entries, want)
+			if !ok {
+				return
+			}
+			mu.Lock()
+			if !hit {
+				found, hit = loc, true
+			}
+			mu.Unlock()
+		}(pe)
 	}
 	wg.Wait()
-	// Newest-first, so a key in several packs resolves to the same copy a
-	// lazy probe would have found.
-	for i := len(x.packs) - 1; i >= 0; i-- {
-		pe := x.packs[i]
-		if errs[i] != nil {
-			return fmt.Errorf("genfs: index pack %s: %w", pe.Name, errs[i])
-		}
-		if results[i] != nil {
-			x.merge(pe, results[i])
-		}
+	if hit {
+		// A located key is a better answer than a report that some other
+		// pack's trailer would not load: the caller asked where this one
+		// is, and now it knows.
+		return found, true, nil
 	}
-	x.complete = true
-	return nil
+	return packLoc{}, false, firstErr
 }
 
 // trailerEntries returns one pack's entries, from whatever local copy the

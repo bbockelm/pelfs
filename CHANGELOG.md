@@ -56,8 +56,27 @@ sorted spill files rather than holding an identity map. Memory for those
 passes is a buffer the caller sizes rather than a function of object count.
 
 That is a design target with unit-level evidence, not a claim about a
-production volume of that size. The largest trees exercised end to end are
-kernel-source-sized: ~90,000 files, ~1.5 GB.
+production volume of that size.
+
+What is checked end to end, on every push, is smaller and exact. CI untars
+**62,500 files** — 50,000 distinct plus 12,500 hard links to them,
+small-file shaped at ~900 bytes each, ~45 MB of content — through *both*
+frontends, real FUSE and a real kernel NFS client, and then: diffs the
+whole tree against the source through the live mount, seals it, mounts the
+published generation with a state directory that never existed before and
+diffs it again, runs `fsck --deep` and `gc`, and publishes a **second
+generation** carrying an add, a modify and a delete which is cold-mounted
+and diffed once more. The untar's per-chunk rate and the NFS client's RPCs
+per created file are bounded rather than merely reported. Separately, a
+mount is `kill -9`'d mid-flush after writing 384 MB, remounted, and held
+to the recovery contract.
+
+Past that it is manual, and the numbers are nobody's guarantee: the same
+gate takes a file count on the command line (`make big-tree` is the 50,000
+CI runs), and `PELFS_BIGSEAL=1 PELFS_BIGSEAL_FILES=…` runs the seal-cost
+rig over bigger trees. Between the 62,500 files CI proves and the hundred
+million the format is built for there is design and unit-level evidence,
+and no end-to-end run.
 
 ### Known limitations
 
@@ -94,9 +113,16 @@ until the next sweep. The tools are not symmetric about those two.
 ### Verified by
 
 `make test` (unit and CLI, including a model-based random test of the write
-path), `make e2e` (a full mount loop in a container against a fake origin),
-`make mount-gate` (the kernel mount gate: real FUSE and real NFS clients),
+path, and under `-race` in CI), `make e2e` (a full mount loop in a
+container against a fake origin), `make mount-gate` (the kernel mount
+gate: real FUSE and a real NFS client, both required), `make big-tree`
+(the 62,500-file scale gate described under *Scale*), `make crash`
+(`kill -9` of a mount mid-flush, then recovery and `fsck --deep`),
 `make opfuzz` (the overlay op-sequence fuzzer, in a sealed container), and
 `make integration` (transport and publish/resolve against a
-federation-in-a-box). Benchmarks for metadata throughput and untar rate live
-in `scripts/bench-*`.
+federation-in-a-box). Every one of them runs on every push, and on tags.
+
+The parser fuzz targets carry a committed corpus under each package's
+`testdata/fuzz/`, which an ordinary `go test` replays. Cost-attribution
+benchmarks — the tmpfs floor, the overlay without a kernel, the FUSE op
+mix — live in `scripts/bench-*` and are stopwatches, not gates.

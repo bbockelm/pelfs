@@ -247,9 +247,24 @@ type Store struct {
 	// The two halves of the location map. A handle resolves to slices of
 	// chunks; a chunk resolves to a place in a pack. Both bind at flush,
 	// and neither touches a content row.
+	//
+	// The two halves have different LIFETIMES, and the difference is not
+	// arbitrary. handleLoc answers "where are this extent's bytes", which
+	// only a content row can ask, so an entry no row names is unreachable
+	// and goes (locRefs). chunkLoc answers "where is this chunk", which
+	// the seal's multi-pack index and the cross-flush dedup check both ask
+	// about chunks NO current row names — that is the entire point of
+	// them — so it is kept for the life of the store and bounded by the
+	// distinct chunks a session writes rather than by its write calls.
 	handleLoc map[Handle][]ChunkSlice
 	chunkLoc  map[string]PackLoc
-	packs     []packstore.SealedPack
+	// locRefs counts content references to a PUBLISHED handle, so its
+	// location entry can be dropped when the last one goes. Without it
+	// handleLoc grew with WRITE CALLS for the life of a session — ~100-150
+	// MB per million files — including for files a checkpoint had already
+	// published and the overlay had already forgotten.
+	locRefs map[Handle]int
+	packs   []packstore.SealedPack
 
 	stats  Stats
 	closed bool
@@ -350,6 +365,7 @@ func newStore(opts Options) (*Store, error) {
 		content:    make(map[uint64]*content),
 		handleLoc:  make(map[Handle][]ChunkSlice),
 		chunkLoc:   make(map[string]PackLoc),
+		locRefs:    make(map[Handle]int),
 	}
 	s.promoteAt = s.packTarget
 	if runway := int64(opts.TableSize) - int64(opts.PromotionDistance); runway > 0 && s.promoteAt > runway/2 {
@@ -505,10 +521,16 @@ func (s *Store) Truncate(ino uint64, size int64) error {
 // an extent still in the ring dies there and is never uploaded, and one
 // already in a pack becomes garbage for a repack to sweep.
 //
-// It does NOT touch the location map. A handle that has been published
-// may still be named by a catalog row in an earlier generation, and
-// retention is what decides when those packs go — not a file being
-// deleted in a session that has not sealed yet.
+// What it does to the location map is exactly one thing: it releases the
+// last reference to a published HANDLE, whose slice list then goes,
+// because nothing can ask for it any more — only a content row can name a
+// handle. Everything the old rule was protecting is untouched. The chunk
+// half of the map stays, so the seal's multi-pack index still covers every
+// chunk this session placed and cross-flush dedup still recognizes bytes
+// it has already sent; the packs stay; and a catalog row in an earlier
+// generation still names the same chunks, because retention — not a file
+// being deleted in a session that has not sealed yet — is what decides
+// when those packs go.
 func (s *Store) Forget(ino uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -549,22 +571,35 @@ func (c *content) place(off int64, length int, h Handle) map[Handle]int {
 	return d
 }
 
-// applyLocked pushes reference-count deltas onto the two kinds of handle
-// that have local state to lose: ring records, and extents adopted from
-// the base. A handle already packed and reclaimed is neither — losing its
-// last reference makes it garbage in a pack, which is a repack's problem
-// and not this path's.
+// applyLocked pushes reference-count deltas onto the three kinds of handle
+// that have local state to lose: ring records, extents adopted from the
+// base, and PUBLISHED extents, whose location entry is state too — the
+// bytes in the pack are a repack's problem, but the map entry naming them
+// is this store's, and nothing can reach it once no content row names it.
 //
-// This is the ONLY place either count moves, which is what makes it
-// reachable from every path that can drop a reference: a write that
-// supersedes, a truncate, a Forget, an Adopt over an existing body, and a
-// frozen view being released.
+// This is the ONLY place any of the three counts moves, which is what
+// makes it reachable from every path that can drop a reference: a write
+// that supersedes, a truncate, a Forget, an Adopt over an existing body,
+// and a frozen view being released.
 func (s *Store) applyLocked(d map[Handle]int) {
 	for h, delta := range d {
 		if _, ok := s.index[h]; ok {
 			s.live[h] += delta
 			if s.live[h] <= 0 {
 				delete(s.live, h)
+			}
+			continue
+		}
+		if _, ok := s.handleLoc[h]; ok {
+			s.locRefs[h] += delta
+			if s.locRefs[h] <= 0 {
+				// Nothing names the extent, here or in any frozen view, so
+				// nothing can resolve through it: a handle is reachable
+				// only from a content row. The slice list goes; the chunks
+				// it named, their locations, and the packs holding them all
+				// stay exactly where they were.
+				delete(s.locRefs, h)
+				delete(s.handleLoc, h)
 			}
 			continue
 		}

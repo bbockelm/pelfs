@@ -199,6 +199,23 @@ func (s *Store) publish(b *batch, res *flushResult) {
 	s.mu.Lock()
 	for h, sl := range res.handleLoc {
 		s.handleLoc[h] = sl
+		// The handle's references move from the ring's live set to the
+		// location map's, because that is where the state now is. Taking
+		// the count across rather than starting one is what makes the two
+		// halves continuous: a reference that existed before the flush is
+		// the same reference after it.
+		//
+		// Zero means the extent was superseded while this run was
+		// chunking it — the pack run cuts outside the lock — so the entry
+		// is dead on arrival and no row will ever name it. Installing and
+		// immediately dropping it (rather than skipping) keeps this the
+		// only place that decides, and matches what applyLocked would have
+		// done a moment later.
+		if n := s.live[h]; n > 0 {
+			s.locRefs[h] = n
+		} else {
+			delete(s.handleLoc, h)
+		}
 	}
 	for k, v := range res.chunkLoc {
 		s.chunkLoc[k] = v

@@ -29,13 +29,21 @@ import (
 type Frozen struct {
 	s    *Store
 	rows map[uint64]*content
-	// held is the ADOPTED handles these rows name, with multiplicity. They
-	// are the one thing a frozen view owns beyond memory: an adopted
-	// extent's baseRefs entry is collected the moment nothing names it,
-	// and the live map may overwrite or forget the file the instant Freeze
-	// returns. Ring records need no equivalent — the flush above emptied
-	// the ring of anything a content row names, which is the same rule
-	// that makes this whole arrangement a map copy.
+	// held is every handle these rows name, with multiplicity. A frozen
+	// view is a second set of references to the same extents, and both
+	// kinds it can name are COLLECTED when their last reference goes: an
+	// adopted extent loses its baseRefs entry, a published one loses its
+	// location entry. The live map may overwrite or forget the file the
+	// instant Freeze returns, so a view that did not hold its references
+	// would render from state the store had every right to drop — which is
+	// not hypothetical: holding only the adopted half makes
+	// TestFrozenViewIgnoresWritesAfterTheInstant fail with "extent 1 is
+	// gone: it was neither in a memtable nor published".
+	//
+	// Ring records need no entry — the flush above emptied the ring of
+	// anything a content row names, which is the same rule that makes this
+	// whole arrangement a map copy — and the loop below refuses the view
+	// outright if one is left.
 	held []Handle
 }
 
@@ -58,9 +66,7 @@ func (s *Store) Freeze(ctx context.Context) (*Frozen, error) {
 				return nil, fmt.Errorf("memtable: freeze: inode %d extent %d is still in the ring after a flush",
 					ino, r.Handle)
 			}
-			if _, adopted := s.baseRefs[r.Handle]; adopted {
-				f.held = append(f.held, r.Handle)
-			}
+			f.held = append(f.held, r.Handle)
 		}
 		f.rows[ino] = &content{size: c.size, refs: append([]ExtentRef(nil), c.refs...)}
 	}
@@ -76,8 +82,9 @@ func (s *Store) Freeze(ctx context.Context) (*Frozen, error) {
 
 // Release drops the frozen maps and the references they hold. The maps
 // themselves are only memory — that is the whole point of the
-// arrangement — but the adopted extents they name are collectable state,
-// so a view that is never released pins those for the session.
+// arrangement — but the extents they name are collectable state, adopted
+// and published alike, so a view that is never released pins those for
+// the session.
 func (f *Frozen) Release() {
 	if f.rows == nil {
 		return

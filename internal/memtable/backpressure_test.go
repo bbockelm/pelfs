@@ -88,3 +88,117 @@ func TestStatsReportTheRing(t *testing.T) {
 		t.Errorf("used+free = %d after a write, was %d", got, size)
 	}
 }
+
+// locationEntries is how many published handles the store is holding
+// locations for. It is the map that used to grow with WRITE CALLS for the
+// life of a session.
+func locationEntries(s *Store) (handles, chunks, refs int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.handleLoc), len(s.chunkLoc), len(s.locRefs)
+}
+
+// TestPublishedLocationsGoWhenNothingNamesThem is the C2 claim for the
+// write path: handleLoc scaled with write CALLS, not bytes, and nothing
+// ever freed it — so a session that wrote a million files carried their
+// location entries to the end even after a checkpoint had published them
+// and the overlay had forgotten the inodes.
+//
+// A handle is reachable ONLY from a content row, so an entry no row names
+// can go. What must NOT go with it is the chunk half of the map: the
+// seal's multi-pack index and the cross-flush dedup check both ask about
+// chunks no current row names, and that is the whole point of them.
+func TestPublishedLocationsGoWhenNothingNamesThem(t *testing.T) {
+	ctx := context.Background()
+	s, _ := newTestStore(t, 0, Hooks{})
+
+	body := bytes.Repeat([]byte("published extents"), 512)
+	const files = 12
+	for ino := uint64(1); ino <= files; ino++ {
+		if err := s.Write(ctx, ino, 0, body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	handles, chunks, refs := locationEntries(s)
+	if handles < files {
+		t.Fatalf("%d location entries after publishing %d files", handles, files)
+	}
+	if refs != handles {
+		t.Errorf("%d location entries but %d reference counts; the two must agree", handles, refs)
+	}
+	if chunks == 0 {
+		t.Fatal("no chunk locations after a flush")
+	}
+
+	// What a checkpoint does: the overlay drops the rows of the inodes it
+	// returned to clean, and the content store forgets them.
+	for ino := uint64(1); ino <= files; ino++ {
+		if err := s.Forget(ino); err != nil {
+			t.Fatal(err)
+		}
+	}
+	afterHandles, afterChunks, afterRefs := locationEntries(s)
+	if afterHandles != 0 {
+		t.Errorf("%d location entries survive with no content row naming them", afterHandles)
+	}
+	if afterRefs != 0 {
+		t.Errorf("%d reference counts survive their entries", afterRefs)
+	}
+	if afterChunks != chunks {
+		t.Errorf("chunk locations fell from %d to %d: the multi-pack index and cross-flush "+
+			"dedup both depend on chunks no current row names", chunks, afterChunks)
+	}
+	// The packs are still listed, because retention decides when those go
+	// — not a file being deleted in a session that has not sealed yet.
+	if len(s.Packs()) == 0 {
+		t.Error("forgetting the inodes dropped the session's packs")
+	}
+}
+
+// A superseded extent's location goes; the surviving one's stays, and the
+// file still reads back. This is the partial case the reference count
+// exists for — a whole-file Forget would pass with a much cruder rule.
+func TestSupersededExtentLocationGoes(t *testing.T) {
+	ctx := context.Background()
+	s, _ := newTestStore(t, 0, Hooks{})
+
+	first := bytes.Repeat([]byte("A"), 4096)
+	second := bytes.Repeat([]byte("B"), 4096)
+	if err := s.Write(ctx, 1, 0, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Write(ctx, 2, 0, second); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	before, _, _ := locationEntries(s)
+
+	// Overwrite inode 1 completely: its published extent loses its last
+	// reference while inode 2's keeps hers.
+	over := bytes.Repeat([]byte("C"), 4096)
+	if err := s.Write(ctx, 1, 0, over); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	after, _, refs := locationEntries(s)
+	if after != before {
+		t.Errorf("location entries went %d -> %d across an overwrite; the superseded extent's "+
+			"entry should have gone as the new one arrived", before, after)
+	}
+	if refs != after {
+		t.Errorf("%d entries, %d reference counts", after, refs)
+	}
+	if got := readAll(t, s, 1); !bytes.Equal(got, over) {
+		t.Error("the overwritten file does not read back as the new content")
+	}
+	if got := readAll(t, s, 2); !bytes.Equal(got, second) {
+		t.Error("the untouched file does not read back byte-exact")
+	}
+}

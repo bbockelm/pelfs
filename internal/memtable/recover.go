@@ -228,6 +228,9 @@ func Recover(opts Options, d Durable) (*Store, *Report, error) {
 	}
 
 	s.handleLoc = make(map[Handle][]ChunkSlice, len(d.Handles))
+	// Replaced, not added to, so its reference counts are replaced too:
+	// they are rebuilt below from the rows this recovery could restore.
+	s.locRefs = make(map[Handle]int, len(d.Handles))
 	for h, sl := range d.Handles {
 		s.handleLoc[h] = sl
 		if h >= s.nextHandle {
@@ -261,6 +264,11 @@ func Recover(opts Options, d Durable) (*Store, *Report, error) {
 			}
 			if _, ok := s.handleLoc[r.Handle]; ok {
 				c.refs = append(c.refs, r)
+				// Published, and this row is a reference to it. The count
+				// is rebuilt here for the same reason the ring's and the
+				// base's are above: a recovered store has to be able to
+				// collect what a live one would have collected.
+				s.locRefs[r.Handle]++
 				continue
 			}
 			rep.Lost = append(rep.Lost, LostRange{Inode: row.Inode, FileOff: r.FileOff, Length: r.Length, Handle: r.Handle})

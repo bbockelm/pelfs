@@ -1,10 +1,10 @@
 # The pelfs format: packed objects, split catalogs, signed superblock
 
 Status: **shipped** — this format is what pelfs is. Every section below
-describes the system as built, with two exceptions that are marked in
-place and listed together under "Designed, not built". Considered-and-
-rejected alternatives live in Appendix B; the engine this format replaced
-is Appendix A.
+describes the system as built, with the exceptions marked in place and
+listed together under "Designed, not built". Considered-and-rejected
+alternatives live in Appendix B; the engine this format replaced is
+Appendix A.
 
 In one sentence: **writable CVMFS with restic-style packs** —
 content-addressed immutable packs and split catalogs, with a single small
@@ -1409,56 +1409,75 @@ in `scripts/` (`mount-gate-docker.sh`, `bench-untar-docker.sh`,
 Everything in this list is specified above and has no implementation.
 Nothing else in this document is aspirational.
 
-- **Repack.** No function, no command. `superblock.Condemned` is a field
-  nothing writes. This is the one gap with a user-visible consequence:
-  dead bytes inside retained packs are never reclaimed.
+- **Repack execution.** MEASURING and PLANNING now exist —
+  `internal/reach` computes per-pack liveness and `pelfs repack-plan`
+  reports what is worth rewriting and what it would cost — but nothing
+  carries a plan out. `superblock.Condemned` is still a field nothing
+  writes.
+
+  This remains the one gap with a user-visible consequence, and it is
+  worse than "dead bytes are not reclaimed": publish carries pack lists
+  forward wholesale and consolidation is a union, so a pack whose
+  contents are entirely dead stays named by every later generation and
+  `pelfs gc` will never delete it. Space from rewritten or deleted
+  content is not reclaimed at all today.
+
+  Whoever builds it must honour the contract in `internal/retention`: a
+  repack that TRIMS a manifest segment rather than merging it must put
+  the trimmed packs into `sb.Condemned` in the same change, or readers
+  pinned to a generation inside the retain window lose packs they were
+  promised.
 - **`pelfs rescue`.** Fully specified; the format prerequisites shipped.
 - **Forks.** No command creates a ref from another generation.
 - **Tag creation.** `refs.Store.Tag` exists with no caller; tags can be
   read (`--tag`) but not written.
 - **Key rotation.** `NextPub` is verified but never set.
-- **The LSM write path** of `design-writepath.md`, except its
-  `internal/memtable` prototype, which nothing imports.
 - **`splice`/`ReadResultFd`** on cache hits.
 - **The "snapshot expired" reader error.** The grace window is enforced
   from the sweep side only.
 
+The LSM write path of `design-writepath.md` used to be on this list. It
+is not any more: `internal/memtable` is the default write path of every
+writable mount.
+
 ## Open format questions
 
-One question is open, it is additive, and it is the owner's to decide.
+**All three candidates below have shipped**, and this section is kept as
+the record of why the shipped answers were chosen rather than as a list
+of decisions to make.
 
-**Nothing in the signed superblock says where any identity lives.** So a
-cold mount cannot find its own root catalog without fetching at least one
-trailer. Three candidates, cheapest first, measured on the Linux 6.6
-corpus:
+The problem was: **nothing in the signed superblock said where any
+identity lives**, so a cold mount could not find its own root catalog
+without fetching at least one trailer. Three candidates were measured on
+the Linux 6.6 corpus, cheapest first:
 
-1. **Record the root catalog's pack** (a `root_pack` string, omitempty).
-   Saves the one trailer probe a cold mount pays today: 1–2 GETs and
-   128–256 KiB, ~20–40 ms. Small on average. What it really buys is the
-   tail: the probe order is a heuristic — "the root catalog is in the
-   newest pack, because publish writes it last" — which held at every pack
-   size measured, but if it ever fails (a generation whose root catalog is
-   carried forward unchanged while later packs were appended, or a repack
-   that reorders the list) the probe budget runs out and the mount
-   resolves the whole map instead. At 1002 packs that is 1001 GETs and
-   125 MiB, at mount. This converts a 1-GET mount with a rare four-figure
-   tail into a 1-GET mount with no tail.
-2. **Record each catalog's pack** (a `pack` field on `CatalogEntry`, which
-   publish already maintains). Makes the whole namespace descent
-   location-free. Measured value is LOW on top of (1), because publish
-   already writes catalogs at the end of a seal. It buys determinism
-   rather than requests.
-3. **A per-generation location index**: one object holding every trailer's
-   entries merged, named from the superblock by identity and size. This is
-   the one that addresses the real cost. What forces a mount into
-   resolving the whole map is a CHUNK in an old pack, and no amount of
-   catalog metadata helps with that. On this corpus the merged trailers
-   are about 2.2 MiB — one GET — against 251 GETs and 32.1 MiB of tail
-   probes at 1 MiB packs, or 63 GETs and 7.9 MiB at 4 MiB. It is also what
-   would let the cut size go below 1 MiB, where the fixed 128 KiB probe
-   currently dominates. Backward compatible in both directions: a reader
-   that finds no such field falls back to trailers, and a reader that does
-   not understand the field ignores it.
+1. **Record the root catalog's pack.** SHIPPED, as
+   `superblock.RootCatalogHint` — a hint verified against the identity,
+   falling back to the index if it does not hold, rather than a claim a
+   reader must trust. It saved the one trailer probe a cold mount paid:
+   1-2 GETs and 128-256 KiB, ~20-40 ms. What it really bought was the
+   tail. The probe order was a heuristic — "the root catalog is in the
+   newest pack, because publish writes it last" — which held at every
+   pack size measured, but when it failed (a root catalog carried forward
+   unchanged while later packs were appended, or a repack that reorders
+   the list) the probe budget ran out and the mount resolved the whole
+   map: 1001 GETs and 125 MiB at 1002 packs, at mount.
+2. **Record each catalog's pack.** SHIPPED, as the hints on
+   `CatalogEntry`, and measured LOW value on top of (1) exactly as
+   predicted — publish already writes catalogs at the end of a seal, so
+   it buys determinism rather than requests.
+3. **A per-generation location index.** SHIPPED, and not in the shape
+   described here. The measurement was right about the cost — what forces
+   a mount into resolving the whole map is a CHUNK in an old pack, and no
+   amount of catalog metadata helps — but "one object holding every
+   trailer's entries merged" does not scale: at a hundred million objects
+   that object is rebuilt from the whole volume on every seal. What
+   shipped is the **multi-pack index** ("Locating things"): 16-byte
+   entries, per-generation segments consolidated geometrically, so a seal
+   writes an object proportional to what it changed and a reader fetches
+   the tier in parallel. The 2.2 MiB figure below is what a single merged
+   object costs on this corpus, and it is why the tiering ceiling is
+   where it is.
 
 Deliberately deferred, needing external partners or production mileage
 rather than design: **POSIX ACLs** (out of scope; xattrs carry them

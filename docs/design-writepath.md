@@ -1,28 +1,22 @@
 # The write path: pack as you go
 
-> **Status: BEING BUILT, NOT YET WIRED IN.** `internal/memtable` is an
-> active implementation of this design — 15 commits, ~4,200 lines across
-> 8 files, with 8 test files including a model-based random test and
-> measurement harnesses. It is well past a sketch.
+> **Status: SHIPPED.** `internal/memtable` is the write path of every
+> writable mount. It is imported by `internal/overlay` and by
+> `cmd/pelfs/mountgen.go`; the staging directory it replaced is gone for
+> every inode that is not deferred.
 >
-> But **no non-test file in the tree imports it.** It is not connected to
-> a mount, a seal, or a checkpoint, so nothing here describes how pelfs
-> writes today, and deleting the package would change no user-visible
-> behaviour. The shipped write path is still the overlay plus staging
-> directory: every modified file gets a local file keyed by inode, and a
-> checkpoint or the seal at unmount does the chunking, packing and
-> uploading.
+> Everything under "Designed, not built" below was the gate list that
+> stood between the prototype and a user, and it has been worked through.
+> What that section holds now is what remains open AFTER shipping.
 >
-> Read the two statuses together. Where this document says "the
-> prototype" it means that package, and its measurements are real. Where
-> it describes behaviour — flush contracts, backpressure, recovery — that
-> is what the package does in isolation, not what a user gets.
+> Where this document says "the prototype" it means this package during
+> development, and those passages — what it measured, what it falsified,
+> the mistakes it made — are kept because the measurements are real and
+> the reasoning is why the shipped code looks as it does.
 >
-> The integration work this needs is listed under "Designed, not built".
-> Read `design-packfs.md` for the format, the read path, and the write
-> path as it actually ships.
+> Read `design-packfs.md` for the format and the read path.
 
-## What is wrong with the current write path
+## What was wrong with the write path this replaced
 
 Every modified or created file gets its own local file in the overlay's
 staging directory, keyed by inode (`overlay.stagingPath`). Content stays
@@ -908,46 +902,57 @@ is re-measured rather than taken on trust.
 
 ## Designed, not built
 
-`internal/memtable` implements the machinery in isolation. Reaching a
-user needs all of the following, and the first item gates the rest:
+The gate list that stood between the prototype and a user is DONE. It is
+recorded here because how each item was resolved is the argument for the
+shape the code has:
 
-- **The catalog cannot express a partially overwritten extent** (see "The
-  format does not yet support late-bound identity"). Either `ChunkRef`
-  grows a chunk-offset field or the flusher chunks only live sub-ranges.
-  Nothing else can land until this is decided, because it determines what
-  a flush is allowed to emit.
-- **A durable location map.** A flush must persist one row per surviving
-  extent; nothing on the federation has heard of an extent handle, so
-  this cannot be rebuilt from packs.
-- **`genfs` must resolve through live memtables** before the pack index,
-  treating a location-map hit as the terminal case rather than the only
-  one.
-- **The overlay's content side must move off staging files** — content
-  rows stop meaning "there is a staging file for this inode" and start
-  naming extent handles. `materializeContentLocked` and the staging
-  directory go away for every inode that is not deferred.
-- **A background flush that does not block**, which the prototype's
-  `Flush` does (see "Two kinds of flush"). A periodic checkpoint must
-  take its consistent point and return.
-- **The deferred-inode escape hatch** for randomly rewritten files, with
-  the promotion heuristic and its one-way rule.
-- **Crash recovery wired to a real session**: recovery currently
-  reconciles against an in-memory content map, not the overlay database.
+- **The catalog could not express a partially overwritten extent**, and
+  nothing else could land until it was decided: either `ChunkRef` grows a
+  chunk-offset field, or the flusher chunks only live sub-ranges. The
+  SECOND was taken. A seal re-chunks only the spans it cannot express as
+  whole chunks (`memtable.Sealer`), so the format keeps "whole chunks,
+  end to end" and the cost is proportional to the REWRITE rather than to
+  the file.
+- **A durable location map** — `internal/memtable/journal.go`. A flush
+  persists one row per surviving extent, and recovery replays it.
+- **`genfs` resolves through live memtables** before the pack index.
+- **The overlay's content side moved off staging files.** Content rows
+  name extent handles; `internal/overlay/content.go` abstracts the two
+  stores behind one interface so the change was a swap rather than a
+  rewrite.
+- **A background flush that does not block.** A checkpoint takes its
+  consistent point as a map copy (`memtable.Freeze`) and returns.
+- **The deferred-inode escape hatch** for randomly rewritten files.
+- **Crash recovery wired to a real session**, reconciling against the
+  overlay database rather than an in-memory map.
+
+What remains open is smaller and is not a gate on anything:
+
+- **Nothing writes `sb.Condemned`**, so a repack cannot yet trim what
+  this path leaves behind (`design-packfs.md`, "Designed, not built").
+- **`FetchAll` reads each merge input whole**, which is the remaining
+  ceiling on how large an index or manifest tier can grow.
 
 ## Open questions
 
 1. Does the per-pack live-byte field belong in the superblock's pack list
    at all, given it grows per generation on volumes that may hold
-   thousands of packs? A local sidecar is cheaper but unshared, so a
-   second client cannot act on it.
-2. Should a flush upload one pack or several concurrently? The packer
-   already runs four uploads at once, but a flusher that inherits that
-   has to order location-map updates against partial failures.
+   thousands of packs? ANSWERED, and the answer was no — not because of
+   the size, but because a writer cannot know it. Liveness is a property
+   of the whole live set, so `internal/reach` measures it by walking
+   references, and nothing records it in the format.
+2. Should a flush upload one pack or several concurrently? ANSWERED: a
+   flush hands finished packs to a shared, byte-bounded upload queue with
+   four workers (`memtable.uploadQueue`), and orders the location map
+   against partial failure by journaling a batch's locations only after
+   its uploads land.
 3. Is there a case for flushing on idle — no writes for some interval —
-   rather than only on a full table? It would shorten the crash-loss
-   window and smooth uploads, at the cost of smaller packs.
-4. Which of the two ways out of the tiling problem to take: a chunk-offset
-   field on `ChunkRef`, or CDC over live sub-ranges only.
+   rather than only on a full table? STILL OPEN. Promotion by age covers
+   the steady state, and the periodic checkpoint bounds the crash-loss
+   window, so the remaining case is a session that writes a little and
+   then sits: its last partial pack waits for the seal.
+4. Which of the two ways out of the tiling problem to take? ANSWERED: CDC
+   over live sub-ranges only (see "Designed, not built").
 
 ## Appendix: considered and not taken
 

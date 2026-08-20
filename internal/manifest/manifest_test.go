@@ -30,17 +30,17 @@ func pack(n int) packstore.SealedPack {
 	return p
 }
 
-func build(t *testing.T, from, to int) *Manifest {
-	t.Helper()
+func build(tb testing.TB, from, to int) *Manifest {
+	tb.Helper()
 	b := NewBuilder()
 	for i := from; i < to; i++ {
 		if err := b.Add(pack(i)); err != nil {
-			t.Fatal(err)
+			tb.Fatal(err)
 		}
 	}
 	m, err := Open(b.Encode())
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	return m
 }
@@ -111,6 +111,120 @@ func TestASetEnumeratesEverySegment(t *testing.T) {
 	}
 	if _, ok := set.Lookup(packName(7)); !ok {
 		t.Error("a pack in the older segment does not resolve through the set")
+	}
+}
+
+// tieredSet builds a set shaped the way consolidate leaves one: a few
+// segments, oldest first, each roughly half the size of the one before
+// it, summing to n packs. Sizes descend towards the newest end because
+// that is what geometric tiering produces — and because it is the shape
+// that used to be worst for the union, every older segment's whole run
+// sorting BELOW everything already placed.
+func tieredSet(tb testing.TB, n int) *Set {
+	tb.Helper()
+	var segments []*Manifest
+	at := 0
+	for rest := n; rest > 0; {
+		// Halving from the oldest end: geometric tiering leaves each
+		// surviving segment at least as large as the sum of the newer ones.
+		s := rest / 2
+		if s < 1 {
+			s = rest
+		}
+		segments = append(segments, build(tb, at, at+s))
+		at += s
+		rest -= s
+	}
+	return NewSet(segments)
+}
+
+// The union of a generation's segments is on the critical path of every
+// cold mount — manifest.Packs calls it before the first question — so its
+// cost is a mount-time cost and belongs under a bound.
+//
+// The bound is deliberately loose: what it has to separate is a pass
+// (milliseconds at this size) from the quadratic sort this replaced, which
+// over the same fixture spent tens of seconds moving each older segment's
+// run past every newer one. Anything between those is a regression worth
+// failing on, and no ordinary machine variation reaches it.
+func TestUnioningSegmentsIsAPassNotASort(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds a 100,000-pack fixture")
+	}
+	const n = 100_000
+	set := tieredSet(t, n)
+	const budget = 3 * time.Second
+	start := time.Now()
+	all := set.All()
+	elapsed := time.Since(start)
+	if len(all) != n {
+		t.Fatalf("the union holds %d packs, want %d", len(all), n)
+	}
+	prev := ""
+	for _, p := range all {
+		if p.Name <= prev {
+			t.Fatalf("%s does not follow %s; the union is not in creation order", p.Name, prev)
+		}
+		prev = p.Name
+	}
+	if elapsed > budget {
+		t.Errorf("unioning %d packs across %d segments took %v, over the %v budget: "+
+			"the union is sorting its input again rather than merging it",
+			n, len(set.segments), elapsed.Round(time.Millisecond), budget)
+	}
+	t.Logf("%d packs across %d segments unioned in %v", n, len(set.segments), elapsed.Round(time.Millisecond))
+}
+
+// The union must not depend on the shape of the segmentation: the same
+// packs cut into one segment or a dozen are the same generation.
+func TestUnionIsIndependentOfSegmentation(t *testing.T) {
+	one := NewSet([]*Manifest{build(t, 0, 600)}).All()
+	many := tieredSet(t, 600).All()
+	if len(one) != len(many) {
+		t.Fatalf("one segment yields %d packs, several yield %d", len(one), len(many))
+	}
+	for i := range one {
+		if one[i] != many[i] {
+			t.Fatalf("pack %d differs: %+v vs %+v", i, one[i], many[i])
+		}
+	}
+}
+
+// A pack rewritten into a newer segment — what a repack leaves behind —
+// must resolve to the NEWER record, and appear once.
+func TestTheNewestSegmentWinsInTheUnion(t *testing.T) {
+	old := build(t, 0, 10)
+	b := NewBuilder()
+	rewritten := pack(5)
+	rewritten.Size = 999_999
+	rewritten.TrailerHash = blake3.Sum256([]byte("rewritten"))
+	if err := b.Add(rewritten); err != nil {
+		t.Fatal(err)
+	}
+	newer, err := Open(b.Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	all := NewSet([]*Manifest{old, newer}).All()
+	if len(all) != 10 {
+		t.Fatalf("the union holds %d packs, want 10: the rewritten pack was not deduped", len(all))
+	}
+	if all[5] != rewritten {
+		t.Fatalf("pack 5 = %+v, want the newer segment's %+v", all[5], rewritten)
+	}
+}
+
+func BenchmarkSetAll(b *testing.B) {
+	for _, n := range []int{1_000, 10_000, 100_000} {
+		b.Run(strconv.Itoa(n), func(b *testing.B) {
+			set := tieredSet(b, n)
+			b.ResetTimer()
+			for b.Loop() {
+				if got := len(set.All()); got != n {
+					b.Fatalf("%d packs, want %d", got, n)
+				}
+			}
+		})
 	}
 }
 

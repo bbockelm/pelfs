@@ -319,28 +319,40 @@ func (s *Set) Lookup(name string) (packstore.SealedPack, bool) {
 }
 
 // All enumerates every pack the generation names, in creation order, with
-// the newest segment's record winning. Retention walks this.
+// the newest segment's record winning. Retention walks this, and so does
+// every mount: manifest.Packs turns it into the generation's pack list.
+//
+// It is a K-WAY MERGE rather than a concatenate-and-sort, and the
+// difference is the whole cost of a cold mount at scale. Each segment is
+// ALREADY sorted — that is what a packidx table is — so the union needs
+// one pass with a cursor per segment, not a sort. The version this
+// replaced concatenated the segments newest-first and finished with an
+// insertion sort, which on that input (every segment's run lands entirely
+// before the runs already placed) is the quadratic case rather than the
+// linear one: 0.22s over 10,000 packs, 88s over 200,000, minutes at
+// 400,000 — paid on every mount, before the first question.
+//
+// MergeKeys also subsumes the two things the old walk did by hand. It
+// yields each distinct key once, so the `seen` set of every pack name —
+// itself megabytes at target scale — is gone; and it reports the LAST
+// table holding a key, so passing the segments oldest-first is exactly
+// the newest-segment-wins rule.
+//
+// Keys are pack names zero-padded to keyLen, and byte order over the
+// padding agrees with string order over the names (NUL sorts below every
+// character a name may hold), so merged key order is name order.
 func (s *Set) All() []packstore.SealedPack {
-	seen := map[string]struct{}{}
-	var out []packstore.SealedPack
-	for i := len(s.segments) - 1; i >= 0; i-- {
-		for j := 0; j < s.segments[i].Len(); j++ {
-			p := s.segments[i].At(j)
-			if _, dup := seen[p.Name]; dup {
-				continue
-			}
-			seen[p.Name] = struct{}{}
-			out = append(out, p)
-		}
+	tables := make([]*packidx.Table, len(s.segments))
+	n := 0
+	for i, m := range s.segments {
+		tables[i] = m.table
+		n += m.Len()
 	}
-	sortByName(out)
+	out := make([]packstore.SealedPack, 0, n)
+	// MergeKeys only fails by way of fn, and fn here cannot.
+	_ = packidx.MergeKeys(tables, func(_ int, key, v []byte) error {
+		out = append(out, decode(trimName(key), v))
+		return nil
+	})
 	return out
-}
-
-func sortByName(p []packstore.SealedPack) {
-	for i := 1; i < len(p); i++ {
-		for j := i; j > 0 && p[j].Name < p[j-1].Name; j-- {
-			p[j], p[j-1] = p[j-1], p[j]
-		}
-	}
 }

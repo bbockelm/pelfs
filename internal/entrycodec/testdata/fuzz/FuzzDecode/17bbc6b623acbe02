@@ -1,0 +1,4 @@
+go test fuzz v1
+[]byte("0000d00008000110C00000200000028d0000000100000\x91\x91\x91\x91\x91\x91077AXZaYBb\xf58cx9By 1$8\"%\x8a\xaf^0000000")
+byte('\x00')
+bool(false)

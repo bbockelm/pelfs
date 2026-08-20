@@ -1,0 +1,4 @@
+go test fuzz v1
+[]byte("(\xb5/\xfd8")
+byte('\x01')
+bool(false)

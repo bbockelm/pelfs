@@ -85,14 +85,31 @@ jobs:
 
   fuzz:
     # Tier 1 (parsers): unrestricted — pure functions over untrusted
-    # federation bytes, safe to run anywhere. Short smoke runs; the
-    # corpus in testdata/ carries forward every past finding.
+    # federation bytes, safe to run anywhere. Short smoke runs on top of
+    # the checked-in corpus under each package's testdata/fuzz/, which
+    # every ordinary `go test` replays as well — that is what carries a
+    # finding forward once it has been found.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26.x"
+      # The corpus is the point of the job: fail loudly if it went missing
+      # rather than fuzzing from nothing and calling it a pass.
+      - name: Check the committed corpus is there
+        run: |
+          set -e
+          for d in internal/packstore/testdata/fuzz/FuzzDecodeTrailer \
+                   internal/packstore/testdata/fuzz/FuzzParseTail \
+                   internal/superblock/testdata/fuzz/FuzzDecodeVerify \
+                   internal/entrycodec/testdata/fuzz/FuzzDecode \
+                   internal/chunkid/testdata/fuzz/FuzzChunker \
+                   internal/catalog/testdata/fuzz/FuzzStaticCatalog; do
+            n=$(find "$d" -type f 2>/dev/null | wc -l)
+            [ "$n" -gt 0 ] || { echo "no corpus in $d" >&2; exit 1; }
+            echo "$d: $n inputs"
+          done
       - name: Fuzz parsers (30s each)
         run: |
           set -e
@@ -107,6 +124,17 @@ jobs:
             echo "== $2 =="
             CGO_ENABLED=0 go test -run xxx -fuzz "^$2\$" -fuzztime 30s "./$1/"
           done
+      # A failing input is written into the package's own testdata/fuzz
+      # directory, which is exactly the file that has to be committed to
+      # carry the finding forward. Upload it, or the one artifact that
+      # made this job worth running dies with the runner.
+      - name: Upload the failing input
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-findings
+          path: internal/*/testdata/fuzz/**
+          if-no-files-found: warn
 
   opfuzz:
     # Tier 2 (filesystem operation sequences): CONTAINED, always. The
@@ -138,10 +166,13 @@ jobs:
         run: |
           sudo modprobe fuse
           sudo chmod 666 /dev/fuse
+      # Through the container launcher, not the script bare: the gate's NFS
+      # leg needs a kernel NFS client, and the runner image has no
+      # nfs-common. mount-gate-docker.sh builds an image that does, which
+      # is why the leg now hard-fails when mount.nfs is missing instead of
+      # printing a note and passing.
       - name: Mount a published generation and benchmark it
-        env:
-          PELFS_MOUNT_TEST_OK: "1"
-        run: ./scripts/mount-gate-test.sh
+        run: ./scripts/mount-gate-docker.sh
 
   bench:
     # Benchmarks are not a pass/fail gate; they run to catch build rot in

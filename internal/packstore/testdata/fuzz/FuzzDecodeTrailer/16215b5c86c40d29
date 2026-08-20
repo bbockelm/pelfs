@@ -1,0 +1,3 @@
+go test fuzz v1
+[]byte("(\xb5/\xfd00\xdd\x02\x002\xc6\x13\x18\x80G\x04\xd2x,x)'\x04\xe4Z\xeaBoF\"Y\xb3078\xde9000017011010002w\xb5110702211\xb4\x8d7+\xfc1\xdd0110270\xfe001001021Z7C0000000000")
+bool(true)

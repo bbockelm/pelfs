@@ -1,0 +1,4 @@
+go test fuzz v1
+[]byte("(\xb5/\xfd00\x1d\x00\x00\xb59\xfd0\xab\x96\x97W1\x86\r\xf00000")
+byte('\x01')
+bool(false)

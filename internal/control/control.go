@@ -21,7 +21,10 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"time"
+
+	"github.com/bbockelm/pelfs/internal/version"
 )
 
 // SocketName is the socket's file name inside a session state directory.
@@ -180,17 +183,12 @@ func writeBugreport(w http.ResponseWriter, h Hooks) {
 			add("stats.json", b)
 		}
 	}
-	buf := make([]byte, 4<<20)
-	buf = buf[:runtime.Stack(buf, true)]
-	add("goroutines.txt", buf)
-	rt, _ := json.MarshalIndent(map[string]any{
-		"go":         runtime.Version(),
-		"goroutines": runtime.NumGoroutine(),
-		"os":         runtime.GOOS,
-		"arch":       runtime.GOARCH,
-		"time":       now.Format(time.RFC3339),
-	}, "", "  ")
-	add("runtime.json", rt)
+	add("goroutines.txt", stackDump())
+	rt := version.Get().Map()
+	rt["goroutines"] = runtime.NumGoroutine()
+	rt["time"] = now.Format(time.RFC3339)
+	rtj, _ := json.MarshalIndent(rt, "", "  ")
+	add("runtime.json", rtj)
 	if h.BugreportExtra != nil {
 		for name, data := range h.BugreportExtra() {
 			add(name, data)
@@ -199,6 +197,35 @@ func writeBugreport(w http.ResponseWriter, h Hooks) {
 	_ = tw.Close()
 	_ = gz.Close()
 }
+
+// stackDump renders every goroutine, growing the buffer until they all
+// fit rather than truncating at a guess.
+//
+// The guess was 4 MiB, and a real report arrived with 30,681 goroutines
+// of which 5,167 made it into the file. The dump is the ONE artifact that
+// says what a stalled process is doing; a truncated one turns a diagnosis
+// into an inference, and the whole point of collecting it is to avoid
+// exactly that.
+func stackDump() []byte {
+	for size := 4 << 20; ; size *= 2 {
+		buf := make([]byte, size)
+		if n := runtime.Stack(buf, true); n < size {
+			return buf[:n]
+		}
+		if size >= maxStackDump {
+			// A dump this large means something pathological, and saying
+			// so beats returning nothing: the truncation is now visible
+			// in the artifact rather than silent.
+			buf := make([]byte, maxStackDump)
+			n := runtime.Stack(buf, true)
+			return append(buf[:n], []byte("\n\n[truncated at "+strconv.Itoa(maxStackDump)+" bytes]\n")...)
+		}
+	}
+}
+
+// maxStackDump bounds the dump so collecting one cannot itself exhaust
+// memory on a process already in trouble.
+const maxStackDump = 256 << 20
 
 // Client talks to a session's control socket.
 type Client struct {

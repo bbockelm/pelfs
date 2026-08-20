@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/bbockelm/pelfs/internal/ui"
+	"github.com/bbockelm/pelfs/internal/version"
 )
 
 func main() {
@@ -50,6 +51,8 @@ func main() {
 		code = cmdFsck(os.Args[2:])
 	case "repack-plan":
 		code = cmdRepackPlan(os.Args[2:])
+	case "version", "--version":
+		fmt.Println(version.Get())
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -81,6 +84,8 @@ Usage:
   pelfs fsck   [flags] [--deep] <prefix>                  verify a published generation
   pelfs repack-plan [flags] <prefix>                      report what a repack would
                                                           rewrite, and what it would cost
+  pelfs version                                           which build this is (quote it
+                                                          in bug reports)
 
 Common flags:
 `)

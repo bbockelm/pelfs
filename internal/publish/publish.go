@@ -1485,12 +1485,30 @@ func (p *pipeline) buildSuperblock(newPacks []packstore.SealedPack, shards []sup
 	if p.o.Prev != nil {
 		sb.PrevHash = superblock.Hash(p.o.PrevRaw)
 	}
+	// The catalog list is the one big field a seal may decline to write,
+	// so it is the first thing spent when the budget runs out: a slow next
+	// seal beats a superblock past the read cap, which is a volume that
+	// can never be mounted or published again (superblock.TrimCatalogs).
+	if n := sb.TrimCatalogs(); n > 0 {
+		ui.Warn("publish: generation {gen}'s catalog list is {bytes} bytes, past its {budget}-byte share of "+
+			"the superblock budget, so this generation omits it; the next seal rebuilds every catalog "+
+			"instead of carrying unchanged subtrees forward",
+			"gen", sb.Generation, "bytes", n, "budget", int64(superblock.CatalogBudgetBytes))
+	}
 	if err := sb.Sign(p.o.SigningKey); err != nil {
 		return nil, nil, fmt.Errorf("publish: %w", err)
 	}
 	raw, err := sb.Encode()
 	if err != nil {
 		return nil, nil, fmt.Errorf("publish: encode superblock: %w", err)
+	}
+	// Checked on the way OUT, which is the only place it can be checked at
+	// all: nothing about the fields above says how many bytes they came to,
+	// and a superblock past the ceiling is unreadable by the very publish
+	// that would fix it. A refused seal costs the uploads it already did
+	// and leaves the volume exactly as mountable as it was.
+	if err := sb.CheckSize(len(raw)); err != nil {
+		return nil, nil, fmt.Errorf("publish: %w", err)
 	}
 	return sb, raw, nil
 }

@@ -20,6 +20,7 @@ import (
 	"github.com/bbockelm/pelfs/internal/reach"
 	"github.com/bbockelm/pelfs/internal/refs"
 	"github.com/bbockelm/pelfs/internal/superblock"
+	"github.com/bbockelm/pelfs/internal/ui"
 )
 
 // Executing a plan.
@@ -468,6 +469,17 @@ func repackedSuperblock(ctx context.Context, o ExecOptions, prev *superblock.Sup
 	// moved with the bytes or dropped.
 	sb.RootCatalogHint = movedRootHint(prev, condemn, moved)
 
+	// Same budget as a seal's, and the same order: spend the optional
+	// catalog list before failing (superblock.TrimCatalogs). A repack is
+	// what a user is told to run when the pack list has grown too big, so
+	// it is the one writer that must not refuse for a reason it could have
+	// fixed itself.
+	if n := sb.TrimCatalogs(); n > 0 {
+		ui.Warn("repack: the parent's catalog list is {bytes} bytes, past its {budget}-byte share of the "+
+			"superblock budget, so the repacked generation omits it; the next seal rebuilds every catalog",
+			"bytes", n, "budget", int64(superblock.CatalogBudgetBytes))
+	}
+
 	// A repack rewrites the pack list wholesale, so it is the writer most
 	// able to leave a generation stating its pack set two ways (it starts
 	// from a copy of the parent, which may be the inline shape). Asked
@@ -481,6 +493,13 @@ func repackedSuperblock(ctx context.Context, o ExecOptions, prev *superblock.Sup
 	raw, err := sb.Encode()
 	if err != nil {
 		return nil, nil, fmt.Errorf("repack: encode superblock: %w", err)
+	}
+	// A repack SHRINKS the pack list, so this should be the writer that
+	// never trips — and it is checked precisely because of that: the
+	// failure it guards is a flip past the mutable-object read cap, after
+	// which nothing can read the volume, this tool included.
+	if err := sb.CheckSize(len(raw)); err != nil {
+		return nil, nil, fmt.Errorf("repack: %w", err)
 	}
 	return &sb, raw, nil
 }

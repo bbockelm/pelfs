@@ -238,6 +238,29 @@ after=$(cat "$WORK/origin/e2e/ns/refs/main" | cksum)
   || { echo "FAIL: fsck after repack"; cat "$WORK/fsck2.log"; exit 1; }
 grep -q "generation is consistent" "$WORK/fsck2.log" || {
   echo "FAIL: fsck after repack did not report consistency"; cat "$WORK/fsck2.log"; exit 1; }
+# A repack PUBLISHES a generation, so it takes the advisory lease. Losing
+# a flip is cheap for a checkpoint and expensive here: the sweep and the
+# rewrite are already paid by the time the flip happens.
+cat > "$WORK/origin/e2e/ns/meta/lease.json" <<LEASE
+{"session":"other-client","hostname":"elsewhere","pid":4242,
+ "acquired":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","renewed":"$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+ "ttl_seconds":600}
+LEASE
+if "$PELFS" repack --apply --state-dir "$WORK/state1" "$PREFIX" > "$WORK/repack-held.log" 2>&1; then
+  echo "FAIL: repack --apply ran while another client held the lease"
+  cat "$WORK/repack-held.log"; exit 1
+fi
+grep -q "in use by another pelfs client" "$WORK/repack-held.log" || {
+  echo "FAIL: the refusal did not mention the lease:"; cat "$WORK/repack-held.log"; exit 1; }
+grep -q "elsewhere" "$WORK/repack-held.log" || {
+  echo "FAIL: the refusal did not name the holder:"; cat "$WORK/repack-held.log"; exit 1; }
+# A REPORT needs no lease: inspecting a volume someone else is using is
+# exactly when you want to know what it is carrying.
+"$PELFS" repack --state-dir "$WORK/state1" "$PREFIX" > "$WORK/repack-held-report.log" 2>&1 || {
+  echo "FAIL: repack (report) was refused while the lease was held:"
+  cat "$WORK/repack-held-report.log"; exit 1; }
+rm -f "$WORK/origin/e2e/ns/meta/lease.json"
 echo "   measured the volume, held back every pack inside the grace window, changed nothing"
+echo "   refused to publish while another client held the lease; reporting stayed available"
 
 echo "== PASS: create, write, seal, read back, encrypt, prefetch, lease, gc, fsck, repack =="

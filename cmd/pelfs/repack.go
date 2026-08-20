@@ -83,6 +83,14 @@ func cmdRepack(args []string) int {
 			return exitErr(err)
 		}
 		opts.SigningKey = key
+		// Taken around the rewrite, not just the flip: the flip is the
+		// only step that can CONFLICT, but everything before it is the
+		// work that would be wasted by losing one.
+		l, err := maintenanceLease(ctx, o, pos[0], "repack-"+newSessionID())
+		if err != nil {
+			return exitErr(err)
+		}
+		defer releaseLease(ctx, l)
 	}
 
 	res, err := repack.Execute(ctx, opts)

@@ -912,6 +912,22 @@ func (p *pipeline) provideContent(ctx context.Context, cp ContentProvider, r *re
 		r.inline = c.Inline
 		p.stats.InlineFiles++
 	case c.Refs != nil && !inlineNow:
+		// The lengths must account for the whole file before the rows go in.
+		// Everything else here is a mismatch between the two halves of the
+		// merged view, which re-chunking settles; this one is the SOURCE
+		// contradicting itself, and re-chunking cannot settle it because the
+		// bytes it would read are the bytes these rows describe. A catalog
+		// whose chunk lengths sum short of the node's length is a file no
+		// reader will open — "chunk lengths sum to X, node length is Y" —
+		// so the seal refuses to sign one instead of producing it.
+		var covered int64
+		for _, ref := range c.Refs {
+			covered += ref.LLen
+		}
+		if covered != r.n.Length {
+			return false, fmt.Errorf("publish: inode %d: the content source offered %d bytes of chunk "+
+				"records for a %d-byte file", r.n.Inode, covered, r.n.Length)
+		}
 		r.chunks = c.Refs
 		p.rememberReusedChunks(c.Refs)
 		p.stats.ChunkedFiles++

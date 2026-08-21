@@ -152,6 +152,46 @@ The resolver must change regardless: `genfs` must consult the ring before
 the pack index, and must treat "identity present in the location map" as
 the terminal case rather than the only one.
 
+### An extent map is sparse; a catalog cannot be
+
+The same limit has a second half, and it cost a wrong-length file before
+anyone wrote it down. A `content` row is a list of extents, and nothing
+requires them to cover `[0, size)`: a write past the end of the file
+leaves a gap, `Truncate` upward leaves one at the tail, and the read path
+answers zeros for both without an extent existing. That is the correct
+behaviour of a sparse file, and the mount had it right all along.
+
+A catalog cannot say it. `Chunks` refuses any file whose chunk lengths do
+not sum to the node's length — *"chunk lengths sum to X, node length is
+Y"* — so a renderer that walked only the extents produced a signed
+generation holding a file no reader will open. The shape is not exotic:
+an NFS client flushing a write train out of order makes one on its own,
+and `truncate(1)` makes one deliberately.
+
+**Settled: a gap is a span to re-chunk, exactly like a broken one.**
+`Sealer.inodeFrom` renders `[0, size)` TOTALLY and refuses to return rows
+that do not account for it; the zeros come through the store's own read
+path, which is where "a hole reads as zeros" already lives. That makes
+the memtable answer what the staging store it replaces always answered —
+`ftruncate` and `pwrite` make those zeros real, and its seal chunked them
+like any other bytes — so the two content stores stay indistinguishable
+from above, which is the only rule that lets either of them be swapped
+in.
+
+The cost is bounded by dedup rather than by the hole: identical zero
+chunks are one identity, so a 4 MiB hole seals as ~1.4 KiB on the wire.
+`ChunkRefs` refuses a gap BY NAME for the same reason it refuses an
+untiled chunk — extents that each tile perfectly can still leave a range
+between them that nothing covers, and judging them one at a time accepted
+a list that summed short.
+
+The row a re-chunk emits carries the STORED numbers `add` reports, never
+the plaintext's. `CLen` is the length of the entry in the pack and `Alg`
+says how to decode it, and both diverge from the logical length the
+moment zstd shrinks the bytes — which is to say for every span of
+zeros — or a volume key seals them, which is every span on an encrypted
+volume.
+
 ### The seal must not need the network
 
 Re-chunking reads the straddling chunk from wherever it now lives, and if

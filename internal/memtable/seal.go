@@ -54,6 +54,18 @@ func (sl *Sealer) Inode(ctx context.Context, ino uint64) ([]catalog.ChunkRef, er
 // inodeFrom renders a named content map. view is where re-chunking reads
 // from — nil means the live store — so a frozen render never picks up a
 // byte written after its instant.
+//
+// The render is TOTAL: what comes back always accounts for exactly
+// [0, size). An extent map is sparse by construction — a write past the
+// end of the file and a truncate that grows one both leave a range no
+// extent covers, and the read path is entitled to answer zeros for it
+// without an extent existing — so a renderer that walked only the
+// extents would emit a list whose lengths sum SHORT of the node's, which
+// no catalog can hold and every reader refuses ("chunk lengths sum to X,
+// node length is Y"). A gap is therefore a span to be chunked like any
+// other, and it costs what the staging store this replaces always paid
+// for the same file: the zeros are read through the store's own read
+// path, which is where "a hole reads as zeros" already lives.
 func (sl *Sealer) inodeFrom(ctx context.Context, view *Frozen, c *content, ino uint64) ([]catalog.ChunkRef, error) {
 	s := sl.s
 	s.mu.Lock()
@@ -62,12 +74,17 @@ func (sl *Sealer) inodeFrom(ctx context.Context, view *Frozen, c *content, ino u
 	if err != nil {
 		return nil, err
 	}
+	var size int64
+	if c != nil {
+		size = c.size
+	}
 
 	// Split the file into what already tiles and what does not. Adjacent
-	// broken groups merge into one span so a rewrite that crosses several
+	// broken spans merge into one so a rewrite that crosses several
 	// chunks is re-chunked once, in one CDC pass, rather than chunk by
 	// chunk — which would cut new boundaries at the old chunks' edges and
-	// carry the old chunking forward forever.
+	// carry the old chunking forward forever. A gap merges with them by
+	// the same rule and for the same reason.
 	type segment struct {
 		g     group
 		whole bool
@@ -75,22 +92,34 @@ func (sl *Sealer) inodeFrom(ctx context.Context, view *Frozen, c *content, ino u
 		to    int64
 	}
 	var segs []segment
+	broken := func(from, to int64) {
+		if to <= from {
+			return
+		}
+		if n := len(segs); n > 0 && !segs[n-1].whole && segs[n-1].to == from {
+			segs[n-1].to = to
+			return
+		}
+		segs = append(segs, segment{from: from, to: to})
+	}
+	var covered int64
 	for _, g := range groupPieces(ps) {
+		broken(covered, g.at) // the gap this group starts after, if any
 		if g.whole() {
 			segs = append(segs, segment{g: g, whole: true})
-			continue
+		} else {
+			broken(g.at, g.end())
 		}
-		if n := len(segs); n > 0 && !segs[n-1].whole && segs[n-1].to == g.at {
-			segs[n-1].to = g.end()
-			continue
-		}
-		segs = append(segs, segment{from: g.at, to: g.end()})
+		covered = g.end()
 	}
+	broken(covered, size) // and the one at the end, which a truncate leaves
 
 	var out []catalog.ChunkRef
+	var total int64
 	for _, seg := range segs {
 		if seg.whole {
 			out = append(out, seg.g.ref())
+			total += seg.g.llen
 			continue
 		}
 		refs, err := sl.rechunk(ctx, view, ino, seg.from, seg.to)
@@ -98,6 +127,15 @@ func (sl *Sealer) inodeFrom(ctx context.Context, view *Frozen, c *content, ino u
 			return nil, err
 		}
 		out = append(out, refs...)
+		total += seg.to - seg.from
+	}
+	// The standing check on the loop above. A row whose lengths do not
+	// account for the node's is a file the format cannot express and a
+	// reader refuses to open, so it must not leave this function — least
+	// of all into a generation that is about to be signed.
+	if total != size {
+		return nil, fmt.Errorf("memtable: inode %d rendered %d bytes of chunk refs for a %d-byte file",
+			ino, total, size)
 	}
 	return out, nil
 }

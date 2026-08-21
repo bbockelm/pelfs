@@ -145,6 +145,31 @@ rm "$WORK/mnt/dir/small.txt"
 echo "appended" >> "$WORK/mnt/dir/sub/mid.bin"
 [ -f "$WORK/mnt/dir/written.txt" ] || { echo "write not visible in the mount" >&2; exit 1; }
 
+# SPARSE FILES, made with the syscalls rather than through an API. A
+# file's LENGTH can run past its last written byte, and a catalog cannot
+# say that: its chunk lengths must account for exactly the node's length
+# or no reader will open the file ("chunk lengths sum to X, node length is
+# Y"). Both ways a program makes one are here:
+#
+#   - seek past the end and write, which is also what an NFS client
+#     produces on its own when it flushes a write train out of order;
+#   - grow the file with truncate(1), which sets a length with no bytes
+#     behind it at all.
+#
+# The mount answered both correctly all along — the gap reads as zeros —
+# so this belongs where it is CHECKED: against the sealed generation
+# below, which is the only place the two representations have to meet.
+dd if=/dev/urandom of="$WORK/mnt/sparse-seek.bin" bs=16384 count=1 status=none
+dd if=/dev/urandom of="$WORK/mnt/sparse-seek.bin" bs=16384 count=1 seek=2 \
+   conv=notrunc status=none
+dd if=/dev/urandom of="$WORK/mnt/sparse-tail.bin" bs=16384 count=1 status=none
+truncate -s 49152 "$WORK/mnt/sparse-tail.bin"
+for f in sparse-seek.bin sparse-tail.bin; do
+  [ "$(stat -c %s "$WORK/mnt/$f")" = "49152" ] || {
+    echo "$f is $(stat -c %s "$WORK/mnt/$f") bytes in the live mount, want 49152" >&2; exit 1; }
+  cp "$WORK/mnt/$f" "$WORK/src/$f"
+done
+
 # Unmount seals the overlay into generation 1.
 unmount_at "$WORK/mnt"
 wait "$MOUNT_PID" 2>/dev/null || true
@@ -157,7 +182,16 @@ grep -q "sealed write" "$WORK/mnt/dir/written.txt" || { echo "sealed write missi
 [ -d "$WORK/mnt/newdir" ] || { echo "sealed mkdir missing" >&2; exit 1; }
 [ ! -e "$WORK/mnt/dir/small.txt" ] || { echo "sealed deletion did not stick" >&2; exit 1; }
 cmp "$WORK/src/dir/big.bin" "$WORK/mnt/dir/big.bin"
-echo "seal round trip verified: writes, mkdir, deletion, untouched content"
+# The sparse pair, read back from the generation rather than from the
+# overlay that made them. A short chunk list fails the LENGTH check here
+# before cmp ever runs, which is what the sighting looked like.
+for f in sparse-seek.bin sparse-tail.bin; do
+  [ -e "$WORK/mnt/$f" ] || { echo "$f did not survive the seal" >&2; exit 1; }
+  [ "$(stat -c %s "$WORK/mnt/$f")" = "49152" ] || {
+    echo "$f is $(stat -c %s "$WORK/mnt/$f") bytes in the sealed generation, want 49152" >&2; exit 1; }
+  cmp "$WORK/src/$f" "$WORK/mnt/$f" || { echo "$f does not read back from the sealed generation" >&2; exit 1; }
+done
+echo "seal round trip verified: writes, mkdir, deletion, sparse files, untouched content"
 
 echo "== subshell workflow: pelfs shell, catalog-native =="
 unmount_at "$WORK/mnt"
@@ -431,6 +465,11 @@ done
 }
 grep -q "sealed write" "$WORK/nfsmnt/dir/written.txt"
 cmp "$WORK/src/dir/big.bin" "$WORK/nfsmnt/dir/big.bin"
+# The sparse pair through the OS NFS client, which is the backend a macOS
+# box without macFUSE gets and the one the sighting came from.
+for f in sparse-seek.bin sparse-tail.bin; do
+  cmp "$WORK/src/$f" "$WORK/nfsmnt/$f" || { echo "$f does not read back over NFS" >&2; exit 1; }
+done
 echo "NFS backend verified: content byte-exact through the OS NFS client"
 unmount_at "$WORK/nfsmnt"
 kill "$NFS_PID" 2>/dev/null || true

@@ -172,6 +172,14 @@ func groupPieces(ps []piece) []group {
 // bytes: everything it needs was decided when the packs were written.
 // That is the "a seal becomes metadata only" claim, kept in a form that
 // can fail — Sealer is the same rendering with the repair attached.
+//
+// A GAP is one of the things it refuses, and it has to be said out loud
+// rather than left to the whole-chunk test: an extent map is sparse by
+// construction, and a file whose extents happen to tile individually can
+// still leave a range between them — or after the last one — that no
+// extent covers. Those rows would be accepted one by one and sum short of
+// the node's length, which is the one failure a strict renderer exists to
+// make impossible.
 func (s *Store) ChunkRefs(ino uint64) ([]catalog.ChunkRef, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -179,13 +187,27 @@ func (s *Store) ChunkRefs(ino uint64) ([]catalog.ChunkRef, error) {
 	if err != nil {
 		return nil, err
 	}
+	var size int64
+	if c := s.content[ino]; c != nil {
+		size = c.size
+	}
 	var out []catalog.ChunkRef
+	var covered int64
 	for _, g := range groupPieces(ps) {
+		if g.at != covered {
+			return nil, fmt.Errorf("%w: inode %d has no extent for bytes [%d,%d)",
+				ErrNotTiled, ino, covered, g.at)
+		}
 		if !g.whole() {
 			return nil, fmt.Errorf("%w: inode %d wants bytes [%d,%d) of chunk %s (length %d) at file offset %d",
 				ErrNotTiled, ino, g.off, g.off+g.n, g.id, g.llen, g.at)
 		}
 		out = append(out, g.ref())
+		covered = g.end()
+	}
+	if covered != size {
+		return nil, fmt.Errorf("%w: inode %d has no extent for bytes [%d,%d)",
+			ErrNotTiled, ino, covered, size)
 	}
 	return out, nil
 }

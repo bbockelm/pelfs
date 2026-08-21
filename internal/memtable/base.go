@@ -78,7 +78,17 @@ func (s *Store) Adopt(ctx context.Context, ino uint64, length int64) error {
 	if length <= 0 {
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		s.contentFor(ino).size = 0
+		// Punched, not just resized. Setting the size alone would leave any
+		// ref this inode already had naming bytes past the end of a
+		// zero-length file — content no renderer can place and no reference
+		// count would ever release. The length > 0 path below punches for
+		// the same reason; this one used to skip it on the assumption that
+		// an inode being adopted has nothing yet, which is a property of
+		// the callers rather than of the operation.
+		cnt := s.contentFor(ino)
+		dropped := make(map[Handle]int)
+		cnt.truncate(0, dropped)
+		s.applyLocked(dropped)
 		return s.journalLocked(JournalEntry{Op: OpTruncate, Inode: ino, Length: 0})
 	}
 	if c.Inline != nil {

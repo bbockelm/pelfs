@@ -247,7 +247,7 @@ func measureStaging(t *testing.T, plan []fileSpec, latency time.Duration) result
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := pk.add(ctx, hasher.Sum(c.Data), c.Data); err != nil {
+			if _, _, _, err := pk.add(ctx, hasher.Sum(c.Data), c.Data); err != nil {
 				t.Fatal(err)
 			}
 		}

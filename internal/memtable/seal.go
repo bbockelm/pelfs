@@ -130,13 +130,24 @@ func (sl *Sealer) rechunk(ctx context.Context, view *Frozen, ino uint64, from, t
 		// already there, or re-cutting a boundary at the same place twice —
 		// because paying for it would make a rewrite cost bytes it did not
 		// change.
-		if err := sl.pk.add(ctx, id, c.Data); err != nil {
+		//
+		// The row is filled in from what add reports, never from the
+		// plaintext in hand. CLen is the length of the ENTRY in the pack and
+		// Alg says how to decode it, and both differ from the logical length
+		// the moment zstd shrinks the bytes or a volume key seals them —
+		// which is to say for a span of zeros, and for every span on an
+		// encrypted volume. A row that claimed otherwise sent a reader to
+		// read a chunk that is not the size the row says it is.
+		clen, alg, keyID, err := sl.pk.add(ctx, id, c.Data)
+		if err != nil {
 			return nil, err
 		}
 		out = append(out, catalog.ChunkRef{
 			Identity:      append([]byte(nil), id[:]...),
 			LLen:          int64(len(c.Data)),
-			CLen:          int64(len(c.Data)),
+			CLen:          clen,
+			Alg:           int64(alg),
+			KeyID:         keyID,
 			LogicalOffset: at,
 		})
 		at += int64(len(c.Data))

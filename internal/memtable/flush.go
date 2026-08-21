@@ -183,7 +183,7 @@ func (s *Store) chunkInode(ctx context.Context, b *batch, exts []Record, pk *flu
 			return err
 		}
 		id := s.hasher.Sum(c.Data)
-		if err := pk.add(ctx, id, c.Data); err != nil {
+		if _, _, _, err := pk.add(ctx, id, c.Data); err != nil {
 			return err
 		}
 		emit(pos, id, len(c.Data))
@@ -302,15 +302,19 @@ type flushPacker struct {
 	keyID    int64
 	onUpload func(string, int64, time.Duration)
 
-	w       *packstore.PackWriter
-	pend    []pendingLoc
-	pending map[string]struct{}
+	w    *packstore.PackWriter
+	pend []pendingLoc
+	// pending is the open pack's entries, by key. It holds the entry
+	// rather than a marker because a caller writing a catalog row needs
+	// the STORED numbers of a chunk this run has already encoded, and
+	// those exist here before the pack is cut.
+	pending map[string]pendingLoc
 	locs    map[string]PackLoc
 
-	// placed asks the store whether a chunk already has a location — the
-	// only dedup that reaches back past this run. Nil for a packer with no
-	// store behind it, which is what the measurement harness builds.
-	placed func(key string) bool
+	// placed asks the store where a chunk already is — the only dedup that
+	// reaches back past this run. Nil for a packer with no store behind
+	// it, which is what the measurement harness builds.
+	placed func(key string) (PackLoc, bool)
 
 	sealed  []packstore.SealedPack
 	bytes   int64
@@ -336,7 +340,7 @@ func newFlushPacker(obj pelicanobj.Store, dir string, target int64, cache *packC
 	return &flushPacker{
 		obj: obj, dir: dir, target: target, cache: cache, dek: dek, keyID: keyID,
 		onUpload: onUpload, uploads: uploads,
-		pending: make(map[string]struct{}),
+		pending: make(map[string]pendingLoc),
 		locs:    make(map[string]PackLoc),
 	}
 }
@@ -349,21 +353,21 @@ func (s *Store) newPacker() *flushPacker {
 	return p
 }
 
-// placedChunk reports whether the store already knows where a chunk's
-// bytes are. It takes the lock for the lookup and nothing else: a packer
-// runs OFF the store's lock by design, and holding it across a compress,
-// an encrypt and a pack write would put every writer behind every chunk.
+// placedChunk reports where the store already knows a chunk's bytes are.
+// It takes the lock for the lookup and nothing else: a packer runs OFF
+// the store's lock by design, and holding it across a compress, an
+// encrypt and a pack write would put every writer behind every chunk.
 //
 // Racing here is harmless in both directions. A location installed just
 // after the lookup means one chunk is stored twice, which is a wasted
 // upload and not a wrong answer; a location installed just before means
 // the chunk is skipped, and skipping is only ever correct — identity IS
 // the content, so the entry already in the map is these bytes.
-func (s *Store) placedChunk(key string) bool {
+func (s *Store) placedChunk(key string) (PackLoc, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, ok := s.chunkLoc[key]
-	return ok
+	loc, ok := s.chunkLoc[key]
+	return loc, ok
 }
 
 // add stores one chunk. The bytes are ENCODED first — zstd unless that
@@ -372,17 +376,25 @@ func (s *Store) placedChunk(key string) bool {
 // Doing it here rather than at the seal is the whole point: a session
 // that packs as it writes must produce the same objects a seal would, or
 // it is not the same format.
-func (p *flushPacker) add(ctx context.Context, id chunkid.Identity, data []byte) error {
+//
+// It reports how the chunk was STORED — the encoded length, the codec and
+// the key — because that is what a catalog row carries alongside the
+// logical length, and only the entry that encoded the bytes knows it. A
+// caller that filled those fields in from the plaintext instead would
+// write a row claiming an entry's stored length is its decoded length,
+// which is true only for bytes zstd could not shrink and never true on an
+// encrypted volume.
+func (p *flushPacker) add(ctx context.Context, id chunkid.Identity, data []byte) (stored int64, alg uint8, keyID int64, err error) {
 	key := id.Hex()
-	if _, done := p.locs[key]; done {
-		return nil
+	if loc, done := p.locs[key]; done {
+		return loc.Stored, loc.Alg, loc.KeyID, nil
 	}
 	// The open pack's entries need their own lookup, not a scan of pend: an
 	// a chunk per extent is possible for tiny files, so a pack can hold
 	// thousands of small entries rather than the sixteen a 4 MiB average
 	// would give.
-	if _, open := p.pending[key]; open {
-		return nil
+	if pl, open := p.pending[key]; open {
+		return pl.stored, pl.alg, p.keyID, nil
 	}
 	// Neither of those maps outlives the run, so without this a chunk the
 	// store sent in an EARLIER flush is compressed, encrypted and uploaded
@@ -394,38 +406,41 @@ func (p *flushPacker) add(ctx context.Context, id chunkid.Identity, data []byte)
 	// The chunk is deliberately NOT recorded in p.locs: this run did not
 	// place it, and a caller that copies p.locs into the store's map must
 	// not overwrite the location that already answers for it.
-	if p.placed != nil && p.placed(key) {
-		p.skipped++
-		return nil
+	if p.placed != nil {
+		if loc, ok := p.placed(key); ok {
+			p.skipped++
+			return loc.Stored, loc.Alg, loc.KeyID, nil
+		}
 	}
 	if p.w != nil && p.w.Size() > 0 && p.w.Size()+int64(len(data)) > p.target {
 		if err := p.cut(ctx); err != nil {
-			return err
+			return 0, 0, 0, err
 		}
 	}
 	if p.w == nil {
 		w, err := packstore.NewPackWriter(p.dir)
 		if err != nil {
-			return err
+			return 0, 0, 0, err
 		}
 		p.w = w
 	}
-	stored, alg, err := entrycodec.Encode(data, p.dek)
+	enc, alg, err := entrycodec.Encode(data, p.dek)
 	if err != nil {
-		return fmt.Errorf("memtable: encode chunk %s: %w", key, err)
+		return 0, 0, 0, fmt.Errorf("memtable: encode chunk %s: %w", key, err)
 	}
 	off := p.w.Size()
-	if err := p.w.Add(key, packstore.EntryData, stored); err != nil {
-		return err
+	if err := p.w.Add(key, packstore.EntryData, enc); err != nil {
+		return 0, 0, 0, err
 	}
-	p.pend = append(p.pend, pendingLoc{
+	pl := pendingLoc{
 		key: key, off: off,
-		stored: int64(len(stored)), logical: int64(len(data)), alg: alg,
-	})
-	p.pending[key] = struct{}{}
-	p.bytes += int64(len(stored))
+		stored: int64(len(enc)), logical: int64(len(data)), alg: alg,
+	}
+	p.pend = append(p.pend, pl)
+	p.pending[key] = pl
+	p.bytes += int64(len(enc))
 	p.count++
-	return nil
+	return pl.stored, pl.alg, p.keyID, nil
 }
 
 // cut seals the open pack and uploads it. The upload is synchronous: a

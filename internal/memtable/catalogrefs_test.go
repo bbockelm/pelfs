@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/bbockelm/pelfs/internal/catalog"
+	"github.com/bbockelm/pelfs/internal/entrycodec"
 	"github.com/bbockelm/pelfs/internal/packstore"
 )
 
@@ -17,6 +18,14 @@ import (
 // path knows the memtable exists, which is the point — if the packs this
 // write path produces are not the format's packs, this is where it shows.
 func readThroughFormat(t *testing.T, obj *countingStore, packs []packstore.SealedPack, refs []catalog.ChunkRef) []byte {
+	t.Helper()
+	return readThroughFormatKeyed(t, obj, packs, refs, nil)
+}
+
+// readThroughFormatKeyed is the same for an encrypted volume, where the
+// entries decode only with the volume's key.
+func readThroughFormatKeyed(t *testing.T, obj *countingStore, packs []packstore.SealedPack,
+	refs []catalog.ChunkRef, dek []byte) []byte {
 	t.Helper()
 	ctx := context.Background()
 	index := make(map[string]packstore.PackEntry)
@@ -50,12 +59,62 @@ func readThroughFormat(t *testing.T, obj *countingStore, packs []packstore.Seale
 		if err != nil {
 			t.Fatal(err)
 		}
-		if int64(len(data)) != r.LLen {
-			t.Fatalf("chunk %s: pack holds %d bytes, chunkref says %d", idHex, len(data), r.LLen)
+		// Against CLen and through the codec, which is what a reader does.
+		// Comparing the STORED bytes against LLen instead was a hole in this
+		// helper for as long as every test body was incompressible: it made
+		// a row whose CLen and Alg were copied from the plaintext look
+		// correct, and those rows are exactly the ones a reader refuses.
+		if int64(len(data)) != r.CLen {
+			t.Fatalf("chunk %s: pack holds %d bytes, chunkref says clen %d", idHex, len(data), r.CLen)
 		}
-		out = append(out, data...)
+		plain, err := entrycodec.Decode(data, uint8(r.Alg), dek)
+		if err != nil {
+			t.Fatalf("chunk %s: decode with alg %d: %v", idHex, r.Alg, err)
+		}
+		if int64(len(plain)) != r.LLen {
+			t.Fatalf("chunk %s: decodes to %d bytes, chunkref says llen %d", idHex, len(plain), r.LLen)
+		}
+		out = append(out, plain...)
 	}
 	return out
+}
+
+// sealRefs renders one inode the way a seal does and returns the rows.
+func sealRefs(t *testing.T, s *Store, ino uint64) []catalog.ChunkRef {
+	t.Helper()
+	ctx := context.Background()
+	sl := s.NewSealer()
+	refs, err := sl.Inode(ctx, ino)
+	if err != nil {
+		t.Fatalf("seal inode %d: %v", ino, err)
+	}
+	if err := sl.Finish(ctx); err != nil {
+		t.Fatalf("finish seal: %v", err)
+	}
+	return refs
+}
+
+// mustCover fails unless the rows account for exactly the file's length.
+func mustCover(t *testing.T, refs []catalog.ChunkRef, size int64) {
+	t.Helper()
+	var sum, at int64
+	for i, r := range refs {
+		if r.LogicalOffset != at {
+			t.Fatalf("row %d starts at %d, want %d", i, r.LogicalOffset, at)
+		}
+		sum += r.LLen
+		at += r.LLen
+	}
+	if sum != size {
+		t.Fatalf("chunk lengths sum to %d, node length is %d", sum, size)
+	}
+}
+
+func mustWrite(t *testing.T, s *Store, ino uint64, off int64, p []byte) {
+	t.Helper()
+	if err := s.Write(context.Background(), ino, off, p); err != nil {
+		t.Fatalf("write inode %d at %d: %v", ino, off, err)
+	}
 }
 
 // The whole vertical slice, ending in the format rather than in the

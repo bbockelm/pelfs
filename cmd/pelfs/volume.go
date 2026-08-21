@@ -128,16 +128,33 @@ func isNotFoundErr(err error) bool {
 		strings.Contains(msg, "not found") || strings.Contains(msg, "no such")
 }
 
+// signingKeyFileIn is where a volume's signing key lives: the explicit
+// --signing-key when one is given, and the state directory's copy
+// otherwise.
+//
+// One resolver for every path that signs — init, the seal at unmount, a
+// checkpoint, a background repack — because a volume's identity is a
+// property of the VOLUME, not of the command that happens to be running.
+// Two of these that disagreed would mint a second identity and publish a
+// generation every existing reader rejects.
+func signingKeyFileIn(stateDir, override string) string {
+	if override != "" {
+		return override
+	}
+	return filepath.Join(stateDir, "v2-signing.key")
+}
+
 // cmdInit creates a brand-new volume: generation 0 with an empty root.
 func cmdInit(args []string) int {
-	var branch string
+	var branch, signingKey string
 	o, pos, err := parseArgs("init", args, 1, 1, func(fs *flag.FlagSet, o *cmdOpts) {
 		fs.StringVar(&branch, "branch", "main", "ref name to create")
+		fs.StringVar(&signingKey, "signing-key", "", signingKeyUsage)
 	})
 	if err != nil {
 		return exitErr(err)
 	}
-	if err := initVolumeAt(o, pos[0], branch); err != nil {
+	if err := initVolumeAt(o, pos[0], branch, signingKey); err != nil {
 		return exitErr(err)
 	}
 	fmt.Printf("  mount it:    pelfs shell %s\n", pos[0])
@@ -148,7 +165,7 @@ func cmdInit(args []string) int {
 // root, its volume id and signing key minted locally. It is what
 // `pelfs init` runs, and what `pelfs shell` runs when it is pointed at an
 // empty prefix.
-func initVolumeAt(o *cmdOpts, prefix, branch string) error {
+func initVolumeAt(o *cmdOpts, prefix, branch, signingKeyPath string) error {
 	ctx := context.Background()
 	stateDir := o.stateDir
 	if stateDir == "" {
@@ -174,7 +191,11 @@ func initVolumeAt(o *cmdOpts, prefix, branch string) error {
 	} else if !isNotFoundErr(err) {
 		return fmt.Errorf("check for an existing volume: %w", err)
 	}
-	signingKey, err := loadOrCreateSigningKey(filepath.Join(stateDir, "v2-signing.key"), nil)
+	// An explicit key here means "create this volume under an identity I
+	// already have", which is how a volume gets a key its owner keeps
+	// somewhere other than the state directory. Absent, one is minted at
+	// that path — the ordinary case.
+	signingKey, err := loadOrCreateSigningKey(signingKeyFileIn(stateDir, signingKeyPath), nil)
 	if err != nil {
 		return err
 	}
@@ -205,3 +226,16 @@ func initVolumeAt(o *cmdOpts, prefix, branch string) error {
 		"volume", fmt.Sprintf("%x", volID), "ref", refs.RefDirKey+"/"+branch)
 	return nil
 }
+
+// signingKeyUsage is the one description of --signing-key, shared by
+// every command that has it.
+//
+// It says what to DO with it, because the flag exists for one situation
+// and it is not one a user reasons their way to: a volume's identity is
+// per-VOLUME, so publishing from a second machine means putting the same
+// private key there. Reading needs nothing — the public half travels
+// inside every superblock and is pinned on first use — so the failure
+// only ever shows up at the first seal, long after the mount worked.
+const signingKeyUsage = "hex Ed25519 volume signing key to publish with " +
+	"(default: <state-dir>/v2-signing.key). A volume's key is per-VOLUME: to write from a second " +
+	"machine, copy that file across and point this at it. Reading needs no key"

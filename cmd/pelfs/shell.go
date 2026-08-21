@@ -21,9 +21,10 @@ import (
 )
 
 func cmdShell(args []string) int {
-	var branch string
+	var branch, signingKey string
 	o, pos, command, err := parseArgsWithCommand("shell", args, 1, 1, func(fs *flag.FlagSet, o *cmdOpts) {
 		fs.StringVar(&branch, "branch", "main", "branch to mount")
+		fs.StringVar(&signingKey, "signing-key", "", signingKeyUsage)
 	})
 	if err != nil {
 		return exitErr(err)
@@ -43,7 +44,7 @@ func cmdShell(args []string) int {
 	case volumeLegacy:
 		return exitErr(legacyVolumeError(prefix))
 	case volumeEmpty:
-		if err := initVolumeAt(o, prefix, branch); err != nil {
+		if err := initVolumeAt(o, prefix, branch, signingKey); err != nil {
 			return exitErr(fmt.Errorf("create volume: %w", err))
 		}
 	}
@@ -54,10 +55,11 @@ func cmdShell(args []string) int {
 	}
 	defer os.RemoveAll(mountpoint) //nolint:errcheck
 	return runMountGen(o, prefix, mountpoint, command, genArgs{
-		branch:   branch,
-		rw:       !o.readOnly,
-		subshell: true,
-		backend:  backend,
+		branch:         branch,
+		rw:             !o.readOnly,
+		subshell:       true,
+		backend:        backend,
+		signingKeyPath: signingKey,
 	})
 }
 

@@ -93,7 +93,20 @@ scp pelfs worker:~/ && ssh worker './pelfs shell pelican://.../scratch'
 ```
 
 No root, no sudo, no package to install, no setup step. State, caches and
-the volume signing key go under `$HOME/.local/state/pelfs`. `make
+the volume signing key go under `$HOME/.local/state/pelfs`.
+
+**Reading** a volume from a second machine needs nothing: the public half
+of the volume key travels inside every superblock and is pinned on first
+use. **Writing** needs the private key, because only its holder can sign a
+new generation — copy `v2-signing.key` across and point at it:
+
+```
+scp ~/.local/state/pelfs/vol-<id>/v2-signing.key worker:~/
+ssh worker './pelfs shell --signing-key ~/v2-signing.key pelican://.../scratch'
+```
+
+Without it the mount works, reads work, writes work, and the seal at
+unmount is refused — so it is worth doing before the session, not after. `make
 unprivileged` gates exactly this: a linux/amd64 binary run in a container
 as uid 1001 with an empty supplementary group set and nothing writable
 outside its scratch, mounting, writing, sealing, re-reading, and then

@@ -44,23 +44,16 @@ create)
   # this does not have to be world-readable. On a real second machine this
   # is an scp of a 0600 file, which is what the destination gets below.
   chmod 0640 /shared/key
-  # The state directory is per-prefix, so the path is the same on both
-  # machines below HOME. Recording it is the stand-in for "scp the key to
-  # the same place on the other host", which is what a user does --
-  # `pelfs shell` has no --signing-key of its own to point at it with.
-  basename "$(dirname "$KEY")" > /shared/voldir
-  chmod 0640 /shared/voldir
+
   ;;
 use)
   echo "   mounting as uid $(id -u), which did NOT create it"
   # The reproduction, verb for verb: make a directory in the root, then
   # write inside it, exactly as `git clone` does.
   [ -s /shared/key ] || fail "the creating phase left no signing key"
-  VOLDIR=$(cat /shared/voldir)
-  mkdir -p "$HOME/.local/state/pelfs/$VOLDIR"
-  cp /shared/key "$HOME/.local/state/pelfs/$VOLDIR/v2-signing.key"
-  chmod 0600 "$HOME/.local/state/pelfs/$VOLDIR/v2-signing.key"
-  /stage/pelfs shell "$PREFIX" -- /bin/sh -c '
+  # --signing-key is the whole second-machine workflow: copy the key
+  # across, point at it. Nothing is placed by hand under HOME.
+  /stage/pelfs shell --signing-key /shared/key "$PREFIX" -- /bin/sh -c '
     set -eu
     mkdir htcondor
     echo "cloned" > htcondor/README

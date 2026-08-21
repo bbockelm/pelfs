@@ -233,7 +233,7 @@ func cmdMountGen(args []string) int {
 		fs.BoolVar(&a.noMemtable, "no-memtable", false, "with --rw, keep written content in staging files and chunk it all at the seal, instead of packing and uploading during the session")
 		fs.BoolVar(&a.subshell, "subshell", false, "run a subshell in the mount and unmount (sealing, with --rw) when it exits; a trailing `-- command [args...]` runs that instead of a shell and implies this flag")
 		fs.DurationVar(&a.poll, "poll", 0, "read-only: re-check the branch head this often and swap generations live (0 = pinned, the reproducible-batch default)")
-		fs.StringVar(&a.signingKeyPath, "signing-key", "", "hex Ed25519 volume signing key file to seal with (default: <state-dir>/v2-signing.key; a volume's key is per-VOLUME, so a second machine must import it)")
+		fs.StringVar(&a.signingKeyPath, "signing-key", "", signingKeyUsage)
 	})
 	if err != nil {
 		return exitErr(err)
@@ -2075,8 +2075,5 @@ func (g *genSession) publishMountRecord() func() {
 // --signing-key when given, and the state directory's copy otherwise.
 // Shared by the seal and by background maintenance, which both publish.
 func (g *genSession) signingKeyFile() string {
-	if g.signingKeyPath != "" {
-		return g.signingKeyPath
-	}
-	return filepath.Join(g.stateDir, "v2-signing.key")
+	return signingKeyFileIn(g.stateDir, g.signingKeyPath)
 }

@@ -1475,3 +1475,28 @@ func TestAutoRepackDoesNotRunTwiceAtOnce(t *testing.T) {
 			g.sb.Generation, before)
 	}
 }
+
+// A volume's identity is a property of the VOLUME, not of the command
+// that happens to be running, so init, the seal at unmount, a checkpoint
+// and a background repack must all resolve the key to the same file. Two
+// resolvers that disagreed would mint a second identity and publish a
+// generation every existing reader rejects.
+func TestEveryPathThatSignsResolvesTheSameKey(t *testing.T) {
+	g := newGenSession(t, true)
+	const override = "/imported/from/the/other/machine.key"
+
+	if got, want := g.signingKeyFile(), filepath.Join(g.stateDir, "v2-signing.key"); got != want {
+		t.Errorf("default key path = %q, want %q", got, want)
+	}
+	if got := signingKeyFileIn(g.stateDir, ""); got != g.signingKeyFile() {
+		t.Errorf("init resolves %q, the session resolves %q", got, g.signingKeyFile())
+	}
+
+	g.signingKeyPath = override
+	if got := g.signingKeyFile(); got != override {
+		t.Errorf("--signing-key ignored by the session: %q", got)
+	}
+	if got := signingKeyFileIn(g.stateDir, override); got != override {
+		t.Errorf("--signing-key ignored at volume creation: %q", got)
+	}
+}

@@ -1,7 +1,7 @@
 # go-nfs: the fork we carry, and what is left in it
 
 The loopback-NFS backend runs on [willscott/go-nfs](https://github.com/willscott/go-nfs).
-Five of its behaviors were wrong for us: two are fixed on a fork, one was
+Six of its behaviors were wrong for us: three are fixed on a fork, one was
 fixed upstream, one is worked around inside pelfs, and one is tolerated as
 it stands. This note records what the fork holds, why it exists rather
 than a set of local wrappers, and what is still open.
@@ -97,6 +97,61 @@ removal of the log filter `internal/nfsmount` used to need.
 The same commit fixes the reply's `post_op_attr`, which stat'ed
 `billy.File.Name()` — a basename, resolved against the export root rather
 than the directory the file was created in.
+
+## Fixed on the fork: REMOVE resolved through a terminal symlink
+
+A directory would not delete. Three `rm -rf` passes, the same 23 files
+surviving every one:
+
+    $ rm -rf htcondor/
+    rm: htcondor/src/condor_tests: Directory not empty
+
+Every survivor was a **symlink**, and all 23 named the same target — which
+sorts ahead of them. `rm -rf` walks a directory in sorted order, so the
+target was unlinked before the walk reached any link, and every link was
+**dangling** by the time its own turn came.
+
+`onRemoveObj` stat'ed its operands with `fs.Stat`, which follows a terminal
+symlink. On a dangling one that is ENOENT, so the handler answered
+`NFS3ERR_NOENT` and returned **without ever calling `fs.Remove`**. `rm`
+reads ENOENT on an unlink as "someone else got there first" and moves on
+without reporting anything, so the link stayed, and the `rmdir` behind it
+refused. Nothing about that converges: the retry deletes nothing new and
+the same links survive, which is why repeating the command was no help.
+
+RFC 1813 makes both operands of REMOVE and RMDIR *names in a directory* —
+"the file to be removed", not the file the name resolves to — and an NFSv3
+client walks symlinks itself, one LOOKUP at a time. A server that follows
+one has acted on an object the client never named. Two more cases came
+with it: a symlink to a **directory** got `NFS3ERR_ISDIR` from REMOVE and
+was accepted by RMDIR, and a symlink to a **file** was removed correctly
+only because backends do not follow in their own `Remove` — the handler
+and the backend disagreed about which object was named and agreed on the
+outcome by luck.
+
+The fork uses `fs.Lstat`, which is what every other handler that names its
+object by file handle already does (`onGetAttr`, `onSetAttr`, `onLookup`,
+`onLink`'s source, `tryStat`). `onReadLink` carried the same confusion in
+its error path — it asked `fs.Stat` whether the object was a symlink, a
+question `Stat` can only answer about the object at the far end of one —
+and is fixed in the same commit.
+
+This is the REMOVE half of the audit that produced `efc3a30`
+("vfsbilly, nfsmount: stop setting a symlink's attributes on its target").
+That one found the same defect in the SETATTR path and fixed it in pelfs,
+because billy names its methods after the `os` functions and those follow;
+`Remove` was never given the same look. `internal/vfsbilly` turns out to
+have been right all along — its `Remove` resolves the parent and then does
+a raw `Lookup`, following nothing — so this one is purely go-nfs's, and
+pins that with `internal/vfsbilly/symlinkremove_test.go`.
+
+Gated three ways: `nfs_onremove_test.go` on the fork (dangling, live,
+symlink-to-directory, and RMDIR of a symlink), the vfsbilly tests above,
+and `deletion_gate` in `scripts/mount-gate-test.sh`, which reproduces the
+reported shape on a real kernel NFS client and asserts one `rm -rf` pass
+empties it. That gate runs on the FUSE backend too — raw FUSE unlinks by
+`(parent inode, name)` and never resolves a path, so it is immune by
+construction, and the second leg is what says so rather than assuming it.
 
 ## Fixed upstream: RMDIR on a non-empty directory
 

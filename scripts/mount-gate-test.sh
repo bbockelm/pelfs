@@ -56,6 +56,106 @@ unmount_at() {
   return 0
 }
 
+# deletion_gate <label> <writable mount root>
+#
+# Everything `rm -rf` needs from a filesystem, run against whatever backend
+# is mounted at $2. It exists because the property that broke was never
+# tested at any size: the gate had one ENOTEMPTY check on a directory of a
+# single file, which no amount of paging or symlink resolution can disturb.
+#
+# The failure it now catches was reported as an undeletable directory —
+# three `rm -rf` passes, the same 23 files surviving every one:
+#
+#     rm: htcondor/src/condor_tests: Directory not empty
+#
+# Every survivor was a SYMLINK, and all 23 named one target that sorts
+# ahead of them. `rm -rf` walks a directory in sorted order, so the target
+# went first and every link dangled by the time its own turn came. The NFS
+# REMOVE handler stat'ed the object through the link, got ENOENT for a link
+# that was plainly there, and answered NFS3ERR_NOENT without unlinking
+# anything. rm reads ENOENT on unlink as "already gone" and moves on, so
+# the links survived and the rmdir behind them refused — identically, every
+# pass, since nothing about it converges.
+#
+# Sized to run in a couple of seconds. The large directory is here because
+# READDIR cookies are positional indices into a listing, so a directory big
+# enough to need many READDIR calls is the only one that can expose an
+# unlink shifting the entries a client has not been shown yet.
+deletion_gate() {
+  local label="$1" root="$2"
+  local d="$root/deltest"
+  local n out
+
+  rm -rf "$d" 2>/dev/null || true
+  mkdir -p "$d/links" "$d/keep/realdir" "$d/big"
+
+  # The reported shape first, so a regression prints the user's sentence
+  # rather than a proxy for it: one target that sorts ahead of every link
+  # to it, and 23 links, deleted in ONE pass. `rm -rf` exits non-zero when
+  # it leaves anything, so its own message is captured and shown.
+  echo "the target every link names" > "$d/links/aaa_base.run"
+  for i in $(seq 1 23); do
+    ln -s aaa_base.run "$d/links/lib_eventlog_rotation_$i.run"
+  done
+  out=$(rm -rf "$d/links" 2>&1 || true)
+  [ ! -e "$d/links" ] || {
+    echo "$label: one rm -rf pass left a directory of dangling links behind" >&2
+    [ -n "$out" ] && echo "$out" | sed 's/^/    /' >&2
+    ls -la "$d/links" | sed 's/^/    /' >&2
+    exit 1
+  }
+
+  # And the individual cases behind it. Removing a symlink takes the LINK,
+  # never what it names, and following loses in both directions: a live
+  # link's target would be destroyed silently, a dangling one refuses the
+  # operation outright.
+  echo "must survive" > "$d/keep/realfile"
+  echo "also survives" > "$d/keep/realdir/inside"
+  ln -s nothing-here "$d/keep/danglink"
+  ln -s realfile "$d/keep/livelink"
+  ln -s realdir "$d/keep/dirlink"
+
+  rm "$d/keep/danglink" || { echo "$label: rm of a DANGLING symlink failed" >&2; exit 1; }
+  [ ! -L "$d/keep/danglink" ] || { echo "$label: the dangling symlink survived rm" >&2; exit 1; }
+
+  rm "$d/keep/livelink" || { echo "$label: rm of a live symlink failed" >&2; exit 1; }
+  [ -f "$d/keep/realfile" ] || { echo "$label: rm of a symlink deleted its TARGET" >&2; exit 1; }
+  [ ! -L "$d/keep/livelink" ] || { echo "$label: rm reported success and left the symlink" >&2; exit 1; }
+
+  rm "$d/keep/dirlink" || { echo "$label: rm of a symlink to a directory failed" >&2; exit 1; }
+  [ -f "$d/keep/realdir/inside" ] || { echo "$label: rm of a symlink emptied the DIRECTORY it named" >&2; exit 1; }
+  [ ! -L "$d/keep/dirlink" ] || { echo "$label: rm reported success and left the symlink to a directory" >&2; exit 1; }
+
+  # A large directory: many READDIR round trips with unlinks landing
+  # between them. `: >` is a builtin redirect, so this is one open per
+  # entry and no forks.
+  for i in $(seq 1 3000); do : > "$d/big/f$(printf %04d "$i")"; done
+  n=$(ls -U "$d/big" | wc -l)
+  [ "$n" = "3000" ] || { echo "$label: enumerating 3000 entries returned $n" >&2; exit 1; }
+  out=$(rm -rf "$d/big" 2>&1 || true)
+  [ ! -e "$d/big" ] || {
+    n=$(ls -U "$d/big" | wc -l)
+    echo "$label: one rm -rf pass left $n of 3000 entries behind" >&2
+    [ -n "$out" ] && echo "$out" | sed 's/^/    /' >&2
+    exit 1
+  }
+
+  # ENOTEMPTY still means ENOTEMPTY: the point is a directory that refuses
+  # for the right reason, not one that never refuses.
+  mkdir -p "$d/notempty" && : > "$d/notempty/child"
+  if rmdir "$d/notempty" 2>/dev/null; then
+    echo "$label: rmdir removed a non-empty directory" >&2; exit 1
+  fi
+  case "$(rmdir "$d/notempty" 2>&1 || true)" in
+    *"not empty"*) : ;;
+    *) echo "$label: rmdir of a non-empty directory reported: $(rmdir "$d/notempty" 2>&1 || true), want ENOTEMPTY" >&2; exit 1 ;;
+  esac
+
+  rm -rf "$d"
+  [ ! -e "$d" ] || { echo "$label: the scratch tree would not go" >&2; ls -laR "$d" >&2; exit 1; }
+  echo "$label: symlinks removed as links, 23 dangling links and 3000 entries each gone in ONE pass"
+}
+
 [ -e /dev/fuse ] || { echo "no /dev/fuse; a kernel mount needs FUSE" >&2; exit 1; }
 
 # Binaries are either prebuilt (the container launcher cross-compiles on
@@ -475,6 +575,45 @@ unmount_at "$WORK/nfsmnt"
 kill "$NFS_PID" 2>/dev/null || true
 wait "$NFS_PID" 2>/dev/null || true
 NFS_PID=
+
+echo "== deletion: rm -rf empties a directory in ONE pass, on BOTH backends =="
+# NFS first. It is where the defect was found, and the only backend whose
+# REMOVE goes through a protocol handler that can form its own opinion
+# about what the name resolves to.
+"$WORK/pelfs" mount-gen --rw --no-seal --backend nfs --state-dir "$WORK/state-del-nfs" \
+  "$PREFIX" "$WORK/nfsmnt" 2>"$WORK/nfs-del.log" &
+NFS_PID=$!
+up=0
+for _ in $(seq 100); do
+  [ -d "$WORK/nfsmnt/dir" ] && { up=1; break; }
+  kill -0 "$NFS_PID" 2>/dev/null || break
+  sleep 0.1
+done
+[ "$up" = "1" ] || {
+  echo "the writable NFS mount did not come up:" >&2
+  sed 's/^/    /' "$WORK/nfs-del.log" >&2
+  exit 1
+}
+deletion_gate "nfs" "$WORK/nfsmnt"
+unmount_at "$WORK/nfsmnt"
+kill "$NFS_PID" 2>/dev/null || true
+wait "$NFS_PID" 2>/dev/null || true
+NFS_PID=
+
+# And FUSE, which unlinks by (parent inode, name) and never resolves a
+# path at all — so it ought to be immune to the symlink half by
+# construction. This leg is what turns "ought to be" into a fact, and what
+# says which layer a future regression is in.
+"$WORK/pelfs" mount-gen --rw --no-seal --state-dir "$WORK/state-del-fuse" \
+  "$PREFIX" "$WORK/mnt" 2>"$WORK/fuse-del.log" &
+MOUNT_PID=$!
+for _ in $(seq 200); do [ -d "$WORK/mnt/dir" ] && break; sleep 0.1; done
+[ -d "$WORK/mnt/dir" ] || {
+  echo "the writable FUSE mount did not come up:" >&2
+  sed 's/^/    /' "$WORK/fuse-del.log" >&2
+  exit 1
+}
+deletion_gate "fuse" "$WORK/mnt"
 
 echo "== live refresh: a read-only mount follows the branch =="
 unmount_at "$WORK/mnt"

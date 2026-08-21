@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/go-git/go-billy/v5/memfs"
+	nfs "github.com/willscott/go-nfs"
 	nfshelper "github.com/willscott/go-nfs/helpers"
 )
 
@@ -195,6 +196,85 @@ func TestVerifierLargerThanBudgetSurvives(t *testing.T) {
 	v := tbl.VerifierFor("/huge", huge)
 	if got := tbl.DataForVerifier("/huge", v); len(got) != len(huge) {
 		t.Fatalf("oversized listing returned %d entries, want %d", len(got), len(huge))
+	}
+}
+
+// READDIR cookies in go-nfs are POSITIONAL: an entry's cookie is its index
+// in the listing the server read, plus two for "." and "..". On its own
+// that is the classic skip-under-mutation bug — unlink an entry between
+// two pages and every later entry shifts down one, so the client resumes
+// past entries it was never shown, `rm -rf` finishes early, and the rmdir
+// behind it reports the directory non-empty.
+//
+// What makes it safe here is that the positions index a SNAPSHOT rather
+// than the live directory: the verifier names a listing, this table
+// retains it, and go-nfs serves every continuation from the retained one
+// (getDirListingWithVerifier consults DataForVerifier before it re-reads).
+// Two properties carry that, and both are asserted below.
+//
+// The scheme is contingent on this type satisfying the interface go-nfs
+// type-asserts for. If it ever stops, nothing fails to build and no test
+// fails — go-nfs silently falls back to re-reading the directory for every
+// page, and the positional cookies above become the skipping bug for real.
+// Hence the assertion.
+var _ nfs.CachingHandler = (*handles)(nil)
+
+// A retained listing must not move when the directory does. This is the
+// property that stops an unlink between two pages from shifting the
+// entries the client has not been shown yet.
+func TestVerifierPinsTheListingAgainstMutation(t *testing.T) {
+	tbl := newTestHandles(16)
+	first := []fs.FileInfo{dummyInfo("a"), dummyInfo("b"), dummyInfo("c"), dummyInfo("d")}
+	v := tbl.VerifierFor("/d", first)
+
+	// The directory loses an entry mid-scan, as an `rm -rf` makes it do
+	// thousands of times.
+	after := []fs.FileInfo{dummyInfo("a"), dummyInfo("c"), dummyInfo("d")}
+	tbl.VerifierFor("/d", after)
+
+	got := tbl.DataForVerifier("/d", v)
+	if len(got) != len(first) {
+		t.Fatalf("the pinned listing changed under the scan: %d entries, want %d", len(got), len(first))
+	}
+	for i := range first {
+		if got[i].Name() != first[i].Name() {
+			t.Fatalf("entry %d of the pinned listing is %q, want %q", i, got[i].Name(), first[i].Name())
+		}
+	}
+}
+
+// And when the pin is NOT available — evicted, or a client resuming
+// against a server that has forgotten it — the verifier the server
+// recomputes must DIFFER, so go-nfs answers NFS3ERR_BAD_COOKIE and the
+// client restarts the scan (RFC 1813 3.3.16). A verifier that did not
+// track content would leave the client resuming into a list that had
+// moved, which is the same skip by another route.
+func TestVerifierChangesWhenTheDirectoryChanges(t *testing.T) {
+	tbl := newTestHandles(16)
+	before := []fs.FileInfo{dummyInfo("a"), dummyInfo("b"), dummyInfo("c")}
+	v := tbl.VerifierFor("/d", before)
+
+	for _, c := range []struct {
+		what     string
+		contents []fs.FileInfo
+	}{
+		{"an entry removed", []fs.FileInfo{dummyInfo("a"), dummyInfo("c")}},
+		{"an entry added", []fs.FileInfo{dummyInfo("a"), dummyInfo("b"), dummyInfo("c"), dummyInfo("d")}},
+		{"an entry renamed", []fs.FileInfo{dummyInfo("a"), dummyInfo("b"), dummyInfo("z")}},
+	} {
+		if got := tbl.VerifierFor("/d", c.contents); got == v {
+			t.Errorf("%s: verifier is unchanged (%d), so a resuming client would never restart", c.what, got)
+		}
+	}
+	// The same directory, unchanged, must keep its verifier: a client
+	// resuming a scan of a quiet directory must not be forced to restart.
+	if got := tbl.VerifierFor("/d", before); got != v {
+		t.Errorf("an unchanged directory changed verifier: %d, want %d", got, v)
+	}
+	// Different directories with identical entries are distinguishable,
+	// which is what keeps one scan's pin from serving another's.
+	if got := tbl.VerifierFor("/other", before); got == v {
+		t.Error("two directories with the same entries share a verifier")
 	}
 }
 

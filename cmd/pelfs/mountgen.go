@@ -111,6 +111,12 @@ type genSession struct {
 	// repacking is set while a background repack is between its sweep and
 	// its flip, so the periodic checkpoint can stand aside. Guarded by mu.
 	repacking bool
+	// lastCollect is when this session last ran the sweep, which is what
+	// the collection floor is measured from. Session-scoped on purpose: a
+	// sweep publishes nothing, so there is nowhere in the volume to record
+	// it, and a mount that has just started is itself decent evidence that
+	// nobody has collected lately. Guarded by mu.
+	lastCollect time.Time
 	// refs is the verified ref store this session reads and flips through.
 	// Kept on the session because background maintenance publishes too
 	// (autorepack.go), and a second store would keep a second key pin.
@@ -707,8 +713,10 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		if !o.noAutoRepack {
 			// Background maintenance, on the same session context: it holds
 			// the lease already and knows when the volume is idle, which a
-			// cron job has neither of.
-			go g.autoRepackPeriodically(sessionCtx, repack.AutoPolicy{})
+			// cron job has neither of. The sweep rides the same loop —
+			// condemning without collecting frees nothing, and a repack is
+			// what makes a sweep worth running.
+			go g.maintainPeriodically(sessionCtx, repack.AutoPolicy{}, !o.noAutoGC)
 		}
 		ui.Info("checkpointing every {interval} (--snapshot-interval 0 disables)",
 			"interval", o.snapshotInterval)
@@ -2030,6 +2038,30 @@ func (g *genSession) controlHooks() control.Hooks {
 			} else {
 				st["branch"] = g.branch
 			}
+			// When this volume last collected, and what it got back. The
+			// status socket is where someone looks when they suspect a mount
+			// is not maintaining itself, and "the sweep has never run in
+			// this session" is an answer that only shows up as an ABSENCE
+			// otherwise.
+			g.mu.Lock()
+			lastCollect := g.lastCollect
+			g.mu.Unlock()
+			if !lastCollect.IsZero() {
+				st["last_gc_at"] = lastCollect.Format(time.RFC3339)
+			}
+			g.stats.Update(func(sum *stats.Summary) {
+				if sum.Maintenance == nil {
+					return
+				}
+				st["reclaimed_bytes"] = sum.Maintenance.ReclaimedBytes
+				st["reclaimed_objects"] = sum.Maintenance.ReclaimedObjects
+				if !sum.Maintenance.LastRepackAt.IsZero() {
+					st["last_repack_at"] = sum.Maintenance.LastRepackAt.Format(time.RFC3339)
+				}
+				if sum.Maintenance.LastCollectionError != "" {
+					st["last_gc_error"] = sum.Maintenance.LastCollectionError
+				}
+			})
 			if g.lease != nil {
 				st["lease_held"] = true
 				// Which object, for the same reason `pelfs status` says

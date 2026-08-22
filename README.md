@@ -212,8 +212,9 @@ See `pelfs -h`. Highlights: `--ro` (read-only, no overlay and no seal),
 volume's data keys — the same key must be supplied on every later mount;
 `$PELFS_KEY_PASSPHRASE` unlocks a passphrase-protected PEM), `--state-dir`
 (where the overlay, caches, trust pin, and signing key live), `--poll`
-(read-only mounts follow the branch head live), `--no-seal`, and
-`--volume-pubkey`.
+(read-only mounts follow the branch head live), `--no-seal`,
+`--volume-pubkey`, and the two maintenance switches `--no-auto-repack` /
+`--no-auto-gc`.
 
 ## Messages
 
@@ -265,16 +266,24 @@ a count of bytes, a duration a count of nanoseconds).
 - The origin must permit GET/PUT/DELETE and listing on the prefix (i.e. a
   token with read/modify scopes for the namespace); `pelfs` checks this up
   front and says which scope is missing.
-- **Reclaiming space still needs `gc` to be run.** A writable mount
-  repacks by itself when it has been idle for a while and the branch has
-  drifted since the last one (`--no-auto-repack` turns that off), which
-  condemns the mostly-dead packs. Removing them is still a separate,
-  manual `pelfs gc --delete`, and only once the grace window (72h, not
-  configurable) has passed AND the retain window has moved past the
-  generations that named them — so a repack immediately followed by a
-  sweep frees nothing until the branch has sealed `RetainK` more times.
-  `pelfs repack` with no flags reports what the volume is currently
-  carrying.
+- **A writable mount now maintains itself, both halves.** When it has
+  been idle for a while and the branch has drifted, it repacks
+  (`--no-auto-repack` turns that off), which condemns the mostly-dead
+  packs; it then COLLECTS them (`--no-auto-gc`), which is the half that
+  frees bytes. The sweep is `pelfs gc --delete` — the same code, the same
+  windows, the same fail-closed rule that deletes nothing at all if any
+  ref will not verify — run after a repack and otherwise every six hours
+  while the mount is quiet.
+
+  The windows still apply and are the reason a repack followed straight
+  away by a sweep frees nothing: an object goes when it is past the grace
+  window (72h by default, set per volume with `pelfs init --grace`) AND no
+  longer named by any of the last `Params.RetainK` generations. So the
+  bytes come back a while after the work that made them collectable, on
+  their own. `pelfs ctl <mount> status` reports `last_gc_at` and
+  `reclaimed_bytes`; the statistics file carries a `maintenance` section
+  with both halves. A volume nobody ever mounts writably is still never
+  maintained — that is what `pelfs gc --delete` is for.
 - **A retired generation gets the grace window, and the last K
   generations of its branch.** The sweep's root set is every branch head,
   the last `Params.RetainK` generations behind each head (8 by default),

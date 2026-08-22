@@ -179,10 +179,50 @@ type Summary struct {
 	SealedPacks      int64  `json:"sealed_packs,omitempty"`
 	SealOK           *bool  `json:"seal_ok,omitempty"`
 
+	// Maintenance is what the background repack and sweep have done in this
+	// session. Nil on a mount that runs neither.
+	Maintenance *MaintenanceStats `json:"maintenance,omitempty"`
+
 	// Overall verdict for supervisors: true only when unmount, flush/drain,
 	// and the final snapshot all succeeded.
 	CleanShutdown bool `json:"clean_shutdown"`
 	ExitCode      int  `json:"exit_code"`
+}
+
+// MaintenanceStats is the background maintenance a writable mount performs
+// on its own: repacks, and the sweeps that collect what they condemned.
+//
+// It exists because those are the two operations with NO natural observer.
+// A seal is watched by the person who typed `exit`; a repack and a sweep
+// happen while nobody is looking, six hours apart, and the question they
+// prompt is asked much later and by someone else: "is this volume being
+// maintained, or has it been quietly growing since March?" A log line
+// cannot answer that once it has rotated away, so the answer is a
+// TIMESTAMP and a COUNTER — the shape a supervisor can alert on.
+//
+// The two byte figures are deliberately not one number. CondemnedBytes is
+// what repacks made collectable; ReclaimedBytes is what sweeps actually
+// deleted. A volume where the first grows and the second does not is a
+// volume whose collection half has stopped, which is exactly the failure
+// this file exists to make visible.
+type MaintenanceStats struct {
+	Repacks        int64     `json:"repacks,omitempty"`
+	LastRepackAt   time.Time `json:"last_repack_at,omitempty"`
+	CondemnedBytes int64     `json:"condemned_bytes,omitempty"`
+
+	Collections      int64     `json:"collections,omitempty"`
+	LastCollectAt    time.Time `json:"last_gc_at,omitempty"`
+	ReclaimedObjects int64     `json:"reclaimed_objects,omitempty"`
+	ReclaimedBytes   int64     `json:"reclaimed_bytes,omitempty"`
+	// GraceSeconds is the window the last sweep applied — the volume's
+	// recorded T_grace. Reported beside the counts because "nothing was
+	// reclaimed" and "nothing was old enough yet" are different answers.
+	GraceSeconds int64 `json:"grace_seconds,omitempty"`
+	// A sweep FAILS CLOSED: an unverifiable ref deletes nothing at all. So
+	// a failing sweep looks exactly like a clean one from the outside, and
+	// only these two fields distinguish them.
+	CollectionFailures  int64  `json:"collection_failures,omitempty"`
+	LastCollectionError string `json:"last_collection_error,omitempty"`
 }
 
 // WriteStats is what the memtable knows about pressure, published so a

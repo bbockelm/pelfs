@@ -357,6 +357,25 @@ func (w *world) packSet(sb *superblock.Superblock) map[string]bool {
 	return out
 }
 
+// autoMaintain is a mount's idle maintenance loop, as an op: a repack, and
+// then — the half that did not exist until auto-collection did — the SWEEP
+// that repack made work for, deleting at the CURRENT clock.
+//
+// The current clock is the whole point of having it here as its own op. The
+// far-future sweep the other cases use is the adversarial setting, which
+// answers "is anything retained by luck rather than by a root". This one is
+// the ORDINARY setting, and it is the one a mount actually performs: a
+// deletion pass running seconds after a repack, while the grace window is
+// still open on everything that repack touched and the retain window still
+// covers the generation it grew from. Anything it collects there, it
+// collects out from under a live reader.
+func (w *world) autoMaintain() {
+	w.seal()
+	w.repack()
+	w.gc(w.clock, true)
+	w.count("auto-maintain")
+}
+
 // step drives one random operation from the set that can race. Weighted so
 // that seals dominate — that is what a mount does — with repacks and
 // sweeps landing between them at arbitrary points.
@@ -364,16 +383,18 @@ func (w *world) step() {
 	switch n := w.rng.Intn(100); {
 	case n < 45:
 		w.write()
-	case n < 80:
+	case n < 78:
 		w.seal()
-	case n < 88:
+	case n < 86:
 		// A sweep that cannot delete still exercises the read side: it
 		// resolves every manifest of every ref and tag, which is the thing
 		// that breaks when a segment is swept out from under a generation.
 		w.gc(w.clock, false)
-	case n < 96:
+	case n < 92:
 		w.seal()
 		w.repack()
+	case n < 96:
+		w.autoMaintain()
 	default:
 		w.gc(w.clock.Add(aged), true)
 	}
@@ -843,6 +864,118 @@ func TestACrashLeavesOrphansAndNeverADanglingReference(t *testing.T) {
 						"grace window did not collect it", name)
 				}
 			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------
+// INVARIANT 6
+// ---------------------------------------------------------------------
+
+// INVARIANT: a mount that collects on its own frees what its repacks
+// condemned, and never a moment early.
+//
+// This is the interleaving the automatic sweep introduced. A repack
+// followed IMMEDIATELY by a deletion pass is a new adjacency in this
+// system: every other sweep in this file either cannot delete or runs on a
+// far-future clock, and both of those are asking a different question. Here
+// the sweep runs seconds after the repack, at the same clock, with the
+// grace window wide open on everything the repack touched and the retain
+// window still covering the generation it grew from — which is exactly the
+// moment at which a sweep that had its windows even slightly wrong would
+// take a pack out from under a live reader.
+//
+// The property has two halves and needs both, because either alone is easy
+// to satisfy by doing nothing:
+//
+//   - EARLY: while the windows hold, the auto sweep frees none of what the
+//     repack condemned.
+//   - EVENTUALLY: once the clock has passed the grace window and the branch
+//     has sealed the retain window forward, the same auto sweep — not a
+//     hand-run one, not a far-future one — collects them.
+//
+// A sweep that never deleted anything would pass the first and fail the
+// second; a sweep that ignored its windows would pass the second and fail
+// the first.
+func TestAutoCollectionFreesWhatItsRepackCondemnedAndNotBefore(t *testing.T) {
+	for _, seed := range seeds(t) {
+		t.Run(fmt.Sprintf("seed-%x", seed), func(t *testing.T) {
+			w := newWorld(t, seed, "66666666-0000-0000-0000-000000000006")
+			// Content that mostly dies, so a repack has something to condemn.
+			for range 3 {
+				w.write()
+			}
+			w.seal()
+			for range 8 {
+				w.step()
+			}
+			for range 3 {
+				w.write()
+			}
+			w.seal()
+
+			// Age the volume before repacking, which is what makes the EARLY
+			// half of this property mean anything. A repack only ever
+			// condemns packs already older than the grace window, so in a
+			// real deployment the packs it drops are past the age guard by
+			// the time the sweep that follows it runs — and what stands
+			// between them and that sweep is the retain window and the
+			// condemned ledger, not their youth. Without this the fixture
+			// tests the age guard and nothing else (checked: removing the
+			// ledger from retention leaves it passing).
+			w.advance(retention.DefaultGrace + time.Hour)
+
+			// One repack whose condemnations we can name, followed by the
+			// mount's own sweep at the same clock.
+			before := w.packSet(w.head().Superblock)
+			res := w.repack()
+			if len(res.CondemnedPacks) == 0 {
+				w.fatalf("fixture: the repack condemned nothing, so there is nothing to collect")
+			}
+			condemned := append([]string{}, res.CondemnedPacks...)
+			w.gc(w.clock, true)
+			w.count("auto-maintain")
+
+			for _, name := range condemned {
+				if !objectExists(w, packstore.PackDirKey+"/"+name) {
+					w.fatalf("the sweep that follows a repack collected %s immediately. The pack is old by "+
+						"its own name and the head has stopped naming it, so the only things speaking for "+
+						"it are the retain window and the condemned ledger — and a reader still on the "+
+						"pre-repack generation is reading it right now", name)
+				}
+				if before[name] != true {
+					w.fatalf("fixture: %s was not in the pre-repack pack set", name)
+				}
+			}
+			// And the generations that can still be read, still read.
+			w.pinned = append(w.pinned, w.retained()...)
+			for _, p := range w.pinned {
+				w.reads(p.sb, p.want, p.label+" after an automatic collection")
+			}
+
+			// Now let the volume age the way a real one does: past the grace
+			// window, and far enough forward that the retain window no longer
+			// covers the generations that named those packs.
+			w.advance(retention.DefaultGrace + time.Hour)
+			for range int(w.head().Superblock.Params.RetainK) + 1 {
+				w.write()
+				w.seal()
+			}
+			// The SAME automatic op, on the volume's own clock. Nothing here
+			// is a far-future sweep or an operator with a --retain-k flag.
+			w.autoMaintain()
+
+			for _, name := range condemned {
+				if objectExists(w, packstore.PackDirKey+"/"+name) {
+					w.fatalf("%s was condemned, has aged past the grace window, is named by no generation "+
+						"in the retain window, and the mount's own sweep still has not collected it; this "+
+						"is the volume that grows forever", name)
+				}
+			}
+			if w.ran("gc-collected") == 0 {
+				w.fatalf("no sweep in this sequence deleted anything")
+			}
+			w.mustHaveRun(map[string]int{"auto-maintain": 2, "repack": 2, "gc-delete": 2, "seal": 4})
 		})
 	}
 }

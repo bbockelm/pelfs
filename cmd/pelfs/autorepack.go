@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/bbockelm/pelfs/internal/repack"
+	"github.com/bbockelm/pelfs/internal/retention"
+	"github.com/bbockelm/pelfs/internal/stats"
 	"github.com/bbockelm/pelfs/internal/ui"
 )
 
@@ -35,6 +37,27 @@ import (
 // The packs it was reading are still there for the grace window, so even
 // its open reads are undisturbed.
 
+// AND THE COLLECTION, which is the half that was missing.
+//
+// A repack CONDEMNS; it never deletes. Retention's sweep is what removes
+// the objects, and until now the only thing that ran it was a person typing
+// `pelfs gc --delete`. So the volume that repacked itself faithfully every
+// six hours still grew forever, and "a volume nobody runs gc on grows
+// without bound" stayed true for exactly the half that frees bytes.
+//
+// The sweep belongs in the same idle machinery for the same two reasons the
+// repack does — the mount is holding the lease and knows when the volume is
+// quiet — plus a third: a repack is precisely the event that CREATES work
+// for a sweep, so the two want to run in that order, and only one of them
+// knows when the other finished.
+//
+// What makes it safe to automate is that nothing about the sweep changes.
+// It is retention.GC, the same call the command makes, with the same
+// windows (grace, retain-K, the condemned ledgers) and the same fail-closed
+// rule: a ref that will not verify aborts the whole run and deletes
+// nothing. There is no second deletion path in this file to keep in
+// agreement with the first.
+
 const (
 	// autoRepackCheck is how often the cheap gate is consulted. It reads
 	// the head this session already holds, so the cost is a comparison.
@@ -44,17 +67,38 @@ const (
 	// and uploading; starting one during a pause between two files would
 	// be the background work users learn to disable.
 	autoRepackQuiet = 5 * time.Minute
+	// autoCollectInterval is the floor between sweeps that no repack asked
+	// for.
+	//
+	// A sweep has no cheap gate the way a repack does (repack.Worthwhile
+	// reads the head; "is there garbage" is a listing of the whole pack key
+	// space plus every ref, every tag and the retain window's backups), so
+	// the floor IS the policy. Six hours matches the repack floor, which is
+	// the cadence the pair was reasoned about together: a volume that is
+	// quiet enough to sweep is quiet enough to have been swept recently.
+	autoCollectInterval = 6 * time.Hour
 )
 
-// autoRepackPeriodically repacks when the mount is quiet and the branch
-// has drifted far enough to be worth sweeping.
+// maintainPeriodically repacks when the mount is quiet and the branch has
+// drifted far enough to be worth sweeping, and collects what earlier
+// repacks condemned.
 //
-// Failures are logged and dropped, exactly as a periodic checkpoint's
-// are. Nothing here is load-bearing: a repack that does not happen costs
-// storage, and storage is the thing this is trying to save. Tearing down
-// a mount over it would be a strictly worse trade.
-func (g *genSession) autoRepackPeriodically(ctx context.Context, policy repack.AutoPolicy) {
+// collect is `--no-auto-gc` inverted. It is separate from the repack half
+// because the two have different failure modes — a repack that does not run
+// costs storage, a sweep that runs wrongly costs data — and an operator who
+// wants the second one off should not have to turn the first one off too.
+//
+// Failures are logged and dropped, exactly as a periodic checkpoint's are.
+// Nothing here is load-bearing: maintenance that does not happen costs
+// storage, and storage is what this is trying to save. Tearing down a mount
+// over it would be a strictly worse trade.
+func (g *genSession) maintainPeriodically(ctx context.Context, policy repack.AutoPolicy, collect bool) {
 	if !g.rw {
+		// Writable mounts only, and it is the lease that decides it rather
+		// than tidiness: this deletes objects, and the session that holds
+		// the branch's write lease is the one that knows no other writer is
+		// mid-publish. A read-only mount is also, usually, one of MANY on a
+		// volume — a sweep per reader would be the same work N times.
 		return
 	}
 	t := time.NewTicker(autoRepackCheck)
@@ -79,11 +123,26 @@ func (g *genSession) autoRepackPeriodically(ctx context.Context, policy repack.A
 		if time.Since(quietSince) < autoRepackQuiet {
 			continue
 		}
-		if err := g.autoRepackOnce(ctx, policy); err != nil {
+		repacked, err := g.autoRepackOnce(ctx, policy)
+		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
 			ui.Warn("automatic repack did not run ({error}); it will be tried again", "error", err)
+		}
+		// The sweep follows a repack that published — that repack is what
+		// created the work — and otherwise runs on its own floor, because a
+		// volume also accumulates garbage no repack was involved in: an
+		// aborted publish's packs, a deleted tag's closure, the previous
+		// repack's condemnations now past their window.
+		if g.shouldCollect(collect, repacked, policy) {
+			if err := g.autoCollectOnce(ctx, policy); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				ui.Warn("automatic collection did not run ({error}); nothing was deleted, and it will be "+
+					"tried again", "error", err)
+			}
 		}
 		// Whether it ran, refused or failed, the volume has been looked
 		// at: start the quiet window over so a failure cannot spin.
@@ -91,18 +150,145 @@ func (g *genSession) autoRepackPeriodically(ctx context.Context, policy repack.A
 	}
 }
 
+// shouldCollect is the loop's decision, and it is a function rather than an
+// expression inside the loop so that it can be checked without driving a
+// ticker for six hours. The three inputs are the three reasons a sweep runs
+// or does not: the operator's switch, a repack that has just created work,
+// and the floor.
+func (g *genSession) shouldCollect(collect, repacked bool, policy repack.AutoPolicy) bool {
+	if !collect {
+		// --no-auto-gc, and it wins over everything including a repack that
+		// just condemned: an operator who turned the deletions off did not
+		// ask for them back the moment maintenance found something.
+		return false
+	}
+	// A repack that published overrides the floor. It is the event that
+	// CREATED the collectable objects, and making the volume wait six hours
+	// to act on its own work would be a floor protecting nothing — the
+	// expensive part (the sweep behind the repack) has just been paid.
+	return repacked || g.collectDue(policy)
+}
+
+// collectDue reports whether the sweep floor has passed. The first check of
+// a session is due: a mount that has just started is the best evidence
+// available that nobody has swept this volume lately, since the sweep is
+// something only a mount does.
+func (g *genSession) collectDue(policy repack.AutoPolicy) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.lastCollect.IsZero() {
+		return true
+	}
+	return maintNow(policy).Sub(g.lastCollect) >= autoCollectInterval
+}
+
+// maintNow is the clock the maintenance paths run on. It is the repack
+// policy's, so that a test driving one of these forward drives both and
+// cannot end up with a repack in the future and a sweep in the present.
+func maintNow(policy repack.AutoPolicy) time.Time {
+	if policy.Now.IsZero() {
+		return time.Now()
+	}
+	return policy.Now
+}
+
+// autoCollectOnce runs ONE sweep, with deletion, and says what it freed.
+//
+// It is deliberately a thin wrapper. Every window is retention's — the
+// grace window the volume RECORDS, the retain-K generations reconstructed
+// from superblock backups, the three condemned ledgers — and every guard is
+// retention's too, including the one that matters most: a ref or tag that
+// cannot be fetched and verified aborts the run and deletes NOTHING. This
+// function adds no policy of its own, and that is the point. The most
+// dangerous code in the repo should have exactly one implementation, and
+// automating it must not become a second.
+func (g *genSession) autoCollectOnce(ctx context.Context, policy repack.AutoPolicy) error {
+	// One clock for the run: the sweep's windows and the timestamp this
+	// records have to be the same instant, or a test that moves the clock
+	// gets a sweep in the future recorded in the present.
+	now := maintNow(policy)
+	// The counted transport, so what a background sweep deletes appears in
+	// the session's object-store statistics like everything else.
+	rep, err := retention.GC(ctx, retention.Options{
+		Inner:  g.inner,
+		Refs:   g.refs,
+		Delete: true,
+		Now:    now,
+	})
+	if err != nil {
+		g.recordCollect(now, nil, err)
+		return err
+	}
+	freedObjects := int64(rep.Deleted + rep.Indexes.Deleted + rep.Manifests.Deleted)
+	g.recordCollect(now, rep, nil)
+	if freedObjects == 0 {
+		// Said at debug rather than info: on a healthy volume this is the
+		// answer most of the time, and a line every six hours saying
+		// nothing happened is a line people filter out.
+		ui.Debug("automatic collection found nothing to reclaim ({packs} packs scanned, grace window {grace})",
+			"packs", rep.ScannedPacks, "grace", rep.Grace)
+		return nil
+	}
+	ui.Info("collected {objects} unreferenced object(s), reclaiming {bytes} ({packs} packs, {indexes} "+
+		"indexes, {manifests} manifests; grace window {grace})",
+		"objects", freedObjects, "bytes", ui.ByteCount(reclaimedBytes(rep)),
+		"packs", rep.Deleted, "indexes", rep.Indexes.Deleted, "manifests", rep.Manifests.Deleted,
+		"grace", rep.Grace)
+	return nil
+}
+
+// reclaimedBytes is what a completed sweep freed. The candidate bytes ARE
+// the deleted bytes on a run that finished: finish() counts a candidate and
+// then deletes it, and a failure returns the error this only reads past.
+func reclaimedBytes(rep *retention.Report) int64 {
+	return rep.CandidateBytes + rep.Indexes.CandidateBytes + rep.Manifests.CandidateBytes
+}
+
+// recordCollect publishes the outcome where an operator can see it: when
+// the volume last collected, and what it got back.
+//
+// This is the F5/F6 shape — a timestamp and a counter rather than a log
+// line — because the question it answers is asked LONG after the event ("is
+// this volume being maintained at all?"), and a log line that has rotated
+// away cannot answer it. A failure is recorded too, with its message: a
+// sweep that fails closed every time is a volume quietly growing, and it
+// would otherwise look identical to a volume with nothing to collect.
+func (g *genSession) recordCollect(at time.Time, rep *retention.Report, err error) {
+	g.mu.Lock()
+	g.lastCollect = at
+	g.mu.Unlock()
+	g.stats.Update(func(sum *stats.Summary) {
+		if sum.Maintenance == nil {
+			sum.Maintenance = &stats.MaintenanceStats{}
+		}
+		m := sum.Maintenance
+		if err != nil {
+			m.CollectionFailures++
+			m.LastCollectionError = err.Error()
+			return
+		}
+		m.Collections++
+		m.LastCollectAt = at
+		m.ReclaimedObjects += int64(rep.Deleted + rep.Indexes.Deleted + rep.Manifests.Deleted)
+		m.ReclaimedBytes += reclaimedBytes(rep)
+		m.GraceSeconds = int64(rep.Grace / time.Second)
+	})
+}
+
 // autoRepackOnce consults the cheap gate and, if it passes, runs one
-// repack.
-func (g *genSession) autoRepackOnce(ctx context.Context, policy repack.AutoPolicy) error {
+// repack. It reports whether a repack actually PUBLISHED, which is what
+// tells the caller a sweep now has something to collect: a run that was
+// gated out, refused, or found nothing has created no work.
+func (g *genSession) autoRepackOnce(ctx context.Context, policy repack.AutoPolicy) (bool, error) {
 	g.mu.Lock()
 	head := g.sb
 	busy := g.spent || g.ov == nil
 	g.mu.Unlock()
 	if busy {
-		return nil
+		return false, nil
 	}
 	if worth, _ := repack.Worthwhile(head, policy); !worth {
-		return nil
+		return false, nil
 	}
 	// Claimed for the length of the operation so the periodic checkpoint
 	// stands aside (checkpointPeriodically). Deliberately a FLAG and not a
@@ -112,7 +298,7 @@ func (g *genSession) autoRepackOnce(ctx context.Context, policy repack.AutoPolic
 	g.mu.Lock()
 	if g.repacking {
 		g.mu.Unlock()
-		return nil
+		return false, nil
 	}
 	g.repacking = true
 	g.mu.Unlock()
@@ -127,11 +313,11 @@ func (g *genSession) autoRepackOnce(ctx context.Context, policy repack.AutoPolic
 	// repack that swept on this branch alone would condemn it.
 	live, _, err := liveGenerations(ctx, g.inner, g.refs, g.branch)
 	if err != nil {
-		return err
+		return false, err
 	}
 	key, err := loadOrCreateSigningKey(g.signingKeyFile(), head)
 	if err != nil {
-		return err
+		return false, err
 	}
 	ui.Info("repacking in the background: the mount has been idle and the branch has drifted since the last one")
 	res, err := repack.Execute(ctx, repack.ExecOptions{
@@ -149,21 +335,42 @@ func (g *genSession) autoRepackOnce(ctx context.Context, policy repack.AutoPolic
 		SpoolDir:   filepath.Join(g.stateDir, "repack"),
 	})
 	if err != nil {
-		return err
+		return false, err
 	}
 	if res.Plan.Refused() {
 		ui.Warn("automatic repack could not measure the volume: {reason}", "reason", res.Plan.Refusal)
-		return nil
+		return false, nil
 	}
 	if res.Plan.Empty() {
 		ui.Info("automatic repack found nothing worth rewriting; {packs} packs, {live} live",
 			"packs", res.Plan.ScannedPacks, "live", ui.Percent(liveFraction(res.Plan.LiveBytes, res.Plan.Bytes)))
-		return nil
+		return false, nil
 	}
 	ui.Info("repacked {condemned} packs into {written}, reclaiming {bytes} at generation {generation}",
 		"condemned", len(res.CondemnedPacks), "written", len(res.NewPacks),
 		"bytes", ui.ByteCount(res.ReclaimedBytes), "generation", res.Generation)
-	return g.followRepack(ctx)
+	g.recordRepack(maintNow(policy), res.ReclaimedBytes)
+	return true, g.followRepack(ctx)
+}
+
+// recordRepack is recordCollect for the other half: when this volume last
+// repacked, and what that repack condemned. The two together are what an
+// operator reads to answer "is this volume maintaining itself" without
+// having to already know which of the two steps stopped.
+//
+// Reclaimed bytes here are what the repack CONDEMNED less what it wrote —
+// bytes that become free once the sweep collects them, not bytes that are
+// free now. The statistics document names the two fields differently for
+// that reason.
+func (g *genSession) recordRepack(at time.Time, condemnedBytes int64) {
+	g.stats.Update(func(sum *stats.Summary) {
+		if sum.Maintenance == nil {
+			sum.Maintenance = &stats.MaintenanceStats{}
+		}
+		sum.Maintenance.Repacks++
+		sum.Maintenance.LastRepackAt = at
+		sum.Maintenance.CondemnedBytes += condemnedBytes
+	})
 }
 
 // followRepack moves this session onto the generation the repack

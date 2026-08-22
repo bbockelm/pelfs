@@ -197,6 +197,41 @@
   a repack rewrites the manifest whole, so its segments are already
   condemned together.
 
+- **A writable mount collects, not just condemns.** Auto-repack shipped in
+  v0.1.0 and nothing ever COLLECTED: a repack condemns packs, retention's
+  sweep is what deletes them, and the only thing that ran the sweep was a
+  person typing `pelfs gc --delete`. So the volume that repacked itself
+  faithfully every six hours still grew forever, and both halves of the
+  v0.1.0 limitation ("a volume nobody runs gc on grows without bound", "a
+  volume nobody mounts is never maintained") stayed true for the half that
+  frees bytes.
+
+  The sweep now runs in the same idle machinery, under the same quiescence
+  and back-off rules: after a repack that published — that repack is what
+  created the work — and otherwise every six hours while the mount is
+  quiet. Default ON, `--no-auto-gc` to turn it off, separately from
+  `--no-auto-repack` because the two fail differently (a repack that does
+  not run costs storage; a sweep deletes).
+
+  **It is the existing sweep, not a new one.** `retention.GC` with
+  `Delete`, every window intact — the grace window the volume records, the
+  retain-K generations, the three condemned ledgers — and the same
+  fail-closed rule: a ref or tag that will not verify aborts the run and
+  deletes NOTHING. There is deliberately no second deletion path in the
+  mount to keep in agreement with the first.
+
+  What it freed is visible where it can still be read months later, not
+  only in a log: `pelfs ctl <mount> status` gains `last_gc_at`,
+  `last_repack_at`, `reclaimed_bytes` and `reclaimed_objects`, and the
+  statistics file gains a `maintenance` section carrying those plus the
+  grace window the last sweep applied and the count of sweeps that FAILED
+  closed — because a sweep that fails every time looks exactly like a
+  volume with nothing to collect.
+
+  Unchanged, and still the honest limit: **a volume nobody mounts writably
+  is never maintained.** Maintenance rides the mount because that is what
+  holds the branch's write lease and knows when the volume is idle.
+
 ## v0.1.0 — first release
 
 `pelfs` mounts a POSIX filesystem whose data lives in a

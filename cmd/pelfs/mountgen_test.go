@@ -1239,7 +1239,7 @@ func TestAutoRepackRunsUnderALiveMountAndTheSessionFollows(t *testing.T) {
 
 	// Packs: 1 forces the cheap gate open; the clock is moved past the
 	// grace window, which no real deployment can do and every test must.
-	err := g.autoRepackOnce(ctx, repack.AutoPolicy{Packs: 1, Now: time.Now().Add(200 * time.Hour)})
+	_, err := g.autoRepackOnce(ctx, repack.AutoPolicy{Packs: 1, Now: time.Now().Add(200 * time.Hour)})
 	if err != nil {
 		t.Fatalf("autoRepackOnce: %v", err)
 	}
@@ -1293,7 +1293,7 @@ func TestAutoRepackDoesNothingOnASmallVolume(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := g.sb.Generation
-	if err := g.autoRepackOnce(ctx, repack.AutoPolicy{}); err != nil {
+	if _, err := g.autoRepackOnce(ctx, repack.AutoPolicy{}); err != nil {
 		t.Fatalf("autoRepackOnce: %v", err)
 	}
 	if g.sb.Generation != before {
@@ -1467,7 +1467,7 @@ func TestAutoRepackDoesNotRunTwiceAtOnce(t *testing.T) {
 	g.mu.Unlock()
 	// Thresholds that would certainly trigger, so only the in-flight guard
 	// can be what stops it.
-	if err := g.autoRepackOnce(ctx, repack.AutoPolicy{Packs: 1, Now: time.Now().Add(200 * time.Hour)}); err != nil {
+	if _, err := g.autoRepackOnce(ctx, repack.AutoPolicy{Packs: 1, Now: time.Now().Add(200 * time.Hour)}); err != nil {
 		t.Fatalf("autoRepackOnce: %v", err)
 	}
 	if g.sb.Generation != before {

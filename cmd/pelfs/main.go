@@ -145,6 +145,7 @@ type cmdOpts struct {
 	statsFile         string
 	cacheSize         string
 	noAutoRepack      bool
+	noAutoGC          bool
 }
 
 func registerFlags(fs *flag.FlagSet, o *cmdOpts) {
@@ -184,6 +185,14 @@ func registerFlags(fs *flag.FlagSet, o *cmdOpts) {
 	fs.StringVar(&o.statsFile, "stats-file", "", "write a JSON session-statistics summary to this path (default: <state-dir>/pelfs-stats.json)")
 	fs.StringVar(&o.cacheSize, "cache-size", "", "byte budget for the local cache of packs, decoded chunks, catalogs and trailers (e.g. 8G); default 4G")
 	fs.BoolVar(&o.noAutoRepack, "no-auto-repack", false, "do not repack in the background when the mount is idle and the branch has drifted")
+	// Separate from --no-auto-repack because the two halves fail
+	// differently: a repack that does not run costs storage, while a sweep
+	// DELETES, so an operator who wants to hold the deletions back should
+	// not have to give up the condemning as well. (And turning the repack
+	// off leaves the sweep running, which is equally right: garbage no
+	// repack was involved in -- an aborted publish, a deleted tag's closure
+	// -- is still collectable.)
+	fs.BoolVar(&o.noAutoGC, "no-auto-gc", false, "do not collect unreferenced objects in the background when the mount is idle (the sweep is `pelfs gc --delete`, with the same grace and retain-K windows and the same fail-closed rule)")
 }
 
 func parseArgs(name string, args []string, minPos, maxPos int, extra func(*flag.FlagSet, *cmdOpts)) (*cmdOpts, []string, error) {

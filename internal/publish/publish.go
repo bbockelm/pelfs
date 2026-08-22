@@ -1471,10 +1471,22 @@ func (p *pipeline) buildSuperblock(packList []superblock.PackEntry, shards []sup
 	// max-inode-seen covers only sources that keep none (Source.NextInode
 	// reports 0). Never regress below the previous generation's
 	// (crash-burned numbers stay burned).
-	nextInode := p.maxInode + 1
-	if v := p.src.NextInode(); v > nextInode {
-		nextInode = v
+	// The allocator mark. Normally inferred from the tree — max inode
+	// seen, plus whatever counter the source keeps — but a source that
+	// assembled its tree from elsewhere knows better than the inference
+	// can (InodeMarker), because the tree then holds inodes from another
+	// lineage entirely.
+	var nextInode uint64
+	if m, ok := p.src.(InodeMarker); ok {
+		nextInode = m.InodeMark()
+	} else {
+		nextInode = p.maxInode + 1
+		if v := p.src.NextInode(); v > nextInode {
+			nextInode = v
+		}
 	}
+	// Floored at the predecessor's either way: a branch may never reuse a
+	// number it has already handed out.
 	if p.o.Prev != nil && p.o.Prev.NextInode > nextInode {
 		nextInode = p.o.Prev.NextInode
 	}

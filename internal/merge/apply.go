@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/bbockelm/pelfs/internal/catalog"
 	"github.com/bbockelm/pelfs/internal/genfs"
 	"github.com/bbockelm/pelfs/internal/manifest"
 	"github.com/bbockelm/pelfs/internal/packstore"
@@ -60,6 +61,14 @@ func Apply(ctx context.Context, o ApplyOptions) (*publish.Result, error) {
 		return nil, fmt.Errorf("merge: not mergeable (%d conflicts, %d inode collisions)",
 			len(o.Plan.Conflicts), len(o.Plan.Collisions))
 	}
+	if o.Plan.policy == KeepBoth && o.TheirBranch == "" {
+		// The branch names the kept copies, and a plan that reported
+		// "notes (from dev).txt" must not produce "notes (from
+		// theirs).txt". Refused rather than defaulted, because the plan
+		// already told a user a filename.
+		return nil, errors.New("merge: TheirBranch is required when conflicts are kept, " +
+			"or the kept copies get names the plan did not report")
+	}
 	if o.Plan.FastForward {
 		return nil, errors.New("merge: this is a fast-forward; FastForward publishes it without building a tree")
 	}
@@ -95,10 +104,17 @@ func Apply(ctx context.Context, o ApplyOptions) (*publish.Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	branch := o.TheirBranch
+	if branch == "" {
+		branch = "theirs"
+	}
 	src := &mergeSource{
 		t: trees, ours: o.Ours, theirs: o.Theirs, theirPacks: packs,
+		policy: o.Plan.policy, theirBranch: branch,
 		dirs:       map[uint64]triple{rootInode: {base: rootInode, ours: rootInode, theirs: rootInode}},
 		fromTheirs: map[uint64]bool{},
+		copies:     map[uint64]uint64{},
+		nextInode:  o.Ours.NextInode,
 	}
 	res, err := publish.Publish(ctx, publish.Options{
 		Source: src, Inner: o.Inner, SpoolDir: o.SpoolDir,
@@ -134,13 +150,30 @@ type mergeSource struct {
 	ours, theirs *superblock.Superblock
 	theirPacks   []packstore.SealedPack
 
+	policy      Policy
+	theirBranch string
+
 	dirs       map[uint64]triple
 	fromTheirs map[uint64]bool
+	// copies maps a FRESH inode, allocated for a kept conflicting copy, to
+	// the inode on theirs' side holding its data.
+	//
+	// A fresh number is required rather than tidy. A file that predates the
+	// fork has the same inode on both sides, so writing theirs' version
+	// beside ours under that same number would give one inode two names
+	// with two contents — which is a hard link, and a hard link is one
+	// file. The copy has to be a new inode or it is not a copy.
+	copies map[uint64]uint64
+	// nextInode allocates those, from OUR lineage: the merged generation
+	// is published on our branch, so a number it hands out has to come
+	// from the range our branch owns.
+	nextInode uint64
 }
 
 var (
 	_ publish.Source          = (*mergeSource)(nil)
 	_ publish.ContentProvider = (*mergeSource)(nil)
+	_ publish.InodeMarker     = (*mergeSource)(nil)
 )
 
 func (m *mergeSource) Root() uint64 { return rootInode }
@@ -149,6 +182,17 @@ func (m *mergeSource) Root() uint64 { return rootInode }
 // never drawing from the same range: this branch keeps allocating from its
 // own, the incoming tree keeps the numbers it has, and nothing collides.
 func (m *mergeSource) NextInode() uint64 { return m.ours.NextInode }
+
+// InodeMark says the same thing AUTHORITATIVELY, and it has to, because
+// NextInode alone cannot lower publish's inference.
+//
+// Publish otherwise records max-inode-seen plus one, and the merged tree
+// contains the other branch's inodes — a higher lineage. That would leave
+// this branch allocating inside the other branch's range, whose next
+// allocation is in the same neighbourhood: the two would collide on the
+// next file each created, undoing the whole point of per-branch lineages.
+// A test asserts the merged generation's mark is still in our lineage.
+func (m *mergeSource) InodeMark() uint64 { return m.nextInode }
 
 func (m *mergeSource) Readdir(ctx context.Context, ino uint64) ([]publish.SrcEntry, error) {
 	tr, ok := m.dirs[ino]
@@ -179,17 +223,23 @@ func (m *mergeSource) Readdir(ctx context.Context, ino uint64) ([]publish.SrcEnt
 		te, inTheirs := theirs[name]
 		switch out2, _, detail := decide(ctx, m.t, b, inBase, oe, inOurs, te, inTheirs); out2 {
 		case Drop:
-		case Conflicted:
-			// Compute refused this plan already, so a conflict here is a
-			// disagreement between the plan and the tree — the tree moved,
-			// or the two walks saw different things. Either way, not
-			// something to resolve silently.
-			return nil, fmt.Errorf("merge: %s conflicts during apply (%s); re-plan", name, detail)
 		case Descend:
 			child, tri := m.mergedDir(b, inBase, oe, inOurs, te, inTheirs)
 			child.Name = name
 			m.dirs[child.Node.Inode] = tri
 			out = append(out, child)
+		case Conflicted:
+			// Compute refused this plan unless the policy keeps both, so
+			// reaching here with Refuse means the plan and the tree
+			// disagree — the tree moved under it.
+			if m.policy != KeepBoth {
+				return nil, fmt.Errorf("merge: %s conflicts during apply (%s); re-plan", name, detail)
+			}
+			kept, ok := m.keepBoth(name, oe, inOurs, te, inTheirs)
+			if !ok {
+				return nil, fmt.Errorf("merge: %s conflicts and cannot be kept as two files (%s)", name, detail)
+			}
+			out = append(out, srcEntry(name, oe), kept)
 		case TakeTheirs:
 			m.fromTheirs[te.Node.Inode] = true
 			out = append(out, srcEntry(name, te))
@@ -198,6 +248,23 @@ func (m *mergeSource) Readdir(ctx context.Context, ino uint64) ([]publish.SrcEnt
 		}
 	}
 	return out, nil
+}
+
+// keepBoth emits theirs' version beside ours, under a suffixed name and a
+// fresh inode.
+func (m *mergeSource) keepBoth(name string, oe entry, inOurs bool, te entry, inTheirs bool) (publish.SrcEntry, bool) {
+	if !inOurs || !inTheirs ||
+		oe.Node.Type == catalog.TypeDir || te.Node.Type == catalog.TypeDir {
+		return publish.SrcEntry{}, false
+	}
+	ino := m.nextInode
+	m.nextInode++
+	m.copies[ino] = te.Node.Inode
+	node := te.Node
+	node.Inode = ino
+	// A kept copy is its own file, so it is never a link to anything.
+	node.Nlink = 1
+	return publish.SrcEntry{Name: ConflictName(name, m.theirBranch), Node: srcNode(node)}, true
 }
 
 // mergedDir picks the inode a directory present on one or both sides gets
@@ -235,6 +302,9 @@ func srcNode(n genfs.Node) publish.SrcNode {
 // merge took it from theirs, and otherwise ours — falling back to theirs
 // for an inode ours does not have at all.
 func (m *mergeSource) treeFor(ino uint64) *genfs.FS {
+	if _, ok := m.copies[ino]; ok {
+		return m.t.theirs
+	}
 	if m.fromTheirs[ino] {
 		return m.t.theirs
 	}
@@ -244,8 +314,17 @@ func (m *mergeSource) treeFor(ino uint64) *genfs.FS {
 	return m.t.ours
 }
 
+// dataInode is where an inode's bytes and attributes come from: itself,
+// or the inode it was copied from.
+func (m *mergeSource) dataInode(ino uint64) uint64 {
+	if from, ok := m.copies[ino]; ok {
+		return from
+	}
+	return ino
+}
+
 func (m *mergeSource) Stat(ctx context.Context, ino uint64) (publish.SrcNode, error) {
-	n, err := m.treeFor(ino).GetAttr(ctx, ino)
+	n, err := m.treeFor(ino).GetAttr(ctx, m.dataInode(ino))
 	if err != nil {
 		return publish.SrcNode{}, err
 	}
@@ -253,11 +332,11 @@ func (m *mergeSource) Stat(ctx context.Context, ino uint64) (publish.SrcNode, er
 }
 
 func (m *mergeSource) Readlink(ctx context.Context, ino uint64) (string, error) {
-	return m.treeFor(ino).Readlink(ctx, ino)
+	return m.treeFor(ino).Readlink(ctx, m.dataInode(ino))
 }
 
 func (m *mergeSource) Xattrs(ctx context.Context, ino uint64) (map[string][]byte, error) {
-	fs := m.treeFor(ino)
+	fs, ino := m.treeFor(ino), m.dataInode(ino)
 	names, err := fs.ListXattr(ctx, ino)
 	if err != nil || len(names) == 0 {
 		return nil, err
@@ -282,7 +361,7 @@ func (m *mergeSource) Open(context.Context, uint64, int64) (io.ReadCloser, error
 }
 
 func (m *mergeSource) ProvidedContent(ctx context.Context, ino uint64) (genfs.Content, bool, error) {
-	c, err := m.treeFor(ino).ContentOf(ctx, ino)
+	c, err := m.treeFor(ino).ContentOf(ctx, m.dataInode(ino))
 	if err != nil {
 		return genfs.Content{}, false, err
 	}

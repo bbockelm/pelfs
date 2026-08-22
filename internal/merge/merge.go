@@ -47,6 +47,7 @@ import (
 	"fmt"
 	"path"
 	"sort"
+	"strings"
 
 	"github.com/bbockelm/pelfs/internal/catalog"
 	"github.com/bbockelm/pelfs/internal/genfs"
@@ -72,6 +73,13 @@ type Options struct {
 	DEK []byte
 	// CacheDir holds the three generations' local caches (empty: temp).
 	CacheDir string
+	// OnConflict is what to do with a path neither tree can resolve
+	// (default Refuse). KeepBoth writes both versions and reports what it
+	// named them, so a dry run says exactly what would appear in the tree.
+	OnConflict Policy
+	// TheirBranch names the incoming branch, used only to name kept
+	// copies. Empty takes "theirs".
+	TheirBranch string
 }
 
 // Kind names why a path could not be merged without a decision.
@@ -115,6 +123,15 @@ type Collision struct {
 	TheirsPath string
 }
 
+// Kept is one conflict resolved by writing both versions.
+type Kept struct {
+	// Path is where ours stays; As is where theirs was written.
+	Path, As string
+	Kind     Kind
+}
+
+func (k Kept) String() string { return k.Path + " -> also " + k.As + " (" + string(k.Kind) + ")" }
+
 // Plan is what a merge would do.
 type Plan struct {
 	// Refusal is set when the inputs could not be used at all; every
@@ -133,8 +150,13 @@ type Plan struct {
 	// content. Added counts paths that exist on neither side of the base.
 	Unchanged, TookOurs, TookTheirs int
 
-	// Conflicts are the paths a human has to resolve.
+	// Conflicts are the paths a human has to resolve. Empty under
+	// KeepBoth, where they become Kept instead.
 	Conflicts []Conflict
+	// Kept is what KeepBoth would write: one entry per conflict, naming
+	// the second copy. Reported so a plan says what will appear in the
+	// tree rather than only that something will.
+	Kept []Kept
 	// Collisions are inode numbers both sides allocated after the fork.
 	// A merge cannot proceed with any, and the repair is to renumber one
 	// side rather than to resolve them one at a time.
@@ -142,6 +164,11 @@ type Plan struct {
 	// FirstFreeInode is the number a renumbering would shift into: above
 	// everything either side has allocated.
 	FirstFreeInode uint64
+
+	// policy is what Compute was told to do with conflicts, carried so
+	// that Apply cannot act on a policy the plan was not made under —
+	// which would resolve paths the report said were refused.
+	policy Policy
 }
 
 // Mergeable reports whether the plan describes something that could be
@@ -186,7 +213,10 @@ func Compute(ctx context.Context, o Options) (*Plan, error) {
 	}
 	defer trees.close()
 
-	p := &Plan{FirstFreeInode: max(o.Ours.NextInode, o.Theirs.NextInode)}
+	if o.TheirBranch == "" {
+		o.TheirBranch = "theirs"
+	}
+	p := &Plan{FirstFreeInode: max(o.Ours.NextInode, o.Theirs.NextInode), policy: o.OnConflict}
 	w := &walker{o: o, t: trees, p: p, cut: cut,
 		ourInodes: map[uint64]string{}, theirInodes: map[uint64]string{}}
 	if err := w.dir(ctx, "/", rootInode, rootInode, rootInode); err != nil {
@@ -369,6 +399,15 @@ func (w *walker) dir(ctx context.Context, p string, baseIno, ourIno, theirIno ui
 				return err
 			}
 		case Conflicted:
+			if w.o.OnConflict == KeepBoth {
+				// Kept rather than refused: ours stays where it is and
+				// theirs is written beside it. A directory cannot be kept
+				// this way — see keepBoth — so that one is still a conflict.
+				if as, ok := w.keepBoth(child, name, ours, inOurs, theirs, inTheirs); ok {
+					w.p.Kept = append(w.p.Kept, Kept{Path: child, As: as, Kind: kind})
+					continue
+				}
+			}
 			w.conflict(child, kind, detail)
 		case Same:
 			w.p.Unchanged++
@@ -397,6 +436,33 @@ func inoOf(e entry, present bool) uint64 {
 		return 0
 	}
 	return e.Node.Inode
+}
+
+// keepBoth reports where theirs' copy would go, and whether the conflict
+// can be resolved that way at all.
+//
+// It cannot when either side lacks the path. A modify/delete has only one
+// version to keep, so writing "both" would mean resurrecting a file one
+// side deleted under a name nobody chose — a decision, not a rescue. And a
+// TYPE CHANGE where theirs is a directory would need a whole subtree
+// re-parented under a generated name, which is a large surprise to hand
+// someone who asked to keep a file.
+func (w *walker) keepBoth(path, name string, ours entry, inOurs bool, theirs entry, inTheirs bool) (string, bool) {
+	if !inOurs || !inTheirs {
+		return "", false
+	}
+	if theirs.Node.Type == catalog.TypeDir || ours.Node.Type == catalog.TypeDir {
+		return "", false
+	}
+	return pathJoin(path, ConflictName(name, w.o.TheirBranch)), true
+}
+
+// pathJoin replaces the last element of a path.
+func pathJoin(full, name string) string {
+	if i := strings.LastIndex(full, "/"); i >= 0 {
+		return full[:i+1] + name
+	}
+	return name
 }
 
 func (w *walker) conflict(p string, k Kind, detail string) {

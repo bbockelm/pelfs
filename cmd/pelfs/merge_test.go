@@ -88,6 +88,7 @@ func TestMergeReportsAConflictAndExitsNonzero(t *testing.T) {
 			t.Errorf("the report does not say %q:\n%s", want, out)
 		}
 	}
+	t.Logf("the report a user sees:\n%s", out)
 }
 
 // A branch that has not moved needs no merge, and saying so costs no
@@ -302,4 +303,46 @@ func TestMergeApplyRefusesADivergedTree(t *testing.T) {
 	if after := mustFetch(t, b.rstore, "main"); after.RootCatalog != moved.RootCatalog {
 		t.Error("the refused merge moved main anyway")
 	}
+}
+
+// --keep-both, through the command: a conflicted merge completes, both
+// versions are in the tree, and the report named the second one before it
+// was written.
+func TestMergeKeepBothResolvesAConflict(t *testing.T) {
+	b := newBranchVolume(t, 79)
+	b.write(t, "contested.bin")
+	b.seal(t)
+	if _, code := captureLog(t, func() int {
+		return cmdBranch([]string{"--state-dir", b.stateDir, b.prefix, "dev"})
+	}); code != 0 {
+		t.Fatal("branch failed")
+	}
+	b.want["contested.bin"] = nil
+	b.onBranch(t, "dev")
+	theirBody := b.write(t, "contested.bin")
+	b.seal(t)
+	b.onBranch(t, "main")
+	ourBody := b.write(t, "contested.bin")
+	b.seal(t)
+
+	// Refused without the flag, which is what makes the flag a choice.
+	if _, code := captureMerge(t, "--state-dir", b.stateDir, "--apply", b.prefix, "dev"); code == 0 {
+		t.Fatal("a conflicted merge applied without --keep-both")
+	}
+
+	out, code := captureMerge(t, "--state-dir", b.stateDir, "--apply", "--keep-both", b.prefix, "dev")
+	if code != 0 {
+		t.Fatalf("--keep-both exited %d:\n%s", code, out)
+	}
+	if !strings.Contains(out, "contested (from dev).bin") {
+		t.Errorf("the report does not name the kept copy:\n%s", out)
+	}
+	after := mustFetch(t, b.rstore, "main")
+	if err := coldRead(t, b.inner, after, map[string][]byte{
+		"contested.bin":            ourBody,
+		"contested (from dev).bin": theirBody,
+	}); err != nil {
+		t.Fatalf("the merged head does not serve both versions: %v", err)
+	}
+	t.Logf("\n%s", out)
 }

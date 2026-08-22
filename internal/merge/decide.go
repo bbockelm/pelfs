@@ -3,6 +3,7 @@ package merge
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/bbockelm/pelfs/internal/catalog"
 )
@@ -33,6 +34,49 @@ const (
 	// Descend means the answer is inside a directory rather than about it.
 	Descend
 )
+
+// Policy is what to do with a path neither tree can resolve.
+type Policy int
+
+const (
+	// Refuse reports conflicts and merges nothing. The default, because a
+	// merge is not a thing to half-do: a user who wanted both copies can
+	// ask, and one who did not would rather be told.
+	Refuse Policy = iota
+	// KeepBoth writes both versions — ours under its own name, theirs
+	// under a suffixed one — so a conflicted merge completes and loses
+	// nothing. Dropbox's answer, and it is the right shape for a
+	// FILESYSTEM: there is no place to put conflict markers in a byte
+	// stream that anything would still be able to read, so the two
+	// versions have to be two files.
+	//
+	// The cost is clutter, and it is real: nothing cleans these up, and a
+	// tool that walks the tree will see them. That is why it is opt-in.
+	KeepBoth
+)
+
+// ConflictName is where theirs' copy goes when a conflict is kept rather
+// than reported.
+//
+// The suffix goes BEFORE the extension, so that `report.tar.gz` stays a
+// `.gz` to everything that dispatches on one. Dropbox does the same, for
+// the same reason: a conflicted copy nothing can open is a conflicted copy
+// nobody can resolve.
+//
+// It names the branch rather than a timestamp. A timestamp says when the
+// clash was noticed, which nobody needs; the branch says whose version it
+// is, which is the question a user actually has.
+func ConflictName(name, branch string) string {
+	stem, ext := name, ""
+	// The LAST dot, not the first: `archive.tar.gz` should become
+	// `archive.tar (from dev).gz`, keeping the extension a reader
+	// dispatches on rather than inventing `archive (from dev).tar.gz`,
+	// which would be tidier and would move a name the tree may reference.
+	if i := strings.LastIndex(name, "."); i > 0 {
+		stem, ext = name[:i], name[i:]
+	}
+	return stem + " (from " + branch + ")" + ext
+}
 
 // decide resolves one name against the three trees.
 func decide(ctx context.Context, t *trees, b entry, inBase bool, ours entry, inOurs bool,

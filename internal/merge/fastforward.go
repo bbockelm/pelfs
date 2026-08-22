@@ -123,6 +123,9 @@ type ApplyOptions struct {
 	KeyID       int64
 	CacheDir    string
 	SpoolDir    string
+	// TheirBranch names the incoming branch, for naming kept conflicting
+	// copies. Empty takes "theirs".
+	TheirBranch string
 
 	// Plan is what Compute produced, and it is required: this package
 	// never decides and acts in one call, because the decision is the part

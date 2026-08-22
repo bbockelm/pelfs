@@ -117,6 +117,28 @@ type ContentProvider interface {
 	ProvidedEntries(fn func(identityHex, pack string))
 }
 
+// InodeMarker is the optional Source capability for a tree that contains
+// inodes the SOURCE DID NOT ALLOCATE.
+//
+// Without it, the allocator mark a generation records is max-inode-seen
+// plus one, which is right for every source that made its own tree and
+// wrong for one that assembled a tree from elsewhere. A merge is the case:
+// the merged tree holds the other branch's inodes, which come from that
+// branch's lineage — a different and higher range — so max-inode-seen
+// would put THIS branch's allocator inside the other branch's range.
+//
+// That is not cosmetic drift. The other branch's next allocation is in the
+// same neighbourhood, so the two branches would hand out adjacent numbers
+// from one range and collide on the next file each created, which is the
+// exact problem per-branch lineages exist to prevent.
+//
+// The mark is still floored at the previous generation's, because a branch
+// may never reuse a number it has already handed out. What this replaces
+// is only the inference from what the tree happens to contain.
+type InodeMarker interface {
+	InodeMark() uint64
+}
+
 // CatalogReuser is the optional Source capability that spares TRANSFORM
 // from rebuilding catalogs whose subtree did not change.
 //

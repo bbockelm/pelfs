@@ -28,10 +28,12 @@ import (
 // addressable, and is verified the same way.
 func cmdMerge(args []string) int {
 	var into, base, pubkeyHex, signingKey string
-	var apply bool
+	var apply, keepBoth bool
 	o, pos, err := parseArgs("merge", args, 2, 2, func(fs *flag.FlagSet, o *cmdOpts) {
-		fs.BoolVar(&apply, "apply", false, "carry the merge out (default: report only). "+
-			"Only a fast-forward can be applied yet")
+		fs.BoolVar(&apply, "apply", false, "carry the merge out (default: report only)")
+		fs.BoolVar(&keepBoth, "keep-both", false,
+			"resolve a conflicted file by keeping both versions: ours under its own name, theirs as "+
+				"`name (from <branch>).ext`. Nothing is lost, and nothing cleans the extra files up")
 		fs.StringVar(&signingKey, "signing-key", "", signingKeyUsage)
 		fs.StringVar(&into, "into", "main", "branch the other one would be merged INTO")
 		fs.StringVar(&base, "base", "", "branch or tag holding the generation the two were cut from "+
@@ -67,10 +69,15 @@ func cmdMerge(args []string) int {
 	if err != nil {
 		return exitErr(err)
 	}
+	policy := merge.Refuse
+	if keepBoth {
+		policy = merge.KeepBoth
+	}
 	plan, err := merge.Compute(ctx, merge.Options{
 		Inner: inner, Base: baseSB, BaseRaw: baseRaw,
 		Ours: ours.Superblock, Theirs: theirs.Superblock,
-		DEK: dek, CacheDir: stateDir + "/gencache",
+		DEK: dek, CacheDir: filepath.Join(stateDir, "gencache"),
+		OnConflict: policy, TheirBranch: source,
 	})
 	if err != nil {
 		return exitErr(err)
@@ -106,7 +113,7 @@ func cmdMerge(args []string) int {
 		Plan: plan, Base: baseSB, Ours: ours.Superblock, Theirs: theirs.Superblock,
 		Inner: inner, Refs: rstore, Branch: into, SigningKey: key,
 		DEK: dek, CacheDir: filepath.Join(stateDir, "gencache"),
-		SpoolDir: spool,
+		SpoolDir: spool, TheirBranch: source,
 	}
 	if plan.FastForward {
 		sb, err := merge.FastForward(ctx, ao)
@@ -291,6 +298,14 @@ func printMergePlan(w io.Writer, p *merge.Plan, into, source string, baseGen uin
 	for _, c := range p.Conflicts {
 		fmt.Fprintf(w, "  CONFLICT %-14s %s (%s)\n", c.Kind, c.Path, c.Detail)
 	}
+	if len(p.Conflicts) > 0 {
+		fmt.Fprintln(w, "  (--keep-both writes both versions instead of refusing)")
+	}
+	// The kept copies are named, not counted: the filename that will
+	// appear in the tree is the thing a user needs before agreeing to it.
+	for _, k := range p.Kept {
+		fmt.Fprintf(w, "  kept both      %s, theirs as %s (%s)\n", k.Path, k.As, k.Kind)
+	}
 	if len(p.Collisions) > 0 {
 		// Reported as one problem with a count, not as a list to work
 		// through: they are not resolved one at a time. Every one of them
@@ -307,6 +322,10 @@ func printMergePlan(w io.Writer, p *merge.Plan, into, source string, baseGen uin
 		}
 		fmt.Fprintf(w, "      these branches predate per-branch inode lineages; one side has to be renumbered "+
 			"above %d before they can merge\n", p.FirstFreeInode)
+	}
+	if len(p.Kept) > 0 && len(p.Conflicts) == 0 && len(p.Collisions) == 0 {
+		fmt.Fprintf(w, "mergeable, keeping both versions of %d file(s)\n", len(p.Kept))
+		return
 	}
 	switch {
 	case len(p.Conflicts) > 0 && len(p.Collisions) > 0:

@@ -48,16 +48,17 @@ import (
 //     repack needs no data-encryption key and cannot corrupt content it
 //     cannot read.
 //  3. Write a new manifest naming the surviving packs plus the new ones.
-//  4. Write one multi-pack index segment for the moved identities, listed
-//     LAST so it wins over the stale entries in older segments.
-//  5. Publish a superblock that condemns the old packs, and flip the ref.
+//  4. Write one multi-pack index segment for the moved identities AND for
+//     the live entries of any index this run retires, listed LAST so it
+//     wins over the stale entries in older segments.
+//  5. Publish a superblock that condemns the old packs and the retired
+//     indexes, and flip the ref.
 //
 // # What it does not do
 //
-// It does not retire index or manifest objects on their own account
-// (Plan.Refs). Replacing the manifest wholesale already drops every
-// superseded segment, and index retirement is a separate decision about
-// objects whose only cost is fetch time.
+// It does not retire MANIFEST objects on their own account (Plan.Refs with
+// Kind RefManifest). Replacing the manifest wholesale already drops every
+// superseded segment, so there is nothing left for a rule to decide.
 //
 // It does not touch catalogs, shards, or the namespace in any way. A
 // repacked generation has the same tree as its parent, byte for byte, and
@@ -324,6 +325,170 @@ func trimToLedger(plan *Plan, prev []superblock.CondemnedPack, now time.Time, gr
 		plan.IntoPacks = 0
 	}
 	return held
+}
+
+// retiredIndexes is which index refs this run drops from the list, paced
+// to what the condemned-index ledger can carry.
+//
+// THE CASE IT ANSWERS is the narrow one the design states: an index whose
+// packs are mostly gone spends its bytes on entries that resolve to
+// nothing, and a mount pays for those bytes on every lookup it windows
+// through the object, forever. The planner measures it (RefCandidate,
+// live packs over packs, against RefLive) and this acts on it.
+//
+// IT IS FETCH COST AND NOTHING ELSE, which is what makes it the lowest-risk
+// of the three retirement rules. An index is DERIVED: a generation whose
+// index is missing still mounts and still serves, it just falls back to
+// pack trailers (genfs.packIndex.locate). Nothing here can lose data even
+// if every judgement in it is wrong — the worst case is a reader paying the
+// fallback for entries that used to be indexed, which is why the live
+// entries are re-emitted rather than dropped (carryIndexEntries).
+//
+// PACED THROUGH THE SAME LEDGER DISCIPLINE AS PACKS, for a weaker reason
+// that still holds. A retired index is hash-named, so retention ages it by
+// its mtime — which expired long ago for an index worth retiring — and the
+// ledger row is then the only thing that keeps it while a retired
+// generation still names it. Truncating that ledger silently is what this
+// avoids: what does not fit is simply not retired this run, and the next
+// run sees it again. A repack is resumable by construction.
+//
+// ONE APPROXIMATION, ADMITTED. The plan's liveness fractions were measured
+// against the packs the plan proposed to condemn, and trimToLedger may
+// since have held some of those back. An index judged against a pack that
+// is no longer being condemned is judged slightly too dead. The cost is
+// re-emitting a few live entries a run early; it cannot make a wrong
+// location, because every entry re-emitted names a pack this generation
+// LISTS.
+func retiredIndexes(plan *Plan, prev *superblock.Superblock, now time.Time) map[string]bool {
+	listed := make(map[string]bool, len(prev.PackIndexes))
+	for _, ref := range prev.PackIndexes {
+		listed[ref.Name] = true
+	}
+	// The room the ledger has after the rows this generation must carry.
+	// Asked through the ledger rule itself, exactly as trimToLedger does, so
+	// the arithmetic cannot drift from the rule that enforces it.
+	carried, _ := superblock.CarryCondemnedRefs(prev.CondemnedIndexes, nil, nil, now, graceOf(prev))
+	room := superblock.CondemnedPackRoom(condemnedAsPacks(carried))
+	out := make(map[string]bool)
+	var used int64
+	held := 0
+	for _, c := range plan.Refs {
+		if c.Kind != RefIndex || !listed[c.Name] {
+			// A manifest candidate (handled by rewriting the manifest whole)
+			// or a ref the head no longer lists.
+			continue
+		}
+		n := superblock.CondemnedRowBytes(c.Name, now)
+		if used+n > room {
+			held++
+			continue
+		}
+		used += n
+		out[c.Name] = true
+	}
+	if held > 0 {
+		ui.Info("repack: {held} index segment(s) are worth retiring and the condemned-index ledger has no "+
+			"room for their rows; they are left listed for a later run rather than dropped without one",
+			"held", held)
+	}
+	return out
+}
+
+// condemnedAsPacks re-shapes ref rows as pack rows so that one room
+// calculation serves both ledgers. The two row types encode identically —
+// same two columns, same CBOR keys — and what differs is the NAME, which is
+// carried across unchanged. Stated here rather than by adding a second
+// Room function to the format package, where one rule for one row shape is
+// the point.
+func condemnedAsPacks(rows []superblock.CondemnedRef) []superblock.CondemnedPack {
+	out := make([]superblock.CondemnedPack, len(rows))
+	for i, r := range rows {
+		out[i] = superblock.CondemnedPack{Name: r.Name, CondemnedAtUnix: r.CondemnedAtUnix}
+	}
+	return out
+}
+
+// carryIndexEntries re-emits the entries of every retired index that still
+// name a pack this generation LISTS, and reports how many it carried.
+//
+// This is the "re-emits its live entries" half of the design's retirement
+// rule, and without it retirement would be a speed regression wearing the
+// costume of a cleanup: the entries an index still answers for are exactly
+// the ones for its surviving packs, and dropping the object would send
+// every lookup of them down the trailer-walk fallback. Re-emitting keeps
+// the coverage and drops only the dead share, which is the trade the
+// planner measured (RefCandidate.Move/Reclaim).
+//
+// A key is copied at its stored width (mpi.Builder.AddKey): an entry is
+// twelve bytes of identity by design, and re-emitting one needs no more
+// than the index already holds.
+func carryIndexEntries(ctx context.Context, obj pelicanobj.Store, refs []superblock.IndexRef,
+	retire map[string]bool, listedPacks []string, into *mpi.Builder) (int, error) {
+
+	if len(retire) == 0 {
+		return 0, nil
+	}
+	listed := make(map[string]bool, len(listedPacks))
+	for _, name := range listedPacks {
+		listed[name] = true
+	}
+	carried := 0
+	for _, ref := range refs {
+		if !retire[ref.Name] {
+			continue
+		}
+		ix, err := mpi.Fetch(ctx, obj, ref)
+		if err != nil {
+			// Refused rather than skipped. Retiring an index whose entries
+			// could not be read would drop coverage this run promised to
+			// carry, and a repack that stops has cost only its rewriting —
+			// the ref never flips, and what was written is unreferenced
+			// garbage the sweep collects.
+			return 0, fmt.Errorf("repack: read index %s to carry its live entries: %w", ref.Name, err)
+		}
+		var addErr error
+		ix.Each(func(key []byte, packs []string) {
+			if addErr != nil {
+				return
+			}
+			for _, pn := range packs {
+				if !listed[pn] {
+					continue
+				}
+				if err := into.AddKey(key, pn); err != nil {
+					addErr = fmt.Errorf("repack: carry an entry of index %s: %w", ref.Name, err)
+					return
+				}
+				carried++
+			}
+		})
+		if addErr != nil {
+			return 0, addErr
+		}
+	}
+	return carried, nil
+}
+
+// retiredNames is the retired refs in LIST ORDER, which is what the ledger
+// rule wants: a deterministic order for the rows a generation adds.
+func retiredNames(refs []superblock.IndexRef, retire map[string]bool) []string {
+	out := make([]string, 0, len(retire))
+	for _, ref := range refs {
+		if retire[ref.Name] {
+			out = append(out, ref.Name)
+		}
+	}
+	return out
+}
+
+// indexNames is what a generation LISTS, for listed-wins: an index this
+// generation still names is never condemned, whatever this run dropped.
+func indexNames(refs []superblock.IndexRef) []string {
+	out := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		out = append(out, ref.Name)
+	}
+	return out
 }
 
 // headMatches reports whether the branch head is still the generation this
@@ -617,15 +782,49 @@ func repackedSuperblock(ctx context.Context, o ExecOptions, prev *superblock.Sup
 	sb.CondemnedManifests = condemnRefs(prev.CondemnedManifests, refNames(prev.Manifests),
 		[]string{mref.Name}, now, graceOf(prev), "manifest")
 
-	// One index segment for what moved, listed LAST so it wins: a Set
-	// asks the newest index first, and the older segments still name the
-	// packs this change deleted.
-	if len(moved) > 0 {
-		iref, err := putIndex(ctx, o.Inner, moved)
+	// The index refs this run RETIRES: the ones whose live-pack coverage
+	// has fallen under the threshold, paced to the room their ledger has.
+	// Chosen before the segment is built because their surviving entries go
+	// into it.
+	retire := retiredIndexes(res.Plan, prev, now)
+	ib := mpi.NewBuilder()
+	for id, p := range moved {
+		ib.Add(id, p.pack)
+	}
+	carried, err := carryIndexEntries(ctx, o.Inner, prev.PackIndexes, retire, listedPacks, ib)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// One index segment for what moved and for what a retired index still
+	// answered for, listed LAST so it wins: a Set asks the newest index
+	// first, and the older segments still name the packs this change
+	// deleted.
+	keptIndexes := make([]superblock.IndexRef, 0, len(prev.PackIndexes))
+	for _, ref := range prev.PackIndexes {
+		if !retire[ref.Name] {
+			keptIndexes = append(keptIndexes, ref)
+		}
+	}
+	sb.PackIndexes = keptIndexes
+	if ib.Len() > 0 {
+		iref, err := putIndex(ctx, o.Inner, ib)
 		if err != nil {
 			return nil, nil, err
 		}
-		sb.PackIndexes = append(append([]superblock.IndexRef{}, prev.PackIndexes...), iref)
+		sb.PackIndexes = append(keptIndexes, iref)
+	}
+	if len(retire) > 0 {
+		// Same ledger rule, same field publish writes when consolidation
+		// merges a ref away (superblock.CarryCondemnedRefs). It is what
+		// speaks for these objects while a retired generation still names
+		// them: they are hash-named, so the sweep's mtime guard expired long
+		// ago, and nothing a sweep can enumerate lists them any more.
+		sb.CondemnedIndexes = condemnRefs(prev.CondemnedIndexes, retiredNames(prev.PackIndexes, retire),
+			indexNames(sb.PackIndexes), now, graceOf(prev), "index")
+		ui.Info("repack: retired {n} index segment(s) whose packs are mostly gone, re-emitting {carried} "+
+			"live entries; a reader pinned to an older generation keeps them for the {grace} window",
+			"n", len(retire), "carried", carried, "grace", graceOf(prev))
 	}
 
 	// What this run did, so the next one can decide whether to bother
@@ -769,11 +968,11 @@ func putManifest(ctx context.Context, obj pelicanobj.Store, b *manifest.Builder)
 	return superblock.ManifestRef{Name: name, Hash: hash, Size: int64(len(raw)), Packs: uint32(b.Len())}, nil
 }
 
-func putIndex(ctx context.Context, obj pelicanobj.Store, moved map[[32]byte]placement) (superblock.IndexRef, error) {
-	ib := mpi.NewBuilder()
-	for id, p := range moved {
-		ib.Add(id, p.pack)
-	}
+// putIndex uploads the segment this generation adds. It takes a BUILDER
+// rather than the moved map because the segment has two sources now — the
+// identities this run moved, and the live entries of any index it retired
+// — and both are filled in before anything is written.
+func putIndex(ctx context.Context, obj pelicanobj.Store, ib *mpi.Builder) (superblock.IndexRef, error) {
 	raw := ib.Encode()
 	hash := blake3.Sum256(raw)
 	name := hex.EncodeToString(hash[:])

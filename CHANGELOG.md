@@ -151,6 +151,52 @@
   old backup into a new pack can defeat that. Tag a generation to pin it
   exactly.
 
+- **`T_grace` is a per-volume parameter, and now it really is one.** It was
+  recorded in `Params.TGraceSeconds` and written from a compiled-in 72
+  hours, and the sweep FLOORED its own window at the same constant — so a
+  volume that recorded twelve hours was swept at seventy-two, and the
+  documentation calling it configurable was describing a field nothing
+  read. `pelfs init --grace 12h` sets it; every later seal carries the
+  RECORDED value forward; the sweep, the repack planner and the three
+  condemned ledgers all age against it. `pelfs gc --grace` is unchanged and
+  may still only WIDEN — an option that could narrow the window is an
+  option to delete a concurrent writer's packs — and there is a **one-hour
+  floor** for the same reason. `pelfs gc` prints the window it applied.
+
+  **A large window buys less than it looks like it buys**, and `pelfs init`
+  says so when the numbers collide. The two derived-ref ledgers gain about
+  a row per checkpoint per key space against a 48 KiB cap (~517 hash-named
+  rows), so past `517 x checkpoint-interval` the byte cap binds before the
+  window does: the volume behaves as though its window were that long and
+  repacks pace to the room left. At the 5-minute default that is ~43 hours
+  — the 72-hour default is already past it, `--grace 30d` is past it
+  forty-fold. Nothing a branch head or tag names is affected; what is
+  shortened is the window for objects only a RETIRED generation names, and
+  a workflow needing a real pin should tag.
+
+- **A repack retires index segments whose packs are mostly gone.** The
+  planner has measured this since indexes were tiered and the executor
+  ignored it, so a segment written for packs a later repack condemned went
+  on being listed, fetched and windowed through forever — spending its
+  bytes on entries that resolve to nothing. Under 50% live pack coverage, a
+  repack now drops the segment, **re-emits the entries it still answers
+  for** into the segment it was writing anyway, and condemns the old object
+  through the existing condemned-index ledger (which `pelfs gc` already
+  honours, so it survives the grace window for readers pinned to the
+  generation before the repack).
+
+  Re-emitting is the half that matters: an index is derived, so dropping
+  one costs only fetch time, but dropping one whose surviving packs nothing
+  else indexes sends every lookup of those identities down the pack-trailer
+  fallback — a cleanup that makes cold reads slower. Coverage is preserved
+  and only the dead share is discarded.
+
+  Retirement is **paced by the ledger**, exactly as pack condemnation is:
+  what has no room for a row is left listed for a later run rather than
+  dropped with nothing to speak for it. Manifest segments are unchanged —
+  a repack rewrites the manifest whole, so its segments are already
+  condemned together.
+
 ## v0.1.0 — first release
 
 `pelfs` mounts a POSIX filesystem whose data lives in a

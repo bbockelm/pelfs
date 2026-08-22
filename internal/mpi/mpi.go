@@ -99,6 +99,27 @@ func (b *Builder) Add(id [32]byte, pack string) {
 	b.packs[k] = append(cur, pack)
 }
 
+// AddKey is Add for a caller COPYING an entry out of an index it is
+// retiring — repack, when an index whose packs are mostly gone is dropped
+// and the entries for its surviving packs are re-emitted. It takes the
+// TRUNCATED key because that is all an entry holds (12 bytes, deliberately;
+// see the package comment), and re-emitting needs nothing more: the reader
+// checks the full identity against the pack it is sent to.
+//
+// A key of the wrong length is refused rather than padded or cut. It cannot
+// come from an Index this build parsed, so it means the caller passed
+// something that is not an entry, and reshaping it would put a key in the
+// table that answers for nothing.
+func (b *Builder) AddKey(key []byte, pack string) error {
+	if len(key) != KeyLen {
+		return fmt.Errorf("mpi: entry key is %d bytes, want %d", len(key), KeyLen)
+	}
+	var id [32]byte
+	copy(id[:KeyLen], key)
+	b.Add(id, pack)
+	return nil
+}
+
 // Len is how many distinct keys have been added, and Packs how many packs
 // they span — the two numbers a consolidation policy reads without
 // fetching anything.

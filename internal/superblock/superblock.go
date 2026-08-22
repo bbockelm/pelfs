@@ -141,6 +141,67 @@ type Maint struct {
 	RepackUnixNano int64 `cbor:"repack_unix_nano"`
 }
 
+// Fork is where a branch came from, carried by every generation on it.
+//
+// It exists so that a merge does not have to GUESS its base. Nothing else
+// in the format can supply one: refs and tags are the only addressable
+// entry points, so PrevHash chains cannot be walked back to where two
+// branches meet, and the superblock backups in packs are built over a
+// different pack set so their hashes are not the hashes those chains
+// record. Without this, every merge takes the base as a hand-typed
+// argument and a wrong answer silently mis-attributes change.
+//
+// It also carries the two numbers that make an inode collision decidable
+// rather than guessable — see Lineage and BaseNextInode.
+type Fork struct {
+	// Base is the wire hash of the generation this branch started at, and
+	// BaseGeneration its number. Together they name the merge base for
+	// any branch cut from the same point.
+	Base           [32]byte `cbor:"base"`
+	BaseGeneration uint64   `cbor:"base_generation"`
+	// BaseNextInode is the inode high-water mark at the fork. It is the
+	// exact cut between numbers that meant the same file on both sides
+	// and numbers each side allocated for itself, because NextInode never
+	// reuses a value.
+	BaseNextInode uint64 `cbor:"base_next_inode"`
+	// From names the ref this branch was cut from, for a human reading a
+	// superblock. Not load-bearing: the ref may since have moved or gone.
+	From string `cbor:"from,omitempty"`
+	// Lineage is the partition of the inode space this branch allocates
+	// from, and it is what makes merges cheap instead of impossible.
+	//
+	// Two branches that allocate from one counter assign the same number
+	// to different files, so merging them means renumbering a whole side —
+	// every catalog naming those inodes, the shard ranges that route
+	// hardlink content by inode, and the hardlink grouping that IS inode
+	// equality. Giving each branch its own high-order slice means that
+	// never happens, and it costs nothing but sparse inode numbers.
+	//
+	// Zero is the original lineage of every volume, which is why an
+	// unforked volume needs no Fork record at all.
+	Lineage uint32 `cbor:"lineage"`
+}
+
+// InodeLineageShift splits an inode into a lineage and a counter: the top
+// 24 bits say which branch allocated it, the low 40 bits say which
+// allocation it was.
+//
+// 40 bits is a trillion inodes per lineage, which is three orders of
+// magnitude past the hundred million objects the format is designed for;
+// 24 bits is 16 million branches. Both are far past use, which is the
+// point — a partition that could run out would need a policy for running
+// out.
+const InodeLineageShift = 40
+
+// LineageOf reports which lineage allocated an inode.
+func LineageOf(inode uint64) uint32 { return uint32(inode >> InodeLineageShift) }
+
+// FirstInode is where a lineage starts allocating. Inode 1 is the root in
+// every lineage's numbering, so a fresh lineage begins above it.
+func FirstInode(lineage uint32) uint64 {
+	return uint64(lineage)<<InodeLineageShift + 2
+}
+
 type CondemnedPack struct {
 	Name            string `cbor:"name"`
 	CondemnedAtUnix int64  `cbor:"condemned_at_unix"`
@@ -330,6 +391,10 @@ type Superblock struct {
 	// Absent on a volume no repack has touched, which reads as "never",
 	// and that is the correct starting point rather than a special case.
 	Maint *Maint `cbor:"maint,omitempty"`
+	// Fork is where this branch came from (see Fork). Absent on a volume
+	// that has never been branched, which reads as "the original lineage"
+	// and is the correct starting point rather than a special case.
+	Fork *Fork `cbor:"fork,omitempty"`
 	// Branch names the ref this generation was SEALED ONTO. It is a
 	// statement about the writer, not about where the bytes currently sit:
 	// `pelfs branch dev` copies main's head verbatim under a second name,

@@ -1,11 +1,17 @@
 package main
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/binary"
+	"time"
+
 	"context"
 	"errors"
 	"flag"
 	"fmt"
 
+	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/refs"
 	"github.com/bbockelm/pelfs/internal/superblock"
 	"github.com/bbockelm/pelfs/internal/ui"
@@ -55,10 +61,11 @@ import (
 // README; the seal's refusal to publish over a moved ref is what actually
 // keeps that case safe, as it always was.
 func cmdBranch(args []string) int {
-	var from, fromTag, pubkeyHex string
+	var from, fromTag, pubkeyHex, signingKey string
 	var list, rm bool
 	o, pos, err := parseArgs("branch", args, 1, 2, func(fs *flag.FlagSet, o *cmdOpts) {
 		fs.StringVar(&from, "from", "main", "branch whose current head the new branch starts at")
+		fs.StringVar(&signingKey, "signing-key", "", signingKeyUsage)
 		fs.StringVar(&fromTag, "from-tag", "", "start the new branch at a tagged generation instead of a branch head")
 		fs.StringVar(&pubkeyHex, "volume-pubkey", "", "hex Ed25519 volume key to trust (default: pin on first use)")
 		fs.BoolVar(&list, "list", false, "list this volume's branches instead of creating one")
@@ -87,11 +94,11 @@ func cmdBranch(args []string) int {
 	if rm {
 		return exitErr(removeBranch(ctx, o, prefix, pos[1], pubkeyHex))
 	}
-	return exitErr(createBranch(ctx, o, prefix, pos[1], from, fromTag, pubkeyHex))
+	return exitErr(createBranch(ctx, o, prefix, pos[1], from, fromTag, pubkeyHex, signingKey))
 }
 
 // createBranch writes the verified source head under a second name.
-func createBranch(ctx context.Context, o *cmdOpts, prefix, name, from, fromTag, pubkeyHex string) error {
+func createBranch(ctx context.Context, o *cmdOpts, prefix, name, from, fromTag, pubkeyHex, signingKeyPath string) error {
 	// Validated before anything is fetched, for the reason `pelfs tag` does
 	// it: a name the key space cannot carry is worth saying so about
 	// immediately, not after a round trip. The `.tmp` rule is the one that
@@ -101,7 +108,7 @@ func createBranch(ctx context.Context, o *cmdOpts, prefix, name, from, fromTag, 
 	if err := refs.ValidateName(name); err != nil {
 		return fmt.Errorf("branch: %w", err)
 	}
-	_, rstore, _, err := volumeStore(ctx, o, prefix, pubkeyHex)
+	inner, rstore, stateDir, err := volumeStore(ctx, o, prefix, pubkeyHex)
 	if err != nil {
 		return err
 	}
@@ -127,15 +134,51 @@ func createBranch(ctx context.Context, o *cmdOpts, prefix, name, from, fromTag, 
 		sb, raw, source = f.Superblock, f.Raw, fmt.Sprintf("branch %s", from)
 	}
 
+	// The branch's first generation records WHERE IT CAME FROM and takes
+	// its own slice of the inode space (superblock.Fork).
+	//
+	// This used to copy the source's bytes verbatim, which was elegant —
+	// no key needed, trust preserved exactly — and left the branch unable
+	// to say anything about itself. Two things depend on it being able to.
+	// A merge needs the generation the branches diverged from, and nothing
+	// else in the format can supply one: refs and tags are the only
+	// addressable entry points, so PrevHash chains cannot be walked back
+	// to where they meet. And two branches allocating inodes from one
+	// counter assign the same number to different files, which makes
+	// merging them a renumbering of a whole side rather than a merge.
+	//
+	// The cost is a signature, so this verb now needs the volume key. That
+	// is no real loss: creating a ref is a write, and publishing onto the
+	// branch afterwards needs the key anyway — a branch nobody can seal
+	// onto is not a branch.
+	//
+	// No new content: the generation names the same root, the same
+	// catalogs, the same packs. It is a superblock and nothing else.
+	key, err := loadOrCreateSigningKey(signingKeyFileIn(stateDir, signingKeyPath), sb)
+	if err != nil {
+		return err
+	}
+	lineage, err := pickLineage(ctx, inner, rstore)
+	if err != nil {
+		return err
+	}
+	forkRaw, fork, err := forkGeneration(sb, raw, from, fromTag, lineage, key)
+	if err != nil {
+		return err
+	}
+
 	// Empty expect-ETag: create-if-absent. refs.Flip refuses a ref that is
 	// already there, which is what keeps this verb from repointing a branch
 	// somebody is publishing onto.
-	if err := rstore.Flip(ctx, name, raw, ""); err != nil {
+	if err := rstore.Flip(ctx, name, forkRaw, ""); err != nil {
 		return explainBranchFailure(ctx, rstore, name, err)
 	}
 	ui.Info("created branch {branch} at generation {generation} of {source}; "+
 		"`pelfs mount --branch {branch} --rw` publishes onto it, and it advances independently of {source}",
-		"branch", name, "generation", sb.Generation, "source", source)
+		"branch", name, "generation", fork.Generation, "source", source)
+	ui.Info("it allocates inodes from lineage {lineage} (first {first}), so it can be merged back without "+
+		"renumbering, and it records {base} as the point it was cut from",
+		"lineage", fork.Fork.Lineage, "first", fork.NextInode, "base", fmt.Sprintf("generation %d", sb.Generation))
 	// It used to warn here that the two branches shared one lease. They no
 	// longer do, and the replacement is INFORMATION rather than a warning:
 	// a user who has just been handed a second branch should be told what
@@ -295,4 +338,111 @@ func listBranches(ctx context.Context, o *cmdOpts, prefix, pubkeyHex string) err
 		fmt.Println(n)
 	}
 	return nil
+}
+
+// forkGeneration builds the branch's first generation: the source's tree
+// exactly, plus a record of where it came from and its own inode lineage.
+//
+// Nothing about the namespace changes — same root catalog, same catalog
+// list, same shards, same packs — so this writes no content and reads
+// none. What it changes is the three things that make the branch a branch:
+// its parent, its fork record, and where it allocates inodes.
+func forkGeneration(src *superblock.Superblock, srcRaw []byte, from, fromTag string,
+	lineage uint32, key ed25519.PrivateKey) ([]byte, *superblock.Superblock, error) {
+
+	sb := *src
+	sb.Generation = src.Generation + 1
+	sb.CreatedUnixNano = time.Now().UnixNano()
+	sb.PrevHash = superblock.Hash(srcRaw)
+	sb.Signature = [64]byte{}
+	source := from
+	if fromTag != "" {
+		source = "tags/" + fromTag
+	}
+	sb.Fork = &superblock.Fork{
+		Base:           superblock.Hash(srcRaw),
+		BaseGeneration: src.Generation,
+		BaseNextInode:  src.NextInode,
+		From:           source,
+		Lineage:        lineage,
+	}
+	// The branch allocates from its own slice from here on. Everything
+	// already in the tree keeps the number it has: those inodes mean the
+	// same file on both sides of the fork, which is exactly what makes
+	// them safe to share.
+	sb.NextInode = superblock.FirstInode(lineage)
+	if err := sb.Sign(key); err != nil {
+		return nil, nil, err
+	}
+	raw, err := sb.Encode()
+	if err != nil {
+		return nil, nil, err
+	}
+	return raw, &sb, nil
+}
+
+// pickLineage draws an inode-space partition no ref in this volume is
+// already using.
+//
+// Drawn at random rather than counted up, because a counter would have to
+// live somewhere both branches can see and be incremented under a lock
+// neither holds. Random plus a collision check needs no coordination, and
+// it avoids the trap a name-derived value would set: a branch deleted and
+// re-created would get its predecessor's slice back, and start handing
+// out numbers that generations reachable from a tag are still using.
+//
+// The check reads every branch head and every tag, which is every
+// generation this volume can still name. It is not exhaustive — a retired
+// generation nobody names could hold a lineage this misses — but such a
+// generation cannot be branched from or merged, so it cannot collide with
+// anything either.
+func pickLineage(ctx context.Context, inner pelicanobj.Store, rstore *refs.Store) (uint32, error) {
+	taken := map[uint32]bool{0: true} // 0 is the original lineage
+	branches, err := listRefNames(ctx, inner, refs.RefDirKey)
+	if err != nil {
+		return 0, err
+	}
+	for _, b := range branches {
+		f, err := rstore.Fetch(ctx, b)
+		if err != nil {
+			// An unreadable ref cannot be branched from, but it can still
+			// be holding a lineage. Failing closed: a lineage collision is
+			// silent, and this is the only place that can prevent one.
+			return 0, fmt.Errorf("cannot check branch %s for its inode lineage: %w", b, err)
+		}
+		taken[lineageOf(f.Superblock)] = true
+	}
+	tags, err := listRefNames(ctx, inner, refs.TagDirKey)
+	if err != nil {
+		return 0, err
+	}
+	for _, t := range tags {
+		sb, _, err := rstore.FetchTag(ctx, t)
+		if err != nil {
+			return 0, fmt.Errorf("cannot check tag %s for its inode lineage: %w", t, err)
+		}
+		taken[lineageOf(sb)] = true
+	}
+	// 24 bits, so a draw collides with a hundred taken lineages about once
+	// in 170,000 tries; the loop is here for correctness, not for luck.
+	for range 1000 {
+		var b [4]byte
+		if _, err := rand.Read(b[:]); err != nil {
+			return 0, err
+		}
+		l := binary.BigEndian.Uint32(b[:]) & 0xffffff
+		if l != 0 && !taken[l] {
+			return l, nil
+		}
+	}
+	return 0, errors.New("could not find an unused inode lineage after 1000 draws")
+}
+
+// lineageOf is the lineage a generation allocates from: its fork record's,
+// or the original.
+func lineageOf(sb *superblock.Superblock) uint32 {
+	if sb.Fork != nil {
+		return sb.Fork.Lineage
+	}
+	return 0
 }

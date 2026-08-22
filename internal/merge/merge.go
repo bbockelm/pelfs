@@ -63,6 +63,11 @@ type Options struct {
 	// Base is the generation the two branches diverged from, Ours the
 	// branch being merged INTO, Theirs the branch being merged in.
 	Base, Ours, Theirs *superblock.Superblock
+	// BaseRaw is the base's wire bytes. Supplying them is what turns "the
+	// caller named a base" into "the caller named the RIGHT base": a
+	// branch created by `pelfs branch` records the hash of the generation
+	// it was cut from, so the claim is checkable rather than trusted.
+	BaseRaw []byte
 	// DEK unwraps catalogs on an encrypted volume.
 	DEK []byte
 	// CacheDir holds the three generations' local caches (empty: temp).
@@ -156,6 +161,10 @@ func Compute(ctx context.Context, o Options) (*Plan, error) {
 	if refusal := checkInputs(o); refusal != "" {
 		return &Plan{Refusal: refusal}, nil
 	}
+	cut, refusal := inodeCut(o)
+	if refusal != "" {
+		return &Plan{Refusal: refusal}, nil
+	}
 
 	// Fast-forward first, because it is the common case for a personal
 	// volume and it needs no walk: identical root catalogs mean identical
@@ -178,7 +187,8 @@ func Compute(ctx context.Context, o Options) (*Plan, error) {
 	defer trees.close()
 
 	p := &Plan{FirstFreeInode: max(o.Ours.NextInode, o.Theirs.NextInode)}
-	w := &walker{o: o, t: trees, p: p, ourInodes: map[uint64]string{}, theirInodes: map[uint64]string{}}
+	w := &walker{o: o, t: trees, p: p, cut: cut,
+		ourInodes: map[uint64]string{}, theirInodes: map[uint64]string{}}
 	if err := w.dir(ctx, "/", rootInode, rootInode, rootInode); err != nil {
 		return nil, err
 	}
@@ -207,6 +217,51 @@ func checkInputs(o Options) string {
 			o.Base.Generation, o.Ours.Generation, o.Theirs.Generation)
 	}
 	return ""
+}
+
+// inodeCut is the inode value at or below which a number meant the same
+// file on both sides, and the refusal when the fork records disagree.
+//
+// A branch created by `pelfs branch` carries where it was cut from, and
+// that record is what makes this exact rather than assumed. Three things
+// come out of it:
+//
+//   - THE BASE IS VERIFIED. The record holds the wire hash of the
+//     generation the branch started at, so a caller who names the wrong
+//     base is told so instead of getting a plausible tree that is nobody's
+//     intent. That was the sharpest edge on this whole operation.
+//   - THE CUT IS THE FORK'S, not the supplied base's NextInode. They
+//     agree when the base is right, and when it is wrong this is the one
+//     that is still true.
+//   - TWO BRANCHES CUT FROM DIFFERENT POINTS ARE REFUSED. Their trees may
+//     merge cleanly by accident, and the result would be attributing
+//     change against a base neither of them forked at.
+//
+// A generation with no fork record is from the original lineage, and
+// falls back to the supplied base — which is the pre-fork-record
+// behaviour, unverifiable and honest about it.
+func inodeCut(o Options) (uint64, string) {
+	of, tf := o.Ours.Fork, o.Theirs.Fork
+	switch {
+	case of == nil && tf == nil:
+		return o.Base.NextInode, ""
+	case of != nil && tf != nil && of.Base != tf.Base:
+		return 0, fmt.Sprintf("the two branches were cut from different generations (%d and %d); "+
+			"they have no common fork point to merge against",
+			of.BaseGeneration, tf.BaseGeneration)
+	}
+	fork := of
+	if fork == nil {
+		fork = tf
+	}
+	if len(o.BaseRaw) > 0 {
+		if got := superblock.Hash(o.BaseRaw); got != fork.Base {
+			return 0, fmt.Sprintf("the named base is generation %d (%x), but the branch was cut from %x; "+
+				"merging against the wrong base silently mis-attributes every change",
+				o.Base.Generation, got[:6], fork.Base[:6])
+		}
+	}
+	return fork.BaseNextInode, ""
 }
 
 type trees struct{ base, ours, theirs *genfs.FS }
@@ -260,6 +315,9 @@ type walker struct {
 	o Options
 	t *trees
 	p *Plan
+	// cut is the inode value at or below which a number meant the same
+	// file on both sides (inodeCut).
+	cut uint64
 	// ourInodes and theirInodes map an inode allocated after the fork to
 	// the path that holds it, which is what makes a collision report
 	// actionable rather than a list of numbers.
@@ -288,10 +346,10 @@ func (w *walker) dir(ctx context.Context, p string, baseIno, ourIno, theirIno ui
 		ours, inOurs := ourEnts[name]
 		theirs, inTheirs := theirEnts[name]
 
-		if inOurs && ours.Node.Inode >= w.o.Base.NextInode {
+		if inOurs && ours.Node.Inode >= w.cut {
 			w.ourInodes[ours.Node.Inode] = child
 		}
-		if inTheirs && theirs.Node.Inode >= w.o.Base.NextInode {
+		if inTheirs && theirs.Node.Inode >= w.cut {
 			w.theirInodes[theirs.Node.Inode] = child
 		}
 

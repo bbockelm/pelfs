@@ -1516,6 +1516,14 @@ func (p *pipeline) buildSuperblock(packList []superblock.PackEntry, shards []sup
 		m := *p.o.Prev.Maint
 		sb.Maint = &m
 	}
+	// Where the branch came from is the parent's too, and untouched for a
+	// stronger reason than maintenance state: a seal that dropped it would
+	// leave the branch unable to say what it was cut from, and a merge
+	// would be back to taking its base as a hand-typed argument.
+	if p.o.Prev != nil && p.o.Prev.Fork != nil {
+		f := *p.o.Prev.Fork
+		sb.Fork = &f
+	}
 	// The condemned ledgers for the derived key spaces: what this seal
 	// stopped listing, plus the parent's entries still inside the grace
 	// window. The clock is the generation's own CreatedUnixNano, not

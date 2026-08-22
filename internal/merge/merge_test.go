@@ -330,3 +330,130 @@ func TestADeletedDirectoryWithNoChangesInsideIsHonoured(t *testing.T) {
 		t.Errorf("unexpected conflict deleting an untouched directory: %s", c)
 	}
 }
+
+// forkedProperly builds the shape `pelfs branch` now produces: the child
+// branch's first generation records where it was cut from and takes its
+// own inode lineage. It returns the base's bytes too, because verifying
+// the base against that record is the point.
+func forkedProperly(t *testing.T, uuid string, onOurs, onTheirs func(v *testvol.Volume)) (
+	pelicanobj.Store, *superblock.Superblock, []byte, *superblock.Superblock, *superblock.Superblock) {
+	t.Helper()
+	inner := newInner(t)
+	v := testvol.New(t, inner, testvol.Options{VolumeID: testvol.ParseUUID(t, uuid)})
+	v.WriteFile(rootIno, "base.bin", body(4096, 1))
+	base := v.Publish(publishOpts).Superblock
+	baseRaw := v.Raw()
+
+	// The fork generation, as the command writes it: same tree, its own
+	// lineage, a record of the base.
+	fork := *base
+	fork.Generation = base.Generation + 1
+	fork.PrevHash = superblock.Hash(baseRaw)
+	fork.Fork = &superblock.Fork{
+		Base: superblock.Hash(baseRaw), BaseGeneration: base.Generation,
+		BaseNextInode: base.NextInode, From: "main", Lineage: 7,
+	}
+	fork.NextInode = superblock.FirstInode(7)
+	fork.Signature = [64]byte{}
+	if err := fork.Sign(v.SigningKey()); err != nil {
+		t.Fatal(err)
+	}
+	forkRaw, err := fork.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	v.Adopt(&fork, forkRaw)
+	v.SetBranch("dev")
+	onTheirs(v)
+	theirs := v.Publish(publishOpts).Superblock
+
+	v.Adopt(base, baseRaw)
+	v.SetBranch("main")
+	onOurs(v)
+	ours := v.Publish(publishOpts).Superblock
+	return inner, base, baseRaw, ours, theirs
+}
+
+// The payoff of the fork record: a branch with its own inode lineage
+// creates files that cannot collide with the other side's, so a merge of
+// two branches that both added files has nothing to renumber.
+func TestAForkedLineageHasNoInodeCollisions(t *testing.T) {
+	inner, base, baseRaw, ours, theirs := forkedProperly(t, "eeeeeeee-1111-2222-3333-444444444444",
+		func(v *testvol.Volume) { v.WriteFile(rootIno, "ours-new.bin", body(4096, 50)) },
+		func(v *testvol.Volume) { v.WriteFile(rootIno, "theirs-new.bin", body(4096, 51)) })
+
+	p, err := merge.Compute(context.Background(), merge.Options{
+		Inner: inner, Base: base, BaseRaw: baseRaw, Ours: ours, Theirs: theirs, CacheDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Refusal != "" {
+		t.Fatalf("refused: %s", p.Refusal)
+	}
+	if len(p.Collisions) != 0 {
+		t.Fatalf("a forked lineage still collided: %+v", p.Collisions)
+	}
+	if !p.Mergeable() {
+		t.Fatalf("not mergeable: %d conflicts, %d collisions", len(p.Conflicts), len(p.Collisions))
+	}
+	t.Logf("both sides added files, no collisions: %d ours, %d theirs", p.TookOurs, p.TookTheirs)
+}
+
+// And the sharpest edge, now blunted: a caller who names the WRONG base
+// is told so, instead of getting a plausible tree that is nobody's
+// intent.
+func TestAWrongBaseIsRefusedWhenTheForkRecordSaysSo(t *testing.T) {
+	inner, base, baseRaw, ours, theirs := forkedProperly(t, "ffffffff-1111-2222-3333-444444444444",
+		func(v *testvol.Volume) { v.WriteFile(rootIno, "a.bin", body(64, 1)) },
+		func(v *testvol.Volume) { v.WriteFile(rootIno, "b.bin", body(64, 2)) })
+
+	// The right base still works, which is what makes the refusal below
+	// mean something.
+	if p, err := merge.Compute(context.Background(), merge.Options{
+		Inner: inner, Base: base, BaseRaw: baseRaw, Ours: ours, Theirs: theirs, CacheDir: t.TempDir(),
+	}); err != nil || p.Refusal != "" {
+		t.Fatalf("the correct base was refused: %v %v", err, p)
+	}
+
+	// Bytes that are a real, signed generation of this volume — just not
+	// the one the branch was cut from.
+	wrongRaw, err := ours.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := merge.Compute(context.Background(), merge.Options{
+		Inner: inner, Base: base, BaseRaw: wrongRaw, Ours: ours, Theirs: theirs, CacheDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Refusal == "" {
+		t.Fatal("a base that is not the recorded fork point was accepted")
+	}
+	t.Logf("refused: %s", p.Refusal)
+}
+
+// Two branches cut from different points have no common fork to merge
+// against, and their trees merging cleanly by accident would be the worst
+// way to find that out.
+func TestBranchesCutFromDifferentPointsAreRefused(t *testing.T) {
+	inner, base, baseRaw, ours, theirs := forkedProperly(t, "0a0a0a0a-1111-2222-3333-444444444444",
+		func(v *testvol.Volume) { v.WriteFile(rootIno, "a.bin", body(64, 1)) },
+		func(v *testvol.Volume) { v.WriteFile(rootIno, "b.bin", body(64, 2)) })
+
+	// Give ours a fork record from somewhere else entirely.
+	elsewhere := *ours
+	elsewhere.Fork = &superblock.Fork{
+		Base: [32]byte{0xde, 0xad}, BaseGeneration: 99, BaseNextInode: 1000, Lineage: 9,
+	}
+	p, err := merge.Compute(context.Background(), merge.Options{
+		Inner: inner, Base: base, BaseRaw: baseRaw, Ours: &elsewhere, Theirs: theirs, CacheDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Refusal == "" {
+		t.Fatal("two branches cut from different generations were merged anyway")
+	}
+}

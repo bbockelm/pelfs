@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/ed25519"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	mrand "math/rand"
@@ -60,6 +61,14 @@ func newBranchVolume(t *testing.T, seed int64) *branchVolume {
 		want: map[string][]byte{},
 	}
 	if b.rstore, err = refs.New(inner, stateDir, nil); err != nil {
+		t.Fatal(err)
+	}
+	// The volume's signing key, where `pelfs init` leaves it. Creating a
+	// branch publishes a generation now — it records where the branch was
+	// cut from and takes its own inode lineage — so it needs the key, and
+	// a fixture without one describes a volume nobody could have made.
+	if err := os.WriteFile(filepath.Join(stateDir, "v2-signing.key"),
+		[]byte(hex.EncodeToString(b.v.SigningKey())+"\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	return b
@@ -167,11 +176,33 @@ func TestABranchIsAnIndependentLineOfHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the branch the command wrote does not verify: %v", err)
 	}
-	if devHead.Superblock.Generation != mainGen1.Generation ||
-		devHead.Superblock.RootCatalog != mainGen1.RootCatalog {
-		t.Fatalf("branch dev starts at generation %d/%x, but main's head was %d/%x",
-			devHead.Superblock.Generation, devHead.Superblock.RootCatalog[:4],
-			mainGen1.Generation, mainGen1.RootCatalog[:4])
+	// The TREE is the source's, exactly — a fork changes no content. The
+	// GENERATION is one past it, because creating a branch now publishes a
+	// real generation: it records where the branch was cut from and takes
+	// its own inode lineage, which is what lets it be merged back without
+	// renumbering.
+	if devHead.Superblock.RootCatalog != mainGen1.RootCatalog {
+		t.Fatalf("branch dev starts at tree %x, but main's head was %x",
+			devHead.Superblock.RootCatalog[:4], mainGen1.RootCatalog[:4])
+	}
+	if got, want := devHead.Superblock.Generation, mainGen1.Generation+1; got != want {
+		t.Fatalf("branch dev starts at generation %d, want %d (one past its source)", got, want)
+	}
+	fork := devHead.Superblock.Fork
+	if fork == nil {
+		t.Fatal("the branch records no fork point, so a merge would have to be told its base")
+	}
+	if fork.BaseGeneration != mainGen1.Generation {
+		t.Errorf("fork records base generation %d, want %d", fork.BaseGeneration, mainGen1.Generation)
+	}
+	if fork.BaseNextInode != mainGen1.NextInode {
+		t.Errorf("fork records base inode mark %d, want %d", fork.BaseNextInode, mainGen1.NextInode)
+	}
+	if fork.Lineage == 0 {
+		t.Error("the branch allocates from lineage 0, the same space as its source; merging would need renumbering")
+	}
+	if got, want := devHead.Superblock.NextInode, superblock.FirstInode(fork.Lineage); got != want {
+		t.Errorf("the branch allocates from %d, want %d (the start of its lineage)", got, want)
 	}
 
 	// DIVERGENT WORK ON DEV, sealed. This is the generation the tag will
@@ -432,8 +463,11 @@ func TestBranchRefusesToMoveAnExistingBranch(t *testing.T) {
 			t.Errorf("the refusal does not say %q:\n%s", wantText, out)
 		}
 	}
-	// And it really did not move.
-	if got := mustFetch(t, b.rstore, "dev"); got.Generation == moved.Generation {
+	// And it really did not move. Compared by TREE rather than by
+	// generation number: a fork generation is one past its source, so
+	// dev's number and main's next seal now coincide and a number
+	// comparison would pass while proving nothing.
+	if got := mustFetch(t, b.rstore, "dev"); got.RootCatalog == moved.RootCatalog {
 		t.Fatal("the refused create moved the branch anyway")
 	}
 }
@@ -570,18 +604,25 @@ func TestBranchFromATagSealsForward(t *testing.T) {
 		t.Fatal("branch --from-tag failed")
 	}
 	started := mustFetch(t, b.rstore, "v1-fixes")
-	if started.Generation != pinned.Generation || started.RootCatalog != pinned.RootCatalog {
-		t.Fatalf("branch --from-tag started at generation %d, not the tagged %d",
-			started.Generation, pinned.Generation)
+	if started.RootCatalog != pinned.RootCatalog {
+		t.Fatalf("branch --from-tag started at tree %x, not the tagged %x",
+			started.RootCatalog[:4], pinned.RootCatalog[:4])
+	}
+	if got, want := started.Generation, pinned.Generation+1; got != want {
+		t.Fatalf("branch --from-tag started at generation %d, want %d (one past the tag)", got, want)
+	}
+	if started.Fork == nil || started.Fork.BaseGeneration != pinned.Generation {
+		t.Errorf("the branch does not record the tagged generation as its base: %+v", started.Fork)
 	}
 
 	// And it publishes: a fix on top of what shipped.
 	b.onBranch(t, "v1-fixes")
 	fix := b.write(t, "fix.bin")
 	fixed := b.seal(t).Superblock
-	if fixed.Generation != pinned.Generation+1 {
-		t.Fatalf("the maintenance branch sealed generation %d on top of %d",
-			fixed.Generation, pinned.Generation)
+	// Two past the tag: the fork generation, then this seal.
+	if fixed.Generation != pinned.Generation+2 {
+		t.Fatalf("the maintenance branch sealed generation %d, want %d (the fork, then the fix)",
+			fixed.Generation, pinned.Generation+2)
 	}
 	want := map[string][]byte{"a.bin": released["a.bin"], "b.bin": released["b.bin"], "fix.bin": fix}
 	if err := coldRead(t, b.inner, fixed, want); err != nil {

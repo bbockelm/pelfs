@@ -5,10 +5,10 @@
 // ONE OBJECT PER BRANCH, meta/lease-<branch>.json, names the current
 // holder of that branch. The transport offers no compare-and-swap, so this
 // is DETECTION rather than a hard mutex: acquisition is
-// write-then-read-back, and every renewal first checks (via the object's
-// server-side ETag) that nobody overwrote the lease since our last write.
-// A holder that dies simply stops renewing and its lease expires after the
-// TTL.
+// write-then-read-back, and every renewal first reads the record to check
+// that it is still ours (see whose, which is also where the ETag this used
+// to compare instead went, and why). A holder that dies simply stops
+// renewing and its lease expires after the TTL.
 //
 // That framing is worth keeping in view when reading the rest of this
 // package: the lease is not what makes concurrent writes SAFE. The real
@@ -284,8 +284,10 @@ type Lease struct {
 	opts  Options
 	info  Info
 
-	mu         sync.Mutex
-	lastETag   string
+	mu sync.Mutex
+	// info above is mutated (Renewed) and marshalled under mu, because a
+	// seal-time revalidation runs on the caller's goroutine while the
+	// renewal loop runs on its own, and both write the record.
 	conflicted bool
 	// holder is the record that displaced ours, when we managed to read it.
 	// Kept so a refusal at seal time can name the other client even though
@@ -472,12 +474,11 @@ func Acquire(ctx context.Context, opts Options) (*Lease, error) {
 		if err := l.write(ctx); err != nil {
 			return nil, fmt.Errorf("write lease: %w", err)
 		}
-		after, ki2, err := read(ctx, opts.Store, key)
+		who, after, err := l.whose(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("verify lease: %w", err)
 		}
-		if after != nil && after.Session == opts.Session {
-			l.lastETag = ki2.ETag
+		if who == ownerUs {
 			lost = nil
 			break
 		}
@@ -549,6 +550,77 @@ func isLive(holder *Info, ki *pelicanobj.KeyInfo, fallbackTTL time.Duration) (bo
 	return remaining > 0, remaining
 }
 
+// owner is the answer to the one question the renewal check, the seal-time
+// revalidation, Release and the acquisition's read-back all ask: whose
+// record is on the lease object right now?
+type owner int
+
+const (
+	// ownerUs: the record on the object is this session's.
+	ownerUs owner = iota
+	// ownerOther: somebody else's record — or one that cannot be parsed,
+	// which is not ours either and is treated the same way, since a body we
+	// cannot read is a body we cannot claim.
+	ownerOther
+	// ownerUnknown: the object could not be read at all. NOTHING is decided
+	// from this. In particular a renewal must not go on to write, because
+	// writing over a record we could not identify is exactly how a conflict
+	// gets "resolved" by erasing the other writer.
+	ownerUnknown
+)
+
+// whose reads the lease object and reports whose record is on it, along with
+// that record when there was one to read.
+//
+// IT COMPARES THE RECORD, NOT THE ETAG, and that is the whole of the fix for
+// a conflict this package used to report against ITSELF.
+//
+// The check here used to be `ki.ETag == "" || ki.ETag == l.lastETag`, where
+// lastETag was whatever a stat happened to return after our last Put. Two
+// separate things are wrong with that, and CI found both:
+//
+//   - An ETag we do not recognize is NOT evidence that somebody took the
+//     lease. It is equally the ETag of OUR OWN record on a write we never
+//     got to observe: a Put that returned 500 after the origin had already
+//     written it, a Put whose follow-up stat failed, an origin that
+//     re-derives ETags. The old code called that a takeover, read the object
+//     to name the usurper, and found its own record — so it reported "branch
+//     main is held by <this very session, this pid>" and, because the state
+//     latches, refused every seal for the rest of the mount. That is not a
+//     conflict; it is a session shooting itself over one transient 5xx.
+//   - An ETag observed after a Put "is whatever is there now, ours or not"
+//     — pelicanobj.VerifyPut says so, for the flip path, which learned this
+//     first and reads bytes back for the same reason. Adopting it made a
+//     STRANGER's ETag ours, after which every renewal saw "mine" and rewrote
+//     our record over theirs, no conflict was ever reported, and Release
+//     DELETED their object. This lease is allowed to lose a race. It is not
+//     allowed to erase the winner.
+//
+// The record is the identity the acquisition's read-back already used
+// (`after.Session == opts.Session`), and a session id names one mount
+// uniquely (cmd/pelfs.newSessionID: timestamp, host, 32 random bits). The
+// cost is one GET of a ~250-byte object per renewal — 30s apart at the
+// production default — for a check that also works against an origin
+// serving no ETag at all, where the `ki.ETag == ""` clause above disabled
+// detection completely.
+//
+// WHAT IT STILL CANNOT DO is close the window between this read and the Put
+// that follows it: there is no compare-and-swap, so a stranger writing in
+// that one round trip is overwritten and, if they never write again,
+// unnoticed. That window is the package's premise (see the top of the file),
+// not a regression here — and unlike the ETag it replaces, it does not
+// persist: the next renewal reads the record again.
+func (l *Lease) whose(ctx context.Context) (owner, *Info, error) {
+	rec, _, err := read(ctx, l.store, l.key)
+	if err != nil {
+		return ownerUnknown, nil, err
+	}
+	if rec != nil && rec.Session == l.opts.Session {
+		return ownerUs, rec, nil
+	}
+	return ownerOther, rec, nil
+}
+
 // read fetches one lease object. Both keys go through it — the branch
 // lease and the legacy volume one — so the per-branch objects inherit
 // ReadMutable's checksum fallback and the direct-read store exactly as the
@@ -575,9 +647,22 @@ func read(ctx context.Context, store pelicanobj.Store, key string) (*Info, *peli
 	return &info, ki, nil
 }
 
+// write puts this session's record on the lease object.
+//
+// It does NOT stat afterwards to learn the new ETag, which is what it used to
+// do: an ETag read after a Put is "whatever is there now, ours or not", so
+// remembering it as ours is how a stranger's object came to be treated as
+// this session's and rewritten on every subsequent renewal (see whose). The
+// question "is the object still ours" is answered by reading the record, at
+// the point where it is asked.
 func (l *Lease) write(ctx context.Context) error {
+	// Under the lock: a seal-time revalidation renews on the caller's
+	// goroutine while the renewal loop renews on its own, so this timestamp
+	// and the marshal that reads it are shared state like any other.
+	l.mu.Lock()
 	l.info.Renewed = l.clock().UTC()
 	data, err := json.MarshalIndent(&l.info, "", "  ")
+	l.mu.Unlock()
 	if err != nil {
 		return err
 	}
@@ -590,14 +675,13 @@ func (l *Lease) write(ctx context.Context) error {
 	// record it is replacing was still its own. A failed Put leaves the
 	// stamp where it was, so the gap keeps growing and Fence keeps refusing
 	// — which is the direction a write that did not land should push.
+	//
+	// A failed Put may nevertheless have LANDED (a 5xx from in front of an
+	// origin that already wrote), which is why nothing downstream may treat
+	// "the object changed and we did not see it change" as a takeover.
 	l.mu.Lock()
 	l.renewedAt = l.clock()
 	l.mu.Unlock()
-	if ki, err := l.store.StatKey(ctx, l.key); err == nil {
-		l.mu.Lock()
-		l.lastETag = ki.ETag
-		l.mu.Unlock()
-	}
 	return nil
 }
 
@@ -622,14 +706,10 @@ func (l *Lease) renewOnce() bool {
 	ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
 	defer cancel()
 
-	ki, err := l.store.StatKey(ctx, l.key)
+	who, holder, err := l.whose(ctx)
 	switch {
 	case err == nil:
-		l.mu.Lock()
-		mine := ki.ETag == "" || ki.ETag == l.lastETag
-		l.mu.Unlock()
-		if !mine {
-			holder, _, _ := read(ctx, l.store, l.key)
+		if who == ownerOther {
 			l.markLost(holder)
 			return true
 		}
@@ -651,6 +731,12 @@ func (l *Lease) renewOnce() bool {
 		// admin's tidy-up and a writer that published over us.
 		l.markInterrupted()
 	default:
+		// The object could not be read, so who holds it is UNDECIDED — and
+		// this path deliberately does not write. A renewal that wrote here
+		// would be putting our record over a record we failed to identify.
+		// Nothing is lost by waiting: the renewal stamp stays where it was,
+		// so the gap grows and Fence asks again, synchronously, before
+		// anything is published.
 		ui.Warn("lease check failed (will retry): {error}", "error", err)
 		return false
 	}
@@ -665,6 +751,13 @@ func (l *Lease) renewOnce() bool {
 // renewal loop and from Fence, which is why the "said" flags exist: the two
 // can reach the same conclusion, and a user needs the emergency stated
 // exactly once.
+//
+// THE HOLDER IS NEVER THIS SESSION. Every call site classifies through
+// whose, which cannot answer ownerOther for our own record, and the one
+// remaining caller (clearInterrupted) passes nil because the evidence there
+// is the branch head rather than a record. A holder identity that can be
+// wrong makes the refusal useless — "branch main is held by <yourself>" —
+// which is precisely the defect this structure exists to make unstateable.
 func (l *Lease) markLost(holder *Info) {
 	l.mu.Lock()
 	l.conflicted = true
@@ -825,7 +918,7 @@ func (l *Lease) revalidate(ctx context.Context, head Guard) error {
 	ctx, cancel := context.WithTimeout(ctx, opTimeout)
 	defer cancel()
 
-	ki, err := l.store.StatKey(ctx, l.key)
+	who, holder, err := l.whose(ctx)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		return l.resolveVanished(ctx, head)
@@ -836,19 +929,16 @@ func (l *Lease) revalidate(ctx context.Context, head Guard) error {
 			"will not publish until it can confirm otherwise. the work is in the overlay; retry, or "+
 			"remount to take a fresh lease",
 			ErrUnconfirmed, l.key, err, l.State().Age.Round(time.Second), l.opts.Branch)
-	}
-
-	l.mu.Lock()
-	mine := ki.ETag == "" || ki.ETag == l.lastETag
-	interrupted := l.interrupted
-	l.mu.Unlock()
-	if !mine {
-		holder, _, _ := read(ctx, l.store, l.key)
+	case who == ownerOther:
 		l.markLost(holder)
 		return l.lostError(holder)
 	}
+
+	l.mu.Lock()
+	interrupted := l.interrupted
+	l.mu.Unlock()
 	// Our record, but an earlier absence is still on the books: the renewal
-	// loop reclaimed the object, so the ETag says "ours" and says nothing
+	// loop reclaimed the object, so the record says "ours" and says nothing
 	// about who was here in between. The head is what knows.
 	if interrupted {
 		if err := l.clearInterrupted(ctx, head); err != nil {
@@ -895,16 +985,15 @@ func (l *Lease) resolveVanished(ctx context.Context, head Guard) error {
 	if err := l.write(ctx); err != nil {
 		return fmt.Errorf("%w: could not re-take %s after it vanished (%v)", ErrUnconfirmed, l.key, err)
 	}
-	after, ki, err := read(ctx, l.store, l.key)
+	who, after, err := l.whose(ctx)
 	if err != nil {
 		return fmt.Errorf("%w: could not verify %s after re-taking it (%v)", ErrUnconfirmed, l.key, err)
 	}
-	if after == nil || after.Session != l.opts.Session {
+	if who != ownerUs {
 		l.markLost(after)
 		return l.lostError(after)
 	}
 	l.mu.Lock()
-	l.lastETag = ki.ETag
 	l.interrupted = false
 	l.revalidatedAt = l.clock()
 	l.mu.Unlock()
@@ -972,17 +1061,19 @@ func (l *Lease) Release(ctx context.Context) error {
 	if l.Conflicted() {
 		return nil
 	}
-	ki, err := l.store.StatKey(ctx, l.key)
+	who, _, err := l.whose(ctx)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("release lease: %w", err)
 	}
-	l.mu.Lock()
-	mine := ki.ETag == "" || ki.ETag == l.lastETag
-	l.mu.Unlock()
-	if !mine {
+	// Only ever delete OUR OWN record. The ETag comparison this replaces
+	// deleted whatever was there whenever the origin served no ETag, and
+	// deleted a stranger's object outright once a stranger's ETag had been
+	// mistaken for ours (see whose) — a teardown quietly unlocking a branch
+	// somebody else is writing.
+	if who != ownerUs {
 		return nil
 	}
 	return l.store.Delete(ctx, l.key)

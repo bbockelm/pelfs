@@ -1,6 +1,7 @@
 package lease
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -183,21 +184,20 @@ func TestSecondClientRefused(t *testing.T) {
 	}
 }
 
+// TestExpiredLeaseTakenOver: a holder that stopped renewing stops excluding
+// anybody once its TTL is out.
+//
+// The expiry is expiredTTL rather than a short TTL and a sleep — the record
+// is already past its TTL by the time anything can read it, so there is no
+// timer to lose a race with. See expiredTTL.
 func TestExpiredLeaseTakenOver(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t)
 
-	opts := slowOpts(store, "sess-dead")
-	opts.TTL = 100 * time.Millisecond
-	opts.RenewInterval = time.Hour // never renews: simulates a dead client
-	a, err := Acquire(ctx, opts)
-	if err != nil {
+	// Never renews and never releases: the holder "crashes".
+	if _, err := Acquire(ctx, sleepOpts(store, "sess-dead")); err != nil {
 		t.Fatal(err)
 	}
-	// Do not release: the holder "crashes".
-	_ = a
-
-	time.Sleep(250 * time.Millisecond) // outlive the TTL
 
 	b, err := Acquire(ctx, slowOpts(store, "sess-b"))
 	if err != nil {
@@ -225,69 +225,326 @@ func TestStealLiveLease(t *testing.T) {
 	defer b.Release(ctx)
 }
 
+// TestRenewalDetectsConflict: a renewal that finds somebody else's record on
+// our object reports THAT CLIENT, ends the session's renewals, and leaves the
+// other client's lease alone.
+//
+// IT NO LONGER RACES FOR THE TAKEOVER, and the reason is a two-platform CI
+// failure. This test used to renew every 50ms while a steal wrote
+// concurrently, then wait up to five seconds for the callback. It failed on
+// macos-latest and then on ubuntu-latest with
+//
+//	conflict holder = &{Session:sess-a ...}, want sess-thief
+//
+// — the victim reported as the holder. Two defects met there. The trigger was
+// the test origin, whose PUT staged every write of a key through one shared
+// temp file, so two concurrent PUTs 500'd one of the writers while the
+// object took its body anyway (fixed in fakeorigin). What that produced was a
+// LANDED PUT REPORTED AS FAILED, and the lease then decided ownership by
+// comparing an ETag it had not confirmed was its own, so it read our own
+// record back and named us the usurper (fixed in whose; pinned below by
+// TestALandedPutReportedAsFailedIsNotATakeover).
+//
+// The ordering is now explicit and there is nothing left to lose: the holder
+// renews on an hour's interval, so its loop cannot write while the steal
+// does, and the check that must notice the takeover is invoked directly —
+// the same way TestRenewalRemembersAVanishedLease drives the other branch of
+// renewOnce. The steal-under-a-fast-renewer path this used to exercise by
+// luck is covered deterministically by TestStealRetriesWithoutStalling.
 func TestRenewalDetectsConflict(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t)
 
-	var mu sync.Mutex
 	var conflictHolder *Info
-	conflicted := make(chan struct{})
-
-	opts := Options{
-		Store: store, Session: "sess-a", Branch: "main",
-		TTL: time.Hour, RenewInterval: 50 * time.Millisecond,
-		OnConflict: func(h *Info) {
-			mu.Lock()
-			conflictHolder = h
-			mu.Unlock()
-			close(conflicted)
-		},
-	}
+	calls := 0
+	opts := slowOpts(store, "sess-a")
+	opts.OnConflict = func(h *Info) { conflictHolder = h; calls++ }
 	a, err := Acquire(ctx, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Another client steals the lease out from under us. The holder above
-	// renews every 50ms, so this steal really does lose the occasional
-	// race and take the retry path — which is how the thirty-minute
-	// backoff was found, by hanging here in CI rather than failing.
-	//
-	// The bound is on the test's own wait: a steal that cannot finish in
-	// 30 seconds has stalled, and should say so by name rather than sit
-	// until Go's deadline shoots the whole package.
-	time.Sleep(20 * time.Millisecond) // distinct mtime for a distinct ETag
+	// Another client steals the branch. Uncontested — a's renewal loop is on
+	// an hour's ticker — so this is exactly one write and one read-back.
 	stealOpts := slowOpts(store, "sess-thief")
 	stealOpts.Steal = true
-	stealCtx, cancelSteal := context.WithTimeout(ctx, 30*time.Second)
-	defer cancelSteal()
-	thief, err := Acquire(stealCtx, stealOpts)
+	thief, err := Acquire(ctx, stealOpts)
 	if err != nil {
-		t.Fatalf("steal: %v (a steal that cannot finish in 30s has STALLED, not lost)", err)
+		t.Fatalf("steal: %v", err)
 	}
 	defer thief.Release(ctx)
 
-	select {
-	case <-conflicted:
-	case <-time.After(5 * time.Second):
-		t.Fatal("renewal loop never noticed the conflict")
+	if !a.renewOnce() {
+		t.Fatal("renewOnce did not end the session's renewals after the branch was taken")
 	}
 	if !a.Conflicted() {
 		t.Fatal("Conflicted() should be true")
 	}
-	mu.Lock()
-	holder := conflictHolder
-	mu.Unlock()
-	if holder == nil || holder.Session != "sess-thief" {
-		t.Fatalf("conflict holder = %+v, want sess-thief", holder)
+	if calls != 1 {
+		t.Fatalf("OnConflict called %d times, want exactly 1", calls)
+	}
+	if conflictHolder == nil || conflictHolder.Session != "sess-thief" {
+		t.Fatalf("conflict holder = %+v, want sess-thief", conflictHolder)
+	}
+	// Said twice, because it is the assertion that failed in CI: a conflict
+	// whose holder is the session reporting it names the victim as the
+	// culprit, and the refusal it becomes ("branch main is held by <you>")
+	// tells the user nothing they can act on.
+	if st := a.State(); st.Holder == nil || st.Holder.Session == "sess-a" {
+		t.Fatalf("state holder = %+v; a conflict must never report THIS session as the holder", st.Holder)
 	}
 
 	// Releasing after a conflict must NOT delete the thief's lease.
 	if err := a.Release(ctx); err != nil {
 		t.Fatalf("Release after conflict: %v", err)
 	}
-	if _, err := store.StatKey(ctx, mainKey(t)); err != nil {
-		t.Fatalf("thief's lease should survive our release: %v", err)
+	if info, _, err := read(ctx, store, mainKey(t)); err != nil || info == nil || info.Session != "sess-thief" {
+		t.Fatalf("the thief's record did not survive our release: %+v (%v)", info, err)
+	}
+}
+
+// landedPutStore lets a Put land and THEN reports it failed, which is what a
+// 5xx from anything in front of an origin that already wrote looks like from
+// the client. It fires once, on one key, on demand.
+//
+// This is not an exotic wrapper for an exotic failure: the same shape arises
+// from a Put that succeeded and a follow-up stat that did not, and from an
+// origin that re-derives an object's ETag. All three leave the same evidence
+// — the object holds OUR record, and this session cannot recognize it.
+type landedPutStore struct {
+	pelicanobj.Store
+	key   string
+	mu    sync.Mutex
+	armed bool
+}
+
+func (s *landedPutStore) arm() {
+	s.mu.Lock()
+	s.armed = true
+	s.mu.Unlock()
+}
+
+func (s *landedPutStore) Put(ctx context.Context, key string, r io.Reader) error {
+	if err := s.Store.Put(ctx, key, r); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	fire := s.armed && key == s.key
+	if fire {
+		s.armed = false
+	}
+	s.mu.Unlock()
+	if fire {
+		return errors.New("500 Internal Server Error")
+	}
+	return nil
+}
+
+// TestALandedPutReportedAsFailedIsNotATakeover is the CI failure, reduced to
+// one client and no concurrency at all.
+//
+// A renewal Put lands and is reported as failed. The object now holds this
+// session's own record, freshly written, and this session has no way to have
+// observed the write. The next renewal must NOT read that as somebody having
+// taken the branch — which is what an ETag comparison did, naming this
+// session as the client that stole its own lease and refusing every seal for
+// the rest of the mount over one transient 500.
+func TestALandedPutReportedAsFailedIsNotATakeover(t *testing.T) {
+	ctx := context.Background()
+	store := &landedPutStore{Store: newStore(t), key: mainKey(t)}
+
+	var holder *Info
+	opts := slowOpts(store, "sess-a")
+	opts.OnConflict = func(h *Info) { holder = h }
+	l, err := Acquire(ctx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Release(ctx)
+
+	store.arm()
+	if done := l.renewOnce(); done {
+		t.Fatal("a failed renewal ended the session; a Put to retry is not a lost branch")
+	}
+	if done := l.renewOnce(); done {
+		t.Fatalf("the renewal after a landed-but-failed Put ended the session; holder=%+v", holder)
+	}
+	if l.Conflicted() || holder != nil {
+		t.Fatalf("conflict reported with holder %+v: this session's OWN record, on a write it could not "+
+			"observe, is not a takeover", holder)
+	}
+	// And the session really is still holding it: its own record, and a
+	// Release that removes it.
+	if info, _, err := read(ctx, store, mainKey(t)); err != nil || info == nil || info.Session != "sess-a" {
+		t.Fatalf("lease record after the episode = %+v (%v), want sess-a", info, err)
+	}
+	if err := l.Release(ctx); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	if _, err := store.StatKey(ctx, mainKey(t)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the session could not release the lease it still held: %v", err)
+	}
+}
+
+// TestARenewalDoesNotOverwriteAStrangersRecord pins the other half of the
+// same defect, from the opposite direction.
+//
+// A stranger's write lands immediately after our renewal's Put — the window
+// the old code closed over by adopting whatever ETag a stat returned next.
+// Having adopted THEIR ETag, every later renewal saw "mine" and rewrote our
+// record over theirs, no conflict was ever reported, and Release deleted
+// their object: the lease resolving a conflict by erasing the winner, which
+// is the one thing an advisory lock must not do.
+func TestARenewalDoesNotOverwriteAStrangersRecord(t *testing.T) {
+	ctx := context.Background()
+	base := newStore(t)
+
+	stranger, err := json.MarshalIndent(&Info{
+		Session: "sess-stranger", Hostname: "elsewhere", PID: 7, Branch: "main",
+		Acquired: time.Now().UTC(), Renewed: time.Now().UTC(),
+		TTLSecs: time.Hour.Seconds(),
+	}, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &loseOnceStore{Store: base, key: mainKey(t), usurper: stranger}
+
+	var holder *Info
+	opts := slowOpts(store, "sess-a")
+	opts.OnConflict = func(h *Info) { holder = h }
+	l, err := Acquire(ctx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Release(ctx)
+
+	// Arm AFTER the acquisition, so the write that gets overtaken is a
+	// renewal rather than the acquisition's own (which verifies by read-back
+	// and would simply refuse).
+	store.mu.Lock()
+	store.armed = true
+	store.mu.Unlock()
+	if done := l.renewOnce(); done {
+		t.Fatal("the renewal whose write was overtaken ended the session; it cannot know yet")
+	}
+	if done := l.renewOnce(); !done {
+		t.Fatal("the next renewal did not notice the stranger's record; an adopted ETag makes a stranger's " +
+			"object look like ours forever")
+	}
+	if holder == nil || holder.Session != "sess-stranger" {
+		t.Fatalf("conflict holder = %+v, want sess-stranger", holder)
+	}
+	// THE STRANGER'S BYTES ARE STILL THERE. Not "a conflict was reported" —
+	// that a conflict was reported instead of being written over.
+	got, err := pelicanobj.ReadMutable(ctx, base, mainKey(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, stranger) {
+		t.Fatalf("the stranger's record was rewritten by our renewal:\n%s", got)
+	}
+	if err := l.Release(ctx); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	if got, err := pelicanobj.ReadMutable(ctx, base, mainKey(t)); err != nil || !bytes.Equal(got, stranger) {
+		t.Fatalf("Release removed or rewrote the stranger's lease: %v", err)
+	}
+}
+
+// noETagStore answers stats with the ETag field empty, which is what an
+// origin that does not serve one looks like.
+type noETagStore struct {
+	pelicanobj.Store
+}
+
+func (s *noETagStore) StatKey(ctx context.Context, key string) (*pelicanobj.KeyInfo, error) {
+	ki, err := s.Store.StatKey(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	out := *ki
+	out.ETag = ""
+	return &out, nil
+}
+
+// TestDetectionWorksWithoutETags: the identity of a lease is the record, so
+// an origin that serves no ETag is not an origin where this stops working.
+//
+// It used to be exactly that. The check read `ki.ETag == "" || ki.ETag ==
+// l.lastETag`, so a missing ETag meant "mine" unconditionally: no takeover
+// was ever detected, every renewal wrote over the other client, and Release
+// deleted their object. Nothing in the ObjectStorage contract promises an
+// ETag (pelicanobj.KeyInfo says "when the server provides one").
+func TestDetectionWorksWithoutETags(t *testing.T) {
+	ctx := context.Background()
+	base := newStore(t)
+	store := &noETagStore{Store: base}
+
+	var holder *Info
+	opts := slowOpts(store, "sess-a")
+	opts.OnConflict = func(h *Info) { holder = h }
+	a, err := Acquire(ctx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stealOpts := slowOpts(store, "sess-thief")
+	stealOpts.Steal = true
+	thief, err := Acquire(ctx, stealOpts)
+	if err != nil {
+		t.Fatalf("steal: %v", err)
+	}
+	defer thief.Release(ctx)
+
+	if !a.renewOnce() {
+		t.Fatal("no takeover was detected on an origin that serves no ETag")
+	}
+	if holder == nil || holder.Session != "sess-thief" {
+		t.Fatalf("conflict holder = %+v, want sess-thief", holder)
+	}
+	if err := a.Release(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if info, _, err := read(ctx, base, mainKey(t)); err != nil || info == nil || info.Session != "sess-thief" {
+		t.Fatalf("the thief's lease did not survive our release: %+v (%v)", info, err)
+	}
+}
+
+// TestReleaseDoesNotDeleteAnotherClientsLease covers the takeover NOBODY
+// NOTICED: a session whose lease expired while it slept, whose renewal loop
+// never ticked, and which unmounts before anything asks. It is not
+// conflicted, so Release's own early return does not cover it — the only
+// thing standing between the teardown and somebody else's lock is the check
+// that the record being deleted is ours.
+//
+// Through an origin that serves no ETag, which is where the comparison this
+// replaces gave the wrong answer: `ki.ETag == ""` counted as "mine", so the
+// unmount deleted the new holder's lease and quietly unlocked a branch
+// another client was writing.
+func TestReleaseDoesNotDeleteAnotherClientsLease(t *testing.T) {
+	ctx := context.Background()
+	base := newStore(t)
+	store := &noETagStore{Store: base}
+
+	// Asleep: expired lease, an hour between renewals, so no tick and no
+	// conflict is ever observed by this session.
+	a, err := Acquire(ctx, sleepOpts(store, "sess-asleep"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := Acquire(ctx, slowOpts(store, "sess-awake"))
+	if err != nil {
+		t.Fatalf("the second writer could not take an EXPIRED lease: %v", err)
+	}
+	defer b.Release(ctx)
+
+	if a.Conflicted() {
+		t.Fatal("this test is not testing what it claims: the session already knows it lost the branch")
+	}
+	if err := a.Release(ctx); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	if info, _, err := read(ctx, base, mainKey(t)); err != nil || info == nil || info.Session != "sess-awake" {
+		t.Fatalf("the unmount deleted the other client's lease: %+v (%v)", info, err)
 	}
 }
 
@@ -396,8 +653,7 @@ func TestStealLeaseDoesNotTouchTheVolumeLease(t *testing.T) {
 func TestAnExpiredVolumeLeaseIsNoObstacle(t *testing.T) {
 	ctx := context.Background()
 	store := newStore(t)
-	legacyHolder(t, store, "v010-dead", 100*time.Millisecond)
-	time.Sleep(250 * time.Millisecond)
+	legacyHolder(t, store, "v010-dead", expiredTTL)
 
 	l, err := Acquire(ctx, slowOpts(store, "sess-new"))
 	if err != nil {

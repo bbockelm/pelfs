@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"net/http"
 	"os"
 	"path"
 	"sort"
@@ -82,6 +84,10 @@ func newFedStore(ctx context.Context, cfg Config) (*fedStore, error) {
 	}
 	opts = append(opts, client.WithAcquireToken(cfg.AcquireToken))
 
+	if cfg.AcquireToken && cfg.TokenPath == "" {
+		primeCredential(ctx, strings.TrimRight(cfg.PrefixURL, "/"))
+	}
+
 	// Transfer-only options: accept either CRC32C (the client default) or
 	// MD5 for transfer verification, since many deployed origins provide
 	// only MD5. This must NOT be in the shared opts — DoStat interprets a
@@ -99,6 +105,54 @@ func newFedStore(ctx context.Context, cfg Config) (*fedStore, error) {
 		opts:       opts,
 		directRead: cfg.DirectRead,
 	}, nil
+}
+
+// primeCredential acquires one credential up front covering everything the
+// filesystem will ever ask a Pelican origin to do: read objects, create them,
+// and overwrite them.
+//
+// The Pelican client asks for exactly the scope the operation in hand needs,
+// which is right for a CLI — `pelican object get` should not make a user
+// approve write access — but wrong for us. A mount reads, then creates, then
+// overwrites, and each first-of-its-kind operation whose scope the stored
+// token lacks starts its own OIDC device flow: a URL to visit and a code to
+// type, arriving in the middle of filesystem I/O rather than at mount time.
+// Three approvals for one mount, at moments the user is not looking.
+//
+// The client's own scope mapping gives us the whole set if we ask for the
+// whole set (TokenRead -> storage.read, TokenWrite -> storage.create,
+// TokenDelete -> storage.modify), so a single request covers everything. The
+// result lands in the credential wallet, and because the client checks a
+// stored token against the scopes each later operation needs, this one
+// satisfies all of them -- no further device flows.
+//
+// Best-effort by design. A failure here is not a mount failure: it may just
+// mean nobody is at a terminal to approve anything (the device flow refuses
+// to start when stdout is not a TTY), and every operation still acquires its
+// own credential the way it always did. All this buys is doing it once, at a
+// moment the user is watching.
+func primeCredential(ctx context.Context, prefixURL string) {
+	pUrl, err := client.ParseRemoteAsPUrl(ctx, prefixURL)
+	if err != nil {
+		slog.Debug("skipping credential priming: cannot parse prefix", "prefix", prefixURL, "err", err)
+		return
+	}
+
+	dirResp, err := client.GetDirectorInfoForPath(ctx, pUrl, http.MethodGet, "")
+	if err != nil {
+		slog.Debug("skipping credential priming: director lookup failed", "prefix", prefixURL, "err", err)
+		return
+	}
+
+	opts := config.TokenGenerationOpts{
+		Operation: config.TokenRead | config.TokenWrite | config.TokenDelete,
+	}
+	if _, err := client.AcquireToken(pUrl.GetRawUrl(), dirResp, opts); err != nil {
+		slog.Debug("credential priming did not produce a token; operations will acquire their own",
+			"prefix", prefixURL, "err", err)
+		return
+	}
+	slog.Debug("acquired a credential covering read, create and modify", "prefix", prefixURL)
 }
 
 // querySuffix is appended to every object URL/path this store builds.

@@ -96,9 +96,21 @@ jobs:
         run: ./scripts/e2e-docker.sh
 
   integration:
-    # Builds a pelican server from source (web assets, then the binary)
-    # and runs transport/publish against a federation-in-a-box. Much the
-    # longest job, and almost all of it is building someone else's tree.
+    # Builds a pelican server from the revision go.mod pins and runs
+    # transport/publish against a federation-in-a-box. Much the longest
+    # job, and almost all of it is building someone else's tree.
+    #
+    # No Node, and no `make web-build`. This job used to build pelican's
+    # Next.js bundle before the binary, and the day upstream pelican
+    # switched that build from npm to pnpm the job died on a runner with
+    # no pnpm -- `/bin/sh: 1: pnpm: not found`, from inside someone
+    # else's Makefile, looking for all the world like a test failure. It
+    # turns out the bundle was never needed: pelican commits an empty
+    # web_ui/frontend/out/placeholder to satisfy its own //go:embed, and
+    # the federation this gate stands up runs with the UI switched off.
+    # scripts/build-pelican-server.sh states that reasoning in full and
+    # CHECKS every part of it before it builds, so if pelican changes
+    # underneath us the job says which assumption broke.
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -106,34 +118,11 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26.0"
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-      # Resolve the module we ACTUALLY build against: with a replace in
-      # effect, .Version is the replaced-away pin, so cloning upstream at
-      # it would build a server without the very fixes the replace
-      # exists to supply. This follows the replacement and falls back to
-      # upstream automatically once the replace is dropped.
-      - name: Determine pelican source (honors any go.mod replace)
-        id: pelican
-        run: |
-          mod=$(go list -m -f '{{if .Replace}}{{.Replace.Path}}{{else}}{{.Path}}{{end}}' github.com/pelicanplatform/pelican)
-          ver=$(go list -m -f '{{if .Replace}}{{.Replace.Version}}{{else}}{{.Version}}{{end}}' github.com/pelicanplatform/pelican)
-          sha=$(echo "$ver" | grep -oE '[0-9a-f]{12}$')
-          if [ -z "$sha" ]; then echo "could not derive a commit from $mod $ver" >&2; exit 1; fi
-          echo "repo=https://$mod" >> "$GITHUB_OUTPUT"
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "building pelican from $mod at $sha"
-      - name: Fetch pelican source at that commit
-        run: |
-          git clone --filter=blob:none ${{ steps.pelican.outputs.repo }} pelican-src
-          git -C pelican-src checkout ${{ steps.pelican.outputs.sha }}
-      - name: Build pelican web assets
-        working-directory: pelican-src
-        run: make web-build
-      - name: Build pelican binary
-        working-directory: pelican-src
-        run: go build -tags forceposix,server -o "$GITHUB_WORKSPACE/pelican-bin" ./cmd
+      # Deliberately runnable by hand, identically: the same script builds
+      # the same binary on a developer machine, so this step is one a
+      # human can reproduce rather than a sequence only CI ever runs.
+      - name: Build the pelican server the gate tests against
+        run: ./scripts/build-pelican-server.sh "$GITHUB_WORKSPACE/pelican-bin" "$GITHUB_WORKSPACE/pelican-src"
       - name: Integration tests against federation-in-a-box
         run: PELICAN_BIN="$GITHUB_WORKSPACE/pelican-bin" ./scripts/integration-pelican.sh
 

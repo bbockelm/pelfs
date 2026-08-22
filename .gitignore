@@ -3,3 +3,8 @@
 pelfs-stats.json
 docs/TODO.md
 /pelfs
+# scripts/build-pelican-server.sh's defaults, for a run with no arguments.
+# CI passes explicit paths, but those are under $GITHUB_WORKSPACE and so
+# land here too.
+/pelican-src/
+/pelican-bin

@@ -1,0 +1,33 @@
+# hostile plan: seed=0 ops=11
+#
+# THE SPARSE-TRAIN SEAL FAILURE, minimized. Found by the owner doing a
+# git checkout over the NFS backend and by no gate:
+#
+#     catalog: inode 4688 chunk lengths sum to 32768, node length is 49152
+#
+# A content row is a list of extents and nothing requires them to cover
+# [0, size). A write past the end of the file leaves a gap; truncate
+# upward leaves one at the tail. The mount served both correctly all
+# along -- the hole reads as zeros -- but a catalog cannot SAY it, so a
+# renderer that walked only the extents produced a signed generation
+# holding a file no reader will open. That is a wrong-length file, i.e.
+# data loss, and two ordinary operations reach it: truncate(1) makes one
+# deliberately, and an NFS client flushing a write train out of order
+# makes one on its own.
+#
+# Both routes are here. This plan fails at the SEAL, not in the live
+# view, which is why the exerciser's lifecycle phase (seal, cold-remount,
+# compare, fsck --deep) is not optional: a harness that only checked the
+# live mount would have called this a pass.
+#
+# Fixed at 9d953c7. PRESENT at its parent, 2afa231.
+create seek.dat len=0 fill=00 # sparse train: extents out of order, with gaps
+pwrite seek.dat off=32768 len=16384 fill=52 # the far extent lands FIRST
+pwrite seek.dat off=0 len=16384 fill=51 # ...and the near one second: out of order
+create tail.dat len=16384 fill=53
+truncate tail.dat size=49152 # grow: a tail hole with no bytes behind it
+create cut.dat len=40000 fill=54
+truncate cut.dat size=12288 # shrink through the middle of an extent
+truncate cut.dat size=40000 # regrow: the cut bytes must read as zeros
+pwrite cut.dat off=39000 len=1000 fill=55
+compare

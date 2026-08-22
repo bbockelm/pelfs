@@ -1,0 +1,50 @@
+# hostile plan: seed=0 ops=13
+#
+# THE REPORTED BUG, minimized. Found by the owner at a shell prompt on
+# 2026-08-21 and by no gate: a directory that would not delete, three
+# `rm -rf` passes, the same survivors every time.
+#
+#     rm: htcondor/src/condor_tests: Directory not empty
+#
+# Every survivor was a symlink and all of them named ONE target, which
+# sorts ahead of them. rm(1) walks a directory sorted, so the target was
+# unlinked first and every link was dangling by the time its own turn
+# came. go-nfs's REMOVE handler stat'ed its operand THROUGH the terminal
+# symlink; on a dangling link that is ENOENT, so it answered
+# NFS3ERR_NOENT and never called Remove. rm reads ENOENT on an unlink as
+# "someone else got there first" and moves on silently, so the link
+# survived and the rmdir behind it refused -- identically on every retry,
+# because nothing about it converges.
+#
+# Fixed at e68a538 (go-nfs fork bump). PRESENT at its parent, 9d953c7,
+# which is what scripts/hostile-docker.sh --retro replays this against.
+# NFS leg only: raw FUSE unlinks by (parent inode, name) and resolves no
+# path at all, so it is immune by construction -- and the FUSE leg
+# running this same plan clean is what says so rather than assuming it.
+mkdir forest mode=0755
+create forest/aaa_base.run len=64 fill=41 # the target every link names; sorts first
+symlink forest/lib_eventlog_rotation_0.run -> aaa_base.run
+symlink forest/lib_eventlog_rotation_1.run -> aaa_base.run
+symlink forest/lib_eventlog_rotation_2.run -> aaa_base.run
+symlink forest/lib_eventlog_rotation_3.run -> aaa_base.run
+unlink forest/aaa_base.run # shared target deleted first
+unlink forest/lib_eventlog_rotation_0.run # a dangling link, unlinked on its own: must take the LINK
+rmrf forest # one pass must empty a forest of dangling links
+# SURVIVORS. Without these the tree is empty after the rm -rf and the
+# comparison has nothing to compare -- the detection would rest entirely
+# on the op-level divergence. These are the three individual cases behind
+# the reported shape, and they must come through untouched: removing a
+# symlink takes the LINK, never what it names, and following loses in both
+# directions (a live link's target would be destroyed silently, a dangling
+# one refuses the operation outright).
+mkdir keep mode=0755
+create keep/realfile len=32 fill=4b
+mkdir keep/realdir mode=0755
+create keep/realdir/inside len=32 fill=4c
+symlink keep/danglink -> nothing-here
+symlink keep/livelink -> realfile
+symlink keep/dirlink -> realdir
+unlink keep/danglink # the dangling link, and only it
+unlink keep/livelink # must not touch keep/realfile
+unlink keep/dirlink # must not empty keep/realdir
+compare

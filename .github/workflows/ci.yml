@@ -210,6 +210,58 @@ jobs:
       - name: Concurrent op stress under -race (contained)
         run: ./scripts/opfuzz-docker.sh 0 ConcurrentOpsStress
 
+  hostile:
+    # THE IMPOLITE USER, continuously. Every correctness bug in the v0.1.0
+    # release week — sparse extents from out-of-order NFS write trains,
+    # rechunk CLen/Alg metadata, the condemned-ledger drop, symlink-
+    # following REMOVE, dangling-link rm -rf — was found by the owner's
+    # ordinary shell usage and NONE by a gate, because every other gate
+    # writes polite tar-shaped data: files created once, written front to
+    # back, closed, never revisited. This gate writes the shapes a real
+    # tree has and a tarball does not.
+    #
+    # Adversarial op sequences against a REAL mount on BOTH frontends,
+    # with a reference tree on tmpfs mutated identically and compared
+    # byte-and-metadata-exact at 1s checkpoints; then the whole lifecycle
+    # (seal, cold remount, full compare, fsck --deep, gc) and a kill -9
+    # with remount and recovery. Contained the way opfuzz is, and then
+    # some: build tag, env gate, an image sentinel, os.Root confinement
+    # proven before the first op, and a container whose only host-visible
+    # path is a read-only directory of two binaries.
+    #
+    # Budget: a FIXED seed, so a red run is replayable by hand with the
+    # same command, and a small op count. Measured 22s end to end on
+    # Docker for Mac; the timeout is 15m because a STALL is the failure
+    # mode worth catching here (a wedged mount or a seal that never
+    # returns), and the harness's own deadlines fire first and print the
+    # phase they were stuck in.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.0"
+      - name: Enable FUSE
+        run: |
+          sudo modprobe fuse
+          sudo chmod 666 /dev/fuse
+      # The corpus is checked by name for the same reason the fuzz job
+      # checks its own: a corpus that quietly went missing would leave
+      # this job running random sequences only, and the sequences that
+      # already found bugs are the ones that must never stop running.
+      - name: Check the committed corpus is there
+        run: |
+          set -e
+          n=$(find internal/hostile/testdata/corpus -name '*.plan' | wc -l)
+          [ "$n" -gt 0 ] || { echo "no plans in internal/hostile/testdata/corpus" >&2; exit 1; }
+          echo "$n corpus entries:"
+          for f in internal/hostile/testdata/corpus/*.plan; do
+            echo "  $(basename "$f"): $(grep -cvE '^\s*(#|$)' "$f") ops"
+          done
+      - name: Hostile exerciser (contained; corpus + fixed-seed run, both frontends)
+        run: ./scripts/hostile-docker.sh
+
   mount-gate:
     # A REAL kernel mount of a published generation through
     # genfs+rawfuse, exercised by the end-to-end mount script. Linux only
@@ -325,7 +377,7 @@ jobs:
 
   build-release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [unit, race, e2e, integration, fuzz, opfuzz, mount-gate, crash, big-tree]
+    needs: [unit, race, e2e, integration, fuzz, opfuzz, hostile, mount-gate, crash, big-tree]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:

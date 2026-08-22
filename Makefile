@@ -1,6 +1,6 @@
 ARCH  := $(shell go env GOARCH)
 
-.PHONY: all build linux test e2e integration mount-gate opfuzz unprivileged crash big-tree vet clean
+.PHONY: all build linux test e2e integration mount-gate opfuzz hostile hostile-long hostile-retro unprivileged crash big-tree vet clean
 
 all: build
 
@@ -30,6 +30,33 @@ integration:
 
 opfuzz:
 	./scripts/opfuzz-docker.sh
+
+# The hostile filesystem exerciser: adversarial op sequences against a REAL
+# mount (both frontends), with a reference tree mutated identically and
+# byte-and-metadata-exact comparison at checkpoints, then the whole
+# lifecycle -- seal, cold remount, compare, fsck --deep, gc -- plus a
+# kill -9 and recovery.
+#
+# There is NO host target and there will not be one. Running this outside
+# its container is not discouraged, it is impossible: the code is behind a
+# build tag, refuses to start without an env var only the launcher sets,
+# aborts unless a sentinel file from the launcher's own image is present,
+# confines every path through os.Root, and proves that confinement before
+# it starts. Every target below is the launcher.
+hostile:
+	./scripts/hostile-docker.sh
+
+# Hours if you let it: 20k ops, 5000-entry directories, a random seed
+# (printed, and replayable with --seed).
+hostile-long:
+	./scripts/hostile-docker.sh --long
+
+# Today's exerciser against an OLD pelfs, built inside the container from
+# a git archive. Proof that it finds what humans found: EXPECTED TO FAIL,
+# and each failure is one of the release-week bugs. See the script's RETRO
+# comment for why the reference is a fix's parent and not v0.1.0.
+hostile-retro:
+	./scripts/hostile-docker.sh --retro
 
 # kill -9 a mount mid-flush, remount, and hold recovery to its contract.
 crash:

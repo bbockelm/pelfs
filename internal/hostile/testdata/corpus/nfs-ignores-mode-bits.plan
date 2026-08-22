@@ -1,0 +1,41 @@
+# hostile plan: seed=0 ops=4
+# expect: known-open nfs
+#
+# FOUND AT HEAD (8c3bc64) BY THIS EXERCISER, 2026-08-21. NOT FIXED --
+# product code is outside the hostile-agent run's territory. Filed for
+# triage under "hostile-agent" in docs/TODO.md.
+#
+# THE FINDING. A file chmod'd 0444 accepts a write through the NFS
+# frontend. Through raw FUSE the same write is refused with EACCES,
+# because the kernel applies the ordinary mode check before it sends
+# SETATTR/WRITE to a FUSE server. go-nfs's WRITE handler and
+# internal/vfsbilly do not consult the mode bits at all, and NFSv3 puts
+# that check on the server, so nothing performs it: an unprivileged
+# process can write a file it has no write permission on, and the bytes
+# land -- they survive the seal and read back from the sealed generation.
+#
+#     ro.dat: byte 0 is 0x29 in the mount, 0xc2 in the reference
+#
+# The same shape with `chown` instead of `pwrite` diverges identically
+# when CAP_CHOWN is absent (scripts/hostile-docker.sh --drop-chown): the
+# NFS frontend performs a chown the kernel and the FUSE frontend both
+# refuse. One cause, two symptoms -- the NFS frontend enforces no
+# permission checks of its own and gets none from the client.
+#
+# WHY THIS ENTRY DOES NOT FAIL THE BUILD, and what it does instead. The
+# marker above tells the replayer this divergence is expected: it is
+# reported loudly on every run, and the entry FAILS if the divergence
+# stops happening. That is the direction a corpus entry rots in -- a bug
+# quietly fixed leaves an entry that no longer tests anything -- so when
+# this is fixed, the replay goes red and the marker comes off, and from
+# then on the entry guards the fix. An entry that failed today would just
+# make the gate red until someone had time for it, which is how gates get
+# turned off.
+#
+# The FUSE leg of this same entry expects NO divergence, and gets none:
+# that is what says the difference is the frontend's and not the write
+# path's.
+create ro.dat len=256 fill=41
+chmod ro.dat mode=0444 # no write permission for anyone
+pwrite ro.dat off=0 len=64 fill=42 # FUSE: EACCES. NFS: accepted, and the bytes land.
+compare

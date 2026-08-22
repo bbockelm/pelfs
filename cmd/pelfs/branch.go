@@ -283,11 +283,43 @@ func removeBranch(ctx context.Context, o *cmdOpts, prefix, name, pubkeyHex strin
 			"named here); whatever it alone named is reclaimed by the next `pelfs gc` after the grace window",
 			"branch", name)
 	}
+	reportForkPin(ctx, rstore, name)
 	if name == "main" {
 		ui.Warn("main is gone: every command's --branch defaults to it, so mount, tag, fsck and repack now "+
 			"need --branch naming one of {remaining}", "remaining", remaining(names, name))
 	}
 	return nil
+}
+
+// reportForkPin says that the deleted branch's fork pin is still there,
+// and what it is keeping alive.
+//
+// The pin OUTLIVES the branch on purpose. Creating a branch tags the
+// generation it was cut from, because a merge needs that generation
+// readable and it stops being any ref's head as soon as the source branch
+// seals again. Deleting the branch cannot know whether that is still
+// wanted — someone may have a copy of the branch elsewhere, or be about to
+// re-create it from the same point — so removing the pin would be deciding
+// something this verb was not asked about.
+//
+// What it CAN do is not leave the thing silent. A tag is a retention root:
+// the generation it names, and everything that generation alone names,
+// survives every sweep until the tag goes. Nobody is going to remember a
+// tag they never typed, so this says the name, what it holds, and the one
+// command that releases it.
+func reportForkPin(ctx context.Context, rstore *refs.Store, branch string) {
+	tag := forkTagName(branch)
+	sb, _, err := rstore.FetchTag(ctx, tag)
+	if err != nil {
+		// No pin, or one that cannot be read. Either way there is nothing
+		// useful to say, and a warning about a tag this command did not
+		// touch would be noise.
+		return
+	}
+	ui.Info("tag {tag} is still here, pinning generation {generation} — the point {branch} was cut from. "+
+		"It is a retention root, so that generation survives every `pelfs gc` until the tag goes; keep it if "+
+		"anything may still merge from {branch}, and `pelfs tag --rm {tag}` releases it otherwise",
+		"tag", tag, "generation", sb.Generation, "branch", branch)
 }
 
 // remaining renders the branches left after one is removed, for the

@@ -831,3 +831,91 @@ func TestAV010WriterStillExcludesEveryBranch(t *testing.T) {
 		t.Fatalf("the v0.1.0 lease was disturbed: %v", err)
 	}
 }
+
+// Deleting a branch leaves its fork pin behind, and has to say so.
+//
+// The pin outlives the branch on purpose — a merge needs the fork point
+// readable, and this verb cannot know whether anyone still wants it — but
+// a tag is a retention root, so it keeps that generation alive against
+// every sweep. Nobody is going to remember a tag they never typed.
+func TestBranchRemovalReportsTheForkPinItLeaves(t *testing.T) {
+	ctx := context.Background()
+	b := newBranchVolume(t, 61)
+	b.write(t, "a.bin")
+	cutFrom := b.seal(t).Superblock
+
+	if _, code := captureLog(t, func() int {
+		return cmdBranch([]string{"--state-dir", b.stateDir, b.prefix, "dev"})
+	}); code != 0 {
+		t.Fatal("branch failed")
+	}
+	// A second branch, so the last-branch refusal is not what stops us.
+	if _, code := captureLog(t, func() int {
+		return cmdBranch([]string{"--state-dir", b.stateDir, b.prefix, "keeper"})
+	}); code != 0 {
+		t.Fatal("second branch failed")
+	}
+
+	out, code := captureLog(t, func() int {
+		return cmdBranch([]string{"--rm", "--state-dir", b.stateDir, b.prefix, "dev"})
+	})
+	if code != 0 {
+		t.Fatalf("branch --rm exited %d:\n%s", code, out)
+	}
+	for _, want := range []string{
+		"fork-dev",  // the name, because nobody will guess it
+		"retention", // what it costs to leave it
+		"tag --rm",  // the command that releases it
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the deletion does not mention %q:\n%s", want, out)
+		}
+	}
+	if !strings.Contains(out, fmt.Sprintf("%d", cutFrom.Generation)) {
+		t.Errorf("the deletion does not say which generation the pin holds:\n%s", out)
+	}
+	t.Logf("what a user sees:\n%s", out)
+
+	// And it really is still there: the message would be a lie otherwise,
+	// and the generation it names really is still reachable.
+	sb, _, err := b.rstore.FetchTag(ctx, "fork-dev")
+	if err != nil {
+		t.Fatalf("the fork pin is gone, so the message describes something that does not exist: %v", err)
+	}
+	if sb.Generation != cutFrom.Generation {
+		t.Errorf("fork-dev pins generation %d, dev was cut from %d", sb.Generation, cutFrom.Generation)
+	}
+}
+
+// A branch with no pin — one created before fork records existed, or whose
+// tag was already released — says nothing extra. A warning about a tag the
+// command did not touch and cannot find would be noise.
+func TestBranchRemovalIsQuietWhenThereIsNoPin(t *testing.T) {
+	ctx := context.Background()
+	b := newBranchVolume(t, 62)
+	b.write(t, "a.bin")
+	b.seal(t)
+	if _, code := captureLog(t, func() int {
+		return cmdBranch([]string{"--state-dir", b.stateDir, b.prefix, "dev"})
+	}); code != 0 {
+		t.Fatal("branch failed")
+	}
+	if _, code := captureLog(t, func() int {
+		return cmdBranch([]string{"--state-dir", b.stateDir, b.prefix, "keeper"})
+	}); code != 0 {
+		t.Fatal("second branch failed")
+	}
+	if err := b.rstore.DeleteTag(ctx, "fork-dev"); err != nil {
+		t.Fatalf("release the pin: %v", err)
+	}
+
+	out, code := captureLog(t, func() int {
+		return cmdBranch([]string{"--rm", "--state-dir", b.stateDir, b.prefix, "dev"})
+	})
+	if code != 0 {
+		t.Fatalf("branch --rm exited %d:\n%s", code, out)
+	}
+	if strings.Contains(out, "fork-dev") {
+		t.Errorf("the deletion talks about a pin that is not there:\n%s", out)
+	}
+}

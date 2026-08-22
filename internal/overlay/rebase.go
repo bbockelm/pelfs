@@ -153,10 +153,11 @@ func (fs *FS) Rebase(ctx context.Context, sealedSeq uint64, sealed Options) (*Re
 	if sealedSeq < fs.rebasedSeq {
 		return nil, fmt.Errorf("overlay: sequence %d was already rebased away (at %d)", sealedSeq, fs.rebasedSeq)
 	}
-	edges, ok := fs.snapEdges[sealedSeq]
+	st, ok := fs.snapEdges[sealedSeq]
 	if !ok {
 		return nil, fmt.Errorf("overlay: no snapshot was taken at sequence %d", sealedSeq)
 	}
+	edges := st.byInode
 
 	// Re-establish base residency at the snapshot's namespace before
 	// anything is dropped. This is both a repair and a check: genfs

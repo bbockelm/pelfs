@@ -276,15 +276,22 @@ func (fs *FS) retireSnapEdgesLocked() {
 	}
 }
 
-// readEdgeMap collects the overlay's live namespace as child -> the edge
-// naming it. Whiteouts are not edges to an inode and are excluded; for a
-// hardlinked inode any one of its names is a valid descent, so last wins.
-func readEdgeMap(q querier) (map[uint64]provEdge, error) {
+// readEdgeMap collects the overlay's live namespace both ways round.
+//
+// byInode is child -> the edge naming it: whiteouts are not edges to an
+// inode and are excluded, and for a hardlinked inode any one of its names
+// is a valid descent, so last wins. names is every one of those edges as a
+// (parent, name) key with nothing collapsed — see snapshotState for why the
+// two cannot be one map.
+func readEdgeMap(q querier) (*snapshotState, error) {
 	rows, err := q.Query(`SELECT parent, name, inode FROM oedge WHERE inode != 0 ORDER BY parent, name`)
 	if err != nil {
 		return nil, err
 	}
-	out := make(map[uint64]provEdge)
+	out := &snapshotState{
+		byInode: make(map[uint64]provEdge),
+		names:   make(map[edgeName]struct{}),
+	}
 	for rows.Next() {
 		var parent, ino uint64
 		var name []byte
@@ -292,12 +299,41 @@ func readEdgeMap(q querier) (map[uint64]provEdge, error) {
 			rows.Close() //nolint:errcheck
 			return nil, err
 		}
-		out[ino] = provEdge{parent: parent, name: string(name)}
+		out.byInode[ino] = provEdge{parent: parent, name: string(name)}
+		out.names[edgeName{parent: parent, name: string(name)}] = struct{}{}
 	}
 	if err := closeRows(rows); err != nil {
 		return nil, err
 	}
 	return out, nil
+}
+
+// pendingBaseNameLocked reports whether a snapshot that has been FROZEN but
+// not yet rebased publishes (parent, name).
+//
+// This is the question the write path has to ask alongside "does the base
+// have this name", and the gap between the two is the whole rename-ghost
+// defect. A checkpoint publishes a frozen instant while the mount keeps
+// serving, and the base underneath only becomes that instant seconds later,
+// when the swap lands. In between, a name the instant contains sits in
+// neither place the overlay looks: not in the base yet, and — the moment the
+// session renames or unlinks it — no longer in oedge either. Deleting the
+// row was then taken as enough to make the name go away, and the swap put a
+// generation underneath that still had it, so both names resolved.
+//
+// So a name a pending snapshot published counts as a base name from the
+// instant it is frozen: removing it leaves a whiteout. Being early costs a
+// whiteout over a name the base turns out never to get, if the checkpoint
+// fails — and that resolves, lists, and seals identically to no row at all,
+// because the name is absent either way, which is what the caller asked for.
+func (fs *FS) pendingBaseNameLocked(parent uint64, name string) bool {
+	key := edgeName{parent: parent, name: name}
+	for _, st := range fs.snapEdges {
+		if _, ok := st.names[key]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // openSnapshotView builds the read-only FS over the frozen copy. It
@@ -335,7 +371,7 @@ func openSnapshotView(fs *FS, dir, stagingDir string, content contentStore) (*FS
 		content:    content,
 		prov:       prov,
 		modSeq:     make(map[uint64]uint64),
-		snapEdges:  make(map[uint64]map[uint64]provEdge),
+		snapEdges:  make(map[uint64]*snapshotState),
 	}, nil
 }
 

@@ -206,10 +206,34 @@ type FS struct {
 	modSeq map[uint64]uint64
 	// rebasedSeq is the highest seq already rebased away.
 	rebasedSeq uint64
-	// snapEdges holds, per snapshot seq, the merged namespace that
-	// snapshot published (child inode -> the edge naming it). Rebase
-	// replays it against the sealed base.
-	snapEdges map[uint64]map[uint64]provEdge
+	// snapEdges holds, per snapshot seq, what that frozen instant left the
+	// live overlay to reconcile against (see snapshotState).
+	snapEdges map[uint64]*snapshotState
+}
+
+// edgeName is one name in one directory: the key a whiteout is written at.
+type edgeName struct {
+	parent uint64
+	name   string
+}
+
+// snapshotState is what one frozen instant leaves behind for the LIVE
+// overlay, which keeps serving while that instant is being published.
+//
+// byInode is the namespace Rebase replays against the sealed base: child
+// inode -> the edge naming it. names is the same namespace keyed the other
+// way, and it exists because the two questions are different ones. Rebase
+// asks "where does this inode live", and one name per inode answers it. The
+// write path asks "is this NAME about to appear underneath me", and for a
+// hardlinked inode every one of its names has to answer yes, so the set has
+// an entry per EDGE rather than per inode.
+//
+// Both are dropped together (retireSnapEdgesLocked, and Rebase once the
+// sealed generation is the one being served), because they answer for the
+// same instant and are wrong the moment it stops being pending.
+type snapshotState struct {
+	byInode map[uint64]provEdge
+	names   map[edgeName]struct{}
 }
 
 const (
@@ -377,7 +401,7 @@ func Open(dir string, base *genfs.FS, opts Options) (*FS, error) {
 		content:    content,
 		prov:       make(map[uint64]provEdge),
 		modSeq:     make(map[uint64]uint64),
-		snapEdges:  make(map[uint64]map[uint64]provEdge),
+		snapEdges:  make(map[uint64]*snapshotState),
 	}, nil
 }
 

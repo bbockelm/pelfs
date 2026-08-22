@@ -157,13 +157,18 @@ type Stats struct {
 	StagedFiles int
 	// StagedBytes sums the staging files' sizes.
 	StagedBytes int64
-	// ResidentProv and ResidentSnapEdges are the two per-inode maps this
-	// struct holds in MEMORY rather than in SQLite, reported because a
-	// mount that grows without its dirty set growing is otherwise
-	// undiagnosable from outside the process. Both are ~66 B/entry: prov
-	// caches one base descent step per inode the session has named
-	// (overlay.go), snap edges hold the merged namespace a snapshot
-	// published and are bounded to the newest snapshot's (snapshot.go).
+	// ResidentProv and ResidentSnapEdges are the per-inode maps this struct
+	// holds in MEMORY rather than in SQLite, reported because a mount that
+	// grows without its dirty set growing is otherwise undiagnosable from
+	// outside the process. prov caches one base descent step per inode the
+	// session has named, at ~66 B/entry (overlay.go).
+	//
+	// ResidentSnapEdges counts the namespace a pending snapshot published,
+	// bounded to the newest snapshot's (snapshot.go). It is one COUNT over
+	// two maps of that namespace — by inode for the rebase, by name for the
+	// write path — so the bytes behind an entry are about double prov's.
+	// Two maps rather than one because the two questions differ for a
+	// hardlinked inode; see snapshotState.
 	ResidentProv      int
 	ResidentSnapEdges int
 }
@@ -174,8 +179,8 @@ func (fs *FS) Stats() (Stats, error) {
 	defer fs.mu.Unlock()
 	var s Stats
 	s.ResidentProv = len(fs.prov)
-	for _, edges := range fs.snapEdges {
-		s.ResidentSnapEdges += len(edges)
+	for _, st := range fs.snapEdges {
+		s.ResidentSnapEdges += len(st.byInode)
 	}
 	if err := fs.q.QueryRow(`SELECT count(*) FROM onode`).Scan(&s.DirtyNodes); err != nil {
 		return Stats{}, err

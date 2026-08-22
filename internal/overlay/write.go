@@ -144,10 +144,21 @@ func (fs *FS) Mknod(ctx context.Context, parent uint64, name string, typ uint8, 
 	}, nil)
 }
 
-// baseHasEdgeLocked reports whether the BASE generation has an edge at
-// (parent, name) — the whiteout-needed test when an oedge goes away. q
-// must be the caller's active handle (single-connection pool).
+// baseHasEdgeLocked reports whether the base UNDER THIS OVERLAY has, or is
+// about to have, an edge at (parent, name) — the whiteout-needed test when
+// an oedge goes away. q must be the caller's active handle
+// (single-connection pool).
+//
+// "Is about to" is not a hedge: a frozen snapshot that has not been rebased
+// yet is a generation already being published, and every name in it will be
+// served by the base the moment the swap lands. Asking only about the
+// generation currently mounted is what left rename sources, unlinked names
+// and rmdir'd directories visible after a mid-session checkpoint
+// (pendingBaseNameLocked, snapshot.go).
 func (fs *FS) baseHasEdgeLocked(ctx context.Context, q querier, parent uint64, name string) (bool, error) {
+	if fs.pendingBaseNameLocked(parent, name) {
+		return true, nil
+	}
 	backed, err := fs.baseBackedLocked(q, parent)
 	if err != nil || !backed {
 		return false, err

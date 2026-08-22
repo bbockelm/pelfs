@@ -1,60 +1,76 @@
 # hostile plan: seed=0
-# expect: flaky-open fuse nfs
 #
-# FOUND AT HEAD (3813c62) BY THIS EXERCISER, 2026-08-22. NOT FIXED --
-# product code is outside the hostile-agent run's territory. Filed for
-# triage under "hostile-agent" in docs/TODO.md.
+# FIXED REGRESSION. Found at 3813c62 by this exerciser on 2026-08-22 and
+# filed unfixed; fixed in the overlay on 2026-08-22 (`renameghost-agent`
+# in docs/TODO.md). It carried a flaky-open marker for both backends and
+# now carries NO marker at all, which is the whole point of the
+# reclassification: this entry ASSERTS the corrected behaviour on both
+# backends and goes red if the ghost ever comes back. Do not re-add a
+# marker to quieten it -- the parser reads any such line as live, prose or
+# not, so the words for one are deliberately not written here.
 #
-# THE FINDING. A file created and then RENAMED inside one session can be
-# left visible under BOTH names once a checkpoint seals between the two
-# operations. The directory listing gains a ghost:
+# WHAT IT PINS. A file created and then RENAMED inside one session was left
+# visible under BOTH names once a checkpoint sealed between the two
+# operations. The directory listing gained a ghost:
 #
 #     d/sub: entries differ
 #         mount:     [c013.dat f00.txt f01.txt f02.txt m000.dat ...] (44 entries)
 #         reference: [f00.txt f01.txt f02.txt m000.dat ...]          (43 entries)
 #
 # c013.dat is a rename SOURCE. It was created, renamed to m013.dat, and a
-# --snapshot-interval checkpoint published in between; the new name is
-# there, and so is the old one. The reference tree on tmpfs, given the
+# --snapshot-interval checkpoint published in between; the new name was
+# there, and so was the old one. The reference tree on tmpfs, given the
 # identical op sequence, holds only the new name.
 #
-# NOT A FRONTEND BUG. It was first seen on the NFS backend and then
-# reproduced on FUSE, which rules out go-nfs and internal/vfsbilly --
-# raw FUSE resolves no paths at all. It is in the layer both share: the
-# merge of the overlay against the generations a checkpoint keeps
-# publishing underneath it.
+# THE MECHANISM, because it is not where the symptom points. A checkpoint
+# is freeze -> seal the frozen instant -> swap the base -> rebase, and the
+# mount keeps serving for all of it. The overlay decides whether removing a
+# name needs a WHITEOUT by asking whether the base has that name
+# (overlay/write.go, baseHasEdgeLocked). During a checkpoint that question
+# had a wrong answer available: c013.dat was in the instant being published
+# but not yet in the mounted base, so the rename deleted its edge row and
+# wrote no whiteout -- and the swap then put a generation underneath that
+# did have it. Nothing hid the old name, so both resolved. The fix makes a
+# name in a FROZEN-but-not-yet-rebased snapshot count as a base name from
+# the moment it is frozen (overlay/snapshot.go, pendingBaseNameLocked), so
+# the removal leaves a whiteout for the generation that is about to arrive.
 #
-# WHY IT MATTERS MORE THAN ONE STRAY NAME. At scale the ghosts accumulate
-# and the listing degrades badly. In a 5,482-op run at a 100ms cadence
-# one directory held 3,080 entries where the reference held 7, the same
-# names repeated hundreds of times, and directories were also MISSING
-# entries that were never touched. Downstream, `rm -rf` fails outright:
+# NOT A FRONTEND BUG, which is what made it findable here: it was seen
+# first on the NFS backend and then reproduced on FUSE, ruling out go-nfs
+# and internal/vfsbilly -- raw FUSE resolves no paths at all.
+#
+# WHY IT MATTERED MORE THAN ONE STRAY NAME. The ghosts accumulated one per
+# checkpoint that caught a rename, and the listing degraded badly: in a
+# 5,482-op run at a 100ms cadence one directory held 3,080 entries where
+# the reference held 7. Downstream it became:
 #
 #     rmrf storm2.renamed/bigdir90
 #       reference: ok
 #       mount:     removeat storm2.renamed/bigdir90: directory not empty
 #
-# which is the same sentence as the release-week bug the owner reported
-# (`rm: .../condor_tests: Directory not empty`) arrived at by a different
-# route. A sweep removes everything the listing named; entries the
-# listing never named survive, and the rmdir behind them refuses.
+# the same sentence as the release-week report (`rm: .../condor_tests:
+# Directory not empty`) reached by a different route: a sweep removes
+# everything the listing named, entries the listing never named survive,
+# and the rmdir behind them refuses.
 #
-# THE AMPLIFIER, and why this entry is `flaky-open` rather than
-# `known-open`. It is a RACE between a checkpoint sealing and the ops
-# around it, so it fires only sometimes: roughly 2 runs in 3 for this
-# plan at a 100ms cadence, and rarely at the 1s cadence CI uses. Raise
-# the rate on demand:
+# THE AMPLIFIER. It was a RACE between a checkpoint sealing and the ops
+# around it, so it fired roughly 2 runs in 3 for this plan at a 100ms
+# cadence and rarely at the 1s cadence CI uses. That is still the way to
+# stress it:
 #
 #     scripts/hostile-docker.sh --plan \
 #       internal/hostile/testdata/corpus/rename-ghost-across-checkpoint.plan \
 #       --snapshot 100ms --run TestHostileFUSE
 #
-# 85 ops, about 6 seconds. Do NOT read a passing run as a fix.
+# 85 ops, about 6 seconds. A single passing run was never evidence of a
+# fix and still is not; the deterministic proof is
+# TestRenameAcrossCheckpointLeavesNoGhost and its neighbours in
+# internal/overlay/renameghost_test.go, which drive the checkpoint boundary
+# by hand instead of waiting for a cadence to land on it.
 #
 # The product default is --snapshot-interval 5m, so a checkpoint lands
-# between a create and a rename only in a long session -- which is
-# exactly the session nobody runs in a gate, and exactly the one a user
-# has.
+# between a create and a rename only in a long session -- which is exactly
+# the session nobody runs in a gate, and exactly the one a user has.
 mkdir d mode=0755
 mkdir d/sub mode=0755
 create d/sub/f00.txt len=32 fill=41

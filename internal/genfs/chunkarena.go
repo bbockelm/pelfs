@@ -84,6 +84,18 @@ import (
 // is taking — the parked-read discipline gencache_test.go pins for the file
 // cache — and no two goroutines are ever inside the same bytes.
 //
+// The one flag that is read WITHOUT the slot lock is dead, and it is atomic
+// for it. Two places need to know whether a slot is a corpse while they hold
+// a SHARD lock: the tail of put, deciding whether the fill it just made is
+// still worth publishing, and forget, deciding whether the entry it found is
+// the one it came to remove. Neither may take the slot lock to ask, because
+// an eviction holds that lock across its wait for readers and a shard lock
+// held behind that wait would stall every reader in the shard. So they load
+// it, and because they load it outside the lock kill stores it atomically.
+// What that buys is race-freedom and NOT ordering: a slot can die between
+// the load and the use, so put publishes and then looks again, and whichever
+// of the two goroutines sees the corpse in the index takes it out.
+//
 // ADMISSION, and the mapping is in TWO REGIONS because of it.
 //
 // One wrapping cursor over the whole mapping thrashes as soon as the working
@@ -169,19 +181,25 @@ const chunkArenaShare = 8
 
 // arenaSlot is one decoded chunk's place in the mapping.
 //
-// mu guards BOTH the bytes and the flags, which is what makes the mapping
-// safe to share: a filler holds it exclusively while it writes, a reader
-// shared while it copies, and the allocator exclusively when it takes the
-// space back. dead is one-way — a slot never comes back to life, and the
-// space is described by a NEW slot when it is handed out again — so a
-// reader that finds a live slot and copies under the read lock has read
-// bytes nobody was writing.
+// mu guards the BYTES, which is what makes the mapping safe to share: a
+// filler holds it exclusively while it writes, a reader shared while it
+// copies, and the allocator exclusively when it takes the space back. dead
+// is one-way — a slot never comes back to life, and the space is described
+// by a NEW slot when it is handed out again — so a reader that finds a live
+// slot and copies under the read lock has read bytes nobody was writing.
+//
+// dead is ATOMIC as well as being set under mu, and the two are not the same
+// requirement: the lock is what makes an eviction WAIT for the readers
+// inside the slot, and the atomic is what lets put's publish and forget ask
+// whether a slot is a corpse while they hold a shard lock instead (see the
+// note at the top of the file). A plain bool read there is a data race with
+// kill, and it was one — docs/TODO.md, arenarace-agent.
 type arenaSlot struct {
 	off    int64
 	length int64
 	mu     sync.RWMutex
-	filled bool // the bytes are there
-	dead   bool // the space has been given to someone else
+	filled bool        // the bytes are there, guarded by mu
+	dead   atomic.Bool // the space has been given to someone else
 
 	// served records that this slot answered at least one read since it
 	// was filled, and reused that one of those reads started at offset
@@ -452,7 +470,7 @@ func (a *chunkArena) kill(s *arenaSlot) {
 		return
 	}
 	s.mu.Lock()
-	s.dead = true
+	s.dead.Store(true)
 	s.mu.Unlock()
 }
 
@@ -473,7 +491,7 @@ func (a *chunkArena) read(idHex string, off int64, window []byte) bool {
 	// filled and not dead, checked INSIDE the lock the allocator has to
 	// take before it can hand this space to anyone else. Past this point
 	// the bytes cannot move until the copy is done.
-	if !s.filled || s.dead || off < 0 || off+int64(len(window)) > s.length {
+	if !s.filled || s.dead.Load() || off < 0 || off+int64(len(window)) > s.length {
 		s.mu.RUnlock()
 		return false
 	}
@@ -526,7 +544,7 @@ func (a *chunkArena) put(idHex string, plain []byte) {
 		a.forget(k)
 	}
 	s.mu.Lock()
-	if s.dead {
+	if s.dead.Load() {
 		// The cursor came all the way round and gave this space to someone
 		// else while we were queued behind their readers. Nothing to undo:
 		// the slot was never published.
@@ -539,20 +557,42 @@ func (a *chunkArena) put(idHex string, plain []byte) {
 	sh.mu.Lock()
 	// Published only if it is STILL alive: the cursor may have lapped
 	// between the copy above and this line.
-	if !s.dead {
+	live := !s.dead.Load()
+	if live {
 		sh.byID[idHex] = s
 	}
 	sh.mu.Unlock()
 	a.fills.Add(1)
+	if live && s.dead.Load() {
+		// And it died between that check and the publish. Normally the
+		// killer takes its victims out of the index itself, but its forget
+		// runs after its kill and may already have looked at this shard and
+		// found nothing — this fill had not published yet. In that one
+		// interleaving nobody else is left to notice, and an index entry
+		// naming a dead slot is permanent: every read of it misses, and
+		// put's own duplicate check refuses to ever cache the chunk again.
+		//
+		// It cannot serve wrong bytes — read re-checks dead under mu, which
+		// kill holds — so this is the tier quietly losing a chunk, not the
+		// mapping losing its integrity. It is still a leak, and the fill
+		// that made it is the one that can clean it up.
+		a.forget(idHex)
+	}
 }
 
 // forget removes a key whose slot the cursor has taken back — and only if
-// the map still names THAT slot, since a concurrent fill may already have
-// published a fresh copy of the same chunk somewhere else in the mapping.
+// the entry it finds is itself dead, since a concurrent fill may already
+// have published a fresh copy of the same chunk somewhere else in the
+// mapping, and that copy is nobody's to remove but its own killer's.
+//
+// The entry it finds may be a slot this goroutine never touched, so the
+// deadness test is an atomic load and not a read under the slot's lock:
+// this is holding a shard lock, and a shard lock must not wait on a slot
+// lock that an eviction holds across its wait for readers.
 func (a *chunkArena) forget(key string) {
 	sh := a.shard(key)
 	sh.mu.Lock()
-	if s := sh.byID[key]; s != nil && s.dead {
+	if s := sh.byID[key]; s != nil && s.dead.Load() {
 		delete(sh.byID, key)
 	}
 	sh.mu.Unlock()

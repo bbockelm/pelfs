@@ -83,10 +83,7 @@ func (fs *FS) ArenaOverlaps() (overlaps, indexed int, resident, size int64) {
 	for _, r := range a.regions() {
 		for i := r.head; i < len(r.q); i++ {
 			s := r.q[i]
-			s.mu.RLock()
-			dead := s.dead
-			s.mu.RUnlock()
-			if !dead {
+			if !s.dead.Load() {
 				live = append(live, s)
 				resident += s.length
 			}

@@ -334,6 +334,11 @@ successor key it already minted instead of generating a second one.
 
 ## Caveats (prototype)
 
+These are the ones that change how you use it. Defects that are found and
+not yet fixed, and the limitations that are accepted on purpose, are
+tracked in [`docs/known-issues.md`](docs/known-issues.md) — every entry
+there says whether an executable test pins it.
+
 - **Single writer per BRANCH.** The advisory lease is detection, not mutual
   exclusion: the transport has no compare-and-swap. A seal that would
   overwrite another writer's generation is refused, so the failure mode is

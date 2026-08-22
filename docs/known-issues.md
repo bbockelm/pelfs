@@ -1,0 +1,470 @@
+# Known issues
+
+Open defects that have been **found and not fixed**, and limitations that
+were **accepted on purpose**. This file is TRACKED, which is the whole
+point of it: a bug that lives only in one working copy has not been filed.
+
+Where the other three homes are, so nothing is duplicated into this one:
+
+| document | scope | tracked? |
+|---|---|---|
+| `docs/known-issues.md` (this file) | open defects + accepted limitations, as of **main** | yes |
+| `docs/TODO.md` | the working punchlist — burn-down, agent notes, post-mortems | **no**, `.gitignore:4` |
+| `CHANGELOG.md` → *Known limitations* | what a given RELEASE shipped with, frozen | yes |
+| `README.md` → *Caveats (prototype)* | what a USER has to know before mounting | yes |
+| `internal/hostile/testdata/corpus/*.plan` | findings pinned as executable plans | yes |
+
+Rules for an entry here:
+
+1. **Every entry says whether an executable test pins it**, in those words.
+   A tracked bug and a tracked hope look identical in a document and
+   nothing alike in a repository, and the difference is worth one line.
+2. An entry is deleted when the defect is fixed, not annotated — the fix's
+   own test is the record from then on, and `git log` is the history.
+3. Verified against a commit, and the commit is named. A claim carried
+   forward on faith is how `docs/TODO.md` came to assert that the v0.1.0
+   tag was unpushed three weeks after the release went out.
+
+**Audited at `25100f3` (main, 2026-08-22)** by triage-agent, against every
+open item in `docs/TODO.md`. What was audited and found already fixed is
+listed at the bottom, so nobody re-files it.
+
+---
+
+## Open defects
+
+### KI-1. `link(2)` of a clean inode after a checkpoint fails
+
+**Severity: high for a FUSE writer that hard-links; unreachable on the
+path frontends.** `ln` of a file that has been sitting still — which is
+exactly the file anybody hard-links — fails with
+
+```
+overlay: no base provenance for inode N
+```
+
+**Mechanism.** `link(2)` is the one namespace operation that names its
+subject by BARE INODE and resolves no name: the kernel sends
+`LinkIn.Oldnodeid` and `internal/rawfuse/rw.go:184-195` passes it straight
+to `overlay.FS.Link` (`internal/overlay/write.go:663`). For a clean
+(base-backed) inode `Link` calls `persistChainLocked`
+(`write.go:687`), which reads the base descent step out of the `fs.prov`
+cache **alone** and treats a miss as impossible —
+`internal/overlay/overlay.go:619`, "Unreachable under the kernel contract:
+detaching an inode requires having looked it up". That was true of every
+caller but this one. It also used not to matter, because nothing ever
+deleted from `prov`; then the checkpoint's provenance sweep
+(`internal/overlay/rebase.go:332`, added to bound a map that was ~6.6 GB at
+the hundred-million-object target) started dropping the entry for every
+inode a published generation cleaned. An unreachable error became an
+ordinary one, and a cache whose miss is a hard error is not a cache.
+
+Reachable on FUSE whenever the kernel serves a **cached dentry** instead of
+issuing a LOOKUP — and clean inodes get the longest entry and attribute
+TTLs this binding hands out, so the common case is the failing one. The
+path frontends (`internal/vfsbilly`, and NFS through it) resolve by name,
+record provenance on the way in, and cannot reach it.
+
+**Reproduce.** Create a file, let a checkpoint publish it, then link it
+with no intervening LOOKUP. As a unit test:
+`internal/publish/memtablereadopt_test.go`'s
+`TestAnAdoptedFileWithTwoNamesReopens` with its post-adoption lookup
+removed.
+
+**Code.** `internal/overlay/overlay.go:605-627` (`persistChainLocked`),
+`internal/overlay/rebase.go:300-333` (the sweep and its reasoning),
+`internal/overlay/write.go:663-706` (`Link`),
+`internal/rawfuse/rw.go:184-195` (the bare inode arriving).
+
+**Pinned by an executable test: NO at `25100f3`.** Nothing in the tree
+fails because of this. The hostile exerciser HAS a `link` op
+(`internal/hostile/plan.go:67`) and has never caught it, which is
+consistent with the mechanism: the exerciser links through real syscalls,
+so whether a LOOKUP precedes the LINK is up to the kernel's dcache. Any
+corpus entry for it is `flaky-open` at best.
+
+**Fix shape** (deliberately not done as triage): `genfs` already holds
+`(parent, name)` for every resident inode — the residency record `Swap`
+re-descends from — so an accessor for it lets `persistChainLocked` fall
+back to the base's own copy of the descent step instead of only its cache.
+That is a `genfs` API change with its own tests.
+
+> **In flight, uncommitted, as this entry was written (2026-08-22, by
+> prov-agent).** A concurrent session has exactly that fix in this working
+> tree, plus the pins: `genfs.FS.Edge`, the fallback in
+> `persistChainLocked`, `internal/overlay/linkprov_test.go` (four cases —
+> the bug, a multi-level chain, a second checkpoint, and the ESTALE
+> boundary the fallback must not cross), a marker-free corpus entry
+> `link-clean-inode-after-checkpoint.plan`, and a `shapeHardlinkWeb` that
+> buys one checkpoint per plan so the random lane probes it too.
+> **Delete this entry when that lands** — from then on those are the
+> record. It is kept here because at `25100f3` the defect is real and
+> nothing tracked pins it, and because an entry that disappears when a fix
+> lands is the correct lifecycle for this file. If that work is abandoned
+> instead, this entry is still accurate and still unpinned.
+
+### KI-2. Crash-stranded scratch directories are never swept
+
+**Severity: medium; bites anyone whose seal is killed.** A killed seal
+strands gigabytes in the state directory and nothing ever collects them.
+
+**Mechanism.** `sweepRetiredOverlays` empties exactly one directory,
+`<stateDir>/trash` (`cmd/pelfs/mountgen.go:2159-2168`, wired at
+`mountgen.go:710`). The three scratch families all live in the state-dir
+ROOT, are cleaned only on the happy path, and no sweeper globs them:
+
+| scratch | created | happy-path cleanup |
+|---|---|---|
+| `<stateDir>/snapshot-*` | `cmd/pelfs/mountgen.go:1476` | `retireDir` renames into `trash` (`mountgen.go:1500`) |
+| `<stateDir>/publish-*` | `internal/publish/publish.go:351` (`SpoolDir` set at `mountgen.go:1540`) | `defer os.RemoveAll` (`publish.go:355`) — this is the gigabytes case, packs spool here |
+| `<stateDir>/repack` | `cmd/pelfs/autorepack.go:350`, `cmd/pelfs/repack.go:71` | none: `internal/repack/execute.go:167`'s `defer os.RemoveAll` fires only for the `SpoolDir == ""` temp fallback |
+
+**Reproduce.** `kill -9` a writable mount mid-seal (the crash phase of
+`scripts/e2e-docker.sh` does this), then list the state directory:
+`publish-*` survives with its spooled packs.
+
+**Pinned by an executable test: NO.** The retired-overlay sweeper has
+tests; the state-dir root has none, and no test asserts that a state
+directory is clean after a crash.
+
+### KI-3. The dedup sidecar never drops a dead chunk, and a repack silently invalidates it
+
+**Severity: medium — unbounded local disk, plus a full re-upload of the
+dedup savings after every repack.**
+
+**Mechanism.** Two halves. (a) `loadDedupIndex` merges every stored row
+into `chunkSeen` and `saveDedupIndex` writes all of `chunkSeen` back
+verbatim (`internal/publish/dedup.go:76`, `:122-129`), so an entry is never
+dropped; the file's own comment says a v2 repack "must rewrite the index
+with exactly the live set it computed" (`dedup.go:20-23`) and
+`internal/repack` contains no reference to the sidecar at all. (b) Worse
+than stale: repack publishes `prev.Generation + 1`
+(`internal/repack/execute.go:718`) without restamping the sidecar, while
+`loadDedupIndex` requires `meta["generation"] == Prev.Generation`
+(`dedup.go:62-64`) — so after a repack the sidecar is ignored **in full**
+and the first post-repack seal re-uploads everything it would have
+deduplicated, with the stale file (dead chunks included) sitting on disk
+until that seal overwrites it.
+
+**Reproduce.** Seal, repack `--apply`, seal again with unchanged content
+and watch the upload volume; or check `v2-dedup.db`'s size across a long
+autosave-shaped workload.
+
+**Code.** `internal/publish/dedup.go`, `internal/repack/execute.go:718`,
+sidecar path at `cmd/pelfs/mountgen.go:1549`.
+
+**Pinned by an executable test: NO** for either half. No test asserts the
+sidecar shrinks, and none asserts a post-repack seal still deduplicates.
+
+### KI-4. No checkpoint-health signal: no last-checkpoint time, no failure count
+
+**Severity: medium, operators.** A periodic checkpoint that fails forever
+is invisible to every reporting surface except a WARN in `daemon.log`. This
+is the early warning for the whole class of "the mount looks fine and has
+published nothing for a day".
+
+**Mechanism.** The maintenance half of this shape landed with auto-collect
+— `Summary.Maintenance` carries `last_repack_at`, `last_gc_at`,
+`collections`, `reclaimed_objects`, `reclaimed_bytes`, `condemned_bytes`,
+the grace window applied, `collection_failures` and `last_collection_error`
+(`internal/stats/stats.go:225-246`, reported by
+`pelfs ctl <mount> status`). The **checkpoint** half did not. The seal
+block of `Summary` is counters and ids only — `Seals`, `SealedGeneration`,
+`SealedChunks`, `SealedCatalogs`, `SealedPacks`, `SealOK`
+(`stats.go:186-197`) — with no timestamp anywhere:
+`grep -rn 'LastCheckpoint\|last_seal' --include=*.go` is empty repo-wide.
+And the failure count is not merely unreported, it is never computed:
+`checkpointPeriodically` (`cmd/pelfs/mountgen.go:1877-1993`) keeps a local
+`backoff` duration, resets it on success (`:1971`), warns
+(`:1976-1979`), and never touches `g.stats`. `SealOK`
+(`mountgen.go:2030`) is a boolean about the seal at EXIT.
+
+**Field shape to copy:** `MaintenanceStats`.
+
+**Pinned by an executable test: NO** — and it cannot be, since the fields
+do not exist. This is a gap, not a regression risk.
+
+### KI-5. No standing size signal for a volume nobody mounts writably
+
+**Severity: low-medium.** "Do I need a repack?" is answerable only by
+paying for a full sweep.
+
+**Mechanism.** No volume pack count and no volume byte total in the stats
+file. The nearest fields, `PrefetchPacks` / `PrefetchBytes`
+(`internal/stats/stats.go:155-156`), are the right number written from
+exactly one place — `runPrefetch`'s recorder, `cmd/pelfs/mountgen.go:1025`
+— so a mount without `--prefetch` leaves both zero. `pelfs ctl <mount>
+status` (`mountgen.go:2183-2245`) reports neither. Offline it IS answered
+twice, both by commands that do real work: `pelfs repack-plan` prints
+`packs: <n>, <bytes> (<pct> live)` (`cmd/pelfs/repackplan.go:190`) and
+`pelfs fsck` prints a pack count (`cmd/pelfs/fsck.go:94`). Auto-repack
+narrowed this for volumes that ARE mounted writably; the volume this item
+was written for is the one nobody mounts.
+
+**Pinned by an executable test: NO** (nothing to pin).
+
+### KI-6. Terminal federation errors are neither classed nor logged
+
+**Severity: low-medium, diagnosis.** When a transfer fails permanently, the
+class the retry loop just computed is thrown away.
+
+**Mechanism.** `internal/packstore/retry.go:189-194` returns a
+non-retryable error with no counter and no log line, on the stated grounds
+that logging FAILED there would cry wolf on every legitimate 404 probe —
+a good reason not to log, not a reason to discard the class. `retryable`
+(`retry.go:216-227`) distinguishes context-end from `isNotExist` from a
+`"404"`/`"not found"` substring and returns a bare bool.
+`internal/packstore` imports no `stats` at all. The op IS counted
+downstream, because the stats wrapper sits inside the retry loop
+(`cmd/pelfs/mountgen.go:487`), into per-verb `Errors` plus 20 error samples
+(`internal/stats/stats.go:88-104`, `:460-505`) — which is precisely the
+"one scalar + verb-split" that is not enough to tell a misconfigured token
+from a flaky link.
+
+**Pinned by an executable test: NO.**
+
+### KI-7. SETATTR is one SQLite transaction per attribute
+
+**Severity: performance; bites every archive restore.** `tar`'s
+chown/chmod/utimes triple is three transactions per file, and `SetAttr`
+alone was measured at 22% of untar CPU. The cheapest remaining write-path
+win.
+
+**Mechanism.** `overlay.FS.SetAttr` takes `fs.mu` then one `withTx`
+(`internal/overlay/write.go:606-613`), and `withTx` is
+`Begin`…`Commit`, one commit per call
+(`internal/overlay/overlay.go:502-519`). No group commit, no deferred
+writeback. `internal/rawfuse/rw.go:301-330` does merge mode/uid/gid/size/
+mtime WITHIN one kernel request, but tar's three syscalls arrive as three
+requests; `internal/vfsbilly/vfsbilly.go:908-953` calls `SetAttr` once per
+operation from `Chmod`/`Chown`/`Lchown`/utimes.
+
+**Reproduce.** `make big-tree`, or `scripts/e2e-docker.sh`'s untar leg,
+with a CPU profile from `pelfs ctl <mount> pprof cpu`.
+
+**Pinned by an executable test: NO.** `BenchmarkOverlayCreateWrite`
+(`internal/overlay/bench_test.go:69`) exercises a `SetAttr` but asserts no
+cost, and nothing fails if the per-attribute transaction count grows.
+
+### KI-8. The location cap is lifted wholesale for two whole-map callers
+
+**Severity: high at the design target, invisible below it.** The C2
+burn-down capped the read path's resident location map at 131,072 entries
+(~21 MB, measured); two callers still opt out and hold every location —
+measured at 169-174 bytes each, so 15.8-16.2 GB at 100M objects.
+
+**Mechanism.** `packIndex.holdEverything`
+(`internal/genfs/packindex.go:282-286`) sets `unbounded` one-way and is
+called from `packIndex.all` (`:547`). Callers of `all` at HEAD:
+
+- `FS.ContentOf` — `internal/genfs/read.go:155`, protecting the "present in
+  no listed pack" verdict at `read.go:177-179`. Reached from the seal walk
+  (`internal/overlay/accessors.go:381` → `internal/publish/source.go:305`)
+  **and from an ordinary write's copy-up** (`internal/memtable/base.go:71`
+  ← `internal/overlay/write.go:528`), so this is reachable without sealing.
+- `FS.Prefetch` — `internal/genfs/prefetch.go:110`.
+- `FS.LoadPackIndex` (`packindex.go:517`) has no non-test callers.
+
+**The blocker named in the TODO is gone**: the "spill the merged trailers
+into a sorted, mmap'd, binary-searchable table" step was built — as
+`internal/extsort`, for `internal/fsck` and `internal/reach`
+(`internal/fsck/fsck.go:202-224`). It was simply never wired into
+`packIndex`. Note also that **fsck is no longer a `holdEverything` caller**
+— `internal/fsck` does not reference `packIndex` at all — so both
+`docs/TODO.md`'s list and the code comment at `packindex.go:531-534` name
+it wrongly.
+
+**Pinned by an executable test: PARTLY.** `TestLocationHeap`
+(gated, `PELFS_LOCATION_HEAP=1`) measures per-location heap and pins the
+CAP; nothing fails because `ContentOf` and `Prefetch` bypass it.
+
+### KI-9. A repack stamps its condemned-ledger rows from the wall clock
+
+**Severity: low in production, real for testability.** It makes a class of
+test impossible to write, which is why it is here rather than in the
+punchlist.
+
+**Mechanism.** `internal/repack/execute.go:716` takes `now := time.Now()`
+and stamps `CreatedUnixNano` (`:719`), the condemned-ref rows (`:783`),
+retired indexes (`:789`, `:824`), `RepackUnixNano` (`:836`) and condemned
+packs (`:842`) from it — while the same call path has an injected clock,
+`Options.Now` (`internal/repack/repack.go:134`), and uses it for the
+ledger-room check two hundred lines earlier (`execute.go:196`). Harmless in
+production, where the wall clock IS the right clock.
+
+**Consequence.** A test cannot drive the ledger's clock through a repack.
+That is why the mount-level auto-collect test asserts only the windows and
+the reporting, and why the end-to-end "condemned, then collected" property
+had to be written in the lifecycle interleaving where the world drives its
+own clock.
+
+**Pinned by an executable test: NO, and cannot be.** Fixing it means
+deciding whether a repack's ledger stamp is inside the injectable clock —
+a repack-semantics call.
+
+---
+
+## Accepted limitations
+
+Deliberate, current on main, and each one either pinned or documented where
+a user will meet it. Listed here so a triage pass does not re-file them as
+defects.
+
+### KL-1. Rotating a key makes a pending merge base permanently unreadable
+
+A branch pins its merge base with a `fork-<branch>` tag, every tag stops
+verifying across a rotation, and `pelfs tag` can only freeze a branch HEAD
+— so there is no repair. The only correct advice is ordering: **merge
+first, then rotate.** `pendingForkTags` (`cmd/pelfs/rotate.go:250`) fetches
+each head and the command WARNS, naming each branch and its pinning tag,
+before writing anything (`rotate.go:294-299`); `--break-siblings` gates it.
+Not fixed on purpose: making rotation re-pin fork bases would have it mint
+new tags under the new key, which is a scope and blast-radius change.
+
+**Pinned by an executable test: YES.**
+`TestRotationMakesAPendingMergeBaseUnreadable`
+(`cmd/pelfs/rotaterescue_test.go:440`) drives `pelfs branch` for real,
+asserts the base is readable before, that the warning names the tag, and
+that the base is unreadable after — and so **fails loudly if the
+interaction is ever fixed elsewhere**, telling whoever fixed it to delete
+the warning.
+
+### KL-2. The exit drain is unbounded and cannot be interrupted
+
+A mount that is asked to exit while a checkpoint is in flight WAITS for it,
+with no deadline: a federation that never answers leaves the drain waiting
+for the transport's own timeouts or a SIGKILL, and under a batch system
+SIGTERM spends the grace period finishing the seal. That is the trade the
+owner asked for — a deadline here would be inventing policy.
+
+**Pinned by an executable test: YES.**
+`TestExitDrainsAnInFlightCheckpoint` (`cmd/pelfs/mountgen_test.go`) parks a
+checkpoint inside `sealLocked` behind a gated upload, asserts the drain
+does NOT return, then asserts the generation landed and the ref advanced.
+
+### KL-3. A branch NAME is not a lineage
+
+`(branch, generation)` is now an identity for retention attribution, but
+delete a branch, recreate it from an older generation and seal the same
+numbers again, and the two incarnations collide exactly as two branches
+used to. The newest-first scan favours the live one, and a repack that
+copied an old backup into a new pack can defeat that. Tag a generation to
+pin it exactly. Documented in `CHANGELOG.md` (*What is still not fixed*).
+
+**Pinned by an executable test: NO.** The attribution rule it qualifies is
+tested; this residue is not.
+
+### KL-4. A long grace window buys less than it looks like it buys
+
+The two derived-ref ledgers gain ~a row per checkpoint per key space
+against a 48 KiB cap (~517 hash-named rows), so past
+`517 x checkpoint-interval` the byte cap binds before the window does: the
+volume behaves as though its window were that long, and repack paces to the
+room left. At the 5-minute default that is ~43h — the 72h default is
+already past it and `--grace 30d` is past it forty-fold. Safe (pacing only;
+nothing a head or tag names is affected), so it is computed
+(`superblock.LedgerWindow`) and printed by `pelfs init` when the numbers
+collide rather than being prevented.
+
+**Pinned by an executable test: YES.**
+`TestTheLedgerCarriesAsManyRowsAsLedgerWindowClaims`
+(`internal/superblock/ledgerwindow_test.go:26`) holds the arithmetic to
+what the ledger rule actually does, so the sentence `pelfs init` prints
+cannot drift from the behaviour.
+
+### KL-5. Mixing a pelfs v0.1.0 client onto a v0.2 volume is asymmetric
+
+A v0.2 writer refuses while a live `meta/lease.json` exists (it cannot tell
+which branch that client is on) and never writes that object, so **a
+v0.1.0 client sees a v0.2 writer as unleased and mounts straight past it**
+— its only guard is then the seal's refusal to publish over a moved ref.
+Separately, `Branch` in the superblock is a one-way door: a v0.1.0 binary
+cannot read a generation a v0.2 writer sealed (`ErrBadSignature`, chosen
+over a quiet mis-read that would collect live packs).
+
+**Pinned by an executable test: YES.**
+`internal/lease/lease_test.go`'s `TestLiveVolumeLeaseExcludesEveryBranch`,
+`TestAnExpiredVolumeLeaseIsNoObstacle`,
+`TestStealLeaseDoesNotTouchTheVolumeLease`; the wire compatibility against
+CAPTURED v0.1.0 bytes in `internal/superblock/nextpubcompat_test.go`.
+Documented in `README.md` *Caveats*.
+
+### KL-6. The NFS frontend does not consult the AUTH_UNIX credential
+
+Every request is evaluated as the server process's own identity. The export
+is loopback and single-user, and any local process can dial 127.0.0.1 and
+claim any uid, so honoring the credential would make the check look like a
+security boundary, which it is not. This is FIDELITY — the same answer
+through both frontends — and not access control. Written down in those
+words in `docs/go-nfs-patches.md`.
+
+**Pinned by an executable test: YES** for the model it implements
+(`internal/vfsbilly/perm_test.go`, plus the `permission_gate` in
+`scripts/mount-gate-test.sh` which compares every permission answer over a
+real kernel NFS client against the same probe on a local tree). The
+credential decision itself is a policy, not a behaviour to assert.
+
+---
+
+## `CHANGELOG.md` v0.1.0 *Known limitations*: status on main
+
+Those entries are RELEASE-scoped and stay where they are —
+`CHANGELOG.md:551-610` describes what v0.1.0 shipped and must not be
+rewritten. But a reader who arrives from the release notes should not be
+misled about **main**, so:
+
+| v0.1.0 limitation | on main (`25100f3`) |
+|---|---|
+| Reclamation is manual; a repack then a sweep frees nothing | **fixed** — a writable mount repacks AND collects itself (`--no-auto-gc`); `Summary.Maintenance` reports both halves. A volume nobody mounts writably is still never maintained (see KI-5). |
+| Grace window 72h, not configurable | **fixed** — `pelfs init --grace`, carried forward by every seal, read by the sweep, the planner and all three ledgers, one-hour floor. See KL-4 for what a large window really buys. |
+| Retain window only as good as the superblock backups | **unchanged and still true**; reported and warned about, never silently assumed. |
+| A repack cannot retire index or manifest objects | **fixed** — under 50% live pack coverage a repack drops the segment, re-emits the entries it still answers for, and condemns the old object through the existing ledger. |
+| Single writer per VOLUME rather than per branch | **fixed** — the key is `meta/lease-<branch>.json` (`internal/lease/lease.go:119`); `TestBranchesDoNotShareAWriteLease` (`cmd/pelfs/branch_test.go:698`) asserts the inverse of what v0.1.0 pinned. The legacy object is still READ, never written: see KL-5. |
+| Two diverged branches stay diverged; no merge | **fixed** — `pelfs merge`, report-first, three-way over the catalogs, reads no file content. A v0.1.0 branch has no fork record or inode lineage, so merging one needs its inodes renumbered first, which `pelfs merge` reports. |
+| The retain window over-retains on a multi-branch volume (no branch attribution) | **fixed** — a superblock records the ref it was sealed onto, so `(branch, generation)` is an identity; generations below a fork point and anything sealed by v0.1.0 keep the old conservative rule and the sweep says which it used. Residue: KL-3. |
+| No key rotation; `pelfs rescue` specified and not built | **both fixed** — `pelfs rotate` (two generations per branch, announce-then-apply, resumable) and `pelfs rescue` (rebuilds refs from the packs, verifies every scavenged backup, never deletes). New consequence: KL-1. |
+| The origin must permit GET/PUT/DELETE and listing | unchanged, checked up front. |
+
+The *Unreleased* section carries one **stale** claim of the same kind,
+noted here because it is exactly the failure mode this file exists to
+prevent: the NFS-permissions entry's "What can still surprise you"
+paragraph (`CHANGELOG.md:206-219`) says `access(2)` / `test -w` answer from
+an ACCESS RPC that ignores the mode, and that `tar -p` of a read-only file
+fails on the write. Both were fixed by the access-agent fork bump
+(`13c0560`) — honest ACCESS via `nfs.PermissionChecker` plus the
+knfsd-scoped owner override on the data path, gated by `permission_gate` in
+`scripts/mount-gate-test.sh`. See `docs/go-nfs-patches.md`.
+
+---
+
+## Audited and deliberately NOT carried here
+
+Checked against `25100f3` and found already fixed or stale. Recorded so the
+next pass does not re-file them.
+
+| item (`docs/TODO.md`) | verdict |
+|---|---|
+| **E5.** "local v0.1.0 is annotated at a64a15e, unpushed, already stale" | **STALE.** The retag happened: `v0.1.0` is annotated `b409546` over commit `e68a538` both locally and at `origin`, and the GitHub release published 2026-08-21. |
+| **G7**, first half: "README reclamation section stale (repack now exists)" | **FIXED.** `README.md:367-395` documents auto-repack, auto-gc, both windows, and the reporting. The second half — `pelfs ctl pprof` undocumented in the README, though it exists at `cmd/pelfs/ctl.go:42` — is a doc punchlist item and stays in `docs/TODO.md`. |
+| **"VOLUME-WIDE WRITE LEASE — NOT FIXED, DOCUMENTED"** | **FIXED** by the lease key-space change; see the table above and KL-5. `TestBranchesShareOneWriteLease` no longer exists; its inverse does. |
+| **"the half that is still open"** (go.mod fork pin, honest ACCESS) | **FIXED** by access-agent (fork `13c0560`, pin moved). |
+| **readopt: "A SECOND WRITABLE SESSION REFUSES TO START"** | **FIXED** by readopt-agent (two bugs in one sentence); the corpus entry `second-session-refuses-after-adopt.plan` is now a passing regression with its marker removed. |
+| **"SHAKEN LOOSE BY THE RAISED-OP RUNS"** — hostile phase E dies with `memtable: re-adopt inode N: genfs: stale inode (no residency)` | **FIXED** by the same readopt work: it is the same refusal, and phase E now starts on an adopted plan. |
+| **NFS frontend enforces no permission checks** (hostile finding) | **FIXED** by modebits-agent + access-agent. `nfs-ignores-mode-bits.plan` carries no marker and now FAILS if the write is ever accepted again. |
+| **nlink not decremented for a clean hardlinked file** | **FIXED** by nlink-agent (a third option, neither of the two the report proposed). |
+| **rename ghost across a checkpoint** | **FIXED** by renameghost-agent, with the whole sibling family (unlink, one of two hardlinks, rmdir, rename onto a name, cross-parent rename, recreate-over-whiteout). |
+| **C2**, the "fsck lifts the cap" claim | **STALE** in that detail — `internal/fsck` does not touch `packIndex`. The rest of C2 survives as KI-8. |
+| **F11** dead/unwired inventory; **G4**, **G6** doc-staleness sweeps | Real work, but hygiene and prose rather than defects or limitations. They stay in `docs/TODO.md`, which is what a punchlist is for. |
+
+At `25100f3` the hostile corpus holds **no open finding**: all six entries
+in `internal/hostile/testdata/corpus/` are marker-free, i.e. each is a
+regression that must PASS. That is a good state and worth checking against
+whenever this file gains an entry — a bug the corpus can express belongs
+there rather than here, because there it fails on its own.
+
+Nothing in this file is expressible as a plan, which is why they are here:
+a memory ceiling reached only at a hundred million objects (KI-8), a
+missing stats field (KI-4, KI-5), an error class thrown away (KI-6), a
+transaction count (KI-7), a wall clock in the wrong place (KI-9), and two
+things that need a crash or a repack plus a look at the disk (KI-2, KI-3).
+KI-1 is the exception and is the one being pinned as a plan.

@@ -214,6 +214,14 @@
   created and then written through one file descriptor — `tar -p` extracting
   a 0444 file — fails on the write over NFS where FUSE allows it. Both need
   a change in the go-nfs fork; see `docs/go-nfs-patches.md`.
+  *(Both done, later in this same unreleased window: the fork pin moved to
+  `13c0560`, which exports `nfs.PermissionChecker` so ACCESS is a
+  projection of the model above rather than an echo of the request, and
+  `internal/vfsbilly` takes the knfsd-scoped owner override on the data
+  path — the two are only safe together. `permission_gate` in
+  `scripts/mount-gate-test.sh` extracts a read-only tree with `tar -p`
+  over a real kernel NFS client and requires every permission answer to
+  match the same probe on a local tree, on both backends.)*
 
 - **The write lease is per branch.** It was `meta/lease.json`, one object
   for the whole prefix, so two writable mounts on DIFFERENT branches of one

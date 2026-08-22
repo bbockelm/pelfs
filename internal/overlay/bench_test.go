@@ -10,10 +10,12 @@ package overlay_test
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 
 	"github.com/bbockelm/pelfs/internal/overlay"
+	"github.com/bbockelm/pelfs/internal/publish"
 )
 
 func benchOverlay(b *testing.B, files int) (*overlay.FS, uint64, []string) {
@@ -159,5 +161,92 @@ func BenchmarkOverlayReaddir(b *testing.B) {
 		if _, err := ov.Readdir(ctx, dir); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// BenchmarkOverlayUnlinkCleanFile is the `rm -rf` shape against a
+// PUBLISHED tree: every name resolves through the base, every inode is
+// clean, and nothing the removal touches was written by this session. It
+// is the workload the release-week report was about (an rm -rf of a
+// kernel-tarball-sized tree), and it is the one a fix that materializes an
+// onode row per unlink would pay for.
+//
+// One iteration is one unlink. The pool is republished whenever it runs
+// out, off the clock.
+func BenchmarkOverlayUnlinkCleanFile(b *testing.B) {
+	const pool = 2048
+	ctx := context.Background()
+	var ov *overlay.FS
+	var dir uint64
+	var names []string
+	next := pool
+	refill := func() {
+		b.StopTimer()
+		fx := newFixture(b, "b0000000-0000-4000-8000-00000000b010")
+		v := openOverlay(b, fx, b.TempDir())
+		d, err := v.Mkdir(ctx, rootIno, "rmrf", 0755, 0, 0)
+		if err != nil {
+			b.Fatal(err)
+		}
+		names = make([]string, pool)
+		for i := range names {
+			names[i] = fmt.Sprintf("f%05d.dat", i)
+			n, err := v.Create(ctx, d.Inode, names[i], 0644, 0, 0)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if _, err := v.Write(ctx, n.Inode, 0, []byte("content")); err != nil {
+				b.Fatal(err)
+			}
+		}
+		// One whole checkpoint: the tree becomes the base generation's and
+		// the overlay forgets every row it wrote.
+		quietCheckpointB(b, fx, v)
+		ov, dir, next = v, d.Inode, 0
+		b.StartTimer()
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		if next == pool {
+			refill()
+		}
+		if err := ov.Unlink(ctx, dir, names[next]); err != nil {
+			b.Fatal(err)
+		}
+		next++
+	}
+}
+
+// quietCheckpointB is quietCheckpoint (renameghost_test.go) for a
+// benchmark, which gets a testing.TB rather than a *testing.T.
+func quietCheckpointB(b *testing.B, fx *fixture, ov *overlay.FS) {
+	b.Helper()
+	ctx := context.Background()
+	snap, err := ov.Snapshot(ctx, filepath.Join(b.TempDir(), "snap"))
+	if err != nil {
+		b.Fatalf("snapshot: %v", err)
+	}
+	defer snap.Close() //nolint:errcheck
+	res, err := publish.Seal(ctx, publish.Options{
+		OverlaySnapshot: snap,
+		Inner:           fx.inner,
+		SpoolDir:        b.TempDir(),
+		SigningKey:      fx.key,
+		Prev:            fx.head.Superblock,
+		PrevRaw:         fx.head.Raw,
+		TargetPackSize:  1 << 20,
+	})
+	if err != nil {
+		b.Fatalf("seal: %v", err)
+	}
+	if _, err := fx.base.Swap(ctx, res.Superblock); err != nil {
+		b.Fatalf("swap: %v", err)
+	}
+	fx.head = res
+	if _, err := ov.Rebase(ctx, snap.Seq(), overlay.Options{
+		BaseRoot:       res.Superblock.RootCatalog,
+		BaseGeneration: res.Superblock.Generation,
+	}); err != nil {
+		b.Fatalf("rebase: %v", err)
 	}
 }

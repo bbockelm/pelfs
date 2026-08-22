@@ -115,6 +115,29 @@
 
 ### Changed
 
+- **Removing one name of a hardlinked file decrements its link count.** It
+  did not, when the file was one the base generation already held: the write
+  overlay had no row for a clean inode, so it wrote the whiteout for the
+  removed name and left the count alone. The wrong count was **published**,
+  not merely served — a cold mount of the sealed generation saw `nlink 2` for
+  a file with one name, and it never converged, because a later write seeded
+  its row from the same stale value.
+
+  Nothing downstream corrected it. The seal recomputes a link count from
+  surviving edges for **directories**, whose count is a function of the
+  namespace; a file's is a stored attribute, and the stored attribute was the
+  stale one. The count is now decremented where the name is removed, and only
+  when names survive — the last name still costs exactly one whiteout, so
+  removing a published tree is unchanged (measured: no difference in time or
+  allocations on an `rm -rf` of a clean tree).
+
+  Beyond the wrong number, a file that is falsely hardlinked keeps its
+  content records in an inode **shard** and marks its catalog as holding a
+  promoted inode, which stops that whole subtree from ever being skipped by a
+  later seal. Stale counts therefore made incremental seals monotonically
+  more expensive. Found by the hostile exerciser, in the phase that compares
+  the **sealed** generation cold.
+
 - **The NFS frontend enforces file permissions.** It enforced none. A file
   chmod'd 0444 accepted a write through an NFS-backed mount and the bytes
   survived the seal; through FUSE the same write was refused with EACCES,

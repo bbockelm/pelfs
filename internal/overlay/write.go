@@ -176,16 +176,64 @@ func (fs *FS) baseHasEdgeLocked(ctx context.Context, q querier, parent uint64, n
 	return true, nil
 }
 
-// dropNodeRefLocked decrements the onode link count after an edge to ino
-// went away. At zero the inode's rows and staging file go (an overlay-new
-// inode vanishes entirely; a base-backed one stays expressed by the
-// whiteouts on its base edges). No onode row means untouched base
-// attributes: the whiteout alone expresses the deletion and seal
-// recomputes nlink from surviving edges.
-func (fs *FS) dropNodeRefLocked(tx querier, ino uint64, removeStaging *uint64) error {
+// dropNodeRefLocked decrements the link count after an edge to ino went
+// away. At zero the inode's rows and staging file go (an overlay-new inode
+// vanishes entirely; a base-backed one stays expressed by the whiteouts on
+// its base edges).
+//
+// An inode with no onode row is one this session has not touched, so the
+// count to decrement is the BASE generation's, and hint carries it when the
+// caller resolved the name through base (Unlink and Rename both did, one
+// query ago). It is decremented by MATERIALIZING the row — but only when
+// there is something left to count. Two cases, and the difference between
+// them is the whole of this function's cost on an `rm -rf`:
+//
+//   - nlink 1, the overwhelmingly common one: the name being removed is the
+//     only one, the whiteout expresses the deletion completely, and no row
+//     is written. A removal stays one whiteout, which is what makes
+//     removing a published tree proportional to the tree.
+//   - nlink > 1: names survive, and the count they publish has to shrink.
+//     Nothing downstream will do it — the seal recomputes nlink from
+//     surviving edges for DIRECTORIES only (publish.go, "A directory's link
+//     count is a function of the namespace"); a file's count is a stored
+//     attribute, and for a clean base-backed inode the stored attribute is
+//     the base's stale one. So the row is materialized here, at one
+//     decrement, and the row is also what puts the inode in the dirty set
+//     (DirtyInodes reads the onode table) so that the seal descends to the
+//     SURVIVING names and republishes them. Without the row the catalog
+//     holding the survivor is not dirty, and a seal carries it forward
+//     verbatim — stale count and all.
+//
+// The nlink-1 early return is not a hole in the same argument: an inode
+// losing its last name is published by nobody, so no surviving catalog
+// holds a count of it to correct.
+func (fs *FS) dropNodeRefLocked(ctx context.Context, tx querier, ino uint64, hint *Node, removeStaging *uint64) error {
 	row, err := getONode(tx, ino)
-	if err != nil || row == nil {
+	if err != nil {
 		return err
+	}
+	if row == nil {
+		n := hint
+		if n == nil {
+			// Resolved through an oedge (a base inode this session renamed,
+			// say), so nothing handed us the base attributes.
+			if err := fs.ensureBaseLocked(ctx, tx, ino); err != nil {
+				return err
+			}
+			bn, err := fs.base.GetAttr(ctx, ino)
+			if err != nil {
+				return err
+			}
+			n = &bn
+		}
+		if n.Nlink <= 1 {
+			return nil
+		}
+		// No persistChainLocked here, unlike Link: the inode is losing a
+		// name, not gaining one at a path the base does not have, so at
+		// least one base name still walks to it and residency is still
+		// reachable the way it always was.
+		row = &onodeRow{Node: *n, base: true}
 	}
 	if row.Nlink > 1 {
 		row.Nlink--
@@ -240,7 +288,7 @@ func (fs *FS) Unlink(ctx context.Context, parent uint64, name string) error {
 		if err := fs.removeEdgeLocked(ctx, tx, parent, name, r.overlay); err != nil {
 			return err
 		}
-		return fs.dropNodeRefLocked(tx, r.ino, &removeStaging)
+		return fs.dropNodeRefLocked(ctx, tx, r.ino, r.node, &removeStaging)
 	})
 	if err == nil && removeStaging != 0 {
 		if drop := fs.content.Drop(removeStaging); drop != nil {
@@ -400,7 +448,7 @@ func (fs *FS) Rename(ctx context.Context, srcParent uint64, srcName string, dstP
 				if err := fs.removeDirLocked(tx, dst.ino); err != nil {
 					return err
 				}
-			} else if err := fs.dropNodeRefLocked(tx, dst.ino, &removeStaging); err != nil {
+			} else if err := fs.dropNodeRefLocked(ctx, tx, dst.ino, dst.node, &removeStaging); err != nil {
 				return err
 			}
 		}

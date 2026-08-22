@@ -2,3 +2,4 @@
 *.db
 pelfs-stats.json
 docs/TODO.md
+/pelfs

@@ -33,76 +33,6 @@ listed at the bottom, so nobody re-files it.
 
 ## Open defects
 
-### KI-1. `link(2)` of a clean inode after a checkpoint fails
-
-**Severity: high for a FUSE writer that hard-links; unreachable on the
-path frontends.** `ln` of a file that has been sitting still — which is
-exactly the file anybody hard-links — fails with
-
-```
-overlay: no base provenance for inode N
-```
-
-**Mechanism.** `link(2)` is the one namespace operation that names its
-subject by BARE INODE and resolves no name: the kernel sends
-`LinkIn.Oldnodeid` and `internal/rawfuse/rw.go:184-195` passes it straight
-to `overlay.FS.Link` (`internal/overlay/write.go:663`). For a clean
-(base-backed) inode `Link` calls `persistChainLocked`
-(`write.go:687`), which reads the base descent step out of the `fs.prov`
-cache **alone** and treats a miss as impossible —
-`internal/overlay/overlay.go:619`, "Unreachable under the kernel contract:
-detaching an inode requires having looked it up". That was true of every
-caller but this one. It also used not to matter, because nothing ever
-deleted from `prov`; then the checkpoint's provenance sweep
-(`internal/overlay/rebase.go:332`, added to bound a map that was ~6.6 GB at
-the hundred-million-object target) started dropping the entry for every
-inode a published generation cleaned. An unreachable error became an
-ordinary one, and a cache whose miss is a hard error is not a cache.
-
-Reachable on FUSE whenever the kernel serves a **cached dentry** instead of
-issuing a LOOKUP — and clean inodes get the longest entry and attribute
-TTLs this binding hands out, so the common case is the failing one. The
-path frontends (`internal/vfsbilly`, and NFS through it) resolve by name,
-record provenance on the way in, and cannot reach it.
-
-**Reproduce.** Create a file, let a checkpoint publish it, then link it
-with no intervening LOOKUP. As a unit test:
-`internal/publish/memtablereadopt_test.go`'s
-`TestAnAdoptedFileWithTwoNamesReopens` with its post-adoption lookup
-removed.
-
-**Code.** `internal/overlay/overlay.go:605-627` (`persistChainLocked`),
-`internal/overlay/rebase.go:300-333` (the sweep and its reasoning),
-`internal/overlay/write.go:663-706` (`Link`),
-`internal/rawfuse/rw.go:184-195` (the bare inode arriving).
-
-**Pinned by an executable test: NO at `25100f3`.** Nothing in the tree
-fails because of this. The hostile exerciser HAS a `link` op
-(`internal/hostile/plan.go:67`) and has never caught it, which is
-consistent with the mechanism: the exerciser links through real syscalls,
-so whether a LOOKUP precedes the LINK is up to the kernel's dcache. Any
-corpus entry for it is `flaky-open` at best.
-
-**Fix shape** (deliberately not done as triage): `genfs` already holds
-`(parent, name)` for every resident inode — the residency record `Swap`
-re-descends from — so an accessor for it lets `persistChainLocked` fall
-back to the base's own copy of the descent step instead of only its cache.
-That is a `genfs` API change with its own tests.
-
-> **In flight, uncommitted, as this entry was written (2026-08-22, by
-> prov-agent).** A concurrent session has exactly that fix in this working
-> tree, plus the pins: `genfs.FS.Edge`, the fallback in
-> `persistChainLocked`, `internal/overlay/linkprov_test.go` (four cases —
-> the bug, a multi-level chain, a second checkpoint, and the ESTALE
-> boundary the fallback must not cross), a marker-free corpus entry
-> `link-clean-inode-after-checkpoint.plan`, and a `shapeHardlinkWeb` that
-> buys one checkpoint per plan so the random lane probes it too.
-> **Delete this entry when that lands** — from then on those are the
-> record. It is kept here because at `25100f3` the defect is real and
-> nothing tracked pins it, and because an entry that disappears when a fix
-> lands is the correct lifecycle for this file. If that work is abandoned
-> instead, this entry is still accurate and still unpinned.
-
 ### KI-2. Crash-stranded scratch directories are never swept
 
 **Severity: medium; bites anyone whose seal is killed.** A killed seal
@@ -453,6 +383,7 @@ next pass does not re-file them.
 | **NFS frontend enforces no permission checks** (hostile finding) | **FIXED** by modebits-agent + access-agent. `nfs-ignores-mode-bits.plan` carries no marker and now FAILS if the write is ever accepted again. |
 | **nlink not decremented for a clean hardlinked file** | **FIXED** by nlink-agent (a third option, neither of the two the report proposed). |
 | **rename ghost across a checkpoint** | **FIXED** by renameghost-agent, with the whole sibling family (unlink, one of two hardlinks, rmdir, rename onto a name, cross-parent rename, recreate-over-whiteout). |
+| **`link(2)` of a clean inode after a checkpoint** (was KI-1) | **FIXED** by prov-agent (`e614330`): `genfs.FS.Edge` plus a fallback in `persistChainLocked`, pinned by `internal/overlay/linkprov_test.go` (five cases). The reachable shape is NOT "a file sitting still" as first reported — `rawfuse`'s dirty mark is sticky for a mount's lifetime, so within one session the sweep's victims carry a 1s TTL and the dentry expires. It is a SECOND session over an inherited file: mount, look up a file that was already there, edit it, keep working, then link it. Two corpus entries were built for it and NEITHER reproduced, so none was kept — this entry's own prediction that a plan would be `flaky-open` at best was right, and stronger than it knew. |
 | **C2**, the "fsck lifts the cap" claim | **STALE** in that detail — `internal/fsck` does not touch `packIndex`. The rest of C2 survives as KI-8. |
 | **F11** dead/unwired inventory; **G4**, **G6** doc-staleness sweeps | Real work, but hygiene and prose rather than defects or limitations. They stay in `docs/TODO.md`, which is what a punchlist is for. |
 
@@ -462,9 +393,12 @@ regression that must PASS. That is a good state and worth checking against
 whenever this file gains an entry — a bug the corpus can express belongs
 there rather than here, because there it fails on its own.
 
-Nothing in this file is expressible as a plan, which is why they are here:
+Nothing left in this file is expressible as a plan, which is why they are
+here:
 a memory ceiling reached only at a hundred million objects (KI-8), a
 missing stats field (KI-4, KI-5), an error class thrown away (KI-6), a
 transaction count (KI-7), a wall clock in the wrong place (KI-9), and two
 things that need a crash or a repack plus a look at the disk (KI-2, KI-3).
-KI-1 is the exception and is the one being pinned as a plan.
+The one entry that looked plan-shaped (KI-1, now fixed) turned out not to
+be: two corpus entries were written for it and neither reproduced, because
+whether a LOOKUP precedes a LINK is the kernel dcache's call.

@@ -1,41 +1,45 @@
 # hostile plan: seed=0 ops=4
-# expect: known-open nfs
 #
-# FOUND AT HEAD (8c3bc64) BY THIS EXERCISER, 2026-08-21. NOT FIXED --
-# product code is outside the hostile-agent run's territory. Filed for
-# triage under "hostile-agent" in docs/TODO.md.
+# THE FINDING, and now the regression that guards its fix. Found at HEAD
+# (8c3bc64) by this exerciser on 2026-08-21, filed under "hostile-agent"
+# in docs/TODO.md, fixed under "modebits-agent".
 #
-# THE FINDING. A file chmod'd 0444 accepts a write through the NFS
-# frontend. Through raw FUSE the same write is refused with EACCES,
-# because the kernel applies the ordinary mode check before it sends
-# SETATTR/WRITE to a FUSE server. go-nfs's WRITE handler and
-# internal/vfsbilly do not consult the mode bits at all, and NFSv3 puts
-# that check on the server, so nothing performs it: an unprivileged
-# process can write a file it has no write permission on, and the bytes
-# land -- they survive the seal and read back from the sealed generation.
+# A file chmod'd 0444 accepted a write through the NFS frontend. Through
+# raw FUSE the same write was refused with EACCES, because the mount asks
+# for `default_permissions` and the kernel applies the ordinary mode check
+# before it sends anything to a FUSE server. NFSv3 puts that check on the
+# SERVER, and go-nfs's handlers and internal/vfsbilly consulted no mode
+# bit, so nothing performed it: an unprivileged process wrote a file it
+# had no write permission on and the bytes landed -- they survived the
+# seal and read back from the sealed generation.
 #
 #     ro.dat: byte 0 is 0x29 in the mount, 0xc2 in the reference
 #
-# The same shape with `chown` instead of `pwrite` diverges identically
-# when CAP_CHOWN is absent (scripts/hostile-docker.sh --drop-chown): the
-# NFS frontend performs a chown the kernel and the FUSE frontend both
-# refuse. One cause, two symptoms -- the NFS frontend enforces no
-# permission checks of its own and gets none from the client.
+# The reference tree is what makes this a bug rather than POSIX. The
+# container runs as root, and root may legitimately write a 0444 file --
+# but only with CAP_DAC_OVERRIDE, and the launcher drops it
+# (--cap-drop ALL --cap-add SYS_ADMIN,CHOWN,FOWNER). The tmpfs reference
+# in the same container, as the same process, REFUSED this write. So did
+# the kernel's FUSE check. Only the NFS frontend allowed it.
 #
-# WHY THIS ENTRY DOES NOT FAIL THE BUILD, and what it does instead. The
-# marker above tells the replayer this divergence is expected: it is
-# reported loudly on every run, and the entry FAILS if the divergence
-# stops happening. That is the direction a corpus entry rots in -- a bug
-# quietly fixed leaves an entry that no longer tests anything -- so when
-# this is fixed, the replay goes red and the marker comes off, and from
-# then on the entry guards the fix. An entry that failed today would just
-# make the gate red until someone had time for it, which is how gates get
-# turned off.
+# The same shape with `chown` diverged identically when CAP_CHOWN was
+# absent (scripts/hostile-docker.sh --drop-chown). One cause, two
+# symptoms: the NFS frontend enforced no permission checks of its own and
+# got none from the client.
 #
-# The FUSE leg of this same entry expects NO divergence, and gets none:
-# that is what says the difference is the frontend's and not the write
-# path's.
+# FIXED in internal/vfsbilly (perm.go): the frontend now applies the POSIX
+# model itself -- the equivalent of `default_permissions` for the path
+# that has no kernel to ask -- as the server's own identity, with the
+# server's own capability set, so the two frontends answer this the same
+# way. The marker that made this entry expect a divergence is GONE, which
+# is what the corpus discipline asks for: from here on the entry FAILS if
+# the write is ever accepted again.
+#
+# What a passing run looks like now: the reference refuses the pwrite on
+# permission grounds, the mount refuses it too, the op is recorded as
+# NOT COMPARABLE, and the compare that follows finds ro.dat byte-identical
+# on both sides.
 create ro.dat len=256 fill=41
 chmod ro.dat mode=0444 # no write permission for anyone
-pwrite ro.dat off=0 len=64 fill=42 # FUSE: EACCES. NFS: accepted, and the bytes land.
+pwrite ro.dat off=0 len=64 fill=42 # refused on BOTH frontends now; the bytes do not land
 compare

@@ -1112,17 +1112,25 @@ func (c *campaign) applyAll(ops []Op) {
 				continue
 			}
 			c.permDiverge++
+			// Marked so the compare that follows attributes the file's
+			// contents to THIS report instead of repeating it as a fresh
+			// difference; the report itself is a failure now.
 			c.markPermPath(op.Path)
-			if c.expectDiverge {
-				c.observed++
-			}
-			c.tb.Logf("PERMISSION DIVERGENCE at op %d on the %s backend -- KNOWN-OPEN FINDING\n"+
+			// A FAILURE, not a note in the log. It was a bare Logf while the
+			// mode-bits finding was open, because every run of the corpus
+			// entry that pinned it would otherwise have been red. The
+			// frontend enforces the model now (internal/vfsbilly/perm.go),
+			// so a mount that permits what the kernel refuses is a
+			// regression again -- and this is the line that makes the
+			// corpus entry GUARD the fix rather than merely replay it,
+			// since the bytes it would otherwise catch are attributed above.
+			c.note("PERMISSION DIVERGENCE at op %d on the %s backend\n"+
 				"    op:        %s\n"+
 				"    reference: %s\n"+
 				"    mount:     PERMITTED IT\n"+
 				"    The frontend allowed an operation the kernel refused on an identical\n"+
-				"    tree. Filed under hostile-agent in docs/TODO.md and pinned by\n"+
-				"    testdata/corpus/nfs-ignores-mode-bits.plan; NOT fixed here.",
+				"    tree. The NFS frontend's permission model is internal/vfsbilly/perm.go;\n"+
+				"    the FUSE one is the kernel's, via `default_permissions`.",
 				i, c.backend, op, errStr(refErr))
 			continue
 		}

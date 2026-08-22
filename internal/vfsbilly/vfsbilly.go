@@ -16,6 +16,17 @@
 // metadata length against bytes still in flight — the entire class of
 // truncation bugs a write-back handle cache exists to prevent does not
 // arise here.
+//
+// PERMISSIONS ARE CHECKED HERE, and they have to be: the FUSE frontend
+// mounts with `default_permissions` and gets the ordinary mode check from
+// the kernel for free, while NFSv3 puts that check on the server, so an
+// adapter that consults no mode bit makes them advisory on one frontend and
+// enforced on the other. Every path in this file therefore passes through
+// perm.go, which holds the model and the reasoning: the identity is the
+// SERVER PROCESS's (uid, gid, groups and capabilities), mapped through
+// internal/idmap exactly as reported ownership is, and the wire's AUTH_UNIX
+// credential is deliberately not consulted. It is fidelity, not access
+// control — see the file comment in perm.go before changing any of it.
 package vfsbilly
 
 import (
@@ -62,6 +73,11 @@ type billyFS struct {
 	ov  *overlay.FS
 	uid uint32
 	gid uint32
+	// cred is the identity every request is evaluated as, and the one the
+	// permission check in perm.go consults. uid/gid above are the same
+	// numbers, kept separate because they are also what new nodes are
+	// STAMPED with, which is a different question.
+	cred Cred
 	// ids translates the volume's own identity onto this process, so a
 	// volume made under one uid is writable when mounted under another
 	// (internal/idmap).
@@ -82,27 +98,37 @@ var (
 // New returns a billy.Filesystem over a read-write overlay. Nodes it
 // creates are owned by the invoking user: the volume is a single-user
 // scratch space and the mount must be able to write what it made.
-func New(ov *overlay.FS) billy.Filesystem {
-	return &billyFS{rd: ov, ov: ov, uid: uint32(os.Getuid()), gid: uint32(os.Getgid()),
-		ids: volumeOwner(ov), dirs: newDirCache()}
+func New(ov *overlay.FS) billy.Filesystem { return NewAs(ov, ProcessCred()) }
+
+// NewAs is New with the identity named explicitly. The mount serves, and
+// checks permissions, as cred — see perm.go for why that identity is the
+// server's own and not the caller's AUTH_UNIX credential. It exists so the
+// permission matrix can be exercised at this interface without the test
+// process having to BE four different users.
+func NewAs(ov *overlay.FS, cred Cred) billy.Filesystem {
+	return &billyFS{rd: ov, ov: ov, uid: cred.UID, gid: cred.GID, cred: cred,
+		ids: volumeOwner(ov, cred), dirs: newDirCache()}
 }
 
 // NewReadOnly returns a billy.Filesystem over an immutable generation.
-func NewReadOnly(fs *genfs.FS) billy.Filesystem {
-	return &billyFS{rd: fs, uid: uint32(os.Getuid()), gid: uint32(os.Getgid()),
-		ids: volumeOwner(fs), dirs: newDirCache()}
+func NewReadOnly(fs *genfs.FS) billy.Filesystem { return NewReadOnlyAs(fs, ProcessCred()) }
+
+// NewReadOnlyAs is NewReadOnly with the identity named explicitly.
+func NewReadOnlyAs(fs *genfs.FS, cred Cred) billy.Filesystem {
+	return &billyFS{rd: fs, uid: cred.UID, gid: cred.GID, cred: cred,
+		ids: volumeOwner(fs, cred), dirs: newDirCache()}
 }
 
 // volumeOwner reads the identity a volume was created under, from its
 // root. A root that will not stat leaves the zero map, which translates
 // uid 0 -- the identity most worth mapping, and the one a volume rooted
 // at root would otherwise be stuck with.
-func volumeOwner(rd reader) idmap.Map {
+func volumeOwner(rd reader, cred Cred) idmap.Map {
 	n, err := rd.GetAttr(ctx(), genfs.RootInode)
 	if err != nil {
-		return idmap.Owner(0, 0)
+		return idmap.OwnerTo(0, 0, cred.UID, cred.GID)
 	}
-	return idmap.Owner(n.UID, n.GID)
+	return idmap.OwnerTo(n.UID, n.GID, cred.UID, cred.GID)
 }
 
 // ctx is the request context. billy carries none, and neither layer
@@ -141,7 +167,7 @@ func (b *billyFS) resolve(c context.Context, p string) (genfs.Node, error) {
 	dir, err := b.descend(c, parts[:len(parts)-1], true)
 	if err == nil {
 		var n genfs.Node
-		if n, err = b.rd.Lookup(c, dir, parts[len(parts)-1]); err == nil {
+		if n, err = b.step(c, dir, parts[len(parts)-1]); err == nil {
 			return n, nil
 		}
 	}
@@ -151,7 +177,20 @@ func (b *billyFS) resolve(c context.Context, p string) (genfs.Node, error) {
 	if dir, err = b.descend(c, parts[:len(parts)-1], false); err != nil {
 		return genfs.Node{}, err
 	}
-	return b.rd.Lookup(c, dir, parts[len(parts)-1])
+	return b.step(c, dir, parts[len(parts)-1])
+}
+
+// step is one name resolution inside a directory, with the search
+// permission that reaching a name through it requires. Every Lookup this
+// binding makes goes through here or through descend, which makes the same
+// check: an unsearchable directory has to hide its contents from LOOKUP
+// exactly as it does from a path walk, or the frontend answers a question
+// the kernel would have refused.
+func (b *billyFS) step(c context.Context, dir uint64, name string) (genfs.Node, error) {
+	if err := b.mayTraverse(c, dir); err != nil {
+		return genfs.Node{}, err
+	}
+	return b.rd.Lookup(c, dir, name)
 }
 
 // resolveDir walks p from the root and returns its inode, requiring every
@@ -172,6 +211,12 @@ func (b *billyFS) resolveDir(c context.Context, p string) (uint64, error) {
 func (b *billyFS) descend(c context.Context, parts []string, cached bool) (uint64, error) {
 	ino := genfs.RootInode
 	for _, part := range parts {
+		// Search permission on the directory being entered, cached edge or
+		// not: skipping the Lookup is an optimization, and skipping the
+		// check with it would be a hole.
+		if err := b.mayTraverse(c, ino); err != nil {
+			return 0, err
+		}
 		if cached {
 			if child, ok := b.dirs.get(ino, part); ok {
 				ino = child
@@ -186,9 +231,104 @@ func (b *billyFS) descend(c context.Context, parts []string, cached bool) (uint6
 			return 0, overlay.ErrNotDir
 		}
 		b.dirs.put(ino, part, n.Inode)
+		b.dirs.putPerm(n.Inode, dirPerm{mode: n.Mode, uid: n.UID, gid: n.GID})
 		ino = n.Inode
 	}
 	return ino, nil
+}
+
+// dirAttrs returns a directory's permission attributes, from the memo when
+// it has them (dircache.go).
+func (b *billyFS) dirAttrs(c context.Context, ino uint64) (dirPerm, error) {
+	if p, ok := b.dirs.perm(ino); ok {
+		return p, nil
+	}
+	n, err := b.rd.GetAttr(c, ino)
+	if err != nil {
+		return dirPerm{}, err
+	}
+	p := dirPerm{mode: n.Mode, uid: n.UID, gid: n.GID}
+	if n.Type == catalog.TypeDir {
+		b.dirs.putPerm(ino, p)
+	}
+	return p, nil
+}
+
+// mayTraverse checks search permission on one directory. It returns a bare
+// errno; every caller is inside a descent whose error the caller wraps with
+// the path the client actually named, which is the path the kernel would
+// have reported EACCES for too.
+//
+// A GetAttr that answers ErrStale is passed through unchanged so the
+// self-healing retry in resolve still fires: a permission check must not
+// turn an evictable inode into a permanent refusal.
+func (b *billyFS) mayTraverse(c context.Context, ino uint64) error {
+	p, err := b.dirAttrs(c, ino)
+	if err != nil {
+		return err
+	}
+	if b.mayDir(p, permExec) {
+		return nil
+	}
+	return syscall.EACCES
+}
+
+// mayDir applies the mode check to a directory, in the id space the mount
+// reports (internal/idmap): the ownership a caller is compared against has
+// to be the ownership the caller can SEE.
+func (b *billyFS) mayDir(p dirPerm, want perm) bool {
+	uid, gid := b.ids.Apply(p.uid, p.gid)
+	return b.cred.allowed(uid, gid, p.mode, true, want)
+}
+
+// mayNode is mayDir for an object named by node.
+func (b *billyFS) mayNode(n genfs.Node, want perm) bool {
+	uid, gid := b.ids.Apply(n.UID, n.GID)
+	return b.cred.allowed(uid, gid, n.Mode, n.Type == catalog.TypeDir, want)
+}
+
+// dirWritable resolves a directory's attributes and requires write and
+// search on it — what creating, removing or renaming a name inside it
+// costs. It returns the attributes because the sticky-bit rule needs them
+// next and they are not worth fetching twice.
+func (b *billyFS) dirWritable(c context.Context, op, path string, dir uint64) (dirPerm, error) {
+	p, err := b.dirAttrs(c, dir)
+	if err != nil {
+		return dirPerm{}, pe(op, path, err)
+	}
+	if !b.mayDir(p, permWrite|permExec) {
+		return dirPerm{}, accessErr(op, path)
+	}
+	return p, nil
+}
+
+// maySticky applies the sticky-bit rule to a name being removed from or
+// renamed within dir: in a +t directory only the file's owner, the
+// directory's owner, or CAP_FOWNER may unlink a name. It is what stops
+// /tmp from being a free-for-all, and it is EPERM, not EACCES.
+func (b *billyFS) maySticky(op, path string, dir dirPerm, target genfs.Node) error {
+	if dir.mode&syscall.S_ISVTX == 0 {
+		return nil
+	}
+	duid, _ := b.ids.Apply(dir.uid, dir.gid)
+	tuid, _ := b.ids.Apply(target.UID, target.GID)
+	if b.cred.UID == tuid || b.cred.UID == duid || b.cred.Caps.has(CapFOwner) {
+		return nil
+	}
+	return permErr(op, path)
+}
+
+// accessErr and permErr are the two refusals, kept apart because the
+// kernel keeps them apart and a client reports them differently: EACCES is
+// "the mode bits say no", EPERM is "you are not the owner". Both satisfy
+// errors.Is(err, os.ErrPermission) and os.IsPermission, which go-nfs tests
+// separately.
+func accessErr(op, p string) error {
+	return &os.PathError{Op: op, Path: clean(p), Err: syscall.EACCES}
+}
+
+func permErr(op, p string) error {
+	return &os.PathError{Op: op, Path: clean(p), Err: syscall.EPERM}
 }
 
 // staleDescent reports whether an error is one a cached edge could have
@@ -306,10 +446,16 @@ func (b *billyFS) OpenFile(filename string, flag int, perm os.FileMode) (billy.F
 		if n.Type == catalog.TypeDir && mutates {
 			return nil, pe("open", name, overlay.ErrIsDir)
 		}
+		if err := b.mayOpen(name, n, mutates); err != nil {
+			return nil, err
+		}
 	case errors.Is(err, genfs.ErrNotExist) && flag&os.O_CREATE != 0:
 		dir, base, derr := b.resolveParent(c, name)
 		if derr != nil {
 			return nil, pe("open", name, derr)
+		}
+		if _, derr := b.dirWritable(c, "open", name, dir); derr != nil {
+			return nil, derr
 		}
 		if n, err = b.ov.Create(c, dir, base, uint32(perm.Perm()), b.uid, b.gid); err != nil {
 			return nil, pe("open", name, err)
@@ -329,6 +475,28 @@ func (b *billyFS) OpenFile(filename string, flag int, perm os.FileMode) (billy.F
 		f.pos = n.Length
 	}
 	return f, nil
+}
+
+// mayOpen is the check open(2) makes on an EXISTING file. A newly created
+// one is not checked, which is not an omission: the kernel checks the
+// parent directory for a create and never the mode the new file is being
+// given, which is what lets `install -m 444` work at all.
+//
+// A mutating open asks for WRITE ONLY, never write-and-read, and that is
+// deliberate. go-nfs's WRITE handler opens O_RDWR because billy has no
+// positional writer without it, so demanding read as well would refuse
+// every write to a file whose mode grants w and not r — an operation the
+// kernel and the FUSE frontend both allow. Reads are checked where reads
+// actually happen: go-nfs's READ handler opens O_RDONLY.
+func (b *billyFS) mayOpen(name string, n genfs.Node, mutates bool) error {
+	want := permRead
+	if mutates {
+		want = permWrite
+	}
+	if b.mayNode(n, want) {
+		return nil
+	}
+	return accessErr("open", name)
 }
 
 func (b *billyFS) Stat(filename string) (os.FileInfo, error) {
@@ -367,6 +535,34 @@ func (b *billyFS) Rename(oldpath, newpath string) error {
 	if from != "/" && strings.HasPrefix(to+"/", from+"/") {
 		return pe("rename", newpath, syscall.EINVAL)
 	}
+	// A rename unbinds a name in one directory and binds one in another,
+	// so it costs write+search in both — and the sticky rule applies to
+	// the source name, and to the destination name when it is about to be
+	// replaced.
+	srcDir, err := b.dirWritable(c, "rename", oldpath, src)
+	if err != nil {
+		return err
+	}
+	dstDir, err := b.dirWritable(c, "rename", newpath, dst)
+	if err != nil {
+		return err
+	}
+	if srcDir.mode&syscall.S_ISVTX != 0 {
+		n, lerr := b.rd.Lookup(c, src, srcName)
+		if lerr != nil {
+			return pe("rename", oldpath, lerr)
+		}
+		if serr := b.maySticky("rename", oldpath, srcDir, n); serr != nil {
+			return serr
+		}
+	}
+	if dstDir.mode&syscall.S_ISVTX != 0 {
+		if n, lerr := b.rd.Lookup(c, dst, dstName); lerr == nil {
+			if serr := b.maySticky("rename", newpath, dstDir, n); serr != nil {
+				return serr
+			}
+		}
+	}
 	// Both edges change identity; the subtree under a renamed directory
 	// does not, because the cache is keyed by parent INODE and the moved
 	// directory keeps its own.
@@ -384,11 +580,19 @@ func (b *billyFS) Remove(filename string) error {
 	if err != nil {
 		return pe("remove", filename, err)
 	}
+	dirAttrs, err := b.dirWritable(c, "remove", filename, dir)
+	if err != nil {
+		return err
+	}
 	n, err := b.rd.Lookup(c, dir, name)
 	if err != nil {
 		return pe("remove", filename, err)
 	}
+	if err := b.maySticky("remove", filename, dirAttrs, n); err != nil {
+		return err
+	}
 	b.dirs.forget(dir, name)
+	b.dirs.forgetPerm(n.Inode)
 	if n.Type == catalog.TypeDir {
 		return pe("remove", filename, b.ov.Rmdir(c, dir, name))
 	}
@@ -424,6 +628,15 @@ func (b *billyFS) ReadDir(p string) ([]os.FileInfo, error) {
 	if err != nil {
 		return nil, pe("readdir", p, err)
 	}
+	// Listing a directory costs READ on it — the search permission the
+	// descent already checked is what it costs to walk THROUGH.
+	attrs, err := b.dirAttrs(c, ino)
+	if err != nil {
+		return nil, pe("readdir", p, err)
+	}
+	if !b.mayDir(attrs, permRead) {
+		return nil, accessErr("readdir", p)
+	}
 	entries, err := b.rd.Readdir(c, ino)
 	if err != nil {
 		return nil, pe("readdir", p, err)
@@ -454,6 +667,9 @@ func (b *billyFS) MkdirAll(filename string, perm os.FileMode) error {
 func (b *billyFS) mkdirAll(c context.Context, parts []string, perm os.FileMode, cached bool) error {
 	dir := genfs.RootInode
 	for _, part := range parts {
+		if err := b.mayTraverse(c, dir); err != nil {
+			return err
+		}
 		if cached {
 			if child, ok := b.dirs.get(dir, part); ok {
 				dir = child
@@ -462,6 +678,14 @@ func (b *billyFS) mkdirAll(c context.Context, parts []string, perm os.FileMode, 
 		}
 		child, err := b.rd.Lookup(c, dir, part)
 		if errors.Is(err, genfs.ErrNotExist) {
+			// Only the component actually being created costs write
+			// permission on its parent; the ones already there cost the
+			// search the loop already paid for.
+			if p, aerr := b.dirAttrs(c, dir); aerr != nil {
+				return aerr
+			} else if !b.mayDir(p, permWrite|permExec) {
+				return syscall.EACCES
+			}
 			child, err = b.ov.Mkdir(c, dir, part, uint32(perm.Perm()), b.uid, b.gid)
 			if errors.Is(err, overlay.ErrExist) {
 				// Someone else created it in between; an existing name is
@@ -476,6 +700,7 @@ func (b *billyFS) mkdirAll(c context.Context, parts []string, perm os.FileMode, 
 			return overlay.ErrNotDir
 		}
 		b.dirs.put(dir, part, child.Inode)
+		b.dirs.putPerm(child.Inode, dirPerm{mode: child.Mode, uid: child.UID, gid: child.GID})
 		dir = child.Inode
 	}
 	return nil
@@ -502,6 +727,9 @@ func (b *billyFS) Link(oldname, newname string) error {
 	if err != nil {
 		return pe("link", newname, err)
 	}
+	if _, derr := b.dirWritable(c, "link", newname, dir); derr != nil {
+		return derr
+	}
 	_, err = b.ov.Link(c, src.Inode, dir, name)
 	return pe("link", newname, err)
 }
@@ -516,6 +744,9 @@ func (b *billyFS) Symlink(target, link string) error {
 	dir, name, err := b.resolveParent(c, link)
 	if err != nil {
 		return pe("symlink", link, err)
+	}
+	if _, derr := b.dirWritable(c, "symlink", link, dir); derr != nil {
+		return derr
 	}
 	_, err = b.ov.Symlink(c, dir, name, target, b.uid, b.gid)
 	return pe("symlink", link, err)
@@ -577,8 +808,13 @@ func (b *billyFS) Capabilities() billy.Capability {
 //     that was in fact created correctly.
 
 // setAttr resolves name — the link itself, never its target — and applies
-// one attribute change.
-func (b *billyFS) setAttr(op, name string, in overlay.SetAttrIn) error {
+// one attribute change, once permitted has agreed to it.
+//
+// permitted takes the node because every one of these operations is
+// governed by the object's OWNERSHIP rather than by its mode bits, which
+// is the half of the model that mode bits alone cannot express: a file
+// mode 0777 is still only its owner's to chmod.
+func (b *billyFS) setAttr(op, name string, in overlay.SetAttrIn, permitted func(genfs.Node) error) error {
 	if b.ov == nil {
 		return roErr(op, name)
 	}
@@ -587,28 +823,75 @@ func (b *billyFS) setAttr(op, name string, in overlay.SetAttrIn) error {
 	if err != nil {
 		return pe(op, name, err)
 	}
+	if err := permitted(n); err != nil {
+		return &os.PathError{Op: op, Path: clean(name), Err: err}
+	}
 	_, err = b.ov.SetAttr(c, n.Inode, in)
+	if err == nil && n.Type == catalog.TypeDir {
+		// The memo in dircache.go holds a directory's mode and ownership,
+		// and this is the only thing that can change them.
+		b.dirs.forgetPerm(n.Inode)
+	}
 	return pe(op, name, err)
+}
+
+// owner is the ownership test shared by chmod and utimes: the owner, or
+// CAP_FOWNER standing in for them.
+func (b *billyFS) owner(n genfs.Node) error {
+	uid, _ := b.ids.Apply(n.UID, n.GID)
+	if b.cred.owns(uid) {
+		return nil
+	}
+	return syscall.EPERM
 }
 
 func (b *billyFS) Chmod(name string, mode os.FileMode) error {
 	m := unixMode(mode)
-	return b.setAttr("chmod", name, overlay.SetAttrIn{Mode: &m})
+	return b.setAttr("chmod", name, overlay.SetAttrIn{Mode: &m}, b.owner)
 }
 
 func (b *billyFS) Chown(name string, uid, gid int) error {
-	u, g := uint32(uid), uint32(gid)
-	return b.setAttr("chown", name, overlay.SetAttrIn{UID: &u, GID: &g})
+	return b.chown("chown", name, uid, gid)
 }
 
 func (b *billyFS) Lchown(name string, uid, gid int) error {
-	u, g := uint32(uid), uint32(gid)
-	return b.setAttr("lchown", name, overlay.SetAttrIn{UID: &u, GID: &g})
+	return b.chown("lchown", name, uid, gid)
+}
+
+// chown applies whichever of the two ids was actually named. A negative
+// operand means "unchanged", to chown(2) and to os.Lchown alike — this
+// used to convert one to 0xffffffff and store it.
+func (b *billyFS) chown(op, name string, uid, gid int) error {
+	var in overlay.SetAttrIn
+	if uid >= 0 {
+		u := uint32(uid)
+		in.UID = &u
+	}
+	if gid >= 0 {
+		g := uint32(gid)
+		in.GID = &g
+	}
+	return b.setAttr(op, name, in, b.chowner(uid, gid))
+}
+
+// chowner is the CAP_CHOWN rule, applied against the ownership the mount
+// REPORTS — which is the ownership the client asked to change, since the
+// uid it sends is the one it read back from a GETATTR.
+func (b *billyFS) chowner(uid, gid int) func(genfs.Node) error {
+	return func(n genfs.Node) error {
+		cur, curg := b.ids.Apply(n.UID, n.GID)
+		return b.cred.mayChown(cur, curg, uid, gid)
+	}
 }
 
 // Chtimes sets mtime only: catalogs carry no atime by design, and mtime
 // stands in for it everywhere else in the stack.
+//
+// Setting an explicit time is the owner's privilege (utimes(2) with a
+// non-NULL argument), and NFSv3 SETATTR carries explicit times, so that is
+// the rule applied. Write permission is enough only for the "set it to
+// now" form, which never arrives here.
 func (b *billyFS) Chtimes(name string, atime, mtime time.Time) error {
 	ns := mtime.UnixNano()
-	return b.setAttr("chtimes", name, overlay.SetAttrIn{MtimeNS: &ns})
+	return b.setAttr("chtimes", name, overlay.SetAttrIn{MtimeNS: &ns}, b.owner)
 }

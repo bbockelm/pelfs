@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/go-git/go-billy/v5"
+
 	"github.com/bbockelm/pelfs/internal/fakeorigin"
 	"github.com/bbockelm/pelfs/internal/genfs"
 	"github.com/bbockelm/pelfs/internal/overlay"
@@ -13,6 +15,7 @@ import (
 	"github.com/bbockelm/pelfs/internal/publish"
 	"github.com/bbockelm/pelfs/internal/superblock"
 	"github.com/bbockelm/pelfs/internal/testvol"
+	"github.com/bbockelm/pelfs/internal/vfsbilly"
 )
 
 // The fixture publishes a fixed base tree over fakeorigin exactly as the
@@ -46,6 +49,28 @@ func openBase(t testing.TB, inner pelicanobj.Store, sb *superblock.Superblock) *
 	}
 	t.Cleanup(func() { _ = fs.Close() })
 	return fs
+}
+
+// fixtureCred is the identity these fixtures are mounted as, and it is 0:0
+// on purpose. testvol stamps every node it creates with uid 0 / gid 0,
+// while publish.InitVolume owns the ROOT as the process that ran it — so a
+// fixture tree is a volume whose content belongs to root and whose root
+// directory belongs to whoever ran `go test`. Mounted as the test process,
+// every file in it is other-class and unwritable, which is not a quirk of
+// the check added in perm.go: it is exactly what the kernel does to the
+// FUSE frontend today, for the same tree, from the same attributes.
+//
+// Mounting as 0:0 makes the fixture self-consistent, the way a real volume
+// is: the identity that wrote the content is the identity that mounts it.
+// Tests that want a non-owner build one explicitly (perm_test.go).
+var fixtureCred = vfsbilly.Cred{UID: 0, GID: 0}
+
+// newBilly is vfsbilly.New for the fixtures — see fixtureCred.
+func newBilly(ov *overlay.FS) billy.Filesystem { return vfsbilly.NewAs(ov, fixtureCred) }
+
+// newBillyReadOnly is vfsbilly.NewReadOnly for the fixtures.
+func newBillyReadOnly(fs *genfs.FS) billy.Filesystem {
+	return vfsbilly.NewReadOnlyAs(fs, fixtureCred)
 }
 
 // fixture is one published base tree:

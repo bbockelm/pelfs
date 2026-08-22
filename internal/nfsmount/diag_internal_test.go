@@ -159,7 +159,12 @@ func TestChangeErrorsCarryAnNFSStatus(t *testing.T) {
 	}{
 		{"stale", syscall.ESTALE, nfs.NFSStatusStale, false},
 		{"missing", os.ErrNotExist, nfs.NFSStatusNoEnt, false},
-		{"denied", syscall.EPERM, nfs.NFSStatusAccess, false},
+		// EPERM and EACCES are different answers and must not collapse: a
+		// chmod refused for want of ownership is NFS3ERR_PERM, which
+		// reaches a client as "Operation not permitted" — what the FUSE
+		// frontend and every local filesystem say for the same refusal.
+		{"not the owner", syscall.EPERM, nfs.NFSStatusPerm, false},
+		{"denied by the mode bits", syscall.EACCES, nfs.NFSStatusAccess, false},
 		{"notempty", syscall.ENOTEMPTY, nfs.NFSStatusNotEmpty, false},
 		{"unknown", errors.New("the layer below came apart"), nfs.NFSStatusIO, true},
 	} {

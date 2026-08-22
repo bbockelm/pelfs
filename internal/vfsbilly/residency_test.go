@@ -11,7 +11,6 @@ import (
 
 	"github.com/bbockelm/pelfs/internal/genfs"
 	"github.com/bbockelm/pelfs/internal/overlay"
-	"github.com/bbockelm/pelfs/internal/vfsbilly"
 )
 
 // Residency is bounded on the NFS binding (mount-gen sets MaxResident),
@@ -44,7 +43,7 @@ func TestExtractionSurvivesResidencyEviction(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = ov.Close() })
 
-	bfs := vfsbilly.New(ov)
+	bfs := newBilly(ov)
 	ch := bfs.(billy.Change)
 	mode := uint32(0o644)
 	when := time.Unix(1700000000, 0)

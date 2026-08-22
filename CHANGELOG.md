@@ -115,6 +115,43 @@
 
 ### Changed
 
+- **The NFS frontend enforces file permissions.** It enforced none. A file
+  chmod'd 0444 accepted a write through an NFS-backed mount and the bytes
+  survived the seal; through FUSE the same write was refused with EACCES,
+  because that mount asks the kernel to check (`default_permissions`) and
+  NFSv3 puts the check on the server, where nothing performed it. Two
+  frontends over one filesystem answered the same question differently, and
+  which mount flag you used decided whether your own mode bits meant
+  anything. Found by the hostile exerciser; pinned by a regression entry in
+  its corpus.
+
+  The model is now applied in `internal/vfsbilly`: mode bits by class
+  (owner, else group, else other, first match deciding), write and search on
+  the parent directory for anything that creates or removes a name, the
+  sticky-bit rule, search permission on every path component, and ownership
+  for `chmod`/`utimes` — with `CAP_CHOWN` for a `chown` and `CAP_FOWNER`,
+  `CAP_DAC_OVERRIDE`, `CAP_DAC_READ_SEARCH` where the kernel would honor
+  them. It is EPERM where the kernel says EPERM and EACCES where it says
+  EACCES.
+
+  **Whose permissions**: the mount's own. The export is loopback and
+  single-user, so every request is evaluated as the identity that started
+  the server — uid, gid, groups and capabilities, translated through the
+  same id map that decides whose name the mount puts on a file. The
+  AUTH_UNIX credential in each NFS request is deliberately not consulted:
+  any local process can claim any uid over loopback, so honoring it would
+  make the check look like a security boundary, which it is not. This is
+  fidelity — the same answer through both frontends — and not access
+  control.
+
+  **What can still surprise you**, and it is written down rather than left
+  to be discovered: `access(2)` and `test -w` are answered by an ACCESS RPC
+  that go-nfs replies to without consulting the mode, so they still say
+  "writable" for a file the write path will refuse, and a read-only file
+  created and then written through one file descriptor — `tar -p` extracting
+  a 0444 file — fails on the write over NFS where FUSE allows it. Both need
+  a change in the go-nfs fork; see `docs/go-nfs-patches.md`.
+
 - **The write lease is per branch.** It was `meta/lease.json`, one object
   for the whole prefix, so two writable mounts on DIFFERENT branches of one
   volume refused each other though they could never touch the same ref —

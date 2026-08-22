@@ -63,10 +63,16 @@ type Map struct {
 // special case: uid 0 is exactly the identity that most needs mapping,
 // since a volume rooted at uid 0 is unwritable by every ordinary user.
 func Owner(rootUID, rootGID uint32) Map {
-	return Map{
-		FromUID: rootUID, FromGID: rootGID,
-		ToUID: uint32(os.Getuid()), ToGID: uint32(os.Getgid()),
-	}
+	return OwnerTo(rootUID, rootGID, uint32(os.Getuid()), uint32(os.Getgid()))
+}
+
+// OwnerTo is Owner with the destination identity named explicitly, for a
+// mount that serves as somebody other than the calling process — which is
+// what the NFS frontend's permission check needs, since the identity it
+// evaluates requests as and the identity it REPORTS have to be the same
+// number or a mount is unusable by the person who owns it.
+func OwnerTo(rootUID, rootGID, toUID, toGID uint32) Map {
+	return Map{FromUID: rootUID, FromGID: rootGID, ToUID: toUID, ToGID: toGID}
 }
 
 // Apply maps one inode's stored ownership to what the mount reports.

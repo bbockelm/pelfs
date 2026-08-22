@@ -9,7 +9,6 @@ import (
 	"testing"
 
 	"github.com/bbockelm/pelfs/internal/genfs"
-	"github.com/bbockelm/pelfs/internal/vfsbilly"
 	nfsfile "github.com/willscott/go-nfs/file"
 )
 
@@ -165,7 +164,7 @@ func TestDirCacheSurvivesResidencyEviction(t *testing.T) {
 		t.Fatalf("genfs.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = base.Close() })
-	bfs := vfsbilly.NewReadOnly(base)
+	bfs := newBillyReadOnly(base)
 
 	want := fx.body["dir/inner/leaf.txt"]
 	for i := 0; i < 20; i++ {

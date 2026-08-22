@@ -1,10 +1,11 @@
 # go-nfs: the fork we carry, and what is left in it
 
 The loopback-NFS backend runs on [willscott/go-nfs](https://github.com/willscott/go-nfs).
-Six of its behaviors were wrong for us: three are fixed on a fork, one was
-fixed upstream, one is worked around inside pelfs, and one is tolerated as
-it stands. This note records what the fork holds, why it exists rather
-than a set of local wrappers, and what is still open.
+Eight of its behaviors were wrong for us: three are fixed on a fork, one was
+fixed upstream, two are handled inside pelfs (an error translation, and the
+whole POSIX permission check), one is still open on the fork, and one is
+tolerated as it stands. This note records what the fork holds, why it exists
+rather than a set of local wrappers, and what is still open.
 
 The pin lives in `go.mod`:
 
@@ -183,6 +184,77 @@ that describes them, which fixes SETATTR outright and leaves Apply's own
 about to become NFS3ERR_IO is logged with its operation, path and cause,
 rate-limited, so a bare "Input/output error" on a client is always
 explained on the server.
+
+## Enforced in pelfs: the POSIX permission model
+
+`internal/vfsbilly` now applies the mode check itself (`perm.go`). It has to,
+and the shape of the reason is the same as everything else on this page: the
+check NFSv3 puts on the server is a check go-nfs's handlers do not make.
+
+The FUSE frontend mounts with `default_permissions`, which asks the kernel to
+apply the ordinary mode check from the attributes we report before anything
+reaches us. The NFS frontend had no equivalent, so the two frontends over one
+filesystem answered the same question differently: a file chmod'd 0444
+accepted a write through the mount and the bytes survived the seal, while the
+same write through FUSE was refused with EACCES. Found by the hostile
+exerciser and pinned by
+`internal/hostile/testdata/corpus/nfs-ignores-mode-bits.plan`.
+
+**Whose permissions.** The export is loopback, single-mount and single-user,
+and every request is evaluated as the SERVER PROCESS's identity — uid, gid,
+supplementary groups and capabilities — translated through `internal/idmap`
+exactly as reported ownership is. The AUTH_UNIX credential NFSv3 puts in
+every request is deliberately not consulted: it is unauthenticated (any local
+process can dial the port and claim any uid, and the mount already advertises
+AUTH_NULL), and it does not reach a `billy.Filesystem` in any case, since
+go-nfs parses it into an unexported request struct and billy carries no
+per-request context. Using it would need a commit here on the fork whose only
+justification would be a credential we have decided not to trust. What the
+check buys is FIDELITY, not access control — the same answer through both
+frontends for a program that probes permissions by attempting an operation.
+
+**Capabilities, not uid 0.** The kernel's rule for "root may write a 0444
+file" is CAP_DAC_OVERRIDE, and the two come apart exactly where this bug was
+found: the hostile container runs as root with that capability dropped, and
+its tmpfs reference tree refused the write our mount accepted. So the four
+capabilities that change a permission answer are modelled (DAC_OVERRIDE,
+DAC_READ_SEARCH, FOWNER, CHOWN) and the credential carries the ones this
+process actually holds, read from `CapEff` in `/proc/self/status`.
+
+**One thing knfsd does that this does not**, and why it is half of a pair.
+Linux's in-kernel NFS server gives a file's owner a bypass on the data path
+(`NFSD_MAY_OWNER_OVERRIDE`), because a stateless server delegates the
+open-time check to a client it trusts — and without it, `open(O_CREAT|O_WRONLY,
+0444)` followed by writes, which is `tar -p` extracting a read-only file,
+fails on the WRITE. We do not take that bypass, because the check it delegates
+to is the ACCESS reply below, and ours is not honest yet. The two belong in
+one change; see the next section.
+
+## Still open: ACCESS answers whatever it was asked
+
+`onAccess` reads the client's requested access mask and writes it straight
+back, minus the three write bits when the filesystem does not advertise
+`billy.WriteCapability`. It never looks at the object's mode or ownership —
+`tryStat` is called only to fill in `post_op_attr`.
+
+That is the client-side half of `default_permissions`. A Linux or macOS NFSv3
+client answers `open(2)` from the ACCESS reply (`nfs_permission` →
+`nfs_do_access`), so an honest reply is what makes a permission failure
+arrive at `open` — where the kernel and the FUSE frontend both put it —
+rather than at the first WRITE. With the mode check now enforced on the
+operations themselves (previous section) the bytes never land either way, and
+the divergence the corpus entry pinned is closed; what remains is that
+`access(2)` and `test -w` still answer "writable" for a file the write path
+will refuse, and that a read-only file created and then written by one client
+fd (the `tar -p` shape) is refused where the kernel would allow it.
+
+The fix is a fork commit: compute the granted mask from the file's mode and
+the mount's identity, as knfsd's `nfsd_access` does, and clear the bits the
+mode denies. It belongs with the owner bypass above, and the two together are
+exactly knfsd's split — the client refuses at open, the server trusts a
+client that got past it. It is not written here because a fork commit is only
+useful once it is pushed and the `go.mod` pin moves with it, which is the
+owner's call; the pin has NOT moved for the permission work.
 
 ## Tolerated: COMMIT is a no-op
 

@@ -52,8 +52,8 @@
 #   scripts/hostile-docker.sh --run PATTERN   # -run filter
 #   scripts/hostile-docker.sh --snapshot 100ms # checkpoint cadence in phase A
 #   scripts/hostile-docker.sh --env K=V       # diagnostic env var in the container
-#   scripts/hostile-docker.sh --drop-chown    # reproduce the open NFS-vs-FUSE
-#                                             # chown permission divergence
+#   scripts/hostile-docker.sh --drop-chown    # run with CAP_CHOWN/CAP_FOWNER
+#                                             # dropped: the capability-poor shape
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -264,19 +264,23 @@ esac
 # and everything else is a tmpfs that dies with the container. Layer 4 is
 # untouched.
 #
-# --drop-chown reproduces the finding these caps were added in response to:
-# with CAP_CHOWN absent, the NFS frontend ACCEPTS a chown that the kernel
-# and the FUSE frontend both refuse. Kept as a switch rather than the
-# default so the ongoing gate tests chown semantics instead of sitting
-# permanently red on one open triage item. See docs/TODO.md, hostile-agent.
+# --drop-chown runs the same vocabulary with both dropped, which is the
+# shape that found the mode-bits bug: with CAP_CHOWN absent, the NFS
+# frontend used to ACCEPT a chown that the kernel and the FUSE frontend
+# both refused. It is fixed (docs/TODO.md, modebits-agent — the frontend
+# applies the model itself now, reading its OWN capability set, so dropping
+# a capability changes its answer exactly as it changes the reference's),
+# and this switch is what keeps that true: both variants must be green,
+# the default one testing that the capabilities are honored and this one
+# testing that their absence is.
 CAPS=(--cap-add CHOWN --cap-add FOWNER)
 if [ "$DROP_CHOWN" = 1 ]; then
   # Explicit drops rather than an empty array: --cap-drop ALL above already
   # covers it, and bash 3.2 (the macOS system shell) treats "${EMPTY[@]}"
   # as an unbound variable under `set -u`.
   CAPS=(--cap-drop CHOWN --cap-drop FOWNER)
-  echo "   NOTE: running WITHOUT CAP_CHOWN/CAP_FOWNER, to reproduce the frontend"
-  echo "         permission divergence filed under hostile-agent in docs/TODO.md"
+  echo "   NOTE: running WITHOUT CAP_CHOWN/CAP_FOWNER. Both frontends must refuse"
+  echo "         what the reference refuses; this is the variant that says so."
 fi
 
 ENVS=(

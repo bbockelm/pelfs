@@ -21,7 +21,15 @@ import (
 func newRW(t *testing.T, uuid string) (billy.Filesystem, *fixture) {
 	t.Helper()
 	fx := newFixture(t, uuid)
-	return vfsbilly.New(openOverlay(t, fx)), fx
+	return newBilly(openOverlay(t, fx)), fx
+}
+
+// newRWAs is newRW mounted as some other identity, for a test that needs a
+// capability the ordinary fixture mount deliberately does not hold.
+func newRWAs(t *testing.T, uuid string, cred vfsbilly.Cred) (billy.Filesystem, *fixture) {
+	t.Helper()
+	fx := newFixture(t, uuid)
+	return vfsbilly.NewAs(openOverlay(t, fx), cred), fx
 }
 
 func names(fis []os.FileInfo) []string {
@@ -479,7 +487,12 @@ func TestReadAfterWrite(t *testing.T) {
 }
 
 func TestTempFileAndChange(t *testing.T) {
-	bfs, _ := newRW(t, "baaa1111-2222-3333-4444-555566667777")
+	// CAP_CHOWN: this test gives a file away to a uid nobody is, which is
+	// the one thing in it that ownership alone does not permit (perm.go).
+	// The permission matrix itself is perm_test.go's business.
+	cred := fixtureCred
+	cred.Caps |= vfsbilly.CapChown
+	bfs, _ := newRWAs(t, "baaa1111-2222-3333-4444-555566667777", cred)
 	f, err := bfs.TempFile("/dir", "tmp-")
 	if err != nil {
 		t.Fatal(err)
@@ -534,7 +547,7 @@ func TestTempFileAndChange(t *testing.T) {
 
 func TestReadOnly(t *testing.T) {
 	fx := newFixture(t, "caaa1111-2222-3333-4444-555566667777")
-	bfs := vfsbilly.NewReadOnly(fx.base)
+	bfs := newBillyReadOnly(fx.base)
 
 	// Reads work.
 	if got := readWhole(t, bfs, "/dir/inner/leaf.txt"); !bytes.Equal(got, fx.body["dir/inner/leaf.txt"]) {
@@ -612,8 +625,8 @@ func TestResolutionIsByDescent(t *testing.T) {
 	}
 
 	for _, bfs := range []billy.Filesystem{
-		vfsbilly.NewReadOnly(fx.base),
-		vfsbilly.New(openOverlay(t, fx)),
+		newBillyReadOnly(fx.base),
+		newBilly(openOverlay(t, fx)),
 	} {
 		fi, err := bfs.Stat("/dir/inner/leaf.txt")
 		if err != nil {

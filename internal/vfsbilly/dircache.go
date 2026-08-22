@@ -42,17 +42,39 @@ var noDirCache = os.Getenv("PELFS_NFS_NO_DESCENT_CACHE") == "1"
 // without per-hit bookkeeping: lookups check the young map, then the old
 // one (promoting), and an overflow retires young to old wholesale. The
 // working set therefore survives at least one full turnover.
+// A second map holds the permission-relevant ATTRIBUTES of the directories
+// whose edges are cached, which is the one exception to "never attributes"
+// above and needs its own justification. Search permission has to be
+// checked on every component of every path (perm.go), and re-reading three
+// or four directory nodes per RPC to answer a question whose answer almost
+// never changes would undo what this cache is for. Unlike size and mtime, a
+// directory's mode and ownership change only through THIS binding's
+// Chmod/Chown — the same property the edges already rest on — so the
+// invalidation is exact rather than a timeout: setAttr drops the entry for
+// the inode it changed. Nothing else can make it stale.
 type dirCache struct {
 	mu       sync.Mutex
 	limit    int
 	disabled bool
 	young    map[dirKey]uint64
 	old      map[dirKey]uint64
+	// perms is keyed by inode, and holds only directories.
+	perms map[uint64]dirPerm
 }
 
 type dirKey struct {
 	parent uint64
 	name   string
+}
+
+// dirPerm is everything the permission check needs about a directory: its
+// mode and its ownership, as the catalog stores them (the idmap
+// translation is applied by the caller, which is where the mount's
+// reporting policy lives).
+type dirPerm struct {
+	mode uint32
+	uid  uint32
+	gid  uint32
 }
 
 // dirCacheLimit is the per-generation bound, so up to twice this many
@@ -62,7 +84,8 @@ type dirKey struct {
 const dirCacheLimit = 1 << 16
 
 func newDirCache() *dirCache {
-	return &dirCache{limit: dirCacheLimit, disabled: noDirCache, young: make(map[dirKey]uint64)}
+	return &dirCache{limit: dirCacheLimit, disabled: noDirCache,
+		young: make(map[dirKey]uint64), perms: make(map[uint64]dirPerm)}
 }
 
 func (c *dirCache) get(parent uint64, name string) (uint64, bool) {
@@ -89,6 +112,42 @@ func (c *dirCache) put(parent uint64, name string, ino uint64) {
 		c.old, c.young = c.young, make(map[dirKey]uint64)
 	}
 	c.young[dirKey{parent, name}] = ino
+}
+
+// perm returns a directory's cached permission attributes.
+func (c *dirCache) perm(ino uint64) (dirPerm, bool) {
+	if c.disabled {
+		return dirPerm{}, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	p, ok := c.perms[ino]
+	return p, ok
+}
+
+// putPerm records a directory's permission attributes. The bound is the
+// same one the edges use, and overflow drops the whole map rather than
+// half of it: a miss costs one GetAttr and the working set refills in the
+// same walk that emptied it.
+func (c *dirCache) putPerm(ino uint64, p dirPerm) {
+	if c.disabled {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.perms) >= c.limit {
+		c.perms = make(map[uint64]dirPerm, c.limit/2)
+	}
+	c.perms[ino] = p
+}
+
+// forgetPerm drops one directory's attributes. Every change to a
+// directory's mode or ownership must call it, which is what makes the
+// entries above safe to hold without a timeout.
+func (c *dirCache) forgetPerm(ino uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.perms, ino)
 }
 
 // forget drops one edge. Every namespace mutation that can unbind a name

@@ -98,6 +98,16 @@ func statusOf(err error) nfs.NFSStatus {
 		return nfs.NFSStatusNotEmpty
 	case errors.Is(err, os.ErrExist):
 		return nfs.NFSStatusExist
+	// EPERM before the os.ErrPermission catch-all, which BOTH EPERM and
+	// EACCES satisfy. They are not synonyms and a client reports them
+	// differently: NFS3ERR_PERM is "you are not the owner", which is what
+	// chmod, utimes, chown and the sticky-bit rule answer
+	// (internal/vfsbilly/perm.go), while NFS3ERR_ACCES is "the mode bits
+	// say no". Collapsing them would have `chown` on this mount report
+	// "Permission denied" where the FUSE frontend — and every local
+	// filesystem — says "Operation not permitted".
+	case errors.Is(err, syscall.EPERM):
+		return nfs.NFSStatusPerm
 	case errors.Is(err, os.ErrPermission):
 		return nfs.NFSStatusAccess
 	case errors.Is(err, syscall.ESTALE):

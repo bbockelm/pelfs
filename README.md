@@ -177,7 +177,12 @@ pelfs shell --prefetch background --stats-file $_CONDOR_SCRATCH_DIR/pelfs-stats.
 - `--prefetch all` downloads the whole generation into the local cache at
   startup and **refuses to start** if anything is unavailable; `--prefetch
   background` starts the same warmup without blocking, recording the
-  outcome in the statistics.
+  outcome in the statistics. What it downloads is the generation's *packs*
+  — the unit of transfer, and the unit every read is served out of — so it
+  costs no decompression, no decryption and no disk beyond the packs
+  themselves. A generation that does not fit in the cache budget
+  (`--cache-size`) is refused with both numbers, rather than fetched and
+  then evicted piece by piece: raise the budget or drop the flag.
 - `--snapshot-interval` sets how often a writable mount checkpoints its
   overlay into a new generation. Everything up to the last checkpoint is
   durable in the federation; `0` seals only at unmount.

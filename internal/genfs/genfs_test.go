@@ -934,17 +934,28 @@ func TestPrefetchWarmsCache(t *testing.T) {
 	if rep.Files != 3 {
 		t.Fatalf("walked %d files, want 3", rep.Files)
 	}
-	if rep.Chunks == 0 {
-		t.Fatalf("fetched no chunks: %+v", rep)
+	if rep.Packs == 0 {
+		t.Fatalf("fetched no packs: %+v", rep)
 	}
 	if rep.Bytes < int64(len(bigContent)) {
 		t.Fatalf("warmed %d bytes, want at least one copy of the %d-byte file", rep.Bytes, len(bigContent))
 	}
+	// Nearly all of it was transferred here: the only pack already local is
+	// the one Open pulled to read the root catalog out of.
+	if rep.Fetched == 0 || rep.Fetched > rep.Bytes {
+		t.Fatalf("a cold prefetch made %d bytes local but transferred %d", rep.Bytes, rep.Fetched)
+	}
 
-	// The twin shares every chunk identity, so dedup means the warm set
-	// is one file's worth, not two.
+	// The twin shares every chunk identity, so dedup at publish means the
+	// pack set is one file's worth, not two.
 	if rep.Bytes > int64(len(bigContent))*3/2 {
 		t.Fatalf("warmed %d bytes for two identical files; dedup did not apply", rep.Bytes)
+	}
+
+	// The whole point: nothing was DECODED. A prefetch makes packs local;
+	// unpacking them is a read's business and a read's cost.
+	if ents, err := os.ReadDir(filepath.Join(cache, "chunks")); err == nil && len(ents) != 0 {
+		t.Fatalf("prefetch decoded %d chunk(s) to disk; it is supposed to move packs and nothing else", len(ents))
 	}
 
 	// The cache is genuinely warm: delete the packs and reads still work.
@@ -972,8 +983,9 @@ func TestPrefetchWarmsCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second Prefetch: %v", err)
 	}
-	if rep2.Chunks != 0 || rep2.Cached == 0 {
-		t.Fatalf("second pass fetched %d chunks (cached %d); want all cached", rep2.Chunks, rep2.Cached)
+	if rep2.Packs != 0 || rep2.Cached == 0 || rep2.Fetched != 0 {
+		t.Fatalf("second pass fetched %d packs / %d bytes (cached %d); want all cached",
+			rep2.Packs, rep2.Fetched, rep2.Cached)
 	}
 }
 

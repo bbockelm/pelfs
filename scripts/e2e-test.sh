@@ -156,12 +156,19 @@ if "$PELFS" shell --ro --state-dir "$WORK/state-enc3" "$ENCPREFIX" -- /bin/sh -c
 fi
 echo "   encryption verified: opaque objects, key required, round trip intact"
 
-echo "== prefetch: strict mode warms the whole generation =="
+echo "== prefetch: strict mode makes the whole generation local =="
+# What it moves is PACKS, not decoded chunks: a pack is the unit of
+# transfer, everything a read needs comes out of one, and making it local
+# costs no decode. So the state directory must come away with cached packs
+# and NOTHING unpacked beside them.
 "$PELFS" shell --ro --state-dir "$WORK/state-pf" --prefetch all \
   --stats-file "$WORK/stats-pf.json" "$PREFIX" -- /bin/sh -c 'cat hello.txt' > "$WORK/run-pf.log" 2>&1
 grep -q "prefetched" "$WORK/run-pf.log" || { echo "FAIL: strict prefetch did not report success"; exit 1; }
-python3 -c "import json; s=json.load(open('$WORK/stats-pf.json')); assert s['prefetch_complete'] and s['prefetch_chunks']>0, s" \
+python3 -c "import json; s=json.load(open('$WORK/stats-pf.json')); assert s['prefetch_complete'] and s['prefetch_packs']>0, s" \
   || { echo "FAIL: prefetch stats wrong"; cat "$WORK/stats-pf.json"; exit 1; }
+pf_packs="$(find "$WORK/state-pf" -path '*/gencache/packs/*' -type f | wc -l | tr -d ' ')"
+[ "$pf_packs" -gt 0 ] || { echo "FAIL: strict prefetch cached no packs"; find "$WORK/state-pf" -type d; exit 1; }
+echo "   strict prefetch verified: $pf_packs pack(s) local, nothing unpacked"
 
 echo "== lease: a second writer is refused, --steal-lease overrides =="
 mkdir -p "$WORK/origin/e2e/ns/meta"

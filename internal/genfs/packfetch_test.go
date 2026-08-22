@@ -3,6 +3,7 @@ package genfs_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -396,12 +397,19 @@ func TestTruncatedCachedPackIsNotServed(t *testing.T) {
 }
 
 // The cache is bounded: past the cap, least recently used packs go.
+//
+// READS drive it, not a prefetch. A prefetch refuses a generation this
+// much larger than the budget outright — that is what the budget check is
+// for (TestPrefetchRefusesAGenerationLargerThanTheCache) — so the only way
+// a cache this small ever overfills is the ordinary one, a read at a time.
 func TestPackCacheEvicts(t *testing.T) {
 	f := newPackFixture(t, "9ac0de01-0006-4002-8003-a0b0c0d0e0f0", 2<<20)
 	// Room for a couple of packs out of the several the fixture produces.
 	fs := f.open(t, genfs.Options{PackCacheBytes: 5 << 20})
-	if _, err := fs.Prefetch(context.Background(), 4); err != nil {
-		t.Fatalf("Prefetch: %v", err)
+	for name, want := range f.body {
+		if got := readFile(t, fs, name, 1<<20); !bytes.Equal(got, want) {
+			t.Fatalf("%s did not read back byte-exact", name)
+		}
 	}
 	var total int64
 	for _, name := range cachedPacks(t, f.cache) {
@@ -424,11 +432,16 @@ func TestPackCacheEvicts(t *testing.T) {
 
 // PackCacheBytes negative means "coalesce, but never store a whole pack" —
 // the setting for a client with less disk than bandwidth.
+//
+// A prefetch in that mode has nothing it is allowed to make local, so it
+// says so instead of quietly doing nothing (or, as it once did, decoding
+// the whole volume into chunk files that the pack policy had just been
+// told not to spend disk on).
 func TestPackCacheCanBeDisabled(t *testing.T) {
 	f := newPackFixture(t, "9ac0de01-0007-4002-8003-a0b0c0d0e0f0", 4<<20)
 	fs := f.open(t, genfs.Options{PackCacheBytes: -1})
-	if _, err := fs.Prefetch(context.Background(), 4); err != nil {
-		t.Fatalf("Prefetch: %v", err)
+	if _, err := fs.Prefetch(context.Background(), 4); !errors.Is(err, genfs.ErrPrefetchNeedsPackCache) {
+		t.Fatalf("Prefetch with whole-pack caching off: %v, want ErrPrefetchNeedsPackCache", err)
 	}
 	if packs := cachedPacks(t, f.cache); len(packs) != 0 {
 		t.Errorf("whole-pack caching is disabled but cached %v", packs)
@@ -436,6 +449,46 @@ func TestPackCacheCanBeDisabled(t *testing.T) {
 	for name, want := range f.body {
 		if got := readFile(t, fs, name, 1<<20); !bytes.Equal(got, want) {
 			t.Errorf("%s did not read back byte-exact", name)
+		}
+	}
+}
+
+// A generation that does not FIT in the local cache cannot be made local,
+// and the honest answer is a refusal with both numbers in it. Fetching it
+// anyway would evict the front of the pack set to make room for the back
+// and leave the mount slower than it would have been with no prefetch at
+// all — and, in strict mode, would report a warm cache that is not one.
+func TestPrefetchRefusesAGenerationLargerThanTheCache(t *testing.T) {
+	f := newPackFixture(t, "9ac0de01-0008-4002-8003-a0b0c0d0e0f0", 2<<20)
+	fs := f.open(t, genfs.Options{CacheBytes: 5 << 20})
+	// Open has already pulled the pack holding the root catalog; the
+	// question is whether the REFUSED prefetch adds to that.
+	wasCached := len(cachedPacks(t, f.cache))
+	before := f.inner.gets.Load()
+	rep, err := fs.Prefetch(context.Background(), 4)
+	var budget *genfs.PrefetchBudgetError
+	if !errors.As(err, &budget) {
+		t.Fatalf("Prefetch of a ~36 MiB generation into a 5 MiB cache: %v (report %+v)", err, rep)
+	}
+	if budget.Need <= budget.Budget {
+		t.Errorf("refused a set of %d bytes against a %d-byte budget", budget.Need, budget.Budget)
+	}
+	if budget.Packs == 0 {
+		t.Error("the refusal did not say how many packs it was refusing")
+	}
+	// It refused BEFORE moving payload. Trailers are read to resolve the
+	// locations the refusal is computed from; packs are not.
+	if got := cachedPacks(t, f.cache); len(got) != wasCached {
+		t.Errorf("a refused prefetch went from %d cached pack(s) to %d", wasCached, len(got))
+	}
+	t.Logf("refused %d bytes in %d packs against a %d-byte budget, after %d trailer request(s)",
+		budget.Need, budget.Packs, budget.Budget, f.inner.since(before))
+
+	// And the mount still WORKS: a refusal to prefetch is not a refusal to
+	// read. Only --prefetch all turns it into a failure to start.
+	for name, want := range f.body {
+		if got := readFile(t, fs, name, 1<<20); !bytes.Equal(got, want) {
+			t.Errorf("%s did not read back byte-exact after a refused prefetch", name)
 		}
 	}
 }

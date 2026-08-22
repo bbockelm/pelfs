@@ -1749,12 +1749,34 @@ kinds of thing in it:
 - `trailers/` — verified pack trailers, so a resolved location map
   survives a remount.
 
-`--prefetch all` fills the chunk cache for a whole generation before the
-mount starts and refuses to run if anything is unavailable; `--prefetch
-background` starts the same warmup without blocking. Prefetch walks
-catalogs rather than the pack list on purpose: the pack list includes
-catalogs, shards and backups, and can name packs holding chunks no live
-file references.
+`--prefetch all` makes a whole generation local before the mount starts
+and refuses to run if anything is unavailable; `--prefetch background`
+starts the same warmup without blocking.
+
+What it moves is PACKS. A pack is the unit of transfer and of storage, and
+everything a read needs — chunk bytes, catalogs, the pack's own trailer —
+comes out of one, so "the data is local" and "the packs are local" say the
+same thing, and the second costs no decompression and no decryption. (It
+used to pull every chunk through the read path, decoding the whole volume
+up front and writing a plaintext file per chunk. That paid for a decode
+the mount then repeated anyway whenever the chunk file had been evicted.)
+
+It walks catalogs rather than taking the pack list wholesale, for the same
+reason it always did: the pack list includes catalogs, shards and
+superblock backups, and after a repack it can name packs holding chunks no
+live file references. The walk names the packs the generation's live files
+and catalogs are actually made of, and nothing else.
+
+Two refusals, both loud, both before any payload moves:
+
+- a generation whose pack set is larger than the cache budget cannot be
+  made local at all — fetching it would evict the front of the set to make
+  room for the back, leaving the mount slower than no prefetch and its
+  report a lie — so the size and the budget are named and strict mode
+  declines to start;
+- a mount that has turned whole-pack caching off (`PackCacheBytes` below
+  zero, for a client with less disk than bandwidth) has nothing it is
+  permitted to make local, and says so rather than warming nothing.
 
 ## Overwrite churn
 

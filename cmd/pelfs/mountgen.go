@@ -858,11 +858,17 @@ func (g *genSession) releaseLease() {
 }
 
 // runPrefetch honors the shared --prefetch flag's three modes.
+//
+// What a prefetch moves is PACKS, not decoded chunks (genfs/prefetch.go):
+// a pack is the unit of transfer and everything a read needs comes out of
+// one, so "the data is local" and "the packs are local" are the same
+// statement, and the second costs no decode.
 func (g *genSession) runPrefetch(ctx context.Context, mode string) error {
 	record := func(rep *genfs.PrefetchReport, complete bool) {
 		g.stats.Update(func(sum *stats.Summary) {
-			sum.PrefetchChunks = int64(rep.Chunks)
+			sum.PrefetchPacks = int64(rep.Packs + rep.Cached)
 			sum.PrefetchBytes = rep.Bytes
+			sum.PrefetchFetchedBytes = rep.Fetched
 			sum.PrefetchFailed = int64(rep.Failed)
 			sum.PrefetchComplete = complete
 		})
@@ -871,19 +877,29 @@ func (g *genSession) runPrefetch(ctx context.Context, mode string) error {
 	switch mode {
 	case "", "none":
 	case "all":
-		ui.Info("prefetching the generation into the local cache...")
+		ui.Info("prefetching the generation's packs into the local cache...")
 		rep, err := g.gfs.Prefetch(ctx, pelicanobj.TransferWorkers())
 		if err != nil {
+			// A generation larger than the cache budget is the one refusal
+			// worth spelling out: nothing is wrong with the volume or with
+			// the federation, the disk is simply too small for what was
+			// asked, and the two numbers say so.
+			var budget *genfs.PrefetchBudgetError
+			if errors.As(err, &budget) {
+				return fmt.Errorf("prefetch: refusing to mount: the generation is %s in %d packs and the local cache budget is %s; "+
+					"raise --cache-size, or use --prefetch none and read from the federation",
+					ui.ByteCount(budget.Need), budget.Packs, ui.ByteCount(budget.Budget))
+			}
 			return fmt.Errorf("prefetch: %w", err)
 		}
 		record(rep, rep.Failed == 0)
 		if rep.Failed > 0 {
-			return fmt.Errorf("prefetch: %d chunk(s) could not be fetched (%v); refusing to mount",
+			return fmt.Errorf("prefetch: %d pack(s) could not be made local (%v); refusing to mount",
 				rep.Failed, rep.Sample)
 		}
-		ui.Info("prefetched {chunks} chunks ({cached} already cached) across {files} files, {bytes}",
-			"chunks", rep.Chunks, "cached", rep.Cached, "files", rep.Files,
-			"bytes", ui.ByteCount(rep.Bytes))
+		ui.Info("prefetched {packs} packs ({cached} already cached) across {files} files, {bytes} local ({fetched} transferred)",
+			"packs", rep.Packs, "cached", rep.Cached, "files", rep.Files,
+			"bytes", ui.ByteCount(rep.Bytes), "fetched", ui.ByteCount(rep.Fetched))
 	case "background":
 		go func() {
 			// Half the transfer pool, so warming never starves the
@@ -894,8 +910,8 @@ func (g *genSession) runPrefetch(ctx context.Context, mode string) error {
 				return
 			}
 			record(rep, rep.Failed == 0)
-			ui.Info("background prefetch done: {chunks} chunks, {failed} failed",
-				"chunks", rep.Chunks, "failed", rep.Failed)
+			ui.Info("background prefetch done: {packs} packs, {failed} failed, {fetched} transferred",
+				"packs", rep.Packs, "failed", rep.Failed, "fetched", ui.ByteCount(rep.Fetched))
 		}()
 	default:
 		return fmt.Errorf("unknown --prefetch %q (want none, all, or background)", mode)

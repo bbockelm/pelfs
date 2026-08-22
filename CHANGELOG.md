@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **`--prefetch` moves packs, not decoded chunks.** "I want the data
+  local" now means the generation's *packs* are local, which is what a
+  read is served out of anyway. It used to pull every chunk through the
+  read path — decompressing, decrypting, and writing one plaintext file
+  per chunk — so a prefetch cost a full decode of the volume up front plus
+  a second copy of it on disk, for a decode the mount then repeated later
+  anyway whenever a chunk file had been evicted. Strict mode's contract is
+  unchanged: it still refuses to start unless everything is local, and the
+  check is now that every referenced pack is cached and length-verified.
+
+  Two refusals are new, and both happen before any payload moves: a
+  generation whose pack set exceeds the local cache budget is declined
+  with both numbers rather than fetched and evicted piece by piece, and a
+  mount with whole-pack caching turned off (a negative `PackCacheBytes`)
+  reports that a prefetch is impossible rather than warming nothing.
+
+  **Statistics change:** `prefetch_chunks` is replaced by
+  `prefetch_packs`, and `prefetch_fetched_bytes` is added — what this
+  session actually transferred, as against `prefetch_bytes`, the size of
+  the set now local. A supervisor keying on `prefetch_chunks` needs
+  updating; `prefetch_complete` and `prefetch_failed` are unchanged.
+
 ## v0.1.0 — first release
 
 `pelfs` mounts a POSIX filesystem whose data lives in a

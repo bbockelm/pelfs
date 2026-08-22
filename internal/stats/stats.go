@@ -121,9 +121,17 @@ type Summary struct {
 	Writable        bool   `json:"writable,omitempty"` // --rw: an overlay shadows the generation
 	GenerationSwaps int64  `json:"generation_swaps,omitempty"`
 
-	// Prefetch warms whole content-defined chunks.
-	PrefetchChunks int64 `json:"prefetch_chunks,omitempty"`
-	PrefetchBytes  int64 `json:"prefetch_bytes,omitempty"`
+	// Prefetch makes whole PACKS local — the unit of transfer, and the
+	// unit everything a read needs comes out of. PrefetchPacks is the size
+	// of the generation's referenced pack set, PrefetchBytes what that set
+	// takes on disk, PrefetchFetchedBytes what this session actually moved
+	// (zero when a previous session had already cached it all).
+	//
+	// It replaced `prefetch_chunks`, which counted decoded chunk files, in
+	// the release after v0.1.0: a prefetch no longer decodes anything.
+	PrefetchPacks        int64 `json:"prefetch_packs,omitempty"`
+	PrefetchBytes        int64 `json:"prefetch_bytes,omitempty"`
+	PrefetchFetchedBytes int64 `json:"prefetch_fetched_bytes,omitempty"`
 
 	// ResidentInodes is how many inodes the mount is holding resolved, and
 	// ResidencyEvicted how many a residency cap has dropped. The second is

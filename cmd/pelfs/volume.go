@@ -17,6 +17,7 @@ import (
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/publish"
 	"github.com/bbockelm/pelfs/internal/refs"
+	"github.com/bbockelm/pelfs/internal/rotate"
 	"github.com/bbockelm/pelfs/internal/superblock"
 	"github.com/bbockelm/pelfs/internal/ui"
 )
@@ -32,6 +33,21 @@ func keyPassphrase() []byte { return []byte(os.Getenv("PELFS_KEY_PASSPHRASE")) }
 // produce a superblock every reader rejects, so that is refused here
 // rather than discovered by readers.
 func loadOrCreateSigningKey(path string, prev *superblock.Superblock) (ed25519.PrivateKey, error) {
+	// A ROTATION INTERRUPTED AFTER ITS LAST FLIP LANDS HERE, and this is
+	// the one place that can finish it. `pelfs rotate` publishes the
+	// generation signed by the successor and then promotes the successor to
+	// be the live local key; a crash between those two leaves a head whose
+	// key is sitting in a file named `.next`, and the check below would
+	// refuse every seal until someone re-ran a command they may not know
+	// about. Reconcile promotes on evidence — the pending key's public half
+	// IS the key the head is signed with — and does nothing otherwise, so a
+	// wrong state directory still gets the refusal it deserves.
+	if promoted, err := rotate.Reconcile(path, prev); err != nil {
+		return nil, err
+	} else if promoted {
+		ui.Warn("completed an interrupted key rotation: {path} now holds the key generation {gen} is signed "+
+			"by, and the previous key is archived beside it", "path", path, "gen", prev.Generation)
+	}
 	if b, err := os.ReadFile(path); err == nil {
 		k, err := hex.DecodeString(strings.TrimSpace(string(b)))
 		if err != nil || len(k) != ed25519.PrivateKeySize {
@@ -41,14 +57,18 @@ func loadOrCreateSigningKey(path string, prev *superblock.Superblock) (ed25519.P
 		if prev != nil {
 			pub := priv.Public().(ed25519.PublicKey)
 			if !strings.EqualFold(hex.EncodeToString(pub), hex.EncodeToString(prev.SigningPub[:])) {
-				// The advice has to be advice a user can take. This used to
-				// offer "or rotate via NextPub", which is not a thing anyone
-				// can do: the format carries a successor-key announcement and
-				// nothing in this tool writes one, so the only way forward is
-				// the key that signed the branch.
+				// The advice has to be advice a user can take, and BOTH
+				// halves of it are now takeable. It once said "or rotate via
+				// NextPub", which was not a thing anyone could do; then it
+				// said rotation was unsupported, which stopped being true
+				// when `pelfs rotate` landed. What has never changed is that
+				// a mismatch cannot be fixed by publishing: rotation starts
+				// from the key that signed the head, so the key still has to
+				// arrive from somewhere first.
 				return nil, fmt.Errorf("signing key %s does not match the branch head's key %x — readers would "+
-					"reject the generation, so import the key that signed this volume (key rotation is not supported yet)",
-					path, prev.SigningPub[:8])
+					"reject the generation, so import the key that signed this volume. Once it is here, "+
+					"`pelfs rotate --apply` replaces it through the custody chain (which is a decision, not a "+
+					"repair: it retires the pin volume-wide)", path, prev.SigningPub[:8])
 			}
 		}
 		return priv, nil

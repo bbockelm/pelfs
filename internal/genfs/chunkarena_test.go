@@ -26,6 +26,14 @@ type arenaFixture struct {
 
 func newArenaFixture(t *testing.T, uuid string, files, size int) *arenaFixture {
 	t.Helper()
+	return newSizedArenaFixture(t, uuid, files, func(int) int { return size })
+}
+
+// newSizedArenaFixture is the same fixture with a file size per file, for
+// the cases where UNIFORM chunks are the thing that hides the bug: an arena
+// whose chunks all divide its size evenly never strands the tail of a lap.
+func newSizedArenaFixture(t *testing.T, uuid string, files int, size func(i int) int) *arenaFixture {
+	t.Helper()
 	raw, _ := newInner(t)
 	f := &arenaFixture{
 		inner: &countingStore{Store: raw},
@@ -35,7 +43,7 @@ func newArenaFixture(t *testing.T, uuid string, files, size int) *arenaFixture {
 	v := newTestVolume(t, f.inner, uuid)
 	for i := 0; i < files; i++ {
 		name := fmt.Sprintf("a%03d.bin", i)
-		f.body[name] = pseudorandom(size, int64(3300+i))
+		f.body[name] = pseudorandom(size(i), int64(3300+i))
 		v.Write(v.Create(rootIno, name), f.body[name])
 		f.names = append(f.names, name)
 	}
@@ -174,6 +182,124 @@ func TestArenaEvictionUnderConcurrentReaders(t *testing.T) {
 	}
 	t.Logf("1 MiB arena over a %d MiB volume, 8 readers x 6 rounds: %d hits, %d misses, %s decoded",
 		(files*size)>>20, st.Hits, st.Misses, bytesH(st.DecodedBytes))
+}
+
+// The arena's central invariant: no two LIVE slots ever name the same bytes,
+// and the mapping never claims to hold more than it is.
+//
+// This is the case the eviction test above cannot see. Its chunks are all
+// 512 KiB in a 1 MiB arena, so the cursor divides the mapping exactly and
+// nothing is ever stranded. Give the chunks awkward sizes and the cursor
+// reaches the end of the mapping with a few bytes to spare, cannot fit the
+// next chunk there, and restarts at zero — leaving live slots from the
+// previous lap sitting in the tail it just skipped, at the HEAD of the
+// eviction queue. In v0.1.0 nothing took those back, so every eviction for a
+// whole lap afterwards found a head slot that did not overlap the
+// allocation and stopped: the cursor overwrote live slots without declaring
+// them dead, the index went on publishing them, and readers were served
+// another chunk's bytes. Measured on this fixture before the fix: 651 live
+// slots holding 66 MiB inside a 1 MiB mapping, overlapping each other.
+func TestArenaSlotsNeverOverlap(t *testing.T) {
+	const files = 40
+	// Sizes that do not divide the arena, and that vary, so the tail of a
+	// lap is stranded most laps.
+	f := newSizedArenaFixture(t, "a4e4a000-0007-4000-8000-000000000007", files,
+		func(i int) int { return 40<<10 + (i*7919)%(150<<10) })
+	const arena = 1 << 20
+	fs := f.open(t, genfs.Options{ChunkArenaBytes: arena})
+	ctx := context.Background()
+	buf := make([]byte, 24<<10)
+	for round := 0; round < 8; round++ {
+		for _, name := range f.names {
+			n, err := fs.Lookup(ctx, rootIno, name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for off := int64(0); off < n.Length; {
+				got, err := fs.Read(ctx, n.Inode, off, buf)
+				if err != nil {
+					t.Fatalf("read %s at %d: %v", name, off, err)
+				}
+				if got == 0 {
+					break
+				}
+				if !bytes.Equal(buf[:got], f.body[name][off:off+int64(got)]) {
+					t.Fatalf("round %d: %s at %d read another chunk's bytes", round, name, off)
+				}
+				off += int64(got)
+			}
+		}
+		overlaps, indexed, resident, size := fs.ArenaOverlaps()
+		if overlaps != 0 {
+			t.Fatalf("round %d: %d pairs of live slots share bytes", round, overlaps)
+		}
+		if resident > size {
+			t.Fatalf("round %d: %s resident in a %s mapping", round, bytesH(resident), bytesH(size))
+		}
+		if live := fs.DecodedChunksResident(); indexed > live {
+			t.Fatalf("round %d: the index publishes %d chunks and the mapping holds %d", round, indexed, live)
+		}
+	}
+	st := fs.ChunkStats()
+	if st.Misses <= files {
+		t.Fatalf("only %d misses: the arena never had to wrap", st.Misses)
+	}
+	t.Logf("%d rounds over a %s arena holding %s of chunks: %d hits, %d misses",
+		8, bytesH(arena), bytesH(int64(files)*95<<10), st.Hits, st.Misses)
+}
+
+// What the admission policy is FOR: a scan bigger than the arena must not
+// flush the chunks somebody keeps coming back to.
+//
+// This is the failure the single wrapping cursor had by construction. Every
+// miss admitted, every admission evicted the oldest thing in the mapping,
+// and a pass over a volume larger than the arena therefore replaced all of
+// it with chunks that were read once — so a re-read of the hot subset after
+// the scan found nothing, and on the bench corpus a 32 MiB arena over 166
+// MiB re-scanned at 10%, no better than no tier at all.
+//
+// With probation and protected regions the scan churns a sixteenth of the
+// mapping and cannot reach the rest. The hot subset gets into the protected
+// region the only way anything does — by being re-read, evicted, and asked
+// for again — and stays there across as many scans as the test cares to run.
+func TestAScanDoesNotFlushWhatIsReReadRepeatedly(t *testing.T) {
+	const files, size = 100, 128 << 10
+	const arena = 4 << 20 // a thirtieth of the volume
+	f := newArenaFixture(t, "a4e4a000-0008-4000-8000-000000000008", files, size)
+	fs := f.open(t, genfs.Options{ChunkArenaBytes: arena})
+	hot := f.names[:8] // 1 MiB, comfortably inside the protected region
+
+	readAll := func(names []string) {
+		for _, name := range names {
+			if got := readFile(t, fs, name, 64<<10); !bytes.Equal(got, f.body[name]) {
+				t.Fatalf("%s did not read back byte-exact", name)
+			}
+		}
+	}
+	// Re-read the hot subset, then scan past it: the scan evicts it, but it
+	// leaves having been re-read, which is what the arena remembers.
+	readAll(hot)
+	readAll(hot)
+	readAll(f.names)
+	// The miss after that eviction is the promotion; the read after the
+	// promotion is the one that should be free.
+	readAll(hot)
+	readAll(hot)
+
+	// And now the test: scan the whole volume, thirty times the arena, and
+	// come back.
+	readAll(f.names)
+	before := fs.ChunkStats()
+	readAll(hot)
+	st := fs.ChunkStats()
+	hits, misses := st.Hits-before.Hits, st.Misses-before.Misses
+	if hits == 0 || misses*4 > hits {
+		t.Fatalf("after a scan of %s through a %s arena, the hot subset read %d hits / %d misses: "+
+			"the scan flushed what was being re-read",
+			bytesH(files*size), bytesH(arena), hits, misses)
+	}
+	t.Logf("%s arena, %s volume: the hot subset survives a full scan at %d hits / %d misses",
+		bytesH(arena), bytesH(files*size), hits, misses)
 }
 
 // A v0.1.0 state directory has a populated flat chunks/ directory. It is a

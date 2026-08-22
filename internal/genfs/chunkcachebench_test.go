@@ -12,20 +12,25 @@ package genfs_test
 //
 // It is not part of the suite: it builds a ~166 MiB source-shaped tree and
 // reads it several times over, so it runs only under
-// PELFS_CHUNKCACHE_BENCH=1. Three workloads, over three arms — the default
-// arena, an arena deliberately too small for the working set, and no tier
-// at all:
+// PELFS_CHUNKCACHE_BENCH=1. Four workloads:
 //
 //	scan     — a cold read of every file, front to back. The `grep -r` that
 //	           follows an untar: every chunk touched once, which is the case
 //	           a decode cache is supposed not to help.
 //	rescan   — the same read again, warm. The case it is FOR.
+//	rescan2  — and again, because an admission policy that admits on
+//	           evidence can look excellent on the pass after the one that
+//	           filled the arena and then drift, as each pass's misses evict
+//	           the residents that served the last one.
 //	scatter  — one small window from a randomly chosen file, over and over.
 //	           The interactive case, and the one where a whole chunk is
 //	           decoded to serve four kilobytes of it.
 //
-// Packs are made local first in every arm, so what is being compared is
-// decode work and nothing else.
+// over four arms, which since there is an admission policy is the axis that
+// decides everything: an arena LARGER than the working set, one a hair
+// smaller, one a fifth the size, and no tier at all. Packs are made local
+// first in every arm, so what is being compared is decode work and nothing
+// else.
 
 import (
 	"context"
@@ -154,17 +159,36 @@ type phase struct {
 	read  int64
 	stats genfs.ChunkStats
 	gets  int64
+	res   genfs.ArenaResidency
+}
+
+func (p phase) rate() float64 {
+	total := p.stats.Hits + p.stats.Misses
+	if total == 0 {
+		return 0
+	}
+	return 100 * float64(p.stats.Hits) / float64(total)
 }
 
 func (p phase) String() string {
 	total := p.stats.Hits + p.stats.Misses
-	rate := 0.0
-	if total > 0 {
-		rate = 100 * float64(p.stats.Hits) / float64(total)
-	}
-	return fmt.Sprintf("%-8s %8s  read %9s  chunk hits %7d / %7d (%5.1f%%)  decoded %9s  gets %5d",
+	return fmt.Sprintf("%-8s %8s  read %9s  chunk hits %7d / %7d (%5.1f%%)  decoded %9s  gets %5d  %s",
 		p.name, p.wall.Round(time.Millisecond), bytesH(p.read),
-		p.stats.Hits, total, rate, bytesH(p.stats.DecodedBytes), p.gets)
+		p.stats.Hits, total, p.rate(), bytesH(p.stats.DecodedBytes), p.gets,
+		residencyH(p.res))
+}
+
+// residencyH says what the arena is holding and how much of it anybody read
+// again — the question an admission policy exists to change.
+func residencyH(r genfs.ArenaResidency) string {
+	if r.Slots == 0 {
+		return "resident 0"
+	}
+	return fmt.Sprintf("resident %5d/%9s  served %4.0f%% reused %4.0f%%  fill %6d evict %6d promote %6d",
+		r.Slots, bytesH(r.Bytes),
+		100*float64(r.ServedBytes)/float64(r.Bytes),
+		100*float64(r.ReusedBytes)/float64(r.Bytes),
+		r.Fills, r.Evicted, r.Promoted)
 }
 
 // runArm runs the three workloads against one configuration and returns a
@@ -200,6 +224,7 @@ func runArm(t *testing.T, c *benchCorpus, o genfs.Options, encrypted bool) ([]ph
 			DecodedBytes: now.DecodedBytes - base.DecodedBytes,
 		}
 		p.gets = c.inner.gets.Load() - baseGets
+		p.res = fs.ArenaResidency()
 		base, baseGets = now, c.inner.gets.Load()
 		return p
 	}
@@ -231,7 +256,11 @@ func runArm(t *testing.T, c *benchCorpus, o genfs.Options, encrypted bool) ([]ph
 		return total
 	}
 
-	out := []phase{measure("scan", scan), measure("rescan", scan)}
+	// Two re-scans, not one. A policy that admits on evidence can look
+	// excellent on the pass right after the one that filled the arena and
+	// then drift, as each pass's misses evict the residents that served the
+	// last one; the only way to see that is to run the pass again.
+	out := []phase{measure("scan", scan), measure("rescan", scan), measure("rescan2", scan)}
 
 	out = append(out, measure("scatter", func() int64 {
 		r := rand.New(rand.NewSource(99))
@@ -285,6 +314,32 @@ func describeCache(t *testing.T, dir string) string {
 	return out
 }
 
+// The SIZE arms, which are the interesting axis once there is an admission
+// policy at all: the tier's behaviour is entirely decided by how the working
+// set compares to the mapping.
+//
+//	fits   — the default arena, comfortably larger than the corpus. The
+//	         shipped numbers, and the floor no policy may regress.
+//	1.1x   — an arena a HAIR smaller than the working set. The adversarial
+//	         case: a bare FIFO cursor evicts each chunk one access before it
+//	         is wanted, so a re-scan hits nothing at all though nearly
+//	         everything would fit.
+//	32M    — an arena a fifth of the working set. The thrash case, where the
+//	         honest ceiling for a cyclic re-read is the resident fraction.
+func benchSizeArms(corpus int64) []struct {
+	name  string
+	arena int64
+} {
+	return []struct {
+		name  string
+		arena int64
+	}{
+		{"fits", 0},
+		{"1.1x", int64(float64(corpus) / 1.1)},
+		{"32M", 32 << 20},
+	}
+}
+
 func TestChunkCacheWorkloads(t *testing.T) {
 	if os.Getenv("PELFS_CHUNKCACHE_BENCH") != "1" {
 		t.Skip("set PELFS_CHUNKCACHE_BENCH=1 to measure the decoded-chunk tier")
@@ -296,31 +351,39 @@ func TestChunkCacheWorkloads(t *testing.T) {
 		}
 		t.Run(label, func(t *testing.T) {
 			c := buildBenchCorpus(t, encrypted)
-			arms := []struct {
-				name string
-				o    genfs.Options
-			}{
-				{"arena", genfs.Options{}},
-				{"arena/32M", genfs.Options{ChunkArenaBytes: 32 << 20}},
-				{"none", genfs.Options{ChunkArenaBytes: -1}},
-			}
 			t.Logf("== %s corpus: %d files, %s ==", label, len(c.files), bytesH(c.bytes))
-			var baseline []phase
-			for _, arm := range arms {
-				ps, cache := runArm(t, c, arm.o, encrypted)
-				t.Logf("%s", arm.name)
-				for i, p := range ps {
-					line := fmt.Sprintf("  %s", p)
-					if baseline != nil {
-						pct := 100 * (float64(p.wall) - float64(baseline[i].wall)) / float64(baseline[i].wall)
-						line += fmt.Sprintf("  [%+.1f%% vs arena]", pct)
-					}
-					t.Logf("%s", line)
+
+			type row struct {
+				arm string
+				ps  []phase
+			}
+			var rows []row
+			for _, size := range benchSizeArms(c.bytes) {
+				ps, cache := runArm(t, c, genfs.Options{ChunkArenaBytes: size.arena}, encrypted)
+				t.Logf("%s (arena %s)", size.name, bytesH(genfs.ArenaBytesFor(size.arena)))
+				for _, p := range ps {
+					t.Logf("  %s", p)
 				}
 				t.Logf("  cache: %s", cache)
-				if baseline == nil {
-					baseline = ps
+				rows = append(rows, row{size.name, ps})
+			}
+			// No tier at all: the number every arm has to beat to be worth
+			// the disk, and the one a thrashing arena was not beating.
+			none, _ := runArm(t, c, genfs.Options{ChunkArenaBytes: -1}, encrypted)
+			t.Logf("none (no decode tier)")
+			for _, p := range none {
+				t.Logf("  %s", p)
+			}
+			rows = append(rows, row{"none", none})
+
+			t.Logf("== wall, and chunk hit rate ==")
+			t.Logf("%-6s | %-15s %-15s %-15s %-15s", "arm", "scan", "rescan", "rescan2", "scatter")
+			for _, r := range rows {
+				line := fmt.Sprintf("%-6s |", r.arm)
+				for _, p := range r.ps {
+					line += fmt.Sprintf(" %8s %5.1f%% ", p.wall.Round(time.Millisecond), p.rate())
 				}
+				t.Logf("%s", line)
 			}
 		})
 	}

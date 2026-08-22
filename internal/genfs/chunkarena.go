@@ -46,9 +46,10 @@ import (
 //     pack.
 //
 // Space is allocated by a bump cursor that WRAPS, so there is no
-// fragmentation to manage and allocation is O(1). Wrapping over live
-// chunks is the eviction: FIFO, which for this cache is not the
-// compromise it sounds like — the arena's own numbers say so.
+// fragmentation to manage and allocation is O(1). Wrapping over live chunks
+// is the eviction: FIFO, and there are two of them, because FIFO alone
+// thrashes as soon as the volume does not fit in the mapping (see ADMISSION
+// below).
 //
 // A ristretto (TinyLFU) index was built first, because a scan-resistant
 // admission policy is the obviously right answer to "what belongs in a
@@ -82,6 +83,73 @@ import (
 // the space away. So an eviction WAITS for the readers inside the region it
 // is taking — the parked-read discipline gencache_test.go pins for the file
 // cache — and no two goroutines are ever inside the same bytes.
+//
+// ADMISSION, and the mapping is in TWO REGIONS because of it.
+//
+// One wrapping cursor over the whole mapping thrashes as soon as the working
+// set does not fit: every miss admits, every admit evicts something about to
+// be wanted, and a scan defeats itself. Measured on the 166 MiB corpus, a
+// bare cursor re-scans at 10% however much it is given short of the whole
+// thing — 10% at a 32 MiB arena, and still 10% at 150 MiB, an arena a HAIR
+// smaller than the working set, where nearly everything would have fitted.
+// That second number is the interesting one: it is the textbook cyclic
+// cliff, where the cursor evicts each chunk one access before it is wanted,
+// and it does not improve as the arena grows. It improves when the arena
+// exceeds the working set, and not before.
+//
+// The 10% it does serve is worth naming, because it is what any policy here
+// has to keep: a 128 KiB kernel read of a 500 KiB chunk decodes the WHOLE
+// chunk, so the next three reads of that chunk are hits. Those hits are
+// nearly all of what the tier buys on a cold pass, they arrive microseconds
+// after the fill, and a policy that holds a new chunk at arm's length to see
+// whether it deserves the space throws every one of them away. That is what
+// killed the two obvious answers (docs/TODO.md, admission-agent): a
+// second-touch doorkeeper, and admitting only chunks a ghost table had seen
+// before. Both cost more on the cold and scattered passes than they bought
+// on the re-scan, and the ghost variant deadlocked itself — with nothing
+// admitted nothing is evicted, so nothing enters the ghost table, so nothing
+// is ever admitted again.
+//
+// So NOTHING IS EVER REFUSED. The gate does not decide whether a chunk is
+// cached, only WHERE, and the mapping is split so there is a where:
+//
+//	probation — a sixteenth of the mapping, its own wrapping cursor. Every
+//	            chunk lands here. A scan churns this and only this, and a
+//	            sixteenth is many chunks deep, so the sub-reads of the chunk
+//	            being streamed are still hits.
+//	protected — the rest, its own wrapping cursor, and a scan cannot touch
+//	            it. A chunk gets in by having been RE-READ: when the cursor
+//	            takes back a slot that somebody read from offset zero while
+//	            it was resident, the identity goes into a small ghost table,
+//	            and the miss that follows admits it here.
+//
+// Offset zero is the whole discrimination, and it is free: a read at a
+// NONZERO offset is the next kernel window of a chunk being streamed, a read
+// at zero of a chunk already resident is somebody coming back to it. Count
+// hits instead and a scan promotes itself, which is the failure the shipped
+// FIFO had by another name.
+//
+// While the protected cursor has never lapped it takes everything directly,
+// so a working set that fits ends up entirely inside it having paid nothing
+// at all for the policy — same hit rates, zero evictions, and the numbers
+// this file quotes above are still the numbers. What it buys, on the same
+// corpus and against the bare cursor:
+//
+//	arena             re-scan hit rate      scattered 4 KiB
+//	256 MiB (fits)    100% ->  100%         100% -> 100%
+//	150 MiB (1.1x)     10% ->   88%          90% ->  92%
+//	 32 MiB (0.2x)     10% ->   27%          18% ->  20%
+//
+// and the number behind those: after a re-scan at 32 MiB, the bare cursor's
+// resident 32 MiB contains 0% that anybody has re-read, while this holds
+// 94%. It is the same mapping, full of chunks somebody wants instead of
+// chunks that happened to be decoded last.
+//
+// The ghost table is consulted and updated with atomics on the MISS path,
+// under the allocation lock, next to a decode that costs microseconds. A HIT
+// is the same map lookup and memcpy it always was plus one flag check, which
+// is not an accident: the hot re-scan is 100% hits, and an instruction added
+// there is paid a hundred times for every time the gate changes a decision.
 
 // DefaultChunkArenaBytes is the decoded-chunk arena's size when nothing
 // says otherwise.
@@ -114,9 +182,44 @@ type arenaSlot struct {
 	mu     sync.RWMutex
 	filled bool // the bytes are there
 	dead   bool // the space has been given to someone else
+
+	// served records that this slot answered at least one read since it
+	// was filled, and reused that one of those reads started at offset
+	// zero — a whole-chunk re-read rather than the next kernel-sized
+	// window of a chunk being streamed. Written under the slot's READ
+	// lock, so they are atomic and are checked before being set: eight
+	// readers inside one hot chunk must not trade a cache line for a bit
+	// that is already the value they want. Nothing reads them but the
+	// residency report; they are how "what fraction of the arena is
+	// serving repeat reads" gets answered with a number.
+	served atomic.Bool
+	reused atomic.Bool
 }
 
-// chunkArena is the tier: the mapping, the cursor, and the index.
+// arenaRegion is a wrapping bump cursor over one span of the mapping, and
+// the queue of what that span currently holds.
+//
+// There are two, probation and protected, and each is a plain FIFO in its
+// own span of the mapping — a chunk never moves between them, so a promotion
+// costs a decode and never a memcpy, and every slot stays contiguous.
+//
+// lapped is the gate's other input: false means the cursor has never
+// wrapped, so there is virgin space ahead of it and taking some cannot cost
+// anybody their bytes. It is also how the protected region knows to stop
+// accepting new chunks directly, which is the moment the policy starts
+// existing at all.
+type arenaRegion struct {
+	base   int64 // where the region starts in the mapping
+	size   int64
+	next   int64 // the cursor, region-relative
+	lapped bool  // the cursor has wrapped at least once: it is full
+	q      []*arenaSlot
+	keys   []string
+	head   int
+}
+
+// chunkArena is the tier: the mapping, its two cursors, the index, and the
+// gate that chooses between them.
 type chunkArena struct {
 	f    *os.File
 	mm   []byte
@@ -130,21 +233,125 @@ type chunkArena struct {
 	// come back round to its bytes.
 	idx [arenaShards]arenaShard
 
-	// mu guards the cursor and the allocation queue. It is never held
+	// mu guards the cursors and the allocation queues. It is never held
 	// across a decode or a federation read, and readers never take it.
 	mu sync.Mutex
-	// next is the bump cursor: the offset the next allocation starts at.
-	next int64
-	// q is the slots in allocation order, oldest first — the eviction
-	// order, and the only record of what occupies the mapping. head is the
-	// index of the oldest slot still in it.
-	q    []*arenaSlot
-	keys []string
-	head int
+	// main is the protected region — the bulk of the mapping, which a scan
+	// cannot reach — and probation the sixteenth in front of it that every
+	// new chunk goes into.
+	main      arenaRegion
+	probation arenaRegion
+
+	// ghost remembers the identities of chunks that had earned the
+	// protected region when the cursor took them back, so the miss that
+	// follows can tell a chunk coming BACK from a chunk arriving. Lock-free.
+	ghost *arenaFilter
 
 	// Counters, atomic because the fill path touches them from every
 	// reader goroutine and must not serialize on anything.
-	fills, evicted, rejected atomic.Int64
+	fills, evicted, rejected, promoted atomic.Int64
+}
+
+// probationShare is the fraction of the mapping new chunks land in, and
+// segProbationFloor the least it may come to.
+//
+// A sixteenth, measured. The share is a straight trade: probation is the
+// buffer a scan churns instead of the cache, and every byte of it is a byte
+// the protected region does not have. Bigger probation admits more chunks to
+// the proving ground and holds fewer proven ones — at a quarter the 1.1x
+// re-scan serves 74%, at a sixteenth 88%, at a thirty-second 90%. The knee is
+// at a sixteenth and the last two points are worth less than the risk on the
+// other side of the trade, which is a probation region too small to hold the
+// chunk being streamed through it (see gate).
+//
+// The floor is what keeps a small arena from having a probation region that
+// no chunk fits in. Below it the split stops being a split: a mapping this
+// size holds a handful of chunks however they are divided.
+const (
+	probationShare = 16
+	probationFloor = 1 << 20
+)
+
+// probationBytes divides the mapping.
+func probationBytes(size int64) int64 {
+	p := size / probationShare
+	if p < probationFloor {
+		p = probationFloor
+	}
+	if p > size/2 {
+		p = size / 2
+	}
+	return p
+}
+
+// arenaFilter is a fixed-size, lock-free set of identities seen lately.
+//
+// It is one uint32 tag per bucket, and its decay is that a bucket holds
+// exactly one identity: a tag survives until another identity hashes to the
+// same place, which for a table sized to the arena's own entry count is
+// about one lap's worth of traffic. That is the horizon this wants — an
+// identity the cursor let go of a whole working set ago is not evidence of
+// anything, and remembering it forever is how a doorkeeper re-admits an
+// entire scan on its second pass.
+//
+// It is approximate in both directions and that is fine. A false positive
+// (two identities, one bucket) admits one chunk that had not earned it; a
+// false negative refuses one that had, and costs a decode that the version
+// without a filter at all was paying every time.
+type arenaFilter struct {
+	mask uint64
+	tags []atomic.Uint32
+}
+
+func newArenaFilter(entries int) *arenaFilter {
+	n := 4096
+	for n < entries && n < 1<<20 {
+		n <<= 1
+	}
+	return &arenaFilter{mask: uint64(n - 1), tags: make([]atomic.Uint32, n)}
+}
+
+// filterHash splits an identity into a bucket and a tag. FNV-1a over the
+// first sixteen hex characters: that is sixty-four bits of BLAKE3 output,
+// which is more than a table of a million buckets can use, and it is a
+// dozen instructions rather than a hash of a 64-byte string.
+func filterHash(key string) (uint64, uint32) {
+	h := uint64(14695981039346656037)
+	n := len(key)
+	if n > 16 {
+		n = 16
+	}
+	for i := 0; i < n; i++ {
+		h = (h ^ uint64(key[i])) * 1099511628211
+	}
+	// Never zero: zero is how an untouched bucket reads.
+	return h, uint32(h>>32) | 1
+}
+
+// note records an identity.
+func (f *arenaFilter) note(key string) {
+	h, tag := filterHash(key)
+	f.tags[h&f.mask].Store(tag)
+}
+
+// take reports whether the filter remembers this identity, and forgets it
+// if so. Single-use on purpose: the evidence is spent by the admission it
+// justifies, so one eviction buys one re-entry and a chunk that came back
+// has to earn its next return the same way.
+func (f *arenaFilter) take(key string) bool {
+	h, tag := filterHash(key)
+	b := &f.tags[h&f.mask]
+	if b.Load() != tag {
+		return false
+	}
+	b.Store(0)
+	return true
+}
+
+func (f *arenaFilter) clear() {
+	for i := range f.tags {
+		f.tags[i].Store(0)
+	}
 }
 
 // arenaShards is how many pieces the index is cut into. A power of two so
@@ -207,6 +414,15 @@ func newChunkArena(dir string, size int64) (*chunkArena, error) {
 		return nil, fmt.Errorf("genfs: mmap chunk arena %s: %w", path, err)
 	}
 	a := &chunkArena{f: f, mm: mm, size: size}
+	p := probationBytes(size)
+	a.probation = arenaRegion{base: 0, size: p}
+	a.main = arenaRegion{base: p, size: size - p}
+	// The ghost table is sized to the arena's own entry count, so its
+	// horizon is about one lap. Chunks are not a fixed size, so the count
+	// has to be assumed: eight kilobytes is well under the smallest thing
+	// worth caching and errs toward a table too big, which costs memory
+	// and nothing else.
+	a.ghost = newArenaFilter(int(size / (8 << 10)))
 	for i := range a.idx {
 		a.idx[i].byID = make(map[string]*arenaSlot)
 	}
@@ -262,6 +478,16 @@ func (a *chunkArena) read(idHex string, off int64, window []byte) bool {
 		return false
 	}
 	copy(window, a.mm[s.off+off:s.off+off+int64(len(window))])
+	if !s.served.Load() {
+		s.served.Store(true)
+	}
+	if off == 0 && !s.reused.Load() {
+		// A read from the START of a chunk that is already here is a
+		// genuine re-read. A read at a nonzero offset is the next
+		// kernel-sized window of a chunk being streamed, which is reuse of
+		// a decode and not evidence of anything about the future.
+		s.reused.Store(true)
+	}
 	s.mu.RUnlock()
 	return true
 }
@@ -348,50 +574,176 @@ func (a *chunkArena) forget(key string) {
 func (a *chunkArena) alloc(key string, length int64) (*arenaSlot, []string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if length > a.size {
+	r := a.gate(key, length)
+	if length > r.size {
 		return nil, nil
 	}
-	if a.next+length > a.size {
-		a.next = 0
-	}
-	s := &arenaSlot{off: a.next, length: length}
-	end := a.next + length
 	var evicted []string
-	// Oldest first, for as long as the oldest is in the way. The queue is
-	// in allocation order, which is address order everywhere except across
-	// the wrap — and across the wrap the slots at high addresses are the
-	// NEWEST, so they sit at the back and the front-of-queue test still
-	// names the right victim.
-	for a.head < len(a.q) {
-		v := a.q[a.head]
-		if v.off >= end || v.off+v.length <= a.next {
-			break
-		}
-		a.kill(v)
-		evicted = append(evicted, a.keys[a.head])
-		a.head++
-		a.evicted.Add(1)
+	if r.next+length > r.size {
+		// The tail cannot hold this chunk, so the cursor restarts at zero
+		// and the bytes between here and the end of the region are
+		// stranded. THE SLOTS STILL IN THEM HAVE TO BE TAKEN BACK NOW.
+		//
+		// They belong to the previous lap and sit at the head of the queue,
+		// and the cursor will not reach their addresses again for a whole
+		// lap. Leave them there and every eviction for that entire lap
+		// finds a head slot that does not overlap the allocation and stops
+		// — so the cursor writes over live slots without declaring them
+		// dead, the index goes on naming them, and a reader is handed
+		// another chunk's bytes under its own identity. That was the
+		// v0.1.0 behaviour, invisible on a volume whose chunks all happen
+		// to be the same size (nothing is ever stranded) and reproduced by
+		// TestArenaSlotsNeverOverlap on one whose chunks vary.
+		evicted = append(evicted, a.reclaim(r, r.next, r.size)...)
+		r.next = 0
+		r.lapped = true
 	}
+	s := &arenaSlot{off: r.base + r.next, length: length}
+	end := r.next + length
+	evicted = append(evicted, a.reclaim(r, r.next, end)...)
 	// Compact when the dead prefix is most of the queue, so a long session
 	// does not grow it without bound.
-	if a.head > 0 && a.head*2 >= len(a.q) {
-		a.q = append(a.q[:0], a.q[a.head:]...)
-		a.keys = append(a.keys[:0], a.keys[a.head:]...)
-		a.head = 0
+	if r.head > 0 && r.head*2 >= len(r.q) {
+		r.q = append(r.q[:0], r.q[r.head:]...)
+		r.keys = append(r.keys[:0], r.keys[r.head:]...)
+		r.head = 0
 	}
-	a.q = append(a.q, s)
-	a.keys = append(a.keys, key)
-	a.next = end
+	r.q = append(r.q, s)
+	r.keys = append(r.keys, key)
+	r.next = end
 	return s, evicted
 }
 
-// stats is what the tier is doing, for `pelfs cache` and the statistics
-// file.
-func (a *chunkArena) stats() (fills, evicted, rejected int64) {
-	if a == nil {
-		return 0, 0, 0
+// reclaim takes back every slot at the head of the region's queue that
+// overlaps [lo, hi), and returns their keys for the caller to unpublish.
+//
+// Oldest first, for as long as the oldest is in the way. The queue is in
+// allocation order, which is address order everywhere except across the
+// wrap — and across the wrap the slots at high addresses are the NEWEST, so
+// they sit at the back and the front-of-queue test still names the right
+// victim. That holds only because a wrap reclaims the stranded tail as it
+// happens (see alloc): the head of the queue is always the lowest address
+// the cursor has not yet come back to.
+//
+// Called with a.mu held.
+func (a *chunkArena) reclaim(r *arenaRegion, lo, hi int64) []string {
+	var out []string
+	for r.head < len(r.q) {
+		v := r.q[r.head]
+		vo := v.off - r.base
+		if vo >= hi || vo+v.length <= lo {
+			break
+		}
+		a.kill(v)
+		// The gate's memory: what the cursor let go of, so a miss on it
+		// later can be told apart from a miss on something new.
+		if a.remembers(v) {
+			a.ghost.note(r.keys[r.head])
+		}
+		out = append(out, r.keys[r.head])
+		r.head++
+		a.evicted.Add(1)
 	}
-	return a.fills.Load(), a.evicted.Load(), a.rejected.Load()
+	return out
+}
+
+// gate decides which region a freshly decoded chunk goes in. It never
+// decides NOT to cache it, which is the property that keeps the cold and
+// scattered workloads exactly where they were.
+//
+// Called with a.mu held, from the allocation path and nowhere else — so it
+// is on the MISS path, next to a decode that costs microseconds, and never
+// on a hit.
+func (a *chunkArena) gate(key string, length int64) *arenaRegion {
+	switch {
+	case !a.main.lapped:
+		// Nothing has had to be evicted yet, so there is nothing to protect
+		// FROM and no reason to hold a chunk at arm's length. Fill straight
+		// into the protected region: a working set that fits ends up
+		// entirely inside it, having paid nothing for the policy.
+		return &a.main
+	case a.ghost.take(key):
+		// Here before, gone, and wanted again — and it left having proved
+		// itself. Straight to protected. The evidence is spent by this
+		// admission, so the chunk has to earn its next return the same way.
+		a.promoted.Add(1)
+		return &a.main
+	case length > a.probation.size:
+		// Too big for probation. Protected is the only region that can hold
+		// it, and refusing to cache it would cost every sub-read of a chunk
+		// that is, by construction, large enough to be read in pieces. A
+		// chunk too big for BOTH regions is not cached at all, exactly as a
+		// chunk too big for the whole mapping was not.
+		return &a.main
+	default:
+		return &a.probation
+	}
+}
+
+// remembers reports whether an evicted slot's identity goes into the ghost
+// table — whether, in other words, this chunk had earned a second chance.
+//
+// The proof is a whole-chunk RE-READ, not merely a hit. A chunk being
+// streamed is hit two, three, four times as the kernel walks its windows,
+// and those hits are why the tier pays for itself on a cold pass; treating
+// them as evidence of reuse would promote an entire scan into the protected
+// region and there would be nothing left of the policy. A read that starts
+// at offset zero on a chunk that is already resident is a different event:
+// somebody came back to the beginning of this chunk.
+func (a *chunkArena) remembers(v *arenaSlot) bool { return v.reused.Load() }
+
+// regions is both regions, for the walks that do not care which.
+func (a *chunkArena) regions() []*arenaRegion { return []*arenaRegion{&a.main, &a.probation} }
+
+// stats is what the tier is doing, for `pelfs cache` and the statistics
+// file. promoted is how often the ghost table let a chunk back into the
+// protected region, which is the number that says the policy is adapting
+// rather than merely holding whatever it saw first.
+func (a *chunkArena) stats() (fills, evicted, rejected, promoted int64) {
+	if a == nil {
+		return 0, 0, 0, 0
+	}
+	return a.fills.Load(), a.evicted.Load(), a.rejected.Load(), a.promoted.Load()
+}
+
+// arenaResidency is what the mapping is HOLDING, as opposed to what has
+// passed through it: the question "is the arena full of chunks anybody
+// reads again", answered with a number.
+type arenaResidency struct {
+	// Slots and Bytes are what is resident.
+	Slots int
+	Bytes int64
+	// Served and Reused are the resident slots that have answered any read
+	// since they were filled, and the ones that answered a read starting at
+	// offset zero — a whole-chunk re-read rather than the streaming
+	// continuation of the read that filled them.
+	Served, Reused           int
+	ServedBytes, ReusedBytes int64
+}
+
+func (a *chunkArena) residency() arenaResidency {
+	var out arenaResidency
+	if a == nil {
+		return out
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, r := range a.regions() {
+		for i := r.head; i < len(r.q); i++ {
+			s := r.q[i]
+			out.Slots++
+			out.Bytes += s.length
+			if s.served.Load() {
+				out.Served++
+				out.ServedBytes += s.length
+			}
+			if s.reused.Load() {
+				out.Reused++
+				out.ReusedBytes += s.length
+			}
+		}
+	}
+	return out
 }
 
 // has reports whether the identity is in the index right now. It is the
@@ -488,10 +840,15 @@ func (a *chunkArena) clear() {
 	a.mu.Lock()
 	// Dead first, then unmapped from the index: a reader between the two
 	// sees a slot it is told is dead, which is a miss, which is correct.
-	for i := a.head; i < len(a.q); i++ {
-		a.kill(a.q[i])
+	for _, r := range a.regions() {
+		for i := r.head; i < len(r.q); i++ {
+			a.kill(r.q[i])
+		}
+		r.q, r.keys, r.head, r.next, r.lapped = nil, nil, 0, 0, false
 	}
-	a.q, a.keys, a.head, a.next = nil, nil, 0, 0
+	// And the gate forgets too: every identity it remembered named a slot
+	// in a generation that is no longer the one being read.
+	a.ghost.clear()
 	a.mu.Unlock()
 	for i := range a.idx {
 		a.idx[i].mu.Lock()

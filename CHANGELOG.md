@@ -99,6 +99,58 @@
   the set now local. A supervisor keying on `prefetch_chunks` needs
   updating; `prefetch_complete` and `prefetch_failed` are unchanged.
 
+- **The retain window no longer over-retains on a multi-branch volume.** A
+  superblock now records the ref it was sealed onto (`Branch`), which is
+  what a scavenged disaster-recovery backup was missing: a generation
+  NUMBER counts steps along one lineage, so both children of generation N
+  seal N+1 and their backups were indistinguishable. v0.1.0 answered by
+  keeping EVERY candidate for a wanted number — safe, but it meant one
+  branch's window carried the other's manifests, indexes and packs, and the
+  scan could never stop at the first complete answer.
+
+  With `(branch, generation)` an identity, a generation resolved from a
+  backup this branch sealed drops the siblings, and the scan stops as soon
+  as every generation in the window has one. Measured on a two-branch
+  fixture (main nine generations deep, dev five, at `--retain-k 3`) the
+  retained set falls from 29 objects to 25; a forked volume's window scan
+  reads 3–4 pack trailers of 15 where it previously read all of them.
+
+  **The generations attribution cannot cover keep the old rule, per
+  generation.** A branch's window reaches back past its own fork point, and
+  those generations were sealed by the parent branch and say so — they are
+  the branch's history all the same — as are any backups written before the
+  field existed. Both keep every distinct candidate, and only those
+  generations do, so an upgraded volume gets the tight rule for its new
+  history and the conservative one across the legacy span until it has
+  sealed K more times. The sweep says which it used: `retain window: branch
+  dev keeps 6 of 8 generations (attributed, 3 legacy candidates kept for 3
+  generation(s))`.
+
+  A repack now also stamps the branch it publishes onto rather than
+  inheriting the parent's — `pelfs branch dev` copies main's head verbatim,
+  so a repack can be the first writer a branch ever has. It writes no
+  backup either way; the generation a repack grew from is covered by the
+  condemned-ledger floor, as before.
+
+  **On-disk change, and it is a one-way door.** `Branch` is `omitempty`, so
+  every superblock written before it still verifies unchanged (pinned
+  against captured v0.1.0 wire bytes, not against a round trip through the
+  current encoder). The other direction is a hard refusal: `Verify`
+  re-encodes the decoded struct, so a **v0.1.0 binary cannot read a
+  generation a v0.2 writer sealed** — `ErrBadSignature` at the trust
+  boundary, the same door `Manifests` went through. Stamping only the
+  backup would have kept old mounts working and was rejected for it: an old
+  `pelfs gc` would then mount the volume, fail to verify the new backups,
+  read them as absent, report a short window and collect what those
+  generations alone named. A loud refusal beats a quiet deletion.
+
+  **What is still not fixed:** a branch NAME is not a lineage. Delete
+  `dev`, recreate it from an older generation and seal the same numbers
+  again, and the two incarnations collide exactly as two branches used to.
+  The newest-first scan favours the live one, and a repack that copied an
+  old backup into a new pack can defeat that. Tag a generation to pin it
+  exactly.
+
 ## v0.1.0 — first release
 
 `pelfs` mounts a POSIX filesystem whose data lives in a

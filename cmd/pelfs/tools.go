@@ -118,8 +118,16 @@ func cmdGC(args []string) int {
 	// — because a short window is a silent outcome otherwise: the run
 	// succeeds, and the generations it could not describe are the ones
 	// whose objects were just collected.
+	//
+	// And HOW it was established, because "attributed" and "N legacy
+	// candidates kept" are the difference between a window holding exactly
+	// this branch's generations and one holding every document that claimed
+	// a wanted number. The second retains more than the branch needs and is
+	// what a user is looking at when a sweep on a forked volume frees less
+	// than they expected (retention.LastKReport.ScanMode).
 	for _, w := range rep.Windows {
-		fmt.Printf("retain window:    branch %s keeps %d of %d generations\n", w.Branch, w.Generations, w.K)
+		fmt.Printf("retain window:    branch %s keeps %d of %d generations (%s)\n",
+			w.Branch, w.Generations, w.K, w.ScanMode())
 		if len(w.Unresolved) > 0 {
 			fmt.Printf("  not retained:   generation(s) %s (no readable superblock backup)\n",
 				joinGenerations(w.Unresolved))

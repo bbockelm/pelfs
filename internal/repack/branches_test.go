@@ -175,3 +175,65 @@ func mustFetchSB(t *testing.T, rs *refs.Store, branch string) *superblock.Superb
 	}
 	return f.Superblock
 }
+
+// A REPACKED HEAD SAYS WHICH BRANCH IT WAS PUBLISHED ONTO.
+//
+// A repack builds its generation from a COPY of the parent, so every field
+// it does not overwrite it inherits — and `pelfs branch dev` creates a
+// branch by writing main's head verbatim under a second name, which makes
+// "the parent says main" the ordinary state of a young branch rather than
+// a corner case. A repack that inherited it would leave dev's head
+// claiming to be main's, and would go on claiming it for as long as
+// nothing else sealed on dev.
+//
+// It costs nothing today: a repack writes no superblock BACKUP, so nothing
+// it produces is ever scavenged by the retain-window scan, and the
+// generation it grew from is covered by the condemned-ledger floor instead
+// (retention.retainedSet). What it costs tomorrow is every reader that
+// takes a head's own statement about its branch at face value — starting
+// with the seal after this one, which is the document the window scan DOES
+// read.
+func TestARepackedHeadCarriesTheBranchItPublishedOnto(t *testing.T) {
+	ctx := context.Background()
+	inner, v, head, want := rewrittenVolume(t, "6b1e7c4a-0000-4000-8000-000000000003")
+	rs, err := refs.New(inner, t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := rs.Fetch(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.Superblock.Branch != "main" {
+		t.Fatalf("fixture: the volume's head was sealed onto %q", f.Superblock.Branch)
+	}
+	// dev is main's head under a second name — so its head says "main", and
+	// truthfully: main is what sealed those bytes.
+	if err := rs.Flip(ctx, "dev", f.Raw, ""); err != nil {
+		t.Fatalf("create branch dev: %v", err)
+	}
+
+	// The first writer dev ever has is a repack.
+	if _, err := repack.Execute(ctx, repack.ExecOptions{
+		Options: repack.Options{
+			Inner: inner, Live: []*superblock.Superblock{head, f.Superblock}, Head: f.Superblock,
+			CacheDir: t.TempDir(), Workers: 4, Now: time.Now().Add(400 * time.Hour),
+		},
+		Refs: rs, Branch: "dev", SigningKey: v.SigningKey(), SpoolDir: t.TempDir(),
+	}); err != nil {
+		t.Fatalf("repack onto dev: %v", err)
+	}
+
+	after := mustFetchSB(t, rs, "dev")
+	if after.Branch != "dev" {
+		t.Errorf("the head at refs/dev was published by a repack onto dev and says it belongs to %q; a head "+
+			"that names a branch it was not published onto is a statement every later reader has to "+
+			"disbelieve", after.Branch)
+	}
+	// And it is still the same volume, tree for tree: the stamp is not an
+	// excuse to have rewritten anything else.
+	readsBack(t, inner, after, want, "after a repack that was dev's first writer")
+	if main := mustFetchSB(t, rs, "main"); main.Branch != "main" {
+		t.Errorf("the untouched branch main now says %q", main.Branch)
+	}
+}

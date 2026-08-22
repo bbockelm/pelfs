@@ -104,6 +104,16 @@ package retention
 // up as unresolved once and then age out of the window. K=1 is the old
 // behaviour exactly — head and tags — and costs not a single request,
 // which is what makes it the safe thing to fall back to.
+//
+// And WHICH BRANCH a scavenged backup belongs to is the second question,
+// answered by superblock.Branch and argued at length over scavengeBackups.
+// The short version: a generation number counts steps along one lineage,
+// so on a forked volume it names two documents; the branch the seal
+// recorded turns (branch, generation) into an identity, which is what
+// makes a window tight and lets the scan stop early again. Generations
+// with no document of their own — the span below a branch's fork point,
+// and anything sealed before the field existed — keep the conservative
+// keep-every-candidate rule, and only those generations do.
 
 import (
 	"context"
@@ -154,6 +164,41 @@ type LastKReport struct {
 	Unresolved []uint64
 	// TrailersRead is how many pack trailers the scan cost.
 	TrailersRead int
+
+	// HOW each generation was established, which is a different question
+	// from how many were. Attributed counts the generations resolved from a
+	// backup THIS BRANCH sealed — an exact answer, one document. Legacy
+	// counts the generations that had no such backup and fell back to the
+	// keep-every-candidate rule, and LegacyCandidates how many documents
+	// that kept for them.
+	//
+	// The two are worth separating in a report because they have different
+	// costs and different meanings. A window that is entirely attributed is
+	// tight and was cheap to establish. A window with legacy generations is
+	// retaining more than that branch strictly needs — the fork prefix a
+	// sibling sealed, or backups from before the field existed — and it is
+	// why the scan could not stop early. Neither is an error; a user
+	// wondering why a sweep freed nothing deserves to be told which.
+	//
+	// The head is in neither: Generations counts it, and it was fetched by
+	// name rather than scavenged, so Attributed+Legacy is Generations-1.
+	Attributed       int
+	Legacy           int
+	LegacyCandidates int
+}
+
+// ScanMode is the one-phrase answer to "how was this window established",
+// for the sweep's report.
+func (r LastKReport) ScanMode() string {
+	switch {
+	case r.Legacy == 0:
+		return "attributed"
+	case r.Attributed == 0:
+		return fmt.Sprintf("%d legacy candidates kept", r.LegacyCandidates)
+	default:
+		return fmt.Sprintf("attributed, %d legacy candidates kept for %d generation(s)",
+			r.LegacyCandidates, r.Legacy)
+	}
 }
 
 // clone copies a report for one branch's use, so the caller's appends to
@@ -190,7 +235,7 @@ func (c *windowCache) get(ctx context.Context, o Options, branch string,
 		return w, nil
 	}
 	w := &cachedWindow{}
-	roots, err := windowRoots(ctx, o, head, &w.rep, branches)
+	roots, err := windowRoots(ctx, o, branch, head, &w.rep, branches)
 	if err != nil {
 		return nil, err
 	}
@@ -207,7 +252,7 @@ func (c *windowCache) get(ctx context.Context, o Options, branch string,
 // absorb them into the live set exactly as they absorb a head, which is
 // the point — a generation is a generation, whatever produced the document
 // that describes it.
-func windowRoots(ctx context.Context, o Options, head *superblock.Superblock, rep *LastKReport,
+func windowRoots(ctx context.Context, o Options, branch string, head *superblock.Superblock, rep *LastKReport,
 	branches int) ([]*superblock.Superblock, error) {
 	// K comes from THIS BRANCH's own head, which is what makes the window
 	// per-branch rather than volume-wide: a branch created yesterday and a
@@ -241,7 +286,7 @@ func windowRoots(ctx context.Context, o Options, head *superblock.Superblock, re
 	for g := oldest; g <= head.Generation; g++ {
 		want[g] = true
 	}
-	found, err := scavengeBackups(ctx, o, head, want, rep, branches)
+	found, err := scavengeBackups(ctx, o, branch, head, want, rep, branches)
 	if err != nil {
 		return nil, err
 	}
@@ -251,19 +296,66 @@ func windowRoots(ctx context.Context, o Options, head *superblock.Superblock, re
 	var roots []*superblock.Superblock
 	for i := uint64(0); i <= head.Generation-oldest; i++ {
 		g := head.Generation - i
-		sbs, ok := found[g]
+		set, ok := found[g]
 		if !ok {
 			// The generation this backup would have described.
 			rep.Unresolved = append(rep.Unresolved, g-1)
 			continue
 		}
-		// Every candidate, not the first — see scavengeBackups. Extra roots
-		// can only retain more, and the count is of GENERATIONS resolved,
-		// which is what the report promises.
-		roots = append(roots, sbs...)
+		switch {
+		case len(set.mine) > 0:
+			// ATTRIBUTED. A backup this branch sealed says which generation
+			// of WHICH LINEAGE it describes, so the sibling documents at the
+			// same number are not candidates for this window at all and are
+			// left out of it. This is where the over-retention goes.
+			//
+			// All of them rather than the first, and they are almost always
+			// one: a publish that uploaded its last pack and then failed
+			// before the flip leaves a backup for a generation the retry
+			// seals again, so two documents can honestly carry this branch's
+			// name at one number. Keeping both is the union rule doing what
+			// it always did, over a set this rule has already made small.
+			roots = append(roots, set.mine...)
+			rep.Attributed++
+		case len(set.others) > 0:
+			// LEGACY, and confined to the generations that need it. Nothing
+			// on this branch claims the number: either the generation
+			// predates the Branch field, or it predates the fork and the
+			// PARENT branch sealed it. Both are this branch's history and
+			// neither can be told from a sibling's document, so the old rule
+			// applies here and only here — keep every distinct candidate and
+			// let the union sort it out.
+			roots = append(roots, set.others...)
+			rep.Legacy++
+			rep.LegacyCandidates += len(set.others)
+		default:
+			rep.Unresolved = append(rep.Unresolved, g-1)
+			continue
+		}
 		rep.Generations++
 	}
 	return roots, nil
+}
+
+// backupSet is what the scan found for one generation NUMBER, split by
+// whether the document says this branch sealed it.
+//
+// The split is the whole point of keeping a struct here rather than a
+// slice: mine is an exact answer and others is a conservative one, and the
+// caller must be able to tell which it is holding — a window resolved from
+// `others` is retaining more than the branch needs and could not stop
+// scanning early, and a user reading a sweep that freed nothing is owed
+// that distinction.
+type backupSet struct {
+	// mine carries this branch's name. Normally one; a publish that
+	// uploaded its last pack and then failed before the flip leaves a
+	// second at the generation its retry sealed again.
+	mine []*superblock.Superblock
+	// others is everything else claiming the number: a v0.1.0 backup that
+	// names no branch, a sibling's, and — the case that must never be
+	// discarded — the PARENT branch's, for the generations below this
+	// branch's fork point, which are this branch's history too.
+	others []*superblock.Superblock
 }
 
 // scavengeBackups reads pack trailers newest-first, pulling out every
@@ -278,49 +370,69 @@ func windowRoots(ctx context.Context, o Options, head *superblock.Superblock, re
 //
 // ================= A GENERATION NUMBER IS NOT AN IDENTITY =============
 //
-// This is where a second branch makes a single-branch assumption
-// load-bearing, and the assumption was wrong the moment a volume could
-// have two.
+// A backup is found by LOOKING, not by being pointed at, so what says
+// which generation it describes is what is written inside it. A number
+// alone will not do: it counts steps along ONE lineage, so branch a volume
+// at generation N and both children seal N+1, both write a backup, and
+// both are signed by the volume key over the same VolumeID. Every test
+// this scan could apply passed for either of them.
 //
-// A backup is found by LOOKING, not by being pointed at, so the only thing
-// that says which generation it describes is the number inside it. That
-// number counts steps along ONE lineage: branch a volume at generation N
-// and both children seal N+1. Both write a backup. Both are signed by the
-// volume key and both carry the VolumeID — so every test this scan applied
-// passed for either of them, and whichever the newest-first walk reached
-// first won the slot (`if _, dup := found[g]; !dup`).
-//
-// The consequence is not over-retention, which would be harmless. It is
+// The consequence was never over-retention, which would be harmless. It is
 // that the OTHER branch's generation silently leaves the root set: branch
 // dev's window fills with main's documents, and anything only dev's
 // retired generations named — a pack a repack on dev condemned, whose only
 // protection past the grace window is being named by a generation inside
 // the window — becomes a deletion candidate. A reader pinned to that
-// generation loses it.
+// generation loses it. v0.1.0 answered by keeping EVERY candidate for a
+// wanted number, which converted that loss into bytes, and paid for it by
+// giving up the early stop on any volume with siblings.
 //
-// There is no way to attribute a backup to a branch. The lineage chain
-// authenticates exactly one step: a head's PrevHash names its parent's
-// wire bytes, and a backup's PrevHash names its own parent's, so nothing
-// links backup_G to backup_{G-1}. Attribution is not available from the
-// store, and this does not pretend otherwise.
+// SO THE BACKUP SAYS WHICH BRANCH SEALED IT (superblock.Branch), and the
+// pair (branch, generation) is the identity a number could not be. It is a
+// signed field, because the trailer that led us here is not authenticated
+// and attribution decides which window a document may FILL — the direction
+// that loses data. What it is NOT is a lineage chain: a head's PrevHash
+// names its parent's wire bytes and a backup's names its own parent's, so
+// nothing links backup_G to backup_{G-1}, and this file still cannot walk
+// a chain. It matches a label.
 //
-// WHAT IT DOES INSTEAD IS KEEP EVERY CANDIDATE. A generation number maps
-// to every DISTINCT document claiming it, and the caller absorbs them all.
-// Retention is a union, so extra roots can only keep more: this converts
-// under-retention (data loss) into over-retention (bytes, until the window
-// moves past them), which is the asymmetry the whole sweep is built on.
+// THREE RULES COME OUT OF THAT, and the second is the one that keeps this
+// safe rather than merely tight:
 //
-// AND THE EARLY STOP GOES WITH IT — but only where it was wrong. On a
-// single-branch volume a number IS an identity, so the first document
-// found for a generation is the only one that can exist, and the scan
-// still stops the moment the set is complete: unchanged cost, unchanged
-// behaviour, and that is the overwhelmingly common volume. With two or
-// more branches the scan runs to the end of the pack space or to the
-// budget, because stopping at "every generation has A candidate" is
-// exactly what stops before the sibling's. The budget still bounds it and
-// still fails closed by name, with `--retain-k` as the documented escape.
-func scavengeBackups(ctx context.Context, o Options, head *superblock.Superblock,
-	want map[uint64]bool, rep *LastKReport, branches int) (map[uint64][]*superblock.Superblock, error) {
+//   - ATTRIBUTED. A generation with at least one candidate carrying THIS
+//     branch's name is resolved from those alone. The siblings at that
+//     number are not candidates and are dropped from the window.
+//   - LEGACY, PER GENERATION. A generation with none keeps the v0.1.0 rule
+//     — every distinct candidate, whoever sealed it. This is not only for
+//     backups written before the field existed. A branch's window reaches
+//     back PAST ITS OWN FORK POINT, and dev's generations 1..N were sealed
+//     by main and say so; they are dev's history all the same. Refusing
+//     them because the label does not match would be exactly the
+//     under-retention this change exists to remove, so the fallback is
+//     conservative and it is confined to the generations that need it. A
+//     mixed volume gets the tight rule for its new history and the
+//     conservative one only across the legacy span.
+//   - THE EARLY STOP RETURNS, for every volume rather than only for
+//     single-branch ones. The scan stops once every wanted generation has
+//     an ATTRIBUTED candidate, which is a complete answer that no later
+//     pack can improve on. It cannot stop while a generation is still on
+//     the legacy rule, because "one candidate" is not "every candidate"
+//     and the sibling's may be in the next pack — so a volume whose window
+//     spans a fork prefix still walks the pack space for that span. The
+//     single-branch stop (a number IS an identity there) is kept as it
+//     was, for the v0.1.0-era volume whose backups carry no branch at all.
+//
+// THE RESIDUAL, written down rather than papered over: a branch NAME is
+// not a lineage. Delete dev, recreate dev from an older generation, and
+// seal the same numbers again, and the two incarnations' backups are
+// indistinguishable exactly as two branches' were — the newest-first walk
+// favours the live one, since the current incarnation's seals are the most
+// recent, but a repack that copied an old backup into a new pack can
+// defeat that. The exposure is one branch name reused for a different line
+// of history, and the answer is the one that was always exact: TAG the
+// generation, which pins it by name.
+func scavengeBackups(ctx context.Context, o Options, branch string, head *superblock.Superblock,
+	want map[uint64]bool, rep *LastKReport, branches int) (map[uint64]*backupSet, error) {
 
 	entries, err := listDir(ctx, o.Inner, packstore.PackDirKey)
 	if err != nil {
@@ -345,7 +457,12 @@ func scavengeBackups(ctx context.Context, o Options, head *superblock.Superblock
 		return ti.After(tj)
 	})
 
-	found := make(map[uint64][]*superblock.Superblock, len(want))
+	found := make(map[uint64]*backupSet, len(want))
+	// attributed counts the generations that have at least one candidate
+	// carrying this branch's name — the early stop's condition, kept as a
+	// counter so the stop is a comparison rather than a walk of the map on
+	// every pack.
+	attributed := 0
 	// seen dedups by DOCUMENT, not by generation: a repack copies backups
 	// into the packs it writes, so the same bytes are reachable from
 	// several packs, and counting one twice would put one generation in the
@@ -356,10 +473,18 @@ func scavengeBackups(ctx context.Context, o Options, head *superblock.Superblock
 	seen := make(map[[32]byte]struct{}, len(want))
 	unread := 0
 	for _, p := range packs {
-		// The early stop is sound only where a generation number is an
-		// identity, which is to say on a volume with one branch. See the
-		// function comment: with siblings in play, "every generation has a
-		// candidate" is reached before the sibling's candidate is found.
+		// THE COMPLETE ANSWER: every wanted generation has a document this
+		// branch sealed, and (branch, generation) is an identity, so no
+		// later pack can hold a candidate that belongs in this window and
+		// is not already in it.
+		if attributed == len(want) {
+			break
+		}
+		// The older stop, for the volume whose backups carry no branch at
+		// all: with one branch a generation number IS an identity, so the
+		// first document found for a number is the only one there can be.
+		// It is what keeps a v0.1.0-era single-branch volume costing a
+		// handful of trailer reads instead of a walk of its pack space.
 		if branches <= 1 && len(found) == len(want) {
 			break
 		}
@@ -412,7 +537,24 @@ func scavengeBackups(ctx context.Context, o Options, head *superblock.Superblock
 				continue
 			}
 			seen[h] = struct{}{}
-			found[sb.Generation] = append(found[sb.Generation], sb)
+			set := found[sb.Generation]
+			if set == nil {
+				set = &backupSet{}
+				found[sb.Generation] = set
+			}
+			// The whole of the attribution: a name the volume's own key
+			// signed, compared with the ref being swept. Everything else —
+			// a v0.1.0 backup that states no branch, and a backup the
+			// PARENT branch sealed before the fork — goes in the other pile
+			// and is used only where nothing better exists.
+			if sb.Branch == branch {
+				if len(set.mine) == 0 {
+					attributed++
+				}
+				set.mine = append(set.mine, sb)
+				continue
+			}
+			set.others = append(set.others, sb)
 		}
 	}
 	if len(found) < len(want) && unread > 0 {
@@ -500,7 +642,7 @@ func isNotAPack(err error) bool {
 
 // missingList renders the generations still wanted, for an error a user
 // has to act on.
-func missingList(want map[uint64]bool, found map[uint64][]*superblock.Superblock) string {
+func missingList(want map[uint64]bool, found map[uint64]*backupSet) string {
 	var gens []uint64
 	for g := range want {
 		if _, ok := found[g]; !ok {

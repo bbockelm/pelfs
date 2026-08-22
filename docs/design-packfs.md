@@ -453,6 +453,7 @@ predecessor's wire bytes.
 | `Condemned` | packs a repack dropped from the pack list, and when |
 | `CondemnedIndexes`, `CondemnedManifests` | the same, for derived refs a seal stopped listing |
 | `Maint` | what maintenance has already done to this branch |
+| `Branch` | the ref this generation was SEALED ONTO — what attributes a scavenged backup to a lineage |
 | `PrevHash` | lineage: snapshot history, fork detection |
 | `SigningPub`, `NextPub`, `Signature` | trust root and rotation |
 
@@ -588,6 +589,18 @@ work:
   re-encoding of every OLDER document too, changing bytes that were signed
   years ago, and would break the signature of every generation ever
   written. Not "on upgrade": retroactively, everywhere, at once.
+
+  **A scalar is the shape of addition this rule is most likely to lose
+  to.** `Branch` is one string that a current writer always sets, so
+  `cbor:"branch"` looks harmless and is not — an empty string is a zero
+  value, and a non-omitempty tag writes the key into the re-encoding of
+  every superblock that predates the field. The check for a new field is
+  therefore not a round trip through the current encoder, which is the
+  thing on trial: it is WIRE BYTES CAPTURED FROM THE OLD ENCODER, decoded,
+  verified and re-encoded byte for byte
+  (`internal/superblock/testdata/v010-superblock.hex`,
+  `TestAV010SuperblockStillVerifies`). Adding a field without adding that
+  evidence is how this rule gets broken quietly.
 
 Lineage hashes are immune either way, being defined over the wire bytes of
 the predecessor rather than over a re-encoding (`VerifyChain`) — a decoder
@@ -737,18 +750,21 @@ Consequences, deliberate and otherwise:
     in packs the OTHER branch's pack list names, and publish chunkrefs that
     resolve in no pack this generation lists.
   - The retain window is resolved from superblock backups scavenged out of
-    packs, and a backup carries a number and nothing else that could
-    attribute it to a branch. The lineage chain authenticates one step and
-    no more — a head's `PrevHash` names its parent's wire bytes, and a
-    backup's names its own parent's, so nothing links `backup_G` to
-    `backup_{G-1}`. Attribution is not available from the store, so the
-    sweep keeps EVERY candidate for a wanted number rather than the first it
-    finds. It over-retains on a forked volume, which is bytes; the
-    alternative was one branch's window filling with the other's documents
-    and the loser's retired generations dropping out of the root set, which
-    is data. The scan's early stop survives only where a number IS an
-    identity — one branch — so single-branch volumes are unchanged in cost
-    and in behaviour.
+    packs, and a backup found by LOOKING has only what is written inside it
+    to say whose generation it describes. The lineage chain does not supply
+    it: it authenticates one step and no more — a head's `PrevHash` names
+    its parent's wire bytes, and a backup's names its own parent's, so
+    nothing links `backup_G` to `backup_{G-1}`. **So the seal records the
+    branch** (`Superblock.Branch`, additive and `omitempty`), inside the
+    signature because attribution decides which window a document may fill
+    and an unsigned stamp would be a way to aim the resulting loss.
+    `(branch, generation)` is then an identity, the sibling's documents
+    leave the window, and the scan's early stop comes back for forked
+    volumes. What it does NOT cover is the span below a branch's own fork
+    point — the parent branch sealed those and says so, and they are this
+    branch's history too — so a generation with no candidate of its own
+    keeps the v0.1.0 keep-every-candidate rule, per generation. Details and
+    residuals under *Retention and GC*.
 - **Inode uniqueness is per-lineage.** Branch descendants allocate from the
   same counter and may assign equal inode values to different files —
   harmless, since inodes need uniqueness only within a mounted tree and
@@ -1719,16 +1735,58 @@ with:
   generations H-1 … H-K+1 the sweep reads the backups of generations H …
   H-K+2, and each one says what the generation below it named.
 
-  **On a volume with more than one branch, that lookup is by a number two
-  lineages share** — see *Branching semantics*, "a generation number is not
-  an identity". Nothing in the store attributes a backup to a branch, so the
-  sweep keeps every distinct document claiming a wanted number and absorbs
-  them all. The window is a union either way, so extra roots only ever keep
-  more; and the scan gives up its early stop on such volumes, because
-  "every number has a candidate" is reached before the sibling's candidate
-  is found. K is still read from each branch head's own `Params`, so a
-  branch started in the past keeps its own short chain rather than K
-  generations of the trunk's.
+  **On a volume with more than one branch, a number alone is a lookup two
+  lineages answer** — see *Branching semantics*, "a generation number is
+  not an identity". So a superblock records the ref it was SEALED ONTO
+  (`Branch`, additive and `omitempty`), and `(branch, generation)` is the
+  identity a number could not be. Three rules follow, and the middle one is
+  what keeps this safe rather than merely tight:
+
+  - **Attributed.** A generation with a candidate carrying this branch's
+    name is resolved from those alone; the siblings at that number are not
+    candidates and leave the window. This is where the v0.1.0
+    over-retention goes.
+  - **Legacy, per generation.** A generation with none keeps the old rule —
+    every distinct candidate, whoever sealed it. Not only for backups
+    written before the field existed: a branch's window reaches back PAST
+    ITS OWN FORK POINT, and those generations were sealed by the parent
+    branch and say so, while being that branch's history all the same.
+    Requiring a matching name there would be exactly the under-retention
+    this fixes, arrived at from the other side. So a mixed volume gets the
+    tight rule for its new history and the conservative one only across the
+    legacy span, and the sweep's report says which (`retain window: branch
+    dev keeps 6 of 8 generations (attributed, 3 legacy candidates kept for
+    3 generation(s))`).
+  - **The early stop is back, for forked volumes too.** The scan stops once
+    every wanted generation has an attributed candidate — a complete answer
+    no later pack can improve on. It cannot stop while a generation is on
+    the legacy rule, since "one candidate" is not "every candidate", so a
+    window spanning a fork prefix still walks the pack space for that span.
+    The single-branch stop (where a number IS an identity) is unchanged,
+    which is what keeps a v0.1.0-era volume cheap.
+
+  K is still read from each branch head's own `Params`, so a branch started
+  in the past keeps its own short chain rather than K generations of the
+  trunk's.
+
+  **What attribution does not fix, stated so it is not discovered:** a
+  branch NAME is not a lineage. Delete `dev`, recreate it from an older
+  generation and seal the same numbers again, and the two incarnations'
+  backups collide exactly as two branches' used to. The newest-first walk
+  favours the live one — the current incarnation's seals are the most
+  recent — but a repack that copied an old backup into a new pack can
+  defeat that. The exact answer is the one it always was: TAG the
+  generation.
+
+  **Version skew is a refusal, not a misread.** `Verify` re-encodes the
+  decoded struct, so a v0.1.0 binary drops the unknown `branch` key and
+  fails the signature on any generation a v0.2 writer sealed —
+  `ErrBadSignature` at the trust boundary, the same one-way door
+  `Manifests` already went through. Stamping only the BACKUP would have
+  kept old mounts working and was rejected for it: an old `pelfs gc` would
+  then read the volume happily, fail to verify the new backups, treat them
+  as absent, report a short window and collect what those generations alone
+  named. A loud refusal on the head beats a quiet deletion.
 
   A repack writes no backup, so nothing describes the generation a repack
   grew from. What covers that one is the repack's own CONDEMNED LEDGER: a

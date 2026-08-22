@@ -1478,10 +1478,20 @@ func (p *pipeline) buildSuperblock(packList []superblock.PackEntry, shards []sup
 	if p.o.Prev != nil && p.o.Prev.NextInode > nextInode {
 		nextInode = p.o.Prev.NextInode
 	}
+	// Branch is stamped on BOTH documents this function builds, and the
+	// BACKUP is the one it exists for. A retired generation is described
+	// only by the backup its seal buried in a pack, and a backup is found by
+	// looking rather than by being pointed at — so without this the only
+	// thing saying which generation it describes is a number that counts
+	// steps along one lineage, and both children of a fork seal N+1
+	// (internal/retention/lastk.go). applyDefaults has already defaulted
+	// o.Branch to "main", so every document a current writer produces
+	// carries one and an empty Branch means a v0.1.0 writer.
 	sb := &superblock.Superblock{
 		FormatVersion:   superblock.FormatV2,
 		VolumeID:        p.volID,
 		Generation:      p.gen,
+		Branch:          p.o.Branch,
 		CreatedUnixNano: p.o.CreatedUnixNano,
 		RootCatalog:     [32]byte(rootID),
 		PackList:        packList,

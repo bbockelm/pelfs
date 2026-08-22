@@ -2,9 +2,11 @@ package publish_test
 
 import (
 	"context"
+	"crypto/ed25519"
 	"testing"
 
 	"github.com/bbockelm/pelfs/internal/manifest"
+	"github.com/bbockelm/pelfs/internal/publish"
 	"github.com/bbockelm/pelfs/internal/superblock"
 )
 
@@ -114,4 +116,55 @@ func countManifestObjects(t *testing.T, v *reuseVol) int {
 		t.Fatalf("list %s: %v", manifest.Dir, err)
 	}
 	return len(entries)
+}
+
+// THE BACKUP SAYS WHICH BRANCH SEALED IT.
+//
+// This is the field the retain window is built on, and the backup is the
+// document that needs it: a head is fetched by name, so its branch is
+// never in doubt, while a backup is dug out of a pack trailer by looking
+// and has only what is written inside it to say whose generation it
+// describes. A generation NUMBER counts steps along one lineage, so on a
+// forked volume it names two documents; the branch turns that pair into
+// two answers (internal/retention/lastk.go).
+//
+// Both halves are asserted, because a stamp that is not signed is a stamp
+// anyone able to append to a pack can write, and the window would then be
+// aimable: the backup must carry the branch AND still verify under the
+// volume key with it there.
+func TestTheSuperblockBackupCarriesTheBranchThatSealedIt(t *testing.T) {
+	const branch = "release-2"
+	v := newReuseVol(t, [16]byte{0x11, 0xd0, 0x33})
+	v.create(publishRootInode, "a.bin", pseudorandom(3<<20, 43))
+
+	res, err := publish.Seal(context.Background(), publish.Options{
+		Overlay: v.ov, Inner: v.inner, SpoolDir: t.TempDir(),
+		SigningKey: v.priv, Prev: v.head.Superblock, PrevRaw: v.head.Raw,
+		Branch: branch, TargetPackSize: 1 << 20, DedupIndexPath: v.index, SMax: v.smax,
+		SQLiteCatalogs: v.sqlite,
+	})
+	if err != nil {
+		t.Fatalf("seal onto %s: %v", branch, err)
+	}
+	if res.Superblock.Branch != branch {
+		t.Errorf("the head sealed onto %s says it belongs to %q", branch, res.Superblock.Branch)
+	}
+	backup := backupSuperblock(t, v, res)
+	if backup.Branch != branch {
+		t.Fatalf("the disaster-recovery backup says it belongs to %q, not %q; a scavenged document with no "+
+			"branch is one a forked volume cannot attribute, which is the whole hazard", backup.Branch, branch)
+	}
+	if err := backup.Verify(v.priv.Public().(ed25519.PublicKey)); err != nil {
+		t.Fatalf("the backup no longer verifies with the branch stamped on it: %v — an unsigned attribution "+
+			"could be written by anyone who can append to a pack", err)
+	}
+	// A seal that states no branch defaults to main rather than to nothing,
+	// so an EMPTY Branch is a v0.1.0 writer and only that. The distinction
+	// is what lets the window scan tell "no attribution available" from "not
+	// this branch".
+	plain := v.checkpoint()
+	if plain.Superblock.Branch != "main" {
+		t.Errorf("a seal that named no branch produced a head claiming %q, so an empty stamp no longer "+
+			"means what the window scan reads it as", plain.Superblock.Branch)
+	}
 }

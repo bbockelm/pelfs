@@ -330,6 +330,49 @@ type Superblock struct {
 	// Absent on a volume no repack has touched, which reads as "never",
 	// and that is the correct starting point rather than a special case.
 	Maint *Maint `cbor:"maint,omitempty"`
+	// Branch names the ref this generation was SEALED ONTO. It is a
+	// statement about the writer, not about where the bytes currently sit:
+	// `pelfs branch dev` copies main's head verbatim under a second name,
+	// and a tag copies a head into tags/, so both hold documents that still
+	// say "main" — truthfully, because main is what sealed them.
+	//
+	// WHY A SIGNED FIELD AND NOT A TRAILER COLUMN. The only consumer is the
+	// retain window (internal/retention/lastk.go), which reconstructs
+	// retired generations from the disaster-recovery backups buried in
+	// packs. A backup is found by LOOKING — its offset comes from an
+	// unauthenticated trailer, nothing points at it — so the only thing that
+	// makes a scavenged document usable is that the volume's own key signed
+	// it. Attribution decides which branch's window a document is allowed to
+	// FILL, and filling a window with the wrong document drops the right one
+	// out of the root set, which is data loss rather than wasted bytes. A
+	// column that anyone able to append to a pack could write would be a way
+	// to aim that loss. So it lives inside the signature or it does not
+	// exist.
+	//
+	// WHAT IT BUYS. A generation number counts steps along one lineage:
+	// branch a volume at N and both children seal N+1, and before this field
+	// their backups were indistinguishable (same volume id, same key, same
+	// number). The window scan therefore had to keep EVERY candidate for a
+	// wanted number and could not stop at the first complete answer. With
+	// the branch recorded, a backup this branch sealed is identified by
+	// (branch, generation), and the scan stops once every generation in the
+	// window has one.
+	//
+	// WHAT IT DOES NOT BUY, twice over. A branch's window reaches back past
+	// its own fork point, and those generations were sealed by the PARENT
+	// branch — dev inherits main's generations 1..N and their backups say
+	// "main". They are dev's history all the same, so a generation with no
+	// candidate of its own falls back to the old keep-every-candidate rule
+	// rather than being declared unresolved. And a branch NAME reused for a
+	// different line of history — delete dev, recreate it from an older
+	// generation, seal the same numbers again — collides exactly as a bare
+	// number did. Both residuals are argued in lastk.go.
+	//
+	// omitempty per the evolution rule below, and that is not decoration: a
+	// v0.1.0 superblock decodes with Branch empty, re-encodes without the
+	// key, and verifies unchanged. Pinned by TestAV010SuperblockStillVerifies
+	// against wire bytes captured from the v0.1.0 encoder.
+	Branch string `cbor:"branch,omitempty"`
 	// CatalogKeyID names the key-table entry that encrypts catalog,
 	// shard, and superblock-backup pack entries this generation (0 =
 	// plaintext). Catalog references (nested rows, RootCatalog, shard

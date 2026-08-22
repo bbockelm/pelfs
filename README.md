@@ -287,6 +287,15 @@ a count of bytes, a duration a count of nanoseconds).
   (it is the one retention knob that may narrow as well as widen, because
   it is a claim about your own readers rather than a race against a live
   writer).
+
+  On a volume with more than one branch the window is resolved per branch:
+  a seal records which ref it published onto, so a branch's window holds
+  the generations that branch sealed rather than every document carrying
+  the same generation number. `pelfs gc` says which rule each window used
+  — `(attributed)`, or `(… N legacy candidates kept …)` for the
+  generations below a branch's fork point and for anything sealed by pelfs
+  v0.1.0, which are kept conservatively until the branch has sealed
+  `RetainK` more times.
 - **`pelfs tag <prefix> <name>` is the escape from both windows.** A
   tagged generation is in the live set outright, so nothing it references
   is swept while the tag is there. Tags are immutable (creating one over a

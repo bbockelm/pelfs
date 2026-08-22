@@ -554,6 +554,20 @@ func repackedSuperblock(ctx context.Context, o ExecOptions, prev *superblock.Sup
 	sb.CreatedUnixNano = now.UnixNano()
 	sb.PrevHash = superblock.Hash(prevRaw)
 	sb.Signature = [64]byte{}
+	// The branch this repack publishes ONTO, which is not always the one the
+	// parent recorded: `pelfs branch dev` copies main's head verbatim, so a
+	// repack can be the first writer a branch ever has and would otherwise
+	// inherit "main" from the copy and go on re-stating it.
+	//
+	// A REPACK WRITES NO SUPERBLOCK BACKUP — it carries the parent's forward,
+	// it does not add one — so this stamp attributes nothing to the window
+	// scan by itself. What it does is keep a head's own statement true, so
+	// that the seal after it, and anything that reads a head to ask which
+	// line of history it is on, get the same answer. The generation a repack
+	// grows FROM is the one no backup will ever describe, and that hole is
+	// covered by the condemned-ledger floor rather than by attribution
+	// (retention.retainedSet, lastk.windowFloor).
+	sb.Branch = o.Branch
 
 	// The pack set: everything the parent named that is not condemned,
 	// plus what this wrote.

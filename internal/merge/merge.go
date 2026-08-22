@@ -192,6 +192,10 @@ func Compute(ctx context.Context, o Options) (*Plan, error) {
 	if refusal != "" {
 		return &Plan{Refusal: refusal}, nil
 	}
+	// A cut of zero means the question cannot arise: see inodeCut.
+	if lineageOf(o.Ours) != lineageOf(o.Theirs) {
+		cut = 0
+	}
 
 	// Fast-forward first, because it is the common case for a personal
 	// volume and it needs no walk: identical root catalogs mean identical
@@ -270,6 +274,16 @@ func checkInputs(o Options) string {
 // A generation with no fork record is from the original lineage, and
 // falls back to the supplied base — which is the pre-fork-record
 // behaviour, unverifiable and honest about it.
+// lineageOf is the inode range a generation's branch allocates from.
+// Absent a fork record it is the original lineage, which every volume
+// starts in.
+func lineageOf(sb *superblock.Superblock) uint32 {
+	if sb.Fork != nil {
+		return sb.Fork.Lineage
+	}
+	return 0
+}
+
 func inodeCut(o Options) (uint64, string) {
 	of, tf := o.Ours.Fork, o.Theirs.Fork
 	switch {
@@ -469,11 +483,26 @@ func (w *walker) conflict(p string, k Kind, detail string) {
 	w.p.Conflicts = append(w.p.Conflicts, Conflict{Path: p, Kind: k, Detail: detail})
 }
 
-// findCollisions reports inode numbers both sides allocated after the
-// fork. The cut is exact: NextInode is a high-water mark that never
-// reuses a number, so anything at or below the base's was allocated
-// before the fork and means the same file on both sides.
+// findCollisions reports inode numbers both sides allocated
+// independently.
+//
+// A cut of zero disables it, and that is the normal case now: two branches
+// with different lineages CANNOT collide, because each allocates only from
+// its own range and anything else in either tree was inherited from a
+// shared ancestor. Checking anyway is not merely wasted work, it is wrong
+// — an inode from a third lineage, which a previous merge brought in, is
+// numerically far above this fork's mark and present in both trees, so the
+// numeric test calls one inherited file a collision between two. The e2e
+// caught exactly that, reporting /from-dev.txt as colliding with itself.
+//
+// The numeric cut is still right where it is still needed: two branches
+// that share a lineage — anything forked before lineages existed — really
+// do draw from one counter, and then anything above the fork's mark was
+// allocated twice.
 func (w *walker) findCollisions() {
+	if w.cut == 0 {
+		return
+	}
 	for ino, ourPath := range w.ourInodes {
 		if theirPath, ok := w.theirInodes[ino]; ok {
 			w.p.Collisions = append(w.p.Collisions, Collision{

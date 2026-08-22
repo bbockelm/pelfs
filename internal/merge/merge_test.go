@@ -459,3 +459,86 @@ func TestBranchesCutFromDifferentPointsAreRefused(t *testing.T) {
 		t.Fatal("two branches cut from different generations were merged anyway")
 	}
 }
+
+// A merge that brings in content from a THIRD lineage must not report it
+// as a collision.
+//
+// This is what the e2e caught. Merge dev into main, then branch again from
+// the merged main: the new branch's tree holds dev's inodes, which are
+// numerically far above the new fork's mark and present in both trees. The
+// numeric cut called one inherited file a collision with itself.
+//
+// Two branches with different lineages cannot collide at all — each
+// allocates only from its own range — so the check does not run.
+func TestInheritedInodesFromAThirdLineageAreNotCollisions(t *testing.T) {
+	inner := newInner(t)
+	v := testvol.New(t, inner, testvol.Options{VolumeID: testvol.ParseUUID(t, "7b7b7b7b-1111-2222-3333-444444444444")})
+	v.WriteFile(rootIno, "base.bin", body(4096, 1))
+	first := v.Publish(publishOpts).Superblock
+	firstRaw := v.Raw()
+
+	// A branch in lineage 7 that adds a file, standing in for content a
+	// previous merge brought into the trunk.
+	imported := forkAt(t, v, first, firstRaw, 7, func(v *testvol.Volume) {
+		v.WriteFile(rootIno, "from-lineage-7.bin", body(4096, 2))
+	})
+
+	// Now two branches cut from THAT, in their own lineages.
+	ours := forkAt(t, v, imported, encode(t, imported), 11, func(v *testvol.Volume) {
+		v.WriteFile(rootIno, "ours.bin", body(4096, 3))
+	})
+	theirs := forkAt(t, v, imported, encode(t, imported), 12, func(v *testvol.Volume) {
+		v.WriteFile(rootIno, "theirs.bin", body(4096, 4))
+	})
+
+	p, err := merge.Compute(context.Background(), merge.Options{
+		Inner: inner, Base: imported, BaseRaw: encode(t, imported),
+		Ours: ours, Theirs: theirs, CacheDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range p.Collisions {
+		t.Errorf("inherited inode %d reported as a collision: %s here, %s there",
+			c.Inode, c.OursPath, c.TheirsPath)
+	}
+	if !p.Mergeable() {
+		t.Fatalf("not mergeable: %d conflicts, %d collisions", len(p.Conflicts), len(p.Collisions))
+	}
+}
+
+// forkAt publishes a fork generation in the named lineage and then one
+// generation of work on it, returning the head.
+func forkAt(t *testing.T, v *testvol.Volume, base *superblock.Superblock, baseRaw []byte,
+	lineage uint32, work func(*testvol.Volume)) *superblock.Superblock {
+	t.Helper()
+	fork := *base
+	fork.Generation = base.Generation + 1
+	fork.PrevHash = superblock.Hash(baseRaw)
+	fork.Fork = &superblock.Fork{
+		Base: superblock.Hash(baseRaw), BaseGeneration: base.Generation,
+		BaseNextInode: base.NextInode, Lineage: lineage,
+	}
+	fork.NextInode = superblock.FirstInode(lineage)
+	fork.Signature = [64]byte{}
+	if err := fork.Sign(v.SigningKey()); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := fork.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	v.Adopt(&fork, raw)
+	v.SetBranch(fmt.Sprintf("lineage-%d", lineage))
+	work(v)
+	return v.Publish(publishOpts).Superblock
+}
+
+func encode(t *testing.T, sb *superblock.Superblock) []byte {
+	t.Helper()
+	raw, err := sb.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}

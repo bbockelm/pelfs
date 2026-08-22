@@ -245,6 +245,85 @@ print("   both sessions held their own lease object and neither saw a conflict")
 PY
 echo "   two branches wrote at the same time, both sealed, both generations landed"
 
+echo "== merge: two diverged branches become one tree =="
+# main and dev diverged just above, each with a file the other has never
+# seen — which is exactly the merge this reports on. The base is FOUND, not
+# named: `pelfs branch` pinned the fork point with a tag and recorded it,
+# and nothing on this command line says where it is.
+"$PELFS" merge --state-dir "$WORK/state1" "$PREFIX" dev > "$WORK/merge-report.log" 2>&1 \
+  || { echo "FAIL: merge (report)"; cat "$WORK/merge-report.log"; exit 1; }
+sed 's/^/    /' "$WORK/merge-report.log"
+grep -q "mergeable with no conflicts" "$WORK/merge-report.log" || {
+  echo "FAIL: two disjoint changes did not come out mergeable:"; cat "$WORK/merge-report.log"; exit 1; }
+grep -q "inode collisions" "$WORK/merge-report.log" && {
+  echo "FAIL: a properly forked branch collided, so per-branch lineages are not working:"
+  cat "$WORK/merge-report.log"; exit 1; }
+# A report writes nothing, which is the half a --apply flag is worth having.
+before=$(cat "$WORK/origin/e2e/ns/refs/main" | cksum)
+[ "$before" = "$(cat "$WORK/origin/e2e/ns/refs/main" | cksum)" ] || exit 1
+
+"$PELFS" merge --apply --state-dir "$WORK/state1" --signing-key "$SIGNKEY" "$PREFIX" dev \
+  > "$WORK/merge-apply.log" 2>&1 \
+  || { echo "FAIL: merge --apply"; cat "$WORK/merge-apply.log"; exit 1; }
+grep -q "merged dev into main" "$WORK/merge-apply.log" || {
+  echo "FAIL: --apply did not report a merge:"; cat "$WORK/merge-apply.log"; exit 1; }
+[ "$before" != "$(cat "$WORK/origin/e2e/ns/refs/main" | cksum)" ] || {
+  echo "FAIL: --apply left main where it was"; exit 1; }
+
+# BOTH SIDES' WORK, through a mount that has never seen either branch.
+"$PELFS" shell --ro --branch main --state-dir "$WORK/state-merged" "$PREFIX" -- /bin/sh -c '
+  set -eu
+  cat from-main.txt
+  cat from-dev.txt
+' > "$WORK/merge-read.log" 2>&1 || {
+  echo "FAIL: the merged tree does not serve both branches:"; cat "$WORK/merge-read.log"; exit 1; }
+grep -q "main was here" "$WORK/merge-read.log" || { echo "FAIL: main's file is gone"; exit 1; }
+grep -q "dev was here" "$WORK/merge-read.log" || { echo "FAIL: dev's file did not come across"; exit 1; }
+"$PELFS" fsck --deep --state-dir "$WORK/state1" "$PREFIX" > "$WORK/fsck-merged.log" 2>&1 \
+  || { echo "FAIL: fsck of the merged generation"; cat "$WORK/fsck-merged.log"; exit 1; }
+grep -q "generation is consistent" "$WORK/fsck-merged.log" || {
+  echo "FAIL: the merged generation does not verify"; cat "$WORK/fsck-merged.log"; exit 1; }
+echo "   found its own base, merged both branches, and the result verifies"
+
+echo "== merge: a conflict is refused, and --keep-both resolves it =="
+# The same file changed on both branches, which no tree can resolve alone.
+"$PELFS" branch --state-dir "$WORK/state1" "$PREFIX" clash > "$WORK/branch-clash.log" 2>&1 \
+  || { echo "FAIL: creating branch clash"; cat "$WORK/branch-clash.log"; exit 1; }
+for pair in "main:from-main-side" "clash:from-clash-side"; do
+  b=${pair%%:*}; text=${pair##*:}
+  "$PELFS" shell --branch "$b" --state-dir "$WORK/state-cf-$b" --signing-key "$SIGNKEY" \
+    --snapshot-interval 0 "$PREFIX" -- /bin/sh -c "echo $text > contested.txt" \
+    > "$WORK/run-cf-$b.log" 2>&1 \
+    || { echo "FAIL: writing the contested file on $b"; cat "$WORK/run-cf-$b.log"; exit 1; }
+done
+
+if "$PELFS" merge --apply --state-dir "$WORK/state1" --signing-key "$SIGNKEY" "$PREFIX" clash \
+  > "$WORK/merge-conflict.log" 2>&1; then
+  echo "FAIL: a conflicting merge was applied"; cat "$WORK/merge-conflict.log"; exit 1
+fi
+sed 's/^/    /' "$WORK/merge-conflict.log"
+# add-add rather than both-modified: clash was cut from a main that
+# did not have this file, so there is no base version to compare to.
+for want in "CONFLICT" "add-add" "contested.txt" "keep-both"; do
+  grep -q "$want" "$WORK/merge-conflict.log" || {
+    echo "FAIL: the refusal does not mention $want — a user cannot start resolving from it:"
+    cat "$WORK/merge-conflict.log"; exit 1; }
+done
+
+"$PELFS" merge --apply --keep-both --state-dir "$WORK/state1" --signing-key "$SIGNKEY" \
+  "$PREFIX" clash > "$WORK/merge-keepboth.log" 2>&1 \
+  || { echo "FAIL: merge --keep-both"; cat "$WORK/merge-keepboth.log"; exit 1; }
+"$PELFS" shell --ro --branch main --state-dir "$WORK/state-kb" "$PREFIX" -- /bin/sh -c '
+  set -eu
+  cat contested.txt
+  cat "contested (from clash).txt"
+' > "$WORK/keepboth-read.log" 2>&1 || {
+  echo "FAIL: both versions are not in the merged tree:"; cat "$WORK/keepboth-read.log"
+  cat "$WORK/merge-keepboth.log"; exit 1; }
+grep -q "from-main-side" "$WORK/keepboth-read.log" || { echo "FAIL: ours version lost"; exit 1; }
+grep -q "from-clash-side" "$WORK/keepboth-read.log" || { echo "FAIL: theirs version lost"; exit 1; }
+echo "   refused with the conflict named, then kept both versions under distinct names"
+
 echo "== lease: a second writer on the SAME branch is refused, --steal-lease overrides =="
 # Narrowing the lease must not have weakened it. The holder is written
 # directly, as it was for the volume lease in v0.1.0, so the refusal is

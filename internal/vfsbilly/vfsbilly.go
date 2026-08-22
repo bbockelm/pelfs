@@ -93,6 +93,11 @@ var (
 	// signature that drifts from it would silently turn hard links back
 	// into "not supported" rather than fail to build.
 	_ nfs.HardLinker = (*billyFS)(nil)
+	// ACCESS is answered through this one. A filesystem that does not
+	// implement it gets go-nfs's historical reply, which grants whatever
+	// the client asked about -- so a drifting signature would not fail to
+	// build either; it would quietly go back to lying.
+	_ nfs.PermissionChecker = (*billyFS)(nil)
 )
 
 // New returns a billy.Filesystem over a read-write overlay. Nodes it
@@ -488,6 +493,43 @@ func (b *billyFS) OpenFile(filename string, flag int, perm os.FileMode) (billy.F
 // every write to a file whose mode grants w and not r — an operation the
 // kernel and the FUSE frontend both allow. Reads are checked where reads
 // actually happen: go-nfs's READ handler opens O_RDONLY.
+//
+// # The owner override, and exactly how far it reaches
+//
+// Every OpenFile a served filesystem sees comes from the DATA PATH: READ
+// opens O_RDONLY, WRITE opens O_RDWR, and SETATTR-with-a-size opens
+// O_WRONLY|O_EXCL to truncate. NFSv3 has no OPEN operation at all, so
+// none of these is the client's open(2) — that was answered on the client,
+// from our ACCESS reply (Permitted below), before any of them was sent.
+//
+// So this is knfsd's nfsd_open, which passes NFSD_MAY_OWNER_OVERRIDE
+// (fs/nfsd/vfs.c): the file's OWNER is allowed through whatever the mode
+// bits say. The comment in the kernel says why, and it is the case tar -p
+// produces on every read-only file it extracts — `open(O_CREAT|O_WRONLY,
+// 0444)` and then writes, where the descriptor legitimately outlives the
+// mode it was created with. A stateless server cannot see that descriptor;
+// refusing its WRITEs second-guesses an open the client already made, and
+// the file arrives empty. nfsd_setattr adds the same flag for a size
+// change, which is the third route above.
+//
+// What it deliberately does NOT reach:
+//
+//   - ACCESS (Permitted), which never gets the flag in knfsd either
+//     (nfsd_access calls nfsd_permission with the plain access map). That
+//     is the half that refuses the client's open, and the only reason a
+//     server can afford to trust the writes that follow one it allowed.
+//     Grant it here and `test -w` starts lying about a 0444 file again.
+//   - The namespace operations. Creating, removing or renaming a name
+//     costs write and search on the DIRECTORY (NFSD_MAY_CREATE,
+//     NFSD_MAY_REMOVE), neither of which carries the flag, and owning the
+//     object being unlinked has never been what permits unlinking it.
+//   - Search permission on the path (mayTraverse), which a client spends
+//     one LOOKUP at a time and knfsd checks as plain NFSD_MAY_EXEC.
+//   - Ownership itself: chmod, chown, utimes and the sticky-bit rule ask
+//     who the owner IS (Cred.owns, mayChown), a question this cannot
+//     change the answer to.
+//   - Directories, which the data path never opens: knfsd's nfsd_open
+//     takes the type it requires, and for READ and WRITE that is S_IFREG.
 func (b *billyFS) mayOpen(name string, n genfs.Node, mutates bool) error {
 	want := permRead
 	if mutates {
@@ -496,7 +538,56 @@ func (b *billyFS) mayOpen(name string, n genfs.Node, mutates bool) error {
 	if b.mayNode(n, want) {
 		return nil
 	}
+	if n.Type == catalog.TypeFile && b.ownsNode(n) {
+		return nil
+	}
 	return accessErr("open", name)
+}
+
+// ownsNode reports whether the mount's identity is the object's owner, in
+// the id space the mount reports. It is uid equality and nothing else:
+// knfsd's owner override tests i_uid against the caller's fsuid, and
+// CAP_FOWNER — which stands in for ownership where ownership is what an
+// operation REQUIRES — is not consulted there.
+func (b *billyFS) ownsNode(n genfs.Node) bool {
+	uid, _ := b.ids.Apply(n.UID, n.GID)
+	return uid == b.cred.UID
+}
+
+// Permitted answers NFSv3's ACCESS: which of read, write and execute this
+// mount permits on one object. It is nfs.PermissionChecker, the hook
+// go-nfs's ACCESS handler consults instead of echoing the mask the client
+// asked about (docs/go-nfs-patches.md).
+//
+// This is the client-side half of the model — the reply a client turns
+// into its answer for open(2), access(2) and `test -w`, since NFSv3 gives
+// it nothing else to decide those with. It is therefore the ordinary mode
+// check and NOTHING else: no owner override (see mayOpen), so a 0444 file
+// reports "not writable" to its own owner, which is what the kernel says
+// about the same file locally and what the FUSE frontend says through
+// `default_permissions`.
+//
+// The object is named without following a terminal symlink, like every
+// other operation whose object arrives as a file handle.
+func (b *billyFS) Permitted(name string) (nfs.Permission, error) {
+	n, err := b.resolve(ctx(), name)
+	if err != nil {
+		return 0, pe("access", name, err)
+	}
+	var granted nfs.Permission
+	for _, want := range []struct {
+		bit nfs.Permission
+		p   perm
+	}{
+		{nfs.PermissionRead, permRead},
+		{nfs.PermissionWrite, permWrite},
+		{nfs.PermissionExecute, permExec},
+	} {
+		if b.mayNode(n, want.p) {
+			granted |= want.bit
+		}
+	}
+	return granted, nil
 }
 
 func (b *billyFS) Stat(filename string) (os.FileInfo, error) {

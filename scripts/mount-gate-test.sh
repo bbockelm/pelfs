@@ -156,6 +156,128 @@ deletion_gate() {
   echo "$label: symlinks removed as links, 23 dangling links and 3000 entries each gone in ONE pass"
 }
 
+# answer <dir> <shell snippet>
+#
+# Runs a probe in <dir> and prints "yes" or "no". Permission questions are
+# answered by ATTEMPTING the operation, which is what the programs that ask
+# them do -- configure scripts, installers, `test -w` -- so that is how they
+# are asked here. The snippet is evaluated so that a probe can be a
+# redirection, which is the only way to ask "may I write this".
+answer() {
+  local dir="$1" snippet="$2"
+  if (cd "$dir" && eval "$snippet") >/dev/null 2>&1; then echo yes; else echo no; fi
+}
+
+# permission_gate <label> <writable mount root>
+#
+# THE MODE BITS, end to end, on a real kernel client. Two properties, and
+# they are two halves of one design (docs/go-nfs-patches.md):
+#
+#  1. `tar -p` extracting a read-only file must SUCCEED. tar creates the
+#     file with the archive's mode and then writes the body through the
+#     descriptor it already holds -- open(O_CREAT|O_WRONLY, 0444) followed
+#     by writes -- so a stateless NFS server sees a WRITE to a file that is
+#     already 0444. Refusing it second-guesses an open the client made and
+#     the file arrives EMPTY. This is the real-world break: it is every
+#     read-only file in every source tarball.
+#  2. Every permission ANSWER must match the same answer on a local tree.
+#     The reference is what makes this a test rather than a tautology: the
+#     mount and a tmpfs directory get the same tree and the same probes,
+#     and any question they disagree about is a bug in whichever frontend
+#     is under $2 -- which is also why this runs on the FUSE backend, where
+#     the kernel's `default_permissions` gives the answers, as well as on
+#     NFS, where our own ACCESS reply does.
+#
+# It is written against a reference rather than against fixed expectations
+# because the answers legitimately depend on the capabilities the process
+# holds: root WITH CAP_DAC_OVERRIDE may write a 0444 file and root without
+# it may not, and both are correct. A gate that hardcoded either one would
+# be wrong in the other container.
+permission_gate() {
+  local label="$1" root="$2"
+  local d="$root/permgate" ref="$WORK/permref" src="$WORK/permsrc"
+  local out mnt_says ref_says
+
+  rm -rf "$d" "$ref" "$src" 2>/dev/null || true
+  mkdir -p "$d" "$ref" "$src/tree/locked"
+
+  echo "the body of a file nobody may write" > "$src/tree/ro.txt"
+  echo "an ordinary body" > "$src/tree/rw.txt"
+  printf '#!/bin/sh\necho ran\n' > "$src/tree/run.sh"
+  echo "inside a directory that will lose its x bit" > "$src/tree/locked/inside.txt"
+  chmod 0444 "$src/tree/ro.txt"
+  chmod 0644 "$src/tree/rw.txt"
+  chmod 0755 "$src/tree/run.sh"
+  tar -cf "$WORK/perm.tar" -C "$src" tree
+
+  # 1. The extraction itself, onto the mount and onto the reference.
+  out=$(tar -xpf "$WORK/perm.tar" -C "$d" 2>&1) || {
+    echo "$label: tar -p could not extract a tree containing a read-only file" >&2
+    [ -n "$out" ] && echo "$out" | sed 's/^/    /' >&2
+    exit 1
+  }
+  [ -z "$out" ] || {
+    echo "$label: tar -p extracted with complaints:" >&2
+    echo "$out" | sed 's/^/    /' >&2
+    exit 1
+  }
+  tar -xpf "$WORK/perm.tar" -C "$ref" || { echo "$label: the REFERENCE extraction failed" >&2; exit 1; }
+
+  # The read-only file is the one that used to arrive empty.
+  cmp "$src/tree/ro.txt" "$d/tree/ro.txt" || {
+    echo "$label: the read-only file did not survive tar -p intact" >&2
+    ls -l "$d/tree/ro.txt" >&2; exit 1; }
+  for f in ro.txt rw.txt run.sh; do
+    mnt_says=$(stat -c %a "$d/tree/$f")
+    ref_says=$(stat -c %a "$ref/tree/$f")
+    [ "$mnt_says" = "$ref_says" ] || {
+      echo "$label: tar -p left $f mode $mnt_says, the reference has $ref_says" >&2
+      exit 1; }
+  done
+
+  # 2. The answers. A directory stripped of its x bit is set up here rather
+  # than carried in the archive, since archiving one means tar cannot read
+  # it back on a host that would refuse the search.
+  chmod 0644 "$d/tree/locked"
+  chmod 0644 "$ref/tree/locked"
+
+  while IFS= read -r probe; do
+    [ -n "$probe" ] || continue
+    mnt_says=$(answer "$d" "$probe")
+    ref_says=$(answer "$ref" "$probe")
+    [ "$mnt_says" = "$ref_says" ] || {
+      echo "$label: '$probe' answers $mnt_says on the mount and $ref_says on a local tree" >&2
+      echo "    the two must agree; one of them is answering a permission question wrongly" >&2
+      ls -l "$d/tree" >&2
+      exit 1; }
+  done <<'PROBES'
+test -r tree/ro.txt
+test -w tree/ro.txt
+test -x tree/ro.txt
+test -w tree/rw.txt
+test -x tree/run.sh
+test -x tree/locked
+cat tree/locked/inside.txt
+printf x >> tree/ro.txt
+printf x >> tree/rw.txt
+PROBES
+
+  # And the bytes, after the write probes: a write the reference refused
+  # must not have landed here either.
+  for f in ro.txt rw.txt; do
+    cmp "$ref/tree/$f" "$d/tree/$f" || {
+      echo "$label: $f differs from the reference after the write probes" >&2
+      exit 1; }
+  done
+
+  # Put the search bit back before deleting: without CAP_DAC_OVERRIDE
+  # nothing can be unlinked from a directory it cannot search, on either
+  # side, and that refusal is the gate working rather than failing.
+  chmod 0755 "$d/tree/locked" "$ref/tree/locked"
+  rm -rf "$d" "$ref" "$src" "$WORK/perm.tar"
+  echo "$label: tar -p extracted a read-only tree intact, and every permission answer matches a local tree"
+}
+
 [ -e /dev/fuse ] || { echo "no /dev/fuse; a kernel mount needs FUSE" >&2; exit 1; }
 
 # Binaries are either prebuilt (the container launcher cross-compiles on
@@ -598,6 +720,7 @@ done
   exit 1
 }
 deletion_gate "nfs" "$WORK/nfsmnt"
+permission_gate "nfs" "$WORK/nfsmnt"
 unmount_at "$WORK/nfsmnt"
 kill "$NFS_PID" 2>/dev/null || true
 wait "$NFS_PID" 2>/dev/null || true
@@ -617,6 +740,7 @@ for _ in $(seq 200); do [ -d "$WORK/mnt/dir" ] && break; sleep 0.1; done
   exit 1
 }
 deletion_gate "fuse" "$WORK/mnt"
+permission_gate "fuse" "$WORK/mnt"
 
 echo "== live refresh: a read-only mount follows the branch =="
 unmount_at "$WORK/mnt"

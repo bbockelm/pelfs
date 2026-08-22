@@ -40,9 +40,19 @@ echo "== cross-compiling for linux/$ARCH =="
 cp "$REPO/scripts/mount-gate-test.sh" "$STAGE/test.sh"
 
 echo "== running the mount gate on a real Linux kernel =="
+# CAP_DAC_OVERRIDE is DROPPED, and permission_gate is why. The container
+# runs as root, and root WITH that capability may write a 0444 file --
+# which makes every mode-bit question in the gate answer "yes" whatever the
+# frontend does, so a gate that kept it could not tell a correct permission
+# answer from a missing one. Dropped, the process is refused by the kernel
+# exactly as an ordinary user would be, which is the same identity the
+# hostile container models (scripts/hostile-docker.sh) and the identity the
+# mode-bits finding was reported under. Everything else in the gate owns
+# the tree it touches and does not notice.
 exec docker run --rm \
   --device /dev/fuse \
   --cap-add SYS_ADMIN \
+  --cap-drop DAC_OVERRIDE \
   --security-opt apparmor=unconfined \
   --network none \
   -v "$STAGE":/stage:ro \

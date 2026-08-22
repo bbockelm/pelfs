@@ -75,21 +75,27 @@ import (
 // --drop-chown) it is refused, and both answers match what the same process
 // gets from a local filesystem.
 //
-// # What is NOT modelled, and one thing knfsd does that we do not
+// # Where the model is asked, and the one bypass knfsd takes
 //
-// Linux's in-kernel NFS server gives the file's OWNER a bypass on the data
-// path (NFSD_MAY_OWNER_OVERRIDE): a stateless server delegates the
-// open-time check to a client it trusts, and without the bypass an
-// `open(O_CREAT|O_WRONLY, 0444)` followed by writes — which is `tar -p`
-// extracting a read-only file — would fail on the WRITE, since the client's
-// fd outlives the mode. We do not take that bypass yet, because the
-// open-time check it delegates to is driven by our ACCESS reply, and
-// go-nfs's ACCESS handler echoes back whatever mask the client asked for
-// (docs/go-nfs-patches.md, "Still open"). Delegating a check nobody
-// performs is not delegating; it is skipping. When ACCESS becomes honest —
-// a fork commit, not something reachable from here — the owner bypass
-// should arrive in the same change, and this comment is the reason it is
-// two halves of one design rather than an oversight.
+// The same model answers two different questions, and they are asked in
+// two places because knfsd asks them in two places:
+//
+//   - ACCESS (billyFS.Permitted) is the mode check ALONE. NFSv3 has no
+//     OPEN, so this reply is how a client answers open(2), access(2) and
+//     `test -w`; it is the equivalent of the kernel refusing the open
+//     under `default_permissions`, and it must say no about a 0444 file
+//     even to that file's owner.
+//   - The data path (billyFS.mayOpen) gives the file's OWNER a bypass —
+//     knfsd's NFSD_MAY_OWNER_OVERRIDE — because by the time a READ or
+//     WRITE arrives, the open it belongs to was already decided by the
+//     reply above. Without it `open(O_CREAT|O_WRONLY, 0444)` followed by
+//     writes, which is `tar -p` extracting a read-only file, fails on the
+//     WRITE: the descriptor legitimately outlives the mode, and a
+//     stateless server cannot see it.
+//
+// Neither half is safe alone, and mayOpen documents exactly how far the
+// bypass reaches (not the namespace operations, not the path walk, not
+// the ownership questions, not directories).
 //
 // Also not modelled, deliberately: clearing S_ISUID/S_ISGID on chown and on
 // a chmod by a non-member of the file's group. Both are real kernel

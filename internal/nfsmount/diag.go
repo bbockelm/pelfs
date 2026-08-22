@@ -204,20 +204,36 @@ func report(op, path, told string, err error) {
 // before go-nfs gets a chance to discard it.
 func diagnose(fs billy.Filesystem) billy.Filesystem {
 	d := diagFS{Filesystem: fs}
-	// Neither billy.Change nor nfs.HardLinker is part of billy.Filesystem,
-	// and go-nfs decides whether SETATTR and LINK are supported at all by
-	// type-asserting for them. A wrapper that always implemented them
-	// would claim support the wrapped filesystem does not have, so the
-	// assertions are answered by which type is returned.
+	// None of billy.Change, nfs.HardLinker or nfs.PermissionChecker is
+	// part of billy.Filesystem, and go-nfs decides whether SETATTR, LINK
+	// and an honest ACCESS are available at all by type-asserting for
+	// them. A wrapper that always implemented them would claim support the
+	// wrapped filesystem does not have -- and for the permission checker
+	// that is not merely a claim: go-nfs would ask a wrapper that cannot
+	// answer, and every ACCESS would come back denying everything. So the
+	// assertions are answered by which type is returned, one shape per
+	// combination.
 	ch, changeable := fs.(billy.Change)
 	ln, linkable := fs.(nfs.HardLinker)
+	pc, checks := fs.(nfs.PermissionChecker)
+	c := diagChangeFS{diagFS: d, ch: ch}
+	l := diagLinker{ln}
+	p := diagPermitter{pc}
 	switch {
+	case changeable && linkable && checks:
+		return &diagChangeLinkPermFS{c, l, p}
 	case changeable && linkable:
-		return &diagChangeLinkFS{diagChangeFS{diagFS: d, ch: ch}, diagLinker{ln}}
+		return &diagChangeLinkFS{c, l}
+	case changeable && checks:
+		return &diagChangePermFS{c, p}
+	case linkable && checks:
+		return &diagLinkPermFS{d, l, p}
 	case changeable:
-		return &diagChangeFS{diagFS: d, ch: ch}
+		return &c
 	case linkable:
-		return &diagLinkFS{d, diagLinker{ln}}
+		return &diagLinkFS{d, l}
+	case checks:
+		return &diagPermFS{d, p}
 	}
 	return &d
 }
@@ -241,9 +257,27 @@ func (d diagLinker) Link(oldname, newname string) error {
 	return explain("link", newname, toldEIO, d.ln.Link(oldname, newname))
 }
 
+// diagPermitter carries the ACCESS half. An error here is one go-nfs's
+// ACCESS handler can only place if it is a permission error (which is an
+// answer, not a failure) or ENOENT; anything else reaches the client as
+// NFS3ERR_IO, so it goes through the explainer like the rest.
+type diagPermitter struct {
+	pc nfs.PermissionChecker
+}
+
+func (d diagPermitter) Permitted(path string) (nfs.Permission, error) {
+	p, err := d.pc.Permitted(path)
+	return p, explain("access", path, toldEIO, err)
+}
+
 type diagLinkFS struct {
 	diagFS
 	diagLinker
+}
+
+type diagPermFS struct {
+	diagFS
+	diagPermitter
 }
 
 type diagChangeLinkFS struct {
@@ -251,13 +285,38 @@ type diagChangeLinkFS struct {
 	diagLinker
 }
 
+type diagChangePermFS struct {
+	diagChangeFS
+	diagPermitter
+}
+
+type diagLinkPermFS struct {
+	diagFS
+	diagLinker
+	diagPermitter
+}
+
+type diagChangeLinkPermFS struct {
+	diagChangeFS
+	diagLinker
+	diagPermitter
+}
+
 var (
-	_ billy.Filesystem = (*diagFS)(nil)
-	_ billy.Capable    = (*diagFS)(nil)
-	_ billy.Change     = (*diagChangeFS)(nil)
-	_ billy.Change     = (*diagChangeLinkFS)(nil)
-	_ nfs.HardLinker   = (*diagLinkFS)(nil)
-	_ nfs.HardLinker   = (*diagChangeLinkFS)(nil)
+	_ billy.Filesystem      = (*diagFS)(nil)
+	_ billy.Capable         = (*diagFS)(nil)
+	_ billy.Change          = (*diagChangeFS)(nil)
+	_ billy.Change          = (*diagChangeLinkFS)(nil)
+	_ billy.Change          = (*diagChangePermFS)(nil)
+	_ billy.Change          = (*diagChangeLinkPermFS)(nil)
+	_ nfs.HardLinker        = (*diagLinkFS)(nil)
+	_ nfs.HardLinker        = (*diagChangeLinkFS)(nil)
+	_ nfs.HardLinker        = (*diagLinkPermFS)(nil)
+	_ nfs.HardLinker        = (*diagChangeLinkPermFS)(nil)
+	_ nfs.PermissionChecker = (*diagPermFS)(nil)
+	_ nfs.PermissionChecker = (*diagChangePermFS)(nil)
+	_ nfs.PermissionChecker = (*diagLinkPermFS)(nil)
+	_ nfs.PermissionChecker = (*diagChangeLinkPermFS)(nil)
 )
 
 // Capabilities is forwarded explicitly: it is not part of

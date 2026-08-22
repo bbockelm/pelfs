@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/go-git/go-billy/v5"
+	nfs "github.com/willscott/go-nfs"
 
 	"github.com/bbockelm/pelfs/internal/overlay"
 	"github.com/bbockelm/pelfs/internal/vfsbilly"
@@ -150,28 +151,75 @@ func readFrom(fs billy.Filesystem, path string) ([]byte, error) {
 	return io.ReadAll(f)
 }
 
+// access asks the frontend the question NFSv3's ACCESS procedure asks --
+// which of read, write and execute this mount permits on one object -- and
+// renders the answer the way a mode nibble reads, so a case can state it
+// as the string `ls` would show and the kernel would agree with.
+//
+// It is the reply a client turns into its answer for open(2), access(2)
+// and `test -w`: NFSv3 has no OPEN, so there is nothing else for it to
+// decide those with.
+func access(t *testing.T, fs billy.Filesystem, path string) string {
+	t.Helper()
+	checker, ok := fs.(nfs.PermissionChecker)
+	if !ok {
+		t.Fatal("the frontend no longer implements nfs.PermissionChecker, so " +
+			"go-nfs answers ACCESS by echoing back whatever the client asked about")
+	}
+	granted, err := checker.Permitted(path)
+	if err != nil {
+		t.Fatalf("ACCESS on %s: %v", path, err)
+	}
+	out := []byte("---")
+	for i, bit := range []nfs.Permission{nfs.PermissionRead, nfs.PermissionWrite, nfs.PermissionExecute} {
+		if granted&bit != 0 {
+			out[i] = "rwx"[i]
+		}
+	}
+	return string(out)
+}
+
 // THE FINDING, pinned. A file chmod'd 0444 accepted a write through the
 // NFS frontend and the bytes survived the seal
 // (internal/hostile/testdata/corpus/nfs-ignores-mode-bits.plan). Raw FUSE
 // refused the same write with EACCES because the kernel applies the mode
-// check before the request is sent. This test fails on the frontend as it
-// was: it is the whole finding in nine lines.
+// check before the request is sent.
+//
+// WHERE THE REFUSAL LIVES NOW, and why it moved. The reported case is a
+// file the mount's own user owns, and a WRITE on one of those is allowed
+// here on purpose: it is knfsd's owner override, without which `tar -p`
+// cannot extract a read-only file at all (mayOpen documents the rule and
+// its scope). What refuses the write is the half that arrives first — the
+// ACCESS reply, which reports the file as not writable and which is how an
+// NFSv3 client answers open(2). The client never sends the WRITE.
+//
+// So the finding is pinned in the two places it can now be true: ACCESS
+// says no to the file's own owner, and the data path says no to everybody
+// who is not. A regression in either one brings the bug back.
 func TestAWriteTheModeForbidsIsRefusedAndNoBytesLand(t *testing.T) {
 	p := newPerms(t)
 	fs := p.mount(0)
 	original := []byte("the body that must survive")
 	ro := p.rootFile(0o444, p.me, p.grp, original)
 
-	refused(t, "open O_WRONLY on a 0444 file", writeTo(fs, ro, []byte("clobber")), syscall.EACCES)
+	// The client's open(2) is decided by this reply and nothing else.
+	if got := access(t, fs, ro); got != "r--" {
+		t.Fatalf("ACCESS on a 0444 file = %q, want %q — a client told this "+
+			"opens the file for writing, and the write follows", got, "r--")
+	}
 
-	// go-nfs's WRITE handler opens O_RDWR, not O_WRONLY, so the check has
-	// to be on the mode and not on the flag spelling.
-	_, err := fs.OpenFile(ro, os.O_RDWR, 0)
-	refused(t, "open O_RDWR on a 0444 file", err, syscall.EACCES)
+	// And where there is no owner override to reach, the data path itself
+	// refuses: O_WRONLY and O_RDWR alike, since go-nfs's WRITE handler
+	// opens O_RDWR and the check is on the mode, not on the flag spelling.
+	theirs := p.rootFile(0o444, p.they, p.thgr, original)
+	refused(t, "open O_WRONLY on somebody else's 0444 file",
+		writeTo(fs, theirs, []byte("clobber")), syscall.EACCES)
+	_, err := fs.OpenFile(theirs, os.O_RDWR, 0)
+	refused(t, "open O_RDWR on somebody else's 0444 file", err, syscall.EACCES)
 
 	// The bytes are the point: the original report's signature was
 	// "ro.dat: byte 0 is 0x29 in the mount, 0xc2 in the reference".
-	got, err := readFrom(fs, ro)
+	got, err := readFrom(fs, theirs)
 	if err != nil {
 		t.Fatalf("read back a 0444 file: %v", err)
 	}
@@ -182,6 +230,15 @@ func TestAWriteTheModeForbidsIsRefusedAndNoBytesLand(t *testing.T) {
 
 // The mode check itself: class selection, the first-match-wins rule, and
 // the two DAC capabilities.
+//
+// Each case states BOTH answers, because they are two different questions
+// and only one of them is the mode check. `access` is what ACCESS reports,
+// which is the mode check and nothing else; wantWrite/wantRead are what
+// the data path does, where a file's owner is allowed past their own mode
+// (mayOpen's owner override). The one case where they disagree is marked,
+// and that disagreement is knfsd's design rather than a wrinkle in this
+// one: the client refuses the open, so the operation the server would
+// have allowed is never sent.
 func TestModeBitsDecideReadsAndWrites(t *testing.T) {
 	p := newPerms(t)
 	body := []byte("body")
@@ -194,33 +251,37 @@ func TestModeBitsDecideReadsAndWrites(t *testing.T) {
 		owner      string
 		group      string
 		caps       vfsbilly.Caps
+		access     string // what ACCESS reports: the mode check, alone
 		wantWrite  bool
 		wantRead   bool
 		wantErrno  syscall.Errno
 		whyRefused string
 	}{
 		{name: "owner may write what owner-write permits", mode: 0o644,
-			owner: "me", group: "theirs", wantWrite: true, wantRead: true},
-		{name: "owner is refused by their own mode", mode: 0o444,
-			owner: "me", group: "theirs",
-			wantWrite: false, wantRead: true, wantErrno: syscall.EACCES,
-			whyRefused: "the owner class denies w, and the owner does not fall through to other"},
+			owner: "me", group: "theirs", access: "rw-", wantWrite: true, wantRead: true},
+		{name: "the owner's own mode is what ACCESS reports, and the data path overrides it",
+			mode: 0o444, owner: "me", group: "theirs",
+			// The owner class denies w and the owner does not fall through
+			// to other, so ACCESS says r-- and a client refuses the open.
+			// The WRITE that would follow one it allowed is trusted:
+			// NFSD_MAY_OWNER_OVERRIDE, and the reason `tar -p` works.
+			access: "r--", wantWrite: true, wantRead: true},
 		{name: "CAP_DAC_OVERRIDE is what lets root past a 0444 file", mode: 0o444,
 			owner: "me", group: "theirs",
-			caps: vfsbilly.CapDACOverride, wantWrite: true, wantRead: true},
+			caps: vfsbilly.CapDACOverride, access: "rw-", wantWrite: true, wantRead: true},
 		{name: "other class grants what the owner's mode does not", mode: 0o606,
-			owner: "them", group: "theirs", wantWrite: true, wantRead: true},
+			owner: "them", group: "theirs", access: "rw-", wantWrite: true, wantRead: true},
 		{name: "the group class is consulted for a supplementary group", mode: 0o060,
-			owner: "them", group: "shared", wantWrite: true, wantRead: true},
+			owner: "them", group: "shared", access: "rw-", wantWrite: true, wantRead: true},
 		{name: "the group class wins even when other would grant more", mode: 0o604,
-			owner: "them", group: "shared",
+			owner: "them", group: "shared", access: "---",
 			wantWrite: false, wantRead: false, wantErrno: syscall.EACCES,
 			whyRefused: "first matching class decides; group is ---, so other's r-- is never reached"},
 		{name: "a mode nobody may read", mode: 0o000,
-			owner: "them", group: "theirs",
+			owner: "them", group: "theirs", access: "---",
 			wantWrite: false, wantRead: false, wantErrno: syscall.EACCES},
 		{name: "CAP_DAC_READ_SEARCH reads but does not write", mode: 0o000,
-			owner: "them", group: "theirs",
+			owner: "them", group: "theirs", access: "r--",
 			caps: vfsbilly.CapDACReadSearch, wantWrite: false, wantRead: true,
 			wantErrno: syscall.EACCES},
 	} {
@@ -240,6 +301,11 @@ func TestModeBitsDecideReadsAndWrites(t *testing.T) {
 			path := p.rootFile(tc.mode, uid, gid, body)
 			fs := p.mount(tc.caps)
 
+			if got := access(t, fs, path); got != tc.access {
+				t.Errorf("ACCESS = %q, want %q — this is the answer a client "+
+					"gives open(2), access(2) and `test -w`", got, tc.access)
+			}
+
 			err := writeTo(fs, path, []byte("xxxx"))
 			if tc.wantWrite {
 				allowed(t, "write", err)
@@ -258,20 +324,136 @@ func TestModeBitsDecideReadsAndWrites(t *testing.T) {
 
 // A truncate is a write, and it arrives by a different route: NFSv3
 // SETATTR with a size, which go-nfs turns into OpenFile(O_WRONLY|O_EXCL)
-// followed by Truncate. That route has to reach the same answer.
+// followed by Truncate. That route has to reach the same answer -- both
+// halves of it, since knfsd gives a size change the same owner override it
+// gives a WRITE (nfsd_setattr adds NFSD_MAY_OWNER_OVERRIDE for ATTR_SIZE).
 func TestTruncateIsAWrite(t *testing.T) {
 	p := newPerms(t)
 	fs := p.mount(0)
-	ro := p.rootFile(0o444, p.me, p.grp, []byte("keep me"))
+	ro := p.rootFile(0o444, p.they, p.thgr, []byte("keep me"))
 
 	_, err := fs.OpenFile(ro, os.O_WRONLY|os.O_EXCL, 0)
-	refused(t, "SETATTR-size open of a 0444 file", err, syscall.EACCES)
+	refused(t, "SETATTR-size open of somebody else's 0444 file", err, syscall.EACCES)
 
 	rw := p.rootFile(0o644, p.me, p.grp, []byte("keep me"))
 	f, err := fs.OpenFile(rw, os.O_WRONLY|os.O_EXCL, 0)
 	allowed(t, "SETATTR-size open of a 0644 file", err)
 	allowed(t, "truncate", f.Truncate(0))
 	allowed(t, "close", f.Close())
+
+	// The owner's own read-only file: ACCESS says not writable, so a
+	// client refuses ftruncate(2) before sending anything, and the SETATTR
+	// that only arrives from one it allowed is carried out.
+	mine := p.rootFile(0o444, p.me, p.grp, []byte("keep me"))
+	if got := access(t, fs, mine); got != "r--" {
+		t.Fatalf("ACCESS on my own 0444 file = %q, want %q", got, "r--")
+	}
+	f, err = fs.OpenFile(mine, os.O_WRONLY|os.O_EXCL, 0)
+	allowed(t, "SETATTR-size open of my own 0444 file", err)
+	allowed(t, "truncate", f.Truncate(0))
+	allowed(t, "close", f.Close())
+}
+
+// THE ACCESS MATRIX: the answers a client turns into open(2), access(2),
+// `test -w`, `test -x` and a path walk. Every case is written as the answer
+// the KERNEL gives for the same file, which is what "the two frontends
+// agree" has to mean -- the FUSE frontend gets these from the kernel's own
+// mode check under `default_permissions`, and this is the NFS frontend
+// saying the same thing on the wire.
+//
+// Before this, go-nfs echoed the mask the client asked about, so every
+// answer below was "yes".
+func TestAccessAnswersWhatTheKernelWouldSay(t *testing.T) {
+	p := newPerms(t)
+
+	for _, tc := range []struct {
+		name  string
+		mode  uint32
+		dir   bool
+		owner string
+		caps  vfsbilly.Caps
+		want  string
+	}{
+		{name: "test -w on a 0444 file is NO, for its own owner",
+			mode: 0o444, owner: "me", want: "r--"},
+		{name: "test -x on a 0644 file is NO",
+			mode: 0o644, owner: "me", want: "rw-"},
+		{name: "test -x on a 0755 file is YES",
+			mode: 0o755, owner: "me", want: "rwx"},
+		{name: "somebody else's 0600 file is nothing at all",
+			mode: 0o600, owner: "them", want: "---"},
+		{name: "a directory without x cannot be searched, whatever else it grants",
+			mode: 0o644, dir: true, owner: "me", want: "rw-"},
+		{name: "an ordinary directory",
+			mode: 0o755, dir: true, owner: "me", want: "rwx"},
+		{name: "a read-only directory searches and lists but does not change",
+			mode: 0o555, dir: true, owner: "me", want: "r-x"},
+		{name: "CAP_DAC_OVERRIDE grants write on a 0444 file and still no execute",
+			mode: 0o444, owner: "me", caps: vfsbilly.CapDACOverride, want: "rw-"},
+		{name: "CAP_DAC_OVERRIDE does not conjure an execute bit that exists for nobody",
+			mode: 0o644, owner: "me", caps: vfsbilly.CapDACOverride, want: "rw-"},
+		{name: "CAP_DAC_READ_SEARCH reads and searches a directory it may not change",
+			mode: 0o000, dir: true, owner: "them", caps: vfsbilly.CapDACReadSearch, want: "r-x"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			uid, gid := p.me, p.grp
+			if tc.owner == "them" {
+				uid, gid = p.they, p.thgr
+			}
+			var path string
+			if tc.dir {
+				_, path = p.dir(tc.mode, uid, gid)
+			} else {
+				path = p.rootFile(tc.mode, uid, gid, []byte("body"))
+			}
+			if got := access(t, p.mount(tc.caps), path); got != tc.want {
+				t.Errorf("ACCESS = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// `tar -p` extracting a read-only file, which is the shape the owner
+// override exists for. tar creates the file with the mode the archive
+// records, writes the body through the descriptor it already holds, and
+// closes it: `open(O_CREAT|O_WRONLY, 0444)` and then writes.
+//
+// A stateless server sees only the WRITE, on a file that by then is 0444.
+// Refusing it second-guesses an open the client already made and the file
+// arrives EMPTY -- and the client is not wrong, because the descriptor
+// legitimately outlives the mode. knfsd allows it for the file's owner
+// (NFSD_MAY_OWNER_OVERRIDE, fs/nfsd/vfs.c) and so does this.
+func TestTarDashPExtractsAReadOnlyFile(t *testing.T) {
+	p := newPerms(t)
+	fs := p.mount(0)
+	body := []byte("the body tar is about to write")
+
+	// CREATE with the archive's mode. The new file's own mode is not
+	// checked -- the kernel checks the parent directory for a create --
+	// which is what makes `install -m 444` work anywhere.
+	f, err := fs.Create("/extracted.txt")
+	allowed(t, "tar creates the file", err)
+	allowed(t, "close", f.Close())
+	allowed(t, "tar applies the archived mode", fs.(billy.Change).Chmod("/extracted.txt", 0o444))
+
+	// And now the WRITEs, which arrive on a file that is already 0444.
+	// This is the operation that used to fail.
+	allowed(t, "tar writes the body through the descriptor it opened",
+		writeTo(fs, "/extracted.txt", body))
+
+	got, err := readFrom(fs, "/extracted.txt")
+	if err != nil {
+		t.Fatalf("read back the extracted file: %v", err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("the extracted file holds %q, want %q", got, body)
+	}
+
+	// The override is the owner's and nobody else's: the same shape on a
+	// file owned by somebody else is still refused, mode bits and all.
+	theirs := p.rootFile(0o444, p.they, p.thgr, []byte("untouched"))
+	refused(t, "the same write on somebody else's read-only file",
+		writeTo(fs, theirs, body), syscall.EACCES)
 }
 
 // Creating, removing and renaming a NAME costs write and search on the

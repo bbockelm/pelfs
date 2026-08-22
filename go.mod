@@ -156,4 +156,4 @@ replace github.com/pelicanplatform/pelican => github.com/bbockelm/pelican v0.0.0
 // (docs/go-nfs-patches.md). Branch
 // pelfs-nfs-fixes of https://github.com/bbockelm/go-nfs, based on
 // upstream master, whose commits are written to be offered upstream.
-replace github.com/willscott/go-nfs => github.com/bbockelm/go-nfs v0.0.5-0.20260821165816-192dba654a40
+replace github.com/willscott/go-nfs => github.com/bbockelm/go-nfs v0.0.5-0.20260822135043-13c05601d32d

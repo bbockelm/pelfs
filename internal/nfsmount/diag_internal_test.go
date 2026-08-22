@@ -121,14 +121,42 @@ func (f *chmodFS) Lchown(string, int, int) error              { return nil }
 func (f *chmodFS) Chown(string, int, int) error               { return nil }
 func (f *chmodFS) Chtimes(string, time.Time, time.Time) error { return nil }
 
+// permFS gives an in-memory filesystem the ACCESS answer go-nfs asks for
+// by type assertion. What it permits is fixed; the point here is which
+// wrapper shapes carry the method through.
+type permFS struct {
+	billy.Filesystem
+	granted nfs.Permission
+}
+
+func (f *permFS) Permitted(string) (nfs.Permission, error) { return f.granted, nil }
+
+// changePermFS has both of the optional interfaces at once, which is the
+// combination the real filesystem (internal/vfsbilly) presents.
+type changePermFS struct {
+	chmodFS
+	granted nfs.Permission
+}
+
+func (f *changePermFS) Permitted(string) (nfs.Permission, error) { return f.granted, nil }
+
 // The wrapper has to keep every property go-nfs tests for, or it changes
 // the server's behavior while explaining it: WriteCapability (absent, and
-// every mutating RPC is refused with ROFS) and billy.Change (absent, and
-// SETATTR is refused as unsupported).
+// every mutating RPC is refused with ROFS), billy.Change (absent, and
+// SETATTR is refused as unsupported), and nfs.PermissionChecker (absent,
+// and ACCESS echoes the client's mask).
+//
+// The permission checker is the one where a wrapper that over-claims does
+// real damage rather than merely lying: go-nfs would call a method with no
+// filesystem behind it, and every ACCESS would come back granting nothing
+// -- a mount on which nothing can be opened at all.
 func TestDiagnosePreservesTheInterfacesGoNFSAsserts(t *testing.T) {
 	plain := diagnose(memfs.New())
 	if _, ok := plain.(billy.Change); ok {
 		t.Error("wrapper claims billy.Change for a filesystem that has none")
+	}
+	if _, ok := plain.(nfs.PermissionChecker); ok {
+		t.Error("wrapper claims nfs.PermissionChecker for a filesystem that has none")
 	}
 	if !billy.CapabilityCheck(plain, billy.WriteCapability) {
 		t.Error("wrapper dropped WriteCapability")
@@ -137,6 +165,30 @@ func TestDiagnosePreservesTheInterfacesGoNFSAsserts(t *testing.T) {
 	changeable := diagnose(&chmodFS{Filesystem: memfs.New()})
 	if _, ok := changeable.(billy.Change); !ok {
 		t.Fatal("wrapper dropped billy.Change")
+	}
+	if _, ok := changeable.(nfs.PermissionChecker); ok {
+		t.Error("wrapper invented nfs.PermissionChecker for a changeable filesystem")
+	}
+
+	checker := diagnose(&permFS{Filesystem: memfs.New(), granted: nfs.PermissionRead})
+	pc, ok := checker.(nfs.PermissionChecker)
+	if !ok {
+		t.Fatal("wrapper dropped nfs.PermissionChecker")
+	}
+	if got, err := pc.Permitted("/a.c"); err != nil || got != nfs.PermissionRead {
+		t.Errorf("Permitted through the wrapper = %v, %v; want %v, nil",
+			got, err, nfs.PermissionRead)
+	}
+
+	both := diagnose(&changePermFS{
+		chmodFS: chmodFS{Filesystem: memfs.New()},
+		granted: nfs.PermissionRead | nfs.PermissionWrite,
+	})
+	if _, ok := both.(billy.Change); !ok {
+		t.Error("wrapper dropped billy.Change from a filesystem that also checks permissions")
+	}
+	if _, ok := both.(nfs.PermissionChecker); !ok {
+		t.Error("wrapper dropped nfs.PermissionChecker from a filesystem that is also changeable")
 	}
 }
 

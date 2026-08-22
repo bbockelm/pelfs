@@ -672,8 +672,11 @@ func repackedSuperblock(ctx context.Context, o ExecOptions, prev *superblock.Sup
 	return &sb, raw, nil
 }
 
+// graceOf is the window a document RECORDS — the one the ledgers it
+// carries were promised, and the one this generation's rows inherit
+// (a repack copies its parent's Params).
 func graceOf(sb *superblock.Superblock) time.Duration {
-	return time.Duration(sb.Params.TGraceSeconds) * time.Second
+	return sb.Params.Grace()
 }
 
 func refNames(refs []superblock.ManifestRef) []string {

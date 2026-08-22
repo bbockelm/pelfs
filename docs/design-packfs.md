@@ -1643,12 +1643,31 @@ with:
 
 ### The limits to admit
 
-- **`T_grace` is a window, not a pin, and it is hardcoded at 72 hours.**
+- **`T_grace` is a window, not a pin, and it is a PER-VOLUME parameter.**
   It is recorded in `Params.TGraceSeconds` so writers, readers and GC agree
-  on the same number, and `pelfs gc --grace` may only WIDEN it — an option
-  that could narrow it would be an option to delete a concurrent writer's
-  packs. There is no per-volume knob to set it, and the superblock field is
-  written from a compiled-in constant.
+  on the same number. `pelfs init --grace` chooses it (default 72h, floor
+  1h) and every later seal carries the RECORDED value forward instead of
+  re-stating a constant, so the volume's sweep, its repack planner and its
+  three ledgers all age against the number its creator picked. `pelfs gc
+  --grace` may still only WIDEN it — an option that could narrow it would
+  be an option to delete a concurrent writer's packs — and the floor is
+  there for the same reason: under it a sweep can delete a pack a live
+  writer has cut and not yet named.
+
+  **A large window buys less than it looks like it buys**, and the ledger
+  is the number to check before choosing one. The two derived-ref ledgers
+  gain about one row per checkpoint per key space and are capped at 48 KiB
+  each (~517 hash-named rows), so past `517 x checkpoint-interval` the byte
+  cap binds before the window does: the volume behaves as though its window
+  were that long, the oldest rows fall off while the recorded window is
+  still running, and a repack paces its plan to the room that is left. At
+  the default 5-minute cadence that is ~43 hours, so **the default 72-hour
+  window is already past the cap**, and `--grace 30d` is past it forty-fold.
+  Nothing a branch head or a tag names is affected — those name their own
+  objects directly — so what it costs is pacing plus a shortened window for
+  objects only a RETIRED generation names. `pelfs init` prints the
+  arithmetic when the numbers collide (`superblock.LedgerWindow`); a
+  workflow that needs a genuinely long pin should TAG.
 - **`Params.RetainK` is ENFORCED, and this is how.** The root set is every
   branch head, the last K generations behind each head, and every tag. K
   comes from the head's own `Params.RetainK` (8 today) and counts the head

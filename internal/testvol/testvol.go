@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bbockelm/pelfs/internal/genfs"
 	"github.com/bbockelm/pelfs/internal/overlay"
@@ -59,6 +60,12 @@ type Options struct {
 	IdentityKey []byte
 	KeyID       uint32
 	KeyTable    []superblock.KeyEntry
+	// Grace records T_grace on generation 0; zero takes the format's
+	// default. Set on the CREATE only, exactly as `pelfs init --grace`
+	// does — every later seal carries the recorded value forward, and a
+	// fixture that re-stated it on each publish would be exercising
+	// something no writer does.
+	Grace time.Duration
 }
 
 // Volume is a live volume: the published head, plus a write overlay over
@@ -107,6 +114,7 @@ func New(t testing.TB, inner pelicanobj.Store, o Options) *Volume {
 		IdentityKey: o.IdentityKey,
 		KeyID:       o.KeyID,
 		KeyTable:    o.KeyTable,
+		Grace:       o.Grace,
 	})
 	if err != nil {
 		t.Fatalf("InitVolume: %v", err)

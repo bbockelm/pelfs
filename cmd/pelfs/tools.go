@@ -94,8 +94,11 @@ func cmdGC(args []string) int {
 	if err != nil {
 		return exitErr(err)
 	}
-	fmt.Printf("refs scanned:     %d branches, %d tags\npacks retained:   %d\npacks scanned:    %d\n  too young:      %d\n  unreferenced:   %d (%d bytes)\n",
-		rep.Branches, rep.Tags, rep.RetainedPacks, rep.ScannedPacks, rep.SkippedYoung, rep.Candidates, rep.CandidateBytes)
+	// The window is printed beside the counts because "too young" means
+	// nothing without it, and because it is a per-volume parameter now
+	// (`pelfs init --grace`) rather than a number every volume shares.
+	fmt.Printf("refs scanned:     %d branches, %d tags\ngrace window:     %s\npacks retained:   %d\npacks scanned:    %d\n  too young:      %d\n  unreferenced:   %d (%d bytes)\n",
+		rep.Branches, rep.Tags, rep.Grace, rep.RetainedPacks, rep.ScannedPacks, rep.SkippedYoung, rep.Candidates, rep.CandidateBytes)
 	for _, n := range rep.CandidateNames {
 		fmt.Printf("  %s\n", n)
 	}

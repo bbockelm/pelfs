@@ -45,22 +45,38 @@ type ledgerRow struct {
 // in size.go because it is a SHARE of the superblock's write budget
 // (CondemnedBudgetBytes, 48 KiB per ledger, 144 KiB for the three).
 //
-// THE ARITHMETIC IT ANSWERS. Ledger growth is checkpoint-rate times grace
-// window and is INDEPENDENT OF VOLUME SIZE: a consolidating seal condemns
-// about one ref per key space every time, whether the volume holds ten
-// files or a hundred million. At the defaults — a checkpoint every five
-// minutes, a 72-hour grace window — that is 864 rows per key space, which
-// at 95 bytes a hash-named row is ~82 KB and is why an EMPTY volume was
-// measured at 39% of the superblock budget. Halve the interval and it
-// doubles; at `--snapshot-interval 1m` it is 4,320 rows per space and the
-// volume passes the 1 MiB read cap — bricked, unmountable and
-// unpublishable — in about three days of ordinary operation. T_grace is
-// hardcoded, so a user has no lever at all.
+// THE ARITHMETIC IT ANSWERS, and it is stated in the window the VOLUME
+// RECORDS (Params.TGraceSeconds) rather than in a constant, because that
+// window is now a per-volume parameter a user sets at `pelfs init --grace`.
+// Ledger growth is checkpoint-rate times THAT window and is INDEPENDENT OF
+// VOLUME SIZE: a consolidating seal condemns about one ref per key space
+// every time, whether the volume holds ten files or a hundred million. At
+// the defaults — a checkpoint every five minutes, a recorded window of 72
+// hours — that is 864 rows per key space, which at 95 bytes a hash-named
+// row is ~82 KB and is why an EMPTY volume was measured at 39% of the
+// superblock budget. Halve the interval and it doubles; at
+// `--snapshot-interval 1m` it is 4,320 rows per space and the volume would
+// pass the 1 MiB read cap — bricked, unmountable and unpublishable — in
+// about three days of ordinary operation, which is what this cap exists to
+// stop. Raise the recorded window instead and the same product grows the
+// same way: rows = grace / checkpoint-interval, and LedgerWindow computes
+// exactly that against what the budget can carry.
+//
+// WHICH MEANS THE RECORDED WINDOW IS A CEILING ON A PROMISE, NOT THE
+// PROMISE. Past ~517 hash-named rows the byte cap binds before the window
+// does, and what an operator asked for stops being what retired
+// generations get: at a 5-minute checkpoint the ledgers hold about 43
+// hours of rows whatever `--grace` says, so a 72-hour window is ALREADY
+// past the cap at the defaults and a 30-day one is past it forty-fold. The
+// consequence is bounded and it is pacing rather than loss — see WHAT THE
+// CAP COSTS below, and `pelfs init` says the numbers out loud when they
+// collide.
 //
 // WHAT THE CAP COSTS, stated plainly because it is a real cost: 48 KiB is
 // about 517 hash-named rows, which a default-interval mount reaches in
-// about 43 hours, so the OLDEST rows are dropped while the 72-hour window
-// they promise is still running. Dropping one does not corrupt anything
+// about 43 hours, so the OLDEST rows are dropped while the window they
+// promise — 72 hours by default, whatever `--grace` recorded otherwise —
+// is still running. Dropping one does not corrupt anything
 // and cannot affect anything a sweep can enumerate — a branch head and
 // every tag name their own packs, indexes and manifests directly, so their
 // objects are live whatever this ledger says. What it affects is the
@@ -110,6 +126,41 @@ const ledgerHeaderBytes = 3
 func rowBytes(name string, at int64) int64 {
 	return EncodedLen(CondemnedPack{Name: name, CondemnedAtUnix: at})
 }
+
+// LedgerWindow is the cap arithmetic above, computed rather than recited,
+// for a caller that has just been TOLD a grace window and can still say
+// something about it — `pelfs init --grace`.
+//
+// rows is how many a ref ledger accumulates over the window at one row per
+// checkpoint, which is the steady state of a consolidating seal. capacity
+// is how many hash-named rows the budget carries. When rows exceeds
+// capacity the BYTE CAP BINDS FIRST: the volume behaves as though its
+// window were capacity x interval, the oldest rows fall off while the
+// recorded window is still running, and repack paces its plans to the room
+// that is left (repack.trimToLedger). None of that is loss — every
+// enumerable root names its own objects directly — but it is the
+// difference between what an operator asked for and what retired
+// generations actually get, and it should be said at the moment the number
+// is chosen rather than discovered from a ledger months later.
+//
+// Hash-named rows are the measure because they are the expensive shape (95
+// bytes against a pack row's 53) and the two ref ledgers are the ones a
+// CHECKPOINT feeds; the pack ledger grows at the repack rate, which is
+// slower by orders of magnitude.
+func LedgerWindow(grace, interval time.Duration) (rows, capacity int64) {
+	if interval > 0 && grace > 0 {
+		rows = int64(grace / interval)
+	}
+	row := rowBytes(hashNameForSizing, 1<<31)
+	if row > 0 {
+		capacity = (int64(CondemnedBudgetBytes) - ledgerHeaderBytes) / row
+	}
+	return rows, capacity
+}
+
+// hashNameForSizing is a name of the shape publish gives an index or
+// manifest object: 64 hex characters. Only its LENGTH is read.
+const hashNameForSizing = "0000000000000000000000000000000000000000000000000000000000000000"
 
 // CondemnedRowBytes is rowBytes for a caller that has to plan against the
 // budget before it writes anything: repack sizes a plan by summing this

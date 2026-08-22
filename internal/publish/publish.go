@@ -147,8 +147,18 @@ const (
 
 	// Retention defaults recorded in the superblock (design doc,
 	// "Retention and GC").
-	defaultTGraceSeconds int64  = 72 * 3600
-	defaultRetainK       uint32 = 8
+	defaultRetainK uint32 = 8
+)
+
+// DefaultGrace is the T_grace a volume gets when its creator says nothing,
+// and MinGrace the floor a creator may not go under. Both belong to the
+// format (superblock.DefaultTGrace / MinTGrace, which is also where the
+// argument for the floor lives); they are named here because the command
+// offering the knob talks to this package, and a caller validating a flag
+// should not have to know which package owns the field.
+const (
+	DefaultGrace = superblock.DefaultTGrace
+	MinGrace     = superblock.MinTGrace
 )
 
 // Options configures one Publish run.
@@ -223,6 +233,18 @@ type Options struct {
 	// VolumeID identifies a volume being created by InitVolume. Every
 	// other path takes identity from the previous generation.
 	VolumeID [16]byte
+	// Grace records T_grace on the generation this publishes
+	// (Params.TGraceSeconds). Zero CARRIES THE PARENT'S FORWARD, which is
+	// what every ordinary seal wants: the window is a property of the
+	// volume, chosen once when it is created, and a seal that quietly
+	// re-stated the build-time default would move a window readers,
+	// sweepers and ledgers had all agreed on.
+	//
+	// So in practice only `pelfs init` sets it. Below MinGrace it is
+	// refused rather than clamped (applyDefaults): a caller who asked for
+	// no window at all has misunderstood what the window is for, and
+	// silently giving them an hour would hide that.
+	Grace time.Duration
 	// SQLiteCatalogs emits catalogs as SQLite databases instead of the
 	// packed static format (docs/design-catalog.md), which is the default.
 	// Measured on an 80k-file tree, the static format reseals the whole
@@ -525,6 +547,11 @@ func applyDefaults(o *Options) error {
 	}
 	if o.SpoolDir == "" {
 		return errors.New("publish: SpoolDir is required")
+	}
+	if o.Grace != 0 && o.Grace < MinGrace {
+		return fmt.Errorf("publish: a grace window of %s is under the %s floor; the window is what makes "+
+			"the sweep safe against a concurrent writer with no coordination, so a volume under it can "+
+			"have its next gc delete a pack a live writer is about to reference", o.Grace, MinGrace)
 	}
 	if len(o.SigningKey) != ed25519.PrivateKeySize {
 		return fmt.Errorf("publish: signing key is %d bytes, want %d", len(o.SigningKey), ed25519.PrivateKeySize)
@@ -1467,7 +1494,7 @@ func (p *pipeline) buildSuperblock(packList []superblock.PackEntry, shards []sup
 			SMaxBytes:     p.o.SMax,
 			SMinBytes:     catalog.SMin,
 			InlineMax:     p.o.InlineMax,
-			TGraceSeconds: defaultTGraceSeconds,
+			TGraceSeconds: p.graceSeconds(),
 			RetainK:       defaultRetainK,
 		},
 		KeyTable: p.o.KeyTable,
@@ -1483,10 +1510,13 @@ func (p *pipeline) buildSuperblock(packList []superblock.PackEntry, shards []sup
 	// stopped listing, plus the parent's entries still inside the grace
 	// window. The clock is the generation's own CreatedUnixNano, not
 	// time.Now(), so a superblock stays a pure function of its inputs.
-	// Grace is the window this superblock itself states, which is what
-	// retention floors its own window at.
+	// Grace is the window this superblock itself states — which, since the
+	// window became a per-volume parameter, is the parent's recorded value
+	// and not a constant. Everything that ages a row against it reads it
+	// from the document (superblock.Params.Grace), so a volume created with
+	// `--grace 12h` ages its ledgers at twelve hours from the first seal.
 	now := time.Unix(0, p.o.CreatedUnixNano)
-	grace := time.Duration(sb.Params.TGraceSeconds) * time.Second
+	grace := sb.Params.Grace()
 	sb.CondemnedIndexes = condemnLedger(p.prevCondemnedIndexes(), p.droppedIndexes, packIndexes, now, grace, "index")
 	sb.CondemnedManifests = condemnLedger(p.prevCondemnedManifests(), p.droppedManifests, manifests, now, grace, "manifest")
 	// And the pack ledger, which a seal only ever CARRIES — repack is its
@@ -1533,6 +1563,41 @@ func (p *pipeline) buildSuperblock(packList []superblock.PackEntry, shards []sup
 	// checking it would refuse seals that are perfectly sound. See
 	// superblock.CheckSize.
 	return sb, raw, nil
+}
+
+// graceSeconds is the window this generation records, and the order of the
+// three sources is the whole rule.
+//
+// AN EXPLICIT OPTION WINS, which in practice means `pelfs init --grace`:
+// the window is chosen when the volume is created, by the person who knows
+// how long their readers hold a generation.
+//
+// OTHERWISE THE PARENT'S VALUE IS CARRIED, and this is the half that makes
+// the knob real rather than decorative. A seal that re-stated a build-time
+// constant would silently move the window on every checkpoint — a volume
+// created at 12h would be back at 72h one seal later, its ledgers would age
+// against a window its own gc did not use, and the parameter would exist
+// only in generation 0. Carrying it also means the value survives an
+// upgrade that changes the default.
+//
+// THE DEFAULT IS THE LAST RESORT, for generation 0 of a volume whose
+// creator said nothing, and for a parent that recorded nothing at all
+// (which no writer has ever produced, but a zero is a zero).
+//
+// The FLOOR is enforced in applyDefaults, not here: this runs deep inside a
+// publish that has already uploaded packs, and refusing there would refuse
+// after the expensive part. A carried-forward value is not re-checked
+// against the floor — it is what the volume already agreed on, and a writer
+// that lowered someone's recorded window to satisfy a newer floor would be
+// changing policy behind them.
+func (p *pipeline) graceSeconds() int64 {
+	if p.o.Grace > 0 {
+		return int64(p.o.Grace / time.Second)
+	}
+	if p.o.Prev != nil && p.o.Prev.Params.TGraceSeconds > 0 {
+		return p.o.Prev.Params.TGraceSeconds
+	}
+	return int64(DefaultGrace / time.Second)
 }
 
 // rootCatalogHint is where a reader should LOOK for the root catalog

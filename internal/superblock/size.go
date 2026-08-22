@@ -71,6 +71,14 @@ const (
 	// COUNT at half the ref ledger's row COST. In rows, this share is ~927
 	// pack rows or ~517 hash-named rows.
 	//
+	// WHAT FILLS IT is checkpoint-rate times the window the volume RECORDS
+	// (Params.TGraceSeconds, chosen at `pelfs init --grace`), so this share
+	// is what a user's choice of window runs into: past those ~517 rows the
+	// cap binds before the window does, and the volume behaves as though
+	// its window were 517 checkpoints long. That is pacing rather than loss
+	// — condemn.go argues the whole of it, and LedgerWindow computes it —
+	// but it is why a large `--grace` buys less than it looks like it buys.
+	//
 	// THE SUM, which is the thing to re-check whenever a share moves:
 	//
 	//	catalogs (droppable)         256 KiB

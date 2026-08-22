@@ -354,8 +354,9 @@ It raises a question that turns out to be already answered: a pack
 uploaded mid-session is in no generation's pack list until the next ref
 flip, so what stops a concurrent GC from deleting it? The age guard.
 Pack names embed their creation time (`p-<unixnano hex>-<rand>`), and
-retention skips anything younger than `Params.TGraceSeconds`, 72 hours by
-default. The window between uploading a pack and referencing it is
+retention skips anything younger than `Params.TGraceSeconds` — the
+window the volume recorded at `pelfs init --grace`, 72 hours by default and
+never under an hour. The window between uploading a pack and referencing it is
 minutes. The guard was built for coordination-free safety among writers
 and it covers this case by three orders of magnitude — but **no test
 pins it**, and until one does it is a coincidence rather than a

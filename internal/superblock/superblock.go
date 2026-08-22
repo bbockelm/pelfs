@@ -23,6 +23,7 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/fxamacker/cbor/v2"
 	"lukechampine.com/blake3"
@@ -254,6 +255,42 @@ type Params struct {
 	InlineMax     int64  `cbor:"inline_max"`
 	TGraceSeconds int64  `cbor:"t_grace_seconds"`
 	RetainK       uint32 `cbor:"retain_k"`
+}
+
+// The grace window, T_grace, is a per-volume PARAMETER and not a constant.
+// It is recorded in TGraceSeconds, and everything that ages an object
+// against it — retention's two guards, repack's planner, the three
+// condemned ledgers — reads it from the document. These two bound what a
+// writer may record.
+//
+// DefaultTGrace is what a volume gets when nobody says otherwise, and what
+// a reader assumes for a document that states nothing. Every v0.1.0
+// superblock stated 72h, so a volume from before the knob existed keeps
+// exactly the window it already had.
+//
+// MinTGrace is a FOOTGUN FLOOR, and it is the part of this that is not a
+// matter of taste. The window is what makes the sweep safe to run against
+// live writers with no coordination: a pack younger than it may be one a
+// concurrent writer is about to reference from a generation the sweep never
+// saw, and a hash-named object younger than it may be one publish has
+// uploaded but not yet flipped a ref to name. At zero both of those become
+// "delete it", so `--grace 0` would be a volume whose next sweep can race a
+// live writer into data loss. An hour is far more than either of those
+// windows needs — they are one publish long — and far less than any
+// workflow's pin, so refusing below it costs nothing real.
+const (
+	DefaultTGrace = 72 * time.Hour
+	MinTGrace     = time.Hour
+)
+
+// Grace is the window this generation records, or DefaultTGrace when it
+// records none. Every reader of the window comes through here, so that
+// "what does this document say" has exactly one answer.
+func (p Params) Grace() time.Duration {
+	if p.TGraceSeconds <= 0 {
+		return DefaultTGrace
+	}
+	return time.Duration(p.TGraceSeconds) * time.Second
 }
 
 // Superblock is one generation of a volume. All fields participate in the

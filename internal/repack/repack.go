@@ -414,15 +414,25 @@ func build(ctx context.Context, o Options, s swept) *Plan {
 }
 
 // graceWindow mirrors retention's: the widest window any live generation
-// states, floored at the default, and Options may only widen it further.
-// The two must agree — a planner proposing to condemn a pack the GC would
-// refuse to delete plans work that reclaims nothing.
+// RECORDS, the format's default when none records one, and Options may
+// only widen it further. The two must agree — a planner proposing to
+// condemn a pack the GC would refuse to delete plans work that reclaims
+// nothing, and a planner using a wider window than the sweep would condemn
+// packs the sweep then deletes early.
+//
+// The default is not a floor, which is what changed when T_grace became a
+// per-volume parameter: a volume created with `--grace 12h` plans against
+// twelve hours, exactly as its sweep does.
 func graceWindow(o Options) time.Duration {
-	grace := retention.DefaultGrace
+	var stated time.Duration
 	for _, sb := range o.Live {
-		if g := time.Duration(sb.Params.TGraceSeconds) * time.Second; g > grace {
-			grace = g
+		if g := sb.Params.Grace(); g > stated {
+			stated = g
 		}
+	}
+	grace := retention.DefaultGrace
+	if stated > 0 {
+		grace = stated
 	}
 	if o.Grace > grace {
 		grace = o.Grace

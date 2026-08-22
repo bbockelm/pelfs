@@ -44,7 +44,12 @@ func cmdShell(args []string) int {
 	case volumeLegacy:
 		return exitErr(legacyVolumeError(prefix))
 	case volumeEmpty:
-		if err := initVolumeAt(o, prefix, branch, signingKey); err != nil {
+		// The default grace window, deliberately: this path creates a volume
+		// as a side effect of being asked to mount one, and a `--grace` here
+		// would be a flag that silently does nothing on every prefix that
+		// already holds a volume. Choosing the window is `pelfs init`'s job,
+		// which is the command whose whole purpose is creation.
+		if err := initVolumeAt(o, prefix, branch, signingKey, 0); err != nil {
 			return exitErr(fmt.Errorf("create volume: %w", err))
 		}
 	}

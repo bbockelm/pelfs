@@ -80,16 +80,24 @@ import (
 	"github.com/bbockelm/pelfs/internal/superblock"
 )
 
-// DefaultGrace is the T_grace fallback when no superblock states one.
-const DefaultGrace = 72 * time.Hour
+// DefaultGrace is the T_grace fallback when no superblock states one. It
+// is the format's default (superblock.DefaultTGrace) and NOT a floor: the
+// window is a per-volume parameter, and a volume that recorded a shorter
+// one is swept at the window it recorded (retainedSet).
+const DefaultGrace = superblock.DefaultTGrace
 
 // Options configures GC.
 type Options struct {
 	Inner pelicanobj.Store // raw transport (listings, deletes)
 	Refs  *refs.Store      // verified superblock access
 	// Grace overrides the grace window; zero derives it from the largest
-	// Params.TGraceSeconds across verified superblocks (DefaultGrace floor
-	// — the window may only ever widen, never narrow, from options).
+	// Params.TGraceSeconds across verified superblocks — the window may
+	// only ever widen, never narrow, from options.
+	//
+	// DefaultGrace is what an unstated window means, not a floor under a
+	// stated one: T_grace is a per-volume parameter (`pelfs init --grace`),
+	// so a volume that recorded twelve hours is swept at twelve hours and a
+	// reader who wants longer passes it here.
 	Grace time.Duration
 	// RetainK overrides how many generations of each branch stay in the
 	// root set; zero takes each branch's own head's Params.RetainK. Unlike
@@ -137,6 +145,13 @@ type Report struct {
 	// actually establish (lastk.go). A short window is the one outcome a
 	// successful-looking report would otherwise hide.
 	Windows []LastKReport
+
+	// Grace is the age guard this sweep actually applied: the widest window
+	// any root RECORDS (Params.TGraceSeconds), or Options.Grace when that
+	// is wider. Reported because the window is a per-volume parameter now,
+	// so "too young" is only meaningful beside the number it was young
+	// against.
+	Grace time.Duration
 }
 
 // candidate is one object the sweep may delete.
@@ -176,6 +191,7 @@ func GC(ctx context.Context, o Options) (*Report, error) {
 	if o.Grace > grace {
 		grace = o.Grace
 	}
+	rep.Grace = grace
 	rep.RetainedPacks = len(live.packs)
 	rep.Indexes.Retained = len(live.indexes)
 	rep.Manifests.Retained = len(live.manifests)
@@ -378,7 +394,16 @@ func retainedSet(ctx context.Context, o Options, rep *Report, win *windowCache) 
 		indexes:   make(map[string]struct{}),
 		manifests: make(map[string]struct{}),
 	}
-	grace := DefaultGrace
+	// The window comes from the DOCUMENTS, and DefaultGrace is only what an
+	// unstated one means rather than a floor under a stated one. Started at
+	// zero so a volume that recorded a SHORTER window than the default is
+	// swept at the window it recorded, which is the whole point of the
+	// parameter; the widest across every root is what the object-age guards
+	// then use, so one branch or tag written under a longer window keeps
+	// its objects for as long as it was promised. Narrowing a volume's
+	// window therefore takes effect as the documents written under the old
+	// one leave the root set — slow, in the safe direction.
+	var stated time.Duration
 
 	// absorb unions one generation's objects into the live set.
 	//
@@ -425,11 +450,18 @@ func retainedSet(ctx context.Context, o Options, rep *Report, win *windowCache) 
 		for _, mf := range sb.Manifests {
 			live.manifests[mf.Name] = struct{}{}
 		}
-		if g := time.Duration(sb.Params.TGraceSeconds) * time.Second; g > grace {
-			grace = g
+		// The window THIS generation records, which is the window its own
+		// ledger rows were promised. Asked per document rather than taken
+		// from a volume-wide maximum, so the answer for a row cannot depend
+		// on which root the sweep happened to absorb first — a real
+		// difference on a volume whose branches were written under different
+		// windows, and the reason this is not simply `stated`.
+		graceHere := sb.Params.Grace()
+		if graceHere > stated {
+			stated = graceHere
 		}
 		inWindow := func(condemnedAtUnix int64) bool {
-			if o.Now.Sub(time.Unix(condemnedAtUnix, 0)) < grace {
+			if o.Now.Sub(time.Unix(condemnedAtUnix, 0)) < graceHere {
 				return true
 			}
 			return sinceUnixNano != 0 && condemnedAtUnix >= sinceUnixNano/int64(time.Second)
@@ -544,7 +576,13 @@ func retainedSet(ctx context.Context, o Options, rep *Report, win *windowCache) 
 	if rep.Branches+rep.Tags == 0 {
 		return nil, 0, fmt.Errorf("gc aborted: no refs or tags found (a v2 volume always has at least one branch; refusing to treat every pack as garbage)")
 	}
-	return live, grace, nil
+	// The age guards run at the widest window any root RECORDS. Nothing
+	// recorded means the format's default, which is what every document
+	// written before the window was a parameter states anyway.
+	if stated > 0 {
+		return live, stated, nil
+	}
+	return live, DefaultGrace, nil
 }
 
 // listDir lists a key-space directory, treating an absent one as empty:

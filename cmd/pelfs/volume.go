@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/bbockelm/pelfs/internal/entrycodec"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
@@ -146,26 +147,103 @@ func signingKeyFileIn(stateDir, override string) string {
 
 // cmdInit creates a brand-new volume: generation 0 with an empty root.
 func cmdInit(args []string) int {
-	var branch, signingKey string
+	var branch, signingKey, grace string
 	o, pos, err := parseArgs("init", args, 1, 1, func(fs *flag.FlagSet, o *cmdOpts) {
 		fs.StringVar(&branch, "branch", "main", "ref name to create")
 		fs.StringVar(&signingKey, "signing-key", "", signingKeyUsage)
+		fs.StringVar(&grace, "grace", "", graceUsage)
 	})
 	if err != nil {
 		return exitErr(err)
 	}
-	if err := initVolumeAt(o, pos[0], branch, signingKey); err != nil {
+	window, err := parseGrace(grace)
+	if err != nil {
+		return exitErr(err)
+	}
+	if window > 0 {
+		gracePacingNotice(window, o.snapshotInterval)
+	}
+	if err := initVolumeAt(o, pos[0], branch, signingKey, window); err != nil {
 		return exitErr(err)
 	}
 	fmt.Printf("  mount it:    pelfs shell %s\n", pos[0])
 	return 0
 }
 
+// graceUsage is the one description of `pelfs init --grace`.
+//
+// It says what the window IS rather than what it is set to, because the
+// number only means something against the two things it protects: how long
+// an object nothing names any more survives, and therefore how long a
+// reader may hold a generation the branch has moved past.
+const graceUsage = "the volume's GC grace window, recorded in the superblock and used by every " +
+	"later seal, repack and gc (default 72h, floor 1h). It is how long an object nothing " +
+	"references survives, and so how long a reader may go on using a generation the branch has " +
+	"moved past. Set once at creation: seals carry the recorded value forward"
+
+// parseGrace turns the flag into a window, refusing the footgun BEFORE a
+// volume exists rather than inside a publish that has already uploaded.
+func parseGrace(s string) (time.Duration, error) {
+	if s == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("--grace: %w", err)
+	}
+	if d < publish.MinGrace {
+		return 0, fmt.Errorf("--grace %s is under the %s floor: the grace window is what makes a sweep "+
+			"safe to run beside a live writer with no coordination, so a shorter one lets `pelfs gc` "+
+			"delete a pack a concurrent seal is about to reference", d, publish.MinGrace)
+	}
+	return d, nil
+}
+
+// gracePacingNotice says out loud what a large window costs, at the moment
+// the number is chosen.
+//
+// THE INTERACTION IT REPORTS. The condemned ledgers are what keep an object
+// alive for the window once no enumerable generation names it, and they are
+// capped in BYTES (superblock.CondemnedBudgetBytes) because they share the
+// superblock's write budget. They grow at one row per checkpoint per key
+// space, so the rows a window asks for are grace/checkpoint-interval — and
+// past about 517 hash-named rows the CAP BINDS BEFORE THE WINDOW DOES. The
+// volume then behaves as though its window were 517 checkpoints long, and a
+// repack paces its plan to the room the ledger has instead of condemning
+// everything it found (repack.trimToLedger).
+//
+// That is safe — every enumerable root names its own objects directly, so
+// nothing a sweep can walk is at risk, and pacing only delays reclamation —
+// but it is the difference between what an operator asked for and what
+// retired generations get, and finding it out from a ledger months later is
+// strictly worse than being told here.
+func gracePacingNotice(grace, interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	rows, capacity := superblock.LedgerWindow(grace, interval)
+	if capacity <= 0 || rows <= capacity {
+		return
+	}
+	ui.Warn("--grace {grace} at a {interval} checkpoint interval asks the condemned ledgers for about "+
+		"{rows} rows and their share of the superblock carries about {capacity}: the byte cap binds "+
+		"first, so objects only a RETIRED generation names keep about {effective} rather than {grace}, "+
+		"and repacks are paced to the room the ledger has. Nothing a branch head or tag names is "+
+		"affected. Fewer checkpoints (--snapshot-interval) buys window; a tag pins a generation for "+
+		"as long as the tag exists",
+		"grace", grace, "interval", interval, "rows", rows, "capacity", capacity,
+		"effective", (time.Duration(capacity) * interval).Round(time.Minute))
+}
+
 // initVolumeAt creates a brand-new volume: generation 0 with an empty
 // root, its volume id and signing key minted locally. It is what
 // `pelfs init` runs, and what `pelfs shell` runs when it is pointed at an
 // empty prefix.
-func initVolumeAt(o *cmdOpts, prefix, branch, signingKeyPath string) error {
+//
+// grace is the volume's T_grace, zero meaning the format's default. It can
+// only be set HERE, because generation 0 is the only generation that
+// chooses it: every seal after this carries the recorded value forward.
+func initVolumeAt(o *cmdOpts, prefix, branch, signingKeyPath string, grace time.Duration) error {
 	ctx := context.Background()
 	stateDir := o.stateDir
 	if stateDir == "" {
@@ -209,6 +287,7 @@ func initVolumeAt(o *cmdOpts, prefix, branch, signingKeyPath string) error {
 		Branch:     branch,
 		SigningKey: signingKey,
 		VolumeID:   volID,
+		Grace:      grace,
 	}
 	if o.encryptKeyPath != "" {
 		pem, err := os.ReadFile(o.encryptKeyPath)
@@ -222,8 +301,16 @@ func initVolumeAt(o *cmdOpts, prefix, branch, signingKeyPath string) error {
 	if _, err := publish.InitVolume(ctx, popts); err != nil {
 		return err
 	}
-	ui.Info("created volume {volume} on {ref} (generation 0)",
-		"volume", fmt.Sprintf("%x", volID), "ref", refs.RefDirKey+"/"+branch)
+	// The window is worth reporting even when it is the default: it is
+	// recorded on generation 0 and every later seal carries it, so this is
+	// the one moment it is decided and the only place a user sees the
+	// number they will be living with.
+	window := publish.DefaultGrace
+	if grace > 0 {
+		window = grace
+	}
+	ui.Info("created volume {volume} on {ref} (generation 0, grace window {grace})",
+		"volume", fmt.Sprintf("%x", volID), "ref", refs.RefDirKey+"/"+branch, "grace", window)
 	return nil
 }
 

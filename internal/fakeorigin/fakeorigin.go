@@ -60,12 +60,34 @@ func (o *origin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		tmp := p + ".upload"
-		f, err := os.Create(tmp)
+		// A PRIVATE staging name PER REQUEST, and this is not a detail.
+		//
+		// It used to be the fixed `p + ".upload"`, shared by every PUT of the
+		// same key, which made two concurrent PUTs corrupt each other in ways
+		// no origin does: both os.Create the same path, so they write into one
+		// inode at their own offsets; whichever renames first takes that inode
+		// (the other request is still writing into it, now visible AS THE
+		// OBJECT), and the loser's rename finds nothing and answers 500.
+		//
+		// Every test that races two writers on one key — which is how this
+		// repo tests detection, since there is no compare-and-swap to test
+		// instead — was therefore exposed to a spurious 500 and to an object
+		// holding a body its writer was told had failed. That is what made
+		// TestRenewalDetectsConflict fail on two platforms in a row: the 500 it
+		// produced was the trigger the lease's ETag bookkeeping could not
+		// survive. Real concurrent PUTs are last-writer-wins, and now so are
+		// these.
+		//
+		// The suffix is ".tmp" because every listing in pelfs that sweeps a
+		// key space skips that suffix (refs.ValidateName documents the rule),
+		// so an upload in flight cannot show up as a stray object in a
+		// PROPFIND — as ".upload" could.
+		f, err := os.CreateTemp(filepath.Dir(p), filepath.Base(p)+".*.tmp")
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		tmp := f.Name()
 		if _, err := f.ReadFrom(r.Body); err != nil {
 			f.Close()
 			os.Remove(tmp)

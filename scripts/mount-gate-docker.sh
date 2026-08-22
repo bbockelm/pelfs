@@ -17,6 +17,15 @@ ARCH="${PELFS_DOCKER_ARCH:-$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')}
 BENCH="${1:-}"
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
+# The gate drops CAP_DAC_OVERRIDE (the permission checks it now asserts are
+# unfalsifiable while root can bypass mode bits), so root inside the
+# container is an ORDINARY reader of this directory: mktemp -d makes it
+# 0700 owned by the invoking user, and root cannot traverse that without
+# the capability. A macOS host hides this — Docker Desktop's file sharing
+# virtualizes ownership on the bind mount — so it fails only on a Linux
+# host, i.e. only in CI. hostile-docker.sh, which drops the same
+# capability, has always chmod'd its stage for this reason.
+chmod 755 "$STAGE"
 
 command -v docker >/dev/null || { echo "docker is required" >&2; exit 1; }
 
@@ -38,6 +47,9 @@ echo "== cross-compiling for linux/$ARCH =="
 (cd "$REPO" && CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" go build -o "$STAGE/pelfs" ./cmd/pelfs)
 (cd "$REPO" && CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" go build -o "$STAGE/fakeorigin" ./cmd/fakeorigin)
 cp "$REPO/scripts/mount-gate-test.sh" "$STAGE/test.sh"
+# Same reason as the chmod on $STAGE: an ordinary reader must be able to
+# read what it is asked to run, whatever umask the host builds with.
+chmod -R a+rX "$STAGE"
 
 echo "== running the mount gate on a real Linux kernel =="
 # CAP_DAC_OVERRIDE is DROPPED, and permission_gate is why. The container

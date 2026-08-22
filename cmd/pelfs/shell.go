@@ -8,8 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"path"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -202,7 +200,10 @@ const (
 // volume kept its metadata in. It is still probed so such a volume is
 // recognized and reported instead of being mistaken for an empty prefix
 // and overwritten with a new one.
-var legacyMetaDir = path.Dir(lease.Key)
+//
+// It is also where the write leases live, which is why the sweep below
+// asks lease.IsLeaseObject rather than comparing against one name.
+const legacyMetaDir = lease.Dir
 
 // legacyVolumeError explains a prefix this pelfs cannot serve. Refusing is
 // the whole point: the alternative — treating unrecognized metadata as an
@@ -244,11 +245,18 @@ func classifyVolume(o *cmdOpts, prefix, branch string) (volumeKind, error) {
 		}
 		return volumeLegacy, err
 	}
-	// meta/ alone is not proof: the advisory lease lives at
-	// meta/lease.json, so a writable mount of a current volume creates that
-	// directory too. Anything else under it is a snapshot session directory.
+	// meta/ alone is not proof: the write leases live there
+	// (meta/lease-<branch>.json, and meta/lease.json from v0.1.0), so a
+	// writable mount of a current volume creates that directory too.
+	// Anything else under it is a snapshot session directory.
+	//
+	// GETTING THIS WRONG INITIALIZES A NEW VOLUME OVER SOMEBODY'S DATA in
+	// one direction and refuses a perfectly good prefix in the other, so
+	// the rule lives in the lease package beside the naming it must track.
+	// It used to compare against one filename, which the per-branch key
+	// would have turned into "every writable mount looks retired".
 	for _, e := range entries {
-		if e.Name == filepath.Base(lease.Key) {
+		if lease.IsLeaseObject(e.Name) {
 			continue
 		}
 		return volumeLegacy, nil

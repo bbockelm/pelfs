@@ -131,16 +131,20 @@ type cmdOpts struct {
 	encryptKeyPath   string
 	noLease          bool
 	stealLease       bool
-	noAcquireToken   bool
-	insecure         bool
-	debug            bool
-	backend          string
-	shellPath        string
-	gcDelete         bool
-	prefetch         string
-	statsFile        string
-	cacheSize        string
-	noAutoRepack     bool
+	// ignoreVolumeLease is about the v0.1.0 whole-volume lease object and
+	// nothing else; see registerFlags for why it is not folded into
+	// stealLease.
+	ignoreVolumeLease bool
+	noAcquireToken    bool
+	insecure          bool
+	debug             bool
+	backend           string
+	shellPath         string
+	gcDelete          bool
+	prefetch          string
+	statsFile         string
+	cacheSize         string
+	noAutoRepack      bool
 }
 
 func registerFlags(fs *flag.FlagSet, o *cmdOpts) {
@@ -149,8 +153,16 @@ func registerFlags(fs *flag.FlagSet, o *cmdOpts) {
 	fs.DurationVar(&o.snapshotInterval, "snapshot-interval", 5*time.Minute, "how often a writable mount checkpoints its overlay into a new generation (0 seals only at unmount)")
 	fs.StringVar(&o.encryptKeyPath, "encrypt-key", "", "PEM private key wrapping the volume's data keys (required again on every later mount)")
 	fs.BoolVar(&o.readOnly, "ro", false, "mount read-only: no overlay, no seal")
-	fs.BoolVar(&o.noLease, "no-lease", false, "do not take or check the advisory mount lease (concurrent writers will NOT be detected)")
-	fs.BoolVar(&o.stealLease, "steal-lease", false, "take over a live lease held by another client (use only when that client is known dead)")
+	fs.BoolVar(&o.noLease, "no-lease", false, "do not take or check the advisory write lease (concurrent writers will NOT be detected)")
+	fs.BoolVar(&o.stealLease, "steal-lease", false, "take over a live lease on THIS BRANCH held by another client (use only when that client is known dead)")
+	// Two flags rather than one, because the two objects have different
+	// blast radii. --steal-lease is about the branch in front of you.
+	// meta/lease.json is a pelfs v0.1.0 client that locks the WHOLE volume
+	// and whose record does not say which branch it is writing, so
+	// proceeding past it is a bet about a client you cannot see, and it
+	// should have to be typed out. It ignores rather than steals: this
+	// release never writes that object (internal/lease, package comment).
+	fs.BoolVar(&o.ignoreVolumeLease, "ignore-volume-lease", false, "proceed past a live meta/lease.json left by a pelfs v0.1.0 client, which locks the whole volume and does not say which branch it writes")
 	fs.BoolVar(&o.noAcquireToken, "no-acquire-token", false, "never run interactive token-acquisition flows; rely on discovered tokens only")
 	fs.BoolVar(&o.insecure, "insecure", false, "skip TLS verification (test federations only)")
 	// --debug opens a channel, so it is wired where it is defined rather

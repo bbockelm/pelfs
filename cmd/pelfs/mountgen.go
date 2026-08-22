@@ -810,13 +810,19 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	return code
 }
 
-// acquireLease takes the advisory mount lease for a writable session.
+// acquireLease takes the advisory write lease for a writable session.
+//
+// THE LEASE IS THE BRANCH's, not the volume's. g.branch is the only ref
+// this session can move, so it is the only thing it needs to hold, and a
+// writable mount is never a tag (runMountGen refuses that a few lines
+// below the call). A second writable mount of the same volume on a
+// different branch now runs alongside this one instead of being refused.
 //
 // The lease is read and written through a DIRECT-READ store: it is a
 // mutable object, and a federation cache serving a stale copy would either
 // hide a live holder or resurrect a dead one. It never goes through the
 // statistics wrapper's sibling encryption layers either — a client with
-// the wrong volume key must still see that the prefix is busy.
+// the wrong volume key must still see that the branch is busy.
 func (g *genSession) acquireLease(ctx context.Context, o *cmdOpts, prefix string) (*lease.Lease, error) {
 	metaStore, err := pelicanobj.New(ctx, pelicanobj.Config{
 		PrefixURL:    prefix,
@@ -829,22 +835,30 @@ func (g *genSession) acquireLease(ctx context.Context, o *cmdOpts, prefix string
 		return nil, err
 	}
 	l, err := lease.Acquire(ctx, lease.Options{
-		Store:   metaStore,
-		Session: g.sessionID,
-		Steal:   o.stealLease,
+		Store:             metaStore,
+		Session:           g.sessionID,
+		Branch:            g.branch,
+		Steal:             o.stealLease,
+		IgnoreVolumeLease: o.ignoreVolumeLease,
 		OnConflict: func(holder *lease.Info) {
 			g.stats.Update(func(sum *stats.Summary) { sum.LeaseConflictObserved = true })
-			ui.Warn("another client took over this prefix: {holder}\n"+
-				"concurrent writers WILL corrupt each other; stop one of them.\n"+
+			// "this branch", not "this prefix": another writer on another
+			// branch is now ordinary, and only a writer on OURS is the
+			// emergency this warning is for.
+			ui.Warn("another client took over branch {branch}: {holder}\n"+
+				"concurrent writers on one branch WILL corrupt each other; stop one of them.\n"+
 				"this session keeps running but no longer renews the lease;\n"+
 				"the seal at unmount will be REFUSED if that client advanced the branch.",
-				"holder", holder.Describe())
+				"branch", g.branch, "holder", holder.Describe())
 		},
 	})
 	if err != nil {
 		return nil, err
 	}
-	g.stats.Update(func(sum *stats.Summary) { sum.LeaseHeld = true })
+	g.stats.Update(func(sum *stats.Summary) {
+		sum.LeaseHeld = true
+		sum.LeaseKey = l.Key()
+	})
 	return l, nil
 }
 
@@ -2018,6 +2032,10 @@ func (g *genSession) controlHooks() control.Hooks {
 			}
 			if g.lease != nil {
 				st["lease_held"] = true
+				// Which object, for the same reason `pelfs status` says
+				// it: the lease is one branch's, so "held" alone no longer
+				// describes what is excluded.
+				st["lease_key"] = g.lease.Key()
 				st["lease_conflict"] = g.lease.Conflicted()
 			}
 			return st
@@ -2077,7 +2095,7 @@ func (g *genSession) publishMountRecord() func() {
 			"prefix", g.prefix, "pid", info.PID, "statedir", g.stateDir)
 		return noop
 	}
-	data, err := json.MarshalIndent(&mountInfo{
+	rec := &mountInfo{
 		PID:        os.Getpid(),
 		Prefix:     g.prefix,
 		MountPoint: g.mountpoint,
@@ -2085,7 +2103,14 @@ func (g *genSession) publishMountRecord() func() {
 		StateDir:   g.stateDir,
 		ReadOnly:   !g.rw,
 		Started:    g.started,
-	}, "", "  ")
+	}
+	if g.rw {
+		rec.Branch = g.branch
+		if g.lease != nil {
+			rec.LeaseKey = g.lease.Key()
+		}
+	}
+	data, err := json.MarshalIndent(rec, "", "  ")
 	if err != nil {
 		return noop
 	}

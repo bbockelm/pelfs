@@ -479,10 +479,13 @@ grep -q "created volume" "$WORK/fresh.log" || { echo "shell did not CREATE a vol
 grep -q "catalog-native" "$WORK/fresh.log" || { echo "new volume was not served natively:" >&2; sed 's/^/    /' "$WORK/fresh.log" | tail -8; exit 1; }
 # The federation must hold refs + packs and nothing else of substance.
 [ -f "$WORK/origin2/fresh/refs/main" ] || { echo "no ref created" >&2; ls -R "$WORK/origin2" | head; exit 1; }
-# meta/ may exist for the advisory lease (meta/lease.json); nothing else
-# belongs under it.
+# meta/ may exist for the advisory write leases (meta/lease-<branch>.json,
+# one per branch, plus v0.1.0's meta/lease.json on an old volume); nothing
+# else belongs under it. A stray object here is not untidiness — it is what
+# `pelfs shell` reads as a retired block-and-snapshot volume, and it makes
+# the prefix refuse to mount.
 if [ -d "$WORK/origin2/fresh/meta" ]; then
-  extra=$(ls -A "$WORK/origin2/fresh/meta" | grep -v '^lease.json$' || true)
+  extra=$(ls -A "$WORK/origin2/fresh/meta" | grep -Ev '^lease(-.*)?\.json$' || true)
   [ -z "$extra" ] || { echo "unexpected metadata objects appeared: $extra" >&2; exit 1; }
 fi
 "$WORK/pelfs" mount-gen --state-dir "$WORK/state-fresh2" "$NEWPREFIX" "$WORK/mnt2" &

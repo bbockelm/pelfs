@@ -30,8 +30,19 @@ type mountInfo struct {
 	// live. It is NOT always the directory holding this record: a mount
 	// started with --state-dir puts state elsewhere, and `pelfs ctl`
 	// must follow the session, not the record.
-	StateDir string    `json:"state_dir,omitempty"`
-	ReadOnly bool      `json:"read_only,omitempty"`
+	StateDir string `json:"state_dir,omitempty"`
+	ReadOnly bool   `json:"read_only,omitempty"`
+	// Branch is what a writable mount will seal onto, and LeaseKey is the
+	// lease object it holds while doing so (meta/lease-<branch>.json).
+	// Both empty for a read-only mount; LeaseKey alone empty under
+	// --no-lease.
+	//
+	// They are in the record, and printed by `pelfs status`, because the
+	// exclusion is per-branch now: "there is a writable mount on this
+	// prefix" no longer answers "will MY writable mount be refused", and
+	// the branch does.
+	Branch   string    `json:"branch,omitempty"`
+	LeaseKey string    `json:"lease_key,omitempty"`
 	Started  time.Time `json:"started"`
 }
 
@@ -249,9 +260,22 @@ func cmdStatus(args []string) int {
 		if e.info.ReadOnly {
 			mode = "ro"
 		}
+		if e.info.Branch != "" {
+			mode += " on " + e.info.Branch
+		}
 		fmt.Printf("%s\n  mountpoint: %s (%s)\n  pid: %d (%s), up since %s\n",
 			e.info.Prefix, e.info.MountPoint, mode, e.info.PID, state,
 			e.info.Started.Format(time.RFC3339))
+		// Which OBJECT, not just "yes": a reader deciding whether their
+		// own writable mount will be refused needs the key, since two
+		// writable mounts of one volume on different branches are now
+		// ordinary rather than a conflict. A writable mount with no line
+		// here took --no-lease and is detecting nothing.
+		if e.info.LeaseKey != "" {
+			fmt.Printf("  lease: %s\n", e.info.LeaseKey)
+		} else if !e.info.ReadOnly {
+			fmt.Printf("  lease: none (--no-lease)\n")
+		}
 	}
 	return 0
 }

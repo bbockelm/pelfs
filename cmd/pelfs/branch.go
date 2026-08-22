@@ -41,12 +41,19 @@ import (
 // publish and silently reparent their work. Moving a branch is what
 // publishing does, and it goes through the CAS guard.
 //
-// THE SHARED LEASE, stated here because a user meets it here first: the
-// advisory mount lease is one object for the whole volume (meta/lease.json,
-// internal/lease), so two writable mounts on DIFFERENT branches still
-// exclude each other. That is a v0.1.0 limit, not a design position; the
-// refusal names the holder, and it is written down in the README and in
-// docs/design-packfs.md.
+// THE WRITE LEASE IS PER BRANCH, stated here because a user meets the
+// question here first: the advisory lease is meta/lease-<branch>.json
+// (internal/lease), so two writable mounts on DIFFERENT branches of one
+// volume run concurrently and only a second writer on the SAME branch is
+// refused. v0.1.0 had one object for the whole volume and excluded both;
+// that was a limit, not a design position, and it is gone.
+//
+// The exception is a v0.1.0 CLIENT still on the federation. It holds
+// meta/lease.json, which says nothing about which branch it is writing, so
+// it excludes every branch — and it cannot see a v0.2 writer at all. The
+// mixed-version rule is in the internal/lease package comment and in the
+// README; the seal's refusal to publish over a moved ref is what actually
+// keeps that case safe, as it always was.
 func cmdBranch(args []string) int {
 	var from, fromTag, pubkeyHex string
 	var list, rm bool
@@ -129,12 +136,14 @@ func createBranch(ctx context.Context, o *cmdOpts, prefix, name, from, fromTag, 
 	ui.Info("created branch {branch} at generation {generation} of {source}; "+
 		"`pelfs mount --branch {branch} --rw` publishes onto it, and it advances independently of {source}",
 		"branch", name, "generation", sb.Generation, "source", source)
-	// Said once, at the moment a user first has two branches to be
-	// surprised by. The lease is volume-wide (internal/lease), so this is
-	// not a warning about a race — it is the shape of the tool.
-	ui.Warn("branches share ONE write lease in this release: a writable mount of {branch} and a writable "+
-		"mount of another branch of the same volume will refuse each other, naming the holder",
-		"branch", name)
+	// It used to warn here that the two branches shared one lease. They no
+	// longer do, and the replacement is INFORMATION rather than a warning:
+	// a user who has just been handed a second branch should be told what
+	// concurrency it buys, in the same breath, rather than discovering it
+	// by trying.
+	ui.Info("the write lease is per branch ({key}), so a writable mount of {branch} runs alongside a writable "+
+		"mount of {source} — only a second writer on the SAME branch is refused",
+		"key", leaseKeyFor(name), "branch", name, "source", source)
 	return nil
 }
 

@@ -73,12 +73,14 @@ scopes up front.
   (WLCG discovery plus, unless `--no-acquire-token`, interactive
   acquisition).
 - **Concurrent-writer detection**: every writable session holds an advisory
-  lease at `<prefix>/meta/lease.json`, renewed every 30s (2 min TTL). A
-  second `pelfs` pointed at the same prefix refuses to mount while the
-  lease is live, naming the holder; `--steal-lease` overrides it, read-only
-  mounts skip it, and a crashed client's lease simply expires. If another
-  client takes the lease over mid-session, pelfs warns loudly and the seal
-  at unmount is refused if that client advanced the branch. The ref and the
+  lease at `<prefix>/meta/lease-<branch>.json`, renewed every 30s (2 min
+  TTL). A second `pelfs` writing the SAME branch refuses to mount while the
+  lease is live, naming the holder; a writable mount of a DIFFERENT branch
+  of the same volume runs alongside it, since the two can never touch the
+  same ref. `--steal-lease` overrides it, read-only mounts skip it, and a
+  crashed client's lease simply expires. If another client takes the lease
+  over mid-session, pelfs warns loudly and the seal at unmount is refused
+  if that client advanced the branch. The ref and the
   lease are always read bypassing federation caches (`?directread`) —
   mutable objects must never be served stale, while immutable packs keep
   enjoying cache-served reads.
@@ -233,15 +235,33 @@ a count of bytes, a duration a count of nanoseconds).
 
 ## Caveats (prototype)
 
-- **Single writer, and that is per VOLUME rather than per branch.** The
-  advisory lease is detection, not mutual exclusion: the transport has no
-  compare-and-swap. A seal that would overwrite another writer's generation
-  is refused, so the failure mode is a rejected seal rather than silent
-  corruption. `meta/lease.json` is one object for the whole prefix, so two
-  writable mounts on DIFFERENT branches of one volume still exclude each
-  other even though they would never touch the same ref. The refusal names
-  the holder. A per-branch lease is a v0.2 change; branches share one write
-  lease in v0.1.0.
+- **Single writer per BRANCH.** The advisory lease is detection, not mutual
+  exclusion: the transport has no compare-and-swap. A seal that would
+  overwrite another writer's generation is refused, so the failure mode is
+  a rejected seal rather than silent corruption — and that refusal, not the
+  lease, is the guarantee. The lease is what makes you find out at mount
+  time instead of after an hour of work. It is one object per branch,
+  `meta/lease-<branch>.json`, so two writable mounts on different branches
+  of one volume run concurrently and only a second writer on the same
+  branch is refused, naming the holder. `pelfs status` prints which lease
+  object a session holds, and the statistics file records it as
+  `lease_key`.
+- **A pelfs v0.1.0 client on the same volume weakens that, in one
+  direction, and it is worth knowing which.** v0.1.0 held one lease for the
+  whole prefix, `meta/lease.json`, whatever branch it was writing. So:
+  - This release READS that object and refuses to write ANY branch while a
+    v0.1.0 lease is live — it cannot tell which branch that client is on,
+    so it assumes the worst. `--steal-lease` will not clear it (that flag
+    is about one branch); `--ignore-volume-lease` proceeds past it, leaving
+    the object untouched to expire on its own TTL.
+  - This release never WRITES that object, because writing both would put
+    two v0.2 writers on different branches back to excluding each other
+    through the legacy key — the exact problem per-branch leases fix.
+    The honest consequence: **a v0.1.0 client sees a v0.2 writer as
+    unleased and will mount straight past it.** Its only protection is then
+    the seal's refusal to publish over a moved ref, which is the real
+    protection in every case. Do not run a v0.1.0 client against a volume a
+    v0.2 client is writing.
 - The origin must permit GET/PUT/DELETE and listing on the prefix (i.e. a
   token with read/modify scopes for the namespace); `pelfs` checks this up
   front and says which scope is missing.

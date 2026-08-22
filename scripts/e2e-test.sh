@@ -73,8 +73,12 @@ grep -q "created volume" "$WORK/run1.log" || { echo "FAIL: the empty prefix was 
 grep -q "sealed generation" "$WORK/run1.log" || { echo "FAIL: session 1 did not seal"; exit 1; }
 SHA1=$(grep -E '^[0-9a-f]{64}$' "$WORK/run1.log" | head -1)
 [ -n "$SHA1" ] || { echo "FAIL: no checksum captured in run 1"; exit 1; }
-# A clean shutdown must release the mount lease.
-[ ! -f "$WORK/origin/e2e/ns/meta/lease.json" ] || { echo "FAIL: lease not released after session 1"; exit 1; }
+# A clean shutdown must release the write lease, which is the BRANCH's.
+# The v0.1.0 whole-volume object must never have been written at all.
+[ ! -f "$WORK/origin/e2e/ns/meta/lease-main.json" ] || { echo "FAIL: lease not released after session 1"; exit 1; }
+[ ! -e "$WORK/origin/e2e/ns/meta/lease.json" ] || {
+  echo "FAIL: a v0.2 writer wrote the legacy whole-volume lease; two writers on different branches would " \
+       "then exclude each other through it"; exit 1; }
 echo "   wrote rand.bin sha256=$SHA1"
 
 echo "== stats summary from session 1 =="
@@ -86,6 +90,7 @@ assert s["clean_shutdown"] is True, s
 assert s["exit_code"] == 0, s
 assert s["seal_ok"] is True, s
 assert s["lease_held"] is True, s
+assert s["lease_key"] == "meta/lease-main.json", s.get("lease_key")
 assert s["put"]["ops"] >= 2 and s["put"]["bytes"] > 8000000, s["put"]
 assert s["object_errors_total"] == 0, s
 
@@ -170,22 +175,161 @@ pf_packs="$(find "$WORK/state-pf" -path '*/gencache/packs/*' -type f | wc -l | t
 [ "$pf_packs" -gt 0 ] || { echo "FAIL: strict prefetch cached no packs"; find "$WORK/state-pf" -type d; exit 1; }
 echo "   strict prefetch verified: $pf_packs pack(s) local, nothing unpacked"
 
-echo "== lease: a second writer is refused, --steal-lease overrides =="
+echo "== lease: two branches write CONCURRENTLY, and both seal =="
+# THE POINT OF THE PER-BRANCH KEY. In v0.1.0 the lease was one object for
+# the whole prefix (meta/lease.json), so these two mounts refused each
+# other though they can never touch the same ref. They hold
+# meta/lease-main.json and meta/lease-dev.json now and run at once.
+#
+# The overlap is FORCED, not hoped for: each session announces itself and
+# then blocks until the other has announced, so a run in which they
+# happened to be sequential CANNOT pass. Both then seal, and each branch
+# must come away with its own generation.
+#
+# They share the volume's signing key (--signing-key), because a writer
+# with a fresh state directory has no key the branch head was signed with.
+# That is orthogonal to the lease and would be true of one writer too.
+SIGNKEY="$WORK/state1/v2-signing.key"
+[ -f "$SIGNKEY" ] || { echo "FAIL: no volume signing key at $SIGNKEY"; ls "$WORK/state1"; exit 1; }
+"$PELFS" branch --state-dir "$WORK/state1" "$PREFIX" dev > "$WORK/branch-dev.log" 2>&1 \
+  || { echo "FAIL: creating branch dev"; cat "$WORK/branch-dev.log"; exit 1; }
+grep -q "write lease is per branch" "$WORK/branch-dev.log" || {
+  echo "FAIL: branch creation did not state the per-branch lease:"; cat "$WORK/branch-dev.log"; exit 1; }
+
+BARRIER="$WORK/barrier"; mkdir -p "$BARRIER"
+concurrent_writer() { # $1 = own branch, $2 = the branch it waits for
+  "$PELFS" shell --branch "$1" --state-dir "$WORK/state-cc-$1" --signing-key "$SIGNKEY" \
+    --snapshot-interval 0 --stats-file "$WORK/stats-cc-$1.json" "$PREFIX" -- /bin/sh -c "
+      echo '$1 was here' > from-$1.txt
+      touch '$BARRIER/$1'
+      for _ in \$(seq 600); do [ -e '$BARRIER/$2' ] && break; sleep 0.1; done
+      # Both mounts are live and inside their payloads at this instant.
+      # Without this the test would pass on a run where one session had
+      # already exited before the other started.
+      [ -e '$BARRIER/$2' ]
+    "
+}
+( concurrent_writer main dev > "$WORK/run-cc-main.log" 2>&1; echo $? > "$WORK/rc-cc-main" ) &
+CC_MAIN=$!
+( concurrent_writer dev main > "$WORK/run-cc-dev.log" 2>&1; echo $? > "$WORK/rc-cc-dev" ) &
+CC_DEV=$!
+wait "$CC_MAIN" "$CC_DEV" 2>/dev/null || true
+for b in main dev; do
+  [ "$(cat "$WORK/rc-cc-$b" 2>/dev/null)" = "0" ] || {
+    echo "FAIL: the concurrent writer on $b did not complete — it was refused, or never overlapped:"
+    cat "$WORK/run-cc-$b.log"; exit 1; }
+  grep -q "sealed generation" "$WORK/run-cc-$b.log" || {
+    echo "FAIL: the concurrent writer on $b did not seal:"; cat "$WORK/run-cc-$b.log"; exit 1; }
+  [ ! -f "$WORK/origin/e2e/ns/meta/lease-$b.json" ] || {
+    echo "FAIL: lease-$b.json was not released on exit"; exit 1; }
+done
+# BOTH GENERATIONS LANDED. Two writers that both sealed but clobbered one
+# ref would pass every check above and fail here.
+"$PELFS" shell --ro --branch main --state-dir "$WORK/state-cc-read-main" "$PREFIX" -- \
+  /bin/sh -c 'cat from-main.txt; [ ! -e from-dev.txt ]' > "$WORK/run-cc-read-main.log" 2>&1 || {
+  echo "FAIL: main did not come away with its own generation:"; cat "$WORK/run-cc-read-main.log"; exit 1; }
+"$PELFS" shell --ro --branch dev --state-dir "$WORK/state-cc-read-dev" "$PREFIX" -- \
+  /bin/sh -c 'cat from-dev.txt; [ ! -e from-main.txt ]' > "$WORK/run-cc-read-dev.log" 2>&1 || {
+  echo "FAIL: dev did not come away with its own generation:"; cat "$WORK/run-cc-read-dev.log"; exit 1; }
+# And each session reported WHICH object it held, which is what a reader
+# needs now that "a lease was held" no longer implies volume-wide.
+python3 - "$WORK/stats-cc-main.json" "$WORK/stats-cc-dev.json" <<'PY'
+import json, sys
+for path, want in zip(sys.argv[1:3], ("meta/lease-main.json", "meta/lease-dev.json")):
+    s = json.load(open(path))
+    assert s["lease_held"] is True, (path, s)
+    assert s["lease_key"] == want, (path, s.get("lease_key"), want)
+    assert not s.get("lease_conflict_observed"), (path, s)
+    assert s["seal_ok"] is True, (path, s)
+print("   both sessions held their own lease object and neither saw a conflict")
+PY
+echo "   two branches wrote at the same time, both sealed, both generations landed"
+
+echo "== lease: a second writer on the SAME branch is refused, --steal-lease overrides =="
+# Narrowing the lease must not have weakened it. The holder is written
+# directly, as it was for the volume lease in v0.1.0, so the refusal is
+# decided by the record rather than by two processes racing.
 mkdir -p "$WORK/origin/e2e/ns/meta"
+cat > "$WORK/origin/e2e/ns/meta/lease-main.json" <<LEASE
+{"session":"other-client","hostname":"elsewhere","pid":4242,"branch":"main",
+ "acquired":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","renewed":"$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+ "ttl_seconds":600}
+LEASE
+if "$PELFS" shell --state-dir "$WORK/state1" "$PREFIX" -- /bin/sh -c true > "$WORK/run-lease.log" 2>&1; then
+  echo "FAIL: mount should have been refused while another lease on main is live"; exit 1
+fi
+grep -q "in use by another pelfs client" "$WORK/run-lease.log" || { echo "FAIL: refusal did not mention the lease"; exit 1; }
+grep -q "elsewhere" "$WORK/run-lease.log" || { echo "FAIL: refusal did not name the holder"; exit 1; }
+grep -q "branch main is held by" "$WORK/run-lease.log" || {
+  echo "FAIL: the refusal did not say WHICH branch is held:"; cat "$WORK/run-lease.log"; exit 1; }
+# A writer on the other branch is admitted while that record stands: same
+# volume, different ref, and nothing to wait for.
+"$PELFS" shell --branch dev --state-dir "$WORK/state-alongside" --signing-key "$SIGNKEY" \
+  --snapshot-interval 0 "$PREFIX" -- /bin/sh -c 'echo ok > alongside.txt' \
+  > "$WORK/run-alongside.log" 2>&1 || {
+  echo "FAIL: a writer on dev was refused while main's lease was held:"; cat "$WORK/run-alongside.log"; exit 1; }
+"$PELFS" shell --state-dir "$WORK/state1" --steal-lease "$PREFIX" -- /bin/sh -c true > "$WORK/run-steal.log" 2>&1 \
+  || { echo "FAIL: --steal-lease mount failed"; cat "$WORK/run-steal.log"; exit 1; }
+[ ! -f "$WORK/origin/e2e/ns/meta/lease-main.json" ] || { echo "FAIL: stolen lease not released on exit"; exit 1; }
+echo "   same branch refused by name, other branch unaffected, steal behaved as expected"
+
+echo "== lease: a pelfs v0.1.0 client (meta/lease.json) locks every branch =="
+# THE MIXED-VERSION RULE. A v0.1.0 writer holds ONE object for the whole
+# prefix and its record names no branch, so it must exclude every branch
+# here — assuming otherwise would be guessing where an invisible client
+# is. It is simulated by writing the old key directly because this release
+# has no code path that writes it, and that is the other half of the rule:
+# writing both objects would put two writers on different branches back to
+# excluding each other through the legacy key.
 cat > "$WORK/origin/e2e/ns/meta/lease.json" <<LEASE
 {"session":"other-client","hostname":"elsewhere","pid":4242,
  "acquired":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","renewed":"$(date -u +%Y-%m-%dT%H:%M:%SZ)",
  "ttl_seconds":600}
 LEASE
-if "$PELFS" shell --state-dir "$WORK/state1" "$PREFIX" -- /bin/sh -c true > "$WORK/run-lease.log" 2>&1; then
-  echo "FAIL: mount should have been refused while another lease is live"; exit 1
+for b in main dev; do
+  if "$PELFS" shell --branch "$b" --state-dir "$WORK/state-legacy-$b" --signing-key "$SIGNKEY" \
+      "$PREFIX" -- /bin/sh -c true > "$WORK/run-legacy-$b.log" 2>&1; then
+    echo "FAIL: branch $b mounted while a v0.1.0 volume lease was live"; exit 1
+  fi
+  grep -q "in use by another pelfs client" "$WORK/run-legacy-$b.log" || {
+    echo "FAIL: refusal did not mention the lease:"; cat "$WORK/run-legacy-$b.log"; exit 1; }
+  grep -q "elsewhere" "$WORK/run-legacy-$b.log" || {
+    echo "FAIL: refusal did not name the holder:"; cat "$WORK/run-legacy-$b.log"; exit 1; }
+  grep -q "v0.1.0 client" "$WORK/run-legacy-$b.log" || {
+    echo "FAIL: refusal did not say the holder is a v0.1.0 client, so the user cannot pick the right flag:"
+    cat "$WORK/run-legacy-$b.log"; exit 1; }
+done
+# --steal-lease takes ONE BRANCH's lease and deliberately does not clear
+# this one; the refusal has to name the flag that does.
+if "$PELFS" shell --state-dir "$WORK/state-legacy-steal" --steal-lease --signing-key "$SIGNKEY" \
+    "$PREFIX" -- /bin/sh -c true > "$WORK/run-legacy-steal.log" 2>&1; then
+  echo "FAIL: --steal-lease walked past the v0.1.0 volume lease"; exit 1
 fi
-grep -q "in use by another pelfs client" "$WORK/run-lease.log" || { echo "FAIL: refusal did not mention the lease"; exit 1; }
-grep -q "elsewhere" "$WORK/run-lease.log" || { echo "FAIL: refusal did not name the holder"; exit 1; }
-"$PELFS" shell --state-dir "$WORK/state1" --steal-lease "$PREFIX" -- /bin/sh -c true > "$WORK/run-steal.log" 2>&1 \
-  || { echo "FAIL: --steal-lease mount failed"; exit 1; }
-[ ! -f "$WORK/origin/e2e/ns/meta/lease.json" ] || { echo "FAIL: stolen lease not released on exit"; exit 1; }
-echo "   refusal + steal behaved as expected"
+grep -q "ignore-volume-lease" "$WORK/run-legacy-steal.log" || {
+  echo "FAIL: the refusal did not name the flag that does apply:"; cat "$WORK/run-legacy-steal.log"; exit 1; }
+# --ignore-volume-lease proceeds, takes its BRANCH lease, and leaves the
+# legacy object exactly where it was: ignoring is not stealing.
+#
+# On state1 deliberately, so this last advance of main leaves that state
+# directory's overlay current. The sections below write through state1
+# again, and an overlay recorded over a generation some other state
+# directory has since superseded cannot be sealed.
+"$PELFS" shell --state-dir "$WORK/state1" --ignore-volume-lease \
+  --snapshot-interval 0 --stats-file "$WORK/stats-legacy.json" "$PREFIX" -- /bin/sh -c 'echo past > past.txt' \
+  > "$WORK/run-legacy-ok.log" 2>&1 || {
+  echo "FAIL: --ignore-volume-lease mount failed"; cat "$WORK/run-legacy-ok.log"; exit 1; }
+python3 -c "
+import json; s=json.load(open('$WORK/stats-legacy.json'))
+assert s.get('lease_key') == 'meta/lease-main.json', s.get('lease_key')
+" || { echo "FAIL: the session did not hold its own branch lease"; cat "$WORK/stats-legacy.json"; exit 1; }
+[ -f "$WORK/origin/e2e/ns/meta/lease.json" ] || {
+  echo "FAIL: the v0.1.0 lease was removed; this release must never write or delete that object"; exit 1; }
+grep -q "other-client" "$WORK/origin/e2e/ns/meta/lease.json" || {
+  echo "FAIL: the v0.1.0 lease was rewritten"; cat "$WORK/origin/e2e/ns/meta/lease.json"; exit 1; }
+[ ! -f "$WORK/origin/e2e/ns/meta/lease-main.json" ] || {
+  echo "FAIL: the branch lease was not released on exit"; exit 1; }
+rm -f "$WORK/origin/e2e/ns/meta/lease.json"
+echo "   v0.1.0 lease excluded every branch; --steal-lease refused; --ignore-volume-lease proceeded, untouched"
 
 echo "== a retired-format prefix is recognized, not overwritten =="
 mkdir -p "$WORK/origin/e2e/old/meta/20260101T000000Z-host-deadbeef"
@@ -245,11 +389,12 @@ after=$(cat "$WORK/origin/e2e/ns/refs/main" | cksum)
   || { echo "FAIL: fsck after repack"; cat "$WORK/fsck2.log"; exit 1; }
 grep -q "generation is consistent" "$WORK/fsck2.log" || {
   echo "FAIL: fsck after repack did not report consistency"; cat "$WORK/fsck2.log"; exit 1; }
-# A repack PUBLISHES a generation, so it takes the advisory lease. Losing
-# a flip is cheap for a checkpoint and expensive here: the sweep and the
-# rewrite are already paid by the time the flip happens.
-cat > "$WORK/origin/e2e/ns/meta/lease.json" <<LEASE
-{"session":"other-client","hostname":"elsewhere","pid":4242,
+# A repack PUBLISHES a generation, so it takes the advisory lease — the
+# lease of the BRANCH it is about to flip, and only that one. Losing a flip
+# is cheap for a checkpoint and expensive here: the sweep and the rewrite
+# are already paid by the time the flip happens.
+cat > "$WORK/origin/e2e/ns/meta/lease-main.json" <<LEASE
+{"session":"other-client","hostname":"elsewhere","pid":4242,"branch":"main",
  "acquired":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","renewed":"$(date -u +%Y-%m-%dT%H:%M:%SZ)",
  "ttl_seconds":600}
 LEASE
@@ -261,12 +406,17 @@ grep -q "in use by another pelfs client" "$WORK/repack-held.log" || {
   echo "FAIL: the refusal did not mention the lease:"; cat "$WORK/repack-held.log"; exit 1; }
 grep -q "elsewhere" "$WORK/repack-held.log" || {
   echo "FAIL: the refusal did not name the holder:"; cat "$WORK/repack-held.log"; exit 1; }
+# A repack of the OTHER branch is not blocked by it: disjoint refs, and
+# the rewrite it would waste is not the held branch's.
+"$PELFS" repack --branch dev --state-dir "$WORK/state1" "$PREFIX" > "$WORK/repack-dev.log" 2>&1 || {
+  echo "FAIL: repack of dev was refused while main's lease was held:"
+  cat "$WORK/repack-dev.log"; exit 1; }
 # A REPORT needs no lease: inspecting a volume someone else is using is
 # exactly when you want to know what it is carrying.
 "$PELFS" repack --state-dir "$WORK/state1" "$PREFIX" > "$WORK/repack-held-report.log" 2>&1 || {
   echo "FAIL: repack (report) was refused while the lease was held:"
   cat "$WORK/repack-held-report.log"; exit 1; }
-rm -f "$WORK/origin/e2e/ns/meta/lease.json"
+rm -f "$WORK/origin/e2e/ns/meta/lease-main.json"
 echo "   measured the volume, held back every pack inside the grace window, changed nothing"
 echo "   refused to publish while another client held the lease; reporting stayed available"
 

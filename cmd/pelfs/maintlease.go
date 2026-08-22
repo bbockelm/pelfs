@@ -29,7 +29,12 @@ import (
 // than the grace window and `fsck` writes nothing; making them wait on a
 // mount would trade a real capability — inspecting a volume someone is
 // using — for a race neither of them can lose.
-func maintenanceLease(ctx context.Context, o *cmdOpts, prefix, session string) (*lease.Lease, error) {
+//
+// The lease taken is the BRANCH's, and branch is the one the caller is
+// about to flip. A repack of `dev` no longer stops a mount of `main`,
+// which is the whole point of the per-branch key: the two runs touch
+// disjoint refs and always did.
+func maintenanceLease(ctx context.Context, o *cmdOpts, prefix, branch, session string) (*lease.Lease, error) {
 	if o.noLease {
 		ui.Warn("--no-lease: publishing without the advisory lease; " +
 			"a concurrent mount will make one of the two flips fail")
@@ -49,13 +54,15 @@ func maintenanceLease(ctx context.Context, o *cmdOpts, prefix, session string) (
 		return nil, err
 	}
 	l, err := lease.Acquire(ctx, lease.Options{
-		Store:   metaStore,
-		Session: session,
-		Steal:   o.stealLease,
+		Store:             metaStore,
+		Session:           session,
+		Branch:            branch,
+		Steal:             o.stealLease,
+		IgnoreVolumeLease: o.ignoreVolumeLease,
 		OnConflict: func(holder *lease.Info) {
-			ui.Warn("another client took this prefix mid-operation: {holder}\n"+
+			ui.Warn("another client took branch {branch} mid-operation: {holder}\n"+
 				"this run keeps going, but its publish will be refused if that client advanced the branch",
-				"holder", holder.Describe())
+				"branch", branch, "holder", holder.Describe())
 		},
 	})
 	if err != nil {
@@ -68,6 +75,18 @@ func maintenanceLease(ctx context.Context, o *cmdOpts, prefix, session string) (
 		return nil, err
 	}
 	return l, nil
+}
+
+// leaseKeyFor names a branch's lease object for a message. The name has
+// already been validated by every caller that reaches here, so a rejection
+// would be a bug rather than user input; rendering the raw name in that
+// case keeps a diagnostic from becoming a second error.
+func leaseKeyFor(branch string) string {
+	key, err := lease.BranchKey(branch)
+	if err != nil {
+		return branch
+	}
+	return key
 }
 
 // releaseLease drops a lease that may be nil (--no-lease), reporting a

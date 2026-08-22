@@ -4,6 +4,46 @@
 
 ### Changed
 
+- **The write lease is per branch.** It was `meta/lease.json`, one object
+  for the whole prefix, so two writable mounts on DIFFERENT branches of one
+  volume refused each other though they could never touch the same ref —
+  the v0.1.0 limitation that shipped with `pelfs branch` and a warning
+  attached to it. The key is now `meta/lease-<branch>.json`: writable
+  mounts of `main` and `dev` run concurrently and both seal, and only a
+  second writer on the SAME branch is refused, still naming the holder.
+
+  Nothing about the guarantee changed, and that is worth being clear about.
+  The lease was always advisory DETECTION and not mutual exclusion — the
+  transport has no compare-and-swap, and what actually prevents two writers
+  corrupting each other is the seal's refusal to publish over a ref that
+  moved. A per-branch key removes a FALSE exclusion; it adds no safety.
+
+  `pelfs status` now prints which lease object a session holds, the
+  statistics file records it as `lease_key`, and `pelfs ctl <mount> status`
+  reports `lease_key`.
+
+  **Mixed with a pelfs v0.1.0 client**, the rule is asymmetric on purpose:
+
+  | writer | excluded by | excludes |
+  |---|---|---|
+  | v0.2 on branch B | a live `meta/lease.json` (any v0.1.0 writer), and a live `meta/lease-B.json` | v0.2 writers on B only |
+  | v0.1.0 (any branch) | a live `meta/lease.json` | every v0.1.0 writer on the volume — and nothing else |
+
+  A v0.2 writer reads `meta/lease.json` and refuses while one is live,
+  naming the holder, because a v0.1.0 record does not say which branch it
+  is on. It never WRITES that object: doing so would make two v0.2 writers
+  on different branches exclude each other through the legacy key again.
+  The consequence, stated rather than hidden: **a v0.1.0 client sees a v0.2
+  writer as unleased and will mount past it**, and its only guard is then
+  the seal refusal. Do not point a v0.1.0 client at a volume a v0.2 client
+  is writing.
+
+  New flag `--ignore-volume-lease` proceeds past a live `meta/lease.json`.
+  `--steal-lease` deliberately does not: it takes one branch's lease, and
+  the legacy object belongs to a client whose branch you cannot see. The
+  new flag ignores rather than steals — the object is left exactly where it
+  was, to expire on its own TTL.
+
 - **The decoded-chunk cache is one file, not one file per chunk.**
   `gencache/chunks/` held a plaintext file per chunk the mount had ever
   read — an inode and a flat directory entry each, 6,646 of them for a
@@ -198,7 +238,9 @@ and no end-to-end run.
   writable mounts on DIFFERENT branches of one volume exclude each other
   even though they would never touch the same ref. The refusal names the
   holder; branches share one write lease in v0.1.0, and a per-branch lease
-  is a v0.2 change.
+  is a v0.2 change. *(Done — see Unreleased. The record of what v0.1.0
+  shipped stands; a v0.1.0 client still locks the whole volume, and how the
+  two versions interact is described there.)*
 - **Two branches that have diverged stay diverged.** There is no merge, and
   none is planned for this release. What exists is branching, tagging and
   deleting.

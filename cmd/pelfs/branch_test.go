@@ -635,22 +635,22 @@ func TestABranchInheritsTheVolumePinRatherThanEarningItsOwn(t *testing.T) {
 	}
 }
 
-// DANGER 4: THE WRITE LEASE IS THE VOLUME'S, NOT THE BRANCH'S.
+// DANGER 4 (WAS): THE WRITE LEASE IS THE VOLUME'S, NOT THE BRANCH'S.
 //
-// meta/lease.json is one object per prefix (internal/lease), so two
-// writable mounts on DIFFERENT branches of one volume exclude each other
-// even though they would never touch the same ref. That is a real limit of
-// v0.1.0 and it is deliberately not fixed here: a per-branch lease is a
-// key-space change, and shipping one in the same release as the verb that
-// makes branches possible would mean changing the concurrency story and
-// the namespace at once.
+// It was, in v0.1.0. meta/lease.json was one object per prefix, so two
+// writable mounts on DIFFERENT branches excluded each other though they
+// would never touch the same ref, and TestBranchesShareOneWriteLease
+// pinned that — deliberately, because while the limit lasted what mattered
+// was that it be a clean refusal rather than a corruption.
 //
-// What IS required is that the limit be a clean refusal rather than a
-// corruption, and that the refusal name the holder — a user who has been
-// told "another client holds this" and nothing else cannot act. So this
-// pins the behaviour rather than the wish, and the README and
-// docs/design-packfs.md say the same thing in prose.
-func TestBranchesShareOneWriteLease(t *testing.T) {
+// The key is meta/lease-<branch>.json now, and this pins the inverse: two
+// writers on different branches both hold, at once, each on its own
+// object. The lease remains ADVISORY DETECTION rather than mutual
+// exclusion — the real guard against two writers on ONE branch is the
+// seal's refusal to publish over a ref that moved — so what the per-branch
+// key buys is exactly the removal of a false exclusion, and no safety that
+// was not already there.
+func TestBranchesDoNotShareAWriteLease(t *testing.T) {
 	ctx := context.Background()
 	b := newBranchVolume(t, 37)
 	b.write(t, "f.bin")
@@ -662,17 +662,51 @@ func TestBranchesShareOneWriteLease(t *testing.T) {
 	}
 
 	o := &cmdOpts{stateDir: b.stateDir}
-	held, err := maintenanceLease(ctx, o, b.prefix, "writer-on-main")
+	onMain, err := maintenanceLease(ctx, o, b.prefix, "main", "writer-on-main")
+	if err != nil {
+		t.Fatalf("the first writer could not take the lease: %v", err)
+	}
+	defer releaseLease(ctx, onMain)
+
+	onDev, err := maintenanceLease(ctx, o, b.prefix, "dev", "writer-on-dev")
+	if err != nil {
+		t.Fatalf("a writer on another branch was refused; that false exclusion is what this key space "+
+			"exists to remove: %v", err)
+	}
+	defer releaseLease(ctx, onDev)
+
+	if onMain.Key() == onDev.Key() {
+		t.Fatalf("both branches took %q; the lease is not per branch", onMain.Key())
+	}
+	// Neither displaced the other. "Both succeeded" that was really "the
+	// second overwrote the first" would leave the first renewing an object
+	// it no longer owns — the corruption the volume-wide refusal used to
+	// prevent by refusing everything.
+	if onMain.Conflicted() || onDev.Conflicted() {
+		t.Fatal("one writer overwrote the other's lease; the two branches are sharing an object after all")
+	}
+}
+
+// TestASecondWriterOnTheSameBranchIsStillRefused: narrowing the lease must
+// not weaken it. Same branch means the same object, and the refusal still
+// has to name the holder — a user told only "another client holds this"
+// cannot act on it.
+func TestASecondWriterOnTheSameBranchIsStillRefused(t *testing.T) {
+	ctx := context.Background()
+	b := newBranchVolume(t, 41)
+	b.write(t, "f.bin")
+	b.seal(t)
+
+	o := &cmdOpts{stateDir: b.stateDir}
+	held, err := maintenanceLease(ctx, o, b.prefix, "main", "writer-on-main")
 	if err != nil {
 		t.Fatalf("the first writer could not take the lease: %v", err)
 	}
 	defer releaseLease(ctx, held)
 
-	// A second writer, on the OTHER branch. It is refused, and the refusal
-	// names who has it.
-	_, err = maintenanceLease(ctx, o, b.prefix, "writer-on-dev")
+	_, err = maintenanceLease(ctx, o, b.prefix, "main", "writer-on-main-too")
 	if err == nil {
-		t.Fatal("two writers took the volume's lease at once; the advisory lease detects nothing")
+		t.Fatal("two writers took one branch's lease at once; the advisory lease detects nothing")
 	}
 	if !errors.Is(err, lease.ErrHeld) {
 		t.Fatalf("the refusal is not the lease one: %v", err)
@@ -680,12 +714,75 @@ func TestBranchesShareOneWriteLease(t *testing.T) {
 	if !strings.Contains(err.Error(), "writer-on-main") {
 		t.Errorf("the refusal does not name the holder, so a user cannot act on it: %v", err)
 	}
-
-	// And it is a refusal rather than a corruption: the holder was not
-	// disturbed, so the first writer's publish is not about to lose a race
-	// it was never told about.
 	if held.Conflicted() {
 		t.Fatal("the refused second writer took the lease out from under the holder; the refusal is not " +
 			"the whole of what happened")
+	}
+}
+
+// TestAV010WriterStillExcludesEveryBranch is the mixed-version rule seen
+// from the CLI. A pelfs v0.1.0 client holds meta/lease.json and its record
+// says nothing about which branch it is writing, so it must exclude EVERY
+// branch here; assuming otherwise would be guessing that a client we
+// cannot see is somewhere else.
+//
+// --steal-lease must not be what clears it. That flag is about the branch
+// the user is looking at, and this object is about a client they cannot
+// see, so the two decisions get two flags.
+//
+// The v0.1.0 holder is simulated by writing the old key directly. There is
+// no other way: this release has no code path that writes it, which is
+// itself the rule under test (writing both objects would make two v0.2
+// writers on different branches deadlock through the legacy one).
+func TestAV010WriterStillExcludesEveryBranch(t *testing.T) {
+	ctx := context.Background()
+	b := newBranchVolume(t, 43)
+	b.write(t, "f.bin")
+	b.seal(t)
+	if _, code := captureLog(t, func() int {
+		return cmdBranch([]string{"--state-dir", b.stateDir, b.prefix, "dev"})
+	}); code != 0 {
+		t.Fatal("branch failed")
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	record := fmt.Sprintf(`{"session":"v010-writer","hostname":"elsewhere","pid":4242,`+
+		`"acquired":%q,"renewed":%q,"ttl_seconds":600}`, now, now)
+	if err := b.inner.Put(ctx, lease.VolumeKey, strings.NewReader(record)); err != nil {
+		t.Fatal(err)
+	}
+
+	o := &cmdOpts{stateDir: b.stateDir}
+	for _, branch := range []string{"main", "dev"} {
+		_, err := maintenanceLease(ctx, o, b.prefix, branch, "writer-"+branch)
+		if !errors.Is(err, lease.ErrHeld) {
+			t.Fatalf("branch %s: a live v0.1.0 volume lease did not exclude it: %v", branch, err)
+		}
+		if !strings.Contains(err.Error(), "elsewhere") {
+			t.Errorf("branch %s: the refusal does not name the holder: %v", branch, err)
+		}
+	}
+
+	stealing := &cmdOpts{stateDir: b.stateDir, stealLease: true}
+	if _, err := maintenanceLease(ctx, stealing, b.prefix, "main", "thief"); !errors.Is(err, lease.ErrHeld) {
+		t.Fatalf("--steal-lease walked past the v0.1.0 volume lease: %v", err)
+	}
+
+	ignoring := &cmdOpts{stateDir: b.stateDir, ignoreVolumeLease: true}
+	l, err := maintenanceLease(ctx, ignoring, b.prefix, "main", "informed-writer")
+	if err != nil {
+		t.Fatalf("--ignore-volume-lease: %v", err)
+	}
+	defer releaseLease(ctx, l)
+	if l.Key() == lease.VolumeKey {
+		t.Fatal("the writer claimed the legacy object; two writers on different branches would then " +
+			"exclude each other through it")
+	}
+	// Ignoring is not stealing: the legacy record is left exactly where it
+	// was, so a v0.1.0 client that is slow rather than dead still holds
+	// what it believes it holds, and the next writer here is refused again
+	// unless it too says so out loud.
+	if _, err := b.inner.StatKey(ctx, lease.VolumeKey); err != nil {
+		t.Fatalf("the v0.1.0 lease was disturbed: %v", err)
 	}
 }

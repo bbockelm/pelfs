@@ -20,7 +20,10 @@ immutable.
 <prefix>/
   refs/<branch>         mutable superblocks (branch heads)
   tags/<name>           immutable superblocks (frozen generations)
-  meta/lease.json       advisory liveness beacon, one per volume
+  meta/lease-<b>.json   advisory liveness beacon, one per BRANCH
+  meta/lease.json       the same beacon, one per VOLUME: pelfs v0.1.0
+                        wrote this and nothing else; later releases read
+                        it and never write it
   packs/p-<ts>-<rand>   immutable packs: data chunks, small files,
                         catalogs, inode shards, superblock backups
 ```
@@ -476,7 +479,7 @@ we fell into it — see Appendix C.
 **A mutable object is read through a 1 MiB ceiling**
 (`pelicanobj.MaxMutableObject`), enforced on every unverified read. Exactly
 three kinds of object are read that way: `refs/<branch>`, `tags/<name>`,
-and `meta/lease.json`. The ceiling is not tuning. It is the bound that
+and the leases under `meta/`. The ceiling is not tuning. It is the bound that
 makes it safe to read an object into memory before its signature has been
 checked, which every reader must do, because a signature cannot be checked
 on bytes nobody has read yet.
@@ -686,17 +689,38 @@ the source's bytes under a second name, and everything else follows:
 
 Consequences, deliberate and otherwise:
 
-- **Single-writer is per VOLUME, not per branch — v0.1.0's honest limit.**
-  Writers on different branches conflict in nothing the FORMAT cares about:
-  disjoint superblocks, shared immutable objects, and content-addressed
-  uploads that collide only on identical content. But the advisory lease is
-  one object for the whole prefix (`meta/lease.json`), so two writable
-  mounts on different branches of one volume still exclude each other. The
-  failure mode is the clean one — a refusal naming the holder, at mount,
-  before any work is done. A per-branch lease is a v0.2 change, not a design
-  position; until then the fan-out batch pattern (one tagged base
-  environment, N jobs each on a private branch) needs N volumes or
-  `--no-lease`.
+- **Single-writer is per BRANCH.** Writers on different branches conflict
+  in nothing the FORMAT cares about: disjoint superblocks, shared immutable
+  objects, and content-addressed uploads that collide only on identical
+  content. v0.1.0's advisory lease was nonetheless one object for the whole
+  prefix (`meta/lease.json`), so two writable mounts on different branches
+  excluded each other anyway — a refusal with no race behind it, and the
+  reason the fan-out batch pattern (one tagged base environment, N jobs each
+  on a private branch) needed N volumes or `--no-lease`.
+
+  The lease is now `meta/lease-<branch>.json` and the key space matches the
+  format: those N jobs run against one volume, each holding its own branch,
+  and only a second writer on the SAME branch is refused — still cleanly,
+  at mount, naming the holder, before any work is done. `ValidateName` is
+  shared with the ref and tag key spaces, so there is no branch name that
+  can be mounted but not locked.
+
+  **This buys no safety it did not already have.** The seal's
+  compare-and-swap on `refs/<branch>` is what stops two writers on one
+  branch from losing a generation; the lease only makes them find out at
+  mount instead of after the work. Narrowing the key removes a false
+  exclusion and nothing else.
+
+  **Mixed with pelfs v0.1.0, the rule is asymmetric.** A v0.1.0 record does
+  not say which branch its holder is writing, so this release refuses every
+  branch while one is live (`--ignore-volume-lease` to proceed;
+  `--steal-lease` deliberately does not, being about one branch). It never
+  writes that object — writing both would restore the exclusion through the
+  legacy key — so **a v0.1.0 client sees a v0.2 writer as unleased and will
+  mount past it**, falling back on the seal refusal, which is the real
+  guard in every case. Stated here rather than hidden: the interoperability
+  is one-way, and a volume being written by one version should not be
+  written by the other.
 - **A GENERATION NUMBER IS NOT AN IDENTITY.** This is the rule a second
   branch makes load-bearing, and it is easy to get wrong because a number
   looks like a name. Numbers count steps along ONE lineage, so both children
@@ -754,15 +778,22 @@ The volume has exactly **two** mutable objects, with disjoint roles:
   monotonicity guard (`refs.ErrRollback`) refuses a branch head older than
   the newest generation this client has already accepted.
 - **Lease — liveness (advisory).** Heartbeat plus TTL plus takeover
-  warning, at `meta/lease.json`. Its only job is preventing *wasted work*:
-  fail fast at mount instead of at the first failed publish, warn
-  mid-session on takeover. It is unsigned, not content-addressed, never
-  read by read-only mounts, and its loss or corruption affects no data.
-  `--no-lease` skips it; `--steal-lease` overrides a live one.
+  warning, at `meta/lease-<branch>.json`, one per branch. Its only job is
+  preventing *wasted work*: fail fast at mount instead of at the first
+  failed publish, warn mid-session on takeover. It is unsigned, not
+  content-addressed, never read by read-only mounts, and its loss or
+  corruption affects no data. `--no-lease` skips it; `--steal-lease`
+  overrides a live one on this branch; `--ignore-volume-lease` proceeds
+  past a v0.1.0 client's `meta/lease.json`, which locks every branch
+  because its record names none.
 
 Given that the flip is not atomic, the lease is doing more work than
-"courtesy" implies. It is the only thing standing between two writers and
-a lost generation, and it is advisory.
+"courtesy" implies. It is what stands between two writers on ONE branch and
+a lost generation, and it is advisory — the guarantee is the flip's
+refusal, and the lease is how you learn before paying for the work. Two
+writers on DIFFERENT branches were never in this argument at all; v0.1.0
+excluded them because of where the key lived, not because of anything the
+format required.
 
 ## Signing, keys, and trust
 

@@ -110,6 +110,12 @@ type Summary struct {
 	PrefetchComplete      bool   `json:"prefetch_complete,omitempty"`
 	LeaseHeld             bool   `json:"lease_held,omitempty"`
 	LeaseConflictObserved bool   `json:"lease_conflict_observed,omitempty"`
+	// LeaseKey is WHICH lease object this session holds:
+	// meta/lease-<branch>.json. Reported because the exclusion is
+	// per-branch now — "a lease was held" no longer tells a reader whether
+	// another writer elsewhere on the volume was possible, and the key
+	// does. Empty on a session that took none (read-only, or --no-lease).
+	LeaseKey string `json:"lease_key,omitempty"`
 
 	// What the mount is serving. Generation is what it serves NOW — with
 	// --poll it is the head the last live refresh swapped to, not the one

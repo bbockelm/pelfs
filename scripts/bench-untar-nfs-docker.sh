@@ -94,6 +94,17 @@ FILES="$1"; DIRS="$2"; CHUNKS="$3"
 W=/work
 mkdir -p "$W/origin" "$W/out"
 
+# Logs and profiles are written to tmpfs -- a bind mount would put the
+# rate files this gate MEASURES on the host filesystem -- so they have to
+# be copied out to reach the caller. Copy on EXIT rather than only at the
+# end: a gate that fails is the one whose logs somebody wants, and until
+# this trap existed the single copy at the bottom was unreachable from
+# every failure path. CI's artifact upload then found an empty directory,
+# so a failure reproducible ONLY on a shared runner left nothing behind
+# to read. A SIGKILL from the outer timeout still loses them; the
+# stall sentence on stderr is what covers that case.
+trap 'cp -a "$W/out/." /out/ 2>/dev/null || true' EXIT
+
 MAX_DECAY="${PELFS_MAX_DECAY:-2.0}"
 MAX_RPC_PER_FILE="${PELFS_MAX_RPC_PER_FILE:-12}"
 

@@ -1163,3 +1163,63 @@ func TestReaddirRetainEvictsLikeLookupPerEntry(t *testing.T) {
 		t.Fatalf("%d of %d inodes survived a bound of %d", resident, len(all), bound)
 	}
 }
+
+// Edge hands out the DESCENT STEP behind an inode's residency, which is
+// what a layer above needs to refill a cache of the same fact rather than
+// fail on a miss. The overlay's write path does exactly that: it caches one
+// base descent step per inode, a checkpoint sweeps the cache to bound its
+// memory, and link(2) -- the one operation that names its subject by bare
+// inode -- then arrives with nothing behind it. See persistChainLocked in
+// internal/overlay and internal/overlay/linkprov_test.go.
+//
+// The contract in four parts: the step is the one the descent used, it is
+// still a valid step (re-resolving it returns the same inode), an inode no
+// descent reached is ErrStale rather than a scan, and the root is named by
+// no edge at all.
+func TestEdgeIsTheDescentStepResidencyWasEstablishedBy(t *testing.T) {
+	ctx := context.Background()
+	inner, _ := newInner(t)
+	v := newTestVolume(t, inner, "abcdabcd-0000-4000-8000-0000000000ed")
+	dir := v.Mkdir(1, "d")
+	sub := v.Mkdir(dir, "sub")
+	fileIno := v.Create(sub, "f.txt")
+	v.Write(fileIno, []byte("hello"))
+	res := publishVolume(t, v, inner, publish.Options{})
+	fs := openFS(t, inner, res.Superblock, genfs.Options{})
+
+	if _, _, err := fs.Edge(genfs.RootInode); !errors.Is(err, genfs.ErrNotExist) {
+		t.Fatalf("Edge(root) = %v, want ErrNotExist: the root is named by no edge", err)
+	}
+	if _, _, err := fs.Edge(fileIno); !errors.Is(err, genfs.ErrStale) {
+		t.Fatalf("Edge of a never-looked-up inode = %v, want ErrStale: there is no "+
+			"reverse index from inode to name, and the honest answer is to say so", err)
+	}
+
+	if _, err := fs.LookupPath(ctx, "/d/sub/f.txt"); err != nil {
+		t.Fatalf("LookupPath: %v", err)
+	}
+	// Every step of the descent, child to root, with the name it was
+	// reached by -- not just the parent Parent() already answered.
+	for _, want := range []struct {
+		ino    uint64
+		parent uint64
+		name   string
+	}{
+		{fileIno, sub, "f.txt"},
+		{sub, dir, "sub"},
+		{dir, genfs.RootInode, "d"},
+	} {
+		parent, name, err := fs.Edge(want.ino)
+		if err != nil || parent != want.parent || name != want.name {
+			t.Fatalf("Edge(%d) = %d/%q, %v; want %d/%q", want.ino, parent, name, err, want.parent, want.name)
+		}
+		// And it is a step that still RESOLVES, which is the property the
+		// caller is relying on: an edge is immutable within a generation,
+		// so replaying it is always allowed.
+		n, err := fs.Lookup(ctx, parent, name)
+		if err != nil || n.Inode != want.ino {
+			t.Fatalf("replaying Edge(%d) as Lookup(%d, %q) gave inode %d, %v; want %d",
+				want.ino, parent, name, n.Inode, err, want.ino)
+		}
+	}
+}

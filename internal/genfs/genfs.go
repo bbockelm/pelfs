@@ -542,18 +542,46 @@ func (fs *FS) Parent(ino uint64) (uint64, error) {
 	if ino == RootInode {
 		return RootInode, nil
 	}
+	p, _, err := fs.Edge(ino)
+	return p, err
+}
+
+// Edge returns the DESCENT STEP an inode's residency was established by:
+// the parent it was reached through and the name it was reached by. It is
+// the pair Swap replays to re-resolve an inode when the generation
+// changes, handed out so that a caller CACHING the same fact can refill
+// its cache from the source instead of failing on a miss.
+//
+// The pair is authoritative for as long as this generation is the one
+// being served, because edges are immutable within a generation: a step
+// that resolved once resolves again. Only a descent fills it, so the name
+// is always one THIS generation holds — never a name some overlay
+// invented on top. For a hardlinked file it is the most recent path used,
+// which is all POSIX promises and, for re-descending, all anyone needs:
+// any one valid step is as good as another.
+//
+// ErrStale when the inode has no residency, and that is the honest answer
+// rather than a gap to be filled in: the catalog is a locator by descent
+// with no parent pointers, by design, so there is no reverse index to
+// consult and an inode no descent ever reached is one nothing here can
+// name. The root is named by no edge at all and returns ErrNotExist;
+// callers walking a chain upward stop before asking.
+func (fs *FS) Edge(ino uint64) (uint64, string, error) {
+	if ino == RootInode {
+		return 0, "", ErrNotExist
+	}
 	fs.swapMu.RLock()
 	defer fs.swapMu.RUnlock()
 	fs.mu.RLock()
 	defer fs.mu.RUnlock()
 	r, ok := fs.res[ino]
 	if !ok {
-		return 0, ErrStale
+		return 0, "", ErrStale
 	}
 	if r.parent == 0 {
-		return RootInode, nil
+		return RootInode, r.name, nil
 	}
-	return r.parent, nil
+	return r.parent, r.name, nil
 }
 
 // LookupPath descends from the root along a slash-separated path,

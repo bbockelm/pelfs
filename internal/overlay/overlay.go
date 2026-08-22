@@ -602,6 +602,46 @@ func (fs *FS) ensureBaseDepth(ctx context.Context, q querier, ino uint64, depth 
 // whole, so an existing row implies a complete tail). Called whenever an
 // inode detaches from its base path (rename, link): after that, the
 // merged namespace no longer walks the base path that granted residency.
+//
+// A step it cannot find in prov it asks the BASE for, because prov is a
+// cache of the base's own answer and a cache whose miss is a hard error is
+// not a cache. That used to be written the other way round — a miss was
+// declared unreachable, "detaching an inode requires having looked it up,
+// which records provenance" — and it was true of every caller but ONE.
+// link(2) names its source by BARE INODE: the kernel sends
+// LinkIn.Oldnodeid and internal/rawfuse passes it straight through, so a
+// link resolves no name and records no provenance on the way in. It used
+// not to matter, because nothing ever deleted from prov. Then the
+// checkpoint's provenance sweep (rebase.go) started dropping the entry for
+// every inode a published generation cleaned, to bound a map that was
+// otherwise 6.6 GB at the hundred-million-object target — and turned an
+// unreachable error into an ordinary one:
+//
+//	overlay: no base provenance for inode N
+//
+// on a plain `ln` after a checkpoint. The sweep's own test says a sweep
+// that made a published inode unreachable would be trading an
+// out-of-memory kill for an ESTALE; it checked reading and writing, and
+// link is the reachability it missed.
+//
+// What a MOUNT has to do to reach it, since the link fails only when no
+// LOOKUP intervenes: the kernel must answer from a dentry it still holds,
+// and the plainest way there is a SECOND session over a file an earlier
+// one published. A fresh mount's dirty set is empty, so its first lookup
+// of that file is stamped CLEAN — ten years (rawfuse.validity) — and
+// editing the file afterwards makes it dirty without un-caching the dentry
+// the kernel already has. The checkpoint that publishes the edit then
+// sweeps this map underneath it, and the `ln` arrives with a bare inode
+// and nothing behind it. Inside ONE session the two conditions race
+// rather than compose, because rawfuse's dirty mark is sticky and holds
+// the TTL down to a second. Both are pinned, with the reasoning, in
+// internal/overlay/linkprov_test.go.
+//
+// genfs.Edge is the source: genfs records (parent, name) for every
+// resident inode, only a descent fills it, and base edges are immutable
+// within a generation. The answer is not written back into prov — the row
+// this loop is about to insert is the durable home for the fact, and
+// refilling the map would re-grow precisely what the sweep bounds.
 func (fs *FS) persistChainLocked(tx querier, ino uint64) error {
 	for ino != RootInode {
 		var one int64
@@ -614,9 +654,20 @@ func (fs *FS) persistChainLocked(tx querier, ino uint64) error {
 		}
 		pe, ok := fs.prov[ino]
 		if !ok {
-			// Unreachable under the kernel contract: detaching an inode
-			// requires having looked it up, which records provenance.
-			return fmt.Errorf("overlay: no base provenance for inode %d", ino)
+			parent, name, err := fs.base.Edge(ino)
+			if err != nil {
+				// Neither cache nor base can name it. For the inode the
+				// operation NAMED this cannot happen: reaching here means
+				// its attrs came back from the base, which needs the very
+				// residency Edge reads. An ANCESTOR can, if MaxResident
+				// evicted it — the FUSE backstop is far above any real
+				// dcache, and where it does fire this is the same ESTALE
+				// every other base-facing operation on that inode already
+				// gets. Say which inode and why, so the next reader is not
+				// left deducing it from a bare refusal.
+				return fmt.Errorf("overlay: no base provenance for inode %d, and the base cannot name it either: %w", ino, err)
+			}
+			pe = provEdge{parent: parent, name: name}
 		}
 		if _, err := tx.Exec(`INSERT OR REPLACE INTO obase (inode, parent, name) VALUES (?, ?, ?)`,
 			int64(ino), int64(pe.parent), []byte(pe.name)); err != nil {

@@ -115,6 +115,33 @@
 
 ### Changed
 
+- **`ln` works on a file an earlier session published.** Hard-linking such a
+  file on a writable FUSE mount failed with `overlay: no base provenance for
+  inode N` — EIO at the `ln` — once the current session had edited it and a
+  checkpoint had published the edit. Mount a state directory, open a file
+  that was already there, change it, keep working, then hard-link it: that
+  was enough.
+
+  Nothing was lost or corrupted; the operation refused. The cause was a
+  memory fix reaching further than intended. `link(2)` is the only namespace
+  operation that names its source by **bare inode** and resolves no name, so
+  the write path only hears about the file if something else looked it up
+  first. That was always true and never mattered, because the cache of
+  descent steps it consults was emptied by nothing — until checkpoints began
+  sweeping it for everything they published, to keep it from reaching 6.6 GB
+  on a hundred-million-object volume. A cache miss that had been declared
+  impossible became ordinary, and the kernel's directory-entry cache is what
+  decides whether a lookup refills it: the entry a mount stamps for a file it
+  has not touched is valid for ten years, so an edit does not un-cache it and
+  no lookup precedes the link.
+
+  The miss now asks the base generation, which holds the same step for every
+  inode a descent has reached — so the sweep keeps its bound and the link
+  succeeds. An inode nothing ever looked up still gets `ESTALE`, which is the
+  honest answer and is not reachable from a mount.
+
+  The path frontends were never affected: NFS resolves `link` by path.
+
 - **A state directory can be mounted for writing more than once.** Four
   ordinary operations left one that no writable mount would ever open again:
   write a file, let a checkpoint publish it, overwrite part of it, let a

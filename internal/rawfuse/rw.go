@@ -181,6 +181,32 @@ func (r *raw) Symlink(cancel <-chan struct{}, header *fuse.InHeader, pointedTo, 
 }
 
 // Link hard-links Oldnodeid into (NodeId, name).
+//
+// This is the ONE request that names a non-directory by BARE INODE and
+// resolves no name for it, which makes it the one place a layer below can
+// be handed an inode with no descent behind it. Worth naming, because a
+// bug was filed against exactly that (see persistChainLocked in
+// internal/overlay): the write path cached a base descent step per inode,
+// a checkpoint started sweeping the cache to bound its memory, and a plain
+// `ln` of a file the kernel still had a cached dentry for arrived here with
+// nothing to refill it. The dirty set below is half of when that happens —
+// its stickiness is what keeps a dentry's TTL down to a second for
+// anything THIS session touched, so the reachable shape is a second
+// session over a file an earlier one published.
+//
+// The audit behind "the one": across every FUSE request struct, the only
+// inode numbers are InHeader.NodeId (the operand or parent, which every
+// handler here treats as such), LinkIn.Oldnodeid (this), RenameIn.Newdir
+// — a destination DIRECTORY that always travels with newName, and
+// overlay.Rename takes (parent, name) pairs, so its subject is resolved by
+// construction — and CopyFileRangeIn.NodeIdOut, which is refused with
+// EROFS (rawfuse.go) and would be the second door to this class if it were
+// ever implemented. Everything else is a file handle, an offset, a length,
+// a lock owner: Open hands out Fh 0, so there is no open-by-handle path at
+// all, and a dir handle only ever remembers the NodeId its OPENDIR
+// carried. FORGET is the other half of why the fallback is dependable
+// here: overlay.Forget is a no-op, so base residency on a read-write mount
+// outlives anything the kernel says about it.
 func (r *raw) Link(cancel <-chan struct{}, input *fuse.LinkIn, name string, out *fuse.EntryOut) fuse.Status {
 	if r.ov == nil {
 		return fuse.EROFS

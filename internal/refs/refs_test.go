@@ -1,10 +1,13 @@
 package refs
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"errors"
+	"io"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/bbockelm/pelfs/internal/fakeorigin"
@@ -289,5 +292,108 @@ func TestFetchRefusesARolledBackHead(t *testing.T) {
 	}
 	if _, err := s.Fetch(ctx, "main"); err != nil {
 		t.Fatalf("re-reading the current generation must succeed: %v", err)
+	}
+}
+
+// admitBothStore lets TWO writers' flips land, in order, on one key: our Put
+// goes through and then a second one lands on top of it, before our caller
+// gets control back.
+//
+// It is the check-then-put window made deterministic. The window is real —
+// the transports offer no conditional PUT, which is why Flip compares an
+// ETag and then writes — but it is a handful of milliseconds wide in
+// practice, so provoking it by timing is the kind of test df54b95 removed
+// from the lease package: it passes by luck and hangs by luck. Here the
+// interleaving is the store's behaviour, so the question under test is not
+// "can the race happen" but "when it happens, does the loser find out".
+type admitBothStore struct {
+	pelicanobj.Store
+	key    string
+	winner []byte // what lands on top of ours, once
+	armed  bool
+}
+
+func (s *admitBothStore) Put(ctx context.Context, key string, r io.Reader) error {
+	if err := s.Store.Put(ctx, key, r); err != nil {
+		return err
+	}
+	if !s.armed || key != s.key {
+		return nil
+	}
+	s.armed = false
+	return s.Store.Put(ctx, s.key, bytes.NewReader(s.winner))
+}
+
+// TestFlipLearnsItWasClobbered.
+//
+// WHAT THIS CHANGES is not the outcome — the race is unpreventable without a
+// compare-and-swap the transport does not have — but who knows about it.
+// Before, both writers' Puts succeeded, both Flips returned nil, and one
+// generation simply ceased to exist: no branch named it, so its packs became
+// garbage nobody had asked to collect, and the writer that lost went on to
+// report a generation that was not on the branch.
+func TestFlipLearnsItWasClobbered(t *testing.T) {
+	ctx := context.Background()
+	base := newInner(t)
+	pub, priv := genKey(t)
+
+	g0 := gen(t, 0, nil, priv, nil)
+	if err := base.Put(ctx, "refs/main", bytes.NewReader(g0)); err != nil {
+		t.Fatal(err)
+	}
+	// Two writers, both building generation 1 on generation 0 — the ordinary
+	// shape of the race, and the reason a length comparison would not do:
+	// their superblocks are the same size.
+	ours := gen(t, 1, g0, priv, func(sb *superblock.Superblock) { sb.CreatedUnixNano = 5001 })
+	theirs := gen(t, 1, g0, priv, func(sb *superblock.Superblock) { sb.CreatedUnixNano = 5002 })
+	if len(ours) != len(theirs) {
+		t.Fatalf("the two generations differ in length (%d vs %d), so this test would pass on a size "+
+			"check alone and would not be testing what it claims", len(ours), len(theirs))
+	}
+
+	store := &admitBothStore{Store: base, key: "refs/main", winner: theirs, armed: true}
+	s, err := New(store, t.TempDir(), pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := s.Fetch(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = s.Flip(ctx, "main", ours, f.ETag)
+	if !errors.Is(err, ErrFlipClobbered) {
+		t.Fatalf("Flip that was overwritten: err = %v, want ErrFlipClobbered", err)
+	}
+	if errors.Is(err, ErrStaleFlip) {
+		t.Error("a clobbered flip was reported as a stale one; the first means 'we published and lost' " +
+			"and the second 'we refused to publish', and only one of them leaves orphan packs")
+	}
+	// The generation and the way out, both named: the caller keeps its work
+	// and has to know which generation to stop believing in.
+	for _, want := range []string{"generation 1", "superseded", "reseal"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("clobber report does not mention %q: %v", want, err)
+		}
+	}
+	// The branch really does hold the other writer's generation: the loser's
+	// bytes are gone, which is the fact the error is reporting.
+	cur, err := pelicanobj.ReadMutable(ctx, base, "refs/main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(cur, theirs) {
+		t.Fatal("the setup did not actually let the second write land")
+	}
+
+	// And the winner — an unclobbered flip through the same store, now
+	// disarmed — succeeds silently, so the check costs correct flips nothing.
+	next := gen(t, 2, theirs, priv, nil)
+	f2, err := s.Fetch(ctx, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Flip(ctx, "main", next, f2.ETag); err != nil {
+		t.Fatalf("an uncontested flip was refused: %v", err)
 	}
 }

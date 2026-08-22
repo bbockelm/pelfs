@@ -218,7 +218,49 @@ func (s *Store) Flip(ctx context.Context, branch string, raw []byte, expectETag 
 	if err := s.inner.Put(ctx, key, strings.NewReader(string(raw))); err != nil {
 		return fmt.Errorf("flip ref %s: %w", branch, err)
 	}
+	// READ IT BACK. The guard above is check-then-put, so a writer that put
+	// between our check and our put wins by arriving later, and until now
+	// that outcome was indistinguishable from success: both writers returned
+	// nil, one generation vanished from every root set, and its packs became
+	// garbage nobody had asked to collect. This cannot prevent it — there is
+	// no conditional PUT to have — but it turns silent loss into a named
+	// failure while the loser still holds its work.
+	if err := pelicanobj.VerifyPut(ctx, s.inner, key, raw); err != nil {
+		if errors.Is(err, pelicanobj.ErrClobbered) {
+			return fmt.Errorf("%w: ref %s was overwritten between this flip's check and its write; "+
+				"generation %s may be superseded and this publish must be considered LOST. "+
+				"nothing local is gone: re-fetch the branch head and reseal on top of it",
+				ErrFlipClobbered, branch, describeGeneration(raw))
+		}
+		// Unreadable rather than clobbered. The Put succeeded, so the
+		// generation is probably published; say what is and is not known
+		// instead of picking one.
+		return fmt.Errorf("flip ref %s: the write succeeded but could not be read back (%w); "+
+			"re-fetch the branch head to see which generation it holds", branch, err)
+	}
 	return nil
+}
+
+// ErrFlipClobbered reports that refs/<branch> did not hold this flip's bytes
+// immediately after the flip wrote them: another writer's Put landed inside
+// the check-then-put window.
+//
+// It is deliberately NOT ErrStaleFlip. That one means "we refused to
+// publish", which is a safe outcome a caller retries from; this one means
+// "we published and lost", which is a caller's generation gone missing and
+// its packs orphaned. Conflating the two would file the only unrecoverable
+// case under the recoverable one's advice.
+var ErrFlipClobbered = errors.New("flip was overwritten concurrently")
+
+// describeGeneration names the generation in a message when the bytes can
+// be decoded, and says so plainly when they cannot. A diagnostic must not
+// become a second error.
+func describeGeneration(raw []byte) string {
+	sb, err := superblock.Decode(raw)
+	if err != nil {
+		return "(the generation this flip wrote could not be decoded for this message)"
+	}
+	return fmt.Sprintf("%d", sb.Generation)
 }
 
 // ErrTagExists reports an attempt to write a tag that is already there.

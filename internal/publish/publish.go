@@ -1692,6 +1692,22 @@ func flip(ctx context.Context, o Options, raw []byte) error {
 	if err := o.Inner.Put(ctx, key, bytes.NewReader(raw)); err != nil {
 		return fmt.Errorf("publish: flip %s: %w", key, err)
 	}
+	// And read it back, through the same cache-bypassing store the compare
+	// used. The compare above is check-then-put, so a writer that lands
+	// between the two wins by arriving later — and that used to be
+	// indistinguishable from success from in here: this function returned
+	// nil, the seal reported a generation, and the generation was not on the
+	// branch. One extra Get of a ~1 KB object, at the end of a publish that
+	// has just uploaded packs, buys the loser the news.
+	if err := pelicanobj.VerifyPut(ctx, inner, key, raw); err != nil {
+		if errors.Is(err, pelicanobj.ErrClobbered) {
+			return fmt.Errorf("publish: %s was overwritten between this seal's check and its write "+
+				"(%w); this generation may be superseded and must be considered LOST. nothing local "+
+				"is gone: re-read the branch head and reseal on top of it", key, err)
+		}
+		return fmt.Errorf("publish: %s was written but could not be read back (%w); re-read the branch "+
+			"head to see which generation it holds", key, err)
+	}
 	return nil
 }
 

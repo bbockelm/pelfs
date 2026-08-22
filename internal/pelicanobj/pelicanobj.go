@@ -15,6 +15,7 @@
 package pelicanobj
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -238,6 +239,56 @@ func ReadMutable(ctx context.Context, s Store, key string) ([]byte, error) {
 	ui.Warn("unverified re-read of {key} succeeded; continuing on signature and generation checks",
 		"key", key)
 	return raw, nil
+}
+
+// ErrClobbered reports that a mutable object does NOT hold the bytes this
+// process last wrote to it: somebody else's Put landed after ours.
+//
+// It is post-hoc and it cannot prevent anything — there is no
+// compare-and-swap on this transport, which is the fact the whole
+// check-then-put design in internal/refs is built around. What it converts
+// is the FAILURE MODE. A lost race used to be perfectly silent: both
+// writers' Puts succeeded, both callers returned nil, and one generation
+// simply ceased to exist, taking its packs out of every root set with it.
+// Now the loser is told, by name, while it still has its work.
+var ErrClobbered = errors.New("mutable object was overwritten concurrently")
+
+// VerifyPut reports whether key holds exactly want, which is the question a
+// writer with no conditional PUT has to ask AFTER the fact.
+//
+// HOW, and why it is not a stat. The obvious cheap check is to re-stat and
+// compare ETags, and it does not work here: neither transport promises a
+// content digest in that field — the test origin derives it from size and
+// mtime (fakeorigin.etagFor), and an HTTP origin's ETag is opaque by
+// specification — so an ETag observed after the Put is simply "whatever is
+// there now", ours or not. Size is no better: two writers sealing the same
+// parent produce superblocks of near-identical length, so the one case
+// worth catching is the one a length comparison misses.
+//
+// So it reads the bytes back and compares them. The cost is ONE extra Get of
+// one small mutable object (a superblock head, ~1 KB in the common case and
+// bounded by MaxMutableObject) per flip — that is, per publish, against
+// which it does not register. It goes through ReadMutable so an origin
+// serving a digest that disagrees with its own body produces the loud
+// re-read rather than a false clobber report.
+//
+// THE WINDOW IS NOT CLOSED, only narrowed and made observable. A second
+// writer landing after this read still goes unnoticed by the caller that
+// read first, and if both writers verify, exactly one of them sees the
+// other. Detection, as everywhere else in this package's mutable path.
+func VerifyPut(ctx context.Context, s Store, key string, want []byte) error {
+	got, err := ReadMutable(ctx, s, key)
+	if err != nil {
+		// Not a clobber: unknown. Callers must not treat an unreadable
+		// object as proof their write survived OR that it did not, so the
+		// error keeps its own identity.
+		return fmt.Errorf("verify %s after writing it: %w", key, err)
+	}
+	if bytes.Equal(got, want) {
+		return nil
+	}
+	return fmt.Errorf("%w: %s holds %d bytes, not the %d this process wrote",
+		ErrClobbered, key, len(got), len(want))
 }
 
 // readWhole reads an object with a hard ceiling, so a mutable object that

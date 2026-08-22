@@ -146,7 +146,7 @@ require (
 //
 // Dropping this therefore needs all of those upstream, not just the
 // first. Checked against pelican main on 2026-08-17: still required.
-replace github.com/pelicanplatform/pelican => github.com/bbockelm/pelican v0.0.0-20260822192556-24daf8215dad
+replace github.com/pelicanplatform/pelican => github.com/bbockelm/pelican v0.0.0-20260822203357-885e9818ade8
 
 // Fork replace: LINK misparsed its own arguments and answered failures
 // with an undersized reply, so hard links reached clients as EIO;

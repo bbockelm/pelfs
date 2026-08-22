@@ -3,6 +3,7 @@ package memtable
 import (
 	"sort"
 
+	"github.com/bbockelm/pelfs/internal/catalog"
 	"github.com/bbockelm/pelfs/internal/packstore"
 )
 
@@ -32,6 +33,10 @@ type Journal interface {
 	// Append records one content-map operation. Called with the store's
 	// lock held, in the order the operations happened.
 	Append(e JournalEntry) error
+	// Adopted records the records an adopted handle was taken with, before
+	// the OpAdopt entry that names the handle. Also called with the store's
+	// lock held. See AdoptedExtent for why this is written down at all.
+	Adopted(h Handle, a AdoptedExtent) error
 	// Located records where a flush put things: the extents that now have
 	// chunk slices, the chunks those name, and the packs holding them.
 	// Also called with the store's lock held, from the flusher rather
@@ -66,6 +71,43 @@ type JournalEntry struct {
 	Handle Handle
 	Off    int64
 	Length int64
+}
+
+// AdoptedExtent is the durable record of one adopted handle: the base
+// generation's own content records for that file, as they were when the
+// store took it over.
+//
+// Recovery used to re-derive this by asking the base for the inode again,
+// on the stated grounds that the base is immutable and "still describes
+// those files exactly as it did when they were taken over". The base is
+// immutable; THE BASE A LATER MOUNT HAS IS NOT THE SAME ONE. A checkpoint
+// publishes a new generation and the mount swaps onto it, so by the time
+// anyone replays this journal the generation the handle was taken from is
+// two removes back — and, worse, the question cannot even be asked: genfs
+// answers for an inode only after a descent has made it resident
+// (genfs.ErrStale), and a mount that has just started has descended
+// nothing. That is what made a state directory holding an adopted handle
+// unopenable for writing, which is the one failure a local overlay must
+// not have (docs/TODO.md, readopt-agent).
+//
+// So the records are written down. They are IDENTITIES, not locations:
+// what a chunkref names is content-addressed and immutable, valid in every
+// generation that still holds the chunk, whereas the pack a chunk sits in
+// is rewritten by a repack. Recording where the bytes were would have
+// bought a row that a maintenance operation can invalidate; recording what
+// they are cannot go stale.
+type AdoptedExtent struct {
+	// Inode is the base inode the records came from. It is checked on the
+	// way back in: a record whose inode disagrees with the operation log's
+	// is not this handle's record.
+	Inode uint64
+	// Length is the base's length for the file, which is what Adopt
+	// clamped its prefix against.
+	Length int64
+	// Refs are the base's chunk records, in file order. Every one has an
+	// identity: Adopt falls back to reading for inline bodies and holes, so
+	// a handle that reaches here is one whose extents are all named.
+	Refs []catalog.ChunkRef
 }
 
 // Location is one flush's half of the durable state: the binding from

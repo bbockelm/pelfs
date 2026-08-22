@@ -290,6 +290,25 @@ func (g *genSession) openContent(ctx context.Context, disabled bool) (*memtable.
 		OnUpload:          g.reportSessionUpload,
 	})
 	if err != nil {
+		// The one refusal recovery still has is the one a user cannot act on
+		// without being told where the state directory is and what is still
+		// intact, and this is the layer that knows both. Everything through
+		// the last checkpoint IS published: a checkpoint signs a generation
+		// and any client can mount it, so the escape below costs only what
+		// was written after it.
+		var stuck *memtable.UnresolvedAdoptionsError
+		if errors.As(err, &stuck) {
+			return nil, fmt.Errorf("%w\n"+
+				"these extents were taken from a published generation by reference, and this "+
+				"state directory does not say which chunks they are — a mount that has just "+
+				"started cannot ask the generation, and serving the files without them would "+
+				"mean writing zeros over content that still exists.\n"+
+				"what is still yours: every generation this volume ever published, including "+
+				"the last checkpoint's. Mount without --rw to read it, or `pelfs fsck` it.\n"+
+				"to write again: move %s and %s aside (a fresh --state-dir does the same). "+
+				"That discards what was written after the last checkpoint, and nothing else",
+				err, filepath.Join(g.stateDir, "content"), g.overlayDir)
+		}
 		return nil, fmt.Errorf("open the write path's content store: %w", err)
 	}
 	// Recovery is allowed to lose content — a mount is tied to a job, and

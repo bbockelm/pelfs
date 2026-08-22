@@ -153,6 +153,12 @@ type Stats struct {
 	AdoptedBytes     int64
 	AdoptedInline    int64
 	AdoptedByReading int64
+	// DroppedAdoptions counts adopted handles a RECOVERY found in the
+	// journal that no surviving content row named — the residue a
+	// checkpoint leaves when it publishes an adopted file and rebases the
+	// inode clean. It is not loss, and it is counted because recovery used
+	// to refuse to start over one.
+	DroppedAdoptions int64
 	// UploadBacklog is bytes cut into packs and not yet sent. It is the
 	// measure of how far a session is running ahead of its uplink, and
 	// the thing that eventually applies backpressure.

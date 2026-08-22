@@ -1600,32 +1600,14 @@ func inheritPhase(t *testing.T, r *rig, c *campaign, backend, base, stateDir, mn
 	if err := r.tryStartMount(backend, stateDir, mntDir, snapshotInterval(t), "inherit-"+backend+".log"); err != nil {
 		// A SECOND WRITABLE SESSION ON ITS OWN STATE DIRECTORY IS AN
 		// ORDINARY THING TO DO, and a refusal to start is worse than any
-		// divergence: it is the whole volume, not one file.
-		//
-		// THIS IS A FILED OPEN FINDING and it is why the report below is
-		// not an Errorf. `memtable: re-adopt inode N: genfs: stale inode
-		// (no residency)` is reproduced deterministically by
-		// testdata/corpus/second-session-refuses-after-adopt.plan, which
-		// is marked `known-open all` and therefore FAILS if it ever stops
-		// reproducing -- so this allowance cannot outlive the bug it
-		// allows for. What it buys is a random lane that keeps reporting
-		// everything ELSE: any plan containing checkpoint-then-partial-
-		// overwrite reaches this, which is most of them now, and a gate
-		// that is red two runs in three is a gate somebody switches off.
-		// The same reasoning and the same shape as the permission
-		// attribution above (see campaign.permPaths).
-		//
-		// WHEN IT IS FIXED: the corpus entry goes red, its marker comes
-		// off, and isReadoptRefusal goes with it.
-		//
-		// A corpus entry that PINS this takes the c.note path, because
-		// that is what counts an observation and therefore what makes the
-		// entry fail if the finding ever stops reproducing. The bare
-		// allowance is only for the random lane.
-		if isReadoptRefusal(err) && !c.expectDiverge {
-			logReadoptFinding(t, c.backend, "phase C2", err)
-			return
-		}
+		// divergence: it is the whole volume, not one file. There is no
+		// allowance here for any refusal, and there used to be one --
+		// `memtable: re-adopt inode N: genfs: stale inode (no residency)`,
+		// which every plan containing checkpoint-then-partial-overwrite
+		// reached. It is fixed (readopt-agent), the corpus entry that
+		// reproduced it is a passing regression now, and the recogniser
+		// that let the random lane past it is deleted rather than left to
+		// absorb the next refusal that looks like it.
 		c.note("phase C2: a second writable session REFUSED TO START on the state directory "+
 			"the first one sealed cleanly (%s backend). Mounting a volume again from the same "+
 			"machine is the ordinary case, and this is the whole volume rather than one file:\n%s",
@@ -1648,26 +1630,6 @@ func inheritPhase(t *testing.T, r *rig, c *campaign, backend, base, stateDir, mn
 	c.mnt.close()
 	r.stopAndSeal()
 	t.Logf("phase C2: %d rewrite(s) of inherited compressible files, sealed and read back cold", len(ops)-1)
-}
-
-// isTheReadoptFinding recognises the ONE open finding that stops a
-// writable mount from starting, reports it as the expected observation it
-// currently is, and says so. Everything else that stops a mount is a
-// failure.
-//
-// It exists in exactly one place so that removing it when the bug is
-// fixed is one deletion, and it cannot quietly outlive the bug: the
-// corpus entry that pins the same sequence is marked `known-open all` and
-// FAILS the moment the divergence stops reproducing.
-func isReadoptRefusal(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "re-adopt inode")
-}
-
-func logReadoptFinding(tb testing.TB, backend, phase string, err error) {
-	tb.Logf("%s: EXPECTED (known-open finding, %s backend): a writable mount refused to start on "+
-		"a state directory whose journal holds an adopted handle, because the base has moved on "+
-		"since. Pinned by testdata/corpus/second-session-refuses-after-adopt.plan:\n%s",
-		phase, backend, indent(err.Error()))
 }
 
 // inheritedRewrites picks files the plan wrote with COMPRESSIBLE bodies
@@ -1743,14 +1705,10 @@ func crashPhase(t *testing.T, r *rig, c *campaign, backend, base, stateDir, refD
 	// so everything it wrote is unsealed when it dies. That is the state
 	// recovery exists for.
 	// --snapshot-interval 0 and the SAME state dir as phase A, so this is
-	// also a reopen: it meets the known-open re-adopt finding whenever the
-	// plan contained an adoption. See isTheReadoptFinding.
+	// also a reopen: whenever the plan contained an adoption, this is the
+	// mount that has to resume it from what the journal recorded. It used
+	// to be allowed to refuse (the re-adopt finding); it is not.
 	if err := r.tryStartMount(backend, stateDir, mntDir, 0, "crash-"+backend+".log"); err != nil {
-		if isReadoptRefusal(err) {
-			logReadoptFinding(t, backend, "phase E", err)
-			t.Log("phase E: skipped, because the mount it needs cannot start until that finding is fixed")
-			return
-		}
 		t.Fatal(err.Error())
 	}
 	c.mnt = openTree(t, "crashing mount", mntDir)

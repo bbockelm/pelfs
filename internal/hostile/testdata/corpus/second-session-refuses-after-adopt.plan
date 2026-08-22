@@ -1,17 +1,16 @@
 # hostile plan: seed=0 ops=4
-# expect: known-open all
 #
-# A SECOND WRITABLE SESSION REFUSES TO START, and the state directory is
-# left unusable for writing. Found at HEAD (8a97e58) by the second-session
-# phase this vocabulary added; FILED, NOT FIXED -- product code was
-# outside this run's territory and two other agents were in it.
+# A SECOND WRITABLE SESSION OVER AN ADOPTED FILE. Found by the
+# second-session phase this vocabulary added (at 8a97e58), filed unfixed,
+# and FIXED by readopt-agent -- so this entry is now a regression that must
+# PASS, and the marker it used to carry is gone. What it pins:
 #
 #     ERROR pelfs: open the write path's content store:
 #     memtable: re-adopt inode 3: genfs: stale inode (no residency)
 #
-# `pelfs mount-gen --rw` exits 1 before mounting. It is not one file: the
-# volume cannot be mounted for writing from that state directory again, by
-# this harness or by a user. Both frontends, every run.
+# `pelfs mount-gen --rw` exited 1 before mounting, and not for one file:
+# the volume could not be mounted for writing from that state directory
+# again, by this harness or by a user. Both frontends, every run.
 #
 # THE SEQUENCE, and it is four operations:
 #   1. write a file
@@ -20,26 +19,32 @@
 #      from that base by reference (memtable.Store.Adopt), journalling an
 #      adopted handle against the generation it adopted from
 #   4. let a SECOND checkpoint publish, and seal
-# Then mount the same state directory --rw again. Recovery replays the
-# journal and re-adopts every adopted handle against whatever base the
-# mount now has (memtable/recover.go:218, `Adopted extents come back from
-# the base, which still describes those files exactly as it did when they
-# were taken over`). Two checkpoints and a seal later that comment is no
-# longer true, and ContentOf refuses.
+# Then mount the same state directory --rw again. Recovery replayed the
+# journal and re-adopted every adopted handle against whatever base the
+# mount now had (memtable/recover.go, `Adopted extents come back from the
+# base, which still describes those files exactly as it did when they were
+# taken over`). Two checkpoints later that comment was no longer true and
+# ContentOf refused -- a freshly opened generation answers for an inode
+# only after a descent has made it resident, and a mount that has just
+# started has descended nothing.
 #
 # WHAT IS AND IS NOT LOAD-BEARING, measured one variant at a time:
 #   - the SECOND checkpoint is required. Drop the last settle and the same
-#     plan passes: one checkpoint, one adoption, no reopen failure.
-#   - the FILL IS IRRELEVANT. `fill=41` reproduces it identically. It is
+#     plan passed even at 8a97e58: one checkpoint, one adoption, no reopen
+#     failure. What the second one does is REBASE the published inode
+#     clean, which Forgets its content -- so the handle recovery refused
+#     over was one that no surviving content row named, and that it would
+#     have deleted as dead-on-arrival three lines later.
+#   - the FILL IS IRRELEVANT. `fill=41` reproduced it identically. It is
 #     written as fill=text here for one mechanical reason: phase C2 picks
 #     its rewrite targets from files the plan wrote with a compressible
 #     body, because for an incompressible one a re-chunked row is
 #     accidentally correct and proves nothing. So the fill selects the
 #     file, and nothing else.
-#   - no deletion is needed. unlink, rename and truncate-to-zero of the
-#     adopted file all reproduce it, and so does leaving it alone, which
+#   - no deletion was needed. unlink, rename and truncate-to-zero of the
+#     adopted file all reproduced it, and so did leaving it alone, which
 #     is what made the four-op form findable.
-#   - both frontends, deterministically. On FUSE it fires twice per run
+#   - both frontends, deterministically. On FUSE it fired twice per run
 #     (phase C2 and phase E, which also reopens the state directory); on
 #     NFS once, because phase E is FUSE-only by design.
 #
@@ -48,6 +53,12 @@
 # directory, but on a plan that had no adoption in it, and the old
 # vocabulary had no shape that reliably produced checkpoint-then-partial-
 # overwrite -- which is the only way an adoption happens.
+#
+# THE FIX, in one line each, and both are pinned by ordinary-lane tests in
+# internal/memtable and internal/publish (see docs/TODO.md, readopt-agent):
+# an adopted handle no surviving row names is never resolved at all, and
+# the records of one that IS named come from the journal, which records
+# them at adoption time instead of asking a base that has moved on.
 mkdir ad mode=0755
 create ad/a.log len=40000 fill=text:11 # the body a checkpoint will publish
 settle ms=1100 # checkpoint: now it is in a base generation

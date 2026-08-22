@@ -114,6 +114,15 @@ func (s *Store) Adopt(ctx context.Context, ino uint64, length int64) error {
 	defer s.mu.Unlock()
 	h := s.nextHandle
 	s.nextHandle++
+	// The records go down BEFORE the operation that names the handle, so a
+	// replay never meets an OpAdopt whose records are missing. They are the
+	// only way a later mount can resolve this handle at all: see
+	// AdoptedExtent for why asking the base again is not one.
+	if s.journal != nil {
+		if err := s.journal.Adopted(h, AdoptedExtent{Inode: ino, Length: c.Length, Refs: c.Refs}); err != nil {
+			return fmt.Errorf("memtable: record the adoption of inode %d: %w", ino, err)
+		}
+	}
 	cnt := s.contentFor(ino)
 	dropped := make(map[Handle]int)
 	cnt.punch(0, cnt.size, dropped)

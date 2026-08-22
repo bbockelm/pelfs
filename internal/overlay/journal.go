@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 
+	"github.com/bbockelm/pelfs/internal/catalog"
 	"github.com/bbockelm/pelfs/internal/memtable"
 	"github.com/bbockelm/pelfs/internal/packstore"
 )
@@ -73,6 +74,12 @@ CREATE TABLE IF NOT EXISTS opack (
 	trailer BLOB NOT NULL,
 	size    INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS oadopt (
+	handle INTEGER PRIMARY KEY,
+	inode  INTEGER NOT NULL,
+	length INTEGER NOT NULL,
+	refs   BLOB NOT NULL
+);
 `
 
 func openContentJournal(dir string) (*contentJournal, error) {
@@ -104,6 +111,14 @@ func openContentJournal(dir string) (*contentJournal, error) {
 }
 
 // journalSchemaVersion is bumped whenever the tables change shape.
+//
+// It is NOT bumped for a table ADDED to the set, and oadopt is the case:
+// bumping drops every table, which for a state directory a user is about
+// to resume means discarding the session's unsealed content — and doing it
+// silently, since a dropped operation log leaves nothing for the recovery
+// report to name. An added table starts empty on an older journal, which
+// is a state the reader handles (see memtable.UnresolvedAdoptionsError):
+// old rows keep their old meaning and new ones get the new one.
 const journalSchemaVersion = 2
 
 func resetIfOldSchema(db *sql.DB) error {
@@ -112,7 +127,7 @@ func resetIfOldSchema(db *sql.DB) error {
 		return fmt.Errorf("overlay: content journal version: %w", err)
 	}
 	if have != journalSchemaVersion {
-		for _, t := range []string{"ojournal", "ohandle", "ochunk", "opack"} {
+		for _, t := range []string{"ojournal", "ohandle", "ochunk", "opack", "oadopt"} {
 			if _, err := db.Exec(`DROP TABLE IF EXISTS ` + t); err != nil {
 				return fmt.Errorf("overlay: reset content journal: %w", err)
 			}
@@ -136,6 +151,24 @@ func (j *contentJournal) Append(e memtable.JournalEntry) error {
 	_, err := j.append.Exec(int64(e.Op), int64(e.Inode), int64(e.Handle), e.Off, e.Length)
 	if err != nil {
 		return fmt.Errorf("overlay: journal append: %w", err)
+	}
+	return nil
+}
+
+// Adopted records what an adopted handle was taken with. One row, written
+// before the operation log entry that names the handle, and never rewritten
+// — the records of a generation that has already been published cannot
+// change. INSERT OR REPLACE rather than INSERT because a handle number can
+// be reused across the lives of a state directory, and the row that matters
+// is this one.
+func (j *contentJournal) Adopted(h memtable.Handle, a memtable.AdoptedExtent) error {
+	blob, err := encodeChunkRefs(a.Refs)
+	if err != nil {
+		return fmt.Errorf("overlay: journal adoption of inode %d: %w", a.Inode, err)
+	}
+	if _, err := j.db.Exec(`INSERT OR REPLACE INTO oadopt (handle, inode, length, refs) VALUES (?, ?, ?, ?)`,
+		int64(h), int64(a.Inode), a.Length, blob); err != nil {
+		return fmt.Errorf("overlay: journal adoption of inode %d: %w", a.Inode, err)
 	}
 	return nil
 }
@@ -197,10 +230,35 @@ func (j *contentJournal) Load() (memtable.Durable, error) {
 	}
 
 	d := memtable.Durable{
-		Handles: map[memtable.Handle][]memtable.ChunkSlice{},
-		Chunks:  map[string]memtable.PackLoc{},
+		Handles:     map[memtable.Handle][]memtable.ChunkSlice{},
+		Chunks:      map[string]memtable.PackLoc{},
+		AdoptedRefs: map[memtable.Handle]memtable.AdoptedExtent{},
 	}
 	d.Rows, d.Adopted = memtable.ReplayJournal(entries)
+
+	arows, err := j.db.Query(`SELECT handle, inode, length, refs FROM oadopt`)
+	if err != nil {
+		return memtable.Durable{}, err
+	}
+	for arows.Next() {
+		var h int64
+		var a memtable.AdoptedExtent
+		var ino int64
+		var blob []byte
+		if err := arows.Scan(&h, &ino, &a.Length, &blob); err != nil {
+			arows.Close() //nolint:errcheck
+			return memtable.Durable{}, err
+		}
+		if a.Refs, err = decodeChunkRefs(blob); err != nil {
+			arows.Close() //nolint:errcheck
+			return memtable.Durable{}, err
+		}
+		a.Inode = uint64(ino)
+		d.AdoptedRefs[memtable.Handle(h)] = a
+	}
+	if err := closeRows(arows); err != nil {
+		return memtable.Durable{}, err
+	}
 
 	hrows, err := j.db.Query(`SELECT handle, slices FROM ohandle`)
 	if err != nil {
@@ -282,6 +340,46 @@ func encodeSlices(slices []memtable.ChunkSlice) []byte {
 		binary.LittleEndian.PutUint64(rec[40:], uint64(s.Length))
 	}
 	return out
+}
+
+// An adopted extent's records are fixed width too, for the same reason and
+// with the same shape as the slice list above: 32 bytes of identity, then
+// the five counts a chunkref carries. A hole (no identity) is refused
+// rather than encoded — Adopt never takes one by reference, so a row
+// holding one would mean the record does not describe the adoption it
+// claims to.
+const chunkRefRecordLen = 32 + 5*8
+
+func encodeChunkRefs(refs []catalog.ChunkRef) ([]byte, error) {
+	out := make([]byte, len(refs)*chunkRefRecordLen)
+	for i, r := range refs {
+		if len(r.Identity) != 32 {
+			return nil, fmt.Errorf("chunk record at offset %d has a %d-byte identity",
+				r.LogicalOffset, len(r.Identity))
+		}
+		rec := out[i*chunkRefRecordLen:]
+		copy(rec[0:32], r.Identity)
+		for j, v := range []int64{r.LLen, r.CLen, r.Alg, r.KeyID, r.LogicalOffset} {
+			binary.LittleEndian.PutUint64(rec[32+8*j:], uint64(v))
+		}
+	}
+	return out, nil
+}
+
+func decodeChunkRefs(b []byte) ([]catalog.ChunkRef, error) {
+	if len(b)%chunkRefRecordLen != 0 {
+		return nil, fmt.Errorf("overlay: adopted chunk records are %d bytes, not a multiple of %d",
+			len(b), chunkRefRecordLen)
+	}
+	out := make([]catalog.ChunkRef, len(b)/chunkRefRecordLen)
+	for i := range out {
+		rec := b[i*chunkRefRecordLen:]
+		out[i].Identity = append([]byte(nil), rec[0:32]...)
+		for j, p := range []*int64{&out[i].LLen, &out[i].CLen, &out[i].Alg, &out[i].KeyID, &out[i].LogicalOffset} {
+			*p = int64(binary.LittleEndian.Uint64(rec[32+8*j:]))
+		}
+	}
+	return out, nil
 }
 
 func decodeSlices(b []byte) ([]memtable.ChunkSlice, error) {

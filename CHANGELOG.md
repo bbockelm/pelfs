@@ -115,6 +115,46 @@
 
 ### Changed
 
+- **A state directory can be mounted for writing more than once.** Four
+  ordinary operations left one that no writable mount would ever open again:
+  write a file, let a checkpoint publish it, overwrite part of it, let a
+  second checkpoint publish that. The next `pelfs mount-gen --rw` exited 1
+  before mounting, with `memtable: re-adopt inode 3: genfs: stale inode (no
+  residency)`, and it was not one file — the volume could not be written from
+  that state directory again.
+
+  A partial write to a published file **adopts** it from the base generation
+  by reference rather than copying it, and the adoption was journalled as
+  "handle H came from inode N", on the reasoning that an immutable generation
+  can always be asked for N's records again. It cannot. The base a later
+  mount serves is a **later generation**, and a generation answers for an
+  inode only after a descent has made it resident — a mount that has just
+  started has descended nothing. So the adoption's records are written down
+  now, at adoption time, and recovery reads them instead of asking anything
+  outside the state directory. They are chunk **identities**, which are
+  content-addressed and survive a repack; a pack location would not have.
+
+  The four-op sequence had a second cause, and it is why the second
+  checkpoint was needed: publishing an adopted file rebases the inode clean,
+  which forgets its content, so the handle recovery refused over was one no
+  surviving row named — and one that recovery itself would have discarded
+  moments later. Nothing that no row names is resolved at all now.
+
+  The same refusal also met **every remount of an interrupted session** that
+  had adopted a file — kill -9, `--no-seal`, a failed seal — which no test
+  saw because the existing crash test reopens the content store against the
+  same live generation handle, inheriting residency a real remount does not
+  have. Both are pinned by ordinary-lane tests now, and the exerciser's
+  corpus entry for the sequence is a passing regression.
+
+  What is left is one honest refusal, for a state directory written by a
+  build that recorded no adoption records: those extents' bytes are
+  published and immutable, so dropping them would write zeros over live
+  content at the next seal, and refusing is safer than guessing. It now
+  names every affected inode at once and says what is still readable
+  (everything published, including the last checkpoint's generation) and
+  what it costs to start writing again.
+
 - **Removing one name of a hardlinked file decrements its link count.** It
   did not, when the file was one the base generation already held: the write
   overlay had no row for a clean inode, so it wrote the whiteout for the

@@ -26,8 +26,12 @@ import (
 // it finds. --base names one directly for the case where it is not
 // addressable, and is verified the same way.
 func cmdMerge(args []string) int {
-	var into, base, pubkeyHex string
+	var into, base, pubkeyHex, signingKey string
+	var apply bool
 	o, pos, err := parseArgs("merge", args, 2, 2, func(fs *flag.FlagSet, o *cmdOpts) {
+		fs.BoolVar(&apply, "apply", false, "carry the merge out (default: report only). "+
+			"Only a fast-forward can be applied yet")
+		fs.StringVar(&signingKey, "signing-key", "", signingKeyUsage)
 		fs.StringVar(&into, "into", "main", "branch the other one would be merged INTO")
 		fs.StringVar(&base, "base", "", "branch or tag holding the generation the two were cut from "+
 			"(default: found from the fork record)")
@@ -77,6 +81,44 @@ func cmdMerge(args []string) int {
 		// so it exits nonzero.
 		return 1
 	}
+	if !apply {
+		if !plan.FastForward {
+			fmt.Fprintln(mergeReportWriter, "nothing was written; applying a merged tree is not built yet")
+		} else {
+			fmt.Fprintln(mergeReportWriter, "nothing was written; re-run with --apply to fast-forward")
+		}
+		return 0
+	}
+	if !plan.FastForward {
+		// The tree would have to be built and published, which is the next
+		// piece of work. Refusing is the honest answer: the alternative is
+		// taking one side, which is a discard wearing a merge's name.
+		return exitErr(fmt.Errorf("this merge needs a tree built, and that is not implemented yet; "+
+			"only a fast-forward can be applied. %d paths would come from %s", plan.TookTheirs, source))
+	}
+	key, err := loadOrCreateSigningKey(signingKeyFileIn(stateDir, signingKey), ours.Superblock)
+	if err != nil {
+		return exitErr(err)
+	}
+	l, err := maintenanceLease(ctx, o, prefix, into, "merge-"+newSessionID())
+	if err != nil {
+		return exitErr(err)
+	}
+	defer releaseLease(ctx, l)
+
+	sb, err := merge.FastForward(ctx, merge.ApplyOptions{
+		Plan: plan, Ours: ours.Superblock, Theirs: theirs.Superblock,
+		Refs: rstore, Branch: into, SigningKey: key,
+	})
+	if err != nil {
+		return exitErr(err)
+	}
+	if sb == nil {
+		fmt.Fprintf(mergeReportWriter, "nothing to do: %s is already at or past %s\n", into, source)
+		return 0
+	}
+	fmt.Fprintf(mergeReportWriter, "fast-forwarded %s to %s: published generation %d\n",
+		into, source, sb.Generation)
 	return 0
 }
 

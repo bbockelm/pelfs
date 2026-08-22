@@ -180,3 +180,84 @@ func runMergeInto(w *bytes.Buffer, args []string) int {
 
 var _ = context.Background
 var _ = testvol.RootInode
+
+// Applying a fast-forward: the branch being merged into has not moved, so
+// the other side's tree is the answer whole.
+//
+// It publishes a generation rather than moving the ref, because two
+// superblock fields are statements about the BRANCH and not about the
+// bytes: Branch, which retention reads for its per-branch window, and
+// Fork, which would otherwise have main claiming it was forked from main.
+func TestMergeAppliesAFastForward(t *testing.T) {
+	b := newBranchVolume(t, 76)
+	b.write(t, "a.bin")
+	mainHead := b.seal(t).Superblock
+	if _, code := captureLog(t, func() int {
+		return cmdBranch([]string{"--state-dir", b.stateDir, b.prefix, "dev"})
+	}); code != 0 {
+		t.Fatal("branch failed")
+	}
+	b.onBranch(t, "dev")
+	devFile := b.write(t, "theirs.bin")
+	devHead := b.seal(t).Superblock
+
+	out, code := captureMerge(t, "--state-dir", b.stateDir, "--apply", b.prefix, "dev")
+	if code != 0 {
+		t.Fatalf("apply exited %d:\n%s", code, out)
+	}
+	if !strings.Contains(out, "fast-forwarded main to dev") {
+		t.Errorf("the report does not say what it did:\n%s", out)
+	}
+
+	after := mustFetch(t, b.rstore, "main")
+	// The TREE is dev's.
+	if after.RootCatalog != devHead.RootCatalog {
+		t.Errorf("main's tree is %x, dev's is %x", after.RootCatalog[:4], devHead.RootCatalog[:4])
+	}
+	// The IDENTITY is main's. Both halves matter: a head on main claiming
+	// it was sealed onto dev makes retention's per-branch window wrong.
+	if after.Branch != "main" {
+		t.Errorf("main's head says it was sealed onto %q", after.Branch)
+	}
+	if after.Fork != nil {
+		t.Errorf("main adopted dev's fork record, so it now claims to be forked from main: %+v", after.Fork)
+	}
+	if after.Generation <= devHead.Generation {
+		t.Errorf("generation %d does not follow dev's %d", after.Generation, devHead.Generation)
+	}
+	if after.NextInode != mainHead.NextInode {
+		t.Errorf("the inode mark moved to %d; lineages are disjoint, so main keeps its own %d",
+			after.NextInode, mainHead.NextInode)
+	}
+	// And the content is readable through the new head.
+	if err := coldRead(t, b.inner, after, map[string][]byte{"theirs.bin": devFile}); err != nil {
+		t.Fatalf("the fast-forwarded head does not serve dev's file: %v", err)
+	}
+}
+
+// A diverged merge is refused by --apply rather than resolved by taking a
+// side, which would be a discard wearing a merge's name.
+func TestMergeApplyRefusesADivergedTree(t *testing.T) {
+	b := newBranchVolume(t, 77)
+	b.write(t, "a.bin")
+	b.seal(t)
+	if _, code := captureLog(t, func() int {
+		return cmdBranch([]string{"--state-dir", b.stateDir, b.prefix, "dev"})
+	}); code != 0 {
+		t.Fatal("branch failed")
+	}
+	b.onBranch(t, "dev")
+	b.write(t, "theirs.bin")
+	b.seal(t)
+	b.onBranch(t, "main")
+	b.write(t, "ours.bin")
+	moved := b.seal(t).Superblock
+
+	out, code := captureMerge(t, "--state-dir", b.stateDir, "--apply", b.prefix, "dev")
+	if code == 0 {
+		t.Fatalf("a diverged merge was applied:\n%s", out)
+	}
+	if after := mustFetch(t, b.rstore, "main"); after.RootCatalog != moved.RootCatalog {
+		t.Error("the refused merge moved main anyway")
+	}
+}

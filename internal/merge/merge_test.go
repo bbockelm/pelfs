@@ -2,6 +2,7 @@ package merge_test
 
 import (
 	"context"
+	"crypto/ed25519"
 	"fmt"
 	mrand "math/rand"
 	"net/http/httptest"
@@ -336,7 +337,8 @@ func TestADeletedDirectoryWithNoChangesInsideIsHonoured(t *testing.T) {
 // own inode lineage. It returns the base's bytes too, because verifying
 // the base against that record is the point.
 func forkedProperly(t *testing.T, uuid string, onOurs, onTheirs func(v *testvol.Volume)) (
-	pelicanobj.Store, *superblock.Superblock, []byte, *superblock.Superblock, *superblock.Superblock) {
+	pelicanobj.Store, *superblock.Superblock, []byte, *superblock.Superblock, *superblock.Superblock,
+	ed25519.PrivateKey) {
 	t.Helper()
 	inner := newInner(t)
 	v := testvol.New(t, inner, testvol.Options{VolumeID: testvol.ParseUUID(t, uuid)})
@@ -371,14 +373,14 @@ func forkedProperly(t *testing.T, uuid string, onOurs, onTheirs func(v *testvol.
 	v.SetBranch("main")
 	onOurs(v)
 	ours := v.Publish(publishOpts).Superblock
-	return inner, base, baseRaw, ours, theirs
+	return inner, base, baseRaw, ours, theirs, v.SigningKey()
 }
 
 // The payoff of the fork record: a branch with its own inode lineage
 // creates files that cannot collide with the other side's, so a merge of
 // two branches that both added files has nothing to renumber.
 func TestAForkedLineageHasNoInodeCollisions(t *testing.T) {
-	inner, base, baseRaw, ours, theirs := forkedProperly(t, "eeeeeeee-1111-2222-3333-444444444444",
+	inner, base, baseRaw, ours, theirs, _ := forkedProperly(t, "eeeeeeee-1111-2222-3333-444444444444",
 		func(v *testvol.Volume) { v.WriteFile(rootIno, "ours-new.bin", body(4096, 50)) },
 		func(v *testvol.Volume) { v.WriteFile(rootIno, "theirs-new.bin", body(4096, 51)) })
 
@@ -404,7 +406,7 @@ func TestAForkedLineageHasNoInodeCollisions(t *testing.T) {
 // is told so, instead of getting a plausible tree that is nobody's
 // intent.
 func TestAWrongBaseIsRefusedWhenTheForkRecordSaysSo(t *testing.T) {
-	inner, base, baseRaw, ours, theirs := forkedProperly(t, "ffffffff-1111-2222-3333-444444444444",
+	inner, base, baseRaw, ours, theirs, _ := forkedProperly(t, "ffffffff-1111-2222-3333-444444444444",
 		func(v *testvol.Volume) { v.WriteFile(rootIno, "a.bin", body(64, 1)) },
 		func(v *testvol.Volume) { v.WriteFile(rootIno, "b.bin", body(64, 2)) })
 
@@ -438,7 +440,7 @@ func TestAWrongBaseIsRefusedWhenTheForkRecordSaysSo(t *testing.T) {
 // against, and their trees merging cleanly by accident would be the worst
 // way to find that out.
 func TestBranchesCutFromDifferentPointsAreRefused(t *testing.T) {
-	inner, base, baseRaw, ours, theirs := forkedProperly(t, "0a0a0a0a-1111-2222-3333-444444444444",
+	inner, base, baseRaw, ours, theirs, _ := forkedProperly(t, "0a0a0a0a-1111-2222-3333-444444444444",
 		func(v *testvol.Volume) { v.WriteFile(rootIno, "a.bin", body(64, 1)) },
 		func(v *testvol.Volume) { v.WriteFile(rootIno, "b.bin", body(64, 2)) })
 

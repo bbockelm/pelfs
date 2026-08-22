@@ -235,11 +235,11 @@ func TestMergeAppliesAFastForward(t *testing.T) {
 	}
 }
 
-// A diverged merge is refused by --apply rather than resolved by taking a
-// side, which would be a discard wearing a merge's name.
-func TestMergeApplyRefusesADivergedTree(t *testing.T) {
-	b := newBranchVolume(t, 77)
-	b.write(t, "a.bin")
+// A diverged merge, carried out through the command: both sides' work
+// ends up on main, and the generation verifies.
+func TestMergeAppliesADivergedTree(t *testing.T) {
+	b := newBranchVolume(t, 78)
+	b.write(t, "shared.bin")
 	b.seal(t)
 	if _, code := captureLog(t, func() int {
 		return cmdBranch([]string{"--state-dir", b.stateDir, b.prefix, "dev"})
@@ -247,15 +247,57 @@ func TestMergeApplyRefusesADivergedTree(t *testing.T) {
 		t.Fatal("branch failed")
 	}
 	b.onBranch(t, "dev")
-	b.write(t, "theirs.bin")
+	theirFile := b.write(t, "theirs.bin")
 	b.seal(t)
 	b.onBranch(t, "main")
-	b.write(t, "ours.bin")
+	ourFile := b.write(t, "ours.bin")
+	b.seal(t)
+
+	out, code := captureMerge(t, "--state-dir", b.stateDir, "--apply", b.prefix, "dev")
+	if code != 0 {
+		t.Fatalf("apply exited %d:\n%s", code, out)
+	}
+	if !strings.Contains(out, "merged dev into main") {
+		t.Errorf("the report does not say what it did:\n%s", out)
+	}
+	// Both sides' work, read cold from the published generation.
+	after := mustFetch(t, b.rstore, "main")
+	if err := coldRead(t, b.inner, after, map[string][]byte{
+		"ours.bin": ourFile, "theirs.bin": theirFile,
+	}); err != nil {
+		t.Fatalf("the merged head does not serve both sides: %v", err)
+	}
+	if after.Branch != "main" {
+		t.Errorf("the merged head says it was sealed onto %q", after.Branch)
+	}
+	t.Logf("\n%s", out)
+}
+
+// A merge that needs a decision is refused by --apply rather than
+// resolved by taking a side, which would be a discard wearing a merge's
+// name.
+func TestMergeApplyRefusesADivergedTree(t *testing.T) {
+	b := newBranchVolume(t, 77)
+	b.write(t, "contested.bin")
+	b.seal(t)
+	if _, code := captureLog(t, func() int {
+		return cmdBranch([]string{"--state-dir", b.stateDir, b.prefix, "dev"})
+	}); code != 0 {
+		t.Fatal("branch failed")
+	}
+	// Both sides change the SAME file, which is the case no tree can
+	// resolve on its own.
+	b.want["contested.bin"] = nil
+	b.onBranch(t, "dev")
+	b.write(t, "contested.bin")
+	b.seal(t)
+	b.onBranch(t, "main")
+	b.write(t, "contested.bin")
 	moved := b.seal(t).Superblock
 
 	out, code := captureMerge(t, "--state-dir", b.stateDir, "--apply", b.prefix, "dev")
 	if code == 0 {
-		t.Fatalf("a diverged merge was applied:\n%s", out)
+		t.Fatalf("a conflicting merge was applied:\n%s", out)
 	}
 	if after := mustFetch(t, b.rstore, "main"); after.RootCatalog != moved.RootCatalog {
 		t.Error("the refused merge moved main anyway")

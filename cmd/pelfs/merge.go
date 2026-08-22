@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/bbockelm/pelfs/internal/merge"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
@@ -82,19 +83,8 @@ func cmdMerge(args []string) int {
 		return 1
 	}
 	if !apply {
-		if !plan.FastForward {
-			fmt.Fprintln(mergeReportWriter, "nothing was written; applying a merged tree is not built yet")
-		} else {
-			fmt.Fprintln(mergeReportWriter, "nothing was written; re-run with --apply to fast-forward")
-		}
+		fmt.Fprintln(mergeReportWriter, "nothing was written; re-run with --apply to carry it out")
 		return 0
-	}
-	if !plan.FastForward {
-		// The tree would have to be built and published, which is the next
-		// piece of work. Refusing is the honest answer: the alternative is
-		// taking one side, which is a discard wearing a merge's name.
-		return exitErr(fmt.Errorf("this merge needs a tree built, and that is not implemented yet; "+
-			"only a fast-forward can be applied. %d paths would come from %s", plan.TookTheirs, source))
 	}
 	key, err := loadOrCreateSigningKey(signingKeyFileIn(stateDir, signingKey), ours.Superblock)
 	if err != nil {
@@ -106,19 +96,38 @@ func cmdMerge(args []string) int {
 	}
 	defer releaseLease(ctx, l)
 
-	sb, err := merge.FastForward(ctx, merge.ApplyOptions{
-		Plan: plan, Ours: ours.Superblock, Theirs: theirs.Superblock,
-		Refs: rstore, Branch: into, SigningKey: key,
-	})
+	// Publish spools packs and catalog builds here, and expects it to
+	// exist. A merge writes no packs, but it does build catalogs.
+	spool := filepath.Join(stateDir, "merge")
+	if err := os.MkdirAll(spool, 0700); err != nil {
+		return exitErr(err)
+	}
+	ao := merge.ApplyOptions{
+		Plan: plan, Base: baseSB, Ours: ours.Superblock, Theirs: theirs.Superblock,
+		Inner: inner, Refs: rstore, Branch: into, SigningKey: key,
+		DEK: dek, CacheDir: filepath.Join(stateDir, "gencache"),
+		SpoolDir: spool,
+	}
+	if plan.FastForward {
+		sb, err := merge.FastForward(ctx, ao)
+		if err != nil {
+			return exitErr(err)
+		}
+		if sb == nil {
+			fmt.Fprintf(mergeReportWriter, "nothing to do: %s is already at or past %s\n", into, source)
+			return 0
+		}
+		fmt.Fprintf(mergeReportWriter, "fast-forwarded %s to %s: published generation %d\n",
+			into, source, sb.Generation)
+		return 0
+	}
+	res, err := merge.Apply(ctx, ao)
 	if err != nil {
 		return exitErr(err)
 	}
-	if sb == nil {
-		fmt.Fprintf(mergeReportWriter, "nothing to do: %s is already at or past %s\n", into, source)
-		return 0
-	}
-	fmt.Fprintf(mergeReportWriter, "fast-forwarded %s to %s: published generation %d\n",
-		into, source, sb.Generation)
+	fmt.Fprintf(mergeReportWriter, "merged %s into %s: published generation %d "+
+		"(%d catalogs written, %d carried)\n",
+		source, into, res.Superblock.Generation, res.Stats.Catalogs, res.Stats.CatalogsReused)
 	return 0
 }
 

@@ -353,126 +353,50 @@ func (w *walker) dir(ctx context.Context, p string, baseIno, ourIno, theirIno ui
 			w.theirInodes[theirs.Node.Inode] = child
 		}
 
-		switch {
-		case inOurs && inTheirs:
-			if err := w.both(ctx, child, b, inBase, ours, theirs); err != nil {
+		out, kind, detail := decide(ctx, w.t, b, inBase, ours, inOurs, theirs, inTheirs)
+		switch out {
+		case Descend:
+			// A directory on either side, including one the other side
+			// deleted: descended because its inodes have to reach the
+			// collision pass, and because "was it modified" cannot be
+			// answered for a directory by comparing the directory —
+			// sameContent calls two of them equal whenever their metadata
+			// matches, since directories are compared by their ENTRIES.
+			// Deciding a deletion from that would discard a subtree this
+			// side had changed inside, so the descent decides per file and
+			// reports against the file that actually changed.
+			if err := w.dir(ctx, child, inoOf(b, inBase), inoOf(ours, inOurs), inoOf(theirs, inTheirs)); err != nil {
 				return err
 			}
-		case inOurs:
-			if err := w.oneSided(ctx, child, b, inBase, ours, true); err != nil {
-				return err
-			}
-		case inTheirs:
-			if err := w.oneSided(ctx, child, b, inBase, theirs, false); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-// oneSided resolves a path that only one side still has: the other side
-// deleted it, or this side added it. mine says which side has it, which
-// decides only how the conflict reads.
-//
-// A DIRECTORY IS ALWAYS DESCENDED, for two reasons that arrive together.
-// Its inodes have to reach the collision pass whether or not the other
-// side has the path at all. And "was it modified" cannot be answered for
-// a directory by comparing the directory: sameContent calls two
-// directories equal whenever their metadata matches, because directories
-// are compared by their ENTRIES. Deciding a deletion from that would
-// discard a subtree this side had changed inside — so the descent decides
-// per file instead, and reports the conflict against the file that
-// actually changed rather than against the directory above it.
-func (w *walker) oneSided(ctx context.Context, p string, b entry, inBase bool, e entry, mine bool) error {
-	if e.Node.Type == catalog.TypeDir {
-		var baseIno uint64
-		if inBase && b.Node.Type == catalog.TypeDir {
-			baseIno = b.Node.Inode
-		}
-		if mine {
-			return w.dir(ctx, p, baseIno, e.Node.Inode, 0)
-		}
-		return w.dir(ctx, p, baseIno, 0, e.Node.Inode)
-	}
-	if !inBase {
-		// Added by this side, absent from the other and from the base.
-		if mine {
+		case Conflicted:
+			w.conflict(child, kind, detail)
+		case Same:
+			w.p.Unchanged++
+		case TakeOurs:
 			w.p.TookOurs++
-		} else {
+		case TakeTheirs:
 			w.p.TookTheirs++
+		case Drop:
+			// A deletion the other side did not contest. Counted as coming
+			// from whichever side deleted it, because that side's change is
+			// what the merged tree takes.
+			if inOurs {
+				w.p.TookTheirs++
+			} else {
+				w.p.TookOurs++
+			}
 		}
-		return nil
-	}
-	if !sameEntry(ctx, w.t.base, b, w.treeOf(mine), e) {
-		if mine {
-			w.conflict(p, ModifyDelete, "ours modified it, theirs deleted it")
-		} else {
-			w.conflict(p, ModifyDelete, "theirs modified it, ours deleted it")
-		}
-		return nil
-	}
-	// Unmodified here and gone there: the deletion is the change.
-	if mine {
-		w.p.TookTheirs++
-	} else {
-		w.p.TookOurs++
 	}
 	return nil
 }
 
-func (w *walker) treeOf(mine bool) *genfs.FS {
-	if mine {
-		return w.t.ours
+// inoOf is an entry's inode, or 0 when the tree does not have it — the
+// signal dir() takes for "absent from this side".
+func inoOf(e entry, present bool) uint64 {
+	if !present {
+		return 0
 	}
-	return w.t.theirs
-}
-
-// both resolves a path present in both sides.
-func (w *walker) both(ctx context.Context, p string, b entry, inBase bool, ours, theirs entry) error {
-	if ours.Node.Type != theirs.Node.Type {
-		w.conflict(p, TypeChange, fmt.Sprintf("ours is type %d, theirs is type %d", ours.Node.Type, theirs.Node.Type))
-		return nil
-	}
-	if ours.Node.Type == catalog.TypeDir {
-		// Directories merge as the union of their entries, which is why
-		// this recursion is the whole algorithm and why two branches that
-		// touched different areas conflict nowhere.
-		var baseIno uint64
-		if inBase && b.Node.Type == catalog.TypeDir {
-			baseIno = b.Node.Inode
-		}
-		return w.dir(ctx, p, baseIno, ours.Node.Inode, theirs.Node.Inode)
-	}
-
-	same, err := sameContent(ctx, w.t.ours, ours, w.t.theirs, theirs)
-	if err != nil {
-		return err
-	}
-	if same {
-		w.p.Unchanged++
-		return nil
-	}
-	if !inBase {
-		w.conflict(p, AddAdd, "both sides created it with different content")
-		return nil
-	}
-	ourChanged := !sameEntry(ctx, w.t.base, b, w.t.ours, ours)
-	theirChanged := !sameEntry(ctx, w.t.base, b, w.t.theirs, theirs)
-	switch {
-	case ourChanged && theirChanged:
-		w.conflict(p, BothModified, "both sides changed it since the base")
-	case theirChanged:
-		w.p.TookTheirs++
-	case ourChanged:
-		w.p.TookOurs++
-	default:
-		// Neither differs from the base yet they differ from each other,
-		// which cannot happen if the comparison is sound. Reported rather
-		// than silently taking a side.
-		w.conflict(p, BothModified, "the two sides differ but neither differs from the base (base may be wrong)")
-	}
-	return nil
+	return e.Node.Inode
 }
 
 func (w *walker) conflict(p string, k Kind, detail string) {

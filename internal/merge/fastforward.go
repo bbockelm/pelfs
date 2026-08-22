@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/refs"
 	"github.com/bbockelm/pelfs/internal/superblock"
 )
@@ -112,6 +113,17 @@ func FastForward(ctx context.Context, o ApplyOptions) (*superblock.Superblock, e
 
 // ApplyOptions is what carrying a plan out needs beyond computing it.
 type ApplyOptions struct {
+	// Inner, Base, DEK, CacheDir, SpoolDir, IdentityKey and KeyID are
+	// needed only by Apply, which reads the three trees and publishes a
+	// merged one. FastForward needs none of them: it writes a superblock.
+	Inner       pelicanobj.Store
+	Base        *superblock.Superblock
+	DEK         []byte
+	IdentityKey []byte
+	KeyID       int64
+	CacheDir    string
+	SpoolDir    string
+
 	// Plan is what Compute produced, and it is required: this package
 	// never decides and acts in one call, because the decision is the part
 	// a human has to see.

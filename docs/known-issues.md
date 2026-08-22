@@ -33,59 +33,6 @@ listed at the bottom, so nobody re-files it.
 
 ## Open defects
 
-### KI-2. Crash-stranded scratch directories are never swept
-
-**Severity: medium; bites anyone whose seal is killed.** A killed seal
-strands gigabytes in the state directory and nothing ever collects them.
-
-**Mechanism.** `sweepRetiredOverlays` empties exactly one directory,
-`<stateDir>/trash` (`cmd/pelfs/mountgen.go:2159-2168`, wired at
-`mountgen.go:710`). The three scratch families all live in the state-dir
-ROOT, are cleaned only on the happy path, and no sweeper globs them:
-
-| scratch | created | happy-path cleanup |
-|---|---|---|
-| `<stateDir>/snapshot-*` | `cmd/pelfs/mountgen.go:1476` | `retireDir` renames into `trash` (`mountgen.go:1500`) |
-| `<stateDir>/publish-*` | `internal/publish/publish.go:351` (`SpoolDir` set at `mountgen.go:1540`) | `defer os.RemoveAll` (`publish.go:355`) — this is the gigabytes case, packs spool here |
-| `<stateDir>/repack` | `cmd/pelfs/autorepack.go:350`, `cmd/pelfs/repack.go:71` | none: `internal/repack/execute.go:167`'s `defer os.RemoveAll` fires only for the `SpoolDir == ""` temp fallback |
-
-**Reproduce.** `kill -9` a writable mount mid-seal (the crash phase of
-`scripts/e2e-docker.sh` does this), then list the state directory:
-`publish-*` survives with its spooled packs.
-
-**Pinned by an executable test: NO.** The retired-overlay sweeper has
-tests; the state-dir root has none, and no test asserts that a state
-directory is clean after a crash.
-
-### KI-3. The dedup sidecar never drops a dead chunk, and a repack silently invalidates it
-
-**Severity: medium — unbounded local disk, plus a full re-upload of the
-dedup savings after every repack.**
-
-**Mechanism.** Two halves. (a) `loadDedupIndex` merges every stored row
-into `chunkSeen` and `saveDedupIndex` writes all of `chunkSeen` back
-verbatim (`internal/publish/dedup.go:76`, `:122-129`), so an entry is never
-dropped; the file's own comment says a v2 repack "must rewrite the index
-with exactly the live set it computed" (`dedup.go:20-23`) and
-`internal/repack` contains no reference to the sidecar at all. (b) Worse
-than stale: repack publishes `prev.Generation + 1`
-(`internal/repack/execute.go:718`) without restamping the sidecar, while
-`loadDedupIndex` requires `meta["generation"] == Prev.Generation`
-(`dedup.go:62-64`) — so after a repack the sidecar is ignored **in full**
-and the first post-repack seal re-uploads everything it would have
-deduplicated, with the stale file (dead chunks included) sitting on disk
-until that seal overwrites it.
-
-**Reproduce.** Seal, repack `--apply`, seal again with unchanged content
-and watch the upload volume; or check `v2-dedup.db`'s size across a long
-autosave-shaped workload.
-
-**Code.** `internal/publish/dedup.go`, `internal/repack/execute.go:718`,
-sidecar path at `cmd/pelfs/mountgen.go:1549`.
-
-**Pinned by an executable test: NO** for either half. No test asserts the
-sidecar shrinks, and none asserts a post-repack seal still deduplicates.
-
 ### KI-4. No checkpoint-health signal: no last-checkpoint time, no failure count
 
 **Severity: medium, operators.** A periodic checkpoint that fails forever
@@ -384,6 +331,8 @@ next pass does not re-file them.
 | **nlink not decremented for a clean hardlinked file** | **FIXED** by nlink-agent (a third option, neither of the two the report proposed). |
 | **rename ghost across a checkpoint** | **FIXED** by renameghost-agent, with the whole sibling family (unlink, one of two hardlinks, rmdir, rename onto a name, cross-parent rename, recreate-over-whiteout). |
 | **`link(2)` of a clean inode after a checkpoint** (was KI-1) | **FIXED** by prov-agent (`e614330`): `genfs.FS.Edge` plus a fallback in `persistChainLocked`, pinned by `internal/overlay/linkprov_test.go` (five cases). The reachable shape is NOT "a file sitting still" as first reported — `rawfuse`'s dirty mark is sticky for a mount's lifetime, so within one session the sweep's victims carry a 1s TTL and the dentry expires. It is a SECOND session over an inherited file: mount, look up a file that was already there, edit it, keep working, then link it. Two corpus entries were built for it and NEITHER reproduced, so none was kept — this entry's own prediction that a plan would be `flaky-open` at best was right, and stronger than it knew. |
+| **Crash-stranded scratch is never swept** (was KI-2) | **FIXED** by spool-agent: `internal/scratch` names every scratch directory for the process that made it (`publish-<pid>-*`, `snapshot-<pid>-*`, `repack-<pid>-*`) and `sweepStateScratch` (`cmd/pelfs/mountgen.go`) collects, at every mount, the ones whose owner is no longer running — reporting the bytes and the names it took. A repack's spool is now a per-run subdirectory removed on **every** exit from `Execute`, so the happy path no longer strands one either. Pinned by `internal/scratch/scratch_test.go` (nine cases, including a live sibling's spool being left alone), `cmd/pelfs/scratchsweep_test.go`, `internal/repack/spool_test.go`, and phase 4b of `scripts/crash-recovery-docker.sh`. The discipline is pid liveness with a 24h guard for unowned names and a 7d backstop against pid reuse; why liveness rather than the lease is argued at the top of `internal/scratch/scratch.go`. |
+| **The dedup sidecar after a repack** (was KI-3) | **FIXED** by spool-agent, both halves in one operation: `publish.RestampDedupIndex`, called from `repack.execute` after the flip, rewrites the sidecar with exactly the rows the sweep's reachable set still reaches and stamps it with the generation the repack published. Filtering without restamping would be a file nobody reads; restamping without filtering would promise chunks the repack has just dropped — which is why they are one function and not two. Pinned by `internal/repack/dedup_test.go`, which measures the bytes the post-repack seal puts on the wire: 4 KiB with the fix, 3.15 MiB without it. |
 | **C2**, the "fsck lifts the cap" claim | **STALE** in that detail — `internal/fsck` does not touch `packIndex`. The rest of C2 survives as KI-8. |
 | **F11** dead/unwired inventory; **G4**, **G6** doc-staleness sweeps | Real work, but hygiene and prose rather than defects or limitations. They stay in `docs/TODO.md`, which is what a punchlist is for. |
 
@@ -397,8 +346,12 @@ Nothing left in this file is expressible as a plan, which is why they are
 here:
 a memory ceiling reached only at a hundred million objects (KI-8), a
 missing stats field (KI-4, KI-5), an error class thrown away (KI-6), a
-transaction count (KI-7), a wall clock in the wrong place (KI-9), and two
-things that need a crash or a repack plus a look at the disk (KI-2, KI-3).
-The one entry that looked plan-shaped (KI-1, now fixed) turned out not to
-be: two corpus entries were written for it and neither reproduced, because
+transaction count (KI-7), and a wall clock in the wrong place (KI-9).
+Both entries that needed a crash or a repack plus a look at the disk
+(KI-2, KI-3, now fixed) turned out to be expressible after all, in
+ordinary Go tests, once the question was asked in the right units: not
+"is the directory gone" but "whose process made it", and not "does the
+sidecar exist" but "how many bytes did the next seal upload". The one
+entry that looked plan-shaped (KI-1, now fixed) turned out not to be: two
+corpus entries were written for it and neither reproduced, because
 whether a LOOKUP precedes a LINK is the kernel dcache's call.

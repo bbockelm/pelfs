@@ -177,6 +177,21 @@ wait "$WRITER_PID" 2>/dev/null || true
 echo "  SIGKILLed the mount with ~$WROTE_AT_KILL files written into it"
 unmount_at "$W/mnt"
 
+# The seal spool a kill -9 strands. The killed session ran with
+# --snapshot-interval 0 precisely so that nothing it wrote was sealed, so
+# it happens not to have been mid-seal -- which is the interesting case for
+# scratch and the one the state directory must survive. It is staged here
+# instead, named for the pid of the mount that has just been killed, which
+# is exactly the name that mount's own seal would have given it. A second
+# spool is named for THIS SHELL, which is running, and must be left alone:
+# a sweep that cannot tell those two apart deletes a live seal's packs.
+STRANDED="$W/state/publish-$MOUNT_PID-crashed"
+LIVE_SPOOL="$W/state/publish-$$-running"
+mkdir -p "$STRANDED" "$LIVE_SPOOL"
+head -c $((8 * 1024 * 1024)) /dev/urandom > "$STRANDED/p-0001.pack"
+head -c 1024 /dev/urandom > "$LIVE_SPOOL/p-0001.pack"
+echo "  staged $(du -sh "$STRANDED" | cut -f1) of spool owned by the killed mount (pid $MOUNT_PID)"
+
 # ------------------------------------------------- session 3: recover
 echo
 echo "== session 3: remount the same state dir =="
@@ -293,6 +308,36 @@ fi
 if [ "$present" = 0 ]; then
   fail "not one file survived a crash that had already uploaded objects; recovery recovered nothing"
 fi
+
+# 4b. The state directory is cleaned up after a crash. Everything a killed
+#     session was spooling is unreferenced the moment it dies, and until
+#     this sweep existed nothing ever collected it: a state directory
+#     accumulated one seal's worth of packs per crash, forever.
+echo
+echo "== 4b. the mount reclaims the scratch the killed session stranded =="
+for _ in $(seq 100); do [ -d "$STRANDED" ] || break; sleep 0.1; done
+if [ -d "$STRANDED" ]; then
+  ls -la "$W/state" | sed 's/^/    /'
+  fail "the spool of the mount that was killed is still in the state directory after a remount"
+else
+  ok "the killed session's spool was reclaimed"
+fi
+if [ -d "$LIVE_SPOOL" ]; then
+  ok "the spool of a process that is still running was left alone"
+else
+  fail "the sweep deleted the spool of a LIVE process; a concurrent seal would have lost its packs"
+fi
+grep -h "reclaimed .* of scratch" "$W/out/s3.log" | sed 's/^/    /' \
+  || fail "the sweep reclaimed scratch without saying what it took"
+# And nothing else claiming to be scratch survives, including whatever the
+# kill really did leave behind rather than what the test staged.
+rm -rf "$LIVE_SPOOL"
+LEFT=$(find "$W/state" -maxdepth 1 \( -name 'publish-*' -o -name 'snapshot-*' -o -name 'repack*' \) -print)
+[ -z "$LEFT" ] || {
+  echo "$LEFT" | sed 's/^/    /'
+  fail "scratch is still sitting in the state directory after the recovering mount swept it"
+}
+ok "no scratch of any family is left in the state directory"
 
 # 5. And the volume must still be publishable and verifiable.
 echo

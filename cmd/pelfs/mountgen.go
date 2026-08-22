@@ -33,6 +33,7 @@ import (
 	"github.com/bbockelm/pelfs/internal/rawfuse"
 	"github.com/bbockelm/pelfs/internal/refs"
 	"github.com/bbockelm/pelfs/internal/repack"
+	"github.com/bbockelm/pelfs/internal/scratch"
 	"github.com/bbockelm/pelfs/internal/stats"
 	"github.com/bbockelm/pelfs/internal/superblock"
 	"github.com/bbockelm/pelfs/internal/ui"
@@ -41,6 +42,11 @@ import (
 
 // statsInterval is how often a live session rewrites its statistics file.
 const statsInterval = 30 * time.Second
+
+// dedupIndexName is the publish dedup sidecar inside a state directory.
+// Named once because three call sites need the same file: the seal writes
+// it, and both repack paths carry it across the generation they publish.
+const dedupIndexName = "v2-dedup.db"
 
 // nfsMaxResident bounds residency on the loopback-NFS backend. That
 // frontend re-descends from the root on every operation, so an evicted
@@ -708,6 +714,10 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	// mount, and not on either the startup path or the exit path: it is
 	// pure unlinking, and both of those are times a user is waiting.
 	go sweepRetiredOverlays(stateDir)
+	// The same argument for the scratch a KILLED session could not clean
+	// up: the spool of a seal that never returned, which is the case that
+	// strands gigabytes.
+	go sweepStateScratch(stateDir)
 	// Nothing in the write path calls back, so overlay pressure and the
 	// served generation are sampled on the same cadence.
 	go g.sample(sessionCtx, statsInterval)
@@ -1473,7 +1483,7 @@ func (g *genSession) sealLocked(ctx context.Context, follow bool) (*publish.Resu
 	var snap *overlay.Snapshot
 	release := func() {}
 	if follow {
-		snapDir, err := os.MkdirTemp(g.stateDir, "snapshot-*")
+		snapDir, err := scratch.Make(g.stateDir, scratch.Snapshot)
 		if err != nil {
 			return nil, err
 		}
@@ -1546,7 +1556,7 @@ func (g *genSession) sealLocked(ctx context.Context, follow bool) (*publish.Resu
 		IdentityKey:    g.identityKey,
 		KeyID:          g.keyID,
 		KeyTable:       g.sb.KeyTable,
-		DedupIndexPath: filepath.Join(g.stateDir, "v2-dedup.db"),
+		DedupIndexPath: filepath.Join(g.stateDir, dedupIndexName),
 	}
 	if snap != nil {
 		opts.OverlaySnapshot = snap
@@ -2165,6 +2175,52 @@ func sweepRetiredOverlays(stateDir string) {
 	for _, e := range ents {
 		_ = os.RemoveAll(filepath.Join(trash, e.Name()))
 	}
+}
+
+// scratchSpools are the directories a state directory holds per-run
+// scratch in: its own root, where a seal, a checkpoint and a repack spool,
+// and the merge spool, which is a second parent a publish runs under
+// (merge.go). Both are swept by the same rules.
+func scratchSpools(stateDir string) []string {
+	return []string{stateDir, filepath.Join(stateDir, "merge")}
+}
+
+// sweepStateScratch reclaims the spools of runs that died before they
+// could clean up after themselves — the seal that was killed mid-pack, the
+// checkpoint that never got to retire its snapshot, the repack that was
+// interrupted. Retired OVERLAYS are the neighbouring sweep's business
+// (sweepRetiredOverlays); this one is about the state directory's root,
+// which nothing collected at all.
+//
+// It runs at mount time, for read-only mounts too, for the same reason the
+// trash sweep does: the process that made the mess is by definition not
+// coming back, and the next mount is the next chance anyone has. Which
+// directories it may take, and why a live sibling's spool is not among
+// them, is internal/scratch's decision — it asks whether the owning
+// process is still running rather than whether the lease looks free.
+//
+// It says what it took. Silence would make this the one part of the
+// system that deletes gigabytes without a record, and "where did my disk
+// go" is the question a state directory has to be able to answer.
+func sweepStateScratch(stateDir string) {
+	var total scratch.Reclaimed
+	for _, spool := range scratchSpools(stateDir) {
+		got, err := scratch.Sweep(spool, scratch.Options{})
+		if err != nil {
+			ui.Warn("some scratch left by an earlier session under {dir} could not be reclaimed: {error}",
+				"dir", spool, "error", err)
+		}
+		total.Dirs += got.Dirs
+		total.Bytes += got.Bytes
+		total.Names = append(total.Names, got.Names...)
+	}
+	if total.Dirs == 0 {
+		return
+	}
+	ui.Info("reclaimed {bytes} of scratch that an earlier session left behind, in {dirs} spool "+
+		"directories: {names}",
+		"bytes", ui.ByteCount(total.Bytes), "dirs", total.Dirs,
+		"names", strings.Join(total.Names, ", "))
 }
 
 // controlHooks exposes the session on the control socket. Writes land in

@@ -66,6 +66,7 @@ import (
 	"github.com/bbockelm/pelfs/internal/overlay"
 	"github.com/bbockelm/pelfs/internal/packstore"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
+	"github.com/bbockelm/pelfs/internal/scratch"
 	"github.com/bbockelm/pelfs/internal/superblock"
 	"github.com/bbockelm/pelfs/internal/ui"
 )
@@ -348,7 +349,12 @@ func Publish(ctx context.Context, o Options) (*Result, error) {
 		}
 	}
 
-	tmpDir, err := os.MkdirTemp(o.SpoolDir, "publish-*")
+	// Named with this process's pid (internal/scratch), so that the next
+	// mount of this state directory can tell a spool whose process died —
+	// the `kill -9` mid-seal, gigabytes of packs — from one a live sibling
+	// is still packing into. The `defer` below is the happy path and it is
+	// the only one this process gets.
+	tmpDir, err := scratch.Make(o.SpoolDir, scratch.Publish)
 	if err != nil {
 		return nil, err
 	}

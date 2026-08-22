@@ -66,10 +66,17 @@ func cmdRepack(args []string) int {
 			PackLive: liveness,
 			RefLive:  liveness,
 		},
-		Refs:     rstore,
-		Branch:   branch,
-		SpoolDir: filepath.Join(stateDir, "repack"),
-		DryRun:   !apply,
+		Refs:   rstore,
+		Branch: branch,
+		// Execute makes its own per-run subdirectory under this and
+		// removes it on the way out, whatever the outcome.
+		SpoolDir: stateDir,
+		// The sidecar a mount of this state directory seals against. A
+		// repack run from a throwaway state directory finds none and
+		// carries nothing, which is the honest answer: this command
+		// cannot restamp an index it is not looking at.
+		DedupIndexPath: filepath.Join(stateDir, dedupIndexName),
+		DryRun:         !apply,
 	}
 	if grace != "" {
 		if opts.Grace, err = time.ParseDuration(grace); err != nil {

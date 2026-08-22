@@ -347,7 +347,14 @@ func (g *genSession) autoRepackOnce(ctx context.Context, policy repack.AutoPolic
 		Refs:       g.refs,
 		Branch:     g.branch,
 		SigningKey: key,
-		SpoolDir:   filepath.Join(g.stateDir, "repack"),
+		// The state directory itself: Execute makes its own per-run
+		// subdirectory under it and removes it on the way out, and the
+		// mount's scratch sweep collects one a crash strands. This is the
+		// path that made a leak automatic — an idle mount repacks itself.
+		SpoolDir: g.stateDir,
+		// The same sidecar the seal path writes, so that the seal after
+		// this repack still deduplicates against it.
+		DedupIndexPath: filepath.Join(g.stateDir, dedupIndexName),
 	})
 	if err != nil {
 		return false, err

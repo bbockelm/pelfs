@@ -18,8 +18,10 @@ import (
 	"github.com/bbockelm/pelfs/internal/mpi"
 	"github.com/bbockelm/pelfs/internal/packstore"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
+	"github.com/bbockelm/pelfs/internal/publish"
 	"github.com/bbockelm/pelfs/internal/reach"
 	"github.com/bbockelm/pelfs/internal/refs"
+	"github.com/bbockelm/pelfs/internal/scratch"
 	"github.com/bbockelm/pelfs/internal/superblock"
 	"github.com/bbockelm/pelfs/internal/ui"
 )
@@ -78,9 +80,28 @@ type ExecOptions struct {
 	Branch     string
 	SigningKey ed25519.PrivateKey
 
-	// SpoolDir holds packs being built. Empty takes a temporary directory
-	// removed on return.
+	// SpoolDir is where this run creates the scratch directory it builds
+	// packs in — a `repack-<pid>-*` subdirectory (internal/scratch), and
+	// it is removed on return whatever the outcome. Empty takes the system
+	// temporary directory.
+	//
+	// It is a PARENT rather than the scratch directory itself because a
+	// caller supplying one always supplied a fixed name in the state
+	// directory, which nothing ever removed: the cleanup below only fired
+	// on the temporary fallback, so every automatic repack stranded its
+	// spool. A per-run subdirectory makes the cleanup unconditional and
+	// gives a later sweep a name it can attribute to a process.
 	SpoolDir string
+
+	// DedupIndexPath is the publish dedup sidecar for this volume, which a
+	// successful repack rewrites: the live set it computed, stamped with
+	// the generation it published. Empty leaves any sidecar alone.
+	//
+	// A repack that did not do this was worse than leaving the sidecar
+	// stale — it INVALIDATED it, since the sidecar is used only when its
+	// stamp matches the generation being built on, so the first seal after
+	// a repack re-uploaded everything the sidecar would have deduplicated.
+	DedupIndexPath string
 
 	// TargetPackSize cuts the rewritten packs. Zero takes the same target
 	// a seal uses.
@@ -109,6 +130,10 @@ type Result struct {
 	ReclaimedBytes int64
 	// Generation is the generation published, zero on a dry run.
 	Generation uint64
+	// DedupKept and DedupDropped are what carrying the publish dedup
+	// sidecar across this generation kept and dropped. Both zero when
+	// there was no sidecar to carry (see restampDedup).
+	DedupKept, DedupDropped int
 	// DryRun echoes the option, so a caller reporting a Result cannot
 	// present a rehearsal as a change.
 	DryRun bool
@@ -158,15 +183,15 @@ func Execute(ctx context.Context, o ExecOptions) (*Result, error) {
 // execute is the writing half, separated so that everything above it is
 // decisions and everything below it is consequences.
 func execute(ctx context.Context, o ExecOptions, res *Result, rep *reach.Report) error {
-	spool := o.SpoolDir
-	if spool == "" {
-		tmp, err := os.MkdirTemp("", "pelfs-repack-*")
-		if err != nil {
-			return err
-		}
-		defer os.RemoveAll(tmp) //nolint:errcheck
-		spool = tmp
+	// One scratch directory per run, removed on every exit from here —
+	// the return below, an error, or a panic. What a `kill -9` leaves is
+	// the next mount's business (internal/scratch), and the pid in the
+	// name is how that sweep knows this run is not still using it.
+	spool, err := scratch.Make(o.SpoolDir, scratch.Repack)
+	if err != nil {
+		return err
 	}
+	defer os.RemoveAll(spool) //nolint:errcheck
 
 	head, err := o.Refs.Fetch(ctx, o.Branch)
 	if err != nil {
@@ -223,7 +248,65 @@ func execute(ctx context.Context, o ExecOptions, res *Result, rep *reach.Report)
 		return fmt.Errorf("repack: %w", err)
 	}
 	res.Generation = sb.Generation
+	restampDedup(o, head.Superblock, sb, rep, res)
 	return nil
+}
+
+// restampDedup rewrites the publish dedup sidecar for the generation this
+// run just published, keeping exactly the rows the sweep found live.
+//
+// WHY BOTH HALVES ARE ONE OPERATION. The sidecar says "these identities
+// are already stored", and a publish that loads one SKIPS THE UPLOAD of
+// everything it names. That is sound only while every row still resolves
+// in a pack the generation being built on lists — which is why the sidecar
+// carries the generation it was written for and is ignored on a mismatch.
+// A repack publishes a new generation, so restamping alone would hand the
+// next seal a file it now trusts; and a repack drops packs, so some of
+// those rows resolve nowhere. Restamping WITHOUT filtering would therefore
+// turn a wasted upload into chunkrefs that name entries no pack holds.
+// Filtering without restamping would be a correct file nobody reads.
+//
+// WHY FILTERING TO THE REACHABLE SET IS EXACTLY RIGHT, row by row. Every
+// row in the sidecar names an identity some pack the PARENT generation
+// listed holds — that is what wrote it. After this run, that pack is
+// either still listed (the row still resolves) or condemned, in which case
+// the entry was carried into a new pack precisely when the sweep reached
+// it (worthCarrying). So a row that survives this filter resolves in a
+// pack the new generation lists, and one that does not is either dead
+// content or bytes this run just dropped. Nothing is ADDED here, which is
+// what keeps the cross-branch rule intact: an identity another branch
+// reaches is in the reachable set, but it never enters a sidecar it was
+// not already in.
+//
+// Best effort, and after the flip on purpose. The sidecar is an
+// optimization and never an authority (internal/publish/dedup.go), so a
+// failure here costs one seal's worth of re-upload and must not turn a
+// completed repack into a failed one.
+func restampDedup(o ExecOptions, prev, sb *superblock.Superblock, rep *reach.Report, res *Result) {
+	if o.DedupIndexPath == "" || rep == nil || rep.Reachable == nil {
+		return
+	}
+	got, err := publish.RestampDedupIndex(o.DedupIndexPath, publish.RestampOptions{
+		VolumeID: sb.VolumeID,
+		Branch:   o.Branch,
+		PrevGen:  prev.Generation,
+		NewGen:   sb.Generation,
+		Live: func(identity []byte) bool {
+			rec, _, _ := rep.Reachable.Lookup(identity)
+			return rec != nil
+		},
+	})
+	switch {
+	case err != nil:
+		ui.Warn("repack: the dedup index at {path} could not be carried across generation {generation}; "+
+			"the next seal will re-upload what it would have deduplicated: {error}",
+			"path", o.DedupIndexPath, "generation", sb.Generation, "error", err)
+	case got.Rewritten:
+		res.DedupKept, res.DedupDropped = got.Kept, got.Dropped
+		ui.Info("repack: carried {kept} dedup index entries to generation {generation} and dropped "+
+			"{dropped} that no live generation reaches",
+			"kept", got.Kept, "generation", sb.Generation, "dropped", got.Dropped)
+	}
 }
 
 // trimToLedger holds back the candidates the condemned-pack ledger has no

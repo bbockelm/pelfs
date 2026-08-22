@@ -115,6 +115,50 @@
 
 ### Changed
 
+- **A state directory cleans up after a session that was killed.** Every
+  operation that spools to local disk before it uploads — a seal building
+  packs, a checkpoint's frozen overlay, a repack rewriting packs — left its
+  scratch behind when the process died, and nothing ever collected it. The
+  one sweeper a mount ran emptied `trash`; all three scratch families live
+  in the state directory's root. So a `kill -9` mid-seal cost a seal's
+  worth of packs, permanently, per crash.
+
+  A repack leaked its spool with no crash at all: the cleanup fired only
+  when `repack.Execute` had made the directory itself, and both callers
+  supply one. With v0.2 repacking a writable mount **by itself when it is
+  idle**, that turned from a manual-command footgun into something every
+  writable volume did on its own.
+
+  Scratch directories now carry the pid of the process that made them
+  (`publish-<pid>-*`, and the same for `snapshot-` and `repack-`), and every
+  mount — read-only ones too — collects the ones whose owner is no longer
+  running, saying how many bytes it took and from where. **Ownership is
+  asked of the OS, not of the lease:** a lease says who should be writing
+  and stands until it expires, so a killed holder's is exactly the scratch
+  that must go, while a read-only mount or a `pelfs repack` on another
+  branch is a live process with no writable lease whose spool must not.
+  A name with no pid in it — one an older release wrote — waits out a
+  24-hour idle guard instead, and a week untouched collects even an owned
+  one, since pids are reused. A repack's spool is now a per-run
+  subdirectory removed on every exit from `Execute`, success or failure.
+
+- **A seal after a repack still deduplicates.** The local dedup index that
+  lets a seal skip re-uploading content the volume already stores is valid
+  only for the generation it was written against — and a repack publishes a
+  new generation without restamping it, so the whole file was silently
+  ignored and the first seal after any repack re-uploaded everything it
+  would have deduplicated. Measured on the fixture: 3.15 MB back on the wire
+  for a 3 MB file already sitting in a pack the generation lists, against
+  4 KB now.
+
+  The same rewrite fixes the second half — the index never dropped an entry,
+  so it also grew without bound over a volume's life, carrying rows for
+  chunks nothing references any more. A repack already computes exactly
+  which chunks are live, so it now writes the index with that set and
+  stamps it with the generation it published. Both halves are one operation
+  on purpose: restamping without filtering would promise the next seal that
+  chunks the repack has just dropped are still stored.
+
 - **`ln` works on a file an earlier session published.** Hard-linking such a
   file on a writable FUSE mount failed with `overlay: no base provenance for
   inode N` — EIO at the `ln` — once the current session had edited it and a

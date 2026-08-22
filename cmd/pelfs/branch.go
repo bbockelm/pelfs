@@ -162,7 +162,29 @@ func createBranch(ctx context.Context, o *cmdOpts, prefix, name, from, fromTag, 
 	if err != nil {
 		return err
 	}
-	forkRaw, fork, err := forkGeneration(sb, raw, from, fromTag, lineage, key)
+	// THE BASE IS PINNED BEFORE THE BRANCH EXISTS, because a fork point
+	// that cannot be read is a fork point a merge cannot use. Base names
+	// the generation; only a ref or a tag makes one readable, and the
+	// moment the source branch seals again the fork point stops being its
+	// head. That is the ordinary flow, not an edge, so without this a
+	// merge would almost always have nothing to three-way against.
+	//
+	// It is a tag rather than anything cheaper for the second half of the
+	// same reason: retention keeps what a ref names, and a base collected
+	// out from under a branch is a branch that can never be merged.
+	// The branch's existence is checked BEFORE the pin, so that a name
+	// already in use is refused by the message written for it rather than
+	// by a complaint about a tag. Racy in principle and covered anyway:
+	// the create-if-absent flip below is the real guard, and losing that
+	// race leaves only a stray tag pinning a generation.
+	if err := refuseExistingBranch(ctx, rstore, inner, name); err != nil {
+		return err
+	}
+	baseTag, err := pinFork(ctx, rstore, name, sb, raw)
+	if err != nil {
+		return err
+	}
+	forkRaw, fork, err := forkGeneration(sb, raw, from, fromTag, baseTag, lineage, key)
 	if err != nil {
 		return err
 	}
@@ -347,7 +369,7 @@ func listBranches(ctx context.Context, o *cmdOpts, prefix, pubkeyHex string) err
 // list, same shards, same packs — so this writes no content and reads
 // none. What it changes is the three things that make the branch a branch:
 // its parent, its fork record, and where it allocates inodes.
-func forkGeneration(src *superblock.Superblock, srcRaw []byte, from, fromTag string,
+func forkGeneration(src *superblock.Superblock, srcRaw []byte, from, fromTag, baseTag string,
 	lineage uint32, key ed25519.PrivateKey) ([]byte, *superblock.Superblock, error) {
 
 	sb := *src
@@ -364,6 +386,7 @@ func forkGeneration(src *superblock.Superblock, srcRaw []byte, from, fromTag str
 		BaseGeneration: src.Generation,
 		BaseNextInode:  src.NextInode,
 		From:           source,
+		Tag:            baseTag,
 		Lineage:        lineage,
 	}
 	// The branch allocates from its own slice from here on. Everything
@@ -423,14 +446,16 @@ func pickLineage(ctx context.Context, inner pelicanobj.Store, rstore *refs.Store
 		}
 		taken[lineageOf(sb)] = true
 	}
-	// 24 bits, so a draw collides with a hundred taken lineages about once
-	// in 170,000 tries; the loop is here for correctness, not for luck.
+	// 23 bits (superblock.MaxLineage: every inode has to fit in a signed
+	// 64-bit integer, because storage is SQLite). A draw collides with a
+	// hundred taken lineages about once in 84,000 tries; the loop is here
+	// for correctness, not for luck.
 	for range 1000 {
 		var b [4]byte
 		if _, err := rand.Read(b[:]); err != nil {
 			return 0, err
 		}
-		l := binary.BigEndian.Uint32(b[:]) & 0xffffff
+		l := binary.BigEndian.Uint32(b[:]) & superblock.MaxLineage
 		if l != 0 && !taken[l] {
 			return l, nil
 		}
@@ -445,4 +470,53 @@ func lineageOf(sb *superblock.Superblock) uint32 {
 		return sb.Fork.Lineage
 	}
 	return 0
+}
+
+// forkTagName is the tag a branch's fork point is pinned with. A ref name
+// carries no path separator, so this is flat.
+func forkTagName(branch string) string { return "fork-" + branch }
+
+// pinFork tags the generation a branch is being cut from, and reports the
+// tag's name.
+//
+// An EXISTING tag of that name is accepted when it already pins this exact
+// generation, which is what makes `pelfs branch` re-runnable after a
+// failure between the tag and the flip. A tag of that name pinning
+// something else is refused rather than replaced: it is somebody's pin,
+// and the branch can be given another name far more cheaply than a pin can
+// be second-guessed.
+func pinFork(ctx context.Context, rstore *refs.Store, branch string,
+	base *superblock.Superblock, baseRaw []byte) (string, error) {
+
+	name := forkTagName(branch)
+	if err := rstore.Tag(ctx, name, baseRaw); err == nil {
+		return name, nil
+	} else if !errors.Is(err, refs.ErrTagExists) {
+		return "", fmt.Errorf("pin the fork point: %w", err)
+	}
+	sb, raw, err := rstore.FetchTag(ctx, name)
+	if err != nil {
+		return "", fmt.Errorf("tag %s exists but cannot be read: %w", name, err)
+	}
+	if superblock.Hash(raw) == superblock.Hash(baseRaw) {
+		return name, nil
+	}
+	return "", fmt.Errorf("tag %s already pins generation %d, and this branch would be cut from %d; "+
+		"a fork point is pinned under that name, so pick another branch name or remove the tag",
+		name, sb.Generation, base.Generation)
+}
+
+// refuseExistingBranch reports the good refusal for a name already in
+// use, before any of the work that creating a branch would otherwise do.
+//
+// The flip is still the authority — it refuses create-over-existing on the
+// transport, which no local check can promise — but reaching it means
+// having pinned the fork point first, and a name collision discovered
+// there would surface as a complaint about a tag instead of about the
+// branch the user typed.
+func refuseExistingBranch(ctx context.Context, rstore *refs.Store, inner pelicanobj.Store, name string) error {
+	if _, err := inner.StatKey(ctx, refs.RefDirKey+"/"+name); err != nil {
+		return nil // not there, or not knowable: let the flip decide
+	}
+	return explainBranchFailure(ctx, rstore, name, refs.ErrStaleFlip)
 }

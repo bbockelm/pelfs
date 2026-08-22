@@ -586,3 +586,27 @@ func TestCondemnedRefLedgersAreAdditive(t *testing.T) {
 		}
 	}
 }
+
+// Every inode a lineage can produce has to fit in a SIGNED 64-bit
+// integer, because the catalog and the overlay are SQLite and its
+// integers are signed. A lineage with the top bit set makes inodes that
+// round-trip as negative and fail to scan back.
+func TestEveryLineageProducesInodesThatFitInInt64(t *testing.T) {
+	for _, l := range []uint32{0, 1, 1 << 10, MaxLineage} {
+		first := FirstInode(l)
+		if first > 1<<63-1 {
+			t.Errorf("lineage %d starts at %d, past the signed 64-bit range", l, first)
+		}
+		if int64(first) < 0 {
+			t.Errorf("lineage %d starts at a value that is negative as int64", l)
+		}
+		if got := LineageOf(first); got != l {
+			t.Errorf("lineage %d round-trips as %d", l, got)
+		}
+	}
+	// And the last inode a lineage can allocate is still positive.
+	last := FirstInode(MaxLineage) + (1<<InodeLineageShift - 3)
+	if int64(last) < 0 {
+		t.Errorf("the last inode of the last lineage (%d) is negative as int64", last)
+	}
+}

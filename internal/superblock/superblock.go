@@ -167,6 +167,21 @@ type Fork struct {
 	// From names the ref this branch was cut from, for a human reading a
 	// superblock. Not load-bearing: the ref may since have moved or gone.
 	From string `cbor:"from,omitempty"`
+	// Tag is a tag pinning the base generation, and it is what makes the
+	// base READABLE rather than merely named.
+	//
+	// Base identifies the generation; it does not say where to get it, and
+	// a generation is only addressable through a ref or a tag. The moment
+	// the source branch seals again, the fork point is no longer any
+	// branch's head — which happens in the most ordinary flow there is, so
+	// without a pin a merge would almost always have nothing to read. A
+	// tag also keeps retention from collecting it, which is the other half
+	// of the same requirement.
+	//
+	// Empty on a branch created before this existed, or by a writer that
+	// could not create the tag; the base is then findable only if some
+	// other ref happens to name it.
+	Tag string `cbor:"tag,omitempty"`
 	// Lineage is the partition of the inode space this branch allocates
 	// from, and it is what makes merges cheap instead of impossible.
 	//
@@ -182,16 +197,28 @@ type Fork struct {
 	Lineage uint32 `cbor:"lineage"`
 }
 
-// InodeLineageShift splits an inode into a lineage and a counter: the top
-// 24 bits say which branch allocated it, the low 40 bits say which
+// InodeLineageShift splits an inode into a lineage and a counter: the
+// high bits say which branch allocated it, the low 40 bits say which
 // allocation it was.
 //
-// 40 bits is a trillion inodes per lineage, which is three orders of
-// magnitude past the hundred million objects the format is designed for;
-// 24 bits is 16 million branches. Both are far past use, which is the
-// point — a partition that could run out would need a policy for running
-// out.
+// 40 bits is a trillion inodes per lineage, three orders of magnitude past
+// the hundred million objects the format is designed for.
 const InodeLineageShift = 40
+
+// MaxLineage is the largest lineage, and it is 23 bits rather than the 24
+// the shift leaves room for so that EVERY INODE FITS IN A SIGNED 64-BIT
+// INTEGER.
+//
+// Inodes are uint64 in the format and int64 in storage: the catalog and
+// the overlay are SQLite, whose integers are signed. A lineage with the
+// top bit set produces an inode above 2^63, which round-trips as a
+// negative int64 and fails to scan back — "converting driver.Value type
+// int64 (-2130844738536865790) to a uint64", found by the first test that
+// drew a high lineage.
+//
+// Half the address space for nothing, and 8.4 million branches is still
+// far past use.
+const MaxLineage = 1<<23 - 1
 
 // LineageOf reports which lineage allocated an inode.
 func LineageOf(inode uint64) uint32 { return uint32(inode >> InodeLineageShift) }

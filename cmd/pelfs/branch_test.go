@@ -281,8 +281,12 @@ func TestABranchIsAnIndependentLineOfHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gc: %v", err)
 	}
-	if rep.Branches != 1 || rep.Tags != 1 {
-		t.Fatalf("the sweep saw %d branches and %d tags; want main and dev-1.0 alone",
+	// Two tags: dev-1.0, and the fork-dev pin that creating the branch
+	// left behind. The pin outlives the branch on purpose — it is what
+	// keeps the fork point readable, and deleting a branch does not know
+	// whether someone still wants to merge from a copy of it.
+	if rep.Branches != 1 || rep.Tags != 2 {
+		t.Fatalf("the sweep saw %d branches and %d tags; want main alone, with dev-1.0 and fork-dev",
 			rep.Branches, rep.Tags)
 	}
 	if rep.Deleted+rep.Indexes.Deleted+rep.Manifests.Deleted == 0 {

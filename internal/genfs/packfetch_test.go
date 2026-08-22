@@ -123,27 +123,13 @@ func readFile(t *testing.T, fs *genfs.FS, name string, bufSize int) []byte {
 	return out
 }
 
-// chunkFiles counts the decoded chunks currently cached.
-func chunkFiles(t *testing.T, cache string) int {
+// dropChunks empties the decoded-chunk arena, so a re-read has to go back
+// to whatever holds the stored bytes and prove where that was. It used to
+// delete gencache/chunks/; there is no such directory now (chunkarena.go),
+// and the tier is asked directly.
+func dropChunks(t *testing.T, fs *genfs.FS) {
 	t.Helper()
-	entries, err := os.ReadDir(filepath.Join(cache, "chunks"))
-	if err != nil {
-		return 0
-	}
-	return len(entries)
-}
-
-// dropChunks empties the decoded-chunk cache, so a re-read has to go back
-// to whatever holds the stored bytes and prove where that was.
-func dropChunks(t *testing.T, cache string) {
-	t.Helper()
-	dir := filepath.Join(cache, "chunks")
-	if err := os.RemoveAll(dir); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		t.Fatal(err)
-	}
+	fs.DropDecodedChunks()
 }
 
 func cachedPacks(t *testing.T, cache string) []string {
@@ -179,15 +165,18 @@ func TestMultiChunkReadIsOneRequest(t *testing.T) {
 	// trailer probe; counting that as a chunk read would measure the index,
 	// not the coalescing this test is about.
 	readFile(t, fs, "a.bin", 16<<20)
-	dropChunks(t, f.cache)
+	dropChunks(t, fs)
 
 	before := f.inner.gets.Load()
+	beforeDecodes := fs.ChunkStats().Decodes
 	got := readFile(t, fs, "a.bin", 16<<20)
 	gets := f.inner.since(before)
 	if !bytes.Equal(got, f.body["a.bin"]) {
 		t.Fatalf("a.bin did not read back byte-exact")
 	}
-	chunks := chunkFiles(t, f.cache)
+	// The chunks the re-read had to decode: with the tier emptied, that is
+	// the file's chunk count.
+	chunks := int(fs.ChunkStats().Decodes - beforeDecodes)
 	if chunks < 3 {
 		t.Fatalf("fixture produced %d cached chunks; the test needs a multi-chunk file", chunks)
 	}
@@ -206,15 +195,16 @@ func TestKernelSizedSequentialReadCostsOnePerChunk(t *testing.T) {
 	// See TestMultiChunkReadIsOneRequest: the first pass resolves the
 	// location layer, the measured one reads chunks.
 	readFile(t, fs, "a.bin", 128<<10)
-	dropChunks(t, f.cache)
+	dropChunks(t, fs)
 
 	before := f.inner.gets.Load()
+	beforeDecodes := fs.ChunkStats().Decodes
 	got := readFile(t, fs, "a.bin", 128<<10)
 	gets := f.inner.since(before)
 	if !bytes.Equal(got, f.body["a.bin"]) {
 		t.Fatalf("a.bin did not read back byte-exact")
 	}
-	chunks := int64(chunkFiles(t, f.cache))
+	chunks := fs.ChunkStats().Decodes - beforeDecodes
 	if gets > chunks {
 		t.Errorf("%d pack reads for %d chunks over %d kernel-sized reads",
 			gets, chunks, (12<<20)/(128<<10))
@@ -266,7 +256,7 @@ func TestScatteredReadFetchesEachPackWholeAndOnce(t *testing.T) {
 
 	// A second read in the same files must not go out again: the pack it
 	// needs is already whole on disk, decoded chunks or not.
-	dropChunks(t, f.cache)
+	dropChunks(t, fs)
 	before = f.inner.gets.Load()
 	for _, name := range []string{"a.bin", "b.bin", "c.bin"} {
 		n, err := fs.Lookup(ctx, rootIno, name)

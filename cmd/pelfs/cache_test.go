@@ -57,10 +57,10 @@ func TestCacheClearRefusesALiveMount(t *testing.T) {
 		t.Skipf("no short temp path for a unix socket: %v", err)
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) }) //nolint:errcheck
-	if err := os.MkdirAll(filepath.Join(dir, "gencache", "chunks"), 0700); err != nil {
+	if err := os.MkdirAll(filepath.Join(dir, "gencache", "packs"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "gencache", "chunks", "deadbeef"), make([]byte, 4096), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "gencache", "packs", "p-deadbeef-0000"), make([]byte, 4096), 0600); err != nil {
 		t.Fatal(err)
 	}
 	sock := filepath.Join(dir, control.SocketName)

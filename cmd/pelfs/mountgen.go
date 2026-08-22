@@ -557,6 +557,15 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	if err != nil {
 		return fail(err)
 	}
+	// Once, and only on a state directory that had one: v0.1.0 kept a flat
+	// gencache/chunks/ with a plaintext file per chunk it had ever read,
+	// and this build has just deleted it. A user who watches a gigabyte
+	// come back is entitled to know what took it.
+	if n, b := g.gfs.LegacyChunksSwept(); n > 0 {
+		ui.Info("swept {files} decoded-chunk files ({bytes}) left by an older pelfs; "+
+			"the decoded cache is one mmap'd arena now",
+			"files", n, "bytes", ui.ByteCount(b))
+	}
 	defer g.down.timed("gencache", func() { g.gfs.Close() }) //nolint:errcheck
 	startup.mark("root catalog")
 	g.stats.Update(func(sum *stats.Summary) { sum.Generation = sb.Generation })
@@ -1015,6 +1024,7 @@ func cacheStats(fs *genfs.FS) *stats.CacheStats {
 		return nil
 	}
 	u := fs.CacheUsage()
+	ck := fs.ChunkStats()
 	cs := &stats.CacheStats{
 		Bytes:        u.Bytes,
 		Files:        u.Files,
@@ -1022,6 +1032,8 @@ func cacheStats(fs *genfs.FS) *stats.CacheStats {
 		EvictedFiles: u.EvictedFiles,
 		EvictedBytes: u.EvictedBytes,
 		Pinned:       u.Pinned,
+		ChunkHits:    ck.Hits,
+		ChunkMisses:  ck.Misses,
 		Dirs:         make(map[string]int64, len(u.Dirs)),
 	}
 	for _, d := range u.Dirs {

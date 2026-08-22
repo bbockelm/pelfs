@@ -75,7 +75,7 @@ type PrefetchBudgetError struct {
 
 func (e *PrefetchBudgetError) Error() string {
 	return fmt.Sprintf("genfs: the generation is %d bytes in %d packs, the local cache budget is %d bytes; "+
-		"it cannot be made local (raise --cache-bytes above %d, or drop --prefetch all)",
+		"it cannot be made local (raise --cache-size above %d, or drop --prefetch all)",
 		e.Need, e.Packs, e.Budget, e.Need)
 }
 
@@ -202,7 +202,22 @@ func (fs *FS) Prefetch(ctx context.Context, workers int) (*PrefetchReport, error
 // evicted from by the next catalog spill, which is the churn this check
 // exists to prevent. The low-water mark leaves the same headroom eviction
 // itself does, and the cache holds catalogs and trailers besides packs.
-func (fs *FS) prefetchBudget() int64 { return fs.cacheLow() }
+func (fs *FS) prefetchBudget() int64 {
+	low := fs.cacheLow()
+	if low <= 0 {
+		return 0
+	}
+	// The decoded-chunk arena is a fixed reservation out of the same
+	// budget and no sweep can reclaim it, so it is not room a pack set can
+	// be promised.
+	if n := fs.arena.bytes(); n > 0 {
+		low -= n
+	}
+	if low < 0 {
+		low = 0
+	}
+	return low
+}
 
 // noteFailure records one thing the pass could not make local. Callers
 // hold whatever lock protects rep.

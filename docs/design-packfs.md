@@ -1338,12 +1338,12 @@ stays closed.
 ### Read path
 
 ReaddirPlus fills entries and attributes in one pass from a catalog page.
-File reads resolve chunkrefs to the identity-keyed decoded-chunk cache,
+File reads resolve chunkrefs to the identity-keyed decoded-chunk arena,
 then to the pack holding the chunk, fetched whole. `FOPEN_KEEP_CACHE`
 holds the page cache across open and close of clean files on a read-only
 mount; kernel writeback-cache mode batches dirty pages for the overlay.
-Zero-copy `splice` from the cache file (`ReadResultFd`) is *not*
-implemented — reads copy through `ReadResultData`.
+Zero-copy `splice` from the cache (`ReadResultFd`) is *not* implemented —
+reads copy through `ReadResultData`.
 
 Open is stateless (`Fh 0`) and there is no per-handle snapshot isolation.
 Chunk lists live in a per-inode cache which a generation swap clears
@@ -1742,12 +1742,68 @@ from magic bytes inside an entry.
 One cache, under the volume's state directory (`gencache/`), with four
 kinds of thing in it:
 
-- `chunks/` — **decoded** chunk bytes (post-zstd, post-AES), keyed by
-  chunk identity. This is the only local data store.
-- `packs/` — whole packs, the unit of transfer.
+- `packs/` — whole packs, the unit of transfer, and the only local data
+  store: everything else here is derived from one.
+- `chunks.arena` — **decoded** chunk bytes (post-zstd, post-AES), in ONE
+  mmap'd file with an in-memory index. See below.
 - `catalogs/` — catalog blobs by identity.
 - `trailers/` — verified pack trailers, so a resolved location map
   survives a remount.
+
+### The decoded-chunk arena
+
+The arena replaced a flat `chunks/` directory holding one plaintext file
+per chunk the mount had ever read. That shape cost an inode and a
+directory entry per chunk, on a volume with no upper bound on how many
+that is — 6,646 files for a 166 MiB source tree, and a volume is not
+166 MiB. It also cost more than it saved on the workload it was meant to
+help: measured against no decode cache at all, filling it made a cold read
+of the whole tree 2.3x SLOWER, because writing 6,646 small files is more
+work than decoding 166 MiB.
+
+What a decode cache buys is nonetheless real. zstd decodes at about
+1.3 GiB/s on an M-series laptop and AES-GCM adds ~5%, but the rate falls
+with chunk size — 0.5 GiB/s at 4 KiB — and a kernel-sized read of a large
+chunk decodes the whole chunk to serve 128 KiB of it, so an uncached
+re-read of that tree decodes 461 MiB to deliver 166 MiB. So the tier
+stays, in a shape that costs one inode:
+
+- **One preallocated, mmap'd file.** The page cache is the memory tier: a
+  hot chunk is a memcpy, a cold one is a page fault, and neither is a
+  `read(2)` or a filesystem metadata operation.
+- **The index is in memory and is never written down.** A crash loses
+  decode work and nothing else — every byte in the arena is re-derivable
+  from a pack — and the file is truncated at the next Open rather than
+  inherited.
+- **A bump cursor that wraps** is both the allocator and the eviction
+  policy: no fragmentation, O(1) allocation, FIFO reclamation.
+- **Concurrency**: every slot carries an RWMutex. A reader holds it shared
+  for one memcpy, a filler exclusively while it writes, and the allocator
+  exclusively to declare a slot dead before handing its space away — so an
+  eviction waits out the readers inside the region it is taking.
+- **Modest by default**: 256 MiB, capped at an eighth of the whole cache
+  budget, and charged against it. It is an amortizer, not a store.
+
+A ristretto (TinyLFU) index was built first and lost to the plain map by a
+wide margin — 28% hit rate on a hot re-read against 100%, 8% on scattered
+reads against 100%. Not because of the eviction policy but because of
+VISIBILITY: ristretto's `Set` is asynchronous, and the most common event
+in this cache is a chunk read again microseconds after it was decoded (a
+500 KiB chunk serves a 128 KiB kernel read four times over). A cache that
+cannot answer for what it was just given cannot serve that.
+
+Measured on a 166 MiB, 7,200-file source-shaped tree with the packs
+already local, against the shape it replaced:
+
+| workload | flat `chunks/` | arena | no decode tier |
+|---|---|---|---|
+| cold scan of the tree | 2.03 s | 0.55 s | 0.89 s |
+| hot re-scan | 131 ms | 13 ms | 889 ms |
+| scattered 4 KiB reads | 318 ms | 32 ms | 1.43 s |
+| files in the cache dir | 6,646 | 1 | 0 |
+
+A v0.1.0 state directory's populated `chunks/` is swept at the first Open
+with a newer binary, and the mount says so once.
 
 `--prefetch all` makes a whole generation local before the mount starts
 and refuses to run if anything is unavailable; `--prefetch background`

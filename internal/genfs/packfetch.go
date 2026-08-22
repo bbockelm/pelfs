@@ -132,11 +132,11 @@ type span struct {
 	entries     []pendingChunk
 }
 
-// chunkResident reports whether the decoded-chunk cache already holds the
-// whole chunk. A short file is a torn fill and counts as absent.
-func (fs *FS) chunkResident(idHex string, llen int64) bool {
-	fi, err := os.Stat(filepath.Join(fs.chunkDir, idHex))
-	return err == nil && fi.Size() == llen
+// chunkResident reports whether the decoded-chunk arena already holds the
+// chunk, so a batched fill can skip it. With the tier off nothing is ever
+// resident.
+func (fs *FS) chunkResident(idHex string, _ int64) bool {
+	return fs.arena.has(idHex)
 }
 
 // fillChunks brings every missing chunk in refs into the decoded cache,
@@ -185,6 +185,12 @@ func (fs *FS) fillChunks(ctx context.Context, refs []catalog.ChunkRef) {
 			tasks = append(tasks, func() { fs.fillWholePack(ctx, fs.packIndex, pack, want) })
 			continue
 		}
+		if fs.arena == nil {
+			// Ranged coalescing exists to fill the decoded-chunk tier
+			// ahead of the reads that want it. With no tier to fill, the
+			// bytes would be fetched, decoded and thrown away.
+			continue
+		}
 		for _, sp := range coalesce(want) {
 			pack, sp := pack, sp
 			tasks = append(tasks, func() { fs.fillSpan(ctx, pack, sp) })
@@ -231,12 +237,22 @@ func (fs *FS) fillSpan(ctx context.Context, pack string, sp span) {
 func (fs *FS) fillWholePack(ctx context.Context, idx *packIndex, pack string, want []pendingChunk) {
 	f, size, err := fs.openCachedPack(ctx, idx, pack)
 	if err != nil {
+		if fs.arena == nil {
+			return
+		}
 		for _, sp := range coalesce(want) {
 			fs.fillSpan(ctx, pack, sp)
 		}
 		return
 	}
 	defer f.Close() //nolint:errcheck
+	if fs.arena == nil {
+		// The pack is local, which is the whole of a batched fill when
+		// there is no decoded tier to fill: each read decodes the entry it
+		// wants out of it, and pre-decoding the rest would be work thrown
+		// away.
+		return
+	}
 	var missed []pendingChunk
 	for _, w := range want {
 		if w.loc.off+w.loc.length > size {

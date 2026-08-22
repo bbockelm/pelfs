@@ -146,9 +146,9 @@ type Summary struct {
 	// writers. Nil on a read-only mount.
 	Write *WriteStats `json:"write,omitempty"`
 
-	// Cache is the LOCAL disk this mount is using — decoded chunks,
-	// spilled catalogs, pack trailers, whole packs — against the budget
-	// they are held to. Without it "the disk filled up" was unanswerable
+	// Cache is the LOCAL disk this mount is using — the decoded-chunk
+	// arena, spilled catalogs, pack trailers, whole packs — against the
+	// budget they are held to. Without it "the disk filled up" was unanswerable
 	// without attaching to the process, and a cache sitting at its limit
 	// with a large eviction count (a working set that does not fit, which
 	// costs bandwidth) was indistinguishable from one that simply grew.
@@ -217,6 +217,17 @@ type CacheStats struct {
 	EvictedFiles int64            `json:"evicted_files,omitempty"`
 	EvictedBytes int64            `json:"evicted_bytes,omitempty"`
 	Pinned       int              `json:"pinned,omitempty"`
+
+	// ChunkHits and ChunkMisses are the decoded-chunk arena's account of
+	// itself: a chunk read served out of the arena, against one that had
+	// to be decompressed and decrypted out of a pack again. It is the one
+	// number that says whether the arena is the right size for this
+	// workload — a low hit rate on a mount that re-reads its tree means
+	// the working set does not fit, and a high one on a mount that reads
+	// straight through means the arena is buying nothing and its share of
+	// the budget would do more good as pack cache.
+	ChunkHits   int64 `json:"chunk_hits,omitempty"`
+	ChunkMisses int64 `json:"chunk_misses,omitempty"`
 }
 
 const maxErrorSamples = 20

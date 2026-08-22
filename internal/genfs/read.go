@@ -5,9 +5,8 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sync"
+	"sync/atomic"
 
 	"github.com/bbockelm/pelfs/internal/catalog"
 	"github.com/bbockelm/pelfs/internal/entrycodec"
@@ -188,7 +187,7 @@ func (fs *FS) ContentOf(ctx context.Context, ino uint64) (Content, error) {
 // Read fills dst from ino at off, returning the byte count: the full
 // min(len(dst), EOF-off) — short only at EOF, 0 at or past it. Holes (NULL
 // identity chunk rows) read as zeros. Chunks are served from the decoded
-// cache under CacheDir, filled by pack range reads on miss.
+// arena under CacheDir, decoded out of a local pack on miss.
 func (fs *FS) Read(ctx context.Context, ino uint64, off int64, dst []byte) (int, error) {
 	if off < 0 {
 		return 0, fmt.Errorf("genfs: negative read offset %d", off)
@@ -251,21 +250,59 @@ func overlapping(refs []catalog.ChunkRef, off, end int64) []catalog.ChunkRef {
 	return out
 }
 
+// chunkCounters is what the decoded-chunk tier is doing: how often a read
+// was served out of it, how often it had to be filled, and the decode work
+// a fill costs. It is the evidence for whether the tier earns its keep.
+type chunkCounters struct {
+	hits         atomic.Int64
+	misses       atomic.Int64
+	decodes      atomic.Int64
+	decodedBytes atomic.Int64
+}
+
+// ChunkStats is a snapshot of the decoded-chunk tier's counters.
+type ChunkStats struct {
+	// Hits are chunk reads served from a decoded cache file, Misses ones
+	// that had to go to the pack. With the tier off every read is a miss
+	// by definition.
+	Hits, Misses int64
+	// Decodes and DecodedBytes are the zstd/AES-GCM work the misses cost,
+	// which is precisely what the tier exists to avoid repeating.
+	Decodes, DecodedBytes int64
+}
+
+// ChunkStats reports the decoded-chunk tier's counters since Open.
+func (fs *FS) ChunkStats() ChunkStats {
+	return ChunkStats{
+		Hits:         fs.chunkStats.hits.Load(),
+		Misses:       fs.chunkStats.misses.Load(),
+		Decodes:      fs.chunkStats.decodes.Load(),
+		DecodedBytes: fs.chunkStats.decodedBytes.Load(),
+	}
+}
+
 // readChunkAt fills window with chunk bytes starting at chunkOff. Cache
 // files hold verified decoded bytes and are trusted on hit (identity is
 // checked once, at fill — see the package comment for the encrypted-volume
 // caveat where the GCM tag stands in for the keyed identity).
 func (fs *FS) readChunkAt(ctx context.Context, r *catalog.ChunkRef, chunkOff int64, window []byte) error {
 	idHex := hex.EncodeToString(r.Identity)
-	fp := filepath.Join(fs.chunkDir, idHex)
-	if readAtFile(fp, chunkOff, window) {
+	if fs.arena.read(idHex, chunkOff, window) {
+		fs.chunkStats.hits.Add(1)
 		return nil
 	}
-	unlock := fs.lockFill("chunk:" + idHex)
-	defer unlock()
-	if readAtFile(fp, chunkOff, window) {
-		return nil
+	if fs.arena != nil {
+		// Serialize the fill per identity, so a burst of readers of one
+		// chunk costs one decode between them rather than one each — a
+		// 4 MiB chunk is milliseconds of zstd.
+		unlock := fs.lockFill("chunk:" + idHex)
+		defer unlock()
+		if fs.arena.read(idHex, chunkOff, window) {
+			fs.chunkStats.hits.Add(1)
+			return nil
+		}
 	}
+	fs.chunkStats.misses.Add(1)
 	loc, err := fs.packIndex.locate(ctx, idHex)
 	if err != nil {
 		return fmt.Errorf("genfs: chunk %s: %w", idHex, err)
@@ -278,13 +315,9 @@ func (fs *FS) readChunkAt(ctx context.Context, r *catalog.ChunkRef, chunkOff int
 	if err != nil {
 		return err
 	}
-	if err := writeAtomic(fp, plain); err != nil {
-		return err
-	}
-	// Decoded plaintext, one file per chunk ever read, and the reason the
-	// cache needed a budget at all: reading an N-byte volume used to cost
-	// N bytes of local disk permanently (gencache.go).
-	fs.noteCached(int64(len(plain)))
+	// Into the arena, not into a file of its own (chunkarena.go). The
+	// decoded copy is worth keeping and the inode it used to cost was not.
+	fs.arena.put(idHex, plain)
 	copy(window, plain[chunkOff:chunkOff+int64(len(window))])
 	return nil
 }
@@ -307,6 +340,8 @@ func (fs *FS) decodeChunk(idHex string, r *catalog.ChunkRef, stored []byte) ([]b
 	if err != nil {
 		return nil, fmt.Errorf("genfs: decode chunk %s: %w", idHex, err)
 	}
+	fs.chunkStats.decodes.Add(1)
+	fs.chunkStats.decodedBytes.Add(int64(len(plain)))
 	if int64(len(plain)) != r.LLen {
 		return nil, fmt.Errorf("genfs: chunk %s: decoded %d bytes, chunkref llen %d", idHex, len(plain), r.LLen)
 	}
@@ -323,25 +358,14 @@ func (fs *FS) decodeChunk(idHex string, r *catalog.ChunkRef, stored []byte) ([]b
 // produce is fetched again by readChunkAt, which reports the error with
 // the read that actually needed it.
 func (fs *FS) storeChunk(idHex string, r *catalog.ChunkRef, stored []byte) {
+	if fs.arena == nil {
+		return
+	}
 	plain, err := fs.decodeChunk(idHex, r, stored)
 	if err != nil {
 		return
 	}
-	if err := writeAtomic(filepath.Join(fs.chunkDir, idHex), plain); err == nil {
-		fs.noteCached(int64(len(plain)))
-	}
-}
-
-// readAtFile serves window from a cache file; any failure (missing,
-// truncated) reports false so the caller refills.
-func readAtFile(fp string, off int64, window []byte) bool {
-	f, err := os.Open(fp)
-	if err != nil {
-		return false
-	}
-	defer f.Close() //nolint:errcheck
-	_, err = f.ReadAt(window, off)
-	return err == nil
+	fs.arena.put(idHex, plain)
 }
 
 func max64(a, b int64) int64 {

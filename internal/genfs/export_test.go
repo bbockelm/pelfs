@@ -39,3 +39,30 @@ func (fs *FS) IndexedPacks() int {
 	defer x.mu.Unlock()
 	return len(x.keysOf)
 }
+
+// DropDecodedChunks empties the decoded-chunk arena, so the next read of
+// anything has to go back to a pack and decode it again.
+//
+// It replaces "delete gencache/chunks/" as the way a test asks for a cold
+// decode path. The tier is one mmap'd file with an in-memory index now
+// (chunkarena.go), so there are no per-chunk files for a test to unlink —
+// and unlinking the arena file under the mapping would be a bug, not a
+// fixture.
+func (fs *FS) DropDecodedChunks() {
+	fs.swapMu.RLock()
+	defer fs.swapMu.RUnlock()
+	fs.arena.clear()
+}
+
+// DecodedChunksResident is how many chunks the arena is holding. It is the
+// number the old tests counted files in gencache/chunks/ to get.
+func (fs *FS) DecodedChunksResident() int {
+	fs.swapMu.RLock()
+	defer fs.swapMu.RUnlock()
+	if fs.arena == nil {
+		return 0
+	}
+	fs.arena.mu.Lock()
+	defer fs.arena.mu.Unlock()
+	return len(fs.arena.q) - fs.arena.head
+}

@@ -4,6 +4,39 @@
 
 ### Changed
 
+- **The decoded-chunk cache is one file, not one file per chunk.**
+  `gencache/chunks/` held a plaintext file per chunk the mount had ever
+  read — an inode and a flat directory entry each, 6,646 of them for a
+  166 MiB source tree, with no upper bound on a real volume. It is now
+  `gencache/chunks.arena`: one preallocated, mmap'd file with an in-memory
+  index, a bump cursor that wraps for eviction, and a default size of
+  256 MiB capped at an eighth of the cache budget (it was previously
+  unbounded except by the shared budget).
+
+  It is faster as well as smaller — measured on that tree with the packs
+  already local: a cold read 2.03 s → 0.55 s, a hot re-read 131 ms →
+  13 ms, scattered 4 KiB reads 318 ms → 32 ms. Filling the old directory
+  cost more than the decoding it saved.
+
+  The arena's size is reported by `pelfs cache` and in the statistics file
+  under `cache.dirs.arena`, and `cache.chunk_hits` / `cache.chunk_misses`
+  say whether it is the right size for the workload. `ChunkArenaBytes`
+  negative turns the tier off entirely, which on that tree costs 61% on a
+  cold scan (a 500 KiB chunk is decoded four times to serve four 128 KiB
+  kernel reads) and 68x on a re-read.
+
+  **On-disk change:** the first mount with this build sweeps a v0.1.0
+  `gencache/chunks/` directory and logs what it reclaimed. Everything
+  under `gencache/` is re-derivable from the federation, so nothing is
+  lost; a v0.1.0 binary pointed back at the same state directory simply
+  refills it.
+
+- Two cache-reporting bugs found on the way. `CacheUsage` returned zero
+  eviction counters whenever it had to rescan, so "has this cache been
+  evicting" was answerable only by luck; and a mount opened with a smaller
+  budget than the last one inherited the previous arena reservation
+  without agreeing to it.
+
 - **`--prefetch` moves packs, not decoded chunks.** "I want the data
   local" now means the generation's *packs* are local, which is what a
   read is served out of anyway. It used to pull every chunk through the

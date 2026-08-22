@@ -16,19 +16,21 @@ import (
 // directories with four lifetimes and, until this existed, one bound
 // between them:
 //
-//	packs/     whole packs, as fetched (packfetch.go). Bounded since it
-//	           was written, because a pack is tens of megabytes and a
-//	           volume is not going to fit on a laptop.
-//	chunks/    DECODED PLAINTEXT, one file per chunk ever read
-//	           (read.go). Unbounded: reading an N-byte volume cost N
-//	           bytes of local disk, forever, and remounting did not
-//	           reclaim it because the cache survives the process on
-//	           purpose.
-//	catalogs/  spilled SQLite catalogs (genfs.go). Unbounded, and the
-//	           file the catalog handle cache opens.
-//	trailers/  one small file per pack listed (packindex.go).
-//	           Unbounded, and proportional to the whole generation
-//	           rather than to what was read.
+//	packs/        whole packs, as fetched (packfetch.go). Bounded since
+//	              it was written, because a pack is tens of megabytes and
+//	              a volume is not going to fit on a laptop.
+//	chunks/       DECODED PLAINTEXT, one file per chunk ever read
+//	              (read.go). Unbounded: reading an N-byte volume cost N
+//	              bytes of local disk, forever, and remounting did not
+//	              reclaim it because the cache survives the process on
+//	              purpose. GONE — chunks.arena replaced it, one mmap'd
+//	              file of a fixed size (chunkarena.go), and a v0.1.0
+//	              directory left behind is swept at Open.
+//	catalogs/     spilled SQLite catalogs (genfs.go). Unbounded, and the
+//	              file the catalog handle cache opens.
+//	trailers/     one small file per pack listed (packindex.go).
+//	              Unbounded, and proportional to the whole generation
+//	              rather than to what was read.
 //
 // So the cache had one cap covering the one directory whose growth a user
 // could have predicted, and none over the three that grow with what the
@@ -72,11 +74,30 @@ const cacheLowWaterShift = 4
 // walk on the control socket.
 const cacheUsageMaxAge = 30 * time.Second
 
-// cacheDirNames are the subdirectories of CacheDir the budget covers, in
-// report order. Names live here rather than at their four use sites so
-// that `pelfs cache` and the mount cannot disagree about what the cache
-// is made of.
-var cacheDirNames = []string{"chunks", "catalogs", "trailers", "packs"}
+// cacheDirNames are the subdirectories of CacheDir the LRU sweeps, in
+// report order. Names live here rather than at their use sites so that
+// `pelfs cache` and the mount cannot disagree about what the cache is
+// made of.
+//
+// The decoded-chunk arena is NOT one of them and never can be. It is a
+// single preallocated file whose contents are managed by their own cursor
+// (chunkarena.go); an LRU that could unlink it would be unlinking the
+// mapping out from under every reader in the process. It is REPORTED and
+// CHARGED against the same budget — arenaUsage — and it is simply not a
+// candidate for eviction.
+var cacheDirNames = []string{"catalogs", "trailers", "packs"}
+
+// arenaUsage is the decoded-chunk arena's contribution to the cache. It is
+// the file's whole length, because the file is preallocated: the disk is
+// spoken for whether or not the cursor has reached the far end of it, and
+// reporting the part in use would understate what the cache costs.
+func arenaUsage(cacheDir string) DirUsage {
+	du := DirUsage{Name: "arena"}
+	if fi, err := os.Stat(arenaFilePath(cacheDir)); err == nil {
+		du.Bytes, du.Files = fi.Size(), 1
+	}
+	return du
+}
 
 // DirUsage is one cache directory's contribution.
 type DirUsage struct {
@@ -191,7 +212,7 @@ func (fs *FS) evictCache() {
 	// the running estimate whether or not anything is evicted.
 	fs.cache.used.Store(total)
 	if total <= fs.cacheCap {
-		fs.storeUsage(usage)
+		fs.storeUsage(usage) //nolint:errcheck
 		return
 	}
 	low := fs.cacheLow()
@@ -248,7 +269,7 @@ func (fs *FS) evictCache() {
 	// Re-derive the breakdown from what the sweep actually removed rather
 	// than scanning again: the numbers are a report, and one more walk of
 	// the whole cache is a poor way to produce them.
-	fs.storeUsage(fs.recountLocked(files, total, skipped))
+	fs.storeUsage(fs.recountLocked(files, total, skipped)) //nolint:errcheck
 }
 
 // cacheLow is the byte count an eviction pass sweeps down to.
@@ -294,6 +315,12 @@ func (fs *FS) scanCacheLocked() ([]cacheFile, CacheUsage) {
 		usage.Bytes += du.Bytes
 		usage.Files += du.Files
 	}
+	// Charged, never swept: the arena is a reservation this mount holds
+	// for as long as it runs.
+	au := arenaUsage(fs.cacheDir)
+	usage.Dirs = append(usage.Dirs, au)
+	usage.Bytes += au.Bytes
+	usage.Files += au.Files
 	return files, usage
 }
 
@@ -306,6 +333,9 @@ func (fs *FS) recountLocked(files []cacheFile, total int64, pinned int) CacheUsa
 	for _, name := range cacheDirNames {
 		usage.Dirs = append(usage.Dirs, DirUsage{Name: name})
 	}
+	au := arenaUsage(fs.cacheDir)
+	usage.Dirs = append(usage.Dirs, au)
+	usage.Files += au.Files
 	for i := range usage.Dirs {
 		byDir[usage.Dirs[i].Name] = &usage.Dirs[i]
 	}
@@ -323,11 +353,21 @@ func (fs *FS) recountLocked(files []cacheFile, total int64, pinned int) CacheUsa
 	return usage
 }
 
-func (fs *FS) storeUsage(u CacheUsage) {
+// storeUsage publishes a freshly measured breakdown and returns what it
+// stored — the eviction counters filled in, which is the whole reason it
+// returns anything. It used to take its argument by value, stamp the
+// counters onto its own copy, and leave the CALLER holding the version
+// without them; CacheUsage's rescan path returned that caller-side copy,
+// so any report that had to rescan said "nothing has ever been evicted"
+// however much had been. The fast path was correct, which is what kept it
+// hidden: it was only reached often while the decoded-chunk files were
+// driving noteCached on every read.
+func (fs *FS) storeUsage(u CacheUsage) CacheUsage {
 	u.EvictedFiles = fs.cache.evictedFiles.Load()
 	u.EvictedBytes = fs.cache.evictedBytes.Load()
 	fs.cache.usage.Store(&u)
 	fs.cache.scannedA.Store(time.Now().UnixNano())
+	return u
 }
 
 // CacheUsage reports what the local cache holds, rescanning only when the
@@ -350,15 +390,24 @@ func (fs *FS) CacheUsage() CacheUsage {
 			drift = -drift
 		}
 		if drift <= fs.usageDrift() && time.Since(time.Unix(0, fs.cache.scannedA.Load())) < cacheUsageMaxAge {
-			return *u
+			// The per-directory breakdown is as of the last scan; the
+			// EVICTION counters never are. They are session-cumulative
+			// atomics that this process knows exactly at any moment, and
+			// serving a stale copy of them was answering "has anything been
+			// evicted" with "not as of some minutes ago" — the one question
+			// a full-disk report exists to answer, and a test that drives
+			// eviction and then asks about it got the same non-answer.
+			out := *u
+			out.EvictedFiles = fs.cache.evictedFiles.Load()
+			out.EvictedBytes = fs.cache.evictedBytes.Load()
+			return out
 		}
 	}
 	fs.evictMu.Lock()
 	defer fs.evictMu.Unlock()
 	_, usage := fs.scanCacheLocked()
 	fs.cache.used.Store(usage.Bytes)
-	fs.storeUsage(usage)
-	return usage
+	return fs.storeUsage(usage)
 }
 
 // CacheLimit reports the byte budget this mount holds its cache to.
@@ -446,7 +495,11 @@ func InspectCache(dir string) (CacheUsage, error) {
 		usage.Bytes += du.Bytes
 		usage.Files += du.Files
 	}
-	if missing == len(cacheDirNames) {
+	au := arenaUsage(dir)
+	usage.Dirs = append(usage.Dirs, au)
+	usage.Bytes += au.Bytes
+	usage.Files += au.Files
+	if missing == len(cacheDirNames) && au.Files == 0 {
 		if _, err := os.Stat(dir); err != nil {
 			return usage, err
 		}
@@ -483,6 +536,12 @@ func ClearCache(dir string) (CacheUsage, error) {
 				return usage, err
 			}
 		}
+	}
+	// And the arena, which is a cache like everything else here: its index
+	// never outlived the process that built it, so the file left behind is
+	// bytes nothing can read.
+	if err := os.Remove(arenaFilePath(dir)); err != nil && !os.IsNotExist(err) {
+		return usage, err
 	}
 	return usage, nil
 }

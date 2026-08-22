@@ -113,6 +113,17 @@ type Options struct {
 	// pack expendable. Any split of the disk between them is a guess that
 	// starves one use to protect another.
 	CacheBytes int64
+	// ChunkArenaBytes sizes the decoded-chunk arena (chunkarena.go): one
+	// mmap'd file that amortizes decode across repeated reads. Zero takes
+	// the default — DefaultChunkArenaBytes, capped at a fraction of
+	// CacheBytes — and a NEGATIVE value turns the tier off entirely, so
+	// every read decodes out of the local pack.
+	//
+	// Off is a real configuration and not only a measurement switch: it
+	// costs about 2.5x on a re-read of a hot tree and nothing at all on a
+	// single pass, so a mount that reads a volume once has no use for the
+	// arena and a mount that reads it repeatedly does.
+	ChunkArenaBytes int64
 }
 
 // Node is one inode's attributes: catalog.Node with a kernel-shaped uint64
@@ -173,7 +184,6 @@ type FS struct {
 	sb         *superblock.Superblock
 	dek        []byte
 	cacheDir   string
-	chunkDir   string
 	catDir     string
 	packDir    string
 	trailerDir string
@@ -199,6 +209,15 @@ type FS struct {
 	cacheCap int64
 	cache    cacheState
 	evictMu  sync.Mutex
+	// arena is the decoded-chunk tier: one mmap'd file with an in-memory
+	// index (chunkarena.go), nil when it is turned off. chunkStats counts
+	// what it is doing — hits, misses, and the decode work a miss costs.
+	arena      *chunkArena
+	chunkStats chunkCounters
+	// legacyChunks is what the v0.1.0 chunks/ directory held when this
+	// mount swept it, for the one line the caller logs about it.
+	legacyChunkFiles int
+	legacyChunkBytes int64
 
 	cats *catCache
 	ext  *extentCache
@@ -274,10 +293,9 @@ func Open(ctx context.Context, o Options) (*FS, error) {
 		packCacheCap = -1
 	}
 	catDir := filepath.Join(o.CacheDir, "catalogs")
-	chunkDir := filepath.Join(o.CacheDir, "chunks")
 	packDir := filepath.Join(o.CacheDir, "packs")
 	trailerDir := filepath.Join(o.CacheDir, "trailers")
-	dirs := []string{catDir, chunkDir, trailerDir}
+	dirs := []string{catDir, trailerDir}
 	if packCacheCap > 0 {
 		dirs = append(dirs, packDir)
 	}
@@ -291,7 +309,6 @@ func Open(ctx context.Context, o Options) (*FS, error) {
 		sb:           o.SB,
 		dek:          o.DEK,
 		cacheDir:     o.CacheDir,
-		chunkDir:     chunkDir,
 		catDir:       catDir,
 		packDir:      packDir,
 		trailerDir:   trailerDir,
@@ -303,6 +320,16 @@ func Open(ctx context.Context, o Options) (*FS, error) {
 		maxResident:  o.MaxResident,
 		fills:        make(map[string]*fillGate),
 	}
+	// A v0.1.0 state directory holds a flat chunks/ directory with one
+	// plaintext file per chunk it ever read. Nothing reads it now; it is a
+	// cache, so deleting it is always safe, and leaving it would be
+	// unreclaimable disk that no budget in this process covers.
+	fs.legacyChunkFiles, fs.legacyChunkBytes = sweepLegacyChunkDir(o.CacheDir)
+	arena, err := newChunkArena(o.CacheDir, chunkArenaBytes(o.ChunkArenaBytes, cacheCap))
+	if err != nil {
+		return nil, err
+	}
+	fs.arena = arena
 	// The generation's pack set, from whichever shape it uses — the
 	// manifest objects it names, or the inline list an older generation
 	// carries (manifest.Packs). Failure is fatal and says why: a mount
@@ -311,6 +338,7 @@ func Open(ctx context.Context, o Options) (*FS, error) {
 	// unreadable one.
 	packs, err := manifest.Packs(ctx, o.Inner, o.SB)
 	if err != nil {
+		fs.arena.Close() //nolint:errcheck
 		return nil, fmt.Errorf("genfs: %w", err)
 	}
 	fs.packIndex = newPackIndex(fs, packs)
@@ -372,12 +400,25 @@ func Open(ctx context.Context, o Options) (*FS, error) {
 	return fs, nil
 }
 
-// Close releases every open catalog handle. Spill and chunk cache files
-// remain in CacheDir for the next Open.
+// Close releases every open catalog handle and unmaps the decoded-chunk
+// arena. Spill files and cached packs remain in CacheDir for the next
+// Open; the arena does not, because its index lived only in memory.
 func (fs *FS) Close() error {
 	fs.swapMu.Lock()
 	defer fs.swapMu.Unlock()
-	return fs.cats.closeAll()
+	err := fs.cats.closeAll()
+	if aerr := fs.arena.Close(); err == nil {
+		err = aerr
+	}
+	return err
+}
+
+// LegacyChunksSwept reports what a v0.1.0 chunks/ directory held when this
+// Open removed it: zero files on every state directory that never had one.
+// The caller says it once, in the log — a user who has just watched a
+// gigabyte of disk come back is entitled to know why.
+func (fs *FS) LegacyChunksSwept() (files int, bytes int64) {
+	return fs.legacyChunkFiles, fs.legacyChunkBytes
 }
 
 // residencyOf returns the catalog identity (hex) an inode resolves in.

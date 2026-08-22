@@ -230,11 +230,23 @@ jobs:
     # path is a read-only directory of two binaries.
     #
     # Budget: a FIXED seed, so a red run is replayable by hand with the
-    # same command, and a small op count. Measured 22s end to end on
-    # Docker for Mac; the timeout is 15m because a STALL is the failure
-    # mode worth catching here (a wedged mount or a seal that never
-    # returns), and the harness's own deadlines fire first and print the
-    # phase they were stuck in.
+    # same command, and a small op count. Measured 53s for the plaintext
+    # leg plus 25s for the encrypted corpus, end to end on Docker for Mac
+    # (was 29s before the fill vocabulary). The timeout is 15m because a
+    # STALL is the failure mode worth catching here (a wedged mount or a
+    # seal that never returns), and the harness's own deadlines fire first
+    # and print the phase they were stuck in.
+    #
+    # WHAT THE RAISE BOUGHT, since it is most of the budget: two corpus
+    # entries at ~3s x 2 frontends each (12s), a second WRITABLE session
+    # over the generation the first one published (phase C2, ~5s on FUSE),
+    # and one fsck --deep of the generation a mid-run CHECKPOINT published
+    # rather than only the one the seal did. Between them they retro-catch
+    # the release-week rechunk CLen/Alg bug -- which nothing here could
+    # reach before, because every body was incompressible -- and they
+    # found an open bug at HEAD. Cheapest levers if it needs trimming, in
+    # order: --large-file 0 (drops the one multi-megabyte body), then move
+    # the encrypted leg to a nightly, then phase C2 to `make hostile-long`.
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -261,6 +273,22 @@ jobs:
           done
       - name: Hostile exerciser (contained; corpus + fixed-seed run, both frontends)
         run: ./scripts/hostile-docker.sh
+      # THE ENCRYPTED LEG, corpus only. Encryption is not a second copy of
+      # the same test: a chunk is compressed and THEN sealed, so a nonce
+      # and a GCM tag are always added and no entry in any pack is the
+      # length of its plaintext -- for EVERY chunk, not only the
+      # compressible ones. Measured against the pre-fix build of the
+      # rechunk CLen/Alg bug (--retro c26428f --encrypt), that is the
+      # difference between catching it on the compressible file only and
+      # catching it on the incompressible control too, off by exactly the
+      # 28 bytes the seal adds.
+      #
+      # The CORPUS rather than the whole campaign, deliberately: 25s
+      # against 65s, and the corpus is where the entry that pins this
+      # interaction lives. `scripts/hostile-docker.sh --encrypt` runs the
+      # full encrypted campaign and is the manual/nightly form.
+      - name: Hostile exerciser, ENCRYPTED volumes (contained; corpus, both frontends)
+        run: ./scripts/hostile-docker.sh --encrypt --run TestReplayTheRegressionCorpus
 
   mount-gate:
     # A REAL kernel mount of a published generation through

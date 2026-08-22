@@ -1,6 +1,6 @@
 ARCH  := $(shell go env GOARCH)
 
-.PHONY: all build linux test e2e integration mount-gate opfuzz hostile hostile-long hostile-retro unprivileged crash big-tree vet clean
+.PHONY: all build linux test e2e integration mount-gate opfuzz hostile hostile-long hostile-encrypted hostile-retro unprivileged crash big-tree vet clean
 
 all: build
 
@@ -51,10 +51,20 @@ hostile:
 hostile-long:
 	./scripts/hostile-docker.sh --long
 
+# The same vocabulary against ENCRYPTED volumes. Not a second copy of the
+# same test: a chunk is compressed and THEN sealed, so no entry in a pack
+# is ever the length of its plaintext, which is the strongest form of the
+# question the fill kinds ask. CI runs the corpus leg of this; this is the
+# whole campaign.
+hostile-encrypted:
+	./scripts/hostile-docker.sh --encrypt
+
 # Today's exerciser against an OLD pelfs, built inside the container from
 # a git archive. Proof that it finds what humans found: EXPECTED TO FAIL,
-# and each failure is one of the release-week bugs. See the script's RETRO
-# comment for why the reference is a fix's parent and not v0.1.0.
+# and each failure is one of the release-week bugs -- three of them now
+# that the vocabulary has compressible bodies and a second writable
+# session. See the script's RETRO comment for why the reference is a fix's
+# parent and not v0.1.0.
 hostile-retro:
 	./scripts/hostile-docker.sh --retro
 

@@ -37,6 +37,10 @@ package hostile
 
 import (
 	"bytes"
+	crand "crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -193,26 +197,13 @@ func (t *tree) reopen(tb testing.TB) {
 	t.root = root
 }
 
-// fillBytes is the body of a write: deterministic in (fill, offset), so
-// both trees get identical bytes; incompressible, so the packer has real
-// work and nothing dedups away; and offset-keyed, so an overlapping
-// rewrite at a different offset writes DIFFERENT bytes, which is what
-// makes a mis-merged extent list detectable at all.
-func fillBytes(fill byte, off, n int64) []byte {
-	buf := make([]byte, n)
-	for i := int64(0); i < n; i += 8 {
-		x := uint64(fill)<<56 ^ uint64(off+i)*0x9e3779b97f4a7c15
-		x ^= x >> 30
-		x *= 0xbf58476d1ce4e5b9
-		x ^= x >> 27
-		x *= 0x94d049bb133111eb
-		x ^= x >> 31
-		for j := int64(0); j < 8 && i+j < n; j++ {
-			buf[i+j] = byte(x >> (8 * uint(j)))
-		}
-	}
-	return buf
-}
+// bodyOf is the bytes one write puts down. The generation itself is in
+// plan.go — pure, untagged, and unit-tested against the volume's real
+// codec in the ordinary lane — because the claim the fill kinds make
+// (that a fill=text body is something zstd shrinks and a fill=NN body is
+// not) is the whole reason they exist, and a claim only checkable inside
+// a container is a claim nobody checks.
+func bodyOf(op Op, off, n int64) []byte { return Body(op.FillKind, op.Fill, off, n) }
 
 // apply performs one op. The error it returns is COMPARED between the two
 // trees, never acted on: a divergence in whether an operation succeeded is
@@ -227,7 +218,7 @@ func (t *tree) apply(op Op) error {
 			return err
 		}
 		if op.Len > 0 {
-			if _, err := f.Write(fillBytes(op.Fill, 0, op.Len)); err != nil {
+			if _, err := f.Write(bodyOf(op, 0, op.Len)); err != nil {
 				f.Close() //nolint:errcheck
 				return err
 			}
@@ -264,7 +255,7 @@ func (t *tree) apply(op Op) error {
 		if err != nil {
 			return err
 		}
-		_, werr := f.WriteAt(fillBytes(op.Fill, op.Off, op.Len), op.Off)
+		_, werr := f.WriteAt(bodyOf(op, op.Off, op.Len), op.Off)
 		cerr := f.Close()
 		if werr != nil {
 			return werr
@@ -775,6 +766,12 @@ type rig struct {
 	mountDone chan error
 	mountLog  string
 	mnt       string
+	// keyArgs is `--encrypt-key PATH` when this run is against an
+	// ENCRYPTED volume, and empty otherwise. It goes in front of every
+	// pelfs invocation the rig makes, because the key is needed by all of
+	// them: init wraps it, a mount unwraps it, and fsck cannot read a
+	// chunk without it.
+	keyArgs []string
 }
 
 func newRig(tb testing.TB, sandbox, name string, port int) *rig {
@@ -785,6 +782,9 @@ func newRig(tb testing.TB, sandbox, name string, port int) *rig {
 		pelfs:   envOr("PELFS_HOSTILE_PELFS", "/stage/pelfs"),
 		forigin: envOr("PELFS_HOSTILE_FAKEORIGIN", "/stage/fakeorigin"),
 		port:    port,
+	}
+	if encryptedRun() {
+		r.keyArgs = []string{"--encrypt-key", volumeKeyFile(tb, sandbox)}
 	}
 	for _, bin := range []string{r.pelfs, r.forigin} {
 		if _, err := os.Stat(bin); err != nil {
@@ -834,8 +834,70 @@ func envOr(k, def string) string {
 	return def
 }
 
+// ------------------------------------------------------- encrypted volumes
+
+// encryptedRun reports whether this container was launched with
+// scripts/hostile-docker.sh --encrypt.
+//
+// WHY THE VARIANT EXISTS. Everything above this line is about the
+// filesystem; encryption is about what the filesystem's bytes turn into
+// on the way to an object, and the two interact in one specific place
+// that has already produced a released bug. A chunk is COMPRESSED AND
+// THEN ENCRYPTED, so the entry in the pack is never the length of the
+// plaintext on an encrypted volume — a nonce and a GCM tag are always
+// added, whatever the compressor decided. That makes the encrypted leg
+// the strongest form of the same question the fill kinds ask: a catalog
+// row that copies its numbers from the plaintext in hand is wrong for
+// EVERY chunk here, not only for the compressible ones.
+//
+// It is a switch rather than the default because the default gate is
+// budgeted in seconds and this doubles the packer's work per byte.
+func encryptedRun() bool { return os.Getenv("PELFS_HOSTILE_ENCRYPT") == "1" }
+
+// volumeKeyFile mints the RSA key that wraps the volume's data keys, once
+// per container, on the sandbox tmpfs. It is generated here rather than
+// staged from the host for the same reason the corpus travels as data:
+// the container must not need anything of the developer's, and a key that
+// dies with the container cannot be reused against anything real.
+func volumeKeyFile(tb testing.TB, sandbox string) string {
+	tb.Helper()
+	p := path.Join(sandbox, "volume-key.pem")
+	if _, err := os.Stat(p); err == nil {
+		return p
+	}
+	key, err := rsa.GenerateKey(crand.Reader, 2048)
+	if err != nil {
+		tb.Fatalf("generate the volume key: %v", err)
+	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{
+		Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	if err := os.WriteFile(p, pemBytes, 0o600); err != nil {
+		tb.Fatalf("write the volume key: %v", err)
+	}
+	tb.Logf("ENCRYPTED RUN: volume keys are wrapped by a throwaway RSA key at %s. "+
+		"Every chunk is compressed and then sealed, so no entry in any pack is the length "+
+		"of its plaintext.", p)
+	return p
+}
+
 // run executes a pelfs subcommand to completion and returns its output.
+// The subcommand comes first and the key flag after it, which is the
+// order pelfs's per-command flag sets require.
 func (r *rig) run(args ...string) (string, error) {
+	if len(r.keyArgs) > 0 && len(args) > 0 {
+		args = append(append(append([]string{}, args[0]), r.keyArgs...), args[1:]...)
+	}
+	cmd := exec.Command(r.pelfs, args...)
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	err := cmd.Run()
+	return out.String(), err
+}
+
+// runWithoutKey is run with the volume key deliberately withheld: on an
+// encrypted volume it must FAIL, and that failure is the proof the leg is
+// testing what it says it is.
+func (r *rig) runWithoutKey(args ...string) (string, error) {
 	cmd := exec.Command(r.pelfs, args...)
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
@@ -897,6 +959,22 @@ func (r *rig) startReadOnlyMount(backend, stateDir, mnt, logName string) {
 
 func (r *rig) startMountArgs(args []string, mnt, logName string) {
 	r.tb.Helper()
+	if err := r.tryStartMountArgs(args, mnt, logName); err != nil {
+		r.tb.Fatal(err.Error())
+	}
+}
+
+// tryStartMountArgs is startMountArgs for a caller that has something to
+// say about a mount REFUSING TO START, rather than only about what a
+// running mount serves. A mount that will not come up is a finding in its
+// own right -- it is the whole volume, not one file -- and phase C2 found
+// one, so it must be reportable through the campaign's own channel
+// instead of killing the run from inside the rig.
+func (r *rig) tryStartMountArgs(args []string, mnt, logName string) error {
+	r.tb.Helper()
+	if len(r.keyArgs) > 0 {
+		args = append(append(append([]string{}, args[0]), r.keyArgs...), args[1:]...)
+	}
 	if err := os.MkdirAll(mnt, 0o755); err != nil {
 		r.tb.Fatalf("mkdir mountpoint: %v", err)
 	}
@@ -921,20 +999,33 @@ func (r *rig) startMountArgs(args []string, mnt, logName string) {
 	for time.Now().Before(deadline) {
 		if isMountpoint(mnt) {
 			r.tb.Logf("mounted: pelfs %s", strings.Join(args, " "))
-			return
+			return nil
 		}
 		select {
 		case err := <-done:
-			// A dead process will never mount; fail with its own words.
+			// A dead process will never mount; report with its own words.
 			r.mountC, r.mountDone = nil, nil
-			r.tb.Fatalf("the mount process exited (%v) before it mounted:\n  pelfs %s\n%s",
+			return fmt.Errorf("the mount process exited (%v) before it mounted:\n  pelfs %s\n%s",
 				err, strings.Join(args, " "), indent(readAll(logPath)))
 		default:
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	r.tb.Fatalf("the mount did not come up within 90s:\n  pelfs %s\n%s",
+	return fmt.Errorf("the mount did not come up within 90s:\n  pelfs %s\n%s",
 		strings.Join(args, " "), indent(readAll(logPath)))
+}
+
+// tryStartMount is startMount for the same caller.
+func (r *rig) tryStartMount(backend, stateDir, mnt string, snapshot time.Duration, logName string) error {
+	r.tb.Helper()
+	args := []string{"mount-gen"}
+	if backend != "" {
+		args = append(args, "--backend", backend)
+	}
+	args = append(args, "--rw", "--no-lease",
+		"--snapshot-interval", snapshot.String(),
+		"--state-dir", stateDir, r.prefix, mnt)
+	return r.tryStartMountArgs(args, mnt, logName)
 }
 
 // isMountpoint compares st_dev against the parent's, which is what
@@ -1250,6 +1341,18 @@ func planFromEnv(tb testing.TB) Plan {
 		}
 		opt.BigDirEntries = n
 	}
+	// The one file per plan big enough for the chunker to cut in two, and
+	// the cheapest budget lever here: 0 removes it. It is a knob rather
+	// than a constant because it is the only body in the vocabulary whose
+	// cost is measured in megabytes, and it gets written, sealed, cold-
+	// read and compared at every checkpoint.
+	if v := os.Getenv("PELFS_HOSTILE_LARGEFILE"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			tb.Fatalf("PELFS_HOSTILE_LARGEFILE=%q: %v", v, err)
+		}
+		opt.LargeFileBytes = n
+	}
 	seed := uint64(time.Now().UnixNano())
 	if v := os.Getenv("PELFS_HOSTILE_SEED"); v != "" {
 		n, err := strconv.ParseUint(v, 10, 64)
@@ -1280,6 +1383,48 @@ func max(a, b int) int {
 // FUSE resolves no paths; the NFS server resolves them all).
 func TestHostileFUSE(t *testing.T) { runCampaign(t, "fuse", 19310) }
 func TestHostileNFS(t *testing.T)  { runCampaign(t, "nfs", 19311) }
+
+// checkTheCheckpointsGeneration holds the generation A CHECKPOINT
+// published to the same standard as the one the seal publishes, and it is
+// the only thing in this harness that looks at one.
+//
+// THE HOLE IT CLOSES, because it is worth stating exactly. Phase C cold-
+// mounts the FINAL generation, and the final seal re-renders every file
+// it can from the memtable's own location map — so a catalog row that a
+// checkpoint got wrong and the next seal happened to get right is
+// invisible to every other check here, at every phase. That is not a
+// hypothetical: it is precisely what the release-week rechunk CLen/Alg
+// bug does. The wrong rows land in the checkpoint's generation, the
+// SIGTERM seal replaces them with correct ones, and a cold mount of the
+// end state reads clean. Measured on a build that HAS the bug (c26428f):
+// unreadable in the checkpoint's generation, byte-exact in the final one.
+//
+// A checkpoint's generation is signed, published and mountable, and other
+// clients read it, so "wrong for one interval and then repaired" is a
+// released bug and not a transient. fsck --deep is the cheap way to say
+// so: it reads every chunk of every file, and a row whose CLen disagrees
+// with the entry the pack holds is exactly what it reports.
+//
+// It runs while the mount is still up on purpose. The branch head at this
+// instant is the LAST CHECKPOINT's generation, which is the thing under
+// test; once the mount exits, that generation is no longer the head.
+func checkTheCheckpointsGeneration(t *testing.T, r *rig, base, phase string) {
+	t.Helper()
+	out, err := r.run("fsck", "--deep", "--state-dir", path.Join(base, "state-checkpoint-fsck"), r.prefix)
+	switch {
+	case err != nil:
+		t.Errorf("%s: fsck --deep REJECTS the generation a mid-run CHECKPOINT published, which is "+
+			"signed, mountable and read by other clients. The seal that follows may well repair "+
+			"it, and every other check here reads only what the seal produced -- so this is a "+
+			"generation nothing else in this harness would have looked at: %v\n%s",
+			phase, err, indent(out))
+	case !strings.Contains(out, "generation is consistent"):
+		t.Errorf("%s: fsck --deep exited 0 on the checkpoint's generation without reporting "+
+			"consistency:\n%s", phase, indent(out))
+	default:
+		t.Logf("%s: the generation the last mid-run checkpoint published is consistent under fsck --deep", phase)
+	}
+}
 
 func runCampaign(t *testing.T, backend string, port int) {
 	sandbox := requireContainment(t)
@@ -1340,6 +1485,7 @@ func runCampaign(t *testing.T, backend string, port int) {
 			c.notComparable, c.applied)
 	}
 	c.compare("phase A: the live view at the end of the run", compareExact)
+	checkTheCheckpointsGeneration(t, r, base, "phase A")
 
 	// ---- phase B: seal ------------------------------------------------
 	c.mnt.close()
@@ -1377,6 +1523,8 @@ func runCampaign(t *testing.T, backend string, port int) {
 	c.mnt.close()
 	r.stopAndSeal()
 
+	inheritPhase(t, r, c, backend, base, stateDir, mntDir, plan)
+
 	// ---- phase D: fsck --deep, then gc --------------------------------
 	fsckState := path.Join(base, "state-fsck")
 	fout, ferr := r.run("fsck", "--deep", "--state-dir", fsckState, r.prefix)
@@ -1386,6 +1534,21 @@ func runCampaign(t *testing.T, backend string, port int) {
 		t.Errorf("fsck --deep exited 0 without reporting consistency:\n%s", indent(fout))
 	} else {
 		t.Log("phase D: fsck --deep says the generation is consistent")
+	}
+	// The encrypted leg has to prove it IS encrypted, or a --encrypt that
+	// quietly stopped reaching the volume would buy a green run that
+	// tested the plaintext path twice. fsck --deep reads every chunk, so
+	// without the key it must fail; if it passes, the bytes were never
+	// sealed.
+	if encryptedRun() {
+		nout, nerr := r.runWithoutKey("fsck", "--deep", "--state-dir", path.Join(base, "state-nokey"), r.prefix)
+		if nerr == nil {
+			t.Errorf("this run was launched with --encrypt, but fsck --deep read the whole "+
+				"generation WITHOUT the key. The volume is not encrypted and this leg tested "+
+				"the plaintext path:\n%s", indent(nout))
+		} else {
+			t.Log("phase D: the generation is genuinely encrypted -- fsck --deep cannot read it without the key")
+		}
 	}
 	gcState := path.Join(base, "state-gc")
 	gout, gerr := r.run("gc", "--state-dir", gcState, r.prefix)
@@ -1402,6 +1565,160 @@ func runCampaign(t *testing.T, backend string, port int) {
 	// is never allowed to lose it quietly, and never allowed to leave a
 	// file present and wrong.
 	crashPhase(t, r, c, backend, base, stateDir, refDir, mntDir, plan.Seed)
+}
+
+// inheritPhase is a SECOND WRITABLE SESSION over the generation the first
+// one published, and what it exists for is the one thing every other
+// phase here structurally cannot reach.
+//
+// Phase A is a single session on a fresh volume. Its mid-run checkpoints
+// do publish generations, but the memtable that wrote them is still the
+// same object and still holds its own chunk locations — so when a later
+// write in the SAME session disturbs one of those files, the seal renders
+// it from locations it recorded itself. A file inherited from a
+// generation THIS session did not write is a different code path
+// entirely: the memtable adopts it by reference from the base's catalog
+// rows and, when a write straddles one of its chunks, re-chunks a span it
+// has to read back out of the base.
+//
+// That is where the release-week rechunk CLen/Alg bug is observable, and
+// it is why a plain checkpoint-then-overwrite does not show it: measured
+// on the pre-fix build (c26428f), the same op shape inside one session
+// produces a clean generation, and across two sessions it produces a file
+// that cannot be read. So this phase is not extra coverage of the same
+// thing, it is the only coverage of the other thing.
+//
+// Every op it applies goes to BOTH trees like any other, so the oracle is
+// unchanged; the ops are derived from the plan and the reference tree, so
+// a replay is deterministic.
+func inheritPhase(t *testing.T, r *rig, c *campaign, backend, base, stateDir, mntDir string, plan Plan) {
+	ops := inheritedRewrites(plan, c.ref)
+	if len(ops) == 0 {
+		t.Log("phase C2: no inherited compressible file large enough to rewrite; skipped")
+		return
+	}
+	if err := r.tryStartMount(backend, stateDir, mntDir, snapshotInterval(t), "inherit-"+backend+".log"); err != nil {
+		// A SECOND WRITABLE SESSION ON ITS OWN STATE DIRECTORY IS AN
+		// ORDINARY THING TO DO, and a refusal to start is worse than any
+		// divergence: it is the whole volume, not one file.
+		//
+		// THIS IS A FILED OPEN FINDING and it is why the report below is
+		// not an Errorf. `memtable: re-adopt inode N: genfs: stale inode
+		// (no residency)` is reproduced deterministically by
+		// testdata/corpus/second-session-refuses-after-adopt.plan, which
+		// is marked `known-open all` and therefore FAILS if it ever stops
+		// reproducing -- so this allowance cannot outlive the bug it
+		// allows for. What it buys is a random lane that keeps reporting
+		// everything ELSE: any plan containing checkpoint-then-partial-
+		// overwrite reaches this, which is most of them now, and a gate
+		// that is red two runs in three is a gate somebody switches off.
+		// The same reasoning and the same shape as the permission
+		// attribution above (see campaign.permPaths).
+		//
+		// WHEN IT IS FIXED: the corpus entry goes red, its marker comes
+		// off, and isReadoptRefusal goes with it.
+		//
+		// A corpus entry that PINS this takes the c.note path, because
+		// that is what counts an observation and therefore what makes the
+		// entry fail if the finding ever stops reproducing. The bare
+		// allowance is only for the random lane.
+		if isReadoptRefusal(err) && !c.expectDiverge {
+			logReadoptFinding(t, c.backend, "phase C2", err)
+			return
+		}
+		c.note("phase C2: a second writable session REFUSED TO START on the state directory "+
+			"the first one sealed cleanly (%s backend). Mounting a volume again from the same "+
+			"machine is the ordinary case, and this is the whole volume rather than one file:\n%s",
+			c.backend, indent(err.Error()))
+		return
+	}
+	c.mnt = openTree(t, "second-session mount", mntDir)
+	c.applyAll(ops)
+	c.compare("phase C2: a second session's live view over inherited files", compareExact)
+	checkTheCheckpointsGeneration(t, r, base, "phase C2")
+	c.mnt.close()
+	log := r.stopAndSeal()
+	if !strings.Contains(log, "sealed generation") && !strings.Contains(log, "nothing changed") {
+		t.Errorf("phase C2: the second session did not seal:\n%s", indent(log))
+	}
+	coldMnt := path.Join(base, "cold2")
+	r.startReadOnlyMount(backend, path.Join(base, "state-cold2"), coldMnt, "cold2-"+backend+".log")
+	c.mnt = openTree(t, "cold mount after the second session", coldMnt)
+	c.compare("phase C2: the generation a second session sealed, cold", compareExact)
+	c.mnt.close()
+	r.stopAndSeal()
+	t.Logf("phase C2: %d rewrite(s) of inherited compressible files, sealed and read back cold", len(ops)-1)
+}
+
+// isTheReadoptFinding recognises the ONE open finding that stops a
+// writable mount from starting, reports it as the expected observation it
+// currently is, and says so. Everything else that stops a mount is a
+// failure.
+//
+// It exists in exactly one place so that removing it when the bug is
+// fixed is one deletion, and it cannot quietly outlive the bug: the
+// corpus entry that pins the same sequence is marked `known-open all` and
+// FAILS the moment the divergence stops reproducing.
+func isReadoptRefusal(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "re-adopt inode")
+}
+
+func logReadoptFinding(tb testing.TB, backend, phase string, err error) {
+	tb.Logf("%s: EXPECTED (known-open finding, %s backend): a writable mount refused to start on "+
+		"a state directory whose journal holds an adopted handle, because the base has moved on "+
+		"since. Pinned by testdata/corpus/second-session-refuses-after-adopt.plan:\n%s",
+		phase, backend, indent(err.Error()))
+}
+
+// inheritedRewrites picks files the plan wrote with COMPRESSIBLE bodies
+// and returns partial overwrites of them, strictly inside the file.
+//
+// Compressible is the filter that matters and it is not decoration: for
+// an incompressible body a row that copies the plaintext's numbers is
+// accidentally correct, so rewriting one proves nothing. The span is
+// unaligned at both ends so that the chunk holding it straddles the
+// rewrite, which is what makes the seal re-chunk rather than replace.
+func inheritedRewrites(plan Plan, ref *tree) []Op {
+	compressible := map[string]bool{}
+	for _, op := range plan.Ops {
+		if op.Kind != OpCreate && op.Kind != OpPwrite {
+			continue
+		}
+		if op.FillKind != FillRandom && op.Len > 0 {
+			compressible[op.Path] = true
+		}
+	}
+	var paths []string
+	for p := range compressible {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+
+	var ops []Op
+	for _, p := range paths {
+		if len(ops) >= 6 {
+			break
+		}
+		fi, err := ref.root.Lstat(p)
+		// Gone, renamed, or turned into something else by the plan: the
+		// vocabulary does that on purpose and it is not this phase's
+		// business to work around it.
+		if err != nil || !fi.Mode().IsRegular() || fi.Size() < 8192 {
+			continue
+		}
+		size := fi.Size()
+		kind, variant := FillText, byte(0x70+len(ops))
+		if len(ops)%3 == 2 {
+			kind, variant = FillZero, 0
+		}
+		ops = append(ops, Op{Kind: OpPwrite, Path: p,
+			Off: 1 + size/7, Len: size / 3, FillKind: kind, Fill: variant,
+			Note: "second session: partial overwrite of a file INHERITED from a generation it did not write"})
+	}
+	if len(ops) == 0 {
+		return nil
+	}
+	return append(ops, Op{Kind: OpCompare, Note: "inherited rewrites"})
 }
 
 func crashPhase(t *testing.T, r *rig, c *campaign, backend, base, stateDir, refDir, mntDir string, seed uint64) {
@@ -1425,7 +1742,17 @@ func crashPhase(t *testing.T, r *rig, c *campaign, backend, base, stateDir, refD
 	// --snapshot-interval 0: nothing this session writes gets published,
 	// so everything it wrote is unsealed when it dies. That is the state
 	// recovery exists for.
-	r.startMount(backend, stateDir, mntDir, 0, "crash-"+backend+".log")
+	// --snapshot-interval 0 and the SAME state dir as phase A, so this is
+	// also a reopen: it meets the known-open re-adopt finding whenever the
+	// plan contained an adoption. See isTheReadoptFinding.
+	if err := r.tryStartMount(backend, stateDir, mntDir, 0, "crash-"+backend+".log"); err != nil {
+		if isReadoptRefusal(err) {
+			logReadoptFinding(t, backend, "phase E", err)
+			t.Log("phase E: skipped, because the mount it needs cannot start until that finding is fixed")
+			return
+		}
+		t.Fatal(err.Error())
+	}
 	c.mnt = openTree(t, "crashing mount", mntDir)
 
 	// Kill at a point the plan chose, not at a boundary: mid-train.
@@ -1504,6 +1831,18 @@ func TestReplayTheRegressionCorpus(t *testing.T) {
 	}
 }
 
+// planWantsACheckpoint reports whether an entry's settles are load-
+// bearing: a settle long enough to cross the mount's checkpoint interval
+// is there for one reason, and the entry is entitled to have it happen.
+func planWantsACheckpoint(p Plan) bool {
+	for _, op := range p.Ops {
+		if op.Kind == OpSettle && op.Wait >= 1000 {
+			return true
+		}
+	}
+	return false
+}
+
 // replayOne is the corpus lane's campaign: apply, seal, cold-compare,
 // fsck. Deliberately the same lifecycle as a random run, because both bugs
 // in the corpus are only visible at a different stage (one at the live
@@ -1539,12 +1878,30 @@ func replayOne(t *testing.T, sandbox, backend, name string, plan Plan, port int)
 	defer c.ref.close()
 	c.applyAll(plan.Ops)
 	c.compare("corpus "+name+": live view", compareExact)
+	// Before the seal, while the branch head is still the last
+	// CHECKPOINT's generation. For the rechunk entry this is the only
+	// place its bug is observable at all -- see
+	// checkTheCheckpointsGeneration.
+	if planWantsACheckpoint(plan) {
+		checkTheCheckpointsGeneration(t, r, base, "corpus "+name)
+	}
 	c.mnt.close()
 
 	log := r.stopAndSeal()
 	if !strings.Contains(log, "sealed generation") && !strings.Contains(log, "nothing changed") {
 		t.Fatalf("corpus %s: the session did not seal -- which for the sparse-train entry "+
 			"IS the bug it exists to detect:\n%s", name, indent(log))
+	}
+	// An entry whose `settle` ops exist to put a checkpoint between two
+	// operations is testing nothing if no checkpoint landed, and it would
+	// PASS while testing nothing. Say how many there were, and refuse to
+	// call it a replay if an entry that asked for one got none.
+	checkpoints := strings.Count(log, "checkpoint: sealed generation")
+	t.Logf("corpus %s: %d mid-run checkpoint(s) before the seal", name, checkpoints)
+	if checkpoints == 0 && planWantsACheckpoint(plan) {
+		t.Errorf("corpus %s: the entry contains `settle` ops, which are there to put a "+
+			"CHECKPOINT between two operations, and none landed. Whatever the entry pins, "+
+			"this replay did not reach it:\n%s", name, indent(log))
 	}
 
 	coldMnt := path.Join(base, "cold")
@@ -1553,6 +1910,13 @@ func replayOne(t *testing.T, sandbox, backend, name string, plan Plan, port int)
 	c.compare("corpus "+name+": sealed generation, cold", compareExact)
 	c.mnt.close()
 	r.stopAndSeal()
+
+	// The corpus gets the second-session phase too, and for the rechunk
+	// entry it is not optional: a partial overwrite of a file INHERITED
+	// from a generation the writing session did not produce is the only
+	// arrangement in which that entry's bug is observable at all. See
+	// inheritPhase.
+	inheritPhase(t, r, c, backend, base, stateDir, mntDir, plan)
 
 	fout, ferr := r.run("fsck", "--deep", "--state-dir", path.Join(base, "state-fsck"), r.prefix)
 	if ferr != nil || !strings.Contains(fout, "generation is consistent") {

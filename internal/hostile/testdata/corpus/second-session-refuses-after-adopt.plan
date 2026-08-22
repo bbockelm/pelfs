@@ -1,0 +1,56 @@
+# hostile plan: seed=0 ops=4
+# expect: known-open all
+#
+# A SECOND WRITABLE SESSION REFUSES TO START, and the state directory is
+# left unusable for writing. Found at HEAD (8a97e58) by the second-session
+# phase this vocabulary added; FILED, NOT FIXED -- product code was
+# outside this run's territory and two other agents were in it.
+#
+#     ERROR pelfs: open the write path's content store:
+#     memtable: re-adopt inode 3: genfs: stale inode (no residency)
+#
+# `pelfs mount-gen --rw` exits 1 before mounting. It is not one file: the
+# volume cannot be mounted for writing from that state directory again, by
+# this harness or by a user. Both frontends, every run.
+#
+# THE SEQUENCE, and it is four operations:
+#   1. write a file
+#   2. let a CHECKPOINT publish it, so it is in a base generation
+#   3. overwrite part of it -- which makes the memtable ADOPT the file
+#      from that base by reference (memtable.Store.Adopt), journalling an
+#      adopted handle against the generation it adopted from
+#   4. let a SECOND checkpoint publish, and seal
+# Then mount the same state directory --rw again. Recovery replays the
+# journal and re-adopts every adopted handle against whatever base the
+# mount now has (memtable/recover.go:218, `Adopted extents come back from
+# the base, which still describes those files exactly as it did when they
+# were taken over`). Two checkpoints and a seal later that comment is no
+# longer true, and ContentOf refuses.
+#
+# WHAT IS AND IS NOT LOAD-BEARING, measured one variant at a time:
+#   - the SECOND checkpoint is required. Drop the last settle and the same
+#     plan passes: one checkpoint, one adoption, no reopen failure.
+#   - the FILL IS IRRELEVANT. `fill=41` reproduces it identically. It is
+#     written as fill=text here for one mechanical reason: phase C2 picks
+#     its rewrite targets from files the plan wrote with a compressible
+#     body, because for an incompressible one a re-chunked row is
+#     accidentally correct and proves nothing. So the fill selects the
+#     file, and nothing else.
+#   - no deletion is needed. unlink, rename and truncate-to-zero of the
+#     adopted file all reproduce it, and so does leaving it alone, which
+#     is what made the four-op form findable.
+#   - both frontends, deterministically. On FUSE it fires twice per run
+#     (phase C2 and phase E, which also reopens the state directory); on
+#     NFS once, because phase E is FUSE-only by design.
+#
+# WHY NO GATE HAD SEEN IT: nothing else ever ran a second WRITABLE session
+# over a generation a previous one published. Phase E reopens the state
+# directory, but on a plan that had no adoption in it, and the old
+# vocabulary had no shape that reliably produced checkpoint-then-partial-
+# overwrite -- which is the only way an adoption happens.
+mkdir ad mode=0755
+create ad/a.log len=40000 fill=text:11 # the body a checkpoint will publish
+settle ms=1100 # checkpoint: now it is in a base generation
+pwrite ad/a.log off=101 len=999 fill=text:21 # partial overwrite -> the memtable ADOPTS from that base
+settle ms=1100 # a second checkpoint, which moves the base out from under the journal
+compare

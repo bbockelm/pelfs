@@ -92,6 +92,252 @@ func kindByName(s string) (OpKind, bool) {
 	return 0, false
 }
 
+// FillKind is WHAT KIND OF BYTES a write puts down, and it is a first-
+// class part of the vocabulary because it is the axis the storage layer
+// below the filesystem cares about and the one this exerciser was blind
+// to for its first month.
+//
+// Every op used to write incompressible pseudorandom bytes, deliberately:
+// it gives the packer real work and nothing dedups away. That is a fine
+// default and a terrible monoculture. A chunk's catalog row carries the
+// length of the ENTRY IN THE PACK (CLen) and how to decode it (Alg), and
+// those differ from the logical length exactly when zstd shrinks the
+// bytes — which never happened, because nothing this tool wrote could be
+// shrunk. The release-week rechunk bug (docs/TODO.md, "a re-chunked row
+// carries what the pack recorded, not the plaintext") lived in that blind
+// spot and its own fix says so: "every test that re-chunks used
+// incompressible pseudorandom bodies".
+//
+// So there are three, and each one asks the compressor a different
+// question:
+//
+//	random  incompressible. zstd gives up and the entry is stored
+//	        verbatim (alg=none, CLen == LLen), which is the ONE case where
+//	        a row that copies the plaintext's numbers happens to be right.
+//	zero    maximally compressible: ~4400x at 64 KiB. Also the sparse-
+//	        adjacent case (a hole reads as zeros, so a re-chunked gap IS
+//	        this), and the one content every file shares, so it is how
+//	        cross-file DEDUP gets exercised at all.
+//	text    realistically compressible: dictionary-shaped lines, ~3.9x at
+//	        64 KiB. This is what user data looks like and what puts the
+//	        compressor on its ordinary path rather than either extreme.
+//
+// A body that is compressible at the head and not at the tail is NOT a
+// fourth kind. It is two ops — a text create and a random pwrite over the
+// tail — because in a corpus file you can then SEE where the entropy
+// changes, and because that composition is also the shape that matters
+// most here: a partial overwrite, which is what makes a seal re-chunk.
+type FillKind uint8
+
+const (
+	// FillRandom is the original and stays the zero value, so every op in
+	// the corpus and every op no shape thought about keeps its old bytes.
+	FillRandom FillKind = iota
+	FillZero
+	FillText
+	numFillKinds
+)
+
+// fillNames is the wire spelling. FillRandom has none: it is written as
+// the bare `fill=NN` byte literal the format has always used, which is
+// what keeps every committed corpus entry parsing.
+var fillNames = [numFillKinds]string{
+	FillZero: "zero",
+	FillText: "text",
+}
+
+func (k FillKind) String() string {
+	if k < numFillKinds && fillNames[k] != "" {
+		return fillNames[k]
+	}
+	return "random"
+}
+
+// HasVariant reports whether the Fill byte means anything for this kind.
+// Zeros are zeros: a variant would be a lie in the plan text, and worse,
+// it would stop two files of zeros from producing the same chunk identity
+// — which is the dedup this kind exists to reach.
+func (k FillKind) HasVariant() bool { return k != FillZero }
+
+// fillField renders the fill of one op. The three spellings are
+// `fill=4a` (random, unchanged forever), `fill=zero`, and `fill=text:4a`.
+// No name is a valid two-digit hex number, so the parser can tell them
+// apart without a prefix.
+func fillField(kind FillKind, variant byte) string {
+	switch {
+	case kind == FillRandom:
+		return fmt.Sprintf("fill=%02x", variant)
+	case !kind.HasVariant():
+		return "fill=" + kind.String()
+	default:
+		return fmt.Sprintf("fill=%s:%02x", kind, variant)
+	}
+}
+
+// parseFill reads the value half of a fill= field.
+func parseFill(v string) (FillKind, byte, error) {
+	name, variant, hasVariant := strings.Cut(v, ":")
+	for k := FillKind(0); k < numFillKinds; k++ {
+		if fillNames[k] == "" || fillNames[k] != name {
+			continue
+		}
+		if !k.HasVariant() {
+			if hasVariant {
+				return 0, 0, fmt.Errorf("fill=%s takes no variant: %s bytes are %s bytes", name, name, name)
+			}
+			return k, 0, nil
+		}
+		if !hasVariant {
+			return k, 0, nil
+		}
+		n, err := strconv.ParseUint(variant, 16, 8)
+		if err != nil {
+			return 0, 0, fmt.Errorf("fill=%s: bad variant %q: %w", name, variant, err)
+		}
+		return k, byte(n), nil
+	}
+	if hasVariant {
+		return 0, 0, fmt.Errorf("unknown fill kind %q", name)
+	}
+	n, err := strconv.ParseUint(v, 16, 8)
+	if err != nil {
+		return 0, 0, fmt.Errorf("bad fill=%q: not a byte literal and not one of zero, text", v)
+	}
+	return FillRandom, byte(n), nil
+}
+
+// normFill drops a variant a kind cannot carry. A generator that derives
+// a variant arithmetically must go through this, or it writes a byte into
+// a plan that parsing the plan back cannot return — the round trip is the
+// contract a corpus entry rests on.
+func normFill(kind FillKind, variant byte) (FillKind, byte) {
+	if !kind.HasVariant() {
+		return kind, 0
+	}
+	return kind, variant
+}
+
+// Body is the bytes a write puts down, and it lives here — in the pure
+// half, with no build tag — for two reasons. It has to be identical on
+// the mount and on the reference tree or the comparison means nothing,
+// and the CLAIM this whole type makes ("these bytes compress, those do
+// not") is then testable in the ordinary unit lane against the real
+// codec, rather than only inside a container.
+//
+// Every kind is deterministic in (kind, variant, ABSOLUTE offset). The
+// absolute keying is the load-bearing part and predates the fill kinds:
+// it is what makes an overlapping rewrite at a different offset write
+// different bytes, which is what makes a mis-merged extent list
+// detectable at all.
+func Body(kind FillKind, variant byte, off, n int64) []byte {
+	if n <= 0 {
+		return nil
+	}
+	buf := make([]byte, n)
+	switch kind {
+	case FillZero:
+		// Already zero. Deliberately not a loop: this is the case where a
+		// filesystem's own sparseness, a hole, and a written run of zeros
+		// all have to end up reading the same.
+	case FillText:
+		fillText(buf, variant, off)
+	default:
+		fillRandom(buf, variant, off)
+	}
+	return buf
+}
+
+// fillRandom is keyed on the ABSOLUTE 8-byte block, not on a block
+// counted from the start of the call. The difference only shows when a
+// write begins at an unaligned offset — which every partial overwrite
+// this vocabulary now generates does — and getting it wrong would mean
+// the bytes a pwrite lays down are not the bytes the same range would
+// have had from a create, so a body would stop being a window onto one
+// stream and "the same content" would depend on how it was written.
+func fillRandom(buf []byte, variant byte, off int64) {
+	var block [8]byte
+	cur := int64(-1)
+	for i := range buf {
+		p := off + int64(i)
+		base := p &^ 7
+		if base != cur {
+			x := splitmix(uint64(variant)<<56 ^ uint64(base)*0x9e3779b97f4a7c15)
+			for j := 0; j < 8; j++ {
+				block[j] = byte(x >> (8 * uint(j)))
+			}
+			cur = base
+		}
+		buf[i] = block[p-base]
+	}
+}
+
+// textLineLen is the length of one generated line, and the unit the text
+// body is addressable in: the byte at absolute offset p belongs to line
+// p/textLineLen at column p%textLineLen, so a pwrite into the middle of a
+// text file lays down bytes continuous with what is already around it —
+// which is what makes it look like a file somebody edited rather than a
+// splice of two unrelated streams.
+const textLineLen = 48
+
+// textDict is small and boring on purpose. A large or high-entropy word
+// list would compress like random bytes and there would be no point; a
+// 64-word list at ~6 words a line is what real logs and configuration
+// look like to a compressor, and it measures ~3.9x at 64 KiB under the
+// volume's own zstd settings.
+var textDict = [64]string{
+	"the", "run", "job", "node", "event", "log", "start", "stop",
+	"queue", "slot", "submit", "exec", "shadow", "match", "claim", "idle",
+	"held", "done", "error", "warn", "info", "debug", "cluster", "proc",
+	"user", "group", "file", "path", "bytes", "read", "write", "open",
+	"close", "seek", "size", "time", "date", "host", "port", "addr",
+	"conn", "retry", "again", "ok", "fail", "state", "pool", "cache",
+	"chunk", "pack", "index", "seal", "publish", "generation", "catalog", "inode",
+	"extent", "offset", "length", "hash", "key", "value", "and", "with",
+}
+
+func fillText(buf []byte, variant byte, off int64) {
+	var line [textLineLen]byte
+	cur := int64(-1)
+	for i := range buf {
+		p := off + int64(i)
+		idx := p / textLineLen
+		if idx != cur {
+			textLine(&line, variant, idx)
+			cur = idx
+		}
+		buf[i] = line[p%textLineLen]
+	}
+}
+
+// textLine renders one line: words from the dictionary, space separated,
+// padded to exactly textLineLen with a newline at the end. Deterministic
+// in (variant, index) and nothing else.
+func textLine(out *[textLineLen]byte, variant byte, idx int64) {
+	for i := range out {
+		out[i] = ' '
+	}
+	out[textLineLen-1] = '\n'
+	w := splitmix(uint64(variant)<<56 ^ uint64(idx)*0x9e3779b97f4a7c15)
+	for pos := 0; pos < textLineLen-1; {
+		word := textDict[w&63]
+		w = splitmix(w + 0x9e3779b97f4a7c15)
+		if pos+len(word) >= textLineLen-1 {
+			break
+		}
+		copy(out[pos:], word)
+		pos += len(word) + 1 // the space is already there
+	}
+}
+
+func splitmix(x uint64) uint64 {
+	x ^= x >> 30
+	x *= 0xbf58476d1ce4e5b9
+	x ^= x >> 27
+	x *= 0x94d049bb133111eb
+	x ^= x >> 31
+	return x
+}
+
 // Op is one line of a plan. Paths are always relative, slash-separated,
 // and never contain ".." — the executor puts them through an os.Root, which
 // would refuse them anyway, but a generator that emits them is a generator
@@ -106,11 +352,16 @@ type Op struct {
 	Mode  uint32
 	UID   int
 	GID   int
-	MTime int64  // unix seconds, for OpUtimes
-	Count int    // OpReaddirMutate: how many entries to disturb
-	Fill  byte   // OpPwrite/OpCreate: the byte the body is made of
-	Wait  int    // OpSettle: milliseconds
-	Note  string // why the generator emitted this, for the failure message
+	MTime int64 // unix seconds, for OpUtimes
+	Count int   // OpReaddirMutate: how many entries to disturb
+	// FillKind and Fill together say what BYTES a write puts down.
+	// FillKind picks the shape (see FillKind); Fill is the variant within
+	// it, which for FillRandom is the byte-literal the corpus has always
+	// written and for FillText picks which text.
+	FillKind FillKind
+	Fill     byte
+	Wait     int    // OpSettle: milliseconds
+	Note     string // why the generator emitted this, for the failure message
 }
 
 // String renders one op as a corpus line. Round-trips through ParseOp.
@@ -135,10 +386,10 @@ func (o Op) String() string {
 	case OpPwrite:
 		kv("off", o.Off)
 		kv("len", o.Len)
-		fmt.Fprintf(&b, " fill=%02x", o.Fill)
+		b.WriteString(" " + fillField(o.FillKind, o.Fill))
 	case OpCreate:
 		kv("len", o.Len)
-		fmt.Fprintf(&b, " fill=%02x", o.Fill)
+		b.WriteString(" " + fillField(o.FillKind, o.Fill))
 	case OpTruncate:
 		kv("size", o.Size)
 	case OpChmod:
@@ -194,10 +445,18 @@ func ParseOp(line string) (Op, bool, error) {
 			op.Path2 = fields[i]
 		case strings.ContainsRune(f, '='):
 			k, v, _ := strings.Cut(f, "=")
-			base := 10
-			if k == "mode" || k == "fill" {
-				base = 16
+			// fill is the one field with a vocabulary rather than a
+			// number, and it is parsed before the numeric path so that
+			// `fill=zero` is not a malformed hex literal.
+			if k == "fill" {
+				fk, variant, err := parseFill(v)
+				if err != nil {
+					return Op{}, false, fmt.Errorf("%s: %w", kind, err)
+				}
+				op.FillKind, op.Fill = fk, variant
+				continue
 			}
+			base := 10
 			if k == "mode" {
 				base = 8
 			}
@@ -224,8 +483,6 @@ func ParseOp(line string) (Op, bool, error) {
 				op.Count = int(n)
 			case "ms":
 				op.Wait = int(n)
-			case "fill":
-				op.Fill = byte(n)
 			default:
 				return Op{}, false, fmt.Errorf("%s: unknown key %q", kind, k)
 			}
@@ -396,18 +653,30 @@ type Options struct {
 	// BigDirEntries is how many entries a "thousands of entries" directory
 	// gets. CI runs this small; the manual mode does not.
 	BigDirEntries int
+	// LargeFileBytes is the size of the ONE file per plan that is big
+	// enough for the content-defined chunker to cut it in two. Nothing
+	// else here comes close: the volume's chunker has a 1 MiB minimum and
+	// a 4 MiB average, so every other file this vocabulary writes is a
+	// single chunk and a chunk BOUNDARY is a shape it could not reach.
+	//
+	// One per plan, because it is also the most expensive op sequence
+	// here — the file is written to both trees, sealed, and then read
+	// back and compared at every checkpoint — and one is enough to have a
+	// boundary. Zero switches it off.
+	LargeFileBytes int64
 }
 
 // DefaultOptions is the shape of a short run: enough of every hostile
 // shape to be worth running, small enough for a CI budget.
 func DefaultOptions() Options {
 	return Options{
-		Ops:           400,
-		CompareEvery:  120,
-		SettleEvery:   150,
-		MaxNameLen:    255,
-		MaxDepth:      8,
-		BigDirEntries: 1200,
+		Ops:            400,
+		CompareEvery:   120,
+		SettleEvery:    150,
+		MaxNameLen:     255,
+		MaxDepth:       8,
+		BigDirEntries:  1200,
+		LargeFileBytes: 6 << 20,
 	}
 }
 
@@ -435,6 +704,11 @@ var shapes = []shape{
 	{"big-dir-mutate", 4, shapeBigDirMutate},
 	{"deep-and-long", 4, shapeDeepAndLong},
 	{"plain-tree", 8, shapePlainTree},
+	// The bytes, rather than the namespace. Everything above writes
+	// through the same packer, so these two are what put the COMPRESSOR
+	// somewhere other than "gave up" — see FillKind.
+	{"compressible-rewrite", 11, shapeCompressibleRewrite},
+	{"zero-runs", 4, shapeZeroRuns},
 }
 
 // gen carries the generator's PREDICTED namespace. It is a prediction and
@@ -451,6 +725,34 @@ type gen struct {
 	files []string
 	links []string
 	n     int // names minted, for uniqueness
+	// settles counts the OpSettle ops Generate has emitted so far. A shape
+	// reads it to find out whether a checkpoint has had a chance to land
+	// since it last did something — which is how the re-chunk shape gets a
+	// PACKED chunk to overwrite without paying 1.1s for a settle of its
+	// own. See shapeCompressibleRewrite.
+	settles int
+	// packed is compressible bodies waiting to be partly overwritten.
+	packed []packedFile
+	// largeDone caps Options.LargeFileBytes at one file per plan.
+	largeDone bool
+	// paidSettle records that the re-chunk shape has already spent its one
+	// allowance of a settle of its own, and rechunked that it has managed
+	// a partial overwrite of packed bytes at all. See
+	// shapeCompressibleRewrite.
+	paidSettle bool
+	rechunked  bool
+}
+
+// packedFile is a compressible body the generator has created and intends
+// to overwrite LATER. The delay is the whole point: a partial overwrite
+// only makes a seal RE-CHUNK if the bytes underneath it are already in a
+// pack, and what puts them there is a checkpoint.
+type packedFile struct {
+	path    string
+	size    int64
+	kind    FillKind
+	variant byte
+	settles int // g.settles at the moment it was created
 }
 
 func (g *gen) pick(from []string) (string, bool) {
@@ -478,6 +780,45 @@ func (g *gen) join(dir, name string) string {
 		return name
 	}
 	return dir + "/" + name
+}
+
+// anyFill is the ordinary mixture, used wherever a shape has no opinion
+// about entropy. Incompressible stays the plurality — it is what makes
+// the packer do real work and what stops everything from deduping into
+// one chunk — but it is no longer the whole world.
+func (g *gen) anyFill() (FillKind, byte) {
+	switch r := g.rnd.IntN(20); {
+	case r < 3:
+		return FillZero, 0
+	case r < 9:
+		return FillText, byte(g.rnd.IntN(256))
+	default:
+		return FillRandom, byte(g.rnd.IntN(256))
+	}
+}
+
+// compressibleFill is for the shapes that exist to make zstd do
+// something: never random.
+func (g *gen) compressibleFill() (FillKind, byte) {
+	if g.rnd.IntN(4) == 0 {
+		return FillZero, 0
+	}
+	return FillText, byte(g.rnd.IntN(256))
+}
+
+// differentFill returns a compressible fill that is not the one given, so
+// that overwriting with it CHANGES the bytes — and, since the two kinds
+// compress to very different lengths, changes what the entry holding them
+// weighs.
+func (g *gen) differentFill(kind FillKind, variant byte) (FillKind, byte) {
+	k, v := g.compressibleFill()
+	if k == kind && v == variant {
+		if k == FillZero {
+			return FillText, variant ^ 0x3c
+		}
+		return k, v ^ 0x3c
+	}
+	return k, v
 }
 
 func (g *gen) addDir(p string) {
@@ -556,6 +897,11 @@ func Generate(seed uint64, opt Options) Plan {
 
 		if opt.SettleEvery > 0 && sinceSettle >= opt.SettleEvery {
 			sinceSettle = 0
+			// Counted, because it is not only a pause: it is the moment
+			// this session's dirty bytes become PACKED bytes, and a shape
+			// that wants to overwrite a packed chunk needs to know one has
+			// gone by. See shapeCompressibleRewrite.
+			g.settles++
 			p.Ops = append(p.Ops, Op{Kind: OpSettle, Wait: 1100,
 				Note: "let a --snapshot-interval checkpoint publish mid-run"})
 		}
@@ -621,6 +967,11 @@ func shapeSparseTrain(g *gen) []Op {
 	if len(grid) > 3 {
 		grid = grid[:len(grid)-1-g.rnd.IntN(2)]
 	}
+	// One entropy for the whole train, chosen per train: the interesting
+	// combination is a COMPRESSIBLE train with gaps, because then the seal
+	// re-chunks the gaps (which read as zeros) and the extents around
+	// them, and every row it emits is one zstd shrank.
+	kind, variant := g.anyFill()
 	for i, off := range grid {
 		ln := int64(block)
 		if g.rnd.IntN(4) == 0 {
@@ -629,8 +980,8 @@ func shapeSparseTrain(g *gen) []Op {
 			off += int64(g.rnd.IntN(block))
 			ln = int64(1 + g.rnd.IntN(block))
 		}
-		ops = append(ops, Op{Kind: OpPwrite, Path: f, Off: off, Len: ln,
-			Fill: byte(0x50 + i)})
+		k, v := normFill(kind, variant^byte(0x50+i))
+		ops = append(ops, Op{Kind: OpPwrite, Path: f, Off: off, Len: ln, FillKind: k, Fill: v})
 	}
 	g.files = append(g.files, f)
 	return ops
@@ -642,8 +993,9 @@ func shapeSparseTrain(g *gen) []Op {
 func shapeTruncateTrain(g *gen) []Op {
 	dir := g.pickDir()
 	f := g.join(dir, g.name("trunc")+".dat")
+	kind, variant := g.anyFill()
 	ops := []Op{
-		{Kind: OpCreate, Path: f, Len: int64(1 + g.rnd.IntN(30000)), Fill: 0x77,
+		{Kind: OpCreate, Path: f, Len: int64(1 + g.rnd.IntN(30000)), FillKind: kind, Fill: variant,
 			Note: "truncate up and down mid-train"},
 		{Kind: OpPwrite, Path: f, Off: int64(g.rnd.IntN(40000)), Len: int64(1 + g.rnd.IntN(9000)), Fill: 0x78},
 	}
@@ -653,7 +1005,7 @@ func shapeTruncateTrain(g *gen) []Op {
 	// half, then a regrow — the sequence that leaves refs naming bytes
 	// past the end if a resize only sets the size.
 	ops = append(ops,
-		Op{Kind: OpPwrite, Path: f, Off: up - 4096, Len: 4096, Fill: 0x79},
+		Op{Kind: OpPwrite, Path: f, Off: up - 4096, Len: 4096, FillKind: kind, Fill: variant},
 		Op{Kind: OpTruncate, Path: f, Size: up / 3, Note: "shrink through the middle of an extent"},
 		Op{Kind: OpTruncate, Path: f, Size: up, Note: "regrow: the cut bytes must read as zeros"},
 	)
@@ -672,9 +1024,14 @@ func shapeWhiteoutCycle(g *gen) []Op {
 	name := g.join(dir, g.name("cycle")+".txt")
 	ops := []Op{{Kind: OpCreate, Path: name, Len: 128, Fill: 0x61, Note: "whiteout cycle"}}
 	for i := 0; i < 2+g.rnd.IntN(3); i++ {
+		// Recreating over a whiteout with the SAME bytes as a previous
+		// incarnation is a dedup hit against a chunk the volume has
+		// already condemned, which is worth reaching; anyFill's zero case
+		// is what reaches it.
+		kind, variant := g.anyFill()
 		ops = append(ops,
 			Op{Kind: OpUnlink, Path: name},
-			Op{Kind: OpCreate, Path: name, Len: int64(64 + i*97), Fill: byte(0x62 + i),
+			Op{Kind: OpCreate, Path: name, Len: int64(64 + i*97), FillKind: kind, Fill: variant,
 				Note: "recreate over the whiteout"},
 		)
 	}
@@ -761,8 +1118,9 @@ func shapeAttrsAfterClose(g *gen) []Op {
 func shapeHardlinkWeb(g *gen) []Op {
 	dir := g.pickDir()
 	base := g.join(dir, g.name("web")+".dat")
-	ops := []Op{{Kind: OpCreate, Path: base, Len: int64(300 + g.rnd.IntN(5000)), Fill: 0x33,
-		Note: "hardlink web"}}
+	kind, variant := g.anyFill()
+	ops := []Op{{Kind: OpCreate, Path: base, Len: int64(300 + g.rnd.IntN(5000)),
+		FillKind: kind, Fill: variant, Note: "hardlink web"}}
 	var names []string
 	for i := 0; i < 2+g.rnd.IntN(4); i++ {
 		d := g.pickDir()
@@ -882,6 +1240,182 @@ func shapeDeepAndLong(g *gen) []Op {
 	return ops
 }
 
+// shapeCompressibleRewrite is THE shape the fill vocabulary exists for,
+// and it is the one release-week bug this exerciser could not previously
+// reach: a chunk REWRITTEN after a partial overwrite, holding bytes zstd
+// can shrink.
+//
+// A fresh write is not enough and neither is a compressible one. What
+// makes a seal take the re-chunk path (memtable.Sealer.rechunk) is a
+// piece that covers only PART of a chunk that is already in a pack, so
+// the order has to be: write it, let a checkpoint pack it, then overwrite
+// a span strictly inside it. The row the re-chunk emits must then carry
+// the length and algorithm of the ENTRY, and the pre-fix code copied them
+// from the plaintext in hand — invisible for as long as every body here
+// was incompressible, because for those two the numbers agree.
+//
+// IT PAYS NOTHING FOR THE CHECKPOINT. A settle of its own would cost 1.1s
+// per emission and the CI budget is 30 seconds. Instead the shape creates
+// on one draw and rewrites on a LATER one, and only rewrites a file that
+// has been sitting since before the last settle Generate emitted — so the
+// checkpoint it needs is one the plan was going to have anyway.
+func shapeCompressibleRewrite(g *gen) []Op {
+	var ops []Op
+	// Rewrite whatever a checkpoint has packed since this shape last ran,
+	// and then leave a fresh body behind for the NEXT checkpoint to pack.
+	// Both halves on every draw, because draws are the scarce thing here:
+	// a plan is bounded in ops, one big-directory shape can spend most of
+	// that budget in a single draw, and a shape that alternated would need
+	// twice as many turns to do its one job.
+	for i, pf := range g.packed {
+		if pf.settles >= g.settles {
+			continue // no checkpoint has passed over it yet
+		}
+		g.packed = append(g.packed[:i:i], g.packed[i+1:]...)
+		ops = append(ops, g.rewritePacked(pf)...)
+		break
+	}
+	dir := g.pickDir()
+	f := g.join(dir, g.name("comp")+".log")
+	kind, variant := g.compressibleFill()
+	size := int64(20000 + g.rnd.IntN(60000))
+	if len(g.packed) >= 8 {
+		g.packed = g.packed[1:] // bounded: the oldest just never gets rewritten
+	}
+	g.packed = append(g.packed, packedFile{
+		path: f, size: size, kind: kind, variant: variant, settles: g.settles})
+	g.files = append(g.files, f)
+	ops = append(ops, Op{Kind: OpCreate, Path: f, Len: size, FillKind: kind, Fill: variant,
+		Note: "compressible body, to be partly overwritten once a checkpoint has packed it"})
+
+	// THE GUARANTEE, and the only settle this vocabulary ever pays for.
+	// Free settles are scarcer than they look: a single big-directory draw
+	// can spend most of an op budget and still yields exactly one settle
+	// for its twelve hundred ops, so a short plan can easily end having
+	// drawn this shape once. Once is not enough — the create and the
+	// overwrite are different draws — and a run that wrote compressible
+	// bodies without ever re-chunking one would have closed this blind
+	// spot on paper only. So the FIRST time this shape runs in a plan, and
+	// only then, it buys its own checkpoint and does the whole sequence
+	// here: 1.1s per run per frontend, once, for the one shape that cannot
+	// be reached any other way.
+	if !g.rechunked && !g.paidSettle {
+		g.paidSettle = true
+		g.settles++
+		pf := g.packed[len(g.packed)-1]
+		g.packed = g.packed[:len(g.packed)-1]
+		ops = append(ops, Op{Kind: OpSettle, Wait: 1100,
+			Note: "buy a checkpoint: the overwrite below re-chunks only if these bytes are packed"})
+		ops = append(ops, g.rewritePacked(pf)...)
+	}
+	return ops
+}
+
+// rewritePacked is the second half of the shape above: the overwrite
+// itself, in the four arrangements that reach the re-chunk path
+// differently.
+func (g *gen) rewritePacked(pf packedFile) []Op {
+	g.rechunked = true
+	size := pf.size
+	// Strictly inside the file and unaligned at both ends, so the chunk
+	// holding it straddles the rewrite on both sides: those two chunks
+	// are what a seal has to read back and re-cut.
+	off := int64(1 + g.rnd.IntN(int(size/3)))
+	ln := int64(1 + g.rnd.IntN(int(size/3)))
+	kind, variant := g.differentFill(pf.kind, pf.variant)
+	ops := []Op{{Kind: OpPwrite, Path: pf.path, Off: off, Len: ln, FillKind: kind, Fill: variant,
+		Note: "partial overwrite of a PACKED compressible chunk: this is what makes a seal re-chunk"}}
+	if g.rnd.IntN(2) == 0 {
+		// Compressible head, incompressible tail, inside one chunk: the
+		// re-chunked entry compresses, but only some of it does, so its
+		// stored length is neither the plaintext's nor anything a caller
+		// could guess.
+		ops = append(ops, Op{Kind: OpPwrite, Path: pf.path, Off: size - size/4, Len: size / 4,
+			FillKind: FillRandom, Fill: byte(0xd0 + g.rnd.IntN(16)),
+			Note: "an incompressible tail over a compressible head"})
+	}
+	if g.rnd.IntN(3) == 0 {
+		ops = append(ops, Op{Kind: OpPwrite, Path: pf.path, Off: size,
+			Len: int64(1 + g.rnd.IntN(9000)), FillKind: FillText, Fill: variant ^ 0x5a,
+			Note: "append past a packed chunk: only the tail is re-chunked"})
+	}
+	if g.rnd.IntN(4) == 0 {
+		ops = append(ops, Op{Kind: OpTruncate, Path: pf.path, Size: size/2 + 1,
+			Note: "shrink through a packed chunk: the surviving half is re-chunked"})
+	}
+	return ops
+}
+
+// shapeZeroRuns is the other half of the entropy vocabulary, and it is
+// three separate cases that only zeros produce.
+//
+// DEDUP. Identical bodies are identical chunks, so several files of zeros
+// resolve to ONE stored entry and every row but the first is answered
+// from a location the packer already had rather than from bytes it just
+// encoded. Those are three of the four cases the re-chunk row has to get
+// right (a chunk this run placed, one still in the open pack, one an
+// earlier flush sent) and nothing else here reaches them, because
+// incompressible bodies never collide.
+//
+// A HOLE THAT IS NOT A HOLE. A written run of zeros and a gap no extent
+// covers must read back identically, and after a seal they are the same
+// bytes in the same kind of entry — a gap is re-chunked through the read
+// path, which answers zeros.
+//
+// THE CHUNK BOUNDARY. Everything else this vocabulary writes is under
+// 70 KB, and the volume's chunker has a 1 MiB minimum, so no other shape
+// has ever produced a file with TWO chunks in it. One large file per plan
+// does, and a long run of zeros written across where the cut fell moves
+// it: zeros carry a constant rolling hash, so no cut point can land
+// inside one.
+func shapeZeroRuns(g *gen) []Op {
+	dir := g.pickDir()
+	var ops []Op
+
+	// Identical bodies, deliberately the same length and the same kind.
+	ln := int64(4096 * (1 + g.rnd.IntN(16)))
+	for i := 0; i < 2+g.rnd.IntN(3); i++ {
+		f := g.join(dir, g.name("zeros")+".dat")
+		ops = append(ops, Op{Kind: OpCreate, Path: f, Len: ln, FillKind: FillZero,
+			Note: "identical zero bodies: many files, one chunk identity"})
+		g.files = append(g.files, f)
+	}
+
+	// A run of zeros punched into the middle of bytes zstd cannot touch.
+	f := g.join(dir, g.name("punch")+".dat")
+	size := int64(30000 + g.rnd.IntN(40000))
+	ops = append(ops,
+		Op{Kind: OpCreate, Path: f, Len: size, FillKind: FillRandom, Fill: 0x6a},
+		Op{Kind: OpPwrite, Path: f, Off: size / 4, Len: size / 2, FillKind: FillZero,
+			Note: "a run of zeros punched into incompressible bytes"},
+		// And a truncate-grow beside it, so the same file holds a written
+		// run of zeros AND a gap that only reads as zeros.
+		Op{Kind: OpTruncate, Path: f, Size: size + int64(8192+g.rnd.IntN(20000)),
+			Note: "a gap after a written zero run: both must read back the same"},
+	)
+	g.files = append(g.files, f)
+
+	// The one file per plan that the chunker cuts in two.
+	if !g.largeDone && g.opt.LargeFileBytes > 0 {
+		g.largeDone = true
+		big := g.opt.LargeFileBytes
+		bf := g.join(dir, g.name("wide")+".dat")
+		// A window certain to contain the first cut, which for both text
+		// and random bodies falls around 4.6-4.9 MiB under the volume's
+		// 1/4/16 MiB chunker.
+		zfrom := big * 2 / 3
+		zlen := big / 6
+		ops = append(ops,
+			Op{Kind: OpCreate, Path: bf, Len: big, FillKind: FillText, Fill: 0x11,
+				Note: "large enough for the chunker to cut it in two"},
+			Op{Kind: OpPwrite, Path: bf, Off: zfrom, Len: zlen, FillKind: FillZero,
+				Note: "a run of zeros written across where the cut fell; no cut can land inside one"},
+		)
+		g.files = append(g.files, bf)
+	}
+	return ops
+}
+
 // shapePlainTree is the polite filler: ordinary files and directories, so
 // the hostile shapes have a real tree to be hostile inside of.
 func shapePlainTree(g *gen) []Op {
@@ -895,8 +1429,11 @@ func shapePlainTree(g *gen) []Op {
 	}
 	for i := 0; i < 1+g.rnd.IntN(4); i++ {
 		f := g.join(dir, g.name("f")+".txt")
+		// The filler is where most of the tree's bytes come from, so it is
+		// the cheapest place to stop the whole corpus being one entropy.
+		kind, variant := g.anyFill()
 		ops = append(ops, Op{Kind: OpCreate, Path: f,
-			Len: int64(g.rnd.IntN(70000)), Fill: byte(g.rnd.IntN(256))})
+			Len: int64(g.rnd.IntN(70000)), FillKind: kind, Fill: variant})
 		g.files = append(g.files, f)
 	}
 	// Occasionally delete something at random, so the tree is not

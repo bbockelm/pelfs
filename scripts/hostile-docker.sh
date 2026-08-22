@@ -54,6 +54,9 @@
 #   scripts/hostile-docker.sh --env K=V       # diagnostic env var in the container
 #   scripts/hostile-docker.sh --drop-chown    # run with CAP_CHOWN/CAP_FOWNER
 #                                             # dropped: the capability-poor shape
+#   scripts/hostile-docker.sh --encrypt       # every volume ENCRYPTED: chunks are
+#                                             # compressed and then sealed, so no
+#                                             # pack entry is its plaintext's length
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -70,6 +73,7 @@ RETRO_REF=""
 OPS=""
 BIGDIR=""
 DROP_CHOWN=0
+LARGEFILE=""
 EXTRA_ENVS=(-e PELFS_HOSTILE_MARKER=1)
 TIMEOUT="${PELFS_HOSTILE_TIMEOUT:-}"
 
@@ -80,9 +84,25 @@ while [ $# -gt 0 ]; do
     --seed)   SEED="${2:?--seed needs a value}"; shift ;;
     --ops)    OPS="${2:?--ops needs a value}"; shift ;;
     --bigdir) BIGDIR="${2:?--bigdir needs a value}"; shift ;;
+    # Size of the one file per plan the content-defined chunker cuts in
+    # two (default 6 MiB; 0 removes it). Every other body this vocabulary
+    # writes is under 70 KB and the volume's chunker has a 1 MiB minimum,
+    # so without this no plan has ever contained a chunk BOUNDARY. It is
+    # also the cheapest thing to turn off if the budget is squeezed.
+    --large-file) LARGEFILE="${2:?--large-file needs a byte count}"; shift ;;
     --plan)   PLAN="${2:?--plan needs a path}"; shift ;;
     --run)    RUN_PATTERN="${2:?--run needs a pattern}"; shift ;;
     --drop-chown) DROP_CHOWN=1 ;;
+    # Run against ENCRYPTED volumes. The harness mints a throwaway RSA key
+    # on the container's own tmpfs and passes --encrypt-key to init, to
+    # every mount, and to fsck; it then proves the volume really is
+    # encrypted by requiring fsck --deep to FAIL without the key.
+    #
+    # This is the strongest form of the question the fill kinds ask. A
+    # chunk is compressed and THEN encrypted, so a nonce and a GCM tag are
+    # always added and the entry in the pack is never the length of the
+    # plaintext -- for every chunk, not only the compressible ones.
+    --encrypt) EXTRA_ENVS+=(-e PELFS_HOSTILE_ENCRYPT=1) ;;
     # How often a writable mount checkpoints in phase A (default 1s).
     # Shorten it to make a checkpoint far more likely to land INSIDE a
     # large directory's enumeration -- see the readdir finding in
@@ -96,11 +116,12 @@ while [ $# -gt 0 ]; do
     # PELFS_HOSTILE_SANDBOX) are set unconditionally after this.
     --env)    EXTRA_ENVS+=(-e "${2:?--env needs KEY=VALUE}"); shift ;;
     --retro)  MODE=retro
-              # Default: the parent of the sparse-train fix, which is also
-              # BEFORE the go-nfs REMOVE fix -- so one checkout exhibits
-              # both of the bugs the corpus exists to prove this tool
-              # would have caught. See the note under RETRO below.
-              case "${2:-}" in -*|"") RETRO_REF="2afa231" ;; *) RETRO_REF="$2"; shift ;; esac ;;
+              # Default: the parent of the RECHUNK fix, which is also
+              # before the sparse-train fix and before the go-nfs REMOVE
+              # fix -- so one checkout exhibits all three of the bugs the
+              # corpus exists to prove this tool would have caught. See
+              # the note under RETRO below.
+              case "${2:-}" in -*|"") RETRO_REF="c26428f" ;; *) RETRO_REF="$2"; shift ;; esac ;;
     -h|--help) sed -n '2,60p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1 (try --help)" >&2; exit 2 ;;
   esac
@@ -161,14 +182,24 @@ if [ "$MODE" = retro ]; then
   # The proof that this tool would have caught what humans caught: run
   # TODAY's exerciser against YESTERDAY's pelfs.
   #
-  # A NOTE ON THE REFERENCE, because the obvious choice is wrong. Both
-  # bugs were fixed AT OR BEFORE v0.1.0 -- the tag sits exactly on
-  # e68a538, which IS the go-nfs REMOVE fix -- so v0.1.0 exhibits
-  # NEITHER and a retro run against it proves nothing. The pre-fix states
-  # are the fixes' parents:
+  # A NOTE ON THE REFERENCE, because the obvious choice is wrong. All
+  # three bugs were fixed AT OR BEFORE v0.1.0 -- the tag sits exactly on
+  # e68a538, which IS the go-nfs REMOVE fix -- so v0.1.0 exhibits NONE of
+  # them and a retro run against it proves nothing. The pre-fix states
+  # are the fixes' parents, and they nest:
   #     9d953c7  = e68a538^  dangling-symlink rm -rf present
   #     2afa231  = 9d953c7^  sparse-train seal failure ALSO present
-  # 2afa231 is therefore the default: one checkout, both bugs.
+  #     c26428f  = 2afa231^  rechunk CLen/Alg metadata ALSO present
+  # c26428f is therefore the default: one checkout, all three bugs.
+  #
+  # The rechunk one needs BOTH halves of what the fill vocabulary added.
+  # A compressible body, because for incompressible bytes the broken row
+  # is accidentally correct; and a SECOND WRITABLE SESSION over a
+  # generation a previous one published (phase C2), because inside one
+  # session the seal re-renders those rows from locations the memtable
+  # recorded itself and the damage never reaches a reader. Add --encrypt
+  # and it also fires on the incompressible control, off by exactly the
+  # 28 bytes a nonce and a GCM tag add.
   #
   # `git archive` rather than `git worktree add`: a worktree writes into
   # the repository's .git directory, and this script does not write to the
@@ -293,6 +324,7 @@ ENVS=(
   -e TMPDIR=/sandbox/tmp
   -e HOME=/sandbox
 )
+[ -n "$LARGEFILE" ] && ENVS+=(-e "PELFS_HOSTILE_LARGEFILE=$LARGEFILE")
 [ -n "$SEED" ] && ENVS+=(-e "PELFS_HOSTILE_SEED=$SEED")
 [ -n "$PLAN" ] && ENVS+=(-e PELFS_HOSTILE_PLAN_FILE=/stage/replay.plan)
 ENVS+=("${EXTRA_ENVS[@]}")

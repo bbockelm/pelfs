@@ -9,10 +9,13 @@ package hostile
 // nothing parses in normal CI is a corpus that rots.
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/bbockelm/pelfs/internal/entrycodec"
 )
 
 func TestGenerateIsDeterministic(t *testing.T) {
@@ -73,6 +76,11 @@ func TestEveryShapeIsReachable(t *testing.T) {
 	}
 	// One marker note per shape, taken from the shape's first op.
 	wantNotes := []string{
+		"compressible body, to be partly overwritten once a checkpoint has packed it",
+		"partial overwrite of a PACKED compressible chunk: this is what makes a seal re-chunk",
+		"identical zero bodies: many files, one chunk identity",
+		"a run of zeros punched into incompressible bytes",
+		"a run of zeros written across where the cut fell; no cut can land inside one",
 		"symlink forest",
 		"sparse train: extents out of order, with gaps",
 		"whiteout cycle",
@@ -93,6 +101,271 @@ func TestEveryShapeIsReachable(t *testing.T) {
 	for k := OpKind(0); k < numOpKinds; k++ {
 		if !seen["kind:"+k.String()] {
 			t.Errorf("op kind %s is in the vocabulary but no shape emits it", k)
+		}
+	}
+}
+
+// ------------------------------------------------------------ fill kinds
+
+// The fill kinds are a CLAIM about what the storage layer will do with
+// the bytes, so they are checked against the volume's own codec rather
+// than against an idea of compressibility. This is the test that would
+// have made the release-week rechunk bug findable: it says out loud that
+// the old vocabulary's bodies are the one case where a chunk's stored
+// length equals its logical length, which is why a row that copied one
+// into the other looked right.
+func TestFillKindsAreWhatTheyClaimAgainstTheRealCodec(t *testing.T) {
+	const n = 64 << 10
+	for _, tc := range []struct {
+		kind    FillKind
+		variant byte
+		wantAlg uint8
+		minRat  float64
+	}{
+		{FillRandom, 0x41, entrycodec.AlgNone, 0}, // stored verbatim: CLen == LLen
+		{FillText, 0x41, entrycodec.AlgZstd, 2},
+		{FillZero, 0, entrycodec.AlgZstd, 100},
+	} {
+		body := Body(tc.kind, tc.variant, 0, n)
+		if int64(len(body)) != n {
+			t.Fatalf("%s: %d bytes, want %d", tc.kind, len(body), n)
+		}
+		enc, alg, err := entrycodec.Encode(body, nil)
+		if err != nil {
+			t.Fatalf("%s: encode: %v", tc.kind, err)
+		}
+		if alg != tc.wantAlg {
+			t.Errorf("%s: the codec chose alg %d, want %d", tc.kind, alg, tc.wantAlg)
+		}
+		ratio := float64(n) / float64(len(enc))
+		switch {
+		case tc.minRat == 0:
+			// The incompressible case, and the load-bearing half of it: a
+			// stored entry the same size as its plaintext is exactly the
+			// coincidence that hid the bug.
+			if len(enc) != n {
+				t.Errorf("%s: stored %d bytes for a %d-byte body; this kind must be the one "+
+					"where CLen == LLen, or the vocabulary no longer has an incompressible case",
+					tc.kind, len(enc), n)
+			}
+		case ratio < tc.minRat:
+			t.Errorf("%s: compresses only %.2fx, want at least %.0fx -- this kind exists to make "+
+				"CLen differ from LLen and it barely does", tc.kind, ratio, tc.minRat)
+		default:
+			t.Logf("%s: %d -> %d bytes (%.2fx), alg %d", tc.kind, n, len(enc), ratio, alg)
+		}
+		// And on an ENCRYPTED volume every kind's stored length differs
+		// from its logical one, whatever the compressor did, because the
+		// nonce and the GCM tag are always there. That is why the bug this
+		// vocabulary chases was "never true on an encrypted volume".
+		keyed, _, err := entrycodec.Encode(body, make([]byte, 32))
+		if err != nil {
+			t.Fatalf("%s: keyed encode: %v", tc.kind, err)
+		}
+		if int64(len(keyed)) == n {
+			t.Errorf("%s: a sealed entry is the same length as its plaintext, which cannot be", tc.kind)
+		}
+	}
+}
+
+// Both trees must get the same bytes or the comparison means nothing, and
+// the keying must be on the ABSOLUTE offset or an overlapping rewrite is
+// undetectable. Both predate the fill kinds and both have to survive them.
+func TestEveryFillIsDeterministicAndOffsetKeyed(t *testing.T) {
+	for k := FillKind(0); k < numFillKinds; k++ {
+		a := Body(k, 0x33, 4096, 8192)
+		if !bytes.Equal(a, Body(k, 0x33, 4096, 8192)) {
+			t.Errorf("%s: two calls, two answers", k)
+		}
+		// A window read out of a longer body must match the same window
+		// generated on its own: a pwrite lays down bytes continuous with
+		// whatever a create put around them.
+		whole := Body(k, 0x33, 0, 20000)
+		part := Body(k, 0x33, 7777, 3333)
+		if !bytes.Equal(whole[7777:7777+3333], part) {
+			t.Errorf("%s: a body is not a window onto the same stream; a partial overwrite "+
+				"would write bytes that do not belong where they land", k)
+		}
+		if k == FillZero {
+			continue // zeros have no variant, on purpose: that is the dedup case
+		}
+		if bytes.Equal(a, Body(k, 0x34, 4096, 8192)) {
+			t.Errorf("%s: two variants produced identical bytes", k)
+		}
+		if bytes.Equal(a, Body(k, 0x33, 8192, 8192)) {
+			t.Errorf("%s: the same variant at a different offset produced identical bytes, so "+
+				"an overlapping rewrite would be invisible", k)
+		}
+	}
+}
+
+// The corpus is written in this syntax and some of it was written before
+// the fill kinds existed. `fill=NN` must keep meaning exactly what it
+// always meant, or every committed entry silently changes what it tests.
+func TestTheByteLiteralFillSyntaxStillMeansWhatItDid(t *testing.T) {
+	op, ok, err := ParseOp("create a/b.dat len=256 fill=41")
+	if err != nil || !ok {
+		t.Fatalf("parse: %v", err)
+	}
+	if op.FillKind != FillRandom || op.Fill != 0x41 {
+		t.Fatalf("fill=41 parsed as kind %v variant %#x; want the incompressible byte literal 0x41",
+			op.FillKind, op.Fill)
+	}
+	if got := op.String(); got != "create a/b.dat len=256 fill=41" {
+		t.Errorf("re-rendered as %q; a corpus entry must round-trip byte-identical", got)
+	}
+}
+
+func TestFillKindsRoundTripThroughText(t *testing.T) {
+	for _, tc := range []struct {
+		text string
+		kind FillKind
+		v    byte
+	}{
+		{"pwrite a off=0 len=8 fill=00", FillRandom, 0},
+		{"pwrite a off=0 len=8 fill=ff", FillRandom, 0xff},
+		{"pwrite a off=0 len=8 fill=zero", FillZero, 0},
+		{"pwrite a off=0 len=8 fill=text:00", FillText, 0},
+		{"pwrite a off=0 len=8 fill=text:9c", FillText, 0x9c},
+	} {
+		op, ok, err := ParseOp(tc.text)
+		if err != nil || !ok {
+			t.Fatalf("%q: %v", tc.text, err)
+		}
+		if op.FillKind != tc.kind || op.Fill != tc.v {
+			t.Errorf("%q parsed as kind %v variant %#x, want %v/%#x", tc.text, op.FillKind, op.Fill, tc.kind, tc.v)
+		}
+		if got := op.String(); got != tc.text {
+			t.Errorf("%q re-rendered as %q", tc.text, got)
+		}
+	}
+	// `fill=text` with no variant is legible shorthand and must parse; it
+	// renders back in the explicit form, which is the one the generator
+	// writes.
+	op, _, err := ParseOp("create a len=4 fill=text")
+	if err != nil || op.FillKind != FillText || op.Fill != 0 {
+		t.Errorf("bare fill=text: %v, kind %v", err, op.FillKind)
+	}
+}
+
+func TestParseRejectsFillsThatCannotMean(t *testing.T) {
+	for _, bad := range []string{
+		"create a len=4 fill=zero:41", // zeros have no variant
+		"create a len=4 fill=nosuch",
+		"create a len=4 fill=nosuch:41",
+		"create a len=4 fill=text:zz",
+		"create a len=4 fill=1234", // not a byte
+	} {
+		if _, _, err := ParseOp(bad); err == nil {
+			t.Errorf("accepted %q, want an error", bad)
+		}
+	}
+}
+
+// THE SHAPE THE RECHUNK BUG LIVED IN, asserted rather than hoped for. A
+// compressible body is not enough on its own: what makes a seal take the
+// re-chunk path is a piece covering only PART of a chunk that is already
+// in a pack, so the sequence has to be create -> checkpoint -> partial
+// overwrite, in that order, on the same path. A generator that emitted
+// only fresh compressible writes would look like it had closed the blind
+// spot and would not have.
+func TestTheGeneratorOverwritesCompressibleContentAfterACheckpoint(t *testing.T) {
+	found, seeds := 0, 0
+	for seed := uint64(0); seed < 40; seed++ {
+		type born struct {
+			size    int64
+			settles int
+		}
+		compressible := map[string]born{}
+		settles := 0
+		hit := false
+		for _, op := range Generate(seed, DefaultOptions()).Ops {
+			switch op.Kind {
+			case OpSettle:
+				settles++
+			case OpCreate:
+				if op.FillKind != FillRandom && op.Len > 0 {
+					compressible[op.Path] = born{op.Len, settles}
+				} else {
+					delete(compressible, op.Path)
+				}
+			case OpPwrite:
+				b, ok := compressible[op.Path]
+				// Strictly inside the file: a write that starts at 0 or
+				// runs past the end replaces or appends, and neither
+				// leaves a chunk straddling the rewrite.
+				if ok && b.settles < settles && op.Off > 0 && op.Off+op.Len < b.size {
+					hit = true
+				}
+			}
+		}
+		if hit {
+			found++
+		}
+		seeds++
+	}
+	// Two thirds rather than all of them: a plan is bounded in OPS, not in
+	// shape draws, and one big-directory draw can spend most of the budget
+	// at once, so some seeds simply never draw this shape. What makes that
+	// acceptable is that the deterministic guarantee lives elsewhere --
+	// testdata/corpus/rechunk-compressible-rewrite.plan is replayed on
+	// both frontends by every single run.
+	if found*3 < seeds*2 {
+		t.Errorf("only %d of %d seeds produced a partial overwrite of compressible content that a "+
+			"checkpoint had already packed -- that sequence IS the re-chunk path, and without it "+
+			"this vocabulary is compressible-looking rather than compressible", found, seeds)
+	}
+	t.Logf("%d of %d seeds re-chunk compressible content", found, seeds)
+}
+
+// Every kind must actually be emitted, or one of them is decoration.
+func TestEveryFillKindIsGenerated(t *testing.T) {
+	seen := map[FillKind]int{}
+	for seed := uint64(0); seed < 20; seed++ {
+		for _, op := range Generate(seed, DefaultOptions()).Ops {
+			// Bodies only. The big-directory shape mints thousands of
+			// EMPTY files, and counting those would make the balance check
+			// below true no matter what the vocabulary did.
+			if (op.Kind == OpCreate || op.Kind == OpPwrite) && op.Len > 0 {
+				seen[op.FillKind]++
+			}
+		}
+	}
+	for k := FillKind(0); k < numFillKinds; k++ {
+		if seen[k] == 0 {
+			t.Errorf("fill kind %s is in the vocabulary but no shape emits it", k)
+		}
+	}
+	// And incompressible stays the plurality: it is what gives the packer
+	// real work and what stops the whole tree deduping into one chunk.
+	if seen[FillRandom] < seen[FillText]+seen[FillZero] {
+		t.Errorf("compressible writes (%d) now outnumber incompressible ones (%d); the packer "+
+			"should still be doing real work most of the time",
+			seen[FillText]+seen[FillZero], seen[FillRandom])
+	}
+	t.Logf("fills generated: random=%d text=%d zero=%d", seen[FillRandom], seen[FillText], seen[FillZero])
+}
+
+// The one expensive body in the vocabulary is capped at one per plan, and
+// the cap is what keeps it in the CI budget. LargeFileBytes=0 removes it
+// entirely, which is the lever a budget squeeze reaches for first.
+func TestTheChunkBoundaryFileIsOnePerPlanAndOptional(t *testing.T) {
+	for seed := uint64(0); seed < 12; seed++ {
+		n := 0
+		for _, op := range Generate(seed, DefaultOptions()).Ops {
+			if op.Kind == OpCreate && op.Len >= 1<<20 {
+				n++
+			}
+		}
+		if n > 1 {
+			t.Errorf("seed %d emitted %d files over 1 MiB; the budget allows one", seed, n)
+		}
+		opt := DefaultOptions()
+		opt.LargeFileBytes = 0
+		for _, op := range Generate(seed, opt).Ops {
+			if op.Kind == OpCreate && op.Len >= 1<<20 {
+				t.Errorf("seed %d emitted a %d-byte file with LargeFileBytes=0", seed, op.Len)
+			}
 		}
 	}
 }

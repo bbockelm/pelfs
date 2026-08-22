@@ -1,0 +1,56 @@
+# hostile plan: seed=0 ops=8
+#
+# THE RECHUNK CLen/Alg METADATA BUG, minimized. Found by the owner during
+# release week and by no gate, and the fix commit says exactly why:
+#
+#     Sealer.rechunk filled CLen in from len(c.Data) and left Alg and
+#     KeyID at zero, so every row a re-chunk emitted claimed the entry in
+#     the pack was the size of its decoded bytes and needed no decoding.
+#     That is true only for bytes zstd could not shrink [...]
+#     Nothing caught it because every test that re-chunks used
+#     incompressible pseudorandom bodies.
+#
+# The exerciser had the same hole. Every op it generated wrote
+# incompressible bytes on purpose -- so the packer had real work and
+# nothing deduped away -- and incompressible bytes are the ONE case where
+# a row copied from the plaintext happens to be right: zstd gives up, the
+# entry is stored verbatim, and CLen == LLen. `fill=text` and `fill=zero`
+# are what closed it.
+#
+# THE SHAPE, and every line of it is load-bearing:
+#
+#   1. a body zstd can shrink. fill=text compresses ~3.6x under the
+#      volume's own settings, so the entry in the pack is nothing like
+#      the length of the plaintext.
+#   2. a CHECKPOINT. A seal only takes the re-chunk path for a piece that
+#      covers part of a chunk ALREADY IN A PACK. Bytes still in the ring
+#      are chunked whole by the flush path, which was never wrong. The
+#      settle is what turns the create into a packed chunk.
+#   3. a partial overwrite STRICTLY INSIDE the file. Not at 0 and not
+#      past the end: either of those replaces or appends whole chunks and
+#      re-chunks nothing. The chunk has to straddle the rewrite.
+#   4. a second overwrite with the OTHER compressible kind, so the span
+#      recompresses to a different length than it did the first time --
+#      which is the number the row has to carry from the entry rather
+#      than from the bytes in hand.
+#
+# WHERE IT SHOWS. Not in the live view: the mount serves these bytes out
+# of its own overlay and gets them right. It shows in phase C, on a cold
+# mount of the SEALED generation, where a reader follows the row's CLen
+# to a range that is not the entry -- so this entry, like the sparse-train
+# one, is a reason the lifecycle phases are not optional.
+#
+# ON AN ENCRYPTED VOLUME this reproduces for ANY fill, compressible or
+# not: a nonce and a GCM tag are always added, so no entry is ever its
+# plaintext's length. `scripts/hostile-docker.sh --encrypt` is that leg.
+#
+# Fixed at 2afa231. PRESENT at its parent, c26428f.
+mkdir rechunk mode=0755
+create rechunk/base.log len=40000 fill=text:11 # a body zstd shrinks ~3.6x
+settle ms=1100 # the checkpoint that packs it; without this nothing re-chunks
+pwrite rechunk/base.log off=7001 len=9001 fill=text:22 # strictly inside: the chunk straddles it
+pwrite rechunk/base.log off=21001 len=6001 fill=zero # recompresses to a different length again
+create rechunk/plain.dat len=40000 fill=41 # the control: incompressible, CLen == LLen
+settle ms=1100
+pwrite rechunk/plain.dat off=7001 len=9001 fill=42 # the same shape that never showed the bug
+compare

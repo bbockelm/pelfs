@@ -16,6 +16,8 @@
 //	pelfs repack-plan <prefix>       report what a repack would rewrite
 //	pelfs repack [--apply] <prefix>  rewrite mostly-dead packs, publish a generation
 //	pelfs cache  [clear] <prefix>    show, or free, the local cache
+//	pelfs rotate [--apply] <prefix>  replace the volume signing key
+//	pelfs rescue [--apply] <prefix>  rebuild refs from packs after a disaster
 package main
 
 import (
@@ -66,6 +68,10 @@ func main() {
 		code = cmdRepack(os.Args[2:])
 	case "cache":
 		code = cmdCache(os.Args[2:])
+	case "rotate":
+		code = cmdRotate(os.Args[2:])
+	case "rescue":
+		code = cmdRescue(os.Args[2:])
 	case "version", "--version":
 		fmt.Println(version.Get())
 	case "-h", "--help", "help":
@@ -113,6 +119,12 @@ Usage:
                                                           publish a generation
   pelfs cache  [clear] [flags] <prefix>                   show (or free) the local
                                                           cache this volume is using
+  pelfs rotate [--apply] [flags] <prefix>                 replace the volume signing key
+                                                          through the custody chain; reports
+                                                          what it would break by default
+  pelfs rescue [--apply] [flags] <prefix>                 rebuild the refs from the packs'
+                                                          superblock backups, for the day
+                                                          the refs are gone; never deletes
   pelfs version                                           which build this is (quote it
                                                           in bug reports)
 

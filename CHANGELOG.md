@@ -2,6 +2,81 @@
 
 ## Unreleased
 
+### Added
+
+- **`pelfs rescue` — rebuild a volume's refs from its packs.** The operation
+  the format was built for and never had: `refs/<branch>` is the only mutable
+  object, so it is the only one that can be lost, and everything needed to
+  replace it is already in the packs (typed entries, self-identifying
+  catalogs, and a signed superblock backup from every seal).
+
+  Report-first, like `repack`: the default lists, per branch, what the ref
+  holds now, which generation is recoverable and out of which pack, and
+  whether that generation's root catalog can actually be found. `--apply`
+  re-points the refs. **It never deletes anything.**
+
+  Safety, since this is trust-boundary code run in a panic:
+  - Every scavenged backup is VERIFIED against the pinned key or an explicit
+    `--volume-pubkey`. A pack is appendable by anyone with write access, so a
+    rescue that trusted a planted backup would be the attack. Non-verifying
+    documents are reported, never used, and trust-on-first-use is not
+    available — with no key, the answer is an error, not a new pin.
+  - **Ambiguity is presented, never auto-picked.** Two verifiable candidates
+    for one head is both a legitimate state and what a rollback looks like;
+    `--pick <id>` is how you decide.
+  - A candidate whose pack set will not resolve is skipped WITH A REASON and
+    the rescue falls back a generation, rather than offering a head that
+    names fewer packs than it needs.
+  - `--apply` needs the signing key; the report does not.
+
+  Three things had moved since the design specified this, all recorded in
+  `docs/design-packfs.md`: a backup cannot name the pack that CARRIES it
+  (which is where the root catalog usually is, so the rescuer supplies it —
+  and a rescue therefore recovers the full newest generation rather than
+  "minus its tail"); a rescue must RE-SIGN rather than flip the backup's
+  bytes; and the per-file damage report is deliberately left to
+  `pelfs fsck --deep` instead of being reimplemented.
+
+- **`pelfs rotate` — replace the volume signing key.** `superblock.NextPub`
+  has been verified since v0.1.0 and set by nothing, so the format could
+  describe a key rotation and no tool could start one. Now one can.
+
+  A rotation is two generations per branch — one announcing the successor
+  (signed by the current key), one signed by the successor — published by a
+  single command, because nothing carries an announcement forward and
+  leaving the second half to "whatever seals next" is a silent race. Both
+  generations are content-neutral: no pack, no catalog, no change to what the
+  volume holds.
+
+  **Report-first, and read the report.** Three consequences, each of which
+  the command states before acting and refuses to skip past:
+  - **A reader only follows a rotation if it observed the announcement.** A
+    pin advances by exactly one lineage step, so a client whose recorded
+    generation predates the announcement refuses the new head. Hence
+    `--announce-only`: publish the announcement, wait past your readers'
+    poll interval, then finish with `--apply`. A client that misses the
+    window needs `--volume-pubkey` or a cleared state directory.
+  - **The pin is per VOLUME**, so the default rotates EVERY branch with one
+    successor key; narrowing with `--branch` requires `--break-siblings`.
+  - **Every existing tag stops verifying, permanently** — a tag is immutable
+    and takes no chain step. `--break-siblings` covers this too, and the
+    retired key is archived read-only (`v2-signing.key.retired-<pub8>`)
+    precisely so `--volume-pubkey` can still read old tags.
+  - **MERGE FIRST, THEN ROTATE.** A branch pins its merge base with a tag,
+    because the base stops being any branch's head as soon as the source
+    seals again; `pelfs merge` reads it through that tag. A rotation
+    therefore makes a pending merge impossible, with no repair afterwards —
+    `pelfs tag` can only freeze a branch HEAD, so a fork point cannot be
+    re-pinned once unreadable. `pelfs rotate` names the affected branches
+    before acting.
+
+  Crash safety: a rotation interrupted anywhere is resumable or abortable and
+  never leaves a volume whose next seal cannot be signed. Re-running adopts
+  the successor already minted instead of generating a second one;
+  `--abort` retracts an announcement that has not been used; and an interrupt
+  between the final flip and the local key promotion is repaired by the next
+  seal, through the one key resolver every writer shares.
+
 ### Changed
 
 - **The write lease is per branch.** It was `meta/lease.json`, one object

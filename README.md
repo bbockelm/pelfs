@@ -23,6 +23,8 @@ pelfs branch --rm pelican://.../scratch dev                # delete one (never t
 pelfs fsck   [--deep] pelican://.../scratch                # verify a generation
 pelfs repack-plan pelican://.../scratch                    # what a repack would rewrite
 pelfs repack [--apply] pelican://.../scratch               # rewrite it, publish a generation
+pelfs rotate [--apply] pelican://.../scratch               # replace the volume signing key
+pelfs rescue [--apply] pelican://.../scratch               # rebuild refs from packs alone
 pelfs version                                              # which build this is
 ```
 
@@ -234,6 +236,100 @@ have to ask for: one object per line, with the message TEMPLATE as a
 constant `msg` you can group by and the values as typed fields (a size is
 a count of bytes, a duration a count of nanoseconds).
 
+## Disaster: losing the refs, and replacing the key
+
+Two commands for the two things that can go wrong with the only mutable part
+of a volume. **Both report by default; `--apply` is the opt-in.**
+
+### `pelfs rescue` — the refs are gone
+
+`refs/<branch>` is the one object in the format that is overwritten in place,
+which makes it the one that can be lost — to a stray write token, to a `rm`,
+to a cache that mis-reported a length. Everything else survives: packs carry
+the catalogs, the inode shards, the data, and **a signed superblock backup
+from every seal**.
+
+```
+pelfs rescue pelican://.../scratch                  # what is recoverable, per branch
+pelfs rescue --apply pelican://.../scratch          # re-point the refs
+```
+
+The report says, for each branch, what the ref holds now (missing / present
+but unusable / fine), which generation is on offer and out of which pack, and
+whether that generation's root catalog could actually be found — a document
+that verifies is not the same thing as a generation that mounts.
+
+- It **never deletes**. Not a pack, not a manifest, not the ref it replaces.
+  The moment you run this is the moment nobody yet knows what is really
+  missing.
+- It **verifies** every scavenged backup against the pinned key, or one you
+  supply with `--volume-pubkey`. A pack is appendable by anyone who can write
+  to the volume, so a rescue that trusted a planted backup would *be* the
+  attack. Documents that do not verify are reported, never used. There is no
+  trust-on-first-use here: with no key pinned and none supplied, the answer
+  is an error.
+- **Ambiguity is presented, never guessed.** Two verifiable candidates for
+  one head is a real state (a publish that uploaded its last pack and then
+  died leaves a backup its retry seals again) and it is also what a rollback
+  by a key-holder looks like. Nothing can tell them apart, so you pick:
+  `--pick <id>`, using the ids the report prints.
+- `--apply` needs the volume's **signing key**; the report does not. A
+  rescued head is a new document — the backup states its pack set in a shape
+  no branch head may use — so it is re-signed. One consequence to expect: a
+  machine that had already seen a *higher* generation on that branch will
+  refuse the rescued head as a stale read. That check is local state; clear
+  that machine's state directory.
+
+Then run `pelfs fsck --deep` on the result. Rescue answers "which
+generation"; fsck answers "is all of it there".
+
+### `pelfs rotate` — replacing the volume signing key
+
+```
+pelfs rotate pelican://.../scratch                     # what it would do, and break
+pelfs rotate --announce-only --apply pelican://.../s    # step 1, then wait
+pelfs rotate --apply pelican://.../scratch              # step 2, finish
+```
+
+A rotation is **two generations per branch**: one announcing the successor
+key (still signed by the current one), then one signed by the successor.
+Readers follow the announcement and move their pinned key.
+
+Read the report before you use `--apply`. Three things it will tell you:
+
+- **A reader only follows a rotation if it saw the announcement.** A pinned
+  key advances by exactly one lineage step, so a client whose last recorded
+  generation predates the announcement cannot get there and will refuse the
+  new head. On a volume with idle or slow-polling readers, run
+  `--announce-only` first, wait longer than their poll interval, then finish
+  with `--apply`. A client that misses the window needs `--volume-pubkey`
+  with the new key, or a cleared state directory; a brand-new client is
+  unaffected.
+- **The pin is per VOLUME.** So `pelfs rotate` rotates *every* branch by
+  default, with one successor key — that is the only end state a reader can
+  use. Narrowing it with `--branch` strands the others and requires
+  `--break-siblings`.
+- **Every existing tag stops verifying, permanently.** A tag is immutable
+  and is checked against the pinned key with no chain step, so there is no
+  republishing it and no rotation path to it. The only way back to an old tag
+  is `--volume-pubkey` with the retired key — which is why the retired key is
+  archived read-only beside the new one instead of being deleted.
+- **Merge first, then rotate.** A branch pins its merge base with a tag (the
+  base stops being anybody's head as soon as the source branch seals again),
+  and `pelfs merge` reads that base through the tag. So a rotation makes a
+  merge you have not done yet impossible, and there is no repair afterwards —
+  `pelfs tag` can only freeze a branch *head*, so a fork point cannot be
+  re-pinned once it is unreadable. `pelfs rotate` names the branches this
+  applies to before it does anything.
+
+Interrupting a rotation is safe. Before the announcement, nothing has
+happened. Between the two generations the current key is still the head's
+key, so every other writer carries on unaware, and `pelfs rotate --abort`
+retracts it. After the final flip, the next seal on that machine completes
+the local half by itself and says so. Whatever you interrupt, re-running
+`pelfs rotate --apply` resumes rather than starting over: it adopts the
+successor key it already minted instead of generating a second one.
+
 ## Caveats (prototype)
 
 - **Single writer per BRANCH.** The advisory lease is detection, not mutual
@@ -329,9 +425,14 @@ a count of bytes, a duration a count of nanoseconds).
   is refused: every object in a volume is reachable from a ref, so a volume
   with none has no head to mount, nothing for a new branch to start from,
   and no way back from the CLI.
-- There is no **merge**, and no **key rotation**. Two branches that have
-  diverged stay diverged; what exists is branching, tagging and deleting,
-  not reconciling. Key rotation is a format feature (custody-chain
-  verification) with no writer behind it — and note that when one does
-  land, rotating on one branch retires the volume-wide pin and siblings
-  still signed by the old key fail until they are republished.
+- There is no **merge**. Two branches that have diverged stay diverged; what
+  exists is branching, tagging and deleting, not reconciling.
+- **Key rotation exists now** (`pelfs rotate`), with two sharp edges that are
+  properties of the format rather than of the command. The pin is per VOLUME,
+  so rotating one branch retires the pin for the whole volume and siblings
+  still signed by the old key fail until republished — which is why the
+  default rotates every branch at once, and why narrowing it needs
+  `--break-siblings`. And a pin advances by exactly ONE lineage step, so only
+  a reader that observed the announcing generation can follow; use
+  `--announce-only`, wait, then finish. Existing tags stop verifying for
+  good. See "Disaster: losing the refs, and replacing the key" above.

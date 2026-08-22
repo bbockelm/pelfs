@@ -826,10 +826,82 @@ format required.
   of dumb federation storage.
 - **Rotation:** a superblock may introduce a successor public key
   (`NextPub`), signed by the current key; readers follow the custody chain
-  through lineage in `VerifyChain`. Verification is implemented; **nothing
-  in the CLI sets `NextPub`**, so rotation cannot be initiated today.
-  Compromise recovery is out-of-band re-pinning — custody chains cannot
-  distinguish a stolen key's rotation from a legitimate one.
+  through lineage in `VerifyChain`. Both halves now exist: verification
+  shipped in v0.1.0, and `pelfs rotate` (`internal/rotate`) is the writer.
+  Compromise recovery is still out-of-band re-pinning — custody chains
+  cannot distinguish a stolen key's rotation from a legitimate one.
+
+  **Two generations per branch, and it cannot be fewer.** `VerifyChain`
+  admits a successor key only when the *predecessor* announced it, so the
+  announcement and the use of the announced key are necessarily different
+  documents: `N+1` announces and is still signed by the old key, `N+2` is
+  signed by the new one. Both are content-neutral — the head's own struct
+  with lineage advanced and the signature replaced — so a rotation cannot
+  change what a volume contains, and every field the rotation code has never
+  heard of is carried by copying rather than by a list someone must extend.
+  It is one command rather than "and the next seal will use the new key",
+  because nothing carries `NextPub` forward: an announcement is good for
+  exactly one step, so leaving the second half to whoever seals next is a
+  race with every mount on the volume, and losing it is silent.
+
+  **THE READER WINDOW, which is the real limit.** A pin advances by exactly
+  ONE lineage step (`cur.Generation == prev.Generation+1`, against the last
+  superblock *that client* accepted). A rotation is two generations, so a
+  client whose record is generation `N` and which next looks after both have
+  landed sees `N+2`, cannot chain from `N`, and refuses. **The pin only
+  advances for a client that observed the announcement.** So on a volume with
+  long-idle readers a rotation is run in two steps — `pelfs rotate
+  --announce-only`, wait longer than the readers' poll interval, then
+  `--apply` — and clients that miss the window need `--volume-pubkey` with
+  the new key, or a cleared state directory. A client with no record at all
+  simply pins the new key on first use.
+
+  **The pin is per VOLUME, so rotation is a decision and not a chore.** The
+  instant any reader's pin advances through one branch, every object still
+  signed by the old key fails for that reader. Hence `pelfs rotate` rotates
+  *every* branch by default with one successor key, and narrowing it with
+  `--branch` requires `--break-siblings`. TAGS CANNOT BE SAVED: a tag is
+  immutable and `FetchTag` verifies against the pinned key with no chain
+  step, so every existing tag stops verifying, permanently, and the only way
+  back to one is `--volume-pubkey` with the retired key. That is why the
+  retired key is archived read-only beside the new one rather than deleted.
+
+  **Local key lifecycle and crash safety.** The state directory holds
+  `v2-signing.key` (live), `v2-signing.key.next` (pending successor, minted
+  once and thereafter *adopted*, never re-minted), and
+  `v2-signing.key.retired-<pub8>` (mode 0400). A rotation interrupted
+  anywhere is resumable or abortable and never leaves a volume whose next
+  seal cannot be signed: before the announcement the head is untouched;
+  between the two generations the live key is still the head's key, so every
+  other writer carries on unaware; and after the executing flip but before
+  the local promotion, `rotate.Reconcile` — called from the one key resolver
+  every writer shares — promotes on evidence (the pending key's public half
+  IS the head's) and repairs the state directory from inside an ordinary
+  seal. Promotion archives before it replaces, so it is idempotent.
+  `pelfs rotate --abort` deletes an unannounced pending key, or supersedes a
+  published announcement with an ordinary generation signed by the still-live
+  key; a rotation that has already executed cannot be aborted, only finished.
+
+  **IT BREAKS A PENDING MERGE, and nothing can repair that afterwards.** This
+  is the one consequence neither feature's own description implies. A branch
+  records where it was cut from (`superblock.Fork`) and pins that base with a
+  TAG, because the base stops being any branch's head the moment the source
+  seals again and a generation is addressable only through a ref or a tag.
+  `pelfs merge` reads its base with `refs.Store.FetchTag` — pinned key, no
+  chain step. So after a rotation the fork tag no longer verifies, the
+  fallback search skips every unreadable name, and the merge cannot find a
+  base. There is no fix after the fact: `pelfs tag` freezes a branch HEAD, so
+  a fork point cannot be re-pinned once it is unreadable, and
+  `--volume-pubkey` with the retired key would then fail to verify the two
+  rotated heads being merged. **So: merge first, then rotate.** `pelfs
+  rotate` names the affected branches before it acts.
+
+  **What rotation costs, honestly.** The two generations cut no pack, so they
+  write no disaster-recovery backup, and the retain window
+  (`internal/retention/lastk.go`) reports the two generations below them as
+  unresolved. Nothing is at risk — the rotated generations name exactly what
+  their parent named, so the head still protects those objects — but the
+  report says "unresolved" and this is why.
 - **Threat model, stated honestly:** the federation origin is dumb storage
   and cannot verify signatures, so a compromised *write token* permits
   clobbering the mutable ref objects — an availability attack. Signatures
@@ -2010,11 +2082,67 @@ provisions that are all in place:
    in a backup is harmless to expose.)
 
 `pelfs rescue` — enumerate packs, inventory trailers, assemble the newest
-complete generation, then report subtrees intact, files damaged by missing
-chunks, catalogs missing, and a hash-only lost+found for data reachable
-from no surviving catalog — is **specified here and not implemented**. The
-format prerequisites above all shipped, which was the point: retrofitting
-them would have left early volumes unrescuable.
+complete generation, and offer a generation to re-point a ref at — **is
+built** (`internal/rescue`). The format prerequisites above all shipped
+first, which was the point: retrofitting them would have left early volumes
+unrescuable.
+
+What it does: lists packs newest-first, reads trailers, pulls out every
+`"sb"` entry, VERIFIES each against the pinned key or an explicitly supplied
+one, groups the survivors by `(branch, generation)`, and offers the newest
+whose pack set resolves. Report-first — `--apply` re-points the refs and
+nothing else ever writes; it never deletes. Ambiguity (two verifiable
+candidates for one head) is presented and never auto-picked, and a document
+that does not verify is reported rather than considered: a rescue that
+trusted a planted backup would BE the attack, since a pack is appendable by
+anyone who can write to the volume.
+
+**Three deltas from the specification above**, all found by building it:
+
+1. **A backup cannot name the pack it rides in, and that is where the root
+   catalog usually is.** The backup is built before its seal finishes, so
+   its carrier is still an unnamed spool file; catalogs are packed
+   immediately before it. The union of the inline list and the carried
+   manifest refs — which is what this document said to read — therefore
+   yields a head that verifies, states a root catalog, and cannot serve it.
+   The rescuer supplies the third source the document could not: *it knows
+   which object it read the backup out of*. With the carrier included, a
+   rescue recovers the FULL newest generation rather than "the newest
+   generation minus its tail". The residual is a seal whose catalogs filled
+   the open pack so that adding the backup cut a fresh one; the catalog pack
+   is then in neither source, the root is not located, and the rescue falls
+   back a step and says why.
+2. **A rescue RE-SIGNS.** It cannot flip the backup's bytes: a backup is the
+   one document allowed to state its pack set both ways, and every reader
+   resolves a head through `manifest.Packs`, which prefers the manifest and
+   ignores the inline list. So the rescued head states the union ONE way —
+   inline when it fits the write budget, a fresh single manifest segment
+   when it does not — which makes it a new document. Hence `--apply` needs
+   the volume's signing key and the report does not, the same split
+   `repack-plan`/`repack` has. A consequence worth stating: a client that
+   already accepted a HIGHER generation on that branch refuses the rescued
+   head as a stale read (`refs.ErrRollback`), because after a disaster the
+   head really has gone backwards. That check is purely local state.
+3. **Not built: the damage report and the lost+found.** "Subtrees intact,
+   files damaged by missing chunks, catalogs missing, hash-only lost+found"
+   is a reachability walk over a generation, which is what `pelfs fsck
+   --deep` already is; duplicating it inside rescue would be a second
+   implementation of the tree walk at the trust boundary. The composition is
+   `pelfs rescue --apply` then `pelfs fsck --deep`, and rescue's own job
+   stops at "which generation, and can its root be found".
+
+**A merged generation rescues unchanged**, which was worth checking rather
+than assuming. A merge reads no content — both sides' files are already
+chunked, so the merged tree is handed to publish as a `ContentProvider` and
+the chunkrefs point into the OTHER branch's packs. Those packs belong to a
+generation on another branch, so if the merged generation did not name them
+itself a rescue would rebuild a head missing half its data. It does name
+them: publish folds a provider's packs into the generation's pack set, and so
+does the backup (`backupPackList`), so the union rescue already computes
+covers both sides. And two parents never arise — a merged generation has ONE
+`PrevHash` (ours' head) and records the base in `Fork` rather than as a
+second parent, while rescue never walks `PrevHash` at all. Both properties
+are asserted by test, not reasoned.
 
 `pelfs fsck` does exist and verifies a published generation: it builds the
 full location map from the signed pack list, walks catalogs and shards,
@@ -2125,12 +2253,17 @@ counts match on both sides of it.
   (`Plan.Refs`). A repack replacing the manifest wholesale already drops
   every superseded segment, so what is missing is the narrower decision
   about objects whose only cost is fetch time.
-- **`pelfs rescue`.** Fully specified; the format prerequisites shipped.
 - **Forks.** No command creates a ref from another generation.
 - **Ref deletion.** `pelfs tag` creates tags and publish creates branches;
   nothing removes either, so the one operation that finally releases space
   has no command.
-- **Key rotation.** `NextPub` is verified but never set.
+- **A rescue's damage report.** `pelfs rescue` finds the generation and
+  checks that its root catalog is reachable; the per-file "intact / damaged
+  by missing chunks / catalog missing" breakdown and the hash-only
+  lost+found are NOT built, deliberately — that is a reachability walk over
+  a generation, which `pelfs fsck --deep` already is, and a second
+  implementation of the tree walk at the trust boundary is worth more than
+  it costs. The composition is `rescue --apply` then `fsck --deep`.
 - **`splice`/`ReadResultFd`** on cache hits.
 - **The "snapshot expired" reader error.** The grace window is enforced
   from the sweep side only.
@@ -2138,6 +2271,15 @@ counts match on both sides of it.
 The LSM write path of `design-writepath.md` used to be on this list. It
 is not any more: `internal/memtable` is the default write path of every
 writable mount.
+
+`pelfs rescue` and key rotation have both come off it too. Rescue is
+`internal/rescue` and `pelfs rescue [--apply]`; the three ways reality had
+moved since it was specified are recorded under "Disaster recovery". Key
+rotation is `internal/rotate` and `pelfs rotate [--apply]`; `NextPub` is now
+both verified and set, and the reader window it turns out to have — a pin
+advances by exactly one lineage step, so only a client that observed the
+announcement can follow — is under "Signing, keys, and trust", along with
+the `--announce-only` procedure that works around it.
 
 ## Open format questions
 

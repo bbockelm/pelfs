@@ -503,3 +503,454 @@ func TestStealRetriesWithoutStalling(t *testing.T) {
 	defer thief.Release(ctx)
 	t.Logf("steal retried and won in %s", time.Since(start).Round(time.Millisecond))
 }
+
+// ---- fencing: the seal-time gate, and the two ways a lease is lost ----
+
+// expiredTTL is the deterministic stand-in for "this machine slept past its
+// lease".
+//
+// A nanosecond, rather than a short duration plus a sleep. The gate's
+// arithmetic is the same at 1ns as at two minutes — a gap since the last
+// landed renewal, compared against the TTL — so a TTL this small makes every
+// test below decidable the instant it runs, with no timer, no sleep and no
+// wall-clock margin to lose on a loaded machine. It also makes the record
+// this session writes read as EXPIRED to anybody else (isLive), which is
+// exactly the state a suspended writer leaves behind.
+const expiredTTL = time.Nanosecond
+
+// sleepOpts is a session that has been asleep: it will never renew (the
+// interval is an hour, so no tick fires during a test) and its lease is
+// already past its TTL.
+func sleepOpts(store pelicanobj.Store, session string) Options {
+	o := slowOpts(store, session)
+	o.TTL = expiredTTL
+	return o
+}
+
+// countingStore counts the round trips a call makes, so "Fence is free while
+// the lease is fresh" can be asserted as a fact rather than assumed from
+// reading it.
+type countingStore struct {
+	pelicanobj.Store
+	mu    sync.Mutex
+	stats int
+	puts  int
+}
+
+func (s *countingStore) StatKey(ctx context.Context, key string) (*pelicanobj.KeyInfo, error) {
+	s.mu.Lock()
+	s.stats++
+	s.mu.Unlock()
+	return s.Store.StatKey(ctx, key)
+}
+
+func (s *countingStore) Put(ctx context.Context, key string, r io.Reader) error {
+	s.mu.Lock()
+	s.puts++
+	s.mu.Unlock()
+	return s.Store.Put(ctx, key, r)
+}
+
+func (s *countingStore) trips() (int, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stats, s.puts
+}
+
+// fakeClock drives the freshness gate without sleeping. It is anchored at
+// the real now so that the lease RECORDS this session writes stay plausible
+// to the liveness rule, which reads a server mtime it cannot fake.
+type fakeClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func newClock() *fakeClock { return &fakeClock{t: time.Now()} }
+
+func (c *fakeClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *fakeClock) advance(d time.Duration) {
+	c.mu.Lock()
+	c.t = c.t.Add(d)
+	c.mu.Unlock()
+}
+
+// headUnchanged and headMoved are the two answers a Guard can give. The
+// comparison itself belongs to the caller (cmd/pelfs, which reads the ref
+// and compares it against its seal anchor); what this package's tests pin is
+// what it DOES with each answer.
+func headUnchanged(context.Context) (bool, error) { return true, nil }
+func headMoved(context.Context) (bool, error)     { return false, nil }
+
+// TestFenceIsFreeWhileTheLeaseIsFresh: the gate must cost nothing on the
+// path every healthy seal takes. If it ever costs a round trip, it is a
+// round trip per checkpoint on every mount in the world.
+func TestFenceIsFreeWhileTheLeaseIsFresh(t *testing.T) {
+	ctx := context.Background()
+	store := &countingStore{Store: newStore(t)}
+	l, err := Acquire(ctx, slowOpts(store, "sess-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Release(ctx)
+
+	statsBefore, putsBefore := store.trips()
+	for i := 0; i < 5; i++ {
+		if err := l.Fence(ctx, headUnchanged); err != nil {
+			t.Fatalf("Fence on a fresh lease: %v", err)
+		}
+	}
+	stats, puts := store.trips()
+	if stats != statsBefore || puts != putsBefore {
+		t.Fatalf("five Fence calls on a fresh lease cost %d stats and %d puts; a fresh, undisputed "+
+			"lease must be answerable from memory", stats-statsBefore, puts-putsBefore)
+	}
+	if st := l.State(); st.Name() != "held" {
+		t.Fatalf("state = %q, want held", st.Name())
+	}
+}
+
+// TestFenceBoundaryIsExactlyTheTTL pins the comparison at the boundary,
+// because the two sides of it are different behaviours and an off-by-one
+// here is either a needless round trip on every seal or a seal that skips
+// the check in the window that matters.
+//
+// AT the TTL the lease is still live by the same arithmetic every other
+// client acquires under (isLive), so a seal must not be held to a stricter
+// rule than the one that would let somebody else in.
+func TestFenceBoundaryIsExactlyTheTTL(t *testing.T) {
+	ctx := context.Background()
+	store := &countingStore{Store: newStore(t)}
+	clk := newClock()
+	opts := slowOpts(store, "sess-a")
+	opts.TTL = 2 * time.Minute
+	opts.now = clk.now
+	l, err := Acquire(ctx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Release(ctx)
+
+	// Exactly the TTL: fresh, no round trip.
+	clk.advance(2 * time.Minute)
+	statsBefore, _ := store.trips()
+	if err := l.Fence(ctx, headUnchanged); err != nil {
+		t.Fatalf("Fence at exactly the TTL: %v", err)
+	}
+	if stats, _ := store.trips(); stats != statsBefore {
+		t.Fatalf("Fence revalidated AT the TTL (%d stats); the boundary is inclusive, because a lease "+
+			"another client cannot yet take is one this session may still publish under", stats-statsBefore)
+	}
+	if l.State().Stale {
+		t.Fatal("a lease exactly at its TTL reported itself stale")
+	}
+
+	// One nanosecond past it: revalidate.
+	clk.advance(time.Nanosecond)
+	if !l.State().Stale {
+		t.Fatal("a lease one nanosecond past its TTL did not report itself stale")
+	}
+	statsBefore, putsBefore := store.trips()
+	if err := l.Fence(ctx, headUnchanged); err != nil {
+		t.Fatalf("Fence past the TTL: %v", err)
+	}
+	stats, puts := store.trips()
+	if stats <= statsBefore || puts <= putsBefore {
+		t.Fatalf("Fence past the TTL made %d stats and %d puts; it must re-run the renewal check and "+
+			"renew, not assume", stats-statsBefore, puts-putsBefore)
+	}
+	if l.State().RevalidatedAt.IsZero() {
+		t.Fatal("a synchronous revalidation left no trace; lease_revalidated_at is how a gap is " +
+			"observable after the fact")
+	}
+}
+
+// TestFenceRefusesWhenAnotherClientTookTheBranch is the sleep scenario's
+// core, at this package's level: the usurper is STILL HOLDING when we wake.
+//
+// This is the case the renewal loop could already recognize — and the seal
+// path never asked it. `Conflicted()` had exactly one consumer, a status
+// field, so a session in precisely this state would go on to checkpoint,
+// publish, and rely on the flip's check-then-put window: a window whose own
+// documentation says it is narrow BECAUSE the lease keeps other writers out
+// of it.
+func TestFenceRefusesWhenAnotherClientTookTheBranch(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t)
+
+	// A holds an expired lease and is not renewing: asleep.
+	a, err := Acquire(ctx, sleepOpts(store, "sess-asleep"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// B walks up, finds the lease expired, and takes it — no steal needed,
+	// which is the point: B is entitled to it.
+	b, err := Acquire(ctx, slowOpts(store, "sess-awake"))
+	if err != nil {
+		t.Fatalf("the second writer could not take an EXPIRED lease, so this test is not testing the "+
+			"scenario it claims: %v", err)
+	}
+	defer b.Release(ctx)
+
+	err = a.Fence(ctx, headUnchanged)
+	if !errors.Is(err, ErrLost) {
+		t.Fatalf("Fence after the branch was taken: err = %v, want ErrLost", err)
+	}
+	// The message has to name the other client and say the work survives,
+	// because the only correct action from here is a remount and the user
+	// has to be told that publishing nothing did not cost them anything.
+	for _, want := range []string{"sess-awake", "main", "intact", "remount"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal does not mention %q: %v", want, err)
+		}
+	}
+	if st := a.State(); st.Name() != "lost" || st.Holder == nil || st.Holder.Session != "sess-awake" {
+		t.Errorf("state = %+v, want lost and naming sess-awake", st)
+	}
+	// A second Fence is refused from memory, with no further round trip:
+	// once lost, the branch is not un-lost by asking again.
+	if err := a.Fence(ctx, headUnchanged); !errors.Is(err, ErrLost) {
+		t.Errorf("second Fence: err = %v, want ErrLost", err)
+	}
+	// And releasing must not delete B's lease.
+	if err := a.Release(ctx); err != nil {
+		t.Fatalf("Release after a lost lease: %v", err)
+	}
+	if _, err := store.StatKey(ctx, mainKey(t)); err != nil {
+		t.Fatalf("the usurper's lease did not survive our release: %v", err)
+	}
+}
+
+// TestVanishedLeaseIsResolvedAgainstTheHead is the COME-AND-GONE hole.
+//
+// B takes the expired lease, does its work, and RELEASES — and release
+// DELETES the object, so the only trace of the whole episode is that our
+// lease is not there any more. renewOnce used to read that absence as
+// "someone deleted our lease; reclaim it below" and do exactly that,
+// silently, which made the one interleaving that leaves no witness the one
+// interleaving nothing detected.
+//
+// The absence alone cannot decide it: an operator clearing what looked like
+// a stale lease produces the same absence, and making every deletion fatal
+// would turn a tidy-up into a lost session. The branch head is what tells
+// them apart, so that is what the resolution asks.
+func TestVanishedLeaseIsResolvedAgainstTheHead(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		head    Guard
+		wantErr error
+	}{
+		{"an operator deleted a stale-looking lease and nothing was published", headUnchanged, nil},
+		{"another writer took the lease, published, and released", headMoved, ErrLost},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := newStore(t)
+			a, err := Acquire(ctx, sleepOpts(store, "sess-asleep"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Come, and gone: B acquires the expired lease and releases it,
+			// which removes the object.
+			b, err := Acquire(ctx, slowOpts(store, "sess-passer-by"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := b.Release(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.StatKey(ctx, mainKey(t)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("the setup did not leave the lease object absent: %v", err)
+			}
+
+			err = a.Fence(ctx, tc.head)
+			if tc.wantErr == nil {
+				if err != nil {
+					t.Fatalf("Fence with an unchanged head: %v (a deletion that published nothing over "+
+						"us must be reclaimable)", err)
+				}
+				// Reclaimed, and reclaimed AS OURS: the record on the object
+				// is this session's, so the lease is really held again and
+				// Release will remove it.
+				info, _, err := read(ctx, store, mainKey(t))
+				if err != nil {
+					t.Fatalf("the lease was not re-taken: %v", err)
+				}
+				if info.Session != "sess-asleep" {
+					t.Fatalf("re-taken lease holds %q", info.Session)
+				}
+				if st := a.State(); st.Interrupted || st.Conflicted {
+					t.Fatalf("state after a clean reclaim = %+v, want neither interrupted nor lost", st)
+				}
+				if !a.State().WasInterrupted {
+					t.Error("the episode left no latched trace; lease_interrupted is how a session " +
+						"reports that its lease object vanished at all")
+				}
+				return
+			}
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("Fence with a moved head: err = %v, want %v", err, tc.wantErr)
+			}
+			for _, want := range []string{"ADVANCED", "superseded", "intact", "remount"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("refusal does not mention %q: %v", want, err)
+				}
+			}
+			if st := a.State(); st.Name() != "lost" {
+				t.Errorf("state = %q, want lost", st.Name())
+			}
+		})
+	}
+}
+
+// TestRenewalRemembersAVanishedLease: the renewal loop still RECLAIMS, so an
+// operator's tidy-up costs nothing, but it no longer forgets. After the
+// reclaim the object's ETag is ours again and says nothing about who was
+// there in between — so the interrupted state is the only thing that can
+// make the next seal ask the head, and it must survive a renewal that looks
+// entirely successful.
+func TestRenewalRemembersAVanishedLease(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t)
+	l, err := Acquire(ctx, slowOpts(store, "sess-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Release(ctx)
+
+	if err := store.Delete(ctx, mainKey(t)); err != nil {
+		t.Fatal(err)
+	}
+	if done := l.renewOnce(); done {
+		t.Fatal("renewOnce ended the loop over a deletion; an operator clearing a stale-looking lease " +
+			"must not tear the session down")
+	}
+	if _, err := store.StatKey(ctx, mainKey(t)); err != nil {
+		t.Fatalf("renewOnce did not reclaim the object: %v", err)
+	}
+	if !l.Interrupted() {
+		t.Fatal("renewOnce reclaimed silently; the come-and-gone case has no other witness")
+	}
+	// The lease is FRESH — it was just renewed — so nothing but the
+	// interrupted state can make this Fence look at the head.
+	if l.State().Stale {
+		t.Fatal("the reclaim did not refresh the lease, so this test is not testing what it claims")
+	}
+	if err := l.Fence(ctx, headMoved); !errors.Is(err, ErrLost) {
+		t.Fatalf("Fence on a freshly-renewed but INTERRUPTED lease: err = %v, want ErrLost", err)
+	}
+}
+
+// TestFenceFailsClosed: a check that cannot be made is not a check that
+// passed. Both ways of not knowing — the federation not answering, and a
+// caller with no head to compare — refuse, and refuse with their own
+// sentinel so a caller can tell "you lost the branch" from "ask again".
+func TestFenceFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	base := newStore(t)
+	deaf := &deafStore{Store: base}
+	l, err := Acquire(ctx, sleepOpts(deaf, "sess-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		deaf.silence(false)
+		_ = l.Release(ctx)
+	}()
+
+	deaf.silence(true)
+	err = l.Fence(ctx, headUnchanged)
+	if !errors.Is(err, ErrUnconfirmed) {
+		t.Fatalf("Fence with an unreachable federation: err = %v, want ErrUnconfirmed", err)
+	}
+	if errors.Is(err, ErrLost) {
+		t.Error("an unreachable federation was reported as a lost lease; the two need different advice")
+	}
+	deaf.silence(false)
+
+	// And the no-guard case: the lease object is gone, so the question is
+	// live, and a caller that cannot answer it must not be told everything
+	// is fine.
+	if err := base.Delete(ctx, mainKey(t)); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Fence(ctx, nil); !errors.Is(err, ErrUnconfirmed) {
+		t.Fatalf("Fence with no head comparison available: err = %v, want ErrUnconfirmed", err)
+	}
+}
+
+// deafStore stops answering, which is what a federation looks like from a
+// laptop that has woken up on a different network.
+type deafStore struct {
+	pelicanobj.Store
+	mu   sync.Mutex
+	deaf bool
+}
+
+func (s *deafStore) silence(on bool) {
+	s.mu.Lock()
+	s.deaf = on
+	s.mu.Unlock()
+}
+
+func (s *deafStore) quiet() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.deaf
+}
+
+func (s *deafStore) StatKey(ctx context.Context, key string) (*pelicanobj.KeyInfo, error) {
+	if s.quiet() {
+		return nil, errors.New("no route to host")
+	}
+	return s.Store.StatKey(ctx, key)
+}
+
+// TestNoLeaseIsUnfenced: a --no-lease session holds no lease, so there is
+// nothing to fence with and it keeps exactly the behaviour it always had.
+// A nil receiver rather than a flag, so no call site has to remember.
+func TestNoLeaseIsUnfenced(t *testing.T) {
+	var none *Lease
+	if err := none.Fence(context.Background(), nil); err != nil {
+		t.Fatalf("Fence on a --no-lease session: %v", err)
+	}
+	if st := none.State(); st.Name() != "held" || st.Key != "" {
+		t.Fatalf("a nil lease reported %+v; the zero State must need no special case at the call site", st)
+	}
+}
+
+// TestGapSinceSeesAWallClockGap.
+//
+// WHAT CANNOT BE TESTED HERE, said out loud so nobody "fixes" its absence:
+// there is no way in-process to forge a time.Time whose monotonic and wall
+// readings DISAGREE. Add shifts both; Round(0) removes the monotonic one
+// entirely. So the case gapSince exists for — a suspend across which the
+// monotonic clock stood still and the wall clock did not — cannot be built
+// from Go's time API, and the max() that handles it is reasoned about at its
+// definition rather than pinned here.
+//
+// What IS testable is that the wall half works at all: an injected clock
+// carries no monotonic reading relative to the recorded stamp's, and the gap
+// must still come out right rather than as zero.
+func TestGapSinceSeesAWallClockGap(t *testing.T) {
+	ctx := context.Background()
+	clk := newClock()
+	opts := slowOpts(newStore(t), "sess-a")
+	opts.TTL = time.Minute
+	opts.now = clk.now
+	l, err := Acquire(ctx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Release(ctx)
+
+	clk.advance(3 * time.Hour)
+	if age := l.State().Age; age < 3*time.Hour {
+		t.Fatalf("age after a three-hour gap = %s; a gap the process slept through is exactly the gap "+
+			"that must not read as zero", age)
+	}
+}

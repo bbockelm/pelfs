@@ -499,4 +499,88 @@ rm -f "$WORK/origin/e2e/ns/meta/lease-main.json"
 echo "   measured the volume, held back every pack inside the grace window, changed nothing"
 echo "   refused to publish while another client held the lease; reporting stayed available"
 
-echo "== PASS: create, write, seal, read back, encrypt, prefetch, lease, gc, fsck, repack =="
+echo "== lease: a session that LOST its branch refuses to seal, and keeps its work =="
+# THE ENFORCEMENT HALF, and it is deliberately last: the session under test
+# is left holding unsealed work, and its content packs reach the federation
+# DURING the session, so nothing after it may assert that the volume has no
+# unreferenced objects.
+#
+# Detecting a takeover was already implemented before this section existed;
+# ACTING on it was not. `Conflicted()` had exactly one consumer -- a status
+# field -- so a session that had demonstrably lost the branch went on to
+# checkpoint and seal anyway, resting on the flip's check-then-put window: a
+# window whose own documentation says it is narrow BECAUSE the lease keeps
+# other writers out of it.
+#
+# A long sleep is what produces this in the field, and this gate cannot spend
+# a TTL (two minutes) per case, so the same state is reached in one step by a
+# steal: the incumbent's next renewal finds another client's record on its
+# lease object, which is exactly what it would find on waking up. The wait
+# below is POLLED and bounded -- it fails by name rather than by hanging --
+# and what it waits for is one renewal interval (TTL/4 = 30s), not a guess.
+FENCE_LOG="$WORK/run-fence.log"
+(
+  "$PELFS" shell --state-dir "$WORK/state-fence" --signing-key "$SIGNKEY" --snapshot-interval 0 \
+    --stats-file "$WORK/stats-fence.json" "$PREFIX" -- /bin/sh -c "
+      echo 'work that must survive a refused seal' > fenced.txt
+      touch '$WORK/fence-writing'
+      for _ in \$(seq 1800); do [ -e '$WORK/fence-stop' ] && break; sleep 0.1; done
+    " > "$FENCE_LOG" 2>&1
+  echo $? > "$WORK/rc-fence"
+) &
+FENCE_PID=$!
+for _ in $(seq 600); do [ -e "$WORK/fence-writing" ] && break; sleep 0.1; done
+[ -e "$WORK/fence-writing" ] || {
+  echo "FAIL: the fenced session never reached its payload:"; cat "$FENCE_LOG"; exit 1; }
+
+# Another client takes the branch out from under it AND publishes, which
+# makes the incumbent's seal anchor stale as well as its lease.
+"$PELFS" shell --state-dir "$WORK/state-fence-thief" --signing-key "$SIGNKEY" --steal-lease \
+  --snapshot-interval 0 "$PREFIX" -- /bin/sh -c 'echo thief > from-thief.txt' \
+  > "$WORK/run-fence-thief.log" 2>&1 || {
+  echo "FAIL: the second writer could not steal the branch:"; cat "$WORK/run-fence-thief.log"; exit 1; }
+
+# Either discovery is correct, and which one happens depends on whether a
+# renewal landed while the thief still held the object (the thief RELEASES on
+# exit, and a release DELETES it). Both end in the same refusal, so the wait
+# accepts either and the assertions below are on the refusal.
+noticed=""
+for _ in $(seq 1200); do
+  if grep -Eq "another client took over branch|VANISHED while the session still held it" "$FENCE_LOG"; then
+    noticed=1; break
+  fi
+  sleep 0.1
+done
+[ -n "$noticed" ] || {
+  echo "FAIL: the incumbent never noticed that its branch had been taken (waited 120s for a renewal"
+  echo "      interval of ~30s); a session that does not notice cannot refuse:"; cat "$FENCE_LOG"; exit 1; }
+touch "$WORK/fence-stop"
+wait "$FENCE_PID" 2>/dev/null || true
+[ "$(cat "$WORK/rc-fence" 2>/dev/null)" != "0" ] || {
+  echo "FAIL: the session SEALED after losing its branch; this is the silent-clobber case:"
+  cat "$FENCE_LOG"; exit 1; }
+grep -q "refusing to publish" "$FENCE_LOG" || {
+  echo "FAIL: the seal was not refused by the lease fence:"; cat "$FENCE_LOG"; exit 1; }
+grep -q "the overlay is intact at" "$FENCE_LOG" || {
+  echo "FAIL: the refusal did not say the work survives, which is the only thing the user can act on:"
+  cat "$FENCE_LOG"; exit 1; }
+# THE WORK IS STILL THERE. A refusal that lost the overlay would be worse
+# than the clobber it prevented.
+[ -d "$WORK/state-fence/overlay" ] || {
+  echo "FAIL: the refused seal retired the overlay it promised to keep"; ls "$WORK/state-fence"; exit 1; }
+python3 - "$WORK/stats-fence.json" <<'FENCEPY'
+import json, sys
+s = json.load(open(sys.argv[1]))
+assert s["lease_conflict_observed"] is True, s
+assert s.get("seal_ok") is False, s.get("seal_ok")
+assert not s.get("seals"), ("the refused session published a generation", s.get("seals"))
+print("   the refusal was recorded: lease_conflict_observed, seal_ok false, no generation published")
+FENCEPY
+# And the thief's generation is the branch head: the point of refusing was
+# that this is the work the incumbent must rebuild on, not publish over.
+"$PELFS" shell --ro --state-dir "$WORK/state-fence-read" "$PREFIX" -- /bin/sh -c \
+  'cat from-thief.txt; [ ! -e fenced.txt ]' > "$WORK/run-fence-read.log" 2>&1 || {
+  echo "FAIL: the branch does not hold the thief's generation alone:"; cat "$WORK/run-fence-read.log"; exit 1; }
+echo "   the session noticed, stopped publishing, refused its seal by name, and kept every byte"
+
+echo "== PASS: create, write, seal, read back, encrypt, prefetch, lease, fence, gc, fsck, repack =="

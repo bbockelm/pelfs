@@ -831,6 +831,48 @@ writers on DIFFERENT branches were never in this argument at all; v0.1.0
 excluded them because of where the key lived, not because of anything the
 format required.
 
+**Fencing: what a suspended process does to all of this.** Detection needs
+somebody to be looking, and the only thing that looks is the renewal loop —
+which does not run while the machine is asleep. A laptop whose lid closes
+for three hours wakes past every TTL, and for that whole interval another
+client was *entitled* to take the branch, publish, and release, leaving no
+lease object behind at all. Two things follow, and both are now handled:
+
+- **Every flip-bearing operation fences first** (`lease.Fence`, called from
+  `sealLocked` and from the background repack). A lease renewed within its
+  TTL and undisputed answers from memory and costs nothing; one past its
+  TTL is re-checked synchronously *before* the freeze, the walk and the
+  upload, and a session that has lost the branch refuses with its overlay
+  intact. Before this, `Conflicted()` had exactly one consumer — a status
+  field — so a session that had demonstrably lost the branch published
+  anyway and relied on the check-then-put window above, which is narrow
+  *because the lease keeps other writers out of it*.
+- **The gap is measured against both clocks** and the larger estimate wins.
+  A monotonic reading cannot be stepped but is an uptime clock that does not
+  advance across a suspend; a wall reading advances across a suspend but can
+  be stepped by NTP. Each has a failure mode that makes the gap look
+  *smaller*, so the maximum is the composition where neither lie shrinks it.
+- **A lease object that VANISHES is resolved against the head, not
+  reclaimed.** Our own release deletes the object, so an absent lease means
+  someone else was involved — but an operator clearing a stale-looking lease
+  and a writer that took it, sealed and released produce the same absence.
+  The branch head tells them apart: still equal to this session's seal
+  anchor means nothing was published over us (re-acquire, carry on), moved
+  means refuse.
+- **A lost flip is detectable after the fact.** Both flip paths read the ref
+  back and compare bytes (`pelicanobj.VerifyPut`); a mismatch is
+  `refs.ErrFlipClobbered` rather than a silent success. This prevents
+  nothing — there is still no `If-Match` — but a generation that lost the
+  race used to vanish with both writers reporting success, taking its packs
+  out of every root set.
+
+The limit, stated rather than hidden: a lease **inside** its TTL is trusted
+without a round trip, so a steal that lands and is acted on within one
+renewal interval is caught by the renewal loop (up to `TTL/4` later) or by
+the flip, not by the fence. That is the price of a gate that costs a healthy
+checkpoint nothing, and the window it leaves is the one the lease's TTL
+already defines.
+
 ## Signing, keys, and trust
 
 - **Two keys, two jobs.** The volume *signing* keypair (Ed25519, generated

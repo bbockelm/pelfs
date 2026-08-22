@@ -116,6 +116,23 @@ type Summary struct {
 	// another writer elsewhere on the volume was possible, and the key
 	// does. Empty on a session that took none (read-only, or --no-lease).
 	LeaseKey string `json:"lease_key,omitempty"`
+	// LeaseInterrupted records that this session's lease OBJECT went missing
+	// while the session still held it — it never deleted it, so something
+	// else did. It is reported separately from a conflict because the two
+	// have different resolutions and only one of them is necessarily bad: an
+	// operator clearing what looked like a stale lease and a writer that
+	// took the branch, published and released are the same absence, told
+	// apart by whether the branch head moved (lease.Fence). This field says
+	// the absence happened at all, which is otherwise unrecoverable after
+	// the fact.
+	LeaseInterrupted bool `json:"lease_interrupted,omitempty"`
+	// LeaseRevalidatedAt is when a SYNCHRONOUS lease check last confirmed
+	// the lease at seal time, as opposed to the background renewal loop.
+	// Non-zero means this session went long enough without renewing — a
+	// suspended laptop, a stalled uplink — that a publish had to stop and
+	// re-establish that it still held the branch. It is the observable trace
+	// of a gap that leaves none otherwise.
+	LeaseRevalidatedAt time.Time `json:"lease_revalidated_at,omitempty"`
 
 	// What the mount is serving. Generation is what it serves NOW — with
 	// --poll it is the head the last live refresh swapped to, not the one

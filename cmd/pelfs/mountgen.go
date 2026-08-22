@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -163,6 +164,12 @@ type genSession struct {
 	// generation it was building goes unpublished, and a batch wrapper is
 	// entitled to delete the state directory the instant this process
 	// exits, taking the unsealed overlay with it.
+	//
+	// ckMu guards checkpointStop alone, and it is its own mutex rather than
+	// g.mu because the two paths that stop the ticker are a lease conflict
+	// (on the renewal goroutine, which may fire before the checkpointer is
+	// even started) and a refused seal (which is holding g.mu already).
+	ckMu           sync.Mutex
 	checkpointStop context.CancelFunc
 	checkpointWG   sync.WaitGroup
 	// drainOnce keeps the join single: the exit path calls it explicitly
@@ -850,13 +857,22 @@ func (g *genSession) acquireLease(ctx context.Context, o *cmdOpts, prefix string
 		IgnoreVolumeLease: o.ignoreVolumeLease,
 		OnConflict: func(holder *lease.Info) {
 			g.stats.Update(func(sum *stats.Summary) { sum.LeaseConflictObserved = true })
+			// STOP CHECKPOINTING. Every seal from here on is refused by
+			// fenceSeal, and a periodic checkpointer that keeps ticking
+			// would freeze the overlay, walk the dirty set and upload packs
+			// on its interval, forever, to be told each time what it was
+			// told the first time. The work is not lost by stopping — it
+			// stays in the overlay, which is where a refused seal leaves it
+			// anyway.
+			g.haltCheckpointer()
 			// "this branch", not "this prefix": another writer on another
 			// branch is now ordinary, and only a writer on OURS is the
 			// emergency this warning is for.
 			ui.Warn("another client took over branch {branch}: {holder}\n"+
 				"concurrent writers on one branch WILL corrupt each other; stop one of them.\n"+
-				"this session keeps running but no longer renews the lease;\n"+
-				"the seal at unmount will be REFUSED if that client advanced the branch.",
+				"this session keeps serving but will no longer PUBLISH: checkpointing is stopped and\n"+
+				"the seal at unmount will be REFUSED, keeping this session's work in its overlay.\n"+
+				"remount to take a fresh lease and reseal on top of whatever that client published.",
 				"branch", g.branch, "holder", holder.Describe())
 		},
 	})
@@ -868,6 +884,94 @@ func (g *genSession) acquireLease(ctx context.Context, o *cmdOpts, prefix string
 		sum.LeaseKey = l.Key()
 	})
 	return l, nil
+}
+
+// fenceSeal refuses to publish when this session can no longer show that it
+// holds the branch. Called by sealLocked, so it covers the checkpoint, the
+// seal at unmount, and anything else that reaches a flip through it.
+//
+// WHAT IT IS FOR is the mount that went to sleep. A lease is kept alive by a
+// renewal loop, and a suspended process runs no loop: a lid closed for three
+// hours wakes past every TTL, with no tick having fired and nothing on the
+// seal path that ever asked. In that window another writer is ENTITLED to
+// take the branch — the lease says so, by expiring — and if it takes it,
+// seals and releases, it leaves no trace but a moved head.
+//
+// The refusal is worth more than it looks, because of WHEN it happens. The
+// flip's compare-and-swap would catch most of this at the very end, after a
+// freeze, a walk and however many gigabytes of packs; and it would catch
+// none of the case where the head has NOT moved yet because the usurper has
+// not published yet, which is precisely the interleaving that ends with two
+// writers clobbering each other inside the check-then-put window.
+//
+// --no-lease sessions are unaffected: g.lease is nil, Fence returns nil, and
+// they keep exactly the behaviour they have always had (the flip's own CAS,
+// and nothing else). The flag's help says so.
+//
+// The caller holds g.mu, which is what makes reading the anchor safe here
+// and what obliges the guard below not to take it again.
+func (g *genSession) fenceSeal(ctx context.Context) error {
+	anchor := g.prevRaw
+	err := g.lease.Fence(ctx, func(ctx context.Context) (bool, error) {
+		return g.headIs(ctx, anchor)
+	})
+	if err == nil {
+		return nil
+	}
+	g.stats.Update(func(sum *stats.Summary) { sum.LeaseConflictObserved = true })
+	// No new checkpoint should start after this: every one of them would
+	// spend the same work to be refused by the same check.
+	g.haltCheckpointer()
+	return fmt.Errorf("refusing to publish: %w\n"+
+		"the overlay is intact at %s and nothing in it has been lost", err, g.overlayDir)
+}
+
+// headIs reports whether refs/<branch> still holds exactly the bytes the
+// caller's next flip is anchored on.
+//
+// It reads the raw object and compares bytes rather than going through
+// refs.Fetch, for two reasons. Fetch VERIFIES and PINS — it would record a
+// usurper's generation as this client's last accepted one on the way to
+// telling us we had lost the branch, which is a trust-state change made on
+// behalf of a question. And byte equality is the exact question: the flip's
+// own guard compares the same two things (publish.flip), so a guard that
+// agreed with the head on anything looser could pass a seal the flip will
+// then refuse.
+//
+// Read through the direct-read variant, as every read of a mutable object
+// in this codebase is: a cached copy of a ref that just moved reports the
+// head we are trying to detect a change in.
+func (g *genSession) headIs(ctx context.Context, anchor []byte) (bool, error) {
+	if len(anchor) == 0 {
+		return false, errors.New("this session has no recorded head to compare the branch against")
+	}
+	inner := g.inner
+	if d, ok := pelicanobj.AsDirectReader(inner); ok {
+		inner = d.DirectVariant()
+	}
+	cur, err := pelicanobj.ReadMutable(ctx, inner, publish.RefPrefix+g.branch)
+	if err != nil {
+		return false, err
+	}
+	return bytes.Equal(cur, anchor), nil
+}
+
+// haltCheckpointer stops the ticker WITHOUT waiting for a checkpoint in
+// flight, which is what separates it from drainCheckpoints.
+//
+// It exists for the conflict path, and the distinction is the whole reason
+// it is a second function: it is called from the renewal goroutine and from
+// inside a seal, both of which would deadlock on a join — the seal it would
+// be waiting for is the caller. Stopping the ticker is all that is wanted
+// anyway: a checkpoint already running finishes or is refused on its own,
+// and no new one starts.
+func (g *genSession) haltCheckpointer() {
+	g.ckMu.Lock()
+	stop := g.checkpointStop
+	g.ckMu.Unlock()
+	if stop != nil {
+		stop()
+	}
 }
 
 // releaseLease stops renewals and removes the lease. It is deferred at
@@ -882,7 +986,9 @@ func (g *genSession) releaseLease() {
 	if err := g.lease.Release(ctx); err != nil {
 		ui.Warn("release lease: {error}", "error", err)
 	}
-	g.lease = nil
+	// The field is NOT cleared. Release is idempotent, and the statistics
+	// sampler and the control socket both read the lease's state from their
+	// own goroutines: clearing it here would race them to save nothing.
 	// A federation round trip on the exit path, so it belongs in the
 	// teardown breakdown rather than in whatever phase it lands next to.
 	g.down.mark("lease release")
@@ -996,9 +1102,20 @@ func (g *genSession) refresh() {
 		live = err == nil
 	}
 	g.ovMu.RUnlock()
+	// The lease's fencing state is sampled here rather than pushed from the
+	// lease package, for the reason the overlay pressure is: the interesting
+	// values are the ones a session ends with, and a callback per transition
+	// would have to fire from the renewal goroutine into the collector.
+	ls := g.lease.State()
 	g.stats.Update(func(sum *stats.Summary) {
 		sum.Generation = gen
 		sum.Cache = cache
+		if ls.WasInterrupted {
+			sum.LeaseInterrupted = true
+		}
+		if !ls.RevalidatedAt.IsZero() {
+			sum.LeaseRevalidatedAt = ls.RevalidatedAt
+		}
 		sum.ResidentInodes = int64(resident)
 		sum.ResidencyEvicted = evicted
 		if write != nil {
@@ -1272,6 +1389,16 @@ func processCPU() time.Duration {
 // for a mid-session checkpoint, which keeps serving afterwards, and false
 // at unmount, where nothing will read the result.
 func (g *genSession) sealLocked(ctx context.Context, follow bool) (*publish.Result, error) {
+	// FENCE FIRST, before anything is frozen, walked or uploaded.
+	//
+	// It is here rather than in checkpoint() and sealAtExit() separately so
+	// that every path which publishes a generation is covered by
+	// construction — including whatever the next one turns out to be. The
+	// cost on a healthy session is zero: a lease renewed within its TTL and
+	// undisputed answers out of memory (lease.Fence).
+	if err := g.fenceSeal(ctx); err != nil {
+		return nil, err
+	}
 	signingKey, err := loadOrCreateSigningKey(g.signingKeyFile(), g.sb)
 	if err != nil {
 		return nil, err
@@ -1660,7 +1787,9 @@ const checkpointDrainNotice = 250 * time.Millisecond
 // deferred stopSession it would otherwise be waiting on.
 func (g *genSession) startCheckpointer(ctx context.Context, every time.Duration) {
 	ckCtx, stop := context.WithCancel(ctx)
+	g.ckMu.Lock()
 	g.checkpointStop = stop
+	g.ckMu.Unlock()
 	g.checkpointWG.Add(1)
 	go func() {
 		defer g.checkpointWG.Done()
@@ -1684,10 +1813,13 @@ func (g *genSession) startCheckpointer(ctx context.Context, every time.Duration)
 // could do is throw away the seal this is waiting for.
 func (g *genSession) drainCheckpoints() {
 	g.drainOnce.Do(func() {
-		if g.checkpointStop == nil {
+		g.ckMu.Lock()
+		stop := g.checkpointStop
+		g.ckMu.Unlock()
+		if stop == nil {
 			return // no checkpointer: read-only, or --snapshot-interval 0
 		}
-		g.checkpointStop()
+		stop()
 		done := make(chan struct{})
 		go func() {
 			g.checkpointWG.Wait()
@@ -2068,7 +2200,22 @@ func (g *genSession) controlHooks() control.Hooks {
 				// it: the lease is one branch's, so "held" alone no longer
 				// describes what is excluded.
 				st["lease_key"] = g.lease.Key()
-				st["lease_conflict"] = g.lease.Conflicted()
+				ls := g.lease.State()
+				// lease_state, not a pile of booleans. "held", "stale",
+				// "interrupted" and "lost" are four different answers to
+				// "can this mount still publish", and a reader who has to
+				// assemble them from two flags gets it wrong in the
+				// direction of believing a dead session is fine.
+				st["lease_state"] = ls.Name()
+				st["lease_age_seconds"] = ls.Age.Seconds()
+				st["lease_conflict"] = ls.Conflicted
+				st["lease_interrupted"] = ls.Interrupted
+				if !ls.RevalidatedAt.IsZero() {
+					st["lease_revalidated_at"] = ls.RevalidatedAt.Format(time.RFC3339)
+				}
+				if ls.Holder != nil {
+					st["lease_taken_by"] = ls.Holder.Describe()
+				}
 			}
 			return st
 		},

@@ -172,7 +172,14 @@ func registerFlags(fs *flag.FlagSet, o *cmdOpts) {
 	fs.DurationVar(&o.snapshotInterval, "snapshot-interval", 5*time.Minute, "how often a writable mount checkpoints its overlay into a new generation (0 seals only at unmount)")
 	fs.StringVar(&o.encryptKeyPath, "encrypt-key", "", "PEM private key wrapping the volume's data keys (required again on every later mount)")
 	fs.BoolVar(&o.readOnly, "ro", false, "mount read-only: no overlay, no seal")
-	fs.BoolVar(&o.noLease, "no-lease", false, "do not take or check the advisory write lease (concurrent writers will NOT be detected)")
+	// The second clause is not decoration. A leased session now FENCES every
+	// publish — a seal whose lease has gone stale rechecks it before doing
+	// any work, and refuses if it lost the branch — and a --no-lease session
+	// has nothing to fence with. It keeps exactly the guard it always had,
+	// the flip's compare-and-swap, which catches a concurrent writer only
+	// after the whole publish has been paid for and cannot catch one that
+	// has not published yet.
+	fs.BoolVar(&o.noLease, "no-lease", false, "do not take or check the advisory write lease (concurrent writers will NOT be detected, and seals are NOT fenced: publishing rests entirely on the flip's compare-and-swap against the branch head)")
 	fs.BoolVar(&o.stealLease, "steal-lease", false, "take over a live lease on THIS BRANCH held by another client (use only when that client is known dead)")
 	// Two flags rather than one, because the two objects have different
 	// blast radii. --steal-lease is about the branch in front of you.

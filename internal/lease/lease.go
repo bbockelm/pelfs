@@ -19,6 +19,32 @@
 // who never touch the same ref no longer refuse each other — and adds no
 // safety that was not already there.
 //
+// # Fencing, and what a long sleep does to all of the above
+//
+// Detection needs somebody to be LOOKING, and the renewal loop is the only
+// thing that looks. A suspended process runs no ticks: a laptop that closes
+// its lid for three hours wakes with a lease that expired long ago, and for
+// the whole interval another client was entitled to take the branch, seal,
+// and release — leaving no lease object behind at all, since Release
+// deletes it. Two consequences followed, and Fence is the answer to both:
+//
+//   - The renewal check only ever recognized a usurper that was STILL
+//     HOLDING. A writer that came and went hit the "our object is missing"
+//     branch, which silently reclaimed. See renewOnce.
+//   - Nothing on the seal path ever asked. Conflicted() had one consumer
+//     and it was a status field, so a session that had demonstrably lost
+//     the branch would checkpoint, publish, and rely on the flip's
+//     check-then-put window — a window whose own documentation says it is
+//     narrow BECAUSE THE LEASE keeps other writers out of it.
+//
+// So every flip-bearing operation calls Fence first (see there), the gap
+// since the last landed renewal is measured against both clocks (gapSince),
+// and the come-and-gone case is resolved against the branch head rather
+// than guessed at (resolveVanished). Fencing does not make the lease a
+// mutex — nothing here can, without a compare-and-swap — but it stops a
+// session that has lost the branch from spending an hour publishing over
+// somebody else's work.
+//
 // # The v0.1.0 volume lease
 //
 // v0.1.0 had one object for the whole prefix, meta/lease.json (VolumeKey),
@@ -139,6 +165,39 @@ const (
 // ErrHeld indicates another live client holds the lease.
 var ErrHeld = errors.New("prefix is in use by another pelfs client")
 
+// ErrLost reports that this session no longer holds the lease it took, and
+// that the loss could not be explained away: another client's record is on
+// the object, or our record is GONE and the branch head moved while it was.
+//
+// It is a different situation from ErrHeld, which is an acquisition
+// refusing to start. This one belongs to a session that has already run,
+// already has work in an overlay, and must not publish. Callers turn it
+// into a refusal that KEEPS the work — see Fence.
+var ErrLost = errors.New("write lease lost")
+
+// ErrUnconfirmed reports that the lease could not be checked at all: the
+// federation did not answer, or the caller supplied no way to compare the
+// branch head against what its next flip is anchored on.
+//
+// IT FAILS CLOSED, deliberately. The one situation this path exists for is
+// a session that was asleep long enough for another writer to come and go,
+// and for as long as the check cannot be made, "we could not find out" is
+// indistinguishable from "we lost it". Publishing on a maybe is how two
+// writers end up on one ref; refusing costs a remount, and the work sits in
+// the overlay either way.
+var ErrUnconfirmed = errors.New("write lease could not be confirmed")
+
+// Guard answers ONE question for Fence: is the branch head still the exact
+// generation the caller's next flip is anchored on?
+//
+// It is a callback rather than something this package computes, because the
+// answer lives in the caller. The anchor is the seal's Prev/PrevRaw, which
+// a mid-session checkpoint advances, and this package must not learn to
+// fetch, verify and decode superblocks to find it out. A caller with
+// nothing to compare passes nil, which reads as "cannot resolve" rather
+// than as "unchanged" (ErrUnconfirmed).
+type Guard func(ctx context.Context) (bool, error)
+
 // Info is the on-federation lease record.
 //
 // Branch was added with the per-branch key. It is redundant with the key
@@ -206,6 +265,16 @@ type Options struct {
 	// OnConflict is called (once) if another client overwrites our lease
 	// while we hold it.
 	OnConflict func(holder *Info)
+
+	// now is the clock, and it is unexported because it exists for this
+	// package's own tests and must not become part of the API.
+	//
+	// Freshness is the one thing here a store wrapper cannot drive: it is a
+	// question about elapsed time, not about what the federation answered.
+	// The alternative is tests that really sleep past a TTL, and this
+	// package has already paid for time-driven tests once (df54b95 deleted a
+	// steal test that asserted on timing and 7de6f69 fixed the stall it hid).
+	now func() time.Time
 }
 
 // Lease is a held write lease with a background renewal loop.
@@ -218,9 +287,78 @@ type Lease struct {
 	mu         sync.Mutex
 	lastETag   string
 	conflicted bool
+	// holder is the record that displaced ours, when we managed to read it.
+	// Kept so a refusal at seal time can name the other client even though
+	// the discovery happened minutes earlier on the renewal goroutine.
+	holder *Info
+	// renewedAt is the instant of the last renewal this session KNOWS
+	// landed: a Put that returned success, reached only after the check
+	// above it confirmed the record was still ours. It carries both a
+	// monotonic and a wall reading, and gapSince uses both — see there for
+	// why one is not enough.
+	renewedAt time.Time
+	// interrupted means our lease OBJECT went missing while we still held
+	// it. We never deleted it, so something else did, and that is not a
+	// state to reclaim out of silently. Fence resolves it against the
+	// branch head; see resolveVanished.
+	interrupted bool
+	// said keeps the loud warnings singular. A renewal loop that ticks
+	// every thirty seconds would otherwise repeat the same emergency for
+	// the life of the session.
+	said struct{ conflict, interrupt bool }
+	// revalidatedAt is when a synchronous check last confirmed the lease,
+	// for `pelfs status` and the stats file: "held" and "held, and rechecked
+	// after a two-hour gap" are different facts about a session.
+	revalidatedAt time.Time
+	// now is the clock, injectable for tests ONLY. Nil means time.Now.
+	// Freshness is the one thing in this package that cannot be driven by a
+	// store wrapper, and the alternative — tests that really sleep past a
+	// TTL — is what df54b95 removed.
+	now func() time.Time
 
-	stop chan struct{}
-	done chan struct{}
+	stop        chan struct{}
+	done        chan struct{}
+	releaseOnce sync.Once
+}
+
+func (l *Lease) clock() time.Time {
+	if l.now != nil {
+		return l.now()
+	}
+	return time.Now()
+}
+
+// gapSince is how long ago t was, and it deliberately computes the answer
+// TWICE and keeps the larger.
+//
+// THIS IS THE MEASUREMENT A CLOSING LAPTOP LID HAS TO SURVIVE, and neither
+// clock survives it alone:
+//
+//   - The MONOTONIC reading — what a time.Time carries, and what Sub uses
+//     when both operands have one — cannot be stepped by NTP or by an
+//     operator, so it is the honest one while the process is running. But
+//     it is an UPTIME clock on both platforms that matter here
+//     (mach_absolute_time / CLOCK_UPTIME_RAW on darwin, CLOCK_MONOTONIC on
+//     linux) and neither is specified to advance while the machine is
+//     suspended. A lease that expired three hours ago can therefore look
+//     thirty seconds old.
+//   - The WALL reading does advance across a suspend, because it is read
+//     back from a clock that was never asleep. But it can be stepped, in
+//     either direction, by NTP or by hand.
+//
+// So each clock has a failure mode that makes the gap look SMALLER than it
+// really was, and the maximum is the composition in which a lie from either
+// one cannot shrink the answer. Over-estimating costs one synchronous round
+// trip that was not strictly needed. Under-estimating is the bug.
+//
+// Round(0) is how the wall reading is obtained: it STRIPS the monotonic
+// reading from a Time, which is exactly what makes Sub compare wall clocks.
+func (l *Lease) gapSince(t time.Time) time.Duration {
+	if t.IsZero() {
+		return 0
+	}
+	now := l.clock()
+	return max(now.Sub(t), now.Round(0).Sub(t.Round(0)))
 }
 
 // Key is the object this lease is held on. `pelfs status` and the session
@@ -240,7 +378,11 @@ func Acquire(ctx context.Context, opts Options) (*Lease, error) {
 		opts.TTL = DefaultTTL
 	}
 	if opts.RenewInterval <= 0 {
-		opts.RenewInterval = opts.TTL / 4
+		// Floored, because TTL/4 rounds to ZERO for a TTL under 4ns and
+		// time.NewTicker panics on a non-positive period. No flag can ask
+		// for that, but a test reaching for "already expired" can, and a
+		// panic in the renewal loop is a poor way to find out.
+		opts.RenewInterval = max(opts.TTL/4, time.Millisecond)
 	}
 	key, err := BranchKey(opts.Branch)
 	if err != nil {
@@ -284,6 +426,7 @@ func Acquire(ctx context.Context, opts Options) (*Lease, error) {
 		store: opts.Store,
 		key:   key,
 		opts:  opts,
+		now:   opts.now,
 		info: Info{
 			Session:  opts.Session,
 			Hostname: host,
@@ -433,7 +576,7 @@ func read(ctx context.Context, store pelicanobj.Store, key string) (*Info, *peli
 }
 
 func (l *Lease) write(ctx context.Context) error {
-	l.info.Renewed = time.Now().UTC()
+	l.info.Renewed = l.clock().UTC()
 	data, err := json.MarshalIndent(&l.info, "", "  ")
 	if err != nil {
 		return err
@@ -441,6 +584,15 @@ func (l *Lease) write(ctx context.Context) error {
 	if err := l.store.Put(ctx, l.key, strings.NewReader(string(data))); err != nil {
 		return err
 	}
+	// renewedAt moves HERE and nowhere else: a Put that returned success is
+	// the only evidence this session has that its record is on the object,
+	// and every caller reaches this line only after establishing that the
+	// record it is replacing was still its own. A failed Put leaves the
+	// stamp where it was, so the gap keeps growing and Fence keeps refusing
+	// — which is the direction a write that did not land should push.
+	l.mu.Lock()
+	l.renewedAt = l.clock()
+	l.mu.Unlock()
 	if ki, err := l.store.StatKey(ctx, l.key); err == nil {
 		l.mu.Lock()
 		l.lastETag = ki.ETag
@@ -478,16 +630,26 @@ func (l *Lease) renewOnce() bool {
 		l.mu.Unlock()
 		if !mine {
 			holder, _, _ := read(ctx, l.store, l.key)
-			l.mu.Lock()
-			l.conflicted = true
-			l.mu.Unlock()
-			if l.opts.OnConflict != nil {
-				l.opts.OnConflict(holder)
-			}
+			l.markLost(holder)
 			return true
 		}
 	case errors.Is(err, os.ErrNotExist):
-		// Someone deleted our lease; reclaim it below.
+		// OUR LEASE OBJECT IS GONE AND WE DID NOT DELETE IT.
+		//
+		// This branch used to say "someone deleted our lease; reclaim it
+		// below" and do exactly that, silently. It is the come-and-gone
+		// hole: a writer that acquires our expired lease, seals, and
+		// RELEASES leaves no record behind, because Release deletes the
+		// object. The evidence of the takeover was the object's absence, and
+		// absence was the one signal this loop threw away.
+		//
+		// It still reclaims, because the reclaim also covers a harmless
+		// case worth keeping cheap: an operator clearing what looked like a
+		// stale lease by hand. What changes is that the session REMEMBERS,
+		// and Fence resolves the ambiguity where the information is — against
+		// the branch head — instead of this loop having to guess between an
+		// admin's tidy-up and a writer that published over us.
+		l.markInterrupted()
 	default:
 		ui.Warn("lease check failed (will retry): {error}", "error", err)
 		return false
@@ -499,6 +661,41 @@ func (l *Lease) renewOnce() bool {
 	return false
 }
 
+// markLost records a takeover and reports it once. It is called from the
+// renewal loop and from Fence, which is why the "said" flags exist: the two
+// can reach the same conclusion, and a user needs the emergency stated
+// exactly once.
+func (l *Lease) markLost(holder *Info) {
+	l.mu.Lock()
+	l.conflicted = true
+	if holder != nil {
+		l.holder = holder
+	}
+	first := !l.said.conflict
+	l.said.conflict = true
+	l.mu.Unlock()
+	if first && l.opts.OnConflict != nil {
+		l.opts.OnConflict(holder)
+	}
+}
+
+func (l *Lease) markInterrupted() {
+	l.mu.Lock()
+	l.interrupted = true
+	first := !l.said.interrupt
+	l.said.interrupt = true
+	l.mu.Unlock()
+	if !first {
+		return
+	}
+	ui.Warn("this session's lease object {key} VANISHED while the session still held it; "+
+		"nothing here deleted it.\n"+
+		"reclaiming it, but no generation will be published until the branch head has been "+
+		"checked against what this session is building on: if another client published over "+
+		"us the seal will be REFUSED and the work kept.",
+		"key", l.key)
+}
+
 // Conflicted reports whether another client overwrote the lease while we
 // held it.
 func (l *Lease) Conflicted() bool {
@@ -507,10 +704,270 @@ func (l *Lease) Conflicted() bool {
 	return l.conflicted
 }
 
-// Release stops renewing and removes the lease if it is still ours. Safe to
-// call once; returns nil when the lease was taken over by someone else.
+// Interrupted reports whether the lease object went missing while this
+// session held it, and the absence has not yet been resolved by Fence.
+func (l *Lease) Interrupted() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.interrupted
+}
+
+// State is a lease's fencing state, for `pelfs status` and the stats file.
+// It is a snapshot rather than a set of accessors so a reporter cannot
+// print a conflicted lease with a fresh-looking age.
+type State struct {
+	Key string
+	// Age is the gap since the last renewal known to have landed, measured
+	// as gapSince describes.
+	Age time.Duration
+	// Stale is Age past the TTL: the window in which another client was
+	// entitled to take this branch.
+	Stale      bool
+	Conflicted bool
+	// Interrupted is the UNRESOLVED absence: the lease object is missing and
+	// Fence has not yet decided whether anything was published over us.
+	Interrupted bool
+	// WasInterrupted latches: it stays true after a resolution clears
+	// Interrupted. A statistics file sampled every thirty seconds would
+	// otherwise miss the whole event, and "the lease object vanished at some
+	// point during this session" is exactly the fact worth keeping — it is
+	// unrecoverable from anywhere else afterwards.
+	WasInterrupted bool
+	RevalidatedAt  time.Time
+	// Holder is the client that displaced us, when its record was readable.
+	Holder *Info
+}
+
+// Name is the one word `pelfs status` leads with. A boolean pair
+// (held/conflict) could not distinguish the three states that matter to
+// somebody deciding whether to keep working.
+func (s State) Name() string {
+	switch {
+	case s.Conflicted:
+		return "lost"
+	case s.Interrupted:
+		return "interrupted"
+	case s.Stale:
+		return "stale"
+	default:
+		return "held"
+	}
+}
+
+// State samples the lease. A nil lease reports the zero State, so a
+// --no-lease or read-only session needs no special case at the call site.
+func (l *Lease) State() State {
+	if l == nil {
+		return State{}
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	age := l.gapSince(l.renewedAt)
+	return State{
+		Key: l.key, Age: age, Stale: age > l.opts.TTL,
+		Conflicted: l.conflicted, Interrupted: l.interrupted,
+		WasInterrupted: l.said.interrupt,
+		RevalidatedAt:  l.revalidatedAt, Holder: l.holder,
+	}
+}
+
+// Fence is what a flip-bearing operation calls BEFORE it publishes:
+// a checkpoint, the seal at unmount, a background repack's flip.
+//
+// WHY A SEAL NEEDS THIS AT ALL. The lease's renewal loop notices a takeover
+// only while the usurper is still holding — and it notices nothing while the
+// machine is asleep, because a suspended process runs no ticks. So a mount
+// that wakes from hours of sleep has a lease that expired long ago, may
+// have been taken and given back in the meantime, and had until now no
+// point at which it consulted any of that before publishing. `Conflicted()`
+// existed and the seal path never asked it.
+//
+// What it does, in the order the cases can be settled:
+//
+//  1. Already known lost: refuse, no round trip.
+//  2. Interrupted (our object vanished): resolve against head, below.
+//  3. Fresh — the gap since the last landed renewal is within the TTL:
+//     proceed, no round trip. This is the common case and it costs nothing.
+//  4. Stale: revalidate SYNCHRONOUSLY, which is the same check the renewal
+//     loop makes, run now because the loop's schedule is exactly what a
+//     suspend suspends.
+//
+// A nil lease (--no-lease, or a read-only session) returns nil: those
+// sessions keep the behaviour they have always had, which is the flip's own
+// compare-and-swap and nothing else.
+func (l *Lease) Fence(ctx context.Context, head Guard) error {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	conflicted, interrupted := l.conflicted, l.interrupted
+	holder := l.holder
+	fresh := l.gapSince(l.renewedAt) <= l.opts.TTL
+	l.mu.Unlock()
+
+	switch {
+	case conflicted:
+		return l.lostError(holder)
+	case interrupted:
+		return l.revalidate(ctx, head)
+	case fresh:
+		// The boundary is deliberately inclusive: at exactly the TTL the
+		// lease is still live by the same arithmetic isLive uses for
+		// everybody else, and a seal must not be refused on a rule stricter
+		// than the one another client acquires under.
+		return nil
+	}
+	return l.revalidate(ctx, head)
+}
+
+// revalidate re-runs the renewal check right now and renews on success.
+func (l *Lease) revalidate(ctx context.Context, head Guard) error {
+	ctx, cancel := context.WithTimeout(ctx, opTimeout)
+	defer cancel()
+
+	ki, err := l.store.StatKey(ctx, l.key)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return l.resolveVanished(ctx, head)
+	case err != nil:
+		return fmt.Errorf("%w: could not read %s (%v)\n"+
+			"nothing was published and nothing is lost: this session has been out of touch with the "+
+			"federation for %s, which is long enough for another client to have taken branch %s, so it "+
+			"will not publish until it can confirm otherwise. the work is in the overlay; retry, or "+
+			"remount to take a fresh lease",
+			ErrUnconfirmed, l.key, err, l.State().Age.Round(time.Second), l.opts.Branch)
+	}
+
+	l.mu.Lock()
+	mine := ki.ETag == "" || ki.ETag == l.lastETag
+	interrupted := l.interrupted
+	l.mu.Unlock()
+	if !mine {
+		holder, _, _ := read(ctx, l.store, l.key)
+		l.markLost(holder)
+		return l.lostError(holder)
+	}
+	// Our record, but an earlier absence is still on the books: the renewal
+	// loop reclaimed the object, so the ETag says "ours" and says nothing
+	// about who was here in between. The head is what knows.
+	if interrupted {
+		if err := l.clearInterrupted(ctx, head); err != nil {
+			return err
+		}
+	}
+	if err := l.write(ctx); err != nil {
+		return fmt.Errorf("%w: renewing %s failed (%v)\nthe work is in the overlay; retry, or remount "+
+			"to take a fresh lease", ErrUnconfirmed, l.key, err)
+	}
+	l.mu.Lock()
+	l.revalidatedAt = l.clock()
+	l.mu.Unlock()
+	return nil
+}
+
+// resolveVanished settles the come-and-gone case: our lease object is not
+// there, and we did not remove it.
+//
+// The two situations that produce it are not distinguishable from the
+// object — it is equally absent either way — but they ARE distinguishable
+// from the branch head, and that is the whole resolution:
+//
+//   - HARMLESS: an operator deleted what looked like a stale lease, or a
+//     writer took it, wrote nothing and released. The head is still the
+//     generation this session's next flip is anchored on, so nothing was
+//     published over us. Re-acquire and carry on.
+//   - HARMFUL: a writer took the expired lease, SEALED, and released. The
+//     head moved. Our anchor is stale, the work must not be flipped over
+//     theirs, and the session has to be told.
+func (l *Lease) resolveVanished(ctx context.Context, head Guard) error {
+	// Latched here as well as in the renewal loop, because either can be the
+	// one that finds the object gone — a session whose renewal interval is
+	// longer than its sleep was reaches this from Fence with the loop never
+	// having ticked. markInterrupted is idempotent about the warning, so the
+	// two discovery sites cannot double-report.
+	l.markInterrupted()
+	if err := l.clearInterrupted(ctx, head); err != nil {
+		return err
+	}
+	// Re-acquire with the same write-then-read-back the first acquisition
+	// used: there is no compare-and-swap, so a third party writing between
+	// our Put and our read means we did not get it.
+	if err := l.write(ctx); err != nil {
+		return fmt.Errorf("%w: could not re-take %s after it vanished (%v)", ErrUnconfirmed, l.key, err)
+	}
+	after, ki, err := read(ctx, l.store, l.key)
+	if err != nil {
+		return fmt.Errorf("%w: could not verify %s after re-taking it (%v)", ErrUnconfirmed, l.key, err)
+	}
+	if after == nil || after.Session != l.opts.Session {
+		l.markLost(after)
+		return l.lostError(after)
+	}
+	l.mu.Lock()
+	l.lastETag = ki.ETag
+	l.interrupted = false
+	l.revalidatedAt = l.clock()
+	l.mu.Unlock()
+	ui.Info("re-took branch {branch}'s lease after it vanished; the branch head is still the generation "+
+		"this session is building on, so nothing was published over it",
+		"branch", l.opts.Branch)
+	return nil
+}
+
+// clearInterrupted runs the caller's head comparison and either clears the
+// interrupted state or converts it into a loss.
+func (l *Lease) clearInterrupted(ctx context.Context, head Guard) error {
+	if head == nil {
+		return fmt.Errorf("%w: branch %s's lease object %s went missing while this session held it, and "+
+			"this caller has no branch head to compare against, so whether anything was published over "+
+			"it cannot be decided here.\nnothing was published by this session and its work is intact; "+
+			"remount to take a fresh lease",
+			ErrUnconfirmed, l.opts.Branch, l.key)
+	}
+	unchanged, err := head(ctx)
+	if err != nil {
+		return fmt.Errorf("%w: branch %s's lease object went missing and the branch head could not be "+
+			"read to find out whether anything was published over it (%v).\nnothing was published by "+
+			"this session and its work is intact; retry, or remount to take a fresh lease",
+			ErrUnconfirmed, l.opts.Branch, err)
+	}
+	if unchanged {
+		l.mu.Lock()
+		l.interrupted = false
+		l.mu.Unlock()
+		return nil
+	}
+	l.markLost(nil)
+	return fmt.Errorf("%w: branch %s ADVANCED while this session's lease was gone.\n"+
+		"another client took the lease, published, and released it — this session's generation would "+
+		"be built on a superseded parent, so it will not be published.\n"+
+		"nothing is lost: the work is intact locally. unmount and remount to take a fresh lease and "+
+		"rebuild on the current head",
+		ErrLost, l.opts.Branch)
+}
+
+// lostError is the refusal a seal path turns into "the overlay is intact".
+func (l *Lease) lostError(holder *Info) error {
+	age := l.State().Age.Round(time.Second)
+	return fmt.Errorf("%w: branch %s is held by %s.\n"+
+		"this session last renewed its own lease %s ago — long enough (TTL %s) for that client to take "+
+		"the branch, which it did.\n"+
+		"nothing was published and nothing is lost: the work is intact locally. unmount and remount to "+
+		"take a fresh lease; the seal will then be refused only if that client actually advanced the "+
+		"branch",
+		ErrLost, l.opts.Branch, holder.Describe(), age, l.opts.TTL)
+}
+
+// Release stops renewing and removes the lease if it is still ours. It
+// returns nil when the lease was taken over by someone else.
+//
+// Calling it twice is a no-op rather than a panic, and that is what lets the
+// holder keep its *Lease pointer for the life of the process: a session's
+// statistics sampler and its control socket both read the lease's state on
+// their own goroutines, so a teardown that cleared the field would be
+// racing them for nothing.
 func (l *Lease) Release(ctx context.Context) error {
-	close(l.stop)
+	l.releaseOnce.Do(func() { close(l.stop) })
 	<-l.done
 	if l.Conflicted() {
 		return nil

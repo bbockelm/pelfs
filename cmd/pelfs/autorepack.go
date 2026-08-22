@@ -282,6 +282,7 @@ func (g *genSession) recordCollect(at time.Time, rep *retention.Report, err erro
 func (g *genSession) autoRepackOnce(ctx context.Context, policy repack.AutoPolicy) (bool, error) {
 	g.mu.Lock()
 	head := g.sb
+	anchor := g.prevRaw
 	busy := g.spent || g.ov == nil
 	g.mu.Unlock()
 	if busy {
@@ -289,6 +290,20 @@ func (g *genSession) autoRepackOnce(ctx context.Context, policy repack.AutoPolic
 	}
 	if worth, _ := repack.Worthwhile(head, policy); !worth {
 		return false, nil
+	}
+	// A repack ends in a flip, so it is fenced like any other publish — and
+	// it has the most to lose by not being: it sweeps the volume and rewrites
+	// gigabytes BEFORE it flips, so a session that has already lost the
+	// branch spends all of that to be refused, and leaves orphan packs for
+	// the sweep to find.
+	//
+	// Fenced here, before the work, rather than next to the flip: minutes
+	// pass between the two, and the flip's own compare-and-swap is what
+	// covers that interval. This covers the decision to start.
+	if err := g.lease.Fence(ctx, func(ctx context.Context) (bool, error) {
+		return g.headIs(ctx, anchor)
+	}); err != nil {
+		return false, err
 	}
 	// Claimed for the length of the operation so the periodic checkpoint
 	// stands aside (checkpointPeriodically). Deliberately a FLAG and not a

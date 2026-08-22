@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/bbockelm/pelfs/internal/control"
 	"github.com/bbockelm/pelfs/internal/ui"
 )
 
@@ -272,12 +274,65 @@ func cmdStatus(args []string) int {
 		// ordinary rather than a conflict. A writable mount with no line
 		// here took --no-lease and is detecting nothing.
 		if e.info.LeaseKey != "" {
-			fmt.Printf("  lease: %s\n", e.info.LeaseKey)
+			fmt.Printf("  lease: %s%s\n", e.info.LeaseKey, leaseStateSuffix(e))
 		} else if !e.info.ReadOnly {
-			fmt.Printf("  lease: none (--no-lease)\n")
+			fmt.Printf("  lease: none (--no-lease); seals are not fenced\n")
 		}
 	}
 	return 0
+}
+
+// leaseStateSuffix asks a live mount what its lease is actually DOING, and
+// says so on the same line as the key.
+//
+// The record on disk can only say which object was taken at mount time. The
+// question an operator has when they run this is a different one — "is this
+// mount still able to publish?" — and it has four answers, not two: held,
+// stale (past its TTL, so the next publish will stop and recheck),
+// interrupted (the object went missing under it), and lost (another client
+// has the branch; nothing further will be published and the work is sitting
+// in an overlay). The last two are emergencies that used to be visible only
+// as a boolean buried in `pelfs ctl status`.
+//
+// Best effort by construction: a mount that does not answer in a moment gets
+// no suffix rather than an error, because this command's job is to list
+// mounts and it must keep working on one that is wedged.
+func leaseStateSuffix(e mountEntry) string {
+	if !pidAlive(e.info.PID) || e.info.StateDir == "" {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	body, err := control.NewClient(e.info.StateDir).Do(ctx, "GET", "/v1/status")
+	if err != nil {
+		return ""
+	}
+	var st struct {
+		State   string  `json:"lease_state"`
+		Age     float64 `json:"lease_age_seconds"`
+		TakenBy string  `json:"lease_taken_by"`
+	}
+	if json.Unmarshal(body, &st) != nil || st.State == "" {
+		return ""
+	}
+	switch st.State {
+	case "held":
+		return " (held)"
+	case "stale":
+		return fmt.Sprintf(" (STALE: not renewed for %s; the next publish will recheck it first)",
+			time.Duration(st.Age*float64(time.Second)).Round(time.Second))
+	case "interrupted":
+		return " (INTERRUPTED: the lease object vanished under this mount; the next publish will " +
+			"check the branch head before publishing anything)"
+	case "lost":
+		who := st.TakenBy
+		if who == "" {
+			who = "another client"
+		}
+		return fmt.Sprintf(" (LOST to %s: this mount will publish NOTHING further; its work is in "+
+			"its overlay, and remounting takes a fresh lease)", who)
+	}
+	return ""
 }
 
 type mountEntry struct {

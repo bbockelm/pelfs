@@ -2,6 +2,7 @@ package merge
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"github.com/bbockelm/pelfs/internal/catalog"
 	"github.com/bbockelm/pelfs/internal/genfs"
 	"github.com/bbockelm/pelfs/internal/manifest"
+	"github.com/bbockelm/pelfs/internal/mpi"
 	"github.com/bbockelm/pelfs/internal/packstore"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/publish"
@@ -109,12 +111,13 @@ func Apply(ctx context.Context, o ApplyOptions) (*publish.Result, error) {
 		branch = "theirs"
 	}
 	src := &mergeSource{
-		t: trees, ours: o.Ours, theirs: o.Theirs, theirPacks: packs,
+		t: trees, ours: o.Ours, theirs: o.Theirs, theirPacks: packs, obj: o.Inner,
 		policy: o.Plan.policy, theirBranch: branch,
-		dirs:       map[uint64]triple{rootInode: {base: rootInode, ours: rootInode, theirs: rootInode}},
-		fromTheirs: map[uint64]bool{},
-		copies:     map[uint64]uint64{},
-		nextInode:  o.Ours.NextInode,
+		dirs:           map[uint64]triple{rootInode: {base: rootInode, ours: rootInode, theirs: rootInode}},
+		fromTheirs:     map[uint64]bool{},
+		copies:         map[uint64]uint64{},
+		nextInode:      o.Ours.NextInode,
+		tookIdentities: map[[32]byte]struct{}{},
 	}
 	res, err := publish.Publish(ctx, publish.Options{
 		Source: src, Inner: o.Inner, SpoolDir: o.SpoolDir,
@@ -150,6 +153,7 @@ type mergeSource struct {
 	ours, theirs *superblock.Superblock
 	theirPacks   []packstore.SealedPack
 
+	obj         pelicanobj.Store
 	policy      Policy
 	theirBranch string
 
@@ -168,6 +172,18 @@ type mergeSource struct {
 	// is published on our branch, so a number it hands out has to come
 	// from the range our branch owns.
 	nextInode uint64
+
+	// tookIdentities are the chunk identities served from theirs, which
+	// the merged generation's index has to cover or a reader falls back to
+	// probing pack trailers for exactly the content the merge brought in.
+	//
+	// Held as identities rather than resolved as they arrive because the
+	// resolution needs theirs' index, and fetching that is worth doing
+	// once rather than per file. Bounded by what the merge took from
+	// theirs, which is the divergence and not the tree.
+	tookIdentities map[[32]byte]struct{}
+	theirIndex     *mpi.Set
+	indexErr       error
 }
 
 var (
@@ -361,9 +377,19 @@ func (m *mergeSource) Open(context.Context, uint64, int64) (io.ReadCloser, error
 }
 
 func (m *mergeSource) ProvidedContent(ctx context.Context, ino uint64) (genfs.Content, bool, error) {
-	c, err := m.treeFor(ino).ContentOf(ctx, m.dataInode(ino))
+	fs, data := m.treeFor(ino), m.dataInode(ino)
+	c, err := fs.ContentOf(ctx, data)
 	if err != nil {
 		return genfs.Content{}, false, err
+	}
+	if fs == m.t.theirs {
+		// Remembered so the merged generation's index can cover it. Ours'
+		// identities need nothing: publish carries our index refs forward.
+		for _, ref := range c.Refs {
+			if len(ref.Identity) == 32 {
+				m.tookIdentities[[32]byte(ref.Identity)] = struct{}{}
+			}
+		}
 	}
 	return c, true, nil
 }
@@ -375,15 +401,57 @@ func (m *mergeSource) ProvidedPacks(context.Context) ([]packstore.SealedPack, er
 	return m.theirPacks, nil
 }
 
-// ProvidedEntries reports nothing, and the cost is bounded and known.
+// ProvidedEntries names the pack holding every identity the merge took
+// from theirs, so the merged generation's index covers the content it
+// brought in rather than leaving a reader to probe pack trailers for it.
 //
-// A generation's multi-pack index is what spares a reader from probing
-// per-pack trailers. Ours' index refs are carried forward, so content this
-// branch already had resolves through the index; content taken from theirs
-// does not, and falls back to trailers until the next repack or
-// consolidation covers it. Slower, never wrong.
+// IT LOOKS UP RATHER THAN ITERATING, and it has to: an index stores
+// TRUNCATED identities (mpi.KeyLen is 12 of 32 bytes), so walking theirs'
+// index could never produce the full identity this reports. What makes
+// the lookup possible is that the chunkrefs already went past — full
+// identities, from the files the merge served — so the only thing missing
+// was which pack each sits in, which is exactly what an index answers.
 //
-// Doing better means iterating theirs' index and re-emitting it, which
-// needs an iterator internal/mpi does not export yet. Worth adding; not
-// worth blocking a merge on.
-func (m *mergeSource) ProvidedEntries(func(identityHex, pack string)) {}
+// A truncated-key collision returns more than one candidate, and all of
+// them are emitted: that is what the format already expects a reader to
+// do, and naming one arbitrarily would be naming the wrong one half the
+// time. An identity the index cannot resolve is skipped, and falls back
+// to trailers as before — slower, never wrong.
+func (m *mergeSource) ProvidedEntries(fn func(identityHex, pack string)) {
+	set := m.index()
+	if set == nil {
+		return
+	}
+	for id := range m.tookIdentities {
+		packs, ok := set.Lookup(id)
+		if !ok {
+			continue
+		}
+		for _, p := range packs {
+			fn(hex.EncodeToString(id[:]), p)
+		}
+	}
+}
+
+// index fetches theirs' index tiers once. A failure is not fatal: the
+// index is derived, so a merge that cannot read it publishes a generation
+// whose index covers less and reads a little slower.
+func (m *mergeSource) index() *mpi.Set {
+	if m.theirIndex != nil || m.indexErr != nil {
+		return m.theirIndex
+	}
+	if len(m.theirs.PackIndexes) == 0 {
+		m.indexErr = errors.New("the incoming generation lists no index")
+		return nil
+	}
+	ixs, err := mpi.FetchAll(context.Background(), m.obj, m.theirs.PackIndexes)
+	if err != nil || len(ixs) == 0 {
+		m.indexErr = err
+		if m.indexErr == nil {
+			m.indexErr = errors.New("no index segment could be read")
+		}
+		return nil
+	}
+	m.theirIndex = mpi.NewSet(ixs)
+	return m.theirIndex
+}

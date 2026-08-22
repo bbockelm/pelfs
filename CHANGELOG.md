@@ -4,6 +4,42 @@
 
 ### Added
 
+- **`pelfs merge` — bring one branch into another.** Branches could diverge
+  and never come back; the reason given was the inode space, and that is
+  fixed at the fork rather than at the merge (below).
+
+  Report-first, like `repack` and `rescue`: the default says what would come
+  from each side and names every path it cannot resolve. `--apply` carries it
+  out. A fast-forward publishes the other side's tree directly; a diverged
+  merge builds one, three-way over the catalogs, and **reads no file
+  content** — both sides are already chunked, so the merged tree is handed to
+  publish as a `ContentProvider` and the chunkrefs point into the packs that
+  already hold the bytes. The merged generation names both sides' packs and
+  its index covers what came from the other branch.
+
+  It finds its own base. `pelfs branch` now records the generation a branch
+  was cut from and pins it with a tag (`fork-<branch>`), because naming a
+  base is not enough to make one readable: the moment the source branch
+  seals again, the fork point stops being any ref's head. A base named by
+  hand is verified against that record, so a wrong one is refused rather
+  than silently mis-attributing every change.
+
+  Conflicts refuse by default and are listed with the reason. `--keep-both`
+  is the other choice: ours keeps its name, theirs is written as `name (from
+  <branch>).ext`, with the suffix before the extension so the file still
+  opens. Nothing is lost and nothing cleans the copies up, which is why it
+  is opt-in. It refuses what it cannot duplicate — a modify/delete has one
+  version, so "both" would mean resurrecting a deleted file under a name
+  nobody chose.
+
+- **The inode space is partitioned by branch**, which is what makes merging
+  possible at all. A branch takes its own slice — the top 23 bits of an
+  inode name the lineage, the low 40 the allocation — so two branches can
+  never assign one number to two files. Lineage 0 is every volume that
+  predates this. A branch cut before this existed can still be merged, but
+  its inodes have to be renumbered first, and `pelfs merge` reports the
+  collisions and the number to shift above.
+
 - **`pelfs rescue` — rebuild a volume's refs from its packs.** The operation
   the format was built for and never had: `refs/<branch>` is the only mutable
   object, so it is the only one that can be lost, and everything needed to
@@ -451,7 +487,9 @@ and no end-to-end run.
   two versions interact is described there.)*
 - **Two branches that have diverged stay diverged.** There is no merge, and
   none is planned for this release. What exists is branching, tagging and
-  deleting.
+  deleting. *(Done — see Unreleased. The record of what v0.1.0 shipped
+  stands: a v0.1.0 branch has no fork record and no inode lineage of its
+  own, so merging one needs its inodes renumbered first.)*
 - **The retain window over-retains on a multi-branch volume, deliberately.**
   A retired generation is described only by the superblock backup its seal
   buried in a pack, and a backup carries a generation NUMBER — which counts

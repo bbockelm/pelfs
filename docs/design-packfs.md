@@ -765,12 +765,32 @@ Consequences, deliberate and otherwise:
     branch's history too — so a generation with no candidate of its own
     keeps the v0.1.0 keep-every-candidate rule, per generation. Details and
     residuals under *Retention and GC*.
-- **Inode uniqueness is per-lineage.** Branch descendants allocate from the
-  same counter and may assign equal inode values to different files —
-  harmless, since inodes need uniqueness only within a mounted tree and
-  branches mount separately. A future cross-branch *merge* would need to
-  renumber one side; merge is explicitly out of scope, and this rule is
-  why.
+- **The inode space is PARTITIONED by branch.** This bullet used to say
+  the opposite — that branch descendants allocate from one counter, that
+  equal numbers for different files were harmless, and that merge was out
+  of scope because merging would mean renumbering a side. The first two
+  were true and the third was the consequence, so the fix went in at the
+  fork rather than at the merge.
+
+  A branch created by `pelfs branch` takes its own slice: the top 23 bits
+  of an inode say which branch allocated it, the low 40 say which
+  allocation it was — a trillion inodes per lineage, 8.4 million lineages.
+  (23 and not 24: every inode has to fit in a SIGNED 64-bit integer,
+  because the catalog and the overlay are SQLite.) Lineage 0 is every
+  volume that predates this, so nothing already written moves.
+
+  Two consequences worth stating together. Two properly forked branches
+  cannot assign one number to two files, so a merge never renumbers. And
+  because they cannot, the absence of collisions is decidable from two
+  superblocks — a merge checks whether the lineages differ and skips the
+  question entirely. The numeric test that *was* needed (anything above
+  the fork's high-water mark was allocated twice) is kept only for
+  branches that share a lineage, which means anything forked before this
+  existed.
+
+  A branch cut before lineages existed can still be merged; it just has to
+  be renumbered first, and `pelfs merge` reports the collisions and the
+  number to shift above.
 - **The volume key pin stays volume-wide.** A per-branch pin would hand an
   attacker a fresh trust-on-first-use for every branch name they can invent,
   so a branch signed by an unknown key is refused rather than pinned. The

@@ -18,6 +18,8 @@ pelfs tag    --list pelican://.../scratch                  # what is pinned here
 pelfs tag    --rm pelican://.../scratch v1.0               # release the pin (gc reclaims)
 pelfs branch pelican://.../scratch dev                     # a second line of history
 pelfs branch --from-tag v1.0 pelican://.../scratch v1-fix  # ...starting at a pinned generation
+pelfs merge  pelican://.../scratch dev                     # what bringing dev in would take
+pelfs merge  --apply pelican://.../scratch dev             # ...do it (--keep-both on conflicts)
 pelfs branch --list pelican://.../scratch                  # what branches exist
 pelfs branch --rm pelican://.../scratch dev                # delete one (never the last)
 pelfs fsck   [--deep] pelican://.../scratch                # verify a generation

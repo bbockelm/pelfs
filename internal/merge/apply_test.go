@@ -8,6 +8,7 @@ import (
 	"github.com/bbockelm/pelfs/internal/fsck"
 	"github.com/bbockelm/pelfs/internal/genfs"
 	"github.com/bbockelm/pelfs/internal/merge"
+	"github.com/bbockelm/pelfs/internal/mpi"
 	"github.com/bbockelm/pelfs/internal/refs"
 	"github.com/bbockelm/pelfs/internal/superblock"
 	"github.com/bbockelm/pelfs/internal/testvol"
@@ -357,4 +358,73 @@ func TestKeepBothStillRefusesWhatItCannotDuplicate(t *testing.T) {
 	if len(plan.Conflicts) != 1 || plan.Conflicts[0].Kind != merge.ModifyDelete {
 		t.Fatalf("conflicts = %+v, want one modify-delete", plan.Conflicts)
 	}
+}
+
+// The merged generation's index has to cover the content the merge
+// brought in, or a reader probes pack trailers for exactly the files that
+// just arrived.
+//
+// This is a lookup and not a walk, and it has to be: an index stores
+// truncated identities (12 of 32 bytes), so walking theirs' index could
+// never produce the full identity the index builder needs. The full ones
+// come from the chunkrefs the merge already served.
+func TestMergedIndexCoversWhatCameFromTheirs(t *testing.T) {
+	ctx := context.Background()
+	inner, base, baseRaw, ours, theirs, key := forkedProperly(t, "8c8c8c8c-1111-2222-3333-444444444444",
+		func(v *testvol.Volume) { v.WriteFile(rootIno, "ours.bin", body(3<<20, 120)) },
+		func(v *testvol.Volume) { v.WriteFile(rootIno, "theirs.bin", body(3<<20, 121)) })
+	rstore, err := refs.New(inner, t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := merge.Compute(ctx, merge.Options{
+		Inner: inner, Base: base, BaseRaw: baseRaw, Ours: ours, Theirs: theirs, CacheDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := merge.Apply(ctx, merge.ApplyOptions{
+		Plan: plan, Base: base, Ours: ours, Theirs: theirs,
+		Inner: inner, Refs: rstore, Branch: "main", SigningKey: key,
+		CacheDir: t.TempDir(), SpoolDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Every chunk of the file that came from theirs must resolve through
+	// the merged generation's index set, without touching a trailer.
+	fs, err := genfs.Open(ctx, genfs.Options{Inner: inner, SB: res.Superblock, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs.Close() //nolint:errcheck
+	n, err := fs.LookupPath(ctx, "/theirs.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := fs.ContentOf(ctx, n.Inode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(content.Refs) == 0 {
+		t.Fatal("the file that came from theirs has no chunkrefs, so this test proves nothing")
+	}
+
+	ixs, err := mpi.FetchAll(ctx, inner, res.Superblock.PackIndexes)
+	if err != nil {
+		t.Fatalf("fetch the merged generation's index: %v", err)
+	}
+	set := mpi.NewSet(ixs)
+	for i, ref := range content.Refs {
+		if len(ref.Identity) != 32 {
+			continue // a hole
+		}
+		if _, ok := set.Lookup([32]byte(ref.Identity)); !ok {
+			t.Fatalf("chunk %d of /theirs.bin does not resolve through the merged index; "+
+				"a reader would fall back to probing trailers for the content the merge brought in", i)
+		}
+	}
+	t.Logf("%d chunks from theirs, all resolvable through the merged index (%d segments)",
+		len(content.Refs), len(res.Superblock.PackIndexes))
 }

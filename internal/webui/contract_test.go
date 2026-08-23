@@ -348,3 +348,70 @@ func TestGoServeMuxHandlesPercentEncodedIDs(t *testing.T) {
 		t.Error("unreachable: the decoded id cannot equal the collapsed path")
 	}
 }
+
+// THE ROOT DIRECTORY IS THE ONE ID THE OBVIOUS ROUTE PATTERN DOES NOT MATCH,
+// and it is the id every first gesture uses.
+//
+// The component addresses a directory by putting its whole path in ONE
+// percent-encoded segment. For the volume root that is `files/%2F` -- a
+// create-at-root, which is the first thing anybody does. net/http's ServeMux
+// unescapes a path SEGMENT BY SEGMENT before matching, so `/api/v1/files/%2F`
+// matches as `/api/v1/files//`, whose final segment is empty; a `{id}`
+// wildcard requires a NON-EMPTY segment, so the route silently does not match
+// and the request falls through to whatever handles "/" -- in a server that
+// also serves an SPA, that is index.html with a 200, and the app reports "the
+// answer was not JSON".
+//
+// `{id...}` matches all three shapes. cmd/pelfs/browse.go's route-table
+// comment already writes the seam that way; this test is here so that a U11
+// that writes `{id}` instead fails in Go rather than in a browser.
+func TestTheRootDirectoryIDNeedsAWildcardRoute(t *testing.T) {
+	for _, tc := range []struct {
+		pattern string
+		want    map[string]string // request path -> the id the handler sees ("" = no match)
+	}{
+		{
+			pattern: "GET /api/v1/files/{id}",
+			want: map[string]string{
+				"/api/v1/files/%2F":         "", // the root: MISSED
+				"/api/v1/files/%2Fdata":     "/data",
+				"/api/v1/files/%2Fdata%2Fx": "/data/x",
+			},
+		},
+		{
+			pattern: "GET /api/v1/files/{id...}",
+			want: map[string]string{
+				"/api/v1/files/%2F":         "/",
+				"/api/v1/files/%2Fdata":     "/data",
+				"/api/v1/files/%2Fdata%2Fx": "/data/x",
+			},
+		},
+	} {
+		t.Run(tc.pattern, func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.HandleFunc(tc.pattern, func(w http.ResponseWriter, r *http.Request) {
+				fmt.Fprint(w, r.PathValue("id"))
+			})
+			// Stands in for the SPA fallback, which is what makes the miss
+			// look like a content-type problem instead of a routing one.
+			mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusTeapot)
+			})
+			for path, want := range tc.want {
+				rec := httptest.NewRecorder()
+				mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+				got := rec.Body.String()
+				if want == "" {
+					if rec.Code != http.StatusTeapot {
+						t.Errorf("%s %s: matched with id %q; the point of this row is that it does NOT",
+							tc.pattern, path, got)
+					}
+					continue
+				}
+				if rec.Code != http.StatusOK || got != want {
+					t.Errorf("%s %s: got %d %q, want 200 %q", tc.pattern, path, rec.Code, got, want)
+				}
+			}
+		})
+	}
+}

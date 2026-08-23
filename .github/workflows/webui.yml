@@ -150,10 +150,12 @@ jobs:
             sh -c 'go build ./... && go vet ./internal/webui/ && go test -count=1 ./internal/webui/'
 
   browser:
-    # The browser half of the threat model. Measured locally: 12s wall clock
-    # for the whole gate in browse mode (build pelfs, start fakeorigin, create
-    # a volume, serve, six specs), plus ~11s to download the browser when the
-    # cache misses.
+    # The browser half of the threat model, and the file manager driven
+    # against a mock JSON API. Measured locally on an M-series laptop: 14s
+    # wall clock for the whole gate in browse mode (build pelfs, start the
+    # attacker page server and fakeorigin, create a volume, serve, 30 specs in
+    # 9.3s) and 11s in embed mode (22 specs in 7.3s), plus ~11s to download
+    # the browser when the cache misses.
     #
     # NOT on the Go PR path, by the same rule as the bundle job: a Go-only
     # change must not wait on a browser.

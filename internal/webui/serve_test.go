@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/bbockelm/pelfs/internal/browsesession"
 )
 
 // A real server for the browser suite to point at, and the reason it is a
@@ -40,8 +42,22 @@ func TestServeEmbeddedForBrowserSuite(t *testing.T) {
 		t.Fatalf("listening on loopback: %v", err)
 	}
 
+	// The credential lifecycle, for real: the same internal/browsesession the
+	// binary uses, so the app's bootstrap-for-session exchange, its
+	// header-borne session token and its single-use download tickets are
+	// exercised here rather than stubbed. The bootstrap token is printed
+	// below for the harness to hand to the suite.
+	sessions, err := browsesession.New()
+	if err != nil {
+		t.Fatalf("minting the session manager: %v", err)
+	}
+
 	mux := http.NewServeMux()
 	mux.Handle("/", Handler())
+	// The JSON API, mocked (mockapi_test.go). Work item U11 owns the real
+	// one; without a stand-in the app in webui/frontend has nothing to talk
+	// to, and the browser suite could only assert that a shell renders.
+	newMockAPI(sessions).mount(mux)
 	// Echoes the Host header back. This is what makes Chromium's
 	// --host-resolver-rules provably a DNS-rebinding simulation rather than a
 	// flag somebody passed: a page loaded from http://attacker.test:PORT/
@@ -65,7 +81,11 @@ func TestServeEmbeddedForBrowserSuite(t *testing.T) {
 	// The line the harness greps for. Printed to stdout, not through t.Log,
 	// so it is not buffered until the test ends.
 	fmt.Printf("PELFS_WEBUI_URL=http://%s/\n", ln.Addr().String())
-	fmt.Println("pelfs webui: serving the embedded bundle; SIGTERM or SIGINT to stop")
+	// Single-use, 120 seconds, handed over the same way
+	// scripts/webui-playwright.sh hands over `pelfs browse`'s: separately,
+	// because the suite has to put it back in the URL FRAGMENT itself.
+	fmt.Printf("PELFS_WEBUI_BOOTSTRAP=%s\n", sessions.Bootstrap())
+	fmt.Println("pelfs webui: serving the embedded bundle and a mock JSON API; SIGTERM or SIGINT to stop")
 	os.Stdout.Sync()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

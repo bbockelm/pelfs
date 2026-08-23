@@ -33,7 +33,8 @@ fixed is listed at the bottom, so nobody re-files it.
 Every entry below was checked against the code at `0c2baf0`: all six KI
 and all six KL entries were still true. (KL-8 was filed after that audit,
 with the `--fusemount` work; KL-10 was filed and then closed after it, and
-is in the table at the bottom; KI-10 was filed with the fsync work.) What had rotted was the citations —
+is in the table at the bottom; KI-10 was filed with the fsync work and
+closed by commit-agent, and is in that table too.) What had rotted was the citations —
 `internal/repack/execute.go` had moved ~83 lines under KI-9 — and one
 paragraph that had itself gone stale (removed).
 
@@ -197,42 +198,6 @@ own clock.
 **Pinned by an executable test: NO, and cannot be.** Fixing it means
 deciding whether a repack's ledger stamp is inside the injectable clock —
 a repack-semantics call.
-
----
-
-### KI-10. `fsync` through the NFS frontend still returns success without making anything durable
-
-**Severity: medium, correctness of a promise.** Since v0.2.1 a FUSE mount's
-`Fsync`/`FsyncDir` make the session durable on local disk and return OK only
-once that holds (`internal/rawfuse/rw.go`, `overlay.FS.Sync`). An
-NFS-backed mount does not, and pelfs never gets the chance to: NFSv3 COMMIT
-is handled inside the `go-nfs` fork by `onCommit`
-(`nfs_oncommit.go`), which is a deliberate no-op — *"note this is a no-op,
-as we always push writes to the backing store"* — and writes `NFSStatusOk`
-plus the server's write verifier without consulting the filesystem at all.
-For a billy filesystem backed by real files that comment is nearly true;
-for pelfs, whose write buffer is an mmap'd ring and whose two databases run
-`synchronous=NORMAL`, it is not.
-
-So the exact shape of what is left: an application on an NFS mount that
-calls `fsync(2)`, gets success, and then loses the machine can lose those
-writes. It is the same defect the FUSE side had, one layer down and in a
-dependency.
-
-The fix is a FORK change and that is why it is filed rather than done.
-`billy.Filesystem` has no commit operation and neither does go-nfs's
-`Handler`, so there is no seam to implement: it needs either a capability
-interface `onCommit` consults (the shape `billy.CapabilityCheck` and
-`nfs.PermissionChecker` already use, so the precedent is there) or a
-`Commit` method the fork's handler calls when the filesystem offers one.
-`overlay.FS.Sync` is then the one-line body, and its coalescing makes a
-COMMIT free when FUSE or a previous COMMIT has just synced.
-
-**Pinned by an executable test: NO.** The no-op is in the dependency, so
-nothing in this repo's tests reaches it, and the observable difference is
-what survives a MACHINE crash — which no Go test on any platform this runs
-on can produce. What would pin it is a fork-side test that a COMMIT reaches
-the filesystem at all, and that belongs in the fork.
 
 ---
 
@@ -509,6 +474,7 @@ pass does not re-file them.
 | **Crash-stranded scratch is never swept** (was KI-2) | **FIXED** by spool-agent (`a7d336a`): `internal/scratch` names every scratch directory for the process that made it (`publish-<pid>-*`, `snapshot-<pid>-*`, `repack-<pid>-*`) and `sweepStateScratch` (`cmd/pelfs/mountgen.go`) collects, at every mount, the ones whose owner is no longer running — reporting the bytes and the names it took. A repack's spool is now a per-run subdirectory removed on **every** exit from `Execute`, so the happy path no longer strands one either. Pinned by `internal/scratch/scratch_test.go` (ten cases, including a live sibling's spool being left alone), `cmd/pelfs/scratchsweep_test.go`, `internal/repack/spool_test.go`, and phase 4b of `scripts/crash-recovery-docker.sh`. The discipline is pid liveness with a 24h guard for unowned names and a 7d backstop against pid reuse; why liveness rather than the lease is argued at the top of `internal/scratch/scratch.go`. |
 | **The dedup sidecar after a repack** (was KI-3) | **FIXED** by spool-agent (`a7d336a`), both halves in one operation: `publish.RestampDedupIndex`, called from `repack.execute` after the flip, rewrites the sidecar with exactly the rows the sweep's reachable set still reaches and stamps it with the generation the repack published. Filtering without restamping would be a file nobody reads; restamping without filtering would promise chunks the repack has just dropped — which is why they are one function and not two. Pinned by `TestASealAfterARepackStillDeduplicates` (`internal/repack/dedup_test.go:67`), which measures the bytes the post-repack seal puts on the wire for a 3 MiB file the generation already stores. Its ASSERTION is a ceiling (`dedup_test.go:174`, under half the file); the observed 4 KiB with the fix against 3.15 MiB without it is a logged number, not a pinned one. |
 | **A crash between a flush's publish and its location record loses that batch** (was KL-10) | **FIXED** by durability-agent: `publish` no longer reclaims the ring region a batch came from. It queues the region (`Store.locating`) and `journalLocated` releases it, so until the `Located` record binding handles to packs is durable the ring is still where recovery finds those extents — and a crash in the window loses nothing rather than one flush batch (2 MiB at the shipped pack target). Only a PREFIX is released, because that is all a ring can release: four upload workers finish out of order, so a batch is marked done and the tail advances over however many done batches sit at the front. `Flush` waits for the queue to drain, which is what makes "a flush means recorded" true as well as "a flush means uploaded". Pinned by `memtable.TestACrashBeforeTheLocatedRecordLosesNothing` and `memtable.TestTheRingIsNotReclaimedUntilTheLocatedRecordIsDurable` (`internal/memtable/losswindow_test.go`) — one through `Store.Durable`/`Recover`, one at the ring itself, neither killing anything. The cost was the reason it was deferred and it was MEASURED rather than argued (`memtable.TestMeasureRingHoldBackpressure`, `PELFS_RINGHOLD_MEASURE=1`): holding the ring moves the uplink's cost from the seal into the write phase and leaves end-to-end throughput alone. |
+| **`fsync` over NFS makes nothing durable** (was KI-10) | **FIXED** by commit-agent, and NOT where this file said the fix was. The COMMIT no-op was real but unreachable: `onWrite` wrote the constant FILE_SYNC into the stability field of every WRITE reply, and a Linux client queues a page for commit only when the reply said UNSTABLE — so it never sent a COMMIT. Measured before the fix on this repo's own mount-gate container: `dd conv=fsync` produced 2 WRITEs and **0** COMMITs; after, 1 COMMIT. The fork (`d92cb75`, pinned in `go.mod`) now exports `nfs.Committer`, which both `onWrite` and `onCommit` consult; `internal/vfsbilly` implements it with `overlay.FS.Sync`, the same body the FUSE frontend's `Fsync` calls. Pinned by `internal/vfsbilly/commit_test.go` (a commit syncs, a repeat commit is free), `internal/nfsmount/diag_internal_test.go` (the wrapper must not over-claim the interface), the fork's own `nfs_oncommit_test.go`, and `commit_gate` in `scripts/mount-gate-test.sh`, which asserts against a real kernel NFS client that a COMMIT is SENT. |
 | **C2**, the "fsck lifts the cap" claim | **STALE** in that detail — `internal/fsck` does not touch `packIndex`. The rest of C2 survives as KI-8. |
 | **F11** dead/unwired inventory; **G4**, **G6** doc-staleness sweeps | Real work, but hygiene and prose rather than defects or limitations. They stay in `docs/TODO.md`, which is what a punchlist is for. |
 
@@ -530,9 +496,18 @@ Nothing left in this file is expressible as a plan, which is why they
 are here:
 a memory ceiling reached only at a hundred million objects (KI-8), a
 missing stats field (KI-4, KI-5), an error class thrown away (KI-6), a
-transaction count (KI-7), a wall clock in the wrong place (KI-9), and a
-no-op in a dependency whose consequence is what survives a MACHINE crash
-(KI-10) — which is the one thing no test on any platform here can produce.
+transaction count (KI-7), and a wall clock in the wrong place (KI-9).
+
+KI-10 was the second entry whose halves came apart the way KL-10's did,
+and it is worth one paragraph because the resolution was not the one this
+file predicted. It was filed as untestable on the grounds that the
+observable difference is what survives a MACHINE crash — true, and still
+true. But that was the wrong question to look for a test for. The
+falsifiable claim underneath it is on the WIRE: whether the client sends a
+COMMIT at all, which `/proc/self/mountstats` answers for free. It did not
+(zero, against a real kernel client), because the server was claiming
+FILE_SYNC for buffered writes. That is an ordinary assertion, and it is
+now `commit_gate` in `scripts/mount-gate-test.sh`.
 Both entries that needed a crash or a repack plus a look at the disk
 (KI-2, KI-3, now fixed) turned out to be expressible after all, in
 ordinary Go tests, once the question was asked in the right units: not

@@ -438,12 +438,27 @@ release, and what to do about it when upgrading, is in
   the two databases in a state directory may not be made durable in the
   other order.
 
-  **On an NFS-backed mount this is not yet true**, and the reason is one
-  layer down: NFSv3 COMMIT is answered by the `go-nfs` fork, whose handler
-  is a no-op on the stated grounds that writes are already pushed to the
-  backing store — which for pelfs they are not. So an `fsync` through an
-  NFS mount still returns success without making anything durable. Tracked
-  as KI-10 in [`docs/known-issues.md`](docs/known-issues.md).
+  **An NFS-backed mount now gets the same guarantee**, and getting there
+  needed a change one layer down. NFSv3 has no `fsync`: durability is the
+  stability field on every WRITE reply plus a later COMMIT, and the
+  `go-nfs` fork used to write FILE_SYNC into every WRITE reply whatever the
+  client asked for. A Linux client believes that field, so it never sent a
+  COMMIT at all — `dd conv=fsync` over the mount measured **zero** COMMIT
+  RPCs — and the no-op COMMIT handler underneath it was unreachable code.
+  The fork now answers UNSTABLE for writes it has only buffered and asks
+  the filesystem to commit, so `fsync(2)` over NFS does the same work and
+  makes the same promise as over FUSE.
+
+  **The cost worth knowing before you pick the NFS backend for a
+  create-heavy workload**: a FUSE mount syncs when the application asks,
+  and an NFS mount syncs when the CLIENT asks. A Linux client sends a small
+  file's whole body as a FILE_SYNC write to save itself a COMMIT round
+  trip, and RFC 1813 makes that a durability requirement, so the server
+  commits once per file even though the application never called `fsync`.
+  (The kernel's own NFS server does the same.) Copying 500 small files with
+  no `fsync` in the workload: 392 ms before, 1239 ms after, with the state
+  directory on a real disk — about 3x. Large files are unaffected, and so
+  is FUSE.
 - The origin must permit GET/PUT/DELETE and listing on the prefix (i.e. a
   token with read/modify scopes for the namespace); `pelfs` checks this up
   front and says which scope is missing.

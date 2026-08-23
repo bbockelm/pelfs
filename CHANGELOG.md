@@ -348,13 +348,36 @@ implements it with the same `overlay.Sync` the FUSE frontend calls, so both
 frontends make one promise. A filesystem that does not implement it — every
 existing go-nfs user — behaves exactly as before.
 
-**The NFS cost is higher than the FUSE cost, and it is not optional.** An
-NFSv3 client commits on `close(2)` as well as on `fsync(2)`
-(`nfs_file_flush` → `nfs_wb_all`), so a write-heavy NFS workload pays a
-durability pass per file written rather than one per `fsync`. The
-coalescing below makes the repeats free; it does not make the first one
-free. That is what `fsync` costs, and the alternative was answering it with
-a lie.
+**The NFS cost is higher than the FUSE cost, it is not optional, and it is
+bigger than it looks.** A FUSE mount syncs when the application asks. An
+NFS mount syncs when the CLIENT asks, and a Linux client asks far more
+often than an application does: a small file written in one go is sent as a
+FILE_SYNC write, not an unstable one, because that saves the client a
+COMMIT round trip. RFC 1813 makes FILE_SYNC a requirement — the server must
+have the data on stable storage before it replies — so the server commits
+inline, once per file, for an application that never called `fsync` at all.
+That is knfsd's behavior too (`nfsd_vfs_write` sets `RWF_SYNC` for a stable
+write); it is what an NFS server costs.
+
+Measured, copying 500 small files onto an NFS mount with no `fsync`
+anywhere in the workload:
+
+| state directory on | before | after |
+|---|---|---|
+| tmpfs | 332 ms | 246 ms |
+| a real disk | 392 ms | **1239 ms** |
+
+The tmpfs row is the trap: the containerized benchmarks keep their scratch
+on tmpfs, where `fsync` is free, so `make big-tree` shows this change as a
+wash (NFS 66.08s before, 66.22s after, RPCs per file 5.41 both). On real
+storage a create-heavy NFS workload pays about 3x. Large files are
+unaffected — those go out unstable and cost one commit at `close`, not one
+per write — and FUSE is unaffected entirely.
+
+The alternative was answering `fsync` with a lie, so this is the trade and
+not a regression to be tuned away. But it is a real number and the NFS
+frontend is the one macOS uses, so it is written here rather than left to
+be discovered.
 
 **A chatty application pays once.** Repeat calls with nothing written
 between them are coalesced against the overlay's own mutation counter and

@@ -1,5 +1,67 @@
 # Changelog
 
+## Unreleased
+
+### `pelfs mount-gen` is an apptainer `--fusemount` driver
+
+A job can now mount a pelfs volume **inside its own container**, with no
+pelfs on the host and nothing for a site to install beyond apptainer:
+
+```
+apptainer exec \
+  --fusemount "host:$_CONDOR_SCRATCH_DIR/pelfs-fusemount.sh \
+               pelican://<federation>/<prefix> \
+               $_CONDOR_SCRATCH_DIR/pelfs-work /data" \
+  mypipeline.sif ./payload
+```
+
+`scripts/pelfs-fusemount.sh` is that wrapper, ready to ship with a job;
+`docs/design-apptainer.md` has the measurements and the constraints.
+
+What changed to make it work:
+
+- **A `/dev/fd/N` mountpoint is understood.** Apptainer opens `/dev/fuse`,
+  performs the kernel mount itself, and runs the driver as
+  `<driver> /dev/fd/N -f` — the libfuse magic-mountpoint convention, which
+  go-fuse already implements. `mount-gen` used to `os.MkdirAll` its
+  mountpoint first and die with `mkdir /dev/fd/3: not a directory`. It now
+  recognises the form (`rawfuse.PassedFD`) and skips the mkdir, skips the
+  unmount at teardown (there is nothing of ours to unmount, and go-fuse
+  refuses a magic mountpoint by design), skips the `/dev/fuse` usability
+  probe (the mount already exists), refuses `--backend nfs` and
+  `--subshell` for it with a reason, and tolerates the trailing `-f`.
+- **Permissions are enforced by pelfs on such a mount.** On a passed
+  descriptor go-fuse never calls `mount(2)`, so the `ro` and
+  `default_permissions` this process asks for are never delivered —
+  measured: the mount options are the parent's, and apptainer does not ask
+  for `default_permissions`. A `--fusemount` mount would therefore have
+  applied no mode bits at all, which is the inconsistency v0.2.0 closed for
+  the NFS frontend. So `internal/rawfuse` now answers `ACCESS` and checks
+  OPEN, OPENDIR, LOOKUP and every namespace operation itself **when and
+  only when** the kernel is not doing it, over the same model the NFS
+  frontend uses. That model moved to `internal/fsperm`, imported by both
+  frontends; `internal/vfsbilly/perm.go` keeps the NFS-specific half. An
+  ordinary mount is unchanged and still leaves the check to the kernel.
+- **Teardown seals.** A `--rw` driver whose container is killed still
+  publishes: the connection dies with the container's namespace, the device
+  answers `ENODEV`, and the seal and the lease release run then. Verified
+  by SIGKILL'ing apptainer mid-write in the container harness — 32 MiB
+  written, generation sealed, lease released, bytes read back from a fresh
+  mount.
+- `-f`/`--foreground` is accepted (and documented as a no-op: `mount-gen`
+  has always run in the foreground, which is what a `--fusemount` driver
+  must do).
+
+Two constraints a writable `--fusemount` job has to know, both recorded in
+`docs/design-apptainer.md`:
+
+- the driver's environment is **scrubbed**, so the prefix, the work
+  directory, the token and the signing key are command-line arguments of
+  the wrapper, not inherited;
+- with `--rw`, ship the volume's **signing key** (`--signing-key`): a fresh
+  work directory has none, and without it the seal fails after the job has
+  already finished.
+
 ## v0.2.0
 
 v0.1.0 could mount, write, seal, branch and tag. It could not merge a

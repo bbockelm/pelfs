@@ -31,7 +31,8 @@ release-agent for the v0.2.0 release. What was audited and found already
 fixed is listed at the bottom, so nobody re-files it.
 
 Every entry below was checked against the code at `0c2baf0`: all six KI
-and all six KL entries are still true. What had rotted was the citations —
+and all six KL entries were still true. (KL-8 was filed after that audit,
+with the `--fusemount` work.) What had rotted was the citations —
 `internal/repack/execute.go` had moved ~83 lines under KI-9 — and one
 paragraph that had itself gone stale (removed).
 
@@ -332,6 +333,42 @@ side, which is a repack-class operation and a separate design.
 `TestInheritedInodesFromAThirdLineageAreNotCollisions` in
 `internal/merge/`. The renumbering that does not exist is, of course,
 pinned by nothing.
+
+### KL-8. On a passed /dev/fuse descriptor, pelfs checks permissions and reaches two places the kernel would have
+
+A `--fusemount` mount (`docs/design-apptainer.md`) is created by whoever
+opened the descriptor, so `default_permissions` is not applied — measured,
+from the container's own `/proc/self/mountinfo`; apptainer does not ask for
+it and pelfs cannot, the mount predates the driver. `internal/rawfuse`
+therefore applies the mode bits itself there, over `internal/fsperm`, and
+two things a kernel check would cover it cannot:
+
+- **Path traversal is enforced only on a dentry-cache MISS.** The kernel
+  resolves a cached name without asking us, and this mount hands out
+  effectively infinite entry TTLs (`entryValidity`), so a directory whose
+  mode denies search still admits a name that some permitted caller looked
+  up earlier. OPEN, OPENDIR, ACCESS and the namespace operations are never
+  served from cache, so those are exact; the walk is not.
+- **A caller's supplementary groups are not on the wire.** The FUSE header
+  carries uid and gid only, and `/proc/<pid>` is not usable for the rest
+  (the pid is in the caller's namespace). For the mount owner pelfs
+  substitutes its own group set and CapEff, which is exact; for any other
+  uid the group class is evaluated on the primary gid alone, which can deny
+  what the kernel would have allowed.
+
+Not fixed because neither is fixable from a FUSE server: closing the first
+is precisely what `default_permissions` exists for. A `--fusemount` driver
+serves one job's uid, where both reduce to nothing. An ordinary pelfs mount
+is unaffected — the kernel still does the checking there, and `ACCESS` still
+answers ENOSYS.
+
+**Pinned by an executable test: YES** for what it does enforce
+(`internal/rawfuse/perm_test.go` for the ops and the statuses,
+`scripts/apptainer-test.sh` section 7e for the same answers through a real
+`--fusemount` mount against a real kernel, with an ordinary FUSE mount as
+the control). The two gaps are pinned by nothing, which is the honest state
+of them: they are properties of the caching contract, not behaviours to
+assert.
 
 ---
 

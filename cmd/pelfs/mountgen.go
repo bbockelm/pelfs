@@ -241,8 +241,45 @@ type genArgs struct {
 	poll                    time.Duration
 }
 
+// FOREGROUND, AND THE TRAILING -f APPTAINER ADDS.
+//
+// `pelfs mount-gen` has always run in the foreground: it serves in this
+// process, does not fork, does not re-exec, and holds the terminal until
+// the mount goes away (`pelfs mount` is the one that daemonizes). That is
+// exactly what a `--fusemount` driver must do — apptainer waits on the
+// process it started and treats its exit as the mount going away — so the
+// flag it passes to say so, `-f`, is accepted and is a no-op rather than
+// an error.
+//
+// It is accepted AFTER the positional arguments as well as before, because
+// apptainer's command line is `<driver> /dev/fd/N -f` and Go's flag
+// package stops parsing at the first non-flag argument: without hoisting,
+// the `-f` arrives as a third positional and the run dies on the arity
+// check with a message about argument counts.
+func hoistForeground(args []string) []string {
+	out := make([]string, 0, len(args))
+	for _, a := range args {
+		switch a {
+		case "-f", "--f", "-foreground", "--foreground":
+			continue
+		default:
+			out = append(out, a)
+		}
+	}
+	if len(out) == len(args) {
+		return args
+	}
+	return append([]string{"-foreground"}, out...)
+}
+
 func cmdMountGen(args []string) int {
 	a := genArgs{branch: "main"}
+	head, tail, hasTail := splitCommandTail(args)
+	if hasTail {
+		args = append(hoistForeground(head), append([]string{"--"}, tail...)...)
+	} else {
+		args = hoistForeground(head)
+	}
 	o, pos, command, err := parseArgsWithCommand("mount-gen", args, 2, 2, func(fs *flag.FlagSet, o *cmdOpts) {
 		fs.StringVar(&a.branch, "branch", "main", "branch to mount")
 		fs.StringVar(&a.tag, "tag", "", "mount a tag instead of a branch head (pinned exactly)")
@@ -253,6 +290,7 @@ func cmdMountGen(args []string) int {
 		fs.BoolVar(&a.subshell, "subshell", false, "run a subshell in the mount and unmount (sealing, with --rw) when it exits; a trailing `-- command [args...]` runs that instead of a shell and implies this flag")
 		fs.DurationVar(&a.poll, "poll", 0, "read-only: re-check the branch head this often and swap generations live (0 = pinned, the reproducible-batch default)")
 		fs.StringVar(&a.signingKeyPath, "signing-key", "", signingKeyUsage)
+		fs.Bool("foreground", false, "no-op: mount-gen always serves in the foreground. Accepted, before or after the mountpoint, because apptainer passes `-f` to a --fusemount driver")
 	})
 	if err != nil {
 		return exitErr(err)
@@ -260,10 +298,42 @@ func cmdMountGen(args []string) int {
 	if len(command) > 0 {
 		a.subshell = true
 	}
-	if a.backend, err = resolveBackend(o); err != nil {
+	if rawfuse.PassedFD(pos[1]) {
+		if a.subshell {
+			return exitErr(fmt.Errorf("a passed /dev/fuse descriptor (%s) has no path to run a command in: "+
+				"the parent that opened it owns the mountpoint, and this process never learns where it is. "+
+				"Run the command in the container the mount is for", pos[1]))
+		}
+		if a.backend, err = passedFDBackend(o); err != nil {
+			return exitErr(err)
+		}
+	} else if a.backend, err = resolveBackend(o); err != nil {
 		return exitErr(err)
 	}
 	return runMountGen(o, pos[0], pos[1], command, a)
+}
+
+// passedFDBackend is resolveBackend for a mountpoint that is already a
+// mounted /dev/fuse descriptor.
+//
+// The usability probe is skipped deliberately: the mount EXISTS — someone
+// else opened the device and called mount(2) — so opening /dev/fuse
+// ourselves answers a question nobody asked, and on a host that permits
+// FUSE only through that parent (a container with no /dev/fuse of its own,
+// which is the whole point of being handed a descriptor) it answers it
+// wrongly and refuses a mount that would have worked.
+//
+// The NFS backend cannot serve a descriptor at all: it attaches by calling
+// mount(2) on a directory, so it is refused here rather than failing later
+// with an error about a path that is not a path.
+func passedFDBackend(o *cmdOpts) (string, error) {
+	switch o.backend {
+	case "", "auto", "fuse":
+		return "fuse", nil
+	default:
+		return "", fmt.Errorf("--backend %s cannot serve a passed /dev/fuse descriptor: "+
+			"the mount already exists and only the fuse backend can attach to it", o.backend)
+	}
 }
 
 // openContent builds the write path's content store: writes land in an
@@ -613,8 +683,15 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	}
 	startup.mark("prefetch")
 
-	if err := os.MkdirAll(mountpoint, 0755); err != nil {
-		return fail(err)
+	// A passed descriptor is not a directory to create, and MkdirAll on
+	// `/dev/fd/3` is `ENOTDIR` — which is exactly how a --fusemount driver
+	// used to die before it ever reached the mount (docs/design-apptainer.md,
+	// W1).
+	passedFD := rawfuse.PassedFD(mountpoint)
+	if !passedFD {
+		if err := os.MkdirAll(mountpoint, 0755); err != nil {
+			return fail(err)
+		}
 	}
 
 	var srv *fuse.Server
@@ -686,7 +763,17 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		return fail(fmt.Errorf("unknown --backend %q (want fuse or nfs)", backend))
 	}
 	if err != nil {
-		return fail(fmt.Errorf("mount: %w%s", err, mountAdvice(backend)))
+		// The usual advice ("pelfs mounts with FUSE and has no fallback")
+		// is about attaching a mount, and on a passed descriptor the mount
+		// already exists: what failed is the FUSE handshake on somebody
+		// else's fd, so say that instead of sending the reader to install
+		// a package.
+		advice := mountAdvice(backend)
+		if passedFD {
+			advice = fmt.Sprintf(" (the FUSE handshake on the descriptor %s names; "+
+				"it has to be an OPEN /dev/fuse whose mount(2) the parent has already done)", mountpoint)
+		}
+		return fail(fmt.Errorf("mount: %w%s", err, advice))
 	}
 	startup.mark("mount")
 	// Reported after the mount, not after the generation opens: "ready to
@@ -706,6 +793,15 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	}
 	ui.Info("generation {generation} mounted {mode} on {mountpoint} (catalog-native)",
 		"generation", sb.Generation, "mode", mode, "mountpoint", mountpoint)
+	if passedFD {
+		// Said out loud because both halves are surprising: the mount
+		// options this process asked for went nowhere (the parent's
+		// mount(2) already happened), so pelfs is applying the mode bits
+		// itself; and there is nothing here to unmount at exit.
+		ui.Info("serving a /dev/fuse descriptor the parent opened: the mountpoint is theirs, " +
+			"pelfs enforces file permissions itself (the mount's own options were never ours to set), " +
+			"and exit seals and releases rather than unmounting")
+	}
 
 	sessionCtx, stopSession := context.WithCancel(ctx)
 	defer stopSession()
@@ -810,6 +906,36 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 			if unmountErr = nfsmount.Unmount(mountpoint); unmountErr != nil {
 				ui.Error("unmount: {error}", "error", unmountErr)
 			}
+		} else if passedFD {
+			// Nothing to unmount: the mount belongs to whoever opened the
+			// descriptor, go-fuse refuses a magic mountpoint by design
+			// (Server.Unmount), and this process does not even know the
+			// path. So there are exactly two ways out, and both end here.
+			//
+			// The ORDINARY one is the connection going away — apptainer
+			// closes its copy of the fd, or the container's mount
+			// namespace dies with it. The device then answers ENODEV, the
+			// serve loop exits, and Wait returns; the seal that follows
+			// runs with no server left to race it. That is the path a job
+			// takes every time, including a job that is killed.
+			//
+			// The other is a signal, and it is why this is a select rather
+			// than a Wait. A blocked read(2) on /dev/fuse cannot be
+			// interrupted from userspace — neither close nor dup2 wakes it,
+			// which is why libfuse unmounts or writes the kernel's abort
+			// file instead — so a signalled driver cannot stop its own
+			// serve loop. Sealing while it still runs is the same
+			// concurrency a mid-session checkpoint already handles; what
+			// must not happen is exiting WITHOUT sealing, which would
+			// strand the generation.
+			served := make(chan struct{})
+			go func() { srv.Wait(); close(served) }()
+			select {
+			case <-served:
+			case <-sigs:
+				ui.Info("signalled: sealing and releasing (the mount goes away with this process)")
+			}
+			g.beginTeardown()
 		} else {
 			go func() {
 				<-sigs

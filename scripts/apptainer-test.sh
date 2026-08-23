@@ -22,6 +22,13 @@ STATE=/work/state
 LOGDIR=/work/logs
 mkdir -p "$HOME" "$LOGDIR" /work/atmp "$STATE"
 
+# --only-fusemount runs sections 0-2 and 7 and stops: the --fusemount work
+# (W1) is what changes, and the amplification and dedup measurements below
+# it take minutes and answer questions nothing is changing. The full run is
+# still the default.
+ONLY=""
+[ "${1:-}" = "--only-fusemount" ] && { ONLY=fusemount; shift; }
+
 RESULTS=/work/results.txt
 : > "$RESULTS"
 note() { echo "$*" >> "$RESULTS"; }
@@ -92,6 +99,12 @@ POP_START=$(date +%s)
   cp /work/busybox-static /work/echo-dynamic .
   chmod 755 busybox-static echo-dynamic
   cp -a /images/el9-sandbox ./el9-sandbox
+  # The permission fixture, for section 7e. A mode-denying file has to be
+  # refused the same way through every frontend, and a --fusemount mount is
+  # the one where the KERNEL is not the thing refusing it.
+  echo "readable by anyone" > public.txt      && chmod 644 public.txt
+  echo "readable by nobody" > secret.txt      && chmod 000 secret.txt
+  echo "readable by me only" > owneronly.txt  && chmod 600 owneronly.txt
 ' > "$LOGDIR/populate.log" 2>&1
 POP_RC=$?
 POP_SECS=$(( $(date +%s) - POP_START ))
@@ -119,7 +132,16 @@ mount_ro() {
   [ -n "$DLOG" ] || DLOG=$(find /work "$HOME" -name daemon.log -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2)
   return 0
 }
-umount_ro() { "$PELFS" umount "$MNT" >>"$LOGDIR/mount.log" 2>&1; }
+umount_ro() {
+  if ! "$PELFS" umount "$MNT" > "$LOGDIR/umount.log" 2>&1; then
+    # Losing this used to cost an afternoon: the NEXT mount reported
+    # "already mounted" and the reason -- whatever was holding the mount
+    # busy -- had been truncated out of mount.log by the failing mount
+    # itself.
+    echo "    umount of $MNT FAILED:"; sed 's/^/      /' "$LOGDIR/umount.log" | tail -5
+    return 1
+  fi
+}
 
 LOG_MARK=0
 meas_start() {
@@ -152,9 +174,15 @@ read_hist() {
     | sort -n | uniq -c | awk '{printf "      %-10s %s\n", $2, $1}'
 }
 
+# The host-side read-only mount. Hoisted out of section 3 because section
+# 7e needs it too, as the CONTROL for the permission question: the same
+# volume, the same modes, mounted the ordinary way where the kernel does
+# the checking.
+mount_ro || { verdict FAILS "read-only mount would not start"; exit 1; }
+
+if [ -z "$ONLY" ]; then
 # ------------------------------------------- 3. exec a binary off the mount
 say "3. exec a binary directly off a pelfs FUSE mount"
-mount_ro || { verdict FAILS "read-only mount would not start"; exit 1; }
 ls -l "$MNT" | sed 's/^/  /'
 
 cmdline "$MNT/busybox-static echo hello"
@@ -214,6 +242,11 @@ cmdline "apptainer exec --bind $MNT:/data IMAGE /data/busybox-static echo hi"
 run "exec'ing a binary off the bound pelfs mount from inside the container" \
     apptainer exec --bind "$MNT:/data" /work/local-el9.sif /data/busybox-static echo hi
 
+else
+  # Section 6 is what produced this; the fusemount cases need a SIF to run.
+  cp /images/el9.sif /work/local-el9.sif
+fi
+
 # --------------------------------------------- 7. --fusemount, argv probe
 say "7. --fusemount: what does apptainer hand the FUSE driver?"
 cat > /work/argvprobe.sh <<'PROBE'
@@ -225,11 +258,21 @@ cat > /work/argvprobe.sh <<'PROBE'
   for f in /proc/self/fd/*; do
     printf '    %s -> %s\n' "$f" "$(readlink "$f" 2>&1)"
   done
+  # THE ENVIRONMENT, in full. What is missing from this is what a wrapper
+  # has to spell out (scripts/pelfs-fusemount.sh); PREFIX below is exported
+  # by the caller and its absence is the whole point.
+  echo "  env: $(env | sort | tr '\n' ' ')"
+  # And the driver's view of the mount it was handed: if the options carry
+  # default_permissions, the KERNEL is still doing the permission check on
+  # a passed fd and pelfs need not. This is the evidence for that question.
+  echo "  fuse mounts visible to the driver:"
+  grep -i fuse /proc/self/mountinfo 2>&1 | sed 's/^/    /'
 } >> /work/logs/fusemount-argv.log 2>&1
 sleep 15
 PROBE
 chmod 755 /work/argvprobe.sh
 : > "$LOGDIR/fusemount-argv.log"
+export PREFIX
 for FORM in container host; do
   echo "  -- form: $FORM --"
   echo "### form=$FORM" >> "$LOGDIR/fusemount-argv.log"
@@ -254,32 +297,311 @@ run "CONTROL: a libfuse driver (squashfuse_ll) mounted into the container by --f
     timeout 90 apptainer exec --fusemount "host:/work/sq-fusemount.sh /mnt/probe" \
       /work/local-el9.sif ls /mnt/probe
 
-say "7c. --fusemount with pelfs mount-gen itself"
-# mount-gen is the foreground, single-generation mount: no daemon, no
-# re-exec, which is the shape a --fusemount driver has to have. The
-# environment apptainer gives the driver is SCRUBBED, so the prefix, the
-# state directory and HOME are spelled out rather than inherited.
-cat > /work/pelfs-fusemount.sh <<PELFSFM
-#!/bin/bash
-export HOME=/work/home
-exec /stage/pelfs mount-gen --ro --state-dir /work/state-fm "$PREFIX" "\$1"
-PELFSFM
-chmod 755 /work/pelfs-fusemount.sh
-for FORM in host container; do
-  cmdline "apptainer exec --fusemount \"$FORM:/work/pelfs-fusemount.sh /mnt/pelfs\" IMAGE ls /mnt/pelfs"
-  timeout 120 apptainer -d exec --fusemount "$FORM:/work/pelfs-fusemount.sh /mnt/pelfs" \
-    /work/local-el9.sif ls /mnt/pelfs > "$LOGDIR/pelfs-fusemount-$FORM.log" 2>&1
-  RC=$?
-  if [ $RC -eq 0 ] && grep -q 'busybox-static' "$LOGDIR/pelfs-fusemount-$FORM.log"; then
-    verdict WORKS "pelfs mount-gen as an apptainer --fusemount driver ($FORM)"
-  else
-    verdict FAILS "pelfs as a --fusemount driver ($FORM): $(grep -iE 'mkdir|not a directory|ERROR pelfs|FATAL' "$LOGDIR/pelfs-fusemount-$FORM.log" | head -1 | sed 's/.*\(ERROR pelfs.*\|FATAL.*\)/\1/' | cut -c1-140)"
-  fi
+say "7c. --fusemount with pelfs mount-gen itself (W1)"
+# The driver is scripts/pelfs-fusemount.sh, shipped as itself: the file a
+# job would deliver into its scratch directory, with the prefix and the
+# work directory on the COMMAND LINE because the environment is scrubbed.
+# apptainer appends /dev/fd/N and -f to whatever the spec says, so the
+# spec's own arguments come first and the mountpoint written here (/data)
+# is never what the driver sees.
+DRIVER=/stage/pelfs-fusemount.sh
+FMWORK=/work/fm
+mkdir -p "$FMWORK"
+FMSPEC="$DRIVER $PREFIX $FMWORK /data"
+
+# NO host-side pelfs is involved in this case, which is the point of it:
+# the mount happens inside the container, by the job, and the volume was
+# published by a session that has already exited.
+cmdline "apptainer exec --fusemount \"host:$FMSPEC\" el9.sif sh -c 'cat /data/public.txt'"
+timeout 120 apptainer exec --fusemount "host:$FMSPEC" /work/local-el9.sif \
+  /bin/sh -c 'ls /data && cat /data/public.txt && wc -c < /data/el9.sif' \
+  > "$LOGDIR/fusemount-pelfs.log" 2>&1
+RC=$?
+sed 's/^/    /' "$LOGDIR/fusemount-pelfs.log" | head -20
+if [ $RC -eq 0 ] && grep -q 'readable by anyone' "$LOGDIR/fusemount-pelfs.log"; then
+  verdict WORKS "pelfs mount-gen as an apptainer --fusemount driver: a volume mounted INSIDE the container, no host-side pelfs, read and exited cleanly (rc=0)"
+else
+  verdict FAILS "pelfs as a --fusemount driver (rc=$RC): $(grep -iE 'mkdir|not a directory|ERROR pelfs|FATAL|cannot' "$LOGDIR/fusemount-pelfs.log" | head -1 | cut -c1-160)"
+fi
+
+echo "  -- exec a binary off the in-container mount --"
+cmdline "apptainer exec --fusemount \"host:$FMSPEC\" el9.sif /data/busybox-static echo hi"
+run "exec a binary off a volume the container mounted itself" \
+    timeout 120 apptainer exec --fusemount "host:$FMSPEC" /work/local-el9.sif \
+      /data/busybox-static echo hi
+
+echo "  -- the container: form, which resolves the driver inside the IMAGE --"
+cmdline "apptainer exec --fusemount \"container:$FMSPEC\" el9.sif ls /data"
+timeout 120 apptainer exec --fusemount "container:$FMSPEC" /work/local-el9.sif ls /data \
+  > "$LOGDIR/fusemount-container.log" 2>&1
+CFRC=$?
+CFWHY=$(grep -iE 'could not start|no such file|FATAL|ERROR' "$LOGDIR/fusemount-container.log" | head -1 | cut -c1-140)
+echo "    rc=$CFRC -> ${CFWHY:-(no error line; see the log)}"
+echo "    (expected to fail here: the driver is a HOST path, and this form looks for"
+echo "     it inside the image. Bake pelfs and the wrapper in, or use host:.)"
+note "INFO|container-form rc=$CFRC: $CFWHY"
+
+echo "  -- and the mountpoint given to mount-gen directly, apptainer out of the picture --"
+cmdline "pelfs mount-gen --ro <prefix> /dev/fd/3 -f   (3 redirected from /dev/null)"
+"$PELFS" mount-gen --ro --state-dir /work/state-fm "$PREFIX" /dev/fd/3 -f 3</dev/null 2>&1 | tail -3 | sed 's/^/    /'
+note "INFO|mount-gen /dev/fd/3 -f: $("$PELFS" mount-gen --ro --state-dir /work/state-fm "$PREFIX" /dev/fd/3 -f 3</dev/null 2>&1 | grep -oiE '(mkdir|expected .* positional|mount:).*' | head -1 | cut -c1-120)"
+
+# ------------------------- 7d. is default_permissions applied on a passed fd?
+say "7d. does anything apply default_permissions to a passed fd?"
+# Three independent readings of the same question, because the answer
+# decides who has to do the permission check.
+echo "  (1) what go-fuse does with a /dev/fd/N mountpoint: it skips fusermount"
+echo "      AND mount(2), so MountOptions.Options is never delivered."
+echo "  (2) what apptainer asks the kernel for, from its own binaries:"
+for b in /usr/local/bin/apptainer /usr/local/libexec/apptainer/bin/starter; do
+  [ -f "$b" ] || continue
+  printf '        %s: %s\n' "$(basename "$b")" \
+    "$(strings -n 8 "$b" 2>/dev/null | grep -oE 'fd=%d[,a-z_=%]*|rootmode=[^ ]{0,12}|default_permissions' | sort -u | tr '\n' ' ' | cut -c1-200)"
 done
-echo "  -- and the same mountpoint given to mount-gen directly, with apptainer out of the picture --"
-cmdline "pelfs mount-gen --ro <prefix> /dev/fd/3   (3 redirected from /dev/null)"
-"$PELFS" mount-gen --ro --state-dir /work/state-fm "$PREFIX" /dev/fd/3 3</dev/null 2>&1 | tail -2 | sed 's/^/    /'
-note "INFO|mount-gen /dev/fd/3: $("$PELFS" mount-gen --ro --state-dir /work/state-fm "$PREFIX" /dev/fd/3 3</dev/null 2>&1 | grep -o 'mkdir.*' | head -1)"
+echo "  (3) the mount options the CONTAINER sees on a live pelfs --fusemount:"
+timeout 120 apptainer exec --fusemount "host:$FMSPEC" /work/local-el9.sif \
+  /bin/sh -c 'grep " /data " /proc/self/mountinfo; grep -c default_permissions /proc/self/mountinfo' \
+  > "$LOGDIR/fusemount-mountinfo.log" 2>&1
+sed 's/^/        /' "$LOGDIR/fusemount-mountinfo.log" | head -5
+if grep -q 'default_permissions' "$LOGDIR/fusemount-mountinfo.log"; then
+  verdict WORKS "default_permissions IS set on the passed fd (the kernel is still checking; pelfs's own check is redundant)"
+  note "INFO|default_permissions=yes"
+else
+  verdict WORKS "default_permissions is NOT set on the passed fd -- so pelfs is the only thing that can apply the mode bits (internal/rawfuse/perm.go)"
+  note "INFO|default_permissions=no"
+fi
+
+# ---------------------- 7e. the permission answer, in the mount, both ways
+say "7e. a mode-denying read, refused the same way through both mounts"
+# CONTROL first: the ordinary host-side FUSE mount, where the kernel does
+# the checking because pelfs asked it to.
+cmdline "cat \$MNT/secret.txt   (mode 000, on a normal pelfs FUSE mount)"
+if OUT=$(cat "$MNT/secret.txt" 2>&1); then
+  verdict FAILS "CONTROL: a 0000 file was readable on a normal FUSE mount: $OUT"
+else
+  echo "    -> $OUT"
+  verdict WORKS "CONTROL: a 0000 file is refused on a normal FUSE mount (the kernel, via default_permissions)"
+fi
+[ "$(cat "$MNT/public.txt" 2>/dev/null)" = "readable by anyone" ] \
+  && verdict WORKS "CONTROL: the 0644 file next to it reads fine" \
+  || verdict FAILS "CONTROL: the 0644 file did not read"
+
+# And now the same two files through a --fusemount mount, where the kernel
+# is NOT doing it.
+cmdline "apptainer exec --fusemount \"host:$FMSPEC\" el9.sif sh -c 'cat /data/secret.txt; test -r /data/secret.txt'"
+timeout 120 apptainer exec --fusemount "host:$FMSPEC" /work/local-el9.sif /bin/sh -c '
+  printf "container id: "; id
+  echo "what the mount REPORTS, as the container sees it (a 65534 here would"
+  echo "mean the id is not mapped in the namespace, which changes every answer):"
+  stat -c "  %n uid=%u gid=%g mode=%a" /data /data/public.txt /data/owneronly.txt
+  if cat /data/owneronly.txt >/dev/null 2>&1; then echo OWNER_CLASS_READ; else echo OWNER_CLASS_DENIED; fi
+  if cat /data/secret.txt 2>&1; then echo "SECRET_READ"; else echo "SECRET_DENIED"; fi
+  if test -r /data/secret.txt; then echo "TEST_R_YES"; else echo "TEST_R_NO"; fi
+  if cat /data/public.txt >/dev/null 2>&1; then echo "PUBLIC_READ"; else echo "PUBLIC_DENIED"; fi
+  if test -r /data/public.txt; then echo "PUBLIC_TEST_R_YES"; else echo "PUBLIC_TEST_R_NO"; fi
+' > "$LOGDIR/fusemount-perm.log" 2>&1
+sed 's/^/    /' "$LOGDIR/fusemount-perm.log"
+if grep -q SECRET_DENIED "$LOGDIR/fusemount-perm.log" && grep -q PUBLIC_READ "$LOGDIR/fusemount-perm.log"; then
+  verdict WORKS "a 0000 file is refused INSIDE a --fusemount mount, and the 0644 file beside it still reads"
+else
+  verdict FAILS "--fusemount permission enforcement: $(grep -E 'SECRET|PUBLIC' "$LOGDIR/fusemount-perm.log" | tr '\n' ' ' | cut -c1-140)"
+fi
+if grep -q OWNER_CLASS_READ "$LOGDIR/fusemount-perm.log"; then
+  verdict WORKS "a 0600 file reads: the caller is recognised as the volume's owner, not squashed into the other class"
+else
+  verdict FAILS "a 0600 file was refused to its own owner (the caller's identity is not what the mount reports)"
+fi
+if grep -q TEST_R_NO "$LOGDIR/fusemount-perm.log"; then
+  verdict WORKS "access(2) answers no about it too (the FUSE ACCESS request, which the kernel sends only when default_permissions is off)"
+else
+  verdict FAILS "test -r said yes about a 0000 file (ACCESS is not being answered)"
+fi
+
+# ------------------- 7f. teardown: the container is KILLED mid-write
+say "7f. --fusemount --rw: SIGKILL the container mid-write; does it still seal?"
+# The failure mode worth guarding against is a driver that leaks an
+# unsealed generation when the job dies. There is nothing to unmount on a
+# passed fd, so the ONLY thing that ends the session is the connection
+# going away -- which is exactly what a killed container does.
+# On its own BRANCH: everything below section 7 is a measurement of the
+# main branch, and a 32 MiB file dropped into it would move numbers the
+# document quotes. A branch is also the honest shape for a job that writes.
+RWWORK=/work/fmrw
+mkdir -p "$RWWORK"
+"$PELFS" branch --state-dir "$STATE" "$PREFIX" fusekill > "$LOGDIR/branch.log" 2>&1 \
+  || { sed 's/^/    /' "$LOGDIR/branch.log"; verdict FAILS "could not create the fusekill branch"; }
+# The VOLUME's signing key: a writable session in a FRESH state directory
+# has nothing to sign a new generation with, and the seal fails after the
+# job has finished -- which is the worst possible moment to find out. A
+# real job ships this file the same way it ships the binary.
+SIGNKEY="$STATE/v2-signing.key"
+[ -f "$SIGNKEY" ] || verdict FAILS "no volume signing key at $SIGNKEY to give the writable driver"
+RWSPEC="$DRIVER --rw --signing-key $SIGNKEY --branch fusekill $PREFIX $RWWORK /data"
+
+echo "  -- first: can the container write into a --rw --fusemount mount at all? --"
+timeout 120 apptainer exec --fusemount "host:$DRIVER --rw --debug --signing-key $SIGNKEY --branch fusekill $PREFIX /work/fmw /data" \
+  /work/local-el9.sif /bin/sh -c '
+  id
+  grep " /data " /proc/self/mountinfo
+  # THE FIRST TOUCH OF THE MOUNT IS DELIBERATELY A WRITE, because the
+  # kernel refuses that one on its own: the root inode it created at
+  # mount(2) carries PLACEHOLDER attributes (uid 0), apptainer mounted
+  # inside a user namespace that does not map uid 0, so i_uid is
+  # INVALID_UID and inode_permission fails HAS_UNMAPPED_ID with EACCES for
+  # any MAY_WRITE. Nothing has asked pelfs anything at this point -- no
+  # CREATE is sent at all -- and one stat of the mountpoint replaces those
+  # attributes with the ones we report and the write goes through.
+  if dd if=/dev/zero of=/data/nostat.bin bs=1M count=1 2>&1; then echo "dd-before-stat=0"; else echo "dd-before-stat=1"; fi
+  stat -c "  %n uid=%u gid=%g mode=%a" /data
+  if dd if=/dev/zero of=/data/afterstat.bin bs=1M count=1 2>&1; then echo "dd-after-stat=0"; else echo "dd-after-stat=1"; fi
+  touch /data/probe-touch; echo "touch=$?"
+  mkdir /data/probe-dir;   echo "mkdir=$?"
+  echo hi > /data/probe-redirect; echo "redirect=$?"
+  dd if=/dev/zero of=/data/probe-dd bs=1M count=1 2>&1 | tail -1; echo "dd-1m=$?"
+  dd if=/dev/zero of=/data/probe-dd32 bs=1M count=32 2>&1 | tail -1; echo "dd-32m=$?"
+  ls -l /data/probe-dd /data/probe-dd32 2>&1
+' > "$LOGDIR/fusemount-write.log" 2>&1
+grep -vE "^(rx|tx) " "$LOGDIR/fusemount-write.log" | sed 's/^/    /' | head -25
+echo "    -- the protocol trace around the first mutating op --"
+grep -E "CREATE|MKNOD|MKDIR|SETATTR|ACCESS|probe-dd" "$LOGDIR/fusemount-write.log" | head -20 | sed 's/^/    /'
+# The probe's own driver is still SEALING what it just wrote when apptainer
+# exits (32 MiB to pack and upload), and it holds the branch's write lease
+# until it is done. The kill case below takes the same branch, so wait for
+# it rather than racing it.
+for i in $(seq 1 60); do
+  pgrep -f 'mount-gen .*--rw' >/dev/null 2>&1 || break
+  sleep 1
+done
+echo "  -- CONTROL: the same dd as the first write into an ORDINARY --rw mount --"
+timeout 120 "$PELFS" mount-gen --rw --branch fusekill --state-dir /work/ddctl \
+  "$PREFIX" /work/ddmnt -- /bin/sh -c 'dd if=/dev/zero of=/work/ddmnt/dd-first.bin bs=1M count=32 2>&1 | tail -1; ls -l /work/ddmnt/dd-first.bin' \
+  > "$LOGDIR/dd-control.log" 2>&1
+echo "    rc=$?"; grep -vE "^20[0-9][0-9]-" "$LOGDIR/dd-control.log" | sed 's/^/    /' | head -6
+grep -q 'dd-first.bin' "$LOGDIR/dd-control.log" \
+  && verdict WORKS "CONTROL: dd as the first write into an ordinary --rw mount" \
+  || verdict FAILS "CONTROL: dd as the first write into an ORDINARY --rw mount also fails: $(grep -iE 'denied|error' "$LOGDIR/dd-control.log" | head -1 | cut -c1-120)"
+for i in $(seq 1 60); do
+  pgrep -f 'mount-gen .*--rw' >/dev/null 2>&1 || break
+  sleep 1
+done
+if grep -q 'touch=0' "$LOGDIR/fusemount-write.log"; then
+  verdict WORKS "a --fusemount mount is writable from inside the container"
+else
+  verdict FAILS "a --fusemount --rw mount refused a write: $(grep -E 'touch=|cannot|denied' "$LOGDIR/fusemount-write.log" | head -2 | tr '\n' ' ' | cut -c1-140)"
+fi
+# The ordering result, which is the kernel's and not pelfs's. Recorded as
+# its own verdict because a job that writes has to know it.
+BEFORE=$(sed -n 's/^ *dd-before-stat=//p' "$LOGDIR/fusemount-write.log" | head -1)
+AFTER=$(sed -n 's/^ *dd-after-stat=//p' "$LOGDIR/fusemount-write.log" | head -1)
+echo "    dd as the FIRST op: rc=$BEFORE   the same dd after one stat of the mountpoint: rc=$AFTER"
+note "INFO|write-before-stat=$BEFORE write-after-stat=$AFTER"
+if [ "$BEFORE" != 0 ] && [ "$AFTER" = 0 ]; then
+  verdict WORKS "KERNEL, NOT PELFS: the first write into a passed-fd mount is EACCES until something stats the mountpoint (placeholder root attrs, uid 0 unmapped in the container's userns -> HAS_UNMAPPED_ID). No CREATE reaches pelfs at all; the trace above shows the LOOKUP and nothing after it"
+elif [ "$BEFORE" = 0 ]; then
+  verdict WORKS "no ordering constraint on this kernel: the first write into a passed-fd mount needs no prior stat"
+else
+  verdict FAILS "writes into a passed-fd mount fail even after a stat (before=$BEFORE after=$AFTER)"
+fi
+genof() { "$PELFS" fsck --branch "$1" --state-dir "$STATE" "$PREFIX" 2>/dev/null | sed -n 's/^generation \([0-9]*\).*/\1/p' | head -1; }
+GEN_BEFORE=$(genof fusekill)
+# SIGKILL to APPTAINER ALONE, and deliberately not to its process group.
+# The distinction is the whole test: killing the group kills the driver
+# too, and a SIGKILL'd driver cannot seal anything by definition (its
+# overlay survives in the state directory for a remount to seal, which is
+# what any kill -9 of any pelfs mount leaves, and its lease expires on the
+# 2-minute TTL). What a --fusemount driver has to survive is the CONTAINER
+# dying while the driver lives: the namespace goes, the mount with it, the
+# device answers ENODEV, and the seal happens then.
+cmdline "apptainer exec --fusemount \"host:$RWSPEC\" el9.sif sh -c 'dd ... /data/killed.bin; sleep 300' & ... kill -9 the apptainer pid"
+apptainer exec --fusemount "host:$RWSPEC" /work/local-el9.sif /bin/sh -c '
+  ls -ld /data > /dev/null    # see the ordering result above: this is what
+                              # makes the kernel fetch the root attributes
+  if dd if=/dev/zero of=/data/killed.bin bs=1M count=32 2>&1 | tail -1; then
+    ls -l /data/killed.bin; echo WROTE
+  else
+    echo DD_FAILED
+  fi
+  sleep 4242
+' > "$LOGDIR/fusemount-kill.log" 2>&1 &
+APID=$!
+for i in $(seq 1 90); do
+  grep -q WROTE "$LOGDIR/fusemount-kill.log" 2>/dev/null && break
+  sleep 1
+done
+grep -q WROTE "$LOGDIR/fusemount-kill.log" 2>/dev/null \
+  && echo "    the job wrote 32 MiB into the mount; killing apptainer (pid $APID) now" \
+  || echo "    WARNING: the write never reported; killing anyway"
+kill -9 $APID 2>/dev/null
+wait $APID 2>/dev/null
+echo "    apptainer is gone (rc=$?)"
+# The driver inherited this log, so its teardown lands in the same file
+# AFTER apptainer's own output: give it a moment and then print all of it,
+# because the seal line is the answer this section is looking for.
+sleep 5
+sed 's/^/    /' "$LOGDIR/fusemount-kill.log"
+# The driver outlives apptainer by however long the seal takes.
+for i in $(seq 1 60); do
+  pgrep -f 'mount-gen .*--rw' >/dev/null 2>&1 || break
+  sleep 1
+done
+if pgrep -f 'mount-gen .*--rw' >/dev/null 2>&1; then
+  verdict FAILS "the driver was still running 60s after the container was killed"
+  pkill -f 'mount-gen .*--rw'
+else
+  verdict WORKS "the driver exited on its own once the connection died"
+fi
+# The container's payload is ORPHANED, not reaped: killing apptainer's
+# starter leaves the `sleep` it launched alive in the container's mount
+# namespace, which holds a recursive bind of /work -- including the
+# host-side pelfs mount at $MNT -- so `pelfs umount` later fails with the
+# mount busy and section 8 cannot remount. Reap it here, by the marker it
+# was given.
+# The killed apptainer leaves ORPHANS, and they matter to everything after
+# this: apptainer binds the cwd (/work) recursively into the container, so
+# any surviving process of that container holds a mount namespace
+# containing the host-side pelfs mount at $MNT -- and `pelfs umount` then
+# fails with the mount busy, which is how section 8 came to report
+# "already mounted" with the real reason truncated away. Reap them by name,
+# and say what was reaped.
+echo "    orphans left by the SIGKILL: $(pgrep -a -f 'squashfuse|sleep 4242|starter' 2>/dev/null | tr '\n' ';' | cut -c1-160)"
+pkill -f 'sleep 4242' 2>/dev/null && echo "    reaped the container's payload"
+pkill -x squashfuse_ll 2>/dev/null && echo "    reaped the container's squashfuse_ll (it held the rootfs mount)"
+pkill -f 'appinit|starter' 2>/dev/null && echo "    reaped a leftover starter"
+sleep 2
+echo "  -- what its statistics file says about the seal --"
+jq -r '"    seal_ok=\(.seal_ok) generation=\(.generation) clean_shutdown=\(.clean_shutdown) exit_code=\(.exit_code) put_bytes=\(.put.bytes)"' \
+  "$RWWORK/pelfs-stats.json" 2>/dev/null || echo "    (no stats file)"
+if [ "$(jq -r '.seal_ok' "$RWWORK/pelfs-stats.json" 2>/dev/null)" = true ]; then
+  verdict WORKS "the killed container's generation WAS sealed (seal_ok=true)"
+else
+  verdict FAILS "the killed container left the generation unsealed: $(jq -c . "$RWWORK/pelfs-stats.json" 2>/dev/null | cut -c1-120)"
+fi
+GEN_AFTER=$(genof fusekill)
+echo "    branch head: generation $GEN_BEFORE -> $GEN_AFTER"
+note "INFO|kill-seal generations $GEN_BEFORE -> $GEN_AFTER"
+if [ -n "$GEN_AFTER" ] && [ "$GEN_AFTER" != "$GEN_BEFORE" ]; then
+  verdict WORKS "the branch advanced, so what the job wrote before it died is published"
+else
+  verdict FAILS "the branch head did not move ($GEN_BEFORE -> $GEN_AFTER)"
+fi
+echo "  -- and the write lease: a later writer must not have to steal it --"
+run "the lease was released: a new writable session takes it without --steal-lease" \
+    timeout 120 "$PELFS" mount-gen --rw --branch fusekill --state-dir /work/leasetest \
+      "$PREFIX" /work/leasemnt -- /bin/true
+# The file the killed job wrote is in the published generation.
+if [ "$(timeout 120 apptainer exec --fusemount "host:$DRIVER --branch fusekill $PREFIX /work/fmro /data" \
+        /work/local-el9.sif /bin/sh -c 'wc -c < /data/killed.bin' 2>/dev/null | tr -d ' ')" = "33554432" ]; then
+  verdict WORKS "the 32 MiB the job wrote before the SIGKILL reads back at full length from a NEW mount"
+else
+  verdict FAILS "killed.bin did not read back at 33554432 bytes"
+fi
+
+if [ -n "$ONLY" ]; then
+  say "results (--only-fusemount)"
+  sed 's/^/  /' "$RESULTS"
+  umount_ro
+  exit 0
+fi
 
 # ------------------------------------------------- 8. read amplification
 say "8. read amplification"

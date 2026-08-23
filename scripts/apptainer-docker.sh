@@ -72,6 +72,7 @@
 #   federation by however slow the real one is; byte counts do not change.
 #
 # Usage: scripts/apptainer-docker.sh [-- extra args to the test]
+#        scripts/apptainer-docker.sh -- --only-fusemount   (sections 1,2,7)
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -143,6 +144,10 @@ ARCH="$(docker image inspect "$IMAGE_TAG" --format '{{.Architecture}}')"
 (cd "$REPO" && CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" go build -o "$STAGE/pelfs" ./cmd/pelfs)
 (cd "$REPO" && CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" go build -o "$STAGE/fakeorigin" ./cmd/fakeorigin)
 cp "$REPO/scripts/apptainer-test.sh" "$STAGE/test.sh"
+# The --fusemount driver wrapper is shipped as itself, not inlined by the
+# test: it is the file a job would deliver, so the harness proves THAT file
+# works rather than a copy of it that has drifted.
+cp "$REPO/scripts/pelfs-fusemount.sh" "$STAGE/pelfs-fusemount.sh"
 chmod -R a+rX "$STAGE"
 
 echo "== running the apptainer matrix on a real Linux kernel (linux/$ARCH) =="

@@ -2,14 +2,20 @@
 
 Status: **measured, not designed.** Everything below the "What works
 today" heading was run, and the numbers are from a run you can repeat
-with `scripts/apptainer-docker.sh`. The design content is the ranked list
-at the end, and it is short, because the answer to "what would that take?"
-turned out to be **almost nothing for the workflow the owner actually
-runs**.
+with `scripts/apptainer-docker.sh` (`-- --only-fusemount` for sections 0-2
+and 7 alone). The design content is the ranked list at the end, and it is
+short, because the answer to "what would that take?" turned out to be
+**almost nothing for the workflow the owner actually runs**.
 
 In one sentence: **an unprivileged `apptainer exec` of a SIF stored on a
-pelfs mount works today, unmodified, and the two things worth changing are
-one `os.MkdirAll` and the write path's dedup.**
+pelfs mount works today, unmodified, and the one thing still worth
+changing is the write path's dedup.**
+
+**W1 is implemented** (2026-08-23, the `--fusemount` section below is
+rewritten from the failure it recorded): `pelfs mount-gen` is an apptainer
+`--fusemount` driver, so a job can mount a pelfs volume inside its own
+container with no host-side pelfs. What that took, and the permission
+question it forced, is the "`--fusemount`" section.
 
 ---
 
@@ -93,14 +99,13 @@ every deviation from a stock container and why each one is not a privilege.
 
 ---
 
-## What does not work: `--fusemount`
+## `--fusemount`: a volume mounted inside the job's own container
 
-This is the interesting failure, because `--fusemount` is the mechanism
-that would let a job mount a pelfs volume **inside its own container with
-no host-side setup at all** — no `pelfs mount` on the worker node, no bind,
-nothing for a site to install.
-
-It fails, for one reason, and the reason is three lines of pelfs.
+This is the mechanism that lets a job mount a pelfs volume **inside its own
+container with no host-side setup at all** — no `pelfs mount` on the worker
+node, no bind, nothing for a site to install. It works as of 2026-08-23
+(work item **W1**), and getting there answered a permission question that
+was not optional.
 
 ### What apptainer hands the driver
 
@@ -115,55 +120,250 @@ form alike, apptainer runs:
 
 That is the libfuse "magic mountpoint" convention. The mountpoint written
 in the spec (`/mnt/probe`) is **not** passed to the driver; apptainer
-substitutes `/dev/fd/N`. Two more facts the probe established:
+substitutes `/dev/fd/N` and appends `-f`. Anything the spec itself carries
+before the mountpoint IS passed through, which is how the wrapper below
+receives the prefix and the work directory. Three more facts the probe
+established:
 
-- the driver's **environment is scrubbed** — a `$PREFIX` exported by the
-  caller is not there, so a wrapper must spell out the prefix, the state
-  directory and `HOME`;
-- with the `container:` form the driver is resolved **inside the container's
-  filesystem**, so a host path fails with
-  `could not start program ...: no such file or directory`. pelfs would
-  have to be in the image, or bound in.
+- the driver's **environment is scrubbed**, and this is all of it:
 
-### What pelfs does with it
+  ```
+  APPTAINER_MESSAGELEVEL=95  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  PWD=/  SHLVL=1  _=/usr/bin/env
+  ```
 
-`pelfs mount-gen` is otherwise exactly the right shape: foreground, one
-generation, no daemonizing, no re-exec, serves until SIGTERM. And go-fuse
-v2.11.0 **already implements** the magic mountpoint —
-`fuse/server.go:854 parseFuseFd` recognises `/dev/fd/N` and skips
-`fusermount` entirely; its own package doc names Singularity as the
-expected "privileged parent".
+  No `HOME`, no `TMPDIR`, no `BEARER_TOKEN_FILE`, and a `$PREFIX` exported
+  by the caller is not there. So a wrapper must spell out the prefix, the
+  state directory, `HOME`, the token and (for `--rw`) the signing key —
+  which is why `scripts/pelfs-fusemount.sh` takes them as arguments and not
+  from the environment;
+- with the `container:` form the driver is resolved **inside the
+  container's filesystem**, so a host path fails with
+  `could not start program ...: no such file or directory`. pelfs has to
+  be in the image, or bound in. `host:` is the right form when condor just
+  delivered the binary;
+- go-fuse v2.11.0 already implements the magic mountpoint
+  (`fuse/server.go:854 parseFuseFd`), and its own package doc names
+  Singularity as the expected "privileged parent".
 
-pelfs never gets that far:
+### What pelfs had to change
+
+`pelfs mount-gen` was otherwise exactly the right shape — foreground, one
+generation, no daemonizing, no re-exec, serves until the mount goes away —
+and it died before reaching `rawfuse.Mount`:
 
 ```
 $ pelfs mount-gen --ro <prefix> /dev/fd/3
 ERROR pelfs: mkdir /dev/fd/3: not a directory
 ```
 
-`cmd/pelfs/mountgen.go:616` does `os.MkdirAll(mountpoint, 0755)` before
-mounting. On `/dev/fd/3` — a symlink to the fuse device — that is
-`ENOTDIR`, and the session exits before `rawfuse.Mount` is reached.
-Through apptainer the same failure surfaces as
-`ls: cannot access '/mnt/pelfs': Transport endpoint is not connected`.
+`os.MkdirAll(mountpoint, 0755)` on `/dev/fd/3` is `ENOTDIR`. Five things
+now key off `rawfuse.PassedFD(mountpoint)` instead:
 
-**The control proves nothing else is in the way.** A stock libfuse driver
-in the same container, through the same mechanism, works:
+1. **no mkdir** — there is no directory to create;
+2. **no unmount at teardown** — the mount belongs to whoever opened the
+   descriptor, this process does not even know its path, and
+   `fuse.Server.Unmount` refuses a magic mountpoint by design;
+3. **no `/dev/fuse` usability probe** — the mount already exists, and on a
+   host that permits FUSE only through that parent the probe would refuse a
+   mount that works;
+4. **`--backend nfs` and `--subshell` are refused with a reason** — the NFS
+   backend attaches by calling `mount(2)` on a directory, and a subshell
+   needs a path to run in;
+5. **pelfs applies the mode bits itself** — the next section, which is the
+   part that was not plumbing.
+
+A trailing `-f` is accepted too (hoisted before flag parsing, since Go's
+flag package stops at the first positional). `mount-gen` has always run in
+the foreground; the flag is documented as the no-op it is.
+
+### The permission question, and its measured answer
+
+On a passed descriptor go-fuse never calls `mount(2)`, so
+`rawfuse.mount`'s `options = ["ro", "default_permissions"]` are **never
+delivered to anything**. pelfs left `Access` at ENOSYS precisely because
+`default_permissions` makes the kernel do the checking, so the risk was a
+`--fusemount` session that silently enforces no permissions at all — six
+weeks after v0.2.0 shipped POSIX enforcement as a headline change.
+
+**Measured, not assumed.** Two pelfs mounts of the same volume by the same
+binary, as `/proc/self/mountinfo` records them — the first an ordinary
+`pelfs mount` on the host, the second a `--fusemount` mount as the
+container sees it:
 
 ```
-$ cat /work/sq-fusemount.sh
-#!/bin/sh
-exec /usr/bin/squashfuse_ll -o offset=36864 /images/el9.sif "$1"
-
-$ apptainer exec --fusemount "host:/work/sq-fusemount.sh /mnt/probe" IMAGE ls /mnt/probe
-afs bin dev environment etc home ...
+/work/mnt  ... - fuse.pelfs pelfs ro,user_id=1001,group_id=1001,default_permissions,max_read=131072
+/data      ... - fuse       fuse  rw,user_id=1001,group_id=1001
 ```
 
-So: apptainer's plumbing works, go-fuse's half works, and one `MkdirAll`
-is the blocker. See work item **W1**; it is not implemented here, and
-there is more to decide than the `mkdir` (below).
+The first asked for `ro,default_permissions` through `fusermount` and got
+them. The second has neither, and not even the `fuse.pelfs` subtype,
+because none of it was ours to set: apptainer called `mount(2)` before the
+driver existed. (A stock libfuse driver through the same mechanism gets the
+identical line — the harness's argv probe shows `/mnt/probe` with exactly
+those options, so this is apptainer's choice and not something about pelfs.)
 
----
+So on that mount **nothing was applying the mode bits**, and the answer is
+not a documented exception:
+
+- `internal/rawfuse/perm.go` implements the check, over
+  **`internal/fsperm`** — the model `internal/vfsbilly/perm.go` already
+  encoded for the NFS frontend, moved into a package both frontends import.
+  There is one permission model in pelfs, not two;
+- it is active **only** when pelfs did not choose the mount options, i.e.
+  on a passed descriptor. An ordinary mount still leaves the check to the
+  kernel, which is cheaper and more faithful, and `Access` still answers
+  ENOSYS there so the kernel stops asking;
+- the identity evaluated is the **caller's**, from the FUSE request header
+  (uid and gid, authenticated by the kernel) — not the server's, which is
+  what the NFS frontend has to use for the reasons in `vfsbilly/perm.go`.
+  The mount owner is evaluated with this process's real groups and CapEff;
+  uid 0 is credited with the four DAC capabilities, which is correct for a
+  mount owned by a user namespace whose root it is.
+
+Where it is applied, and the two holes that leaves, are in
+`internal/rawfuse/perm.go` and worth reading before trusting it: with
+`default_permissions` off the kernel checks nothing but "an exec needs SOME
+execute bit", so the checks go on the requests that are always sent — OPEN,
+OPENDIR, ACCESS, and the namespace operations. **Path traversal is enforced
+only on a dentry-cache miss** (this mount hands out effectively infinite
+entry TTLs, so a permitted caller's lookup can be reused by one who is not
+permitted), and **a caller's supplementary groups are not on the wire**, so
+for any uid but the mount owner the group class is evaluated on the primary
+gid alone. Closing the first is exactly what `default_permissions` is for.
+A `--fusemount` driver serves one job's uid, where none of this bites.
+
+Verified in the container, not just in unit tests. Same volume, same modes,
+both frontends:
+
+```
+CONTROL, an ordinary pelfs FUSE mount (the kernel checks):
+    $ cat /work/mnt/secret.txt
+    cat: /work/mnt/secret.txt: Permission denied
+
+INSIDE a --fusemount mount (pelfs checks), as uid 1001:
+    $ stat -c '%n uid=%u gid=%g mode=%a' /data /data/public.txt /data/owneronly.txt
+      /data uid=1001 gid=1001 mode=755
+      /data/public.txt uid=1001 gid=1001 mode=644
+      /data/owneronly.txt uid=1001 gid=1001 mode=600
+    $ cat /data/secret.txt        -> Permission denied     (mode 000)
+    $ test -r /data/secret.txt    -> no                    (the ACCESS request)
+    $ cat /data/owneronly.txt     -> read                  (mode 600, we are the owner)
+    $ cat /data/public.txt        -> read
+```
+
+Reverting only the permission half — `Mount`/`MountRW` binding unchecked
+even for a passed fd — makes the same container print `SECRET_READ` and
+`TEST_R_YES`: the 0000 file reads, and `test -r` says yes. That is the
+mutation this section is claiming to prevent.
+
+### The command line that works today
+
+```
+apptainer exec \
+  --fusemount "host:$_CONDOR_SCRATCH_DIR/pelfs-fusemount.sh \
+               pelican://<federation>/<prefix> \
+               $_CONDOR_SCRATCH_DIR/pelfs-work /data" \
+  mypipeline.sif ./payload
+```
+
+`scripts/pelfs-fusemount.sh` is in the repo, is what the harness runs (not
+a copy of it), and documents each thing it has to spell out because the
+environment is scrubbed. Condor ships the binary and the wrapper into the
+scratch directory and that is the whole deployment. For a writable mount
+add `--rw` and `--signing-key <file>` — see the constraints below.
+
+### Teardown: a killed container still seals
+
+There is nothing to unmount, so exactly two things end the session, and
+both were exercised:
+
+- **the connection going away**, which is the ordinary case: apptainer
+  closes its copy of the fd, or the container's mount namespace dies with
+  it. The device answers `ENODEV`, go-fuse's serve loop exits, and the seal
+  runs with no server left to race it;
+- **a signal**, which is why the wait is a `select` and not a `Wait`. A
+  blocked `read(2)` on `/dev/fuse` cannot be interrupted from userspace —
+  neither `close` nor `dup2` wakes it, which is why libfuse unmounts or
+  writes the kernel's abort file instead — so a signalled driver cannot
+  stop its own serve loop. It stops waiting, seals, releases the lease and
+  exits; the process exiting drops the connection.
+
+SIGKILL to apptainer alone, mid-write, in the harness (section 7f):
+
+```
+    the job wrote 32 MiB into the mount; killing apptainer (pid 1014) now
+    apptainer is gone (rc=137)
+    INFO pelfs: sealing the overlay into the next generation...
+    INFO pelfs: seal took 114ms (259ms CPU, 22.1 MiB downloaded, 919.6 KiB uploaded)
+    INFO pelfs: sealed generation 4 (0 chunks, 1 catalogs written, 1 packs)
+    INFO pelfs: torn down in 116ms (... seal 115ms, ... lease release 0s, ...)
+  [WORKS] the killed container's generation WAS sealed (seal_ok=true)
+    branch head: generation 3 -> 4
+  [WORKS] the lease was released: a new writable session takes it without --steal-lease
+  [WORKS] the 32 MiB the job wrote before the SIGKILL reads back from a NEW mount
+```
+
+The distinction that matters: this is SIGKILL to **apptainer**, not to the
+driver. A SIGKILL of the driver itself (which is what a cgroup kill of the
+whole job does) cannot seal anything — no process can — and leaves exactly
+what any `kill -9` of any pelfs mount leaves: the overlay intact in the
+state directory for a remount to seal, and a write lease that expires on
+its own 2-minute TTL. `--snapshot-interval` bounds what such a kill can
+cost; the default is 5 minutes.
+
+### Two things a writable `--fusemount` job must do
+
+Both were found by running it, and both fail at the worst possible moment
+if missed.
+
+**1. Ship the volume's signing key.** A writable session in a fresh work
+directory has nothing to sign a new generation with, and the seal fails
+*after* the job has finished:
+
+```
+ERROR pelfs: seal: no signing key at /work/fmrw/state/v2-signing.key but the branch
+  already has generations signed by e344ad58 — import the volume signing key
+  (the overlay is intact at /work/fmrw/state/overlay; remount to retry)
+```
+
+The wrapper takes `--signing-key <file>` for this, and warns at mount time
+rather than at the seal when `--rw` has no key. Reading needs no key.
+
+**2. Something must stat the mountpoint before the first write — and this
+one is the kernel's, not pelfs's.** With no prior stat, the first write
+into a `--fusemount` mount is refused:
+
+```
+    rx 4: LOOKUP n1 "nostat.bin"  p18
+    tx 4:     2=no such file or directory
+    dd: failed to open '/data/nostat.bin': Permission denied     <- no CREATE was ever sent
+    rx 6: GETATTR n1              p20                            <- one stat of /data
+    tx 6:     OK, {M040755 ... 1001:1001 ...}
+    rx 8: LOOKUP n1 "afterstat.bin"
+    rx 10: CREATE n1 {0100644 [WRONLY,CREAT,TRUNC]} "afterstat.bin"
+    tx 10:    OK                                                 <- the same write, now fine
+```
+
+`dd as the FIRST op: rc=1   the same dd after one stat of the mountpoint: rc=0`.
+
+**No CREATE reaches pelfs at all**, which is what pins the blame: the
+kernel refuses it in `inode_permission`, before `->permission` and before
+any request. The root inode it created at `mount(2)` carries placeholder
+attributes with uid 0; apptainer mounted inside a user namespace that does
+not map uid 0, so `i_uid` is `INVALID_UID` and `HAS_UNMAPPED_ID` fails any
+`MAY_WRITE` with EACCES. Reads are unaffected — the check is write-only —
+which is why a read-only `--fusemount` mount never sees this. One `stat` of
+the mountpoint replaces those attributes with the ones pelfs reports and
+everything after it works. It reproduces with the permission half of pelfs
+removed entirely, and an ordinary `pelfs mount-gen --rw` on a directory
+takes the same first write with no stat at all (both are controls in the
+harness).
+
+Nothing pelfs can do about it from inside: a FUSE server cannot push
+attributes, and the driver does not know the mountpoint's path. So a
+writable job's payload should begin with a `ls -ld "$MOUNT"` or `test -d
+"$MOUNT"`, which most scripts do by accident.
 
 ## Read amplification, measured
 
@@ -382,7 +582,10 @@ No amount of work on pelfs moves any of these.
 4. **`fusermount3` matters only for pelfs's own mount.** Inside its user
    namespace apptainer performs the FUSE mount itself with the namespace's
    `CAP_SYS_ADMIN`, so `squashfuse_ll` needs no setuid helper. The setuid
-   `fusermount3` is what `pelfs mount` needs on the way in.
+   `fusermount3` is what `pelfs mount` needs on the way in — and what a
+   `--fusemount` driver does **not**: apptainer has already mounted, so
+   that path needs no setuid helper on the host either. On a node with no
+   `fusermount3` at all, `--fusemount` is the only way in.
 5. **Nested FUSE doubles the round trips** and, measured, costs about 12%
    on an in-container workload with the packs already local (1.11 s against
    0.99 s off local disk) and nothing measurable on container startup.
@@ -417,7 +620,7 @@ bug:
 
 | | change | buys | effort | unblocks |
 |---|---|---|---|---|
-| **W1** | Skip `os.MkdirAll` for a `/dev/fd/N` mountpoint (`cmd/pelfs/mountgen.go:616`), and skip `srv.Unmount()` for it at teardown (go-fuse refuses a magic mountpoint by design). Tolerate a trailing `-f`. | `--fusemount`: a job mounts a pelfs volume **inside its own container**, no host-side pelfs, nothing for a site to install | ~1 hour for the plumbing; see the caveat below | the only FAILS row in the matrix |
+| ~~**W1**~~ | **DONE (2026-08-23).** `rawfuse.PassedFD` gates the mkdir, the unmount, the `/dev/fuse` probe, the backend choice and the permission check; `internal/fsperm` + `internal/rawfuse/perm.go` apply the mode bits where the kernel does not; `scripts/pelfs-fusemount.sh` is the driver wrapper. | `--fusemount`: a job mounts a pelfs volume **inside its own container**, no host-side pelfs, nothing for a site to install | took an afternoon: the plumbing was an hour and the permission model was the rest | was the only FAILS row in the matrix |
 | **W2** | Cross-generation dedup on the **default** write path — or, far cheaper, document `--no-memtable` as the flag for publishing images and count the seal path's dedup in `write.deduped_chunks` | 149 MB instead of 273 MB for four related images; 92.8% off a derived image, ~100% off a re-push | documenting + the counter: hours. Making the memtable path dedup: real work — its chunker cuts per flush batch and its index is per session | pelfs as an image distribution channel |
 | **W3** | A path argument to `genfs.Prefetch` / `--prefetch <path>` | prefetch one image out of a volume of twenty, instead of the whole generation | moderate | "prefetch or stage" on a slow link |
 | **W4** | Set `MaxWrite`/`MaxReadAhead` in `rawfuse.mount`'s `MountOptions` (both unset today, so reads cap at 128 KiB against a 4 MiB chunk) | fewer FUSE round trips per decoded chunk on the nested-FUSE path | two fields | nothing blocked; a constant-factor win |
@@ -425,14 +628,16 @@ bug:
 | **W6** | Persist the decoded-chunk arena's index across mounts | a fresh mount with warm packs still re-decodes (`warm packs, cold arena` shows the same 7 misses as cold) | real; the index is deliberately memory-only | CPU only, no bandwidth |
 | **W7** | A decoded-bytes counter in the stats file | decode amplification is currently only estimable, never measurable | small | this document's one estimate |
 
-**The caveat inside W1**, which is design and not plumbing: on a passed
-`/dev/fuse` fd, go-fuse never calls `mount(2)`, so
-`rawfuse.mount`'s `options = ["ro", "default_permissions"]` are **never
-applied** — apptainer chose the mount options. pelfs leaves `Access` at
-`ENOSYS` precisely because `default_permissions` makes the kernel do the
-checking, so a `--fusemount` session silently loses its permission model.
-Either implement `Access`, or refuse the magic mountpoint with a message
-saying why. Do not merely delete the `MkdirAll`.
+**The caveat inside W1 was the real work, and it was answered rather than
+documented as an exception**: on a passed `/dev/fuse` fd, go-fuse never
+calls `mount(2)`, so `rawfuse.mount`'s
+`options = ["ro", "default_permissions"]` are never applied — apptainer
+chose the mount options, and it does not ask for `default_permissions`
+(measured, above). `Access` and the rest of the check are therefore
+implemented in `internal/rawfuse`, over the model in `internal/fsperm` that
+the NFS frontend uses, and active only where the kernel is not doing it.
+`ro` is enforced the same way it always was on a read-only binding: every
+mutating op answers EROFS.
 
 ---
 
@@ -462,43 +667,34 @@ pelfs mount-gen --rw --no-memtable <prefix> ~/publish -- cp mypipeline.sif ~/pub
 
 Without it a derived image costs 68 MB; with it, 4.9 MB.
 
-**The smallest change set that unblocks a workflow that does not work
-today** is **W1 alone**, and the workflow it buys is worth naming, because
-it removes the last thing a site has to agree to:
+**And for a job that would rather not mount anything on the host at all**,
+W1 is now in, so this works:
 
 ```
 apptainer exec \
-  --fusemount "host:$_CONDOR_SCRATCH_DIR/mount-my-volume.sh /data" \
+  --fusemount "host:$_CONDOR_SCRATCH_DIR/pelfs-fusemount.sh \
+               pelican://<federation>/<prefix> \
+               $_CONDOR_SCRATCH_DIR/pelfs-work /data" \
   mypipeline.sif ./payload
-```
-
-where the wrapper is, in full:
-
-```
-#!/bin/bash
-# apptainer runs us as: <this> /dev/fd/N -f, with a SCRUBBED environment,
-# so everything it needs is written out rather than inherited.
-export HOME=/scratch/home
-exec /scratch/pelfs-bin/pelfs mount-gen --ro --state-dir /scratch/pelfs \
-     pelican://<federation>/<prefix> "$1"
 ```
 
 That is a pelfs volume mounted at `/data` inside the job's own container,
 by the job, with **no `pelfs mount` on the host** and nothing for the site
-to install beyond apptainer itself — condor ships the binary and the
-wrapper into the scratch directory and that is the whole deployment. The
-`host:` form is the right one here because the driver is a host path; the
-`container:` form works identically but resolves the driver inside the
-image, so it needs pelfs baked into the image or bound in. Everything in
-that command line works now except the `os.MkdirAll`, and the control run
-proves it.
+to install beyond apptainer itself — condor ships the binary and
+`scripts/pelfs-fusemount.sh` into the scratch directory and that is the
+whole deployment. The `host:` form is the right one here because the driver
+is a host path; the `container:` form works identically but resolves the
+driver inside the image, so it needs pelfs baked in or bound in. Add `--rw`
+and `--signing-key` to write, and read the two constraints in the
+`--fusemount` section first.
 
 ---
 
 ## Re-running this
 
 ```
-scripts/apptainer-docker.sh          # builds the image (network) then runs with --network none
+scripts/apptainer-docker.sh                        # builds the image (network) then runs with --network none
+scripts/apptainer-docker.sh -- --only-fusemount    # sections 0-2 and 7 only, ~40s of container time
 ```
 
 The dedup numbers come from `internal/dedupbench` against real SIFs:

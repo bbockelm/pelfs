@@ -200,6 +200,34 @@ pelfs shell --prefetch background --stats-file $_CONDOR_SCRATCH_DIR/pelfs-stats.
   lower layer retried successfully, so nonzero errors with
   `clean_shutdown: true` means "transient trouble, but all data made it".
 
+### Inside a container: apptainer `--fusemount`
+
+A job that runs its payload in a container can mount the volume **inside
+that container**, with no `pelfs mount` on the host and no bind:
+
+```
+apptainer exec \
+  --fusemount "host:$_CONDOR_SCRATCH_DIR/pelfs-fusemount.sh \
+               pelican://osg-htc.org/.../scratch \
+               $_CONDOR_SCRATCH_DIR/pelfs-work /data" \
+  mypipeline.sif ./payload
+```
+
+`scripts/pelfs-fusemount.sh` is the driver wrapper; ship it and the pelfs
+binary with the job. Apptainer opens `/dev/fuse` itself and runs the driver
+on the descriptor, so this needs no setuid `fusermount3` on the node — but
+it does need what everything else here needs: unprivileged user namespaces,
+and a `/dev/fuse` the job may open. Add `--rw --signing-key <file>` to
+write; the wrapper's header and `docs/design-apptainer.md` explain why the
+key and the prefix are command-line arguments (apptainer scrubs the
+driver's environment) and what a writable job must do first.
+
+Permissions on such a mount are applied by pelfs rather than by the kernel:
+the mount options belong to whoever called `mount(2)`, and apptainer does
+not ask for `default_permissions`, so `internal/rawfuse` enforces the same
+model the NFS frontend does (`internal/fsperm`). A mode-0000 file is
+refused inside the container exactly as it is on an ordinary mount.
+
 ## Controlling a running mount
 
 ```

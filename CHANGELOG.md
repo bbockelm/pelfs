@@ -1,5 +1,47 @@
 # Changelog
 
+## Unreleased
+
+### `pelfs fsck` findings now have a severity, and a warning does not fail a run
+
+`fsck` had one verdict: anything it found was damage, and any finding exited
+1. That is right for everything it checks today and wrong for two checks
+arriving next, where the thing being reported is normal rather than broken —
+an external source a volume points at having been republished, or a pinned
+source that cannot be verified from this volume's objects alone. Under the
+old model those would exit 1 on a perfectly healthy volume, and an operator
+who learns that `fsck` cries wolf stops running `fsck`.
+
+What changes for an operator:
+
+- **Nothing was reclassified.** Every check `fsck` ships still reports
+  damage, still exits 1, and reports it in the same words. Nothing produces
+  a warning yet; this release is the tier, not a user of it.
+- **Exit status is unchanged for damage and for a healthy volume**: 0 when
+  nothing was found, 1 when the generation is damaged or the check could not
+  run, 2 for a usage error. Warnings alone will exit **0** — a script that
+  reads "nonzero means broken" will not start failing on a volume that is
+  fine.
+- **`--strict`** fails on warnings too, for a cron job that wants any
+  finding to be an alert. It exits 1, like damage: the flag means "a warning
+  is an error".
+- **Every finding line now leads with its severity** — `error: missing-chunk:
+  /path: ...` — so a line lifted out of the report by a grep still says
+  whether it is damage. The kind, path and detail behind it are unchanged.
+- **The summary line names the warnings it is standing next to.** A run with
+  warnings and no damage says `generation is consistent, with 2 warnings to
+  read above (not damage)`, so "consistent" is never the whole story when it
+  is not. The words `generation is consistent` still appear whenever the
+  generation is consistent, which is what existing greps match.
+
+For anyone using `internal/fsck` directly: `Problem` carries a `Severity`
+(`SeverityError` is the zero value, so an unstated severity is damage),
+`Report` gained `Errors()`, `Warnings()`, `Damaged()` and `Clean()`, and
+`Report.OK()` is **gone**. It used to mean "no findings at all"; with two
+severities every caller has to say which question it is asking — "is this
+volume sound" (`Damaged`) or "is there anything to show a human" (`Clean`) —
+and removing it is how each one got asked.
+
 ## v0.2.1
 
 v0.2.0 made an NFS mount enforce the mode bits and a writable mount collect

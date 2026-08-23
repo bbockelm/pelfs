@@ -110,7 +110,7 @@ both zero. `pelfs ctl <mount> status` (`mountgen.go:2356-2422`) reports
 neither. Offline it IS answered
 twice, both by commands that do real work: `pelfs repack-plan` prints
 `packs: <n>, <bytes> (<pct> live)` (`cmd/pelfs/repackplan.go:190`) and
-`pelfs fsck` prints a pack count (`cmd/pelfs/fsck.go:94`). Auto-repack
+`pelfs fsck` prints a pack count (`cmd/pelfs/fsck.go:173`). Auto-repack
 narrowed this for volumes that ARE mounted writably; the volume this item
 was written for is the one nobody mounts.
 

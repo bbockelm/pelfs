@@ -142,7 +142,7 @@ func TestRepackRewritesPacksAndEveryFileStillReads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fsck the repacked generation: %v", err)
 	}
-	if !rep.OK() {
+	if !rep.Clean() {
 		for _, pr := range rep.Problems {
 			t.Errorf("fsck: %s %s: %s", pr.Kind, pr.Path, pr.Detail)
 		}
@@ -454,7 +454,7 @@ func TestPartlyLivePacksHaveTheirSurvivorsCarried(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fsck: %v", err)
 	}
-	if !rep.OK() {
+	if !rep.Clean() {
 		for _, pr := range rep.Problems {
 			t.Errorf("fsck: %s %s: %s", pr.Kind, pr.Path, pr.Detail)
 		}

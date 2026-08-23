@@ -128,7 +128,7 @@ func problemsOf(rep *fsck.Report, kind string) []fsck.Problem {
 func dumpProblems(t *testing.T, rep *fsck.Report) {
 	t.Helper()
 	for _, p := range rep.Problems {
-		t.Logf("problem: %s %s: %s", p.Kind, p.Path, p.Detail)
+		t.Logf("problem: %s: %s %s: %s", p.Severity, p.Kind, p.Path, p.Detail)
 	}
 }
 
@@ -165,7 +165,7 @@ func TestHealthyGeneration(t *testing.T) {
 	rep := check(t, inner, res.Superblock, fsck.Options{})
 	dumpProblems(t, rep)
 
-	if !rep.OK() {
+	if !rep.Clean() {
 		t.Fatalf("healthy generation reported %d problems", len(rep.Problems))
 	}
 	st := res.Stats
@@ -199,7 +199,7 @@ func TestDeepHealthy(t *testing.T) {
 	rep := check(t, inner, res.Superblock, fsck.Options{Deep: true, Workers: 4})
 	dumpProblems(t, rep)
 
-	if !rep.OK() {
+	if !rep.Clean() {
 		t.Fatalf("deep check of a healthy generation reported %d problems", len(rep.Problems))
 	}
 	if rep.Chunks == 0 || rep.ChunksVerified != rep.Chunks {
@@ -231,6 +231,12 @@ func TestMissingPack(t *testing.T) {
 	}
 	if len(problemsOf(rep, fsck.KindMissingChunk)) == 0 {
 		t.Fatal("no chunk was reported missing after deleting a data pack")
+	}
+	// A deleted pack is damage on the wire, not advice: the severity has
+	// to arrive that way from a real sweep, not only from SeverityOf.
+	if !rep.Damaged() || rep.Warnings() != 0 {
+		t.Fatalf("deleting a data pack gave %d errors and %d warnings; it is damage",
+			rep.Errors(), rep.Warnings())
 	}
 	// Everything else still reported.
 	if rep.Packs != len(packsOf(t, inner, sb))-1 {
@@ -348,7 +354,7 @@ func TestCorruptChunkBytes(t *testing.T) {
 	// still the recorded length, and nothing reads it.
 	shallow := check(t, inner, sb, fsck.Options{})
 	dumpProblems(t, shallow)
-	if !shallow.OK() {
+	if !shallow.Clean() {
 		t.Fatalf("default mode reported %d problems; it must not read chunk bytes", len(shallow.Problems))
 	}
 
@@ -391,7 +397,7 @@ func TestEncryptedDeep(t *testing.T) {
 
 	rep := check(t, inner, sb, fsck.Options{DEK: dek, Deep: true, Workers: 4})
 	dumpProblems(t, rep)
-	if !rep.OK() {
+	if !rep.Clean() {
 		t.Fatalf("healthy encrypted generation reported %d problems", len(rep.Problems))
 	}
 	if rep.Chunks == 0 || rep.ChunksVerified != rep.Chunks {
@@ -415,7 +421,7 @@ func TestEncryptedDeep(t *testing.T) {
 	// story on a keyed-identity volume.
 	victim, entry := packHolding(t, inner, sb, isData)
 	flipDataByte(t, filepath.Join(volDir, packstore.PackDirKey, victim.Name), entry.Off+entry.Length/2)
-	if shallow := check(t, inner, sb, fsck.Options{DEK: dek}); !shallow.OK() {
+	if shallow := check(t, inner, sb, fsck.Options{DEK: dek}); !shallow.Clean() {
 		t.Fatalf("default mode reported %d problems on tampered ciphertext; it must not read chunk bytes", len(shallow.Problems))
 	}
 	deep := check(t, inner, sb, fsck.Options{DEK: dek, Deep: true, Workers: 4})
@@ -520,7 +526,7 @@ func TestHealthyGenerationWithCarriedCatalogs(t *testing.T) {
 
 	rep := check(t, inner, second.Superblock, fsck.Options{Deep: true, Workers: 4})
 	dumpProblems(t, rep)
-	if !rep.OK() {
+	if !rep.Clean() {
 		t.Fatalf("a generation with carried catalogs reported %d problems", len(rep.Problems))
 	}
 	if rep.Catalogs != first.Stats.Catalogs {
@@ -543,7 +549,7 @@ func TestFsckVerifiesAManifestOnlyGeneration(t *testing.T) {
 	}
 	rep := check(t, inner, sb, fsck.Options{Deep: true, Workers: 4})
 	dumpProblems(t, rep)
-	if !rep.OK() {
+	if !rep.Clean() {
 		t.Fatalf("a healthy manifest-only generation reported %d problems", len(rep.Problems))
 	}
 	if rep.Packs != len(packsOf(t, inner, sb)) {
@@ -630,7 +636,7 @@ func TestSharedChunksAreVerifiedOnce(t *testing.T) {
 
 	rep := check(t, inner, res.Superblock, fsck.Options{Deep: true, Workers: 4})
 	dumpProblems(t, rep)
-	if !rep.OK() {
+	if !rep.Clean() {
 		t.Fatalf("a healthy generation reported %d problems", len(rep.Problems))
 	}
 	if rep.Files != 6 {

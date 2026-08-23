@@ -100,10 +100,10 @@ func newSessionID() string {
 // next seal grows from. A mid-session checkpoint advances it, which is the
 // only state a checkpoint changes (see checkpoint).
 type genSession struct {
-	prefix     string
-	branch     string
-	tag        string
-	stateDir   string
+	prefix   string
+	branch   string
+	tag      string
+	stateDir string
 	// stateRoot is the root this invocation's flags select — the same
 	// answer cmdOpts.stateRoot gives — and it is where the mount record
 	// goes. It is a FIELD rather than a call to defaultStateRoot() from

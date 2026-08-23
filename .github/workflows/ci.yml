@@ -570,7 +570,11 @@ jobs:
           CGO_ENABLED=0 go build -trimpath \
             -ldflags "-X github.com/bbockelm/pelfs/internal/version.release=${GITHUB_REF_NAME}" \
             -o "$dist/pelfs$exe" ./cmd/pelfs
-          cp README.md CHANGELOG.md LICENSE "$dist/"
+          # NOTICE is not optional: Apache-2.0 section 4(d) requires it
+          # travel with the distribution, and it is also where the Pelican
+          # Platform mark's permission and the "not an official Pelican
+          # product" disclaimer are recorded.
+          cp README.md CHANGELOG.md LICENSE NOTICE "$dist/"
           tar -czf "${dist}.tar.gz" "$dist"
           ls -l "${dist}.tar.gz"
       # The runner is linux/amd64, so one of the four can actually be run.

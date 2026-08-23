@@ -10,6 +10,9 @@ object graph, and publishing a change is one atomic ref flip.
 pelfs init   pelican://osg-htc.org/my/namespace/scratch    # create a volume
 pelfs shell  pelican://.../scratch                         # mount + subshell
 pelfs mount  [--rw] pelican://.../scratch [mountpoint]     # background mount
+pelfs browse [--rw] pelican://.../scratch                  # a page on 127.0.0.1: what is
+                                                           #   published, publish now, and a
+                                                           #   WebDAV endpoint for Cyberduck
 pelfs umount pelican://.../scratch                         # stop it cleanly
 pelfs status                                               # list background mounts
 pelfs gc     [--delete] pelican://.../scratch              # sweep unreferenced packs

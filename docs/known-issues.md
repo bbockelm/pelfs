@@ -36,13 +36,33 @@ two rows were added to the table at the bottom, and the KI/KL entries that
 predate it were not re-checked (they were current at `0c2baf0` and nothing
 in `pelfs browse` touches them).
 
-Every entry below was checked against the code at `0c2baf0`: all six KI
-and all six KL entries were still true. (KL-8 was filed after that audit,
-with the `--fusemount` work; KL-10 was filed and then closed after it, and
-is in the table at the bottom; KI-10 was filed with the fsync work and
-closed by commit-agent, and is in that table too.) What had rotted was the citations —
-`internal/repack/execute.go` had moved ~83 lines under KI-9 — and one
-paragraph that had itself gone stale (removed).
+**Re-verified at `b16784d`** by release2-agent for the v0.2.1 release,
+this time over every entry rather than one surface. The file now holds
+**7 KI (4-9, 11) and 15 KL (1-9, 11-16)** — KL-15 and KL-16 are new here,
+for the two limitations this release ships with that nothing else tracks:
+no resumable upload on any surface, and what an NFS mount's honest `fsync`
+costs on real storage. Three things were wrong and are fixed:
+
+- **KI-10 was still here as an open entry while the table at the bottom
+  said it was fixed.** It is fixed — `f49cb8f` in this repo and `d92cb75`
+  in the go-nfs fork — so by rule 2 the entry is deleted and the table row
+  is the record. The preamble above already claimed this had happened; it
+  had not.
+- The closing prose carried a **duplicated half-sentence** from a merge,
+  which listed KI-10 as open in the same breath as the paragraph explaining
+  how it was closed.
+- **Every KI entry except KI-9 had stale citations.** `cmd/pelfs/mountgen.go`
+  moved ~130 lines this cycle, `internal/genfs/packindex.go` ~110, and
+  `internal/vfsbilly/vfsbilly.go` ~97. KI-9's ten line numbers are all
+  still exact. KL-6's SCOPE was also wrong rather than merely its
+  citations, and KL-9 named the wrong harness script.
+
+Every entry was previously checked against the code at `0c2baf0`, where all
+of the then-open KI and KL entries were still true. (KL-8 was filed after
+that audit, with the `--fusemount` work; KL-10 was filed and then closed
+after it, and is in the table at the bottom.) What had rotted then was the
+citations — `internal/repack/execute.go` had moved ~83 lines under KI-9 —
+and one paragraph that had itself gone stale (removed).
 
 ---
 
@@ -59,17 +79,17 @@ published nothing for a day".
 — `Summary.Maintenance` carries `last_repack_at`, `last_gc_at`,
 `collections`, `reclaimed_objects`, `reclaimed_bytes`, `condemned_bytes`,
 the grace window applied, `collection_failures` and `last_collection_error`
-(`internal/stats/stats.go:225-243`, reported by
+(`internal/stats/stats.go:232-250`, reported by
 `pelfs ctl <mount> status`). The **checkpoint** half did not. The seal
 block of `Summary` is counters and ids only — `Seals`, `SealedGeneration`,
 `SealedChunks`, `SealedCatalogs`, `SealedPacks`, `SealOK`
-(`stats.go:186-197`) — with no timestamp anywhere:
+(`stats.go:187-204`) — with no timestamp anywhere:
 `grep -rn 'LastCheckpoint\|last_seal' --include=*.go` is empty repo-wide.
 And the failure count is not merely unreported, it is never computed:
-`checkpointPeriodically` (`cmd/pelfs/mountgen.go:1887-2001`) keeps a local
-`backoff` duration, resets it on success (`:1962`), warns
-(`:1957-1960`), and never touches `g.stats`. `SealOK`
-(`mountgen.go:2040`, `:2045`) is a boolean about the seal at EXIT.
+`checkpointPeriodically` (`cmd/pelfs/mountgen.go:2014-2135`) keeps a local
+`backoff` duration, resets it on success (`:2083`), warns
+(`:2079-2081` and `:2120-2122`), and never touches `g.stats`. `SealOK`
+(`mountgen.go:2167`, `:2172`) is a boolean about the seal at EXIT.
 
 **Field shape to copy:** `MaintenanceStats`.
 
@@ -85,8 +105,8 @@ paying for a full sweep.
 file. The nearest fields, `PrefetchPacks` / `PrefetchBytes`
 (`internal/stats/stats.go:155-156`), are the right number written from
 exactly one place — `runPrefetch`'s recorder,
-`cmd/pelfs/mountgen.go:1035-1036` — so a mount without `--prefetch` leaves
-both zero. `pelfs ctl <mount> status` (`mountgen.go:2240-2270`) reports
+`cmd/pelfs/mountgen.go:1172-1173` — so a mount without `--prefetch` leaves
+both zero. `pelfs ctl <mount> status` (`mountgen.go:2356-2422`) reports
 neither. Offline it IS answered
 twice, both by commands that do real work: `pelfs repack-plan` prints
 `packs: <n>, <bytes> (<pct> live)` (`cmd/pelfs/repackplan.go:190`) and
@@ -101,16 +121,16 @@ was written for is the one nobody mounts.
 **Severity: low-medium, diagnosis.** When a transfer fails permanently, the
 class the retry loop just computed is thrown away.
 
-**Mechanism.** `internal/packstore/retry.go:189-194` returns a
+**Mechanism.** `internal/packstore/retry.go:189-193` returns a
 non-retryable error with no counter and no log line, on the stated grounds
 that logging FAILED there would cry wolf on every legitimate 404 probe —
 a good reason not to log, not a reason to discard the class. `retryable`
-(`retry.go:219-227`) distinguishes context-end from `isNotExist` from a
+(`retry.go:219-228`) distinguishes context-end from `isNotExist` from a
 `"404"`/`"not found"` substring and returns a bare bool.
 `internal/packstore` imports no `stats` at all. The op IS counted
 downstream, because the stats wrapper sits inside the retry loop
-(`cmd/pelfs/mountgen.go:487`), into per-verb `Errors` plus 20 error samples
-(`internal/stats/stats.go:88-105`, sampled at `:393-405`) — which is precisely the
+(`cmd/pelfs/mountgen.go:574`), into per-verb `Errors` plus 20 error samples
+(`internal/stats/stats.go:88-105`, sampled at `:420-430`) — which is precisely the
 "one scalar + verb-split" that is not enough to tell a misconfigured token
 from a flaky link.
 
@@ -126,10 +146,10 @@ win.
 **Mechanism.** `overlay.FS.SetAttr` takes `fs.mu` then one `withTx`
 (`internal/overlay/write.go:606-613`), and `withTx` is
 `Begin`…`Commit`, one commit per call
-(`internal/overlay/overlay.go:502-519`). No group commit, no deferred
-writeback. `internal/rawfuse/rw.go:322-351` does merge mode/uid/gid/size/
+(`internal/overlay/overlay.go:552-569`). No group commit, no deferred
+writeback. `internal/rawfuse/rw.go:380-415` does merge mode/uid/gid/size/
 mtime WITHIN one kernel request, but tar's three syscalls arrive as three
-requests; `internal/vfsbilly/vfsbilly.go:908-987` calls `SetAttr` once per
+requests; `internal/vfsbilly/vfsbilly.go:1005-1084` calls `SetAttr` once per
 operation from `Chmod`/`Chown`/`Lchown`/utimes.
 
 **Reproduce.** `make big-tree`, or `scripts/e2e-docker.sh`'s untar leg,
@@ -147,8 +167,8 @@ burn-down capped the read path's resident location map at 131,072 entries
 measured at 169-174 bytes each, so 15.8-16.2 GiB at 100M objects.
 
 **Mechanism.** `packIndex.holdEverything`
-(`internal/genfs/packindex.go:282-286`) sets `unbounded` one-way and is
-called from `packIndex.all` (`:547`). Callers of `all` at HEAD:
+(`internal/genfs/packindex.go:278-287`) sets `unbounded` one-way and is
+called from `packIndex.all` (`:657`). Callers of `all` at HEAD:
 
 - `FS.ContentOf` — `internal/genfs/read.go:155`, protecting the "present in
   no listed pack" verdict at `read.go:178`. Reached from the seal walk
@@ -158,20 +178,20 @@ called from `packIndex.all` (`:547`). Callers of `all` at HEAD:
   It has grown three more non-test call sites since C2 was written, all of
   which lift the cap: `internal/merge/merge.go:595` and `:599` (both sides
   of a three-way compare), `internal/merge/apply.go:381`, and
-  `internal/memtable/recover.go:437`. So `pelfs merge` — a v0.2 verb that
+  `internal/memtable/recover.go:557`. So `pelfs merge` — a v0.2 verb that
   did not exist when this was measured — holds every location of BOTH
   generations, and the entry's old count of "two whole-map callers"
   understated the exposure.
 - `FS.Prefetch` — `internal/genfs/prefetch.go:110`.
-- `FS.LoadPackIndex` (`packindex.go:517`) has no non-test callers.
+- `FS.LoadPackIndex` (`packindex.go:627`) has no non-test callers.
 
 **The blocker named in the TODO is gone**: the "spill the merged trailers
 into a sorted, mmap'd, binary-searchable table" step was built — as
 `internal/extsort`, for `internal/fsck` and `internal/reach`
-(`internal/fsck/fsck.go:202-224`). It was simply never wired into
+(`internal/fsck/fsck.go:242`). It was simply never wired into
 `packIndex`. Note also that **fsck is no longer a `holdEverything` caller**
 — `internal/fsck` does not reference `packIndex` at all — so both
-`docs/TODO.md`'s list and the code comment at `packindex.go:531-534` name
+`docs/TODO.md`'s list and the code comment at `packindex.go:640-644` name
 it wrongly.
 
 **Pinned by an executable test: PARTLY.** `TestLocationHeap`
@@ -206,40 +226,6 @@ deciding whether a repack's ledger stamp is inside the injectable clock —
 a repack-semantics call.
 
 ---
-
-### KI-10. `fsync` through the NFS frontend still returns success without making anything durable
-
-**Severity: medium, correctness of a promise.** Since v0.2.1 a FUSE mount's
-`Fsync`/`FsyncDir` make the session durable on local disk and return OK only
-once that holds (`internal/rawfuse/rw.go`, `overlay.FS.Sync`). An
-NFS-backed mount does not, and pelfs never gets the chance to: NFSv3 COMMIT
-is handled inside the `go-nfs` fork by `onCommit`
-(`nfs_oncommit.go`), which is a deliberate no-op — *"note this is a no-op,
-as we always push writes to the backing store"* — and writes `NFSStatusOk`
-plus the server's write verifier without consulting the filesystem at all.
-For a billy filesystem backed by real files that comment is nearly true;
-for pelfs, whose write buffer is an mmap'd ring and whose two databases run
-`synchronous=NORMAL`, it is not.
-
-So the exact shape of what is left: an application on an NFS mount that
-calls `fsync(2)`, gets success, and then loses the machine can lose those
-writes. It is the same defect the FUSE side had, one layer down and in a
-dependency.
-
-The fix is a FORK change and that is why it is filed rather than done.
-`billy.Filesystem` has no commit operation and neither does go-nfs's
-`Handler`, so there is no seam to implement: it needs either a capability
-interface `onCommit` consults (the shape `billy.CapabilityCheck` and
-`nfs.PermissionChecker` already use, so the precedent is there) or a
-`Commit` method the fork's handler calls when the filesystem offers one.
-`overlay.FS.Sync` is then the one-line body, and its coalescing makes a
-COMMIT free when FUSE or a previous COMMIT has just synced.
-
-**Pinned by an executable test: NO.** The no-op is in the dependency, so
-nothing in this repo's tests reaches it, and the observable difference is
-what survives a MACHINE crash — which no Go test on any platform this runs
-on can produce. What would pin it is a fork-side test that a COMMIT reaches
-the filesystem at all, and that belongs in the fork.
 
 ### KI-11. A failed mutation in the file manager resolves to `undefined`, so a failed rename looks successful
 
@@ -300,7 +286,7 @@ verifying across a rotation, and `pelfs tag` can only freeze a branch HEAD
 — so there is no repair. The only correct advice is ordering: **merge
 first, then rotate.** `pendingForkTags` (`cmd/pelfs/rotate.go:250`) fetches
 each head and the command WARNS, naming each branch and its pinning tag,
-before writing anything (`rotate.go:294-299`); `--break-siblings` gates it.
+before writing anything (`rotate.go:295-301`); `--break-siblings` gates it.
 Not fixed on purpose: making rotation re-pin fork bases would have it mint
 new tags under the new key, which is a scope and blast-radius change.
 
@@ -349,7 +335,7 @@ nothing a head or tag names is affected), so it is computed
 (`superblock.LedgerWindow`, `internal/superblock/condemn.go:150`) and
 printed by `pelfs init` when the numbers collide rather than being
 prevented. One gap: `gracePacingNotice` is called under `if window > 0`
-(`cmd/pelfs/volume.go:183`), so the notice appears only when `--grace` was
+(`cmd/pelfs/volume.go:184`), so the notice appears only when `--grace` was
 passed explicitly — the 72h DEFAULT collides too (864 rows against 517) and
 says nothing.
 
@@ -383,19 +369,34 @@ fixture `internal/superblock/testdata/v010-superblock.hex`, plus
 Documented in `README.md` *Caveats* and in `CHANGELOG.md` *Upgrading from
 v0.1.0*.
 
-### KL-6. The NFS frontend does not consult the AUTH_UNIX credential
+### KL-6. No frontend on the shared layer consults a per-request credential
 
-Every request is evaluated as the server process's own identity. The export
-is loopback and single-user, and any local process can dial 127.0.0.1 and
+Every request is evaluated as the server process's own identity. For NFS
+that means the AUTH_UNIX credential is deliberately ignored: the export is
+loopback and single-user, and any local process can dial 127.0.0.1 and
 claim any uid, so honoring the credential would make the check look like a
 security boundary, which it is not. This is FIDELITY — the same answer
-through both frontends — and not access control. Written down in those
+through every frontend — and not access control. Written down in those
 words in `docs/go-nfs-patches.md`.
+
+**The scope is wider than this entry's old title said.** The identity is a
+property of the shared layer (`internal/vfsbilly/perm.go`), so it now
+governs the **WebDAV** surface too (`internal/vfsdav`, served by
+`pelfs browse`), and a `--fusemount` mount, which checks permissions in
+`internal/rawfuse` over the same `internal/fsperm` model. A per-client
+WebDAV credential decides *whether you may reach the surface at all* and
+whether the surface is read-only; it does not change *whose* uid the
+filesystem answers as. Do not treat any of the three as a multi-user
+boundary. `bd7b89c` narrowed the separate NFS *owner override* to the NFS
+constructors, which is a different exception and is not this one.
 
 **Pinned by an executable test: YES** for the model it implements
 (`internal/vfsbilly/perm_test.go`, plus the `permission_gate` in
 `scripts/mount-gate-test.sh` which compares every permission answer over a
-real kernel NFS client against the same probe on a local tree). The
+real kernel NFS client against the same probe on a local tree), and for the
+owner override's confinement to the NFS frontend
+(`internal/vfsbilly/owneroverride_test.go:98`, `:170`, a call-site
+allowlist that fails naming the constructor to use instead). The
 credential decision itself is a policy, not a behaviour to assert.
 
 ### KL-7. Two branches cut before inode lineages existed cannot be merged
@@ -409,7 +410,7 @@ release (23 bits of lineage above a 40-bit allocation space,
 The merge does not guess: `findCollisions` (`internal/merge/merge.go`)
 reports every colliding inode and `Plan.FirstFreeInode` names the number one
 side must be shifted above, and `Apply` refuses any plan with collisions
-(`cmd/pelfs/merge.go:305-325` prints it). **Nothing in the tool performs the
+(`cmd/pelfs/merge.go:309-337` prints it). **Nothing in the tool performs the
 shift** — `grep -rn renumber` finds only messages and comments — so for a
 pair of v0.1.0 branches this is a diagnosis and not yet a path. Not fixed
 here because renumbering an inode space is a rewrite of every catalog on one
@@ -465,7 +466,7 @@ already holds (`genfs.Placed`), and for the workload that matters — one
 image per generation — it realises the chunker's full potential: measured
 149,224,395 bytes for four related container images against
 `--no-memtable`'s 149,221,054, where before it was 272,755,301
-(`docs/design-apptainer.md`, and `scripts/apptainer-docker.sh` section 8b
+(`docs/design-apptainer.md`, and `scripts/apptainer-test.sh` section 8b
 is the harness).
 
 What it does **not** fix is where the boundaries come from. The flush
@@ -614,6 +615,69 @@ the real source is what is actually proven.
 ordering, so a reorder fails it. What is NOT pinned is the reason, which is
 why it is written down here.
 
+### KL-15. An upload that dies is discarded rather than resumable, on every surface
+
+Filed at `b16784d` with the v0.2.1 release pass.
+
+There is no resumable upload anywhere: not in the JSON data plane, and not
+over WebDAV. `internal/webapi` takes one whole-file `POST`, so a dropped
+connection at 90% of a 68 MB file starts over, and nothing can render a
+progress bar until the request finishes.
+
+What IS designed, and is the half worth having, is that a dead upload does
+not leave a lie behind. Bytes land under `<name>.pelfs-part`
+(`webapi.PartSuffix`, `internal/webapi/webapi.go:119`) and the final name
+appears only on a completed rename, with the temp file unlinked on failure
+(`internal/webapi/upload.go:265`, `:298`). Since bytes are in the overlay
+the moment they are written, a truncated upload under its FINAL name is
+what the next checkpoint would publish — so the part-then-rename discipline
+is durability rather than tidiness.
+
+Not fixed because a resume needs a range-addressable server-side handle
+that outlives an HTTP request, which the single-writer overlay does not
+offer today. **Note that the CHANGELOG's claim that the WebDAV surface
+shares the `.pelfs-part` convention is aspirational** —
+`internal/vfsdav` implements no temp-then-rename at all, and a WebDAV
+client's own partial-file convention is what plays that role there.
+
+**Pinned by an executable test: PARTLY.** The part-then-rename discipline
+and the shared durability vocabulary are pinned
+(`internal/webapi/upload_test.go`, `internal/webui/durability_test.go`).
+The absence of resume is pinned by nothing, being an absence.
+
+### KL-16. An NFS mount commits once per small file created, whether or not anything called `fsync`
+
+Filed at `b16784d` with the v0.2.1 release pass.
+
+`fsync` over NFS now reaches the filesystem (the fork's `nfs.Committer`,
+implemented by `internal/vfsbilly` over `overlay.FS.Sync`), and the cost
+came with the capability. A Linux client sends a small file's whole body as
+a FILE_SYNC write to save itself a COMMIT round trip, and RFC 1813 makes
+that a durability requirement, so the server commits inline once per file
+created — in a workload that never calls `fsync` at all. That is what an
+NFS server costs, and the kernel's own server does the same.
+
+**The number, and its provenance, because this is the figure that decides
+whether someone should pick the NFS backend:** copying 500 small files,
+392 ms before against 1239 ms after with the state directory on a real
+disk, and 332 ms against 246 ms on tmpfs. Those are **single hand-run
+measurements on the owner's machine, and no harness in this tree reproduces
+them** — every containerized gate keeps its scratch on tmpfs, where
+`fsync` is nearly free, which is exactly why CI shows the change as a wash.
+Trust the direction, which is structural, over the digits.
+
+Not "fixed" because the alternative is replying UNSTABLE and lying about
+durability, which is the defect this replaced.
+
+**Pinned by an executable test: NO** for the cost — it is a measurement on
+real storage that a tmpfs runner cannot see, and building a gate for it
+would mean asserting a wall-clock ratio. The BEHAVIOUR is pinned:
+`internal/vfsbilly/commit_test.go`,
+`internal/nfsmount/diag_internal_test.go`, the fork's own
+`nfs_oncommit_test.go`, and `commit_gate` in
+`scripts/mount-gate-test.sh`, which asserts against a real kernel NFS
+client that a COMMIT is SENT.
+
 ---
 
 ## `CHANGELOG.md` v0.1.0 *Known limitations*: status on main
@@ -625,10 +689,10 @@ rather than by line: this table has already once pointed at the wrong
 range.) But a reader who arrives from the release notes should not be
 misled about **main**, so:
 
-| v0.1.0 limitation | on main (`0c2baf0`) |
+| v0.1.0 limitation | on main (`b16784d`) |
 |---|---|
 | Reclamation is manual; a repack then a sweep frees nothing | **fixed** — a writable mount repacks AND collects itself (`--no-auto-gc`); `Summary.Maintenance` reports both halves. A volume nobody mounts writably is still never maintained (see KI-5). |
-| Grace window 72h, not configurable | **fixed** — `pelfs init --grace`, carried forward by every seal, read by the sweep, the planner and all three ledgers, with a one-hour floor at CREATION (`superblock.MinTGrace`, enforced in `cmd/pelfs/volume.go:214`; `pelfs gc --grace` has no floor because it can only widen). See KL-4 for what a large window really buys. |
+| Grace window 72h, not configurable | **fixed** — `pelfs init --grace`, carried forward by every seal, read by the sweep, the planner and all three ledgers, with a one-hour floor at CREATION (`superblock.MinTGrace`, enforced in `cmd/pelfs/volume.go:215`; `pelfs gc --grace` has no floor because it can only widen). See KL-4 for what a large window really buys. |
 | Retain window only as good as the superblock backups | **unchanged and still true**; reported and warned about, never silently assumed. |
 | A repack cannot retire index or manifest objects | **fixed** — under 50% live pack coverage a repack drops the segment, re-emits the entries it still answers for, and condemns the old object through the existing ledger. |
 | Single writer per VOLUME rather than per branch | **fixed** — the key is `meta/lease-<branch>.json` (`internal/lease/lease.go:119`); `TestBranchesDoNotShareAWriteLease` (`cmd/pelfs/branch_test.go:698`) asserts the inverse of what v0.1.0 pinned. The legacy object is still READ, never written: see KL-5. |
@@ -647,7 +711,7 @@ nothing left to flag. `docs/go-nfs-patches.md` has the fork-side detail.)
 ## Audited and deliberately NOT carried here
 
 Checked against `25100f3` and found already fixed or stale, and re-checked
-at `0c2baf0` — three of the rows below were fixed by commits that did not
+at `0c2baf0`, and again at `b16784d` — three of the rows below were fixed by commits that did not
 exist at `25100f3`, and the commit is named in each. Recorded so the next
 pass does not re-file them.
 
@@ -656,7 +720,7 @@ pass does not re-file them.
 | **E5.** "local v0.1.0 is annotated at a64a15e, unpushed, already stale" | **STALE.** The retag happened: `v0.1.0` is annotated `b409546` over commit `e68a538` both locally and at `origin`, and the GitHub release published 2026-08-21. |
 | **G7**, first half: "README reclamation section stale (repack now exists)" | **FIXED.** `README.md:372-389` documents auto-repack, auto-gc, both windows, and the reporting. The second half — `pelfs ctl pprof` undocumented in the README, though it exists at `cmd/pelfs/ctl.go:42` — is a doc punchlist item and stays in `docs/TODO.md`. |
 | **"VOLUME-WIDE WRITE LEASE — NOT FIXED, DOCUMENTED"** | **FIXED** by the lease key-space change; see the table above and KL-5. `TestBranchesShareOneWriteLease` no longer exists; its inverse does. |
-| **"the half that is still open"** (go.mod fork pin, honest ACCESS) | **FIXED** by access-agent. `13c0560` is a commit in the **go-nfs fork**, not in this repo: `go.mod:162` pins `github.com/bbockelm/go-nfs v0.0.5-0.20260822135043-13c05601d32d`, which exports `nfs.PermissionChecker` (asserted at `internal/vfsbilly/vfsbilly.go:100`). |
+| **"the half that is still open"** (go.mod fork pin, honest ACCESS) | **FIXED** by access-agent. `13c0560` is a commit in the **go-nfs fork**, not in this repo, and it is now HISTORICAL: the pin has since advanced past it for the `fsync` work, so at `b16784d` `go.mod:144` pins `github.com/bbockelm/go-nfs v0.0.5-0.20260823220622-d92cb75455ad`. It still exports `nfs.PermissionChecker` (asserted at `internal/vfsbilly/vfsbilly.go:100`) and now also `nfs.Committer`. |
 | **readopt: "A SECOND WRITABLE SESSION REFUSES TO START"** | **FIXED** by readopt-agent (two bugs in one sentence); the corpus entry `second-session-refuses-after-adopt.plan` is now a passing regression with its marker removed. |
 | **"SHAKEN LOOSE BY THE RAISED-OP RUNS"** — hostile phase E dies with `memtable: re-adopt inode N: genfs: stale inode (no residency)` | **FIXED** by the same readopt work: it is the same refusal, and phase E now starts on an adopted plan. |
 | **NFS frontend enforces no permission checks** (hostile finding) | **FIXED** by modebits-agent + access-agent. `nfs-ignores-mode-bits.plan` carries no marker and now FAILS if the write is ever accepted again. |
@@ -690,7 +754,10 @@ Nothing left in this file is expressible as a plan, which is why they
 are here:
 a memory ceiling reached only at a hundred million objects (KI-8), a
 missing stats field (KI-4, KI-5), an error class thrown away (KI-6), a
-transaction count (KI-7), and a wall clock in the wrong place (KI-9).
+transaction count (KI-7), a wall clock in the wrong place (KI-9), and a
+swallowed rejection in a JavaScript dependency's promise chain (KI-11),
+which the corpus cannot express for the simpler reason that the corpus
+drives a filesystem and that one needs a browser.
 
 KI-10 was the second entry whose halves came apart the way KL-10's did,
 and it is worth one paragraph because the resolution was not the one this
@@ -702,12 +769,7 @@ COMMIT at all, which `/proc/self/mountstats` answers for free. It did not
 (zero, against a real kernel client), because the server was claiming
 FILE_SYNC for buffered writes. That is an ordinary assertion, and it is
 now `commit_gate` in `scripts/mount-gate-test.sh`.
-transaction count (KI-7), a wall clock in the wrong place (KI-9), a
-no-op in a dependency whose consequence is what survives a MACHINE crash
-(KI-10) — which is the one thing no test on any platform here can produce
-— and a swallowed rejection in a JavaScript dependency's promise chain
-(KI-11), which the corpus cannot express for the simpler reason that the
-corpus drives a filesystem and this one needs a browser.
+
 Both entries that needed a crash or a repack plus a look at the disk
 (KI-2, KI-3, now fixed) turned out to be expressible after all, in
 ordinary Go tests, once the question was asked in the right units: not

@@ -1,376 +1,57 @@
 # Changelog
 
-## Unreleased
+## v0.2.1
 
-### `pelfs browse` is a file manager, a WebDAV server, and a credential desk
+v0.2.0 made an NFS mount enforce the mode bits and a writable mount collect
+its own garbage. v0.2.1 is two things. `fsync(2)` did nothing and returned
+success; it does the work now, on both frontends, and two crash windows
+that could lose or fabricate bytes are closed. And a volume can now be
+reached without FUSE at all: a page on `127.0.0.1` that says whether your
+data is in the federation and publishes it, a WebDAV endpoint for the
+clients people already have, a credential desk that connects Cyberduck with
+one double-click, an apptainer `--fusemount` driver so a job mounts its own
+volume, and Windows binaries.
 
-The pieces existed and none of them was connected. `pelfs browse` now
-mounts all of them on its one loopback listener:
+The on-disk format is still `FormatVersion 2`, no volume needs converting,
+and nothing here changes what a v0.2.0 binary can read or write. Three
+things change for a v0.2.0 user anyway: **an NFS-backed mount on real
+storage pays about 3x on a create-heavy workload**, a write now pays the
+uplink while it writes rather than at the seal, and **both forked
+dependencies moved** — anyone vendoring needs the new pins. Read
+*Upgrading from v0.2.0*.
 
-- **A JSON data plane** at `/api/v1/files`, `/api/v1/info/{id}` and
-  `/api/v1/upload`: list, create, rename, move, copy, delete and whole-file
-  upload, over the same volume, the same namespace and the same permission
-  model every other frontend sees.
-- **A WebDAV endpoint** at `/dav/`, for the programs that are already good
-  at moving files — Cyberduck, Mountain Duck, rclone, WinSCP,
-  `mount_webdav`, the Windows redirector.
-- **An authorization server** at `/oauth/authorize` and `/oauth/token`, so
-  a downloaded `.cyberduckprofile` connects with one double-click and no
-  password at all.
-- **Downloads that carry no credential in the URL**: the page asks an
-  authenticated route for a single-use 30-second ticket and navigates to
-  `/d/<ticket>`, because an `<a href>` cannot set a request header and an
-  ambient-credential GET is the hole DNS rebinding exploits.
+Still a prototype, still used against real federations, and still
+unprivileged and `CGO_ENABLED=0`.
 
-**"Connect another program"** on the page is real now, where M1 said "not
-yet built": add a program, save the profile or the bookmark, take the
-username and password for everything else, and see and revoke every
-credential this session has handed out. Nothing persists — every secret is
-`crypto/rand` into memory — so quitting `pelfs browse` revokes all of it.
+### Upgrading from v0.2.0
 
-A read-only session (still the default) can hand out a read-only WebDAV
-credential and nothing more: a writable one is refused at registration, by
-name, and the same refusal is checked again at grant time and at request
-time.
+Six changes a v0.2.0 user will notice, and what to do about each.
 
-**One correction to what M1 wrote down**, because it would have broken
-every Cyberduck connection: `POST /oauth/token` is on the guard's token
-surface, not on its exchange surface. Cyberduck's back-channel POST carries
-no `Origin` and no `Sec-Fetch-Site` (the exchange surface answers 403) and
-sends `application/x-www-form-urlencoded`, which RFC 6749 mandates (the
-exchange surface answers 415). The route table now says so, and two tests
-pin it.
+#### 1. `fsync` does work now, and on a real disk an NFS mount pays for it
 
-All of it is gated end to end by `make browse-gate`: the shipped binary
-against a fakeorigin, curl playing the browser, **real Cyberduck** playing
-the WebDAV client, and then a second, fresh `pelfs` that mounts the
-published generation from an empty state directory and reads every byte
-back out of the federation — including the file Cyberduck uploaded.
+This is the one most likely to change a number you were watching.
 
-### `pelfs browse` publishes when the last tab closes
-
-A browser tab has no unmount. A drag-and-drop of 200 documents at ~2 MB
-fires neither write-pressure trigger — 1 GiB staged, 200,000 dirty inodes —
-so before this the work sat in the overlay until the five-minute checkpoint
-came round, while the user closed the laptop and told a collaborator the
-data was there.
-
-A `--rw` browse session now seals on its own once the last `/events` stream
-has been gone for `min(30s, --snapshot-interval)` with nothing written on
-any surface. The page says so ("… or 30s after this tab closes") and labels
-the resulting generation as one nobody clicked for.
-
-The distinctions that make this safe rather than annoying:
-
-- **A reconnecting browser does not trigger it.** An SSE stream drops and
-  re-establishes routinely, so the trigger is a quiet WINDOW after the
-  stream set becomes empty, and any stream that appears clears it.
-- **Two tabs open means one closing is not idle**: only the close that
-  empties the set starts the window.
-- **A closed lid seals when it wakes**, because the window is compared
-  against the clock rather than counted in samples.
-- **`navigator.sendBeacon` is a hint, never a trigger.** A beacon is
-  best-effort by specification; all it does is shorten a wait that is
-  already running, so a hidden-but-open tab changes nothing.
-- **A failed idle seal backs off** on the pressure path's own formula
-  (double, floored at the window, capped at the snapshot interval), because
-  a 30-second retry against a broken federation is the "same warning
-  forever" failure that backoff exists to prevent.
-- **It cannot re-enter a seal in flight**: it takes the same publish slot
-  the "Publish now" button takes, and it starts nothing once teardown has
-  begun.
-
-`--snapshot-interval 0` still means what it says: seal only at exit, no
-automatic publishing, idle sealing included.
-
-### The device-flow prompt shows up in the browser instead of the terminal
-
-`pelfs browse` installs pelican's `oauth2.SetVerificationURLHandler`, so
-"authorize with your institution" arrives as a card on the page — the URL,
-the code to type, and what pelfs is waiting for — rather than as a URL in a
-terminal the user was told they would not need.
-
-Details worth knowing, because the hook constrains them:
-
-- The hook is **process-wide** (one `atomic.Pointer`), so `pelfs browse` is
-  the only verb that installs it, and it removes it on the way out. `pelfs
-  mount` and `pelfs get` keep the terminal behaviour they always had, and
-  pelican still writes the URL to stderr in every case.
-- Prompts are a **set with a TTL**, not a slot: two namespaces can each open
-  a flow, and both get a card. Identical prompts fold together.
-- A prompt raised **before the browser has connected** — the likely case,
-  since credential priming runs as the volume opens — is not lost: the
-  cards are state, and `/events` carries snapshots, so the first frame a
-  stream ever receives already has them.
-- The card **never says "authorization complete"**, because the hook is
-  one-way and cannot know. It greys out on a ten-minute TTL, is dismissible
-  by hand, and carries **no token of any kind**.
-
-### `--state-dir` now covers everything, including the mount registry
-
-`--state-dir` covered a session's overlay, caches, control socket and
-signing key, but the mount-record registry was derived from
-`$XDG_STATE_HOME/pelfs` (or `~/.local/state/pelfs`) independently of the
-flag. So a run pointed entirely at a temp directory still created a
-`vol-<id>` directory in the user's home, wrote `mount.json` into it, and
-left the directory behind, empty, at exit. Measured, not theorised: the
-count went up by one per run of the browser harness, which had to export
-`XDG_STATE_HOME` to work around it.
-
-A **foreground** session — `pelfs shell`, `pelfs mount-gen`, `pelfs browse`
-— now creates nothing outside the root its own flags select. Its record
-goes under `--state-dir`, where `pelfs ctl <state-dir> <verb>` has always
-reached it; `pelfs status` and `pelfs umount` grew a `--state-dir` flag so
-they can look there too.
-
-**`pelfs mount` is the deliberate exception**, because it detaches: its
-whole contract is that a shell finds it afterwards by prefix
-(`pelfs status`, `pelfs umount <prefix>`, `pelfs ctl <prefix> publish`),
-and a reader cannot be told about a `--state-dir` it never saw. A live
-background mount that cannot be stopped by name would be a worse bug than
-the one being fixed, so that one record stays in the machine-wide registry.
-
-What is fixed for it instead: **the registry no longer accumulates**. The
-retraction at exit now removes the `vol-<id>` directory as well as the
-record when nothing else is in it, so a session that comes and goes leaves
-the state root exactly as it found it. (Directories that already hold a
-volume's state are untouched — the removal only succeeds on an empty one.)
-
-### The browser UI has a data plane, and it says out loud what it is not showing you
-
-`internal/webapi` answers the file manager's REST contract under `/api/v1`
-over the same volume, the same namespace and the same permission model every
-other frontend sees: list a directory, make a folder, rename, move, copy,
-delete, upload, download. It is work item U11 of `docs/design-webui.md`.
-
-The contract is not invented. It was recorded from the real
-`@svar-ui/react-filemanager` — every request it makes, in the order it makes
-them, in `internal/webui/testdata/svar-contract/recording.json` — and the tests
-**replay that recording against these handlers**, so the day a component
-upgrade changes the wire shape, a Go test fails instead of a browser.
-
-**A directory listing is capped at 5,000 entries, and the cap is the design
-rather than a fallback.** The component does not virtualize: the probe
-measured 100,000 entries as 1,000,067 DOM nodes and 703 MB of heap. A pelfs
-volume has directories far larger than that, so an uncapped response would
-hang the tab. What makes a cap acceptable is being told about it, and there is
-a second reason the telling is not optional: **the search box filters loaded
-data only and issues no request**, so in a capped folder the search is
-searching the rows on screen and not the folder. A user who searches, finds
-nothing, and concludes the file is not there has been misled by a number
-nobody showed them. So every listing carries the true count in its headers,
-`GET /api/v1/info/{id}` returns it as JSON, and the sentence to display comes
-from the API itself rather than being re-worded per surface:
-
-> Showing 5,000 of 412,006 entries in this folder. Search matches only what is
-> loaded, so it is searching these 5,000 rows and not the whole folder —
-> narrow the path, or use the WebDAV endpoint to see all of it.
-
-**A batch of five moves returns five results.** There is no atomic N-way
-rename in the overlay, in WebDAV or in POSIX, so a batch is N sequential
-operations and each id gets its own outcome: the three that moved say where
-they landed, the one that hit `EACCES` says so, and the request is still a
-200 — because a 4xx would tell the client nothing happened when in fact most
-of it did. A surface that reported "moved" for the whole batch would be lying
-in the one place a user cannot check.
-
-**Uploads stream.** The body is read with `r.MultipartReader()` and copied
-into the volume through a 32 KiB buffer, never `r.ParseMultipartForm`, which
-buffers and then spools the rest to a temp file — writing a 68 MB container
-image to disk twice. The test uploads the reference 68,497,408-byte SIF and
-asserts the consequences rather than the call: peak heap grew by about 5 MB,
-no single write to the volume exceeded the buffer, and the volume received the
-payload's size exactly once.
-
-Bytes land under `<name>.pelfs-part` and are renamed only once the whole body
-has arrived; a failed or abandoned upload unlinks the temp file and never
-shows a name. That is the same convention the WebDAV surface uses, and it is
-durability rather than tidiness: the bytes are in the overlay the moment they
-are written, so a truncated upload under its final name is what the next
-checkpoint would publish.
-
-**What upload does not do yet, stated because a physicist hits it first:**
-there is no resume and no progress. The component sends one whole-file
-`POST` via `fetch`, so a dropped connection at 90% of a 68 MB file starts
-over, and nothing can show a bar until the request finishes. Until resumable
-upload lands, the WebDAV endpoint is the answer for a large file on a flaky
-link, where a real client's own resume works.
-
-**Downloads work now.** The previous release built the ticket mechanism —
-mint an authorization with a session-credentialed call, redeem it once at
-`/d/<ticket>` — and left the file surface nil, so every redemption 404'd. It
-is implemented: the bytes come from the volume with `Range` support, a
-symlink to a file serves the file it names, and a path this session may not
-read is a 403 rather than a 404, because "you cannot" and "there is nothing"
-are different answers.
-
-**Listings do not lie about symlinks.** The policy is the WebDAV adapter's,
-exactly: a link to a regular file is followed and shown under its own name, a
-link to a directory is hidden because the layer below cannot traverse one, a
-dangling link is hidden, and fifos, sockets and device nodes are hidden.
-Everything hidden is counted and reported, so a tree never quietly looks
-smaller than it is.
-
-One finding worth recording for whoever writes the next route: `net/http`'s
-`{id}` wildcard does not match a path segment that is exactly `%2F` — the
-volume root as an id — because unescaped it reads as a trailing empty
-segment. Every id route therefore has an `{id...}` sibling, without which
-"add a folder in the root" would be a 404.
-
-### Connect Cyberduck to a pelfs volume by opening a file, and click once to say so
-
-`pelfs browse` can now hand a WebDAV client a credential of its own.
-Two new packages: **`internal/localoauth`**, an authorization server —
-`GET /oauth/authorize`, `POST /oauth/token`, authorization-code with PKCE
-`S256` — and **`internal/davprofile`**, which generates the
-`.cyberduckprofile`, the `.duck` bookmark and the per-client HTTP Basic
-credential a client that is not Cyberduck needs. Nothing is wired to a route
-yet; that is `pelfs browse`'s own change.
-
-**It was verified against real Cyberduck, not against a golden file.**
-`scripts/oauth-cyberduck-docker.sh` runs `duck` 9.5.3 — the same protocol
-stack as Cyberduck and Mountain Duck — against a live pelfs authorization
-server in a container with no network, and completes the whole flow: 22
-checks, 0 failures. Four things that were previously inference from reading
-Cyberduck's source are now observations:
-
-- a non-blank `OAuth Client ID` really is the switch — the session went
-  straight to "Start new OAuth flow" as `user='anonymous', password=''`,
-  with no password prompt and no password field;
-- Cyberduck sends `code_challenge_method=S256` unprompted, so REQUIRING
-  PKCE costs the primary client nothing;
-- the loopback redirect provider is the one selected for
-  `http://127.0.0.1:52001/pelfs/oauth/callback`, and the `redirect_uri` it
-  sends back is that string verbatim — which is what makes an exact-string
-  allowlist workable rather than aspirational;
-- `Scopes` as a plist `<array>` arrives as a space-delimited `scope`
-  parameter, and `duck --profile <file>` registers a generated profile
-  such that `dav://127.0.0.1:PORT/dav/` resolves to it.
-
-**The consent click is structural, not a convention.** An
-`/authorize` endpoint that mints a token from an existing session with no
-user interaction is a token-exfiltration primitive for anything that can
-navigate the user's browser to it, and being on loopback does not help: a
-top-level navigation needs no preflight. So `GET /oauth/authorize` has no
-code path that emits a `Location` header at all. It renders a screen naming
-the program, the volume, the access being asked for and the address the
-authorization would be sent to; that screen carries a 32-byte consent
-ticket that exists nowhere else, cannot be framed, and — because the page's
-own CSP is `script-src 'none'` — cannot be submitted by script. The only
-thing that can complete an authorization is a person pressing a button.
-That is a deliberate divergence from the design's "remember consent per
-client for the life of the process": remembering it at `/authorize` would
-put the primitive back. The no-re-prompt property lives on the refresh
-token instead, which is where a reconnecting client actually needs it.
-
-**A token from here is strictly weaker than the browser session.** It
-reaches `/dav/*` and nothing else, can never publish, can never mint another
-credential, and can never be wider than the session that issued it — a
-read-only `pelfs browse` cannot mint a writable DAV token, checked when the
-client is registered, when the grant is issued, and again on every request.
-Nothing persists: every secret is `crypto/rand` into memory, the tables hold
-HMACs under a per-process key rather than the secrets themselves (so a heap
-profile of the process carries no usable credential, and a token from a
-previous session does not validate against a new one on the same port), and
-exiting `pelfs browse` is a complete revocation of everything it ever
-minted. Individual revocation — one client, or one connection's tokens — is
-a method call away for the UI that will list them.
-
-Authorization codes are single-use with a 60-second life, bound to the
-client, the exact `redirect_uri` and the PKCE challenge. A replayed code is
-a hard failure, is counted, and revokes the grant the first exchange bought.
-A `redirect_uri` that differs by one character is refused **on pelfs's own
-page**, with no redirect anywhere and nothing from the request echoed back.
-
-Two supporting changes to the packages M1 landed. `internal/httpguard` grew
-a **`SurfaceToken`**: the token endpoint is a back-channel POST from a Java
-HTTP client, which sends no `Origin` and no `Sec-Fetch-Site` and a
-form-encoded body, so the surface the design pencilled it in on
-(`SurfaceExchange`) would answer 403 and 415 to every exchange Cyberduck
-ever makes. It keeps the Host allowlist, the `Sec-Fetch-Site` check, the
-exact-`Origin` match, the cookie strip and the headers, and drops only the
-two rules a non-browser cannot satisfy. And `internal/vfsdav` learned to
-narrow a 401's challenge to the scheme the client tried, so a client whose
-Bearer token was refused is not offered `Basic` — which would drop
-Cyberduck into a password prompt for a profile that has no password field.
-
-### A file manager in the browser, and it never says "uploaded" when it means "on this laptop"
-
-`pelfs browse`'s page could tell you whether your data was in the federation
-and publish it on request; it could not show you a file. The browser UI now
-carries a real file manager — list, create, rename, copy, move, delete,
-upload and download — built on the MIT SVAR React component, bundled by Vite
-under `go generate`, and committed so that `go build`, `go vet`, `go test` and
-every cross-build still need no Node at all.
-
-**The durability panel sits above the files, not behind a tab, and both
-surfaces speak one vocabulary.** A finished upload puts bytes in the local
-overlay: durable against `kill -9`, invisible to the federation until the
-next checkpoint — and for a couple of hundred documents that fires neither
-write-pressure trigger, so nothing is published for up to five minutes while
-the user closes the laptop and tells a collaborator the data is there. The
-upload therefore answers with what it actually did, the panel above it agrees,
-and the two states have DIFFERENT GLYPHS rather than two shades of one colour.
-The hand-written connection page and the React app render that distinction
-from the same `/events` snapshot with the same words, and a Go test fails if
-either side is reworded on its own.
-
-**Two limits are admitted in sentences instead of being discovered.** The
-component does not virtualize — 100,000 entries measured at 703 MB of heap and
-17.7 s to open — so a listing is capped, and a capped folder says how many
-entries it really holds and what to use instead. Its search is client-side
-over loaded data only and asks the server nothing, so the line above the
-search box says so before anyone types and says it more loudly while a search
-is running. "No results" and "not in your volume" are different statements.
-
-**A download is a ticket, not an ambient credential.** An `<a href>` cannot
-send a request header, so a download authorized by the session token would
-have to be authorized by a credential the browser attaches to any GET — which
-is the hole DNS rebinding turned into arbitrary RPC in CVE-2018-5702. An
-authenticated call mints a single-use 30-second ticket instead, and the URL in
-the browser's download history is already spent by the time it is written
-there.
-
-### The browser gate now tests the browser half of the threat model
-
-`scripts/webui-playwright.sh` grew from two example specs into a suite that
-asserts, in a real Chromium against the real binary: no `Set-Cookie` and an
-empty `document.cookie` after a full session; the session token in
-`sessionStorage` and nothing in `localStorage`; a single-use bootstrap token
-whose second use fails visibly, and which never survives in the address bar; a
-ticketed download that works with no credential and 404s on replay; a rebound
-`Host` answered 421; a cross-site page that cannot read a response, submit a
-form, load an `<img>`, frame the app, or preflight a `PROPFIND`; an SSE
-reconnect that leaves no stale view; the `<noscript>` message; and not one
-request leaving 127.0.0.1 for the whole session. `retries: 0`, no fixed
-sleeps, expect-polling only — a browser gate that needs a rerun to go green
-teaches people to rerun the next real failure too.
-
-### `fsync` now does something, and says what it did
-
-`fsync(2)` and `fsyncdir(2)` on a FUSE-backed pelfs mount returned success
-unconditionally, without making anything durable. An application that
-called `fsync`, checked the result, and believed its data was safe — which
-is the only reason to call it — was believing nothing.
-
-They now do the work and return success only once it holds: the write
-buffer's mapping is msync'd, the journal recording which file those bytes
-belong to is fsync'd, and the metadata database holding the name, mode and
-length is fsync'd. In THAT order, so no layer is ever durable ahead of the
-one it names. Kill the process, cut the power, reboot, remount the same
-state directory: the writes are there.
+`fsync(2)` and `fsyncdir(2)` returned success unconditionally, without
+making anything durable. They now do the work and return success only once
+it holds. On the default memtable path that is the write buffer's mapping
+msync'd, the journal recording which file those bytes belong to fsync'd,
+and the metadata database holding the name, mode and length fsync'd — in
+that order, so no layer is ever durable ahead of the one it names. (A
+`--no-memtable` mount has no ring and no journal; there it is the staged
+body files and the staging directory.) Kill the process, cut the power,
+reboot, remount the same state directory: the writes are there.
 
 **What it means is "recoverable by remounting THIS state directory", and
 that is not federation durability.** On ephemeral job scratch — an HTCondor
-slot that gets wiped on eviction — the state directory dies with the slot,
-and every byte `fsync` covered goes with it whether or not `fsync` returned
-success. What survives an eviction is a CHECKPOINT: `--snapshot-interval`
-to have one happen on a cadence, or `pelfs ctl <mount> publish` at the
-points a job knows are worth keeping. A laptop or a long-lived host, where
-the state directory outlives the process, gets exactly the guarantee it
-asks for. Making `fsync` a federation round trip was the alternative and it
-was rejected: for the sqlite-in-a-container workload that makes an
-application call `fsync` at all, it would be minutes per call.
+slot wiped on eviction — the state directory dies with the slot, and every
+byte `fsync` covered goes with it whether or not `fsync` returned success.
+What survives an eviction is a CHECKPOINT: `--snapshot-interval` to have
+one happen on a cadence, or `pelfs ctl <mount> publish` at the points a job
+knows are worth keeping. A laptop or a long-lived host, where the state
+directory outlives the process, gets exactly the guarantee it asks for.
+Making `fsync` a federation round trip was the alternative and it was
+rejected: for the sqlite-in-a-container workload that makes an application
+call `fsync` at all, it would be minutes per call.
 
 A directory `fsync` is the same call, deliberately. It asks for namespace
 durability, which is a real question here because the namespace is a
@@ -379,363 +60,141 @@ entries for inodes the metadata never committed, and the metadata may never
 name content the journal lacks, so a durable namespace over an unsynced
 journal is precisely the state that rule forbids.
 
-**An NFS-backed mount gets this too, and the fix was not where it looked.**
-NFSv3 COMMIT was answered inside the `go-nfs` fork by a hard-coded no-op —
-its own comment said writes are always pushed to the backing store, which
-for pelfs they are not. But adding a hook to COMMIT would have fixed
-nothing, because the handler was unreachable: the fork wrote the constant
-FILE_SYNC into the stability field of every WRITE reply, whatever the
-client asked for. That field is a promise about what the server ACHIEVED,
-and a Linux client believes it — it queues a page for commit only when the
-reply said UNSTABLE — so it never sent a COMMIT at all. Measured on a real
-kernel client before the fix: `dd conv=fsync` produced 2 WRITEs and **zero**
-COMMITs. The lie was in the WRITE reply first.
+**An NFS-backed mount gets this too, and that is where the cost is.** A
+FUSE mount syncs when the application asks. An NFS mount syncs when the
+CLIENT asks, and a Linux client asks far more often than an application
+does: a small file written in one go is sent as a FILE_SYNC write rather
+than an unstable one, because that saves the client a COMMIT round trip.
+RFC 1813 makes FILE_SYNC a requirement — the server must have the data on
+stable storage before it replies — so the server commits inline, **once per
+file, for an application that never called `fsync` at all.** That is what
+an NFS server costs; the kernel's own server behaves the same way.
 
-The fork now carries one optional interface, `nfs.Committer`, that both
-procedures consult. A filesystem that implements it is taken to be holding
-data a crash could take: an unstable write is answered UNSTABLE and left
-for a later COMMIT, a synchronous write is committed before the reply, and
-COMMIT calls the filesystem and reports what it says. `internal/vfsbilly`
-implements it with the same `overlay.Sync` the FUSE frontend calls, so both
-frontends make one promise. A filesystem that does not implement it — every
-existing go-nfs user — behaves exactly as before.
-
-**The NFS cost is higher than the FUSE cost, it is not optional, and it is
-bigger than it looks.** A FUSE mount syncs when the application asks. An
-NFS mount syncs when the CLIENT asks, and a Linux client asks far more
-often than an application does: a small file written in one go is sent as a
-FILE_SYNC write, not an unstable one, because that saves the client a
-COMMIT round trip. RFC 1813 makes FILE_SYNC a requirement — the server must
-have the data on stable storage before it replies — so the server commits
-inline, once per file, for an application that never called `fsync` at all.
-That is knfsd's behavior too (`nfsd_vfs_write` sets `RWF_SYNC` for a stable
-write); it is what an NFS server costs.
-
-Measured, copying 500 small files onto an NFS mount with no `fsync`
-anywhere in the workload:
+Copying 500 small files onto an NFS mount, no `fsync` anywhere in the
+workload:
 
 | state directory on | before | after |
 |---|---|---|
 | tmpfs | 332 ms | 246 ms |
 | a real disk | 392 ms | **1239 ms** |
 
-The tmpfs row is the trap: the containerized benchmarks keep their scratch
-on tmpfs, where `fsync` is free, so `make big-tree` shows this change as a
-wash (NFS 66.08s before, 66.22s after, RPCs per file 5.41 both). On real
-storage a create-heavy NFS workload pays about 3x. Large files are
-unaffected — those go out unstable and cost one commit at `close`, not one
-per write — and FUSE is unaffected entirely.
+Both rows are **single hand-run measurements on the owner's machine, and
+no harness in this tree reproduces them.** Trust the direction rather than
+the digits: the server now performs a commit per stable write that it
+previously skipped, which is a structural change, and about 3.2x is what
+one run of it looked like.
 
-The alternative was answering `fsync` with a lie, so this is the trade and
-not a regression to be tuned away. But it is a real number and the NFS
-frontend is the one macOS uses, so it is written here rather than left to
-be discovered.
+**Every containerized gate keeps its scratch on tmpfs, where `fsync` is
+nearly free, so CI cannot see this at all.** `make big-tree` shows the
+change as a wash for exactly that reason, and its RPCs-per-created-file
+figure (5.41, bounded by the gate at 12) does not move — which is the
+honest statement of what happened: the RPC count is the same, the cost of a
+stable write is not.
 
-**A chatty application pays once.** Repeat calls with nothing written
-between them are coalesced against the overlay's own mutation counter and
-cost a lock and a comparison — no msync, no fsync, no syscall. The first
-call of a session is never coalesced away, because that counter belongs to
-this process and a resumed state directory may hold another session's
-unsynced work. `--no-memtable` mounts are covered too: the staging store
-tracks the bodies it owes, so a sync costs writes-since-the-last-fsync
-rather than one call per dirty file.
+Two smaller notes. A file large enough to go out unstable costs **one
+commit at `close` rather than one per write** — not zero, which is what it
+cost before. And a chatty application pays once: repeat calls with nothing
+written between them are coalesced against the overlay's own mutation
+counter and cost a lock and a comparison, no syscall. The first call of a
+session is never coalesced away, because that counter belongs to this
+process and a resumed state directory may hold another session's unsynced
+work.
 
-### WebDAV: a pelfs volume in Cyberduck, WinSCP, rclone or Finder
+The alternative was answering `fsync` with a lie. This is the trade, not a
+regression to be tuned away — but it is a real number, and the NFS frontend
+is the one macOS uses, so it is written here rather than left to be
+discovered.
 
-pelfs volumes can now be served over **WebDAV** — `internal/vfsdav`, a
-`webdav.FileSystem` over the same layer the NFS frontend mounts, so a person
-on Windows or macOS can browse, download and upload with a client they already
-have and no FUSE, no kext and no administrator. Nothing exposes it yet: the
-listener and the credential that will belongs to `pelfs browse`, and this is
-the surface it mounts.
+#### 2. Both forked dependencies moved, and one of them tracks an open PR
 
-What it is held to is measured, not asserted. `litmus`, the WebDAV compliance
-suite, scores the adapter **basic 16/16, copymove 13/13, props 29/30, locks
-32/34** — identical, test for test, to what the same suite scores against
-`x/net/webdav`'s own in-memory example server, which is the ceiling any Go
-WebDAV server can reach. And three real clients drive it in a container with
-no network: **Cyberduck's CLI** (the same protocol stack as Cyberduck and
-Mountain Duck), **rclone** over both a TCP port and a unix socket, and
-**curl**. A 68,497,408-byte file — the size the Windows WebDAV *redirector*
-refuses outright — transfers byte-for-byte through Cyberduck's stack, and
-`Range` requests are served exactly, so a client can resume a download.
+Anyone who vendors, mirrors, or builds from source needs both pins.
 
-Two things a pelfs volume has that WebDAV has no way to say, handled rather
-than ignored: a symlink to a file is **followed**, so `lib.so -> lib.so.1` is
-the file it names instead of an empty one; and the entries no client could
-render — a link to a directory, a dangling link, a fifo, a socket, a device
-node — are hidden and **counted**, so a tree that looks smaller than it is can
-say so.
+- **`go-nfs` moved from `13c0560` to `d92cb754`.** This is the pin that
+  carries the COMMIT change above, and building v0.2.1 against v0.2.0's pin
+  silently gets the old no-op back. NFSv3 COMMIT was answered inside the
+  fork by a hard-coded no-op whose own comment said writes are always
+  pushed to the backing store — which for pelfs they are not. Adding a hook
+  to COMMIT would have fixed nothing, because the handler was unreachable:
+  the fork wrote the constant FILE_SYNC into the stability field of every
+  WRITE reply, whatever the client asked for. That field is a promise about
+  what the server ACHIEVED, and a Linux client believes it — it queues a
+  page for commit only when the reply said UNSTABLE — so it never sent a
+  COMMIT at all. The lie was in the WRITE reply first. The fork now carries
+  one optional interface, `nfs.Committer`, that both procedures consult: a
+  filesystem that implements it is taken to be holding data a crash could
+  take, so an unstable write is answered UNSTABLE and left for a later
+  COMMIT, a synchronous write is committed before the reply, and COMMIT
+  calls the filesystem and reports what it says. `internal/vfsbilly`
+  implements it with the same `overlay.Sync` the FUSE frontend calls, so
+  both frontends make one promise. A filesystem that does not implement it
+  — every other go-nfs user — behaves exactly as before.
+- **The `pelican` pin is the head of an unmerged pull request.** It moved
+  off a pelfs fork branch onto upstream during this cycle, and then onto
+  `oauth-verification-hook` (pelican PR 3672) for the device-flow hook the
+  browser page installs. A fork branch of an open PR is rebasable and will
+  most likely be deleted when the PR merges, which strands the pin. That is
+  a build-reproducibility exposure rather than a runtime one, and it is
+  worth knowing before it bites: `scripts/build-pelican-server.sh` detects
+  a stranded pin and dies with a named diagnosis rather than a confusing
+  build error.
 
-The surface emits no `Access-Control-Allow-*` header on any response, ever.
-That is not an omission: without one, a web page on another origin cannot get
-a preflight for PROPFIND, PUT, MKCOL, MOVE, COPY, DELETE, PROPPATCH or LOCK,
-so the entire WebDAV write surface is unreachable from a browser by
-construction. A test asserts it on every verb, in every authentication state.
+#### 3. A write now pays the uplink while it writes, not at the seal
 
-### The NFS owner override no longer reaches a frontend that did not ask for it
+Closing the flush/location-record crash window (under *Fixed*) means the
+write ring holds a region until the record that replaces it is durable.
+That is backpressure, and it moves the uplink's cost out of the seal and
+into the write phase: a copy paces against the link instead of finishing
+fast and then waiting. End-to-end throughput is where it was.
 
-The layer both mounts share granted one deliberate exception to the mode bits:
-the owner of a file may write it through the NFS frontend whatever the mode
-says. That is knfsd's own rule and it is why `tar -p` can extract a read-only
-file over NFS — NFSv3 has no open operation, so by the time a write arrives,
-the open it belongs to was already decided, correctly, on the client from our
-own ACCESS reply.
+Measured against a **modelled** per-upload round trip
+(`PELFS_RINGHOLD_MEASURE=1 go test ./internal/memtable -run RingHold`; the
+round trip is a sleep in an in-memory object store, not a network):
+192 MiB at a 250 ms round trip now costs **5.17 s writing + 1.56 s sealing,
+6.73 s in total.** A script that watched the seal phase for progress will
+see a shorter seal and a longer copy for the same work.
 
-WebDAV and SFTP have a real open, and for them that check is the ONLY one
-there will ever be. A frontend built on the shared layer inherited the
-exception anyway, so a WebDAV `PUT` would have emptied a `0444` file that the
-kernel, a FUSE mount and this server's own ACCESS reply all refuse — two
-frontends disagreeing about the same file, which is the defect the permission
-work in v0.2.0 existed to end.
+The pre-change pair is deliberately not quoted: the harness was added by
+the fix itself and there is no knob to turn the hold off, so nothing in the
+tree can produce a "before" number. On a genuinely bad link the cost is
+real and bounded rather than proportional — 96 MiB at 25 s per 2 MiB pack
+takes **350 s against a 300 s bandwidth floor**, and that is pipeline
+bubbles rather than bandwidth: the ring's runway is four packs at the
+shipped sizes (8 MiB of promotion distance over a 2 MiB pack target), so a
+straggler's record can leave upload workers idle. Widening the runway
+recovers it.
 
-The exception is now something a frontend must **ask for by name**, and the
-name says who is entitled to it. The NFS mount is unchanged, `tar -p` over a
-real kernel NFS mount still extracts a read-only tree intact, and a test
-refuses any future frontend that reaches for the NFS constructors: it fails
-with the reason and the constructor to use instead.
+#### 4. `pelfs browse` is a new surface, and it is worth knowing what it opens
 
-### A browser UI that builds with no Node, and the probe that decided its shape
+`pelfs browse` is new (see *What's new*). Nothing else exposes a listener,
+and it exposes one only while it runs, but three properties are worth
+stating before somebody runs it on a shared login node.
 
-`pelfs` now carries a browser UI inside the binary. The mechanics of that
-matter more than the UI does at this stage, because they decide what a
-contributor has to install and what a release has to contain.
+- **It binds `127.0.0.1` on a random port and mints its own credentials.**
+  There are no cookies anywhere, nothing persists, every secret is
+  `crypto/rand` into memory, and exiting revokes everything the process
+  ever minted — including any WebDAV credential or OAuth token it handed
+  out. A token from a previous session does not validate against a new one
+  on the same port.
+- **A `--rw` session seals on its own when the last tab closes.** That is
+  new behaviour for a writable session: after the last `/events` stream has
+  been gone for `min(30s, --snapshot-interval)` with nothing written on any
+  surface, it publishes, and labels the generation as one nobody clicked
+  for. `--snapshot-interval 0` still means seal only at exit, idle sealing
+  included.
+- **Permission enforcement is still fidelity, not access control**, and now
+  that applies to one more surface. Every request through the shared layer
+  is evaluated as the identity that started the server, and the WebDAV
+  endpoint is subject to the same rule as the NFS one. Do not treat either
+  as a multi-user boundary. (This widens KL-6 in `docs/known-issues.md`,
+  which named only the NFS frontend.)
 
-**A contributor who does not touch the frontend needs nothing.** The bundle is
-built by `go generate ./internal/webui` and **committed** to
-`internal/webui/dist`, then embedded with `//go:embed`. So `go build ./...`,
-`go vet ./...` and `go test ./...` need no Node, no pnpm and no npm — and
-`go install github.com/bbockelm/pelfs/cmd/pelfs@latest` produces a binary with
-a *working* UI, which the usual alternative (ship a placeholder, build at
-release time) does not. The precedent is next door: pelican commits an empty
-`web_ui/frontend/out/placeholder` purely to satisfy a non-optional
-`go:embed`, and that is why `scripts/build-pelican-server.sh` works on a
-machine with no pnpm. This does the same thing aimed at a better outcome. It
-is also why the CI job that dies on a missing pnpm cannot happen here: the one
-that needs Node is a separate workflow with its own path filter, and a Go-only
-pull request never waits for it.
+`pelfs browse` also carries a `--test-hooks` flag, which the browser gate
+uses to drive the page into states a volume is not in. It is in the shipped
+binary and in `--help`, and its own help text says never to point it at a
+real volume. It is listed here so that is a decision rather than a
+discovery.
 
-**A committed build artefact rots silently, so a job rebuilds it and diffs.**
-`.github/workflows/webui.yml` runs the build twice — proving the output is
-byte-reproducible, which is what makes the gate trustworthy instead of flaky —
-and fails if `internal/webui/dist` or `internal/webui/third_party.txt` differs
-from what its sources produce. It also fails if any GPLv3 `wx-*` package
-appears in the lockfile: the file manager's components are MIT under their
-`@svar-ui/*` names and were GPLv3 under the retired `wx-*` ones, pelfs is
-Apache-2.0, and the bundle ships *inside* the binary, so that swap would be a
-relicensing event disguised as a version bump. `third_party.txt` lists all 30
-bundled packages with their licences and the full licence text each one
-requires be carried with a distribution; the UI serves it at
-`/third_party.txt`.
-
-**The component was measured before it was adopted.** Two questions could have
-invalidated the whole file-manager plan, and neither was answerable from
-documentation, so `webui/frontend/probe` drives the real component in a real
-browser against a logging stub:
-
-- **Does it load a directory lazily?** Yes — one listing per directory
-  navigated into, and nothing at boot but the root. But *only* because the app
-  wires it: the shipped data provider registers no handler for the store's
-  `request-data` event at all, and it fires that event twice per navigation,
-  which on a large directory is two full listings.
-- **Does it virtualize a large directory?** No. Every entry becomes DOM: a
-  100,000-entry directory renders 100,000 elements, a million DOM nodes and
-  703 MB of heap, and takes 18 seconds. 5,000 entries takes a third of a
-  second. So the JSON API's response cap is the design rather than a
-  fallback, and the number has a measurement behind it.
-
-The request sequence is committed as a fixture
-(`internal/webui/testdata/svar-contract/`) and asserted by Go tests that need
-no browser, which is how a one-time Node cost becomes a permanent gate.
-
-Two defects in the shipped provider were found the same way, both of which
-would have broken the design quietly: `setHeaders()` never reaches the wire
-(the override drops the headers it was given), so the session credential would
-have been silently absent; and every mutating request goes out as
-`Content-Type: text/plain`, which is the one content type an HTML form can
-send and which the threat model answers with 415. Both are fixed in a
-three-line subclass, and both are pinned by tests that will say so if a future
-release makes the subclass unnecessary.
-
-**The UI loads nothing off the network.** The component's default theme injects
-a stylesheet link to a CDN and its default icons are CDN URLs per file
-extension; both are off, and three separate checks — one in the build, one in
-Go, one in a real browser — keep them off. A localhost tool that phones home
-is both a privacy leak and broken on an air-gapped machine.
-
-**A browser gate that drives the real binary.** `scripts/webui-playwright.sh`
-builds `pelfs`, starts a federation stub, creates a volume, runs
-`pelfs browse`, and hands a real Chromium the ephemeral URL and the single-use
-bootstrap token. Chromium's `--host-resolver-rules` maps an attacker hostname
-to loopback, which makes DNS rebinding directly testable: a rebound request is
-answered **421**, and a cross-origin `fetch` is refused by the browser itself
-— which is the one thing a Go test cannot prove. Twelve seconds, off the Go
-pull-request path, no retries and no sleeps.
-
-**Branding.** The UI wears the Pelican Platform mark with the permission of the
-Pelican Project's PI, recorded next to the asset with its checksum. The mark
-is used unmodified — not traced, not redrawn, nothing drawn on top — and the
-"FS" is a wordmark treatment beside it. Every page, and the repository's new
-`NOTICE`, says plainly that pelfs is **not** an official Pelican Platform
-product.
-
-### `pelfs browse`: a page that says whether your data is in the federation
-
-`pelfs browse [--rw] [--open] <prefix>` opens a volume, serves one
-hand-written page on `127.0.0.1` at a random port, and answers the two
-questions a file manager cannot: **is this staged on my laptop or is it in
-the federation**, and **publish it now**. It does not browse files, and the
-page says so in a sentence rather than leaving somebody to discover it —
-`pelfs mount` is still how bytes move. Read-only unless `--rw`; foreground,
-so Ctrl-C is the unmount and the session seals on the way out exactly as a
-mount does. The URL is printed whether or not `--open` launches a browser,
-because a login node has no opener.
-
-The durability line never merges the two facts into one checkmark: a filled
-amber dot for "on this machine only", with the file count, the bytes and
-how long until the next automatic publish, and a green check for "in the
-federation (generation N)". A lease that has gone `stale`, `interrupted` or
-`lost` — a laptop that slept, another writer that took the branch — is a
-banner the moment it is known, rather than a surprise at the seal.
-`Publish now` answers **202 with a job id** and reports progress on a
-Server-Sent-Events stream, because the seal holds the overlay's lock for as
-long as it takes and a synchronous request would be a spinner with no
-information in it; a second click while one is running gets **409** naming
-the job that holds the lock, not a queue.
-
-**There are no cookies, anywhere.** A cookie set for `127.0.0.1` has no
-port isolation at all (RFC 6265bis §8.5), so it is sent to every other
-local service the browser is made to contact — a notebook, a dev server,
-anything. So the launch URL carries a single-use 120-second bootstrap token
-in its **fragment**, the page exchanges it once for a session token it
-keeps in `sessionStorage` (which *is* port-scoped) and sends as a request
-header, and nothing this process mints outlives it. The new
-`internal/httpguard` puts the rest in one place and one order: an exact
-`Host` allowlist that answers `421` to anything else (this is the
-DNS-rebinding defence, and it is the only thing that works —
-CVE-2018-5702 is the case where a custom header *was* the CSRF defence and
-rebinding walked through it), `net/http.CrossOriginProtection` with both of
-its documented gaps closed, an exact `Origin` match, `application/json` on
-anything that mutates, a strict `Content-Security-Policy` with a
-per-response nonce, and no `Access-Control-Allow-*` header on any surface
-ever. Sixteen rows of table test pin all of it, and one of them asserts
-that `/debug/pprof` — which the control socket exposes on the strength of
-being a 0600 unix socket — is not routable from a browser at all.
-
-Downloads are ticketed even though this milestone has nothing to download:
-`POST /api/v1/download` mints a single-use 30-second ticket and
-`GET /d/<ticket>` accepts no session credential, because an `<a href>`
-cannot carry a request header and exempting GET from the credential rule is
-precisely the hole rebinding exploits. The design is
-`docs/design-webui.md`; a WebDAV endpoint on the same listener, an OAuth
-authorization server for Cyberduck, and the JSON API are the milestones
-after this one.
-
-### A crash between a flush and its location record no longer loses that flush
-
-A write's LENGTH became durable immediately — `Store.Write` appends to the
-operation log under its own lock — while the record of WHERE its bytes went
-was written much later, once the flush's packs had landed. In between,
-publishing a flush reclaimed the ring region its records sat in, which
-moves the tail hint a remount walks from. A crash in that window left bytes
-referenced by neither place: up to one flush batch, 2 MiB at the shipped
-pack target, usually already on the federation and with nothing left behind
-to say which pack it was in.
-
-The ring region is now released only once the record that replaces it is
-durable. Until then the ring is still where a recovery finds those extents,
-so a crash in the window recovers the file **byte-exact** instead of cutting
-it back. A flush therefore also means "recorded" as well as "uploaded":
-`pelfs`'s flush waits for the location records of everything it published,
-so a failure to write one reaches the caller rather than being noticed by
-the next mount.
-
-What this costs is backpressure, and it was measured rather than asserted
-(`PELFS_RINGHOLD_MEASURE=1 go test ./internal/memtable -run RingHold`,
-against a modelled per-upload round trip). Holding the ring across an
-upload moves the uplink's cost out of the seal and into the write phase —
-a copy paces against the link instead of finishing fast and then waiting —
-and leaves end-to-end throughput where it was: 192 MiB at a 250 ms round
-trip went from 0.21s writing + 6.91s sealing to 5.14s writing + 1.55s
-sealing, 7.12s against 6.68s in total. On a genuinely bad link (25s per
-2 MiB pack) the end-to-end cost is real but bounded: 300s became 350s,
-which is pipeline bubbles rather than bandwidth — the ring's runway is
-four packs at the shipped sizes, so a straggler's record can leave upload
-workers idle, and widening the runway recovers it.
-
-### A crash no longer leaves a file that reads at full length with zeros in it
-
-A crash could leave a file that came back at **exactly the size it was
-written**, full of bytes nobody wrote. Nothing a user can run revealed it:
-`stat` said the file was whole, `cmp` was the only thing that disagreed,
-and the recovered session then sealed those zeros into a signed generation
-that `pelfs fsck --deep` called consistent.
-
-The two halves of a file's state are durable at different moments. The
-operation log records a write when it happens, so the file's LENGTH
-survives any crash after it; the record of where the bytes went is written
-only once the flush's packs have landed. A crash in between left recovery
-holding a content row at its full length with nothing behind part of it —
-and a gap in an extent map reads as zeros, which is right for a sparse file
-and a lie here.
-
-Recovery now **cuts the file back to the first byte it cannot serve**, in
-both places a length lives: the extent map and the overlay's node row,
-which is the one `stat` answers and a read clamps to. What comes back is a
-genuine prefix of what was written, or nothing, and the recovery report
-names the cut as well as the loss. A short file after a crash is a failure
-a user can see; a full-length file of zeros is not. Genuine holes are
-untouched — a write past the end of a file still reads as zeros, because
-nothing was lost there.
-
-The loss that made this reachable is itself gone now — see the entry above,
-which closes the window rather than reporting it. What is left of this
-change is the guarantee for every OTHER way an extent can go missing: a
-torn ring record, a truncated buffer file, a state directory that lost its
-location map. A file comes back as a genuine prefix of what was written, or
-not at all.
-
-### Cross-generation dedup on the default write path
-
-Writing a file whose content the volume already holds now costs the
-metadata and nothing else, on the **default** write path. Before this, only
-`--no-memtable` deduplicated across generations; the default path packed
-and uploaded during the session against an in-memory, per-session map and
-re-sent every byte.
-
-Measured on four related container images, one per generation, against a
-real origin (`scripts/apptainer-docker.sh` section 8b):
-
-| | uploaded, default | uploaded, `--no-memtable` |
-|---|---|---|
-| before | 272,755,301 | 149,221,054 |
-| after | **149,224,395** | 149,221,054 |
-
-Re-measured on the same harness after the recovery fix above:
-**149,224,374** against `--no-memtable`'s 149,221,048, which is the same
-pair of numbers to within the 26 bytes a generation's catalog rows move by.
-
-A derived image costs 4.9 MB instead of 68 MB, and a re-push of an
-unchanged one costs essentially nothing. **`--no-memtable` is no longer
-worth passing to publish images**: it reaches the same number and stages
-the whole file to local disk to get there.
-
-There is no new index, no sidecar, and no new resident structure. The write
-path asks the generation it is building on, through the same windowed pack
-index the read path already uses — one ~64 KiB range read per lookup at
-worst, usually nothing at all because a small index is one object — and it
-only asks about chunks at least as large as that window, which at the
-shipped 1 MiB chunker minimum is every chunk of a file.
-
-**One caveat, and it is a real one: publish one image per generation.** The
-flush chunks one batch of the write ring at a time, so a session whose
-writes exceed the ring cuts some chunks where the ring flushed rather than
-where the content says, and those chunks cannot dedup against anything.
-One large file per generation is unaffected (100% of bytes cut on content);
-four in one session measured 28%. `docs/known-issues.md` KL-9 has the
-numbers and why the fix is not local.
-
-### The statistics file can now show dedup working
+#### 5. Statistics: three new fields, and the version does not move
 
 `write.deduped_chunks` reported **0 on every path that was actually
 deduplicating**, because it was incremented only on the memtable path,
@@ -746,117 +205,655 @@ question:
   BASE GENERATION already held. This is the cross-generation claim.
 - `write.deduped_chunks` — that, plus repeats within the session.
 - `sealed_deduped_chunks` — `internal/publish`'s own, which is what
-  `--no-memtable` moves. It had no field anywhere: the `write` section is
-  not written at all when there is no memtable.
+  `--no-memtable` moves. It had no field anywhere, because the `write`
+  section is not written at all when there is no memtable.
 
-### Windows builds (`GOOS=windows`), and the port that made them possible
+All three are additive, so **`pelfs_stats_version` stays `3`**. That number
+exists to announce REMOVED keys; nothing was removed here, and a reader
+keyed to the old names still gets them.
 
-`CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build ./...` now succeeds, a CI
-job holds it there, and release tags carry `windows/amd64` and
-`windows/arm64` binaries. This is the groundwork for a Windows frontend —
-**it is not one**. `pelfs mount` and `pelfs shell` do not work on Windows and
-say so; everything that does not attach a filesystem does.
+#### 6. A foreground session no longer writes outside `--state-dir`
 
-The platform-specific code is now split behind build tags rather than
-assumed:
+`--state-dir` covered a session's overlay, caches, control socket and
+signing key, but the mount-record registry was derived from
+`$XDG_STATE_HOME/pelfs` (or `~/.local/state/pelfs`) independently of the
+flag. A run pointed entirely at a temp directory still created a
+`vol-<id>` directory in the user's home, wrote `mount.json` into it, and
+left the directory behind, empty, at exit — measured, not theorised: the
+count went up by one per run of the browser harness.
 
-- **`internal/mmapfile` is new**: one package for every memory mapping in
-  the tree. There are four, and two of them (`internal/memtable`'s ring and
-  buffer) were not in the original survey. Windows mappings are stricter
-  than `mmap` in three ways that all four callers depend on — a zero-length
-  file cannot be mapped, a mapping cannot survive a resize of its file, and
-  a live mapping PINS the file against deletion — so each call site now
-  states which of the three it relies on, and `Table.Close`,
+A **foreground** session — `pelfs shell`, `pelfs mount-gen`, `pelfs browse`
+— now creates nothing outside the root its own flags select, and `pelfs
+status` and `pelfs umount` grew a `--state-dir` flag so they can look
+there. (`pelfs shell` still makes its temporary mountpoint outside the
+state directory, which is the one remaining leak and is a mountpoint rather
+than state.)
+
+**`pelfs mount` is the deliberate exception**, because it detaches: its
+whole contract is that a shell finds it afterwards by prefix, and a reader
+cannot be told about a `--state-dir` it never saw. A live background mount
+that cannot be stopped by name would be a worse bug than the one being
+fixed, so that one record stays in the machine-wide registry (KL-11). What is fixed
+for it instead is that **the registry no longer accumulates**: the
+retraction at exit removes the `vol-<id>` directory as well as the record
+when nothing else is in it. Directories that already hold a volume's state
+are untouched — the removal only succeeds on an empty one.
+
+### What's new
+
+- **`pelfs browse [--rw] [--open] <prefix>` — a page on `127.0.0.1` that
+  answers the two questions a file manager cannot**: is this staged on my
+  laptop or is it in the federation, and publish it now. It opens a volume,
+  serves one page on a random loopback port, and prints the URL whether or
+  not `--open` launches a browser, because a login node has no opener.
+  Read-only unless `--rw`; foreground, so Ctrl-C is the unmount and the
+  session seals on the way out exactly as a mount does.
+
+  The durability line never merges the two facts into one checkmark: a
+  filled amber dot for "on this machine only", with the file count, the
+  bytes and how long until the next automatic publish, and a green check
+  for "in the federation (generation N)". A lease that has gone `stale`,
+  `interrupted` or `lost` — a laptop that slept, another writer that took
+  the branch — is a banner the moment it is known rather than a surprise at
+  the seal. `Publish now` answers **202 with a job id** and reports
+  progress on a Server-Sent-Events stream, because the seal holds the
+  overlay's lock for as long as it takes and a synchronous request would be
+  a spinner with no information in it; a second click while one is running
+  gets **409** naming the job that holds the lock, not a queue.
+
+  **A `--rw` session also seals on its own once the last tab closes.** A
+  browser tab has no unmount, and a drag-and-drop of a couple of hundred
+  documents fires neither write-pressure trigger — those are 1 GiB staged
+  and 200,000 dirty inodes — so before this the work sat in the overlay
+  until the five-minute checkpoint came round, while the user closed the
+  laptop and told a collaborator the data was there. The trigger is a quiet
+  WINDOW after the `/events` stream set becomes empty, which is what makes
+  it safe rather than annoying: a reconnecting browser does not fire it and
+  any stream that appears clears it, two tabs open means one closing is not
+  idle, a closed lid seals when it wakes because the window is compared
+  against the clock rather than counted in samples, `navigator.sendBeacon`
+  only shortens a wait that is already running and is never itself a
+  trigger, a failed idle seal backs off on the write-pressure path's own
+  formula, and it cannot re-enter a seal in flight because it takes the
+  same publish slot the button takes.
+
+  **There are no cookies, anywhere.** A cookie set for `127.0.0.1` has no
+  port isolation at all (RFC 6265bis §8.5), so it is sent to every other
+  local service the browser is made to contact. The launch URL carries a
+  single-use 120-second bootstrap token in its **fragment**, the page
+  exchanges it once for a session token it keeps in `sessionStorage` (which
+  *is* port-scoped) and sends as a request header, and nothing this process
+  mints outlives it. `internal/httpguard` puts the rest in one place and
+  one order: an exact `Host` allowlist that answers **421** to anything else
+  (this is the DNS-rebinding defence, and it is the only thing that works —
+  CVE-2018-5702 is the case where a custom header *was* the CSRF defence
+  and rebinding walked through it), `net/http.CrossOriginProtection` with
+  both of its documented gaps closed, an exact `Origin` match,
+  `application/json` on anything that mutates, a strict
+  `Content-Security-Policy` with a per-response nonce, and no
+  `Access-Control-Allow-*` header on any surface ever. `/debug/pprof` —
+  which the control socket exposes on the strength of being a 0600 unix
+  socket — is not routable from a browser at all.
+
+  **Downloads carry no credential in the URL.** An `<a href>` cannot set a
+  request header, and exempting GET from the credential rule is precisely
+  the hole rebinding exploits, so the page asks an authenticated route for a
+  single-use 30-second ticket and navigates to `/d/<ticket>`. The URL in the
+  browser's download history is already spent by the time it is written
+  there. Bytes come from the volume with `Range` support, a symlink to a
+  file serves the file it names, and a path this session may not read is a
+  403 rather than a 404, because "you cannot" and "there is nothing" are
+  different answers.
+
+- **A WebDAV endpoint, at `/dav/` on the same listener.** `internal/vfsdav`
+  is a `webdav.FileSystem` over the same layer the NFS frontend mounts, so
+  a person on Windows or macOS can browse, download and upload with a client
+  they already have and no FUSE, no kext and no administrator — Cyberduck,
+  Mountain Duck, rclone, WinSCP, `mount_webdav`, the Windows redirector. It
+  is also the answer for a large file on a flaky link, where a real client's
+  own resume works.
+
+  What it is held to is measured. `litmus`, the WebDAV compliance suite,
+  scores the adapter **basic 16/16, copymove 13/13, props 29/30, locks
+  32/34**. The one props failure is the honest part: the same suite scores
+  30/30 against `x/net/webdav`'s own in-memory example server, and the
+  example server reaches that only by hard-coding a 400 on litmus's own
+  probe header. Three real clients also drive it in a container with no
+  network — Cyberduck's CLI (the same protocol stack as Cyberduck and
+  Mountain Duck), rclone over both a TCP port and a unix socket, and curl —
+  and a 68,497,408-byte file, the size the Windows WebDAV *redirector*
+  refuses outright, transfers through Cyberduck's stack at the right length,
+  with `Range` requests served exactly so a client can resume a download.
+
+  Two things a pelfs volume has that WebDAV has no way to say, handled
+  rather than ignored: a symlink to a file is **followed**, so
+  `lib.so -> lib.so.1` is the file it names instead of an empty one; and
+  the entries no client could render — a link to a directory, a dangling
+  link, a fifo, a socket, a device node — are hidden and **counted**, so a
+  tree that looks smaller than it is can say so. The surface emits no
+  `Access-Control-Allow-*` header on any response, ever, which is not an
+  omission: without one a web page on another origin cannot get a preflight
+  for PROPFIND, PUT, MKCOL, MOVE, COPY, DELETE, PROPPATCH or LOCK, so the
+  entire WebDAV write surface is unreachable from a browser by
+  construction. A test asserts it on every one of those verbs, in every
+  authentication state.
+
+- **A credential desk: connect Cyberduck by opening a file, and click once
+  to say so.** `internal/localoauth` is an authorization server —
+  `GET/POST /oauth/authorize`, `POST /oauth/token`, authorization-code with
+  PKCE `S256` — and `internal/davprofile` generates the
+  `.cyberduckprofile`, the `.duck` bookmark and the per-client HTTP Basic
+  credential a client that is not Cyberduck needs. "Connect another
+  program" on the page adds a program, saves the profile or the bookmark,
+  hands over the username and password for everything else, and lists and
+  revokes every credential this session has issued.
+
+  **The consent click is structural, not a convention.** An `/authorize`
+  endpoint that mints a token from an existing session with no user
+  interaction is a token-exfiltration primitive for anything that can
+  navigate the user's browser to it, and being on loopback does not help: a
+  top-level navigation needs no preflight. So `GET /oauth/authorize` has no
+  code path that emits a `Location` header at all. It renders a screen
+  naming the program, the volume, the access being asked for and the address
+  the authorization would be sent to; that screen carries a 32-byte consent
+  ticket that exists nowhere else, cannot be framed, and — because the
+  page's own CSP is `script-src 'none'` — cannot be submitted by script. The
+  only thing that can complete an authorization is a person pressing a
+  button. That is a deliberate divergence from "remember consent per client
+  for the life of the process": the no-re-prompt property lives on the
+  refresh token instead, which is where a reconnecting client actually
+  needs it.
+
+  **A token from here is strictly weaker than the browser session.** It
+  reaches `/dav/*` and nothing else, can never publish, can never mint
+  another credential, and can never be wider than the session that issued
+  it — a read-only `pelfs browse` cannot mint a writable DAV token, and that
+  is checked when the client is registered, when the scope is parsed, when
+  the grant is issued, and again on every request. The tables hold HMACs
+  under a per-process key rather than the secrets themselves, so a heap
+  profile of the process carries no usable credential. Authorization codes
+  are single-use with a 60-second life, bound to the client, the exact
+  `redirect_uri` and the PKCE challenge; a replayed code is a hard failure,
+  is counted, and revokes the grant the first exchange bought. A
+  `redirect_uri` that differs by one character is refused **on pelfs's own
+  page**, with no redirect anywhere and nothing from the request echoed
+  back.
+
+  It was verified against real Cyberduck rather than a golden file:
+  `scripts/oauth-cyberduck-docker.sh` runs `duck` — the same protocol stack
+  as Cyberduck and Mountain Duck — against a live pelfs authorization server
+  in a container with **no network**, and completes the whole flow across 22
+  checks with no failures. Three things that were inference from reading
+  Cyberduck's source are now observations: a non-blank `OAuth Client ID`
+  really is the switch, so the session goes straight to an OAuth flow with
+  no password prompt; Cyberduck sends `code_challenge_method=S256`
+  unprompted, so REQUIRING PKCE costs the primary client nothing; and the
+  `redirect_uri` it sends back for a loopback callback is that string
+  verbatim, which is what makes an exact-string allowlist workable rather
+  than aspirational.
+
+  **One correction to what the design pencilled in**, because it would have
+  broken every Cyberduck connection: `POST /oauth/token` is on the guard's
+  new token surface, not on its exchange surface. Cyberduck's back-channel
+  POST is a Java HTTP client that carries no `Origin` and no
+  `Sec-Fetch-Site` (the exchange surface answers 403) and sends
+  `application/x-www-form-urlencoded`, which RFC 6749 mandates (the exchange
+  surface answers 415). `SurfaceToken` keeps the Host allowlist, the
+  `Sec-Fetch-Site` check, the exact-`Origin` match, the cookie strip and the
+  headers, and drops the rules a non-browser cannot satisfy — the positive
+  provenance requirement, the no-`Authorization` rule and the surface-level
+  body cap, which the token handler re-imposes itself. Tests pin the
+  placement. And `internal/vfsdav` learned to narrow a 401's challenge to
+  the scheme the client tried, so a client whose Bearer token was refused is
+  not offered `Basic`, which would drop Cyberduck into a password prompt for
+  a profile that has no password field.
+
+- **A JSON data plane at `/api/v1`.** `internal/webapi` answers a file
+  manager's REST contract over the same volume, the same namespace and the
+  same permission model every other frontend sees: list, create folder,
+  rename, move, copy, delete and whole-file upload, with download on the
+  ticket route. It is what a browser file manager will be built on, and it
+  is reachable and tested today (see *Not in this release* for what is not).
+
+  The contract is not invented. Every request the real
+  `@svar-ui/react-filemanager` component makes, in the order it makes them,
+  is recorded in `internal/webui/testdata/svar-contract/recording.json`, and
+  Go tests **replay that recording against these handlers**, so the day a
+  component upgrade changes the wire shape a Go test fails instead of a
+  browser.
+
+  Three properties are the design rather than fallbacks. **A directory
+  listing is capped at 5,000 entries**, because the component does not
+  virtualize: a probe drove the real component in a real browser and
+  measured a 100,000-entry directory as 1,000,067 DOM nodes, 703 MB of heap
+  and 17.7 s to open, against 320 ms for 5,000. What makes a cap acceptable
+  is being told about it, and there is a second reason the telling is not
+  optional: the component's search box filters loaded data only and issues
+  no request, so in a capped folder a user who searches, finds nothing, and
+  concludes the file is not there has been misled. Every listing therefore
+  carries the true count, the cap and the hidden count in its headers,
+  `GET /api/v1/info/{id}` returns them as JSON, and the sentence to display
+  is generated by the API rather than re-worded per surface. **A batch of
+  five moves returns five results**, and the request is still a 200 —
+  there is no atomic N-way rename in the overlay, in WebDAV or in POSIX, so
+  a batch is N sequential operations and each id gets its own outcome; a
+  4xx would tell the client nothing happened when in fact most of it did.
+  **Uploads stream**: the body is read with `r.MultipartReader()` and copied
+  through a 32 KiB buffer, never `r.ParseMultipartForm`, which buffers and
+  then spools the rest to a temp file — writing a 68 MB container image to
+  disk twice. The test drives a generated 68,497,408-byte payload and holds
+  the whole handler under a 16 MiB peak-footprint ceiling, and an AST check
+  fails the build if `ParseMultipartForm` reappears anywhere. Bytes land
+  under `<name>.pelfs-part` and are renamed only once the whole body has
+  arrived, so a truncated upload never shows a name that the next checkpoint
+  would publish.
+
+  Listings do not lie about symlinks: the policy is the WebDAV adapter's
+  exactly — a link to a regular file is followed and shown under its own
+  name, a link to a directory is hidden because the layer below cannot
+  traverse one, a dangling link is hidden, and fifos, sockets and device
+  nodes are hidden — and everything hidden is counted and reported, so a
+  tree never quietly looks smaller than it is.
+
+  One finding worth recording for whoever writes the next route:
+  `net/http`'s `{id}` wildcard does not match a path segment that is exactly
+  `%2F` — the volume root as an id — because unescaped it reads as a
+  trailing empty segment. Every id route therefore has an `{id...}` sibling,
+  without which "add a folder in the root" would be a 404.
+
+- **The federation SSO prompt shows up in the browser instead of the
+  terminal.** `pelfs browse` installs pelican's
+  `oauth2.SetVerificationURLHandler`, so "authorize with your institution"
+  arrives as a card on the page — the URL, the code to type, and what pelfs
+  is waiting for — rather than as a URL in a terminal the user was told they
+  would not need. The hook is **process-wide**, so `pelfs browse` is the
+  only verb that installs it and it removes it on the way out; `pelfs mount`
+  and `pelfs get` keep the terminal behaviour they always had, and pelican
+  still writes the URL to stderr in every case. Prompts are a **set with a
+  TTL**, not a slot, so two namespaces can each open a flow and both get a
+  card, and identical prompts fold together. A prompt raised **before the
+  browser has connected** — the likely case, since credential priming runs
+  as the volume opens — is not lost, because the cards are state and
+  `/events` carries snapshots. The card **never says "authorization
+  complete"**, because the hook is one-way and cannot know: it greys out on
+  a ten-minute TTL, is dismissible by hand, and carries no token of any
+  kind.
+
+- **Windows builds.** `CGO_ENABLED=0 GOOS=windows go build ./...` succeeds
+  for `amd64` and `arm64`, a CI job holds it there (build, vet, and two test
+  lanes), and release tags now carry both. This is groundwork for a Windows
+  frontend and **is not one**: `pelfs mount` and `pelfs shell` do not work
+  there and say so during argument handling, naming the missing dependency
+  rather than the platform, while everything that does not attach a
+  filesystem does work. The platform-specific code is now split behind build
+  tags rather than assumed. `internal/mmapfile` is new and is the only place
+  in the tree that maps memory — four call sites, two of which (the
+  memtable's ring and buffer) were not in the original survey — and because
+  Windows mappings are stricter in three ways that all four callers depend
+  on (a zero-length file cannot be mapped, a mapping cannot survive a resize
+  of its file, and a live mapping PINS the file against deletion), each call
+  site states which of the three it relies on, and `Table.Close`,
   `Buffer.Remove` and `Ring.Remove` unmap before they unlink. `Ring.Remove`
-  did not close its file at all before; it does now.
-- **Process liveness**, which the scratch sweeper uses to decide whether to
-  DELETE a directory, has a real Windows implementation:
-  `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` plus
-  `GetExitCodeProcess`. Both calls are needed — a Windows process object
-  outlives the process while any handle to it is held, so an OpenProcess
-  that succeeds proves nothing — and the answer is deliberately lopsided:
-  only a positive "no such process" reports dead, and access-denied or any
-  unrecognised failure reports alive.
-- **The FUSE frontend is excluded, not stubbed.** `internal/rawfuse` carries
-  `//go:build !windows` (go-fuse is the Unix kernel protocol expressed in Go
-  types and cannot be ported), so a Windows build does not contain it, and
-  `pelfs mount --backend fuse` there fails during argument handling with a
-  sentence naming the missing dependency rather than the platform.
-- **The NFS frontend cross-compiles unchanged** — our go-nfs fork,
-  `internal/vfsbilly` and `internal/nfsmount` are pure Go — and is kept in
-  the Windows build. `nfsmount.Mount` and `Unmount` now refuse there instead
-  of falling through to the macOS branch and reporting `mount_nfs:
-  executable file not found in %PATH%`, then reaching for `diskutil`.
-- **`pelfs umount` refuses on Windows** rather than pretending. The Unix
-  path sends `SIGTERM` because the exit path seals the overlay into the next
-  generation; Windows offers a detached process only `TerminateProcess`,
-  which would strand the session unsealed while telling the user it had been
-  published.
+  did not close its file at all before. Process liveness, which the scratch
+  sweeper uses to decide whether to DELETE a directory, has a real Windows
+  implementation — `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` plus
+  `GetExitCodeProcess`, both needed because a Windows process object
+  outlives the process while any handle to it is held, and deliberately
+  lopsided: only a positive "no such process" reports dead, while
+  access-denied or any unrecognised failure reports alive. The FUSE frontend
+  is excluded from the build rather than stubbed, since go-fuse is the Unix
+  kernel protocol expressed in Go types. The NFS frontend cross-compiles
+  unchanged and is kept, with `nfsmount.Mount` and `Unmount` refusing there
+  instead of falling through to the macOS branch and reporting
+  `mount_nfs: executable file not found in %PATH%` and then reaching for
+  `diskutil`. `pelfs umount` refuses rather than pretending: the Unix path
+  sends `SIGTERM` because the exit path seals the overlay into the next
+  generation, and Windows offers a detached process only
+  `TerminateProcess`, which would strand the session unsealed while telling
+  the user it had been published. `internal/rotate`'s `syncDir`, the `errno`
+  comparisons in `internal/nfsmount/diag.go`, and everything that unlinks a
+  file another handle still holds open remain Unix-shaped, and are listed
+  rather than fixed (`docs/TODO.md`, winport-agent).
 
-`internal/rotate`'s `syncDir`, the `errno` comparisons in
-`internal/nfsmount/diag.go`, and everything that unlinks a file another
-handle still holds open remain Unix-shaped, and are listed rather than
-fixed. See `docs/TODO.md` (winport-agent) for the full audit.
+- **`pelfs mount-gen` is an apptainer `--fusemount` driver**, so a job
+  mounts a pelfs volume **inside its own container**, with no pelfs on the
+  host and nothing for a site to install beyond apptainer:
 
-### `pelfs mount-gen` is an apptainer `--fusemount` driver
+  ```
+  apptainer exec \
+    --fusemount "host:$_CONDOR_SCRATCH_DIR/pelfs-fusemount.sh \
+                 pelican://<federation>/<prefix> \
+                 $_CONDOR_SCRATCH_DIR/pelfs-work /data" \
+    mypipeline.sif ./payload
+  ```
 
-A job can now mount a pelfs volume **inside its own container**, with no
-pelfs on the host and nothing for a site to install beyond apptainer:
+  `scripts/pelfs-fusemount.sh` is that wrapper, ready to ship with a job;
+  `docs/design-apptainer.md` has the measurements and the constraints.
 
-```
-apptainer exec \
-  --fusemount "host:$_CONDOR_SCRATCH_DIR/pelfs-fusemount.sh \
-               pelican://<federation>/<prefix> \
-               $_CONDOR_SCRATCH_DIR/pelfs-work /data" \
-  mypipeline.sif ./payload
-```
-
-`scripts/pelfs-fusemount.sh` is that wrapper, ready to ship with a job;
-`docs/design-apptainer.md` has the measurements and the constraints.
-
-What changed to make it work:
-
-- **A `/dev/fd/N` mountpoint is understood.** Apptainer opens `/dev/fuse`,
+  A `/dev/fd/N` mountpoint is understood. Apptainer opens `/dev/fuse`,
   performs the kernel mount itself, and runs the driver as
   `<driver> /dev/fd/N -f` — the libfuse magic-mountpoint convention, which
-  go-fuse already implements. `mount-gen` used to `os.MkdirAll` its
+  go-fuse already implements — where `mount-gen` used to `os.MkdirAll` its
   mountpoint first and die with `mkdir /dev/fd/3: not a directory`. It now
-  recognises the form (`rawfuse.PassedFD`) and skips the mkdir, skips the
-  unmount at teardown (there is nothing of ours to unmount, and go-fuse
-  refuses a magic mountpoint by design), skips the `/dev/fuse` usability
-  probe (the mount already exists), refuses `--backend nfs` and
-  `--subshell` for it with a reason, and tolerates the trailing `-f`.
-- **Permissions are enforced by pelfs on such a mount.** On a passed
-  descriptor go-fuse never calls `mount(2)`, so the `ro` and
-  `default_permissions` this process asks for are never delivered —
-  measured: the mount options are the parent's, and apptainer does not ask
-  for `default_permissions`. A `--fusemount` mount would therefore have
-  applied no mode bits at all, which is the inconsistency v0.2.0 closed for
-  the NFS frontend. So `internal/rawfuse` now answers `ACCESS` and checks
-  OPEN, OPENDIR, LOOKUP and every namespace operation itself **when and
-  only when** the kernel is not doing it, over the same model the NFS
-  frontend uses. That model moved to `internal/fsperm`, imported by both
-  frontends; `internal/vfsbilly/perm.go` keeps the NFS-specific half. An
+  recognises the form and, on such a mount only, skips the mkdir, skips the
+  teardown unmount (there is nothing of ours to unmount, and go-fuse refuses
+  a magic mountpoint by design), skips the `/dev/fuse` usability probe,
+  refuses `--backend nfs` and `--subshell` with a reason, and tolerates the
+  trailing `-f`. `-f`/`--foreground` is accepted and documented as a no-op,
+  since `mount-gen` has always run in the foreground, which is what a
+  `--fusemount` driver must do.
+
+  **Permissions are enforced by pelfs on a passed descriptor.** go-fuse
+  never calls `mount(2)` there, so the `ro` and `default_permissions` this
+  process asks for are never delivered — measured, and recorded in the
+  design doc with the `mountinfo` diff: the mount options are the parent's,
+  and apptainer does not ask for `default_permissions`. Such a mount would
+  therefore have applied no mode bits at all, which is the inconsistency
+  v0.2.0 closed for the NFS frontend. So `internal/rawfuse` answers
+  `ACCESS` and checks OPEN, OPENDIR, LOOKUP and every namespace operation
+  itself when the mountpoint is a passed descriptor, over the same model the
+  NFS frontend uses; that model moved to `internal/fsperm`, imported by both
+  frontends, and `internal/vfsbilly/perm.go` keeps the NFS-specific half. An
   ordinary mount is unchanged and still leaves the check to the kernel.
-- **Teardown seals.** A `--rw` driver whose container is killed still
-  publishes: the connection dies with the container's namespace, the device
-  answers `ENODEV`, and the seal and the lease release run then. Verified
-  by SIGKILL'ing apptainer mid-write in the container harness — 32 MiB
-  written, generation sealed, lease released, bytes read back from a fresh
-  mount.
-- `-f`/`--foreground` is accepted (and documented as a no-op: `mount-gen`
-  has always run in the foreground, which is what a `--fusemount` driver
-  must do).
 
-Two constraints a writable `--fusemount` job has to know, both recorded in
-`docs/design-apptainer.md`:
+  **Teardown seals.** A `--rw` driver whose container is killed still
+  publishes: the connection dies with the container's namespace, the serve
+  loop returns, and the seal and the lease release run then. Verified by
+  SIGKILL'ing apptainer mid-write in the container harness — 32 MiB written,
+  generation sealed, branch advanced, lease released, and the bytes read
+  back from a fresh mount.
 
-- the driver's environment is **scrubbed**, so the prefix, the work
-  directory, the token and the signing key are command-line arguments of
-  the wrapper, not inherited;
-- with `--rw`, ship the volume's **signing key** (`--signing-key`): a fresh
-  work directory has none, and without it the seal fails after the job has
-  already finished.
+  Three things a writable `--fusemount` job has to know, all recorded in
+  `docs/design-apptainer.md`: the driver's environment is **scrubbed**, so
+  the prefix, the work directory, the token and the signing key are
+  command-line arguments of the wrapper rather than inherited; with `--rw`
+  you must ship the volume's **signing key** (`--signing-key`), because a
+  fresh work directory has none and without it the seal fails after the job
+  has already finished; and **stat the mountpoint before writing to it** —
+  with no prior stat the first write is refused `EACCES` and no CREATE ever
+  reaches pelfs, because of an unmapped uid 0 in apptainer's user namespace.
+  That last one is nothing pelfs can fix from inside; the harness works
+  around it with a bare `ls -ld`.
+
+### Fixed
+
+- **`fsync` and `fsyncdir` made nothing durable and returned success**, on
+  both frontends. An application that called `fsync`, checked the result,
+  and believed its data was safe — which is the only reason to call it —
+  was believing nothing. See *Upgrading*, item 1, for what it now
+  guarantees and what it costs.
+
+- **A crash between a flush and its location record no longer loses that
+  flush.** A write's LENGTH became durable immediately, while the record of
+  WHERE its bytes went was written much later, once the flush's packs had
+  landed. In between, publishing a flush reclaimed the ring region its
+  records sat in, which moves the tail hint a remount walks from, so a
+  crash in that window left bytes referenced by neither place: at least one
+  flush batch — 2 MiB at the shipped pack target, and more when packing
+  serialises behind a slow link — usually already on the federation, with
+  nothing left behind to say which pack it was in.
+
+  The ring region is now released only once the record that replaces it is
+  durable. Until then the ring is still where a recovery finds those
+  extents, so a crash in the window recovers the file **byte-exact**
+  instead of cutting it back. A flush therefore also means "recorded" as
+  well as "uploaded": a flush waits for the location records of everything
+  it published, so a failure to write one **reaches the caller** rather
+  than hanging the writer or being discovered by the next mount. That
+  failure is deliberately terminal for the session rather than retryable:
+  once a location record cannot be written, every subsequent write and
+  flush on that mount fails with the same error instead of proceeding over
+  a ring whose records nobody can trust. What the hold costs is
+  backpressure — *Upgrading*, item 3.
+
+- **A crash no longer leaves a file that reads at full length with zeros in
+  it.** A crash could leave a file that came back at exactly the size it
+  was written, full of bytes nobody wrote. Nothing a user could run
+  revealed it: `stat` said the file was whole, `cmp` was the only thing
+  that disagreed, and the recovered session then sealed those zeros into a
+  signed generation that `pelfs fsck --deep` called consistent — a gap in
+  an extent map reads as zeros, which is right for a sparse file and a lie
+  here.
+
+  Recovery now **cuts the file back to the first byte it cannot serve**, in
+  both places a length lives: the extent map and the overlay's node row,
+  which is the one `stat` answers and a read clamps to. What comes back is
+  a genuine prefix of what was written, or nothing, and the recovery report
+  names the cut as well as the loss. A short file after a crash is a
+  failure a user can see; a full-length file of zeros is not. Genuine holes
+  are untouched. The loss that made this reachable is itself gone now — see
+  the entry above, which closes the window rather than reporting it — so
+  what is left of this change is the guarantee for every OTHER way an
+  extent can go missing: a torn ring record, a truncated buffer file, a
+  state directory that lost its location map.
+
+- **Cross-generation dedup on the default write path.** Writing a file
+  whose content the volume already holds now costs the metadata and nothing
+  else. Before this, only `--no-memtable` deduplicated across generations;
+  the default path packed and uploaded during the session against an
+  in-memory, per-session map and re-sent every byte.
+
+  Measured on four related container images, one per generation, against a
+  real origin (`scripts/apptainer-test.sh` section 8b). The figure is the
+  size of the origin at the end of the run, which is the number that
+  matters to whoever pays for it:
+
+  | | default | `--no-memtable` |
+  |---|---|---|
+  | before | 272,755,301 | 149,221,054 |
+  | after | **149,224,395** | 149,221,054 |
+
+  The two paths now land within about 3 KB of each other on a 149 MB
+  volume, which is catalog-row noise rather than re-sent content. So
+  **`--no-memtable` is no longer worth passing to publish images**: it
+  reaches the same number and stages the whole file to local disk to get
+  there. Adding one small file to a 68,497,408-byte image costs 4.9 MB, and
+  a re-push of an unchanged one costs essentially nothing.
+
+  There is no new index, no sidecar, and no new resident structure. The
+  write path asks the generation it is building on, through the same
+  windowed pack index the read path already uses — one 64 KiB range read
+  per lookup at worst, usually nothing at all because a small index is one
+  object — and it only asks about chunks at least as large as that window,
+  which at the shipped 1 MiB chunker minimum is every chunk except a final
+  remainder under 64 KiB.
+
+  **One caveat, and it is a real one: publish one image per generation.**
+  The flush chunks one batch of the write ring at a time, so a session
+  whose writes exceed the ring cuts some chunks where the ring flushed
+  rather than where the content says, and those chunks cannot dedup against
+  anything. One large file per generation is unaffected — 100% of bytes cut
+  on content — while four in one session measured 28%.
+  `docs/known-issues.md` KL-9 has the numbers and why the fix is not local.
+
+- **`write.deduped_chunks` reported 0 on every path that was actually
+  deduplicating.** Three fields now — *Upgrading*, item 5.
+
+- **The NFS owner override no longer reaches a frontend that did not ask
+  for it.** The layer both mounts share granted one deliberate exception to
+  the mode bits: the owner of a file may write it through the NFS frontend
+  whatever the mode says. That is knfsd's own rule, and it is why `tar -p`
+  can extract a read-only file over NFS — NFSv3 has no open operation, so by
+  the time a write arrives the open it belongs to was already decided,
+  correctly, on the client from our own ACCESS reply. WebDAV has a real
+  open, and for it that check is the ONLY one there will ever be, but a
+  frontend built on the shared layer inherited the exception anyway — so a
+  WebDAV `PUT` would have emptied a `0444` file that the kernel, a FUSE
+  mount and this server's own ACCESS reply all refuse. Two frontends
+  disagreeing about the same file is the defect the permission work in
+  v0.2.0 existed to end. The exception is now something a frontend must ask
+  for **by name**, and the name says who is entitled to it; the zero value
+  is the safe one. The NFS mount is unchanged and `tar -p` over a real
+  kernel NFS mount still extracts a read-only tree intact.
+
+- **A foreground session no longer creates a `vol-<id>` directory in the
+  user's home**, and the mount registry no longer accumulates empty ones —
+  *Upgrading*, item 6.
+
+### Not in this release
+
+**The React file manager is built, committed and tested — and no shipped
+verb serves it.** `internal/webui` carries a bundle built from the MIT SVAR
+component by `go generate` and embedded with `//go:embed`, a licence gate,
+a reproducibility gate and a browser suite. But nothing in `cmd/pelfs`
+imports the package, so it is not linked into the `pelfs` binary at all,
+and `pelfs browse` serves its own hand-written page. What ships and is
+reachable is the JSON data plane, the WebDAV endpoint, the credential desk
+and that page. Treat the file manager as landed infrastructure whose wiring
+is the next milestone, and read any claim about "a file manager in the
+browser" as describing what the data plane is for rather than what a user
+can open today.
+
+The build machinery around it is real and is worth having regardless. The
+bundle is **committed**, so `go build ./...`, `go vet ./...` and
+`go test ./...` need no Node, no pnpm and no npm, and the job that needs
+Node is a separate workflow with its own path filter, so a Go-only pull
+request never waits for it. Because a committed build artefact rots
+silently, `.github/workflows/webui.yml` runs the build **twice** — proving
+the output is byte-reproducible, which is what makes the gate trustworthy
+instead of flaky — and fails if `internal/webui/dist` or
+`internal/webui/third_party.txt` differs from what its sources produce. It
+also fails if any GPLv3 `wx-*` package appears in the lockfile: the
+component is MIT under its `@svar-ui/*` names and was GPLv3 under the
+retired `wx-*` ones, pelfs is Apache-2.0, and the bundle would ship *inside*
+the binary, so that swap would be a relicensing event disguised as a
+version bump. `third_party.txt` lists all 30 bundled packages with their
+licences and the full licence text each one requires be carried with a
+distribution.
+
+The component was measured before it was adopted, which is where the API's
+5,000-entry cap comes from, and two defects in its shipped data provider
+were found the same way: `setHeaders()` never reaches the wire, so the
+session credential would have been silently absent, and every mutating
+request goes out as `Content-Type: text/plain`, which is the one content
+type an HTML form can send and which the threat model answers with 415.
+Both are fixed in a two-line override inside a subclass, and both are
+pinned by tests that will say so if a future release makes the subclass
+unnecessary. The UI also loads nothing off the network — the component's
+default theme injects a CDN stylesheet link and its default icons are CDN
+URLs per file extension, and three separate checks (one in the build, one
+in Go, one in a real browser) keep them off, because a localhost tool that
+phones home is both a privacy leak and broken on an air-gapped machine.
+
+**Resumable upload is not built either**, on any surface. The JSON API
+takes one whole-file `POST`, so a dropped connection at 90% of a 68 MB file
+starts over, and nothing can show a progress bar until the request
+finishes. The WebDAV endpoint is the answer for a large file on a flaky
+link. Tracked as KL-15 in `docs/known-issues.md`.
+
+### Scale
+
+Unchanged as a design target — volumes of order a hundred million objects
+— and unchanged in what is proven end to end: CI still untars 62,500 files
+through both frontends, diffs the tree through the live mount, seals it,
+cold-mounts the published generation into a state directory that never
+existed before and diffs it again, runs `fsck --deep` and `gc`, and
+publishes a second generation carrying an add, a modify and a delete which
+is cold-mounted and diffed once more. A mount is still `kill -9`'d
+mid-flush after writing 384 MB, remounted, and held to the recovery
+contract — and that contract is stronger now, because the flush window
+above is closed and a recovered file is a genuine prefix rather than a
+full-length fabrication.
+
+The resident-memory picture is unchanged by this release and still has one
+open item: the read path's pack-location map is capped at 131,072 entries,
+and four call-site families still opt out and hold every location. It is
+tracked as KI-8 in `docs/known-issues.md`, and the sorted, mmap'd spill
+table it needs exists and is simply not wired in.
+
+One new bound worth knowing: **a browser directory listing is capped at
+5,000 entries** and the API says so in its headers and in a sentence,
+because the component that will consume it does not virtualize. That is a
+frontend cap, not a volume limit; WebDAV and both mount frontends list a
+directory in full.
+
+### Known limitations
+
+Everything in v0.2.0's list still holds. Four things this release changes
+or adds:
+
+- **`fsync` is state-directory durability, not federation durability**, and
+  on an NFS mount over real storage it costs a commit per small file
+  created whether or not anything called `fsync` (KL-16). A tmpfs CI runner
+  cannot see that cost.
+- **Permission enforcement is fidelity, not access control — now on three
+  surfaces.** The NFS export, the WebDAV endpoint and a `--fusemount` mount
+  all evaluate every request as the identity that started the server. Do
+  not treat any of them as a multi-user boundary (KL-6, whose scope this
+  release widens).
+- **The checks pelfs applies on a passed descriptor are weaker than the
+  kernel's, in two known ways** (KL-8). Path traversal is enforced only on
+  a dentry-cache miss, so a search-denied directory still admits a name the
+  kernel already looked up; and supplementary groups are unavailable for
+  any uid but the mount owner, so the group class is judged on the primary
+  gid alone and can deny what the kernel would allow. Neither is pinned by
+  a test. An apptainer job that relies on mode bits for isolation between
+  uids inside its own container is getting a weaker check than an ordinary
+  mount gives.
+- **A session that writes more than the write ring holds cannot fully
+  deduplicate.** Publish one image per generation (KL-9).
+- **No resumable upload on any surface** (KL-15).
+- **`pelfs mount` and `pelfs shell` do not work on Windows.** The Windows
+  binary is for everything that does not attach a filesystem; a Windows
+  user reaches a volume's files over WebDAV.
+
+### What a failure looks like
+
+Unchanged, with two additions. A `fsync` that cannot make its layers
+durable returns the error rather than success, and a flush whose location
+record cannot be written fails the writer that asked for it rather than
+hanging or deferring the discovery to the next mount. A crash still loses
+at most what was not yet durable, and what comes back is a genuine prefix
+of what was written, never a full-length file of bytes nobody wrote.
+
+A `pelfs browse` session that cannot reach the federation behaves like any
+other seal that cannot: the overlay is left intact, the branch does not
+move, and the page says so on its banner rather than at exit. A failed
+idle seal backs off rather than retrying every 30 seconds against a broken
+federation.
+
+### Verified by
+
+Everything v0.2.0 listed, plus:
+
+- **`make browse-gate`** — the shipped binary against a fakeorigin, curl
+  playing the browser against every route, **real Cyberduck** (`duck`)
+  playing the WebDAV client including an upload, and then a second, fresh
+  `pelfs` that mounts the published generation from an empty state
+  directory and reads the payloads back out of the federation, including
+  the file Cyberduck uploaded. It is a CI gate and a release gate.
+- **The WebDAV compliance and client harnesses** — `litmus` against the
+  adapter and against `x/net/webdav`'s example server for comparison, and
+  Cyberduck's CLI, rclone (TCP and unix socket) and curl driving the
+  adapter in a container with no network.
+- **`scripts/oauth-cyberduck-docker.sh`** — the whole authorization-code
+  flow against real `duck` in a container with no network.
+- **`scripts/webui-playwright.sh`** — a real Chromium against the real
+  binary, asserting the browser half of the threat model, which is the one
+  half a Go test cannot: no `Set-Cookie` and an empty `document.cookie`
+  after a full session; the session token in `sessionStorage` and nothing
+  in `localStorage`; a single-use bootstrap token whose second use fails
+  visibly and which never survives in the address bar; a ticketed download
+  that works with no credential and 404s on replay; a rebound `Host`
+  answered 421 (Chromium's `--host-resolver-rules` maps an attacker
+  hostname to loopback, which makes DNS rebinding directly testable); a
+  cross-site page that cannot read a response, submit a form, load an
+  `<img>`, frame the app, or preflight a `PROPFIND`; an SSE reconnect that
+  leaves no stale view; the `<noscript>` message; and not one request
+  leaving 127.0.0.1 for the whole session. `retries: 0`, no fixed sleeps,
+  expect-polling only — a browser gate that needs a rerun to go green
+  teaches people to rerun the next real failure too.
+- **A Windows CI job** — build, vet, and two test lanes on
+  `windows-latest`, so the cross-build is held by something other than a
+  release tag.
+- **The apptainer container harness**, including the SIGKILL-mid-write case
+  above.
+
+Cost-attribution measurements that are stopwatches rather than gates now
+include the fsync-coalescing benchmarks
+(`internal/overlay`) and the ring-hold model
+(`PELFS_RINGHOLD_MEASURE=1`). The NFS `fsync` cost on real storage is
+neither — it is a hand measurement, and it is labelled as one above.
 
 ## v0.2.0
 

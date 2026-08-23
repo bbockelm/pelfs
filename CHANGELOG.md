@@ -172,6 +172,83 @@ volume root as an id — because unescaped it reads as a trailing empty
 segment. Every id route therefore has an `{id...}` sibling, without which
 "add a folder in the root" would be a 404.
 
+### Connect Cyberduck to a pelfs volume by opening a file, and click once to say so
+
+`pelfs browse` can now hand a WebDAV client a credential of its own.
+Two new packages: **`internal/localoauth`**, an authorization server —
+`GET /oauth/authorize`, `POST /oauth/token`, authorization-code with PKCE
+`S256` — and **`internal/davprofile`**, which generates the
+`.cyberduckprofile`, the `.duck` bookmark and the per-client HTTP Basic
+credential a client that is not Cyberduck needs. Nothing is wired to a route
+yet; that is `pelfs browse`'s own change.
+
+**It was verified against real Cyberduck, not against a golden file.**
+`scripts/oauth-cyberduck-docker.sh` runs `duck` 9.5.3 — the same protocol
+stack as Cyberduck and Mountain Duck — against a live pelfs authorization
+server in a container with no network, and completes the whole flow: 22
+checks, 0 failures. Four things that were previously inference from reading
+Cyberduck's source are now observations:
+
+- a non-blank `OAuth Client ID` really is the switch — the session went
+  straight to "Start new OAuth flow" as `user='anonymous', password=''`,
+  with no password prompt and no password field;
+- Cyberduck sends `code_challenge_method=S256` unprompted, so REQUIRING
+  PKCE costs the primary client nothing;
+- the loopback redirect provider is the one selected for
+  `http://127.0.0.1:52001/pelfs/oauth/callback`, and the `redirect_uri` it
+  sends back is that string verbatim — which is what makes an exact-string
+  allowlist workable rather than aspirational;
+- `Scopes` as a plist `<array>` arrives as a space-delimited `scope`
+  parameter, and `duck --profile <file>` registers a generated profile
+  such that `dav://127.0.0.1:PORT/dav/` resolves to it.
+
+**The consent click is structural, not a convention.** An
+`/authorize` endpoint that mints a token from an existing session with no
+user interaction is a token-exfiltration primitive for anything that can
+navigate the user's browser to it, and being on loopback does not help: a
+top-level navigation needs no preflight. So `GET /oauth/authorize` has no
+code path that emits a `Location` header at all. It renders a screen naming
+the program, the volume, the access being asked for and the address the
+authorization would be sent to; that screen carries a 32-byte consent
+ticket that exists nowhere else, cannot be framed, and — because the page's
+own CSP is `script-src 'none'` — cannot be submitted by script. The only
+thing that can complete an authorization is a person pressing a button.
+That is a deliberate divergence from the design's "remember consent per
+client for the life of the process": remembering it at `/authorize` would
+put the primitive back. The no-re-prompt property lives on the refresh
+token instead, which is where a reconnecting client actually needs it.
+
+**A token from here is strictly weaker than the browser session.** It
+reaches `/dav/*` and nothing else, can never publish, can never mint another
+credential, and can never be wider than the session that issued it — a
+read-only `pelfs browse` cannot mint a writable DAV token, checked when the
+client is registered, when the grant is issued, and again on every request.
+Nothing persists: every secret is `crypto/rand` into memory, the tables hold
+HMACs under a per-process key rather than the secrets themselves (so a heap
+profile of the process carries no usable credential, and a token from a
+previous session does not validate against a new one on the same port), and
+exiting `pelfs browse` is a complete revocation of everything it ever
+minted. Individual revocation — one client, or one connection's tokens — is
+a method call away for the UI that will list them.
+
+Authorization codes are single-use with a 60-second life, bound to the
+client, the exact `redirect_uri` and the PKCE challenge. A replayed code is
+a hard failure, is counted, and revokes the grant the first exchange bought.
+A `redirect_uri` that differs by one character is refused **on pelfs's own
+page**, with no redirect anywhere and nothing from the request echoed back.
+
+Two supporting changes to the packages M1 landed. `internal/httpguard` grew
+a **`SurfaceToken`**: the token endpoint is a back-channel POST from a Java
+HTTP client, which sends no `Origin` and no `Sec-Fetch-Site` and a
+form-encoded body, so the surface the design pencilled it in on
+(`SurfaceExchange`) would answer 403 and 415 to every exchange Cyberduck
+ever makes. It keeps the Host allowlist, the `Sec-Fetch-Site` check, the
+exact-`Origin` match, the cookie strip and the headers, and drops only the
+two rules a non-browser cannot satisfy. And `internal/vfsdav` learned to
+narrow a 401's challenge to the scheme the client tried, so a client whose
+Bearer token was refused is not offered `Basic` — which would drop
+Cyberduck into a password prompt for a profile that has no password field.
+
 ### `fsync` now does something, and says what it did
 
 `fsync(2)` and `fsyncdir(2)` on a FUSE-backed pelfs mount returned success

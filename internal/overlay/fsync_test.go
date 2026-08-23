@@ -49,7 +49,7 @@ type syncFixture struct {
 	ov      *overlay.FS
 }
 
-func newSyncFixture(t *testing.T, uuid string) *syncFixture {
+func newSyncFixture(t testing.TB, uuid string) *syncFixture {
 	t.Helper()
 	fx := newFixture(t, uuid)
 	s := &syncFixture{fx: fx, memDir: t.TempDir(), ovDir: t.TempDir()}
@@ -308,5 +308,69 @@ func TestTheFirstFsyncOfASessionIsNeverCoalescedAway(t *testing.T) {
 	}
 	if st := s.ov.SyncStats(); st.Passes != 1 || st.Coalesced != 0 {
 		t.Fatalf("the first fsync of a session was coalesced away: %+v", st)
+	}
+}
+
+// What a chatty application actually pays, in nanoseconds rather than in
+// syscall counts.
+//
+// The tests above assert that a repeat fsync makes ZERO syscalls, which is
+// the correctness half. This is the cost half, and it is a BENCHMARK
+// rather than a gated measurement because a per-call cost is exactly what
+// a benchmark reports and there is no env var to remember. Run both:
+//
+//	go test ./internal/overlay -run XXX -bench Fsync -benchtime 2000x
+//
+// BenchmarkFsyncLoop is one write and then fsync forever, which is the
+// shape the coalescing exists for — a database or an editor calling
+// fsync(2) after every operation whether or not anything changed.
+func BenchmarkFsyncLoop(b *testing.B) {
+	ctx := context.Background()
+	s := newSyncFixture(b, "d5f0d5f0-0005-4000-8000-000000000005")
+	n, err := s.ov.Create(ctx, rootIno, "chatty.dat", 0644, 0, 0)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if _, err := s.ov.Write(ctx, n.Inode, 0, pseudorandom(4096, 71)); err != nil {
+		b.Fatal(err)
+	}
+	// The one pass that has work to do, outside the timer.
+	if err := s.ov.Sync(); err != nil {
+		b.Fatal(err)
+	}
+	before := s.ov.SyncStats()
+	b.ResetTimer()
+	for b.Loop() {
+		if err := s.ov.Sync(); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
+	// Reported, not just timed: a fast loop that was quietly syncing would
+	// be a measurement of a warm page cache rather than of the coalescing.
+	b.ReportMetric(float64(s.ov.SyncStats().Fsyncs-before.Fsyncs), "extra-fsyncs")
+}
+
+// BenchmarkFsyncAfterEveryWrite is the other end of the same axis: a write
+// between every fsync, so nothing coalesces and every call does the whole
+// job. The ratio between the two is what the coalescing is worth.
+func BenchmarkFsyncAfterEveryWrite(b *testing.B) {
+	ctx := context.Background()
+	s := newSyncFixture(b, "d5f0d5f0-0006-4000-8000-000000000006")
+	n, err := s.ov.Create(ctx, rootIno, "busy.dat", 0644, 0, 0)
+	if err != nil {
+		b.Fatal(err)
+	}
+	buf := pseudorandom(4096, 72)
+	off := int64(0)
+	b.ResetTimer()
+	for b.Loop() {
+		if _, err := s.ov.Write(ctx, n.Inode, off, buf); err != nil {
+			b.Fatal(err)
+		}
+		off += int64(len(buf))
+		if err := s.ov.Sync(); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

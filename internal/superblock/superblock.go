@@ -105,6 +105,53 @@ func (r IndexRef) RefSize() int64  { return r.Size }
 func (r ManifestRef) RefName() string { return r.Name }
 func (r ManifestRef) RefSize() int64  { return r.Size }
 
+// GraftBudgetBytes is what the graft list may take of the superblock write
+// budget (size.go) before a seal refuses to add another.
+//
+// It is a share of the ~105 KiB the budget's named shares leave over, and
+// it is small on purpose. A graft ROOT is an operator-scale object — a
+// person types the URL — so tens are plausible and thousands are a
+// misuse of the feature rather than a volume that grew. At 215 bytes for
+// an entry with realistic (long) paths this carries ~76 roots, and the
+// entry that would cross it
+// is refused with the list's weight in the message rather than silently
+// pushing the superblock toward the cliff size.go describes.
+const GraftBudgetBytes = 16 << 10
+
+// GraftEntry is one grafted subtree: a path in this volume served by
+// ranged reads against a foreign Pelican prefix, with no copy of the
+// bytes under the volume's own prefix.
+//
+// Path is where the subtree is mounted, Source is the prefix the bytes
+// come from, and Index names the hash-named location table that maps the
+// chunk identities under Path to (object key, offset, length) inside
+// Source. Block is the fixed block size the spider cut with, recorded
+// because a later refresh must cut identically or every identity moves.
+//
+// The signature covers all of it, which makes the source URL
+// TAMPER-EVIDENT and nothing more: a reader still chose to trust whoever
+// holds the volume's signing key with a URL its own network will fetch.
+// That is the whole of the security argument in docs/design-graft.md, and
+// it is why a mount may refuse a source it does not like.
+type GraftEntry struct {
+	Path   string   `cbor:"path"`
+	Source string   `cbor:"source"`
+	Index  [32]byte `cbor:"index"`
+	// Size is the index object's length, so a reader can budget the fetch
+	// before it makes it — the role IndexRef.Size plays.
+	Size int64 `cbor:"size"`
+	// Block is the fixed block size, Blocks how many the index holds, and
+	// Bytes the logical size of the grafted tree. The last two are
+	// reportable facts (`pelfs graft --list`, fsck) that cost nothing to
+	// record and a whole index fetch to recompute.
+	Block  int64  `cbor:"block"`
+	Blocks uint64 `cbor:"blocks"`
+	Bytes  int64  `cbor:"bytes"`
+}
+
+func (g GraftEntry) RefName() string { return g.Path }
+func (g GraftEntry) RefSize() int64  { return g.Size }
+
 // CondemnedPack records a pack repack removed from the pack list: the
 // name and when it was condemned. Publish carries entries forward until
 // they age past Params.TGraceSeconds, then drops them; GC retains
@@ -477,6 +524,21 @@ type Superblock struct {
 	// that do not maintain it; a reader needs nothing from it, and a
 	// publisher that finds it absent simply rebuilds every catalog.
 	Catalogs []CatalogEntry `cbor:"catalogs,omitempty"`
+	// Grafts names the external subtrees this generation serves: a path
+	// inside the volume, and the foreign Pelican prefix whose bytes fill
+	// it (internal/graft, docs/design-graft.md).
+	//
+	// LIKE Manifests AND UNLIKE PackIndexes, these are NOT hints. A graft
+	// is the ONLY record of where a grafted file's bytes live — the
+	// chunkrefs naming them resolve in no pack — so a reader that cannot
+	// resolve a graft must fail the read, never fall through to the pack
+	// index, which would report content missing that was never in a pack.
+	//
+	// Only the ROOTS live here, bounded by GraftBudgetBytes; the
+	// identity -> (object, offset, length) table is the hash-named Index
+	// object each entry names, exactly as a manifest segment is. The
+	// superblock must not grow with the number of grafted FILES.
+	Grafts []GraftEntry `cbor:"grafts,omitempty"`
 	// RootCatalogHint, when set, is where the root catalog was written (see
 	// RootHint). Optional in both directions: a writer that does not track
 	// it omits it, and a reader that finds it absent — or finds it stale —

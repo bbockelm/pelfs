@@ -659,6 +659,13 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		// deliberately, because packs are immutable and content-addressed —
 		// remounting a volume must not re-fetch what the last mount already
 		// pulled down.
+		//
+		// GraftOpener is the reader's veto over the external sources this
+		// generation names (graft.go, genfs/graft.go). Supplying one is
+		// what makes a grafted volume mountable at all; supplying nil
+		// would refuse every graft, which is the right default for a
+		// caller that has not thought about it.
+		GraftOpener: graftOpener(o),
 	})
 	if err != nil {
 		return fail(err)

@@ -161,6 +161,22 @@ func (fs *FS) fillChunks(ctx context.Context, refs []catalog.ChunkRef) {
 		if fs.chunkResident(id, r.LLen) {
 			continue
 		}
+		// A grafted chunk is in no pack, and locate would only discover
+		// that by indexing EVERY pack in the generation — per chunk, on a
+		// multi-chunk read of a grafted file. Skipped here, it is fetched
+		// by the single-chunk path instead.
+		//
+		// So a grafted read gets no coalescing today. That is a real cost
+		// and not a correctness problem: this whole function is a
+		// best-effort prefetch. Coalescing adjacent graft blocks into one
+		// ranged request against the source object is straightforward (they
+		// are contiguous in it, more reliably than pack entries are) and is
+		// on the design doc's ranked work.
+		if fs.grafts != nil {
+			if _, _, ok := fs.grafts.locate(r.Identity); ok {
+				continue
+			}
+		}
 		loc, err := fs.packIndex.locate(ctx, id)
 		if err != nil {
 			continue // reported by the single-chunk path, in context

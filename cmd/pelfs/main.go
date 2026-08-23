@@ -65,6 +65,8 @@ func main() {
 		code = cmdMountGen(os.Args[2:])
 	case "fsck":
 		code = cmdFsck(os.Args[2:])
+	case "graft":
+		code = cmdGraft(os.Args[2:])
 	case "repack-plan":
 		code = cmdRepackPlan(os.Args[2:])
 	case "repack":

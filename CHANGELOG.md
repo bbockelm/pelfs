@@ -2,6 +2,90 @@
 
 ## Unreleased
 
+### A browser UI that builds with no Node, and the probe that decided its shape
+
+`pelfs` now carries a browser UI inside the binary. The mechanics of that
+matter more than the UI does at this stage, because they decide what a
+contributor has to install and what a release has to contain.
+
+**A contributor who does not touch the frontend needs nothing.** The bundle is
+built by `go generate ./internal/webui` and **committed** to
+`internal/webui/dist`, then embedded with `//go:embed`. So `go build ./...`,
+`go vet ./...` and `go test ./...` need no Node, no pnpm and no npm — and
+`go install github.com/bbockelm/pelfs/cmd/pelfs@latest` produces a binary with
+a *working* UI, which the usual alternative (ship a placeholder, build at
+release time) does not. The precedent is next door: pelican commits an empty
+`web_ui/frontend/out/placeholder` purely to satisfy a non-optional
+`go:embed`, and that is why `scripts/build-pelican-server.sh` works on a
+machine with no pnpm. This does the same thing aimed at a better outcome. It
+is also why the CI job that dies on a missing pnpm cannot happen here: the one
+that needs Node is a separate workflow with its own path filter, and a Go-only
+pull request never waits for it.
+
+**A committed build artefact rots silently, so a job rebuilds it and diffs.**
+`.github/workflows/webui.yml` runs the build twice — proving the output is
+byte-reproducible, which is what makes the gate trustworthy instead of flaky —
+and fails if `internal/webui/dist` or `internal/webui/third_party.txt` differs
+from what its sources produce. It also fails if any GPLv3 `wx-*` package
+appears in the lockfile: the file manager's components are MIT under their
+`@svar-ui/*` names and were GPLv3 under the retired `wx-*` ones, pelfs is
+Apache-2.0, and the bundle ships *inside* the binary, so that swap would be a
+relicensing event disguised as a version bump. `third_party.txt` lists all 30
+bundled packages with their licences and the full licence text each one
+requires be carried with a distribution; the UI serves it at
+`/third_party.txt`.
+
+**The component was measured before it was adopted.** Two questions could have
+invalidated the whole file-manager plan, and neither was answerable from
+documentation, so `webui/frontend/probe` drives the real component in a real
+browser against a logging stub:
+
+- **Does it load a directory lazily?** Yes — one listing per directory
+  navigated into, and nothing at boot but the root. But *only* because the app
+  wires it: the shipped data provider registers no handler for the store's
+  `request-data` event at all, and it fires that event twice per navigation,
+  which on a large directory is two full listings.
+- **Does it virtualize a large directory?** No. Every entry becomes DOM: a
+  100,000-entry directory renders 100,000 elements, a million DOM nodes and
+  703 MB of heap, and takes 18 seconds. 5,000 entries takes a third of a
+  second. So the JSON API's response cap is the design rather than a
+  fallback, and the number has a measurement behind it.
+
+The request sequence is committed as a fixture
+(`internal/webui/testdata/svar-contract/`) and asserted by Go tests that need
+no browser, which is how a one-time Node cost becomes a permanent gate.
+
+Two defects in the shipped provider were found the same way, both of which
+would have broken the design quietly: `setHeaders()` never reaches the wire
+(the override drops the headers it was given), so the session credential would
+have been silently absent; and every mutating request goes out as
+`Content-Type: text/plain`, which is the one content type an HTML form can
+send and which the threat model answers with 415. Both are fixed in a
+three-line subclass, and both are pinned by tests that will say so if a future
+release makes the subclass unnecessary.
+
+**The UI loads nothing off the network.** The component's default theme injects
+a stylesheet link to a CDN and its default icons are CDN URLs per file
+extension; both are off, and three separate checks — one in the build, one in
+Go, one in a real browser — keep them off. A localhost tool that phones home
+is both a privacy leak and broken on an air-gapped machine.
+
+**A browser gate that drives the real binary.** `scripts/webui-playwright.sh`
+builds `pelfs`, starts a federation stub, creates a volume, runs
+`pelfs browse`, and hands a real Chromium the ephemeral URL and the single-use
+bootstrap token. Chromium's `--host-resolver-rules` maps an attacker hostname
+to loopback, which makes DNS rebinding directly testable: a rebound request is
+answered **421**, and a cross-origin `fetch` is refused by the browser itself
+— which is the one thing a Go test cannot prove. Twelve seconds, off the Go
+pull-request path, no retries and no sleeps.
+
+**Branding.** The UI wears the Pelican Platform mark with the permission of the
+Pelican Project's PI, recorded next to the asset with its checksum. The mark
+is used unmodified — not traced, not redrawn, nothing drawn on top — and the
+"FS" is a wordmark treatment beside it. Every page, and the repository's new
+`NOTICE`, says plainly that pelfs is **not** an official Pelican Platform
+product.
+
 ### A crash between a flush and its location record no longer loses that flush
 
 A write's LENGTH became durable immediately — `Store.Write` appends to the

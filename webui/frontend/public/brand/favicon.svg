@@ -1,0 +1,12 @@
+<!-- pelfs favicon. Type only: a rounded square in the brand blue with the
+     "fs" of pelfs. It contains NO part of the Pelican mark -- the bird is
+     neither traced nor redrawn anywhere in this repository, because the only
+     form of the mark that exists is a PNG and a redraw would be worse than
+     the original. If a real vector mark is ever supplied, this file is where
+     a compound favicon would be composed. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="pelfs">
+  <rect width="32" height="32" rx="7" fill="#0885ff"/>
+  <text x="16" y="22.5" text-anchor="middle"
+        font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Arial, sans-serif"
+        font-size="17" font-weight="700" fill="#FFFFFA">fs</text>
+</svg>

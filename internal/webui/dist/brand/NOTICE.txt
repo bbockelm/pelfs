@@ -1,0 +1,40 @@
+The Pelican Platform mark in this directory
+===========================================
+
+File
+    PelicanPlatformLogo_Icon.png
+    51,041 bytes
+    sha256 21427ef3cac9eb02d0ed4b678686e4259df6187d074f0457f07481332fbc413d
+
+Provenance
+    Copied byte-for-byte from the Pelican Platform source tree,
+    web_ui/frontend/public/static/images/PelicanPlatformLogo_Icon.png, where
+    it is imported by components/layout/Header.tsx and three navigation
+    components. It is the same icon the project's public branding page
+    offers. No SVG form of the mark exists anywhere in that tree, so this
+    PNG is the mark's only available form; it has NOT been traced, redrawn
+    or otherwise altered here, and no derivative of the bird appears
+    anywhere in this repository.
+
+Permission
+    Used with the permission of the Pelican Project's Principal
+    Investigator. That permission is what Apache-2.0 leaves to be obtained:
+    section 6 of the licence grants no trademark rights ("This License does
+    not grant permission to use the trade names, trademarks, service marks,
+    or product names of the Licensor..."), so the grant is recorded here,
+    next to the asset, rather than reasoned about later.
+
+What this is NOT
+    pelfs is an independent tool for Pelican federations. It is NOT an
+    official Pelican Platform product, and the permission to use the mark
+    does not make it one. Every page of the UI carries that sentence in its
+    footer (src/brand/Brand.tsx, BrandFooter), and the repository carries it
+    in NOTICE at the root.
+
+Palette
+    The three brand colours used by this UI come from the Pelican source of
+    truth, web_ui/frontend/components/ThemeProvider.tsx:34-39 --
+    primary #0885ff, primary.light #CFE4FF, secondary #FFFFFA -- and are
+    defined once, in src/brand/brand.css. The two durability colours (amber
+    for "on this machine only", green for "in the federation") are pelfs's
+    own and are deliberately not brand blue.

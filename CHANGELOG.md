@@ -91,6 +91,87 @@ record when nothing else is in it, so a session that comes and goes leaves
 the state root exactly as it found it. (Directories that already hold a
 volume's state are untouched — the removal only succeeds on an empty one.)
 
+### The browser UI has a data plane, and it says out loud what it is not showing you
+
+`internal/webapi` answers the file manager's REST contract under `/api/v1`
+over the same volume, the same namespace and the same permission model every
+other frontend sees: list a directory, make a folder, rename, move, copy,
+delete, upload, download. It is work item U11 of `docs/design-webui.md`.
+
+The contract is not invented. It was recorded from the real
+`@svar-ui/react-filemanager` — every request it makes, in the order it makes
+them, in `internal/webui/testdata/svar-contract/recording.json` — and the tests
+**replay that recording against these handlers**, so the day a component
+upgrade changes the wire shape, a Go test fails instead of a browser.
+
+**A directory listing is capped at 5,000 entries, and the cap is the design
+rather than a fallback.** The component does not virtualize: the probe
+measured 100,000 entries as 1,000,067 DOM nodes and 703 MB of heap. A pelfs
+volume has directories far larger than that, so an uncapped response would
+hang the tab. What makes a cap acceptable is being told about it, and there is
+a second reason the telling is not optional: **the search box filters loaded
+data only and issues no request**, so in a capped folder the search is
+searching the rows on screen and not the folder. A user who searches, finds
+nothing, and concludes the file is not there has been misled by a number
+nobody showed them. So every listing carries the true count in its headers,
+`GET /api/v1/info/{id}` returns it as JSON, and the sentence to display comes
+from the API itself rather than being re-worded per surface:
+
+> Showing 5,000 of 412,006 entries in this folder. Search matches only what is
+> loaded, so it is searching these 5,000 rows and not the whole folder —
+> narrow the path, or use the WebDAV endpoint to see all of it.
+
+**A batch of five moves returns five results.** There is no atomic N-way
+rename in the overlay, in WebDAV or in POSIX, so a batch is N sequential
+operations and each id gets its own outcome: the three that moved say where
+they landed, the one that hit `EACCES` says so, and the request is still a
+200 — because a 4xx would tell the client nothing happened when in fact most
+of it did. A surface that reported "moved" for the whole batch would be lying
+in the one place a user cannot check.
+
+**Uploads stream.** The body is read with `r.MultipartReader()` and copied
+into the volume through a 32 KiB buffer, never `r.ParseMultipartForm`, which
+buffers and then spools the rest to a temp file — writing a 68 MB container
+image to disk twice. The test uploads the reference 68,497,408-byte SIF and
+asserts the consequences rather than the call: peak heap grew by about 5 MB,
+no single write to the volume exceeded the buffer, and the volume received the
+payload's size exactly once.
+
+Bytes land under `<name>.pelfs-part` and are renamed only once the whole body
+has arrived; a failed or abandoned upload unlinks the temp file and never
+shows a name. That is the same convention the WebDAV surface uses, and it is
+durability rather than tidiness: the bytes are in the overlay the moment they
+are written, so a truncated upload under its final name is what the next
+checkpoint would publish.
+
+**What upload does not do yet, stated because a physicist hits it first:**
+there is no resume and no progress. The component sends one whole-file
+`POST` via `fetch`, so a dropped connection at 90% of a 68 MB file starts
+over, and nothing can show a bar until the request finishes. Until resumable
+upload lands, the WebDAV endpoint is the answer for a large file on a flaky
+link, where a real client's own resume works.
+
+**Downloads work now.** The previous release built the ticket mechanism —
+mint an authorization with a session-credentialed call, redeem it once at
+`/d/<ticket>` — and left the file surface nil, so every redemption 404'd. It
+is implemented: the bytes come from the volume with `Range` support, a
+symlink to a file serves the file it names, and a path this session may not
+read is a 403 rather than a 404, because "you cannot" and "there is nothing"
+are different answers.
+
+**Listings do not lie about symlinks.** The policy is the WebDAV adapter's,
+exactly: a link to a regular file is followed and shown under its own name, a
+link to a directory is hidden because the layer below cannot traverse one, a
+dangling link is hidden, and fifos, sockets and device nodes are hidden.
+Everything hidden is counted and reported, so a tree never quietly looks
+smaller than it is.
+
+One finding worth recording for whoever writes the next route: `net/http`'s
+`{id}` wildcard does not match a path segment that is exactly `%2F` — the
+volume root as an id — because unescaped it reads as a trailing empty
+segment. Every id route therefore has an `{id...}` sibling, without which
+"add a folder in the root" would be a 404.
+
 ### `fsync` now does something, and says what it did
 
 `fsync(2)` and `fsyncdir(2)` on a FUSE-backed pelfs mount returned success

@@ -296,8 +296,14 @@ type CacheStats struct {
 const maxErrorSamples = 20
 
 // Version is the schema of the JSON document. 2 added the per-phase
-// breakdown; every version-1 field kept its name and meaning.
-const Version = 2
+// breakdown; every version-1 field kept its name and meaning. 3 is the
+// first version that REMOVES keys: prefetch_chunks and cache.dirs.chunks
+// went with the per-chunk cache files they counted, replaced by
+// prefetch_packs and cache.dirs.arena. A reader that keys off those names
+// gets nothing rather than a zero, so it has to be able to tell -- which
+// is the whole job of this number, and leaving it at 2 through a removal
+// would have made it a lie.
+const Version = 3
 
 // Collector accumulates counters; safe for concurrent use.
 type Collector struct {

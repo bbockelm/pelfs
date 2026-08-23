@@ -119,10 +119,12 @@ type Options struct {
 	// CacheBytes — and a NEGATIVE value turns the tier off entirely, so
 	// every read decodes out of the local pack.
 	//
-	// Off is a real configuration and not only a measurement switch: it
-	// costs about 2.5x on a re-read of a hot tree and nothing at all on a
-	// single pass, so a mount that reads a volume once has no use for the
-	// arena and a mount that reads it repeatedly does.
+	// Off is a real configuration and not only a measurement switch, but
+	// the price is steeper than this comment used to claim: 1.6x on a
+	// single cold pass and 68x on a re-read of a hot tree, measured by
+	// TestChunkCacheWorkloads' none arm. A mount that streams a volume
+	// once and exits pays the smaller number; anything that reads a file
+	// twice pays the larger one.
 	ChunkArenaBytes int64
 }
 

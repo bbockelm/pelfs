@@ -527,7 +527,7 @@ grep -Eq "uploaded 0 B during the session and [1-9][0-9.]* [KMG]iB after it exit
 # session_phase carries no put bytes at all (the key is omitted when zero)
 # and teardown_phase carries them.
 flat=$(tr -d ' \n' < "$WORK/phase-exit.json")
-echo "$flat" | grep -q '"pelfs_stats_version":2' || { echo "stats file is not version 2" >&2; exit 1; }
+echo "$flat" | grep -q '"pelfs_stats_version":3' || { echo "stats file is not version 3" >&2; exit 1; }
 echo "$flat" | grep -Eq '"session_phase":\{"get":\{[^}]*\},"put":\{"ops":[0-9]+,"errors":0\},' || {
   echo "session_phase reports uploaded bytes for a session that sealed only at exit:" >&2
   echo "$flat" | sed 's/^/    /'; exit 1; }

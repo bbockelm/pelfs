@@ -147,9 +147,11 @@ either will notice.
 - **The dedup sidecar is restamped by a repack**, so the first seal after a
   repack deduplicates again instead of re-uploading everything. Nothing to
   do; the file is rewritten in place by the repack that publishes.
-- **Statistics keys changed, and `pelfs_stats_version` did NOT bump** — it
-  is still `2`, so a consumer cannot detect any of this from the file
-  itself. Three things to fix in a supervisor:
+- **Statistics keys changed, and `pelfs_stats_version` is now `3`.** Two
+  keys were REMOVED, which is exactly what that number exists to
+  announce: a reader keyed to a removed name gets nothing rather than a
+  zero, so it has to be able to tell. Version 2 only ever added fields.
+  Three things to fix in a supervisor:
   - `prefetch_chunks` is **gone**, replaced by `prefetch_packs`.
     `prefetch_fetched_bytes` is new — what this session actually
     transferred, as against `prefetch_bytes`, the size of the set now

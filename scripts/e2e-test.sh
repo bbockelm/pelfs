@@ -98,7 +98,7 @@ assert s["object_errors_total"] == 0, s
 # in both, would make "nothing was uploaded while I was working" unsafe to
 # believe. This session ran with --snapshot-interval 0, so the honest
 # answer is that every uploaded byte belongs to teardown.
-assert s["pelfs_stats_version"] == 2, s
+assert s["pelfs_stats_version"] == 3, s
 ses, tear = s["session_phase"], s["teardown_phase"]
 for kind in ("get", "put", "delete", "other"):
     for field in ("ops", "errors", "bytes"):

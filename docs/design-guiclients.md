@@ -1,7 +1,18 @@
 # Which protocol pelfs should export so an existing GUI client can drive it
 
-Status: **measured, not built.** No pelfs code exists for this and none is
-proposed here as done. The one thing that *is* measured is the Go side:
+Status: **measured; the SFTP recommendation is still NOT built, and
+something else shipped in its place.** `docs/design-webui.md` was written
+after this document, took its analysis as input, and built a browser UI
+plus a WebDAV export on one loopback listener. So **G6, G8, G9 and G11 are
+DONE, G4 shipped under this document's own name but as HTTP rather than
+SFTP, and G1/G2/G3/G5/G10 — the SFTP frontend itself — remain open**. Every
+ranked item now carries a verdict; read that column before chasing
+anything here. The verdict below still stands as the argument for SFTP, and
+nothing in it was overturned: what happened is that a second document found
+a cheaper route to the *same two user questions*, and SFTP was not built
+rather than being ruled out.
+
+The rest of this document is unchanged. The one thing that *is* measured is the Go side:
 `scripts/sftp-clients-docker.sh` drives `github.com/pkg/sftp`'s own
 reference handler with two real, independent clients (OpenSSH `sftp(1)` and
 `rclone`) and its numbers are in "What was measured". Every client-side
@@ -76,7 +87,9 @@ Unpacked, in order of how much each fact decides:
    upstream's own example count.
 
 **And build WebDAV second, not instead.** It is genuinely cheap (D1 is
-measured at litmus 16/16 · 13/13 · 30/30 · 32/34, `docs/design-windows.md`),
+measured at litmus 16/16 · 13/13 · 30/30 · 32/34 against x/net's example
+server; **29/30 on `props` is the honest ceiling for a real one** — see
+`docs/design-windows.md`),
 it is the only protocol Explorer speaks with no install at all, and it is
 the second independent client for the same `internal/vfsbilly` code via
 macOS `mount_webdav`. What it is *not* is the answer to the question asked,
@@ -422,6 +435,20 @@ answers, and all three should exist:
   against a broken federation would reproduce the "same warning forever"
   failure that backoff exists to prevent.
 
+  **This item is DONE, over HTTP, and the "WebDAV cannot" sentence is
+  half wrong.** It is true of WebDAV. It is not true of a single-page app
+  that holds an SSE stream open for the life of the tab: an SSE stream is
+  one long-lived response, so the tab closing cancels the request context,
+  which is an event on the same footing as an SSH channel close — and it
+  arrives sooner, because there is exactly one stream per tab and the page
+  opens it on load. `cmd/pelfs/idleseal.go` is the implementation and the
+  backoff requirement above is honoured verbatim. Two corrections to the
+  recipe: `min(30 s, snapshot-interval)` is **undefined at interval 0**,
+  which a user types on purpose to mean "seal only at unmount", so idle
+  sealing is **off** there; and a `sendBeacon` hint on `pagehide` arrives
+  *before* the stream teardown, so it needs a lead tolerance or it is
+  discarded every single time.
+
 **(b) A partial upload must not be published under its final name.** If a
 client disconnects mid-`PUT`, the bytes already written are in the overlay
 and the next checkpoint publishes a truncated file. Three mitigations, in
@@ -679,6 +706,19 @@ whose editor sends none.
 
 ## The browser UI, assessed
 
+**This section's conclusion — "build the landing page, not a file manager"
+— was overturned, and `docs/design-webui.md` is where the argument is.**
+Two things this assessment did not have: the licence answer for the
+component that removes most of the UI cost (`@svar-ui/*` is MIT, not
+GPLv3 — that belief describes the retired `wx-*` generation), and the
+observation that a single-page app holding an SSE stream open makes "the
+client went away" a real event, which is the mechanism this section says
+HTTP cannot express. The *cost* reasoning below is still correct and is
+worth reading before anyone adds to the UI; the verdict it reached is not.
+The `iofs`/`io.Seeker` concern is retired outright: going through
+`webdav.File`, or calling `http.ServeContent` with the `billy.File`
+directly, avoids `iofs` and the problem does not arise.
+
 A page served on `127.0.0.1` with drag-and-drop upload and click-to-
 download needs no client software at all, which for "most folks just want
 upload and download" is the lowest-friction thing imaginable. It deserves a
@@ -781,7 +821,7 @@ the redirector. Under the pivot:
 
 | item | fate | why |
 |---|---|---|
-| **D1** — `internal/vfsdav`: `webdav.FileSystem` over `internal/vfsbilly` | **SURVIVES, demoted to second** | still cheap, still measured (litmus 16/16 · 13/13 · 30/30 · 32/34), still the macOS second client. Just no longer first. |
+| **D1** — `internal/vfsdav`: `webdav.FileSystem` over `internal/vfsbilly` | **BUILT — and it went FIRST, not second** | shipped as `internal/vfsdav` on `pelfs browse`'s listener, read-write, gated by `scripts/webdav-adapter-litmus-docker.sh` at `16/16 · 13/13 · 29/30 · 32/34` (the `props` ceiling for a real server is 29/30; the 30/30 baseline hard-codes a 400 for `propfind_invalid2`). It was not as cheap as "nearly the same interface" promised: `DeadPropsHolder` is mandatory, `Mkdir` and `RemoveAll` need their own bodies, and a symlink must be followed on OPEN. It is also the macOS second client, as predicted. |
 | **D2** — `--backend webdav`, ephemeral port, per-session digest | **SURVIVES, simplified** | the digest half is now optional: third-party clients accept Basic over loopback [S12][S13]. Digest is needed only if Explorer is a target. |
 | **D3** — `WNetAddConnection2W`/`WNetCancelConnection2W` via `mpr.dll` | **DEAD** | the drive letter comes from `rclone mount` (free, WinFsp) or Mountain Duck [S11][S15]. pelfs writes no Windows attach code. |
 | **D4** — the name-mapping layer (reserved chars, device names, trailing dot/space, case shadowing) | **DEAD as a requirement** | it existed because a drive letter makes volume names into *Windows filesystem* names. An SFTP or WebDAV client shows names in a listing; only a download to a Windows path can fail, and the client reports which file and why. Keep the *counting* (how many names Windows cannot hold) as a banner line; drop the remapping. |
@@ -800,24 +840,40 @@ deferred form.** Everything deleted was Windows-specific pelfs code.
 
 ## Ranked work items
 
-| | change | buys | effort | unblocks |
-|---|---|---|---|---|
-| **G1** | `internal/vfssftp`: `sftp.Handlers` (`FileReader`, `FileWriter`, `OpenFileWriter`, `FileCmder`, `FileLister`, `LstatFileLister`, `ReadlinkFileLister`, `PosixRenameFileCmder`, `StatVFSFileCmder`) over `internal/vfsbilly`, **read-only first** | the whole idea | small — the mapping is nearly 1:1: `billy.File` already is `ReaderAt`/`WriterAt`/`Truncate`, and `Stat`/`Lstat`/`ReadDir`/`Rename`/`Remove`/`MkdirAll`/`Symlink`/`Readlink`/`Link`/`Chmod`/`Chtimes` all exist | everything below |
-| **G2** | `Permitted()` before every `OpenFile`, so the SFTP OPEN is checked as an OPEN and not as NFS's data path | the third frontend answers `test -w`-shaped questions like the other two | trivial, and it is a **correctness** item, not a nicety | trust in the export |
-| **G3** | `internal/sftpmount.Serve(bfs)`: `127.0.0.1:0`, persisted ed25519 host key, per-session credential, `SetDeadline` around the handshake, one goroutine per channel | a server a real client can reach | small; `internal/nfsmount.Serve` is the template, ~80 lines of transport by upstream's own example | G4, G5, the whole CI story |
-| **G4** | `pelfs browse [--rw]`: start the server, print URL + port + fingerprint in the three formats clients want, seal at exit, name `pelfs ctl publish` in the banner | a person can use it | small; `runMountGen` already has the backend switch and the teardown discipline, and `control.Publish` already exists | the deliverable |
-| **G5** | `scripts/sftp-clients-docker.sh` pointed at the pelfs adapter, as a gate | the measured table becomes a regression test, with `preserve-mtime` and `chmod` expected to flip to `ok` | hours — the script exists | catching adapter regressions before a client does |
-| **G6** | Seal on idle: last-client-disconnect + quiet window, with the pressure path's backoff | an uploaded file becomes durable without the user knowing what a checkpoint is | moderate; the trigger is new, the sealing is not | the write path being honest |
-| **G7** | `TransferError` policy: unlink an unfinished file **this session created**, leave a pre-existing one, count both | a killed upload does not get published as a truncated file under its final name | small | the write path being correct |
-| **G8** | The landing page: URL, fingerprint, "publish now", unsealed-file count. **No file manager.** | connect-by-click without a bookmark file | small, and bounded on purpose | the friction |
-| **G9** | `.duck` bookmark + `known_hosts` line written **next to the volume, not into `$HOME`**, and `--open` to hand the URL to the platform opener | one double-click to a browsable volume | small; the `.duck` key set is known (from source, not docs) | the experience |
-| **G10** | The `windows-latest` job: `where sftp`, `sftp.exe` round trip of a 68,497,408-byte file, `WinSCP.com /script=` with `-hostkey=` | every Windows row below | moderate; it is the only place the answers exist | calling this supported |
-| **G11** | D1/D2/D5 — the WebDAV frontend, with **Basic** over loopback, `X-OC-Mtime`, `MOVE`, and **no LOCK requirement** | Explorer with no install (at 47.68 MiB), macOS `mount_webdav` as a second independent client, `litmus` as a second gate | small–moderate, and already measured | a second opinion on the same adapter |
-| **G12** | The write path on Windows: the `FILE_SHARE_DELETE` hazard list in `docs/TODO.md` | `--rw` from a Windows-hosted pelfs | real, and **not this document's work** | uploads on Windows |
+**Read the verdict column first.** `docs/design-webui.md` came after this
+document and built a browser UI plus WebDAV on one loopback listener, which
+delivered four of these items and took `pelfs browse`'s name for a
+different transport. The SFTP frontend — G1, G2, G3, G5, G10 — is still
+unbuilt and still the recommendation for a Windows user with no browser in
+the loop; nothing here was retracted.
+
+| | change | verdict | buys | effort | unblocks |
+|---|---|---|---|---|---|
+| **G1** | `internal/vfssftp`: `sftp.Handlers` (`FileReader`, `FileWriter`, `OpenFileWriter`, `FileCmder`, `FileLister`, `LstatFileLister`, `ReadlinkFileLister`, `PosixRenameFileCmder`, `StatVFSFileCmder`) over `internal/vfsbilly`, **read-only first** | **OPEN.** There is no `internal/vfssftp`. The reasoning stands; the work was not done because `internal/vfsdav` answered the same two user questions on a listener that had to exist anyway | the whole idea | small — the mapping is nearly 1:1: `billy.File` already is `ReaderAt`/`WriterAt`/`Truncate`, and `Stat`/`Lstat`/`ReadDir`/`Rename`/`Remove`/`MkdirAll`/`Symlink`/`Readlink`/`Link`/`Chmod`/`Chtimes` all exist | everything below |
+| **G2** | `Permitted()` before every `OpenFile`, so the SFTP OPEN is checked as an OPEN and not as NFS's data path | **OPEN for SFTP, DONE for the surfaces that shipped.** `internal/vfsdav` and `internal/webapi` both open through `vfsbilly.OpenAnsweredHere`, and a call-site test in `internal/vfsbilly` fails any HTTP-side caller that reaches for the NFS variants. The correctness point was right and it generalised | the third frontend answers `test -w`-shaped questions like the other two | trivial, and it is a **correctness** item, not a nicety | trust in the export |
+| **G3** | `internal/sftpmount.Serve(bfs)`: `127.0.0.1:0`, persisted ed25519 host key, per-session credential, `SetDeadline` around the handshake, one goroutine per channel | **OPEN** | a server a real client can reach | small; `internal/nfsmount.Serve` is the template, ~80 lines of transport by upstream's own example | G4, G5, the whole CI story |
+| **G4** | `pelfs browse [--rw]`: start the server, print URL + port + fingerprint in the three formats clients want, seal at exit, name `pelfs ctl publish` in the banner | **DONE, under this name, with a different transport.** `pelfs browse [--rw] [--open]` serves an HTTP page on `127.0.0.1:0` (tcp4), prints the URL, seals at exit, and names publish on the page rather than in a banner. There is no host-key fingerprint to print because there is no SSH | a person can use it | small; `runMountGen` already has the backend switch and the teardown discipline, and `control.Publish` already exists | the deliverable |
+| **G5** | `scripts/sftp-clients-docker.sh` pointed at the pelfs adapter, as a gate | **OPEN** (needs G1). Its WebDAV analogue shipped: `scripts/webdav-adapter-litmus-docker.sh`, `scripts/webdav-clients-docker.sh` and `scripts/oauth-cyberduck-docker.sh` | the measured table becomes a regression test, with `preserve-mtime` and `chmod` expected to flip to `ok` | hours — the script exists | catching adapter regressions before a client does |
+| **G6** | Seal on idle: last-client-disconnect + quiet window, with the pressure path's backoff | **DONE**, and this document said it could not be done over HTTP. It can: the SPA holds an SSE stream open, so "the last client went away" is a real event. Two things the design did not foresee — `min(30 s, --snapshot-interval)` is undefined at interval 0 (it ships OFF), and `pagehide` fires *before* the teardown, so a naive beacon comparison discards every beacon that worked | an uploaded file becomes durable without the user knowing what a checkpoint is | moderate; the trigger is new, the sealing is not | the write path being honest |
+| **G7** | `TransferError` policy: unlink an unfinished file **this session created**, leave a pre-existing one, count both | **DONE in a different shape.** No client `TransferError` hook exists over HTTP, so the JSON API implements the convention itself: bytes land in `<name>.pelfs-part`, the final `Rename` happens only on completion, and an abandoned upload is unlinked. A leftover `*.pelfs-part` is visible as exactly what it is on both surfaces | a killed upload does not get published as a truncated file under its final name | small | the write path being correct |
+| **G8** | The landing page: URL, fingerprint, "publish now", unsealed-file count. **No file manager.** | **DONE, and then overtaken.** It was promoted from a nicety to the foundation of `docs/design-webui.md`'s M1 — with the auth story it did not have here — and M3/M4 then added the file manager this item said not to build. The discipline survived: the page still says out loud what it is not showing you | connect-by-click without a bookmark file | small, and bounded on purpose | the friction |
+| **G9** | `.duck` bookmark + `known_hosts` line written **next to the volume, not into `$HOME`**, and `--open` to hand the URL to the platform opener | **DONE for WebDAV, not SFTP.** `internal/davprofile` writes a `.cyberduckprofile`, a `.duck` bookmark and a Basic-path bookmark, handed out by the page rather than written next to the volume — nothing lands in `$HOME`. `--open` exists. There is no `known_hosts` question because there is no SSH; the equivalent problem, a credential the user must not have to type, is solved by OAuth instead | one double-click to a browsable volume | small; the `.duck` key set is known (from source, not docs) | the experience |
+| **G10** | The `windows-latest` job: `where sftp`, `sftp.exe` round trip of a 68,497,408-byte file, `WinSCP.com /script=` with `-hostkey=` | **OPEN.** No Windows job exists for either transport. It is now the single largest gap in both this document and `docs/design-windows.md` | every Windows row below | moderate; it is the only place the answers exist | calling this supported |
+| **G11** | D1/D2/D5 — the WebDAV frontend, with **Basic** over loopback, `X-OC-Mtime`, `MOVE`, and **no LOCK requirement** | **DONE, and it went first rather than eleventh.** With Basic over loopback *and* OAuth Bearer; `MOVE` implemented, `LOCK` present as `webdav.NewMemLS()` and not required. `X-OC-Mtime` is **not** implemented — mtime preservation over WebDAV is still open, and is `docs/design-windows.md` D6's surviving half | Explorer with no install (at 47.68 MiB), macOS `mount_webdav` as a second independent client, `litmus` as a second gate | small–moderate, and already measured | a second opinion on the same adapter |
+| **G12** | The write path on Windows: the `FILE_SHARE_DELETE` hazard list in `docs/TODO.md` | **OPEN**, and still not this document's work | `--rw` from a Windows-hosted pelfs | real, and **not this document's work** | uploads on Windows |
 
 ---
 
 ## Recommended minimal first milestone
+
+**STILL THE RECOMMENDATION, AND STILL NOT BUILT.** What shipped instead is
+`docs/design-webui.md`'s M1: `pelfs browse` serving an HTTP page, then
+WebDAV on the same listener. That covers the same two user questions for
+anyone with a browser, and it does not cover this milestone's own case — a
+Windows user pointing WinSCP at a volume with no browser in the loop. G1,
+G2, G3, G5 and G10 remain open, and the banner mock below is the spec for
+them. Note that **`pelfs browse` is now taken** by the HTTP verb, so an
+SFTP export needs either a flag on it or a name of its own.
 
 **A read-only SFTP export a physicist can point WinSCP at — G1, G2, G3,
 G4, G5.** Concretely:
@@ -1115,4 +1171,7 @@ one purchase; none is answered by more reading.
 - **litmus baseline for a WebDAV frontend**: `basic` 16/16, `copymove`
   13/13, `props` 30/30, `locks` 32/34 — measured in
   `docs/design-windows.md` by `scripts/webdav-litmus-docker.sh`, not
-  re-measured here.
+  re-measured here. **The `props` number is the example server's, and it
+  is not reachable by a real one:** that server hard-codes a 400 for
+  `propfind_invalid2` (golang/go#8068). `29/30` is the honest ceiling and
+  what the pelfs adapter is held to.

@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+### A crash between a flush and its location record no longer loses that flush
+
+A write's LENGTH became durable immediately — `Store.Write` appends to the
+operation log under its own lock — while the record of WHERE its bytes went
+was written much later, once the flush's packs had landed. In between,
+publishing a flush reclaimed the ring region its records sat in, which
+moves the tail hint a remount walks from. A crash in that window left bytes
+referenced by neither place: up to one flush batch, 2 MiB at the shipped
+pack target, usually already on the federation and with nothing left behind
+to say which pack it was in.
+
+The ring region is now released only once the record that replaces it is
+durable. Until then the ring is still where a recovery finds those extents,
+so a crash in the window recovers the file **byte-exact** instead of cutting
+it back. A flush therefore also means "recorded" as well as "uploaded":
+`pelfs`'s flush waits for the location records of everything it published,
+so a failure to write one reaches the caller rather than being noticed by
+the next mount.
+
+What this costs is backpressure, and it was measured rather than asserted
+(`PELFS_RINGHOLD_MEASURE=1 go test ./internal/memtable -run RingHold`,
+against a modelled per-upload round trip). Holding the ring across an
+upload moves the uplink's cost out of the seal and into the write phase —
+a copy paces against the link instead of finishing fast and then waiting —
+and leaves end-to-end throughput where it was: 192 MiB at a 250 ms round
+trip went from 0.21s writing + 6.91s sealing to 5.14s writing + 1.55s
+sealing, 7.12s against 6.68s in total. On a genuinely bad link (25s per
+2 MiB pack) the end-to-end cost is real but bounded: 300s became 350s,
+which is pipeline bubbles rather than bandwidth — the ring's runway is
+four packs at the shipped sizes, so a straggler's record can leave upload
+workers idle, and widening the runway recovers it.
+
 ### A crash no longer leaves a file that reads at full length with zeros in it
 
 A crash could leave a file that came back at **exactly the size it was
@@ -27,9 +59,12 @@ a user can see; a full-length file of zeros is not. Genuine holes are
 untouched — a write past the end of a file still reads as zeros, because
 nothing was lost there.
 
-`docs/known-issues.md` KL-10 has the loss itself: one flush batch (2 MiB at
-the shipped defaults), how often a crash lands in the window, and the
-ordering change that would close it.
+The loss that made this reachable is itself gone now — see the entry above,
+which closes the window rather than reporting it. What is left of this
+change is the guarantee for every OTHER way an extent can go missing: a
+torn ring record, a truncated buffer file, a state directory that lost its
+location map. A file comes back as a genuine prefix of what was written, or
+not at all.
 
 ### Cross-generation dedup on the default write path
 

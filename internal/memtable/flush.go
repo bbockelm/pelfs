@@ -61,8 +61,14 @@ func (s *Store) runFlush(ctx context.Context, b *batch) {
 	// holds the bytes — but a record naming a pack that never left is one
 	// a LATER session would publish from, and that generation would be
 	// signed and unreadable.
+	//
+	// And the RING REGION waits for the journal record, which is the whole
+	// of KL-10's fix: until that record is durable the ring is the only
+	// place a recovery could find these extents, so reclaiming here would
+	// leave a crash in this window with a content row whose length the
+	// operation log made durable and nothing behind part of it.
 	res.uploaded.Wait()
-	s.journalLocated(res)
+	s.journalLocated(b, res)
 }
 
 // snapshot captures the frozen table's live set. The design calls this
@@ -259,10 +265,15 @@ func (s *Store) publish(b *batch, res *flushResult) {
 	if n := len(b.recs); n > 0 && n <= len(s.order) {
 		s.order = s.order[n:]
 	}
-	if b.to > s.reclaimTo {
-		s.reclaimTo = b.to
-	}
-	s.releaseLocked()
+	// The region this batch occupied is QUEUED for reclamation, not
+	// reclaimed. Advancing the tail here moves the hint OpenRing walks
+	// from, which is what made these extents unreachable the instant the
+	// locations were installed in memory and long before the Located
+	// record that says where they went — one flush batch a crash could
+	// lose, with the file's length still durable in the operation log
+	// (docs/known-issues.md KL-10, now closed). journalLocated takes it
+	// off this queue.
+	s.locating = append(s.locating, locating{seq: b.seq, to: b.to})
 	// The journal record is NOT written here. It belongs after the packs
 	// have landed (runFlush), and writing it at this point was a leftover
 	// from when uploads were synchronous with the pack run: it recorded a
@@ -273,24 +284,26 @@ func (s *Store) publish(b *batch, res *flushResult) {
 	s.mu.Unlock()
 }
 
-// journalLocated records a landed batch. It runs after the uploads, off
-// the path a writer waits on.
-func (s *Store) journalLocated(res *flushResult) {
-	if s.journal == nil {
-		return
+// journalLocated records a landed batch and then, and only then, lets the
+// ring region that batch came from be reclaimed. It runs after the
+// uploads, off the path a writer waits on.
+func (s *Store) journalLocated(b *batch, res *flushResult) {
+	var err error
+	if s.journal != nil {
+		err = s.journal.Located(Location{
+			Handles: res.handleLoc, Chunks: res.chunkLoc, Packs: res.packs,
+		})
 	}
-	if err := s.journal.Located(Location{
-		Handles: res.handleLoc, Chunks: res.chunkLoc, Packs: res.packs,
-	}); err != nil {
+	s.mu.Lock()
+	if err != nil {
 		// The bytes are on the federation and the map is in memory; only
 		// the RECORD of the map failed. Reads keep working, and a crash
 		// now would lose content that is already durable — so it is a
 		// failed flush, retried, rather than a silent downgrade.
-		s.mu.Lock()
 		s.flushErr = err
-		s.cond.Broadcast()
-		s.mu.Unlock()
 	}
+	s.locatedLocked(b.seq, err)
+	s.mu.Unlock()
 }
 
 // failFlush leaves the records in place. Until their locations are

@@ -317,7 +317,27 @@ type Store struct {
 	// tail short of it, and nothing else would ever try again — a writer
 	// waiting for exactly that space would wait forever.
 	reclaimTo uint64
-	flushErr  error
+	// locating is the published batches whose Located record is not yet
+	// durable, in the order they were cut. Their ring regions may not be
+	// reclaimed: until that record lands the ring is the only place
+	// recovery could find those extents, and the operation log has already
+	// made the files' LENGTHS durable — so a reclaim here is exactly the
+	// batch-sized loss KL-10 described.
+	//
+	// A slice rather than a counter because a batch's region can only be
+	// released as part of the PREFIX at the tail — a ring reclaims to a
+	// position, not a set — and uploads finish out of order with four
+	// workers in flight. It is bounded by the number of flushes that can
+	// be published and unjournalled at once, which is the runway divided
+	// by the pack target: single digits at the shipped sizes, and never a
+	// function of the tree.
+	locating []locating
+	// locateStuck records that a Located record FAILED. The tail may never
+	// pass the region that record was going to describe, so no later batch
+	// may be reclaimed either, and the store says so rather than quietly
+	// reopening the window.
+	locateStuck bool
+	flushErr    error
 
 	nextHandle Handle
 	nextSeq    uint64
@@ -745,6 +765,57 @@ func (s *Store) cutLocked(distance uint64) *batch {
 	return b
 }
 
+// locating is one published batch waiting on its Located record.
+type locating struct {
+	seq uint64
+	// to is the ring position the batch consumed up to — what reclaimTo
+	// may advance to once this batch's record is durable.
+	to   uint64
+	done bool
+}
+
+// locatedLocked settles one published batch: its Located record either
+// landed (err nil) or did not, and the ring's tail moves accordingly.
+//
+// Only a PREFIX is released, because that is the only thing a ring can
+// release. Uploads finish out of order — four workers — so batch 7's
+// record can land before batch 6's, and reclaiming to 7's end would free
+// 6's region as well. So a batch is marked done and the tail advances over
+// however many done batches now sit at the front.
+func (s *Store) locatedLocked(seq uint64, err error) {
+	for i := range s.locating {
+		if s.locating[i].seq != seq {
+			continue
+		}
+		if err != nil {
+			// The record is not durable, so this region stays the only
+			// place these extents exist and the tail must never pass it.
+			// The entry leaves the queue anyway: a Flush waiting on it has
+			// to see the error rather than wait for a record that is not
+			// coming.
+			s.locating = append(s.locating[:i], s.locating[i+1:]...)
+			s.locateStuck = true
+		} else {
+			s.locating[i].done = true
+		}
+		break
+	}
+	n := 0
+	for !s.locateStuck && n < len(s.locating) && s.locating[n].done {
+		if s.locating[n].to > s.reclaimTo {
+			s.reclaimTo = s.locating[n].to
+		}
+		n++
+	}
+	s.locating = s.locating[n:]
+	s.releaseLocked()
+	// Broadcast even when nothing was reclaimed. A Flush waits for this
+	// queue to drain, and a blocked writer waits for space that a pin may
+	// have held back — both have to be woken by the record landing, not
+	// only by the tail moving.
+	s.cond.Broadcast()
+}
+
 // releaseLocked retries a reclaim a pin held off, and wakes anyone
 // waiting for the space. Reclaim clamps to the oldest pin rather than
 // failing, so a pack that published while a read was in flight leaves the
@@ -788,6 +859,15 @@ func (s *Store) Flush(ctx context.Context) error {
 		if err := s.waitPackLocked(); err != nil {
 			return err
 		}
+		// And for the Located records of everything already published.
+		// A flush means "on the federation, and recorded": the batch's
+		// ring region is not reclaimed until its record is durable, so
+		// without this wait the ring would still look occupied, the loop
+		// below would cut an empty batch, and Flush would return having
+		// drained neither the uplink nor the journal.
+		if err := s.waitLocatedLocked(); err != nil {
+			return err
+		}
 		if s.ring == nil || s.ring.Used() == 0 {
 			// Packing is done; the uplink may not be. A flush is what a
 			// checkpoint and a seal call, and both mean "on the
@@ -809,6 +889,17 @@ func (s *Store) Flush(ctx context.Context) error {
 // waitPackLocked waits for any pack run in flight.
 func (s *Store) waitPackLocked() error {
 	for s.packing {
+		if s.flushErr != nil {
+			return s.flushErr
+		}
+		s.cond.Wait()
+	}
+	return s.flushErr
+}
+
+// waitLocatedLocked waits for every published batch's Located record.
+func (s *Store) waitLocatedLocked() error {
+	for len(s.locating) > 0 {
 		if s.flushErr != nil {
 			return s.flushErr
 		}

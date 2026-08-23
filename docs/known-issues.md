@@ -32,7 +32,8 @@ fixed is listed at the bottom, so nobody re-files it.
 
 Every entry below was checked against the code at `0c2baf0`: all six KI
 and all six KL entries were still true. (KL-8 was filed after that audit,
-with the `--fusemount` work.) What had rotted was the citations —
+with the `--fusemount` work; KL-10 was filed and then closed after it, and
+is in the table at the bottom.) What had rotted was the citations —
 `internal/repack/execute.go` had moved ~83 lines under KI-9 — and one
 paragraph that had itself gone stale (removed).
 
@@ -420,70 +421,6 @@ has not collapsed to zero. The two rows above need production chunker
 parameters and a quarter of a gigabyte, so they are recorded here rather
 than asserted; the apptainer harness reproduces the first one on every run.
 
-### KL-10. A crash between a flush's publish and its location record loses that batch — one pack target's worth, already uploaded
-
-A flush is durable in two steps and the gap between them is real.
-`publish` (`internal/memtable/flush.go`) installs the batch's locations,
-drops its records from the ring index, and **reclaims the ring region they
-sat in** — which moves the tail hint in the ring file header, so
-`OpenRing` will not walk them again. Only after that does `runFlush` wait
-for the batch's packs to land and write the `Located` record that says
-where they went. A crash in that window leaves a state directory whose
-operation log knows the file (the op log is appended on the write itself)
-and whose location map has nothing for it: the bytes are usually already
-on the federation, and nothing left behind says which pack they are in.
-
-**Size of the loss: exactly one flush batch**, because that is the unit
-`publish` reclaims. At the shipped defaults a batch is `promoteAt` =
-`DefaultPackTarget` = 2 MiB, and the crash gate reproduces it at exactly
-2,097,216 bytes / 24 extents / 8 files of 256 KiB every time it fires.
-
-**How often, measured** (`scripts/crash-recovery-docker.sh`, 256 KiB
-files, loopback origin, arm64 laptop):
-
-| kill timing | runs | runs that lost a batch |
-|---|---|---|
-| the gate's own detection loop (a `find` of the origin plus `sleep 0.1`) | 155 | 6 |
-| the same kill with the sleep and the mount-side `find` removed, so it fires on the first uploaded object | 43 | 24 |
-
-So the window is the length of one batch's uploads, and how often a crash
-lands in it is entirely a question of when the crash happens — the gate's
-polling granularity is what makes it look like a 5% flake rather than the
-1-in-3 it is at the moment the gate is aiming for.
-
-**This is loss, not silent loss, and the distinction is the whole of why
-it is here rather than in the section above.** Recovery reports it by
-inode and byte range, and since `crossgen-recovery-agent` it also CUTS the
-file back to the first byte it cannot serve rather than leaving the
-content row at its old length with a hole in it (`memtable.Truncation`,
-`overlay.applyRecoveredTruncations`). Before that cut existed the file
-came back at its exact original size reading zeros, sealed those zeros
-into a signed generation, and passed `fsck --deep` — which is the failure
-`scripts/crash-recovery-docker.sh` check 3 exists to catch, and did catch.
-
-**Not fixed, and the fix is one that needs its own measurements.** The
-ordering can be closed: defer the reclaim (`s.reclaimTo` and
-`releaseLocked`, both in `publish`) until after `journalLocated` has
-succeeded, and a crash in the window then finds the records still in the
-ring and loses nothing. `PromotableRange` tolerates a lagging tail — `to`
-is `tail + (head - tail - distance)`, so the tail cancels and the batch
-boundary does not move — and `cutLocked` already skips records `publish`
-removed from the index. What it changes is the write path's backpressure:
-the ring's tail would stop advancing until a batch's uploads land, so a
-slow uplink turns upload backlog into writer stall, and that is a
-throughput trade against `scripts/bench-untar-nfs-docker.sh` rather than a
-correctness fix. It was deliberately left out of the cross-generation
-dedup landing so that neither change has to be reviewed or reverted
-through the other.
-
-**Pinned by an executable test: YES**, for the honesty half —
-`memtable.TestARecoveredFileIsCutBackRatherThanServedAsZeros` and its
-three siblings (`internal/memtable/holerecovery_test.go`) plus
-`overlay.TestARecoveredCutIsAppliedToTheNodeLength` drive exactly this
-boundary through `Store.Durable` and `Recover` with no signal and no
-sleep. The LOSS itself has no test because there is nothing to assert yet
-— it is what the contract permits.
-
 ---
 
 ## `CHANGELOG.md` v0.1.0 *Known limitations*: status on main
@@ -535,6 +472,7 @@ pass does not re-file them.
 | **`link(2)` of a clean inode after a checkpoint** (was KI-1) | **FIXED** by prov-agent (`e614330`; doc follow-up `9e2273d`): `genfs.FS.Edge` (`internal/genfs/genfs.go:569`) plus a fallback in `persistChainLocked` (`internal/overlay/overlay.go:645`), pinned by `internal/overlay/linkprov_test.go` (five cases). The reachable shape is NOT "a file sitting still" as first reported — `rawfuse`'s dirty mark is sticky for a mount's lifetime, so within one session the sweep's victims carry a 1s TTL and the dentry expires. It is a SECOND session over an inherited file: mount, look up a file that was already there, edit it, keep working, then link it. Two corpus entries were built for it and NEITHER reproduced, so none was kept — this entry's own prediction that a plan would be `flaky-open` at best was right, and stronger than it knew. |
 | **Crash-stranded scratch is never swept** (was KI-2) | **FIXED** by spool-agent (`a7d336a`): `internal/scratch` names every scratch directory for the process that made it (`publish-<pid>-*`, `snapshot-<pid>-*`, `repack-<pid>-*`) and `sweepStateScratch` (`cmd/pelfs/mountgen.go`) collects, at every mount, the ones whose owner is no longer running — reporting the bytes and the names it took. A repack's spool is now a per-run subdirectory removed on **every** exit from `Execute`, so the happy path no longer strands one either. Pinned by `internal/scratch/scratch_test.go` (ten cases, including a live sibling's spool being left alone), `cmd/pelfs/scratchsweep_test.go`, `internal/repack/spool_test.go`, and phase 4b of `scripts/crash-recovery-docker.sh`. The discipline is pid liveness with a 24h guard for unowned names and a 7d backstop against pid reuse; why liveness rather than the lease is argued at the top of `internal/scratch/scratch.go`. |
 | **The dedup sidecar after a repack** (was KI-3) | **FIXED** by spool-agent (`a7d336a`), both halves in one operation: `publish.RestampDedupIndex`, called from `repack.execute` after the flip, rewrites the sidecar with exactly the rows the sweep's reachable set still reaches and stamps it with the generation the repack published. Filtering without restamping would be a file nobody reads; restamping without filtering would promise chunks the repack has just dropped — which is why they are one function and not two. Pinned by `TestASealAfterARepackStillDeduplicates` (`internal/repack/dedup_test.go:67`), which measures the bytes the post-repack seal puts on the wire for a 3 MiB file the generation already stores. Its ASSERTION is a ceiling (`dedup_test.go:174`, under half the file); the observed 4 KiB with the fix against 3.15 MiB without it is a logged number, not a pinned one. |
+| **A crash between a flush's publish and its location record loses that batch** (was KL-10) | **FIXED** by durability-agent: `publish` no longer reclaims the ring region a batch came from. It queues the region (`Store.locating`) and `journalLocated` releases it, so until the `Located` record binding handles to packs is durable the ring is still where recovery finds those extents — and a crash in the window loses nothing rather than one flush batch (2 MiB at the shipped pack target). Only a PREFIX is released, because that is all a ring can release: four upload workers finish out of order, so a batch is marked done and the tail advances over however many done batches sit at the front. `Flush` waits for the queue to drain, which is what makes "a flush means recorded" true as well as "a flush means uploaded". Pinned by `memtable.TestACrashBeforeTheLocatedRecordLosesNothing` and `memtable.TestTheRingIsNotReclaimedUntilTheLocatedRecordIsDurable` (`internal/memtable/losswindow_test.go`) — one through `Store.Durable`/`Recover`, one at the ring itself, neither killing anything. The cost was the reason it was deferred and it was MEASURED rather than argued (`memtable.TestMeasureRingHoldBackpressure`, `PELFS_RINGHOLD_MEASURE=1`): holding the ring moves the uplink's cost from the seal into the write phase and leaves end-to-end throughput alone. |
 | **C2**, the "fsck lifts the cap" claim | **STALE** in that detail — `internal/fsck` does not touch `packIndex`. The rest of C2 survives as KI-8. |
 | **F11** dead/unwired inventory; **G4**, **G6** doc-staleness sweeps | Real work, but hygiene and prose rather than defects or limitations. They stay in `docs/TODO.md`, which is what a punchlist is for. |
 
@@ -544,12 +482,15 @@ regression that must PASS. That is a good state and worth checking against
 whenever this file gains an entry — a bug the corpus can express belongs
 there rather than here, because there it fails on its own.
 
-KL-10 is the one entry whose HONESTY half is expressible in ordinary Go
-tests and is (`internal/memtable/holerecovery_test.go`); what stays here is
-its remaining half, a loss the contract permits and a fix that is a
-throughput trade.
+KL-10 was the one entry whose halves came apart like that: the HONESTY
+half was expressible in ordinary Go tests (`holerecovery_test.go`) and the
+LOSS half was not, because a loss the contract permits has nothing to
+assert. It is gone from this file because durability-agent closed the
+window rather than documenting it, and closing it made the loss half
+expressible too — the assertion is byte-exact recovery, which only exists
+once there is something to recover.
 
-Nothing else left in this file is expressible as a plan, which is why they
+Nothing left in this file is expressible as a plan, which is why they
 are here:
 a memory ceiling reached only at a hundred million objects (KI-8), a
 missing stats field (KI-4, KI-5), an error class thrown away (KI-6), a

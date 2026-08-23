@@ -126,7 +126,16 @@ type Stats struct {
 	// CROSS-flush case, and it is the one that costs real bytes on a tree
 	// where the same content arrives under several names.
 	DedupedChunks int64
-	Packs         int64
+	// BaseDedupedChunks and BaseDedupedBytes are the part of DedupedChunks
+	// that the GENERATION this session builds on already had — dedup that
+	// reaches across generations rather than across flushes. They are
+	// counted separately because they are the answer to a different
+	// question: the cross-flush number says a session wrote the same bytes
+	// twice, and this one says the volume already held them, which is what
+	// makes a related image cost a fraction of its size.
+	BaseDedupedChunks int64
+	BaseDedupedBytes  int64
+	Packs             int64
 	// ReclaimErrors counts ring regions a completed pack could not
 	// release. That costs space, never correctness, so it is a statistic
 	// rather than a failure.
@@ -179,6 +188,54 @@ type Stats struct {
 	RingFree int64
 }
 
+// noteBaseHitLocked records that a chunk was borrowed from generation gen
+// of the base. The OLDEST wins: a session that borrowed before a repack
+// and again after it has to recheck the older ones, and one number that
+// errs toward rechecking is worth more than a map that errs toward not.
+func (s *Store) noteBaseHitLocked(gen uint64) {
+	if gen == 0 {
+		// A placer that cannot name its generation cannot be trusted to
+		// say the base has not moved.
+		s.baseRecheckAll = true
+		return
+	}
+	if s.baseHitGen == 0 || gen < s.baseHitGen {
+		s.baseHitGen = gen
+	}
+}
+
+// needsBaseRecheckLocked reports whether a seal has to confirm the chunks
+// it borrowed from the base generation are still stored there.
+func (s *Store) needsBaseRecheckLocked() bool {
+	if s.placer == nil {
+		return false
+	}
+	if s.baseRecheckAll {
+		return true
+	}
+	return s.baseHitGen != 0 && s.placer.Generation() != s.baseHitGen
+}
+
+// asPlacer takes the cross-generation dedup lookup off a Base that has
+// one. A Base that does not is not a lesser Base: correctness never
+// depends on the lookup, since a miss only ever costs a duplicate upload
+// (see Placer).
+//
+// The nil check is on the interface's dynamic value as well as the
+// interface, because a Store built with no base at all holds a nil Base
+// and a type assertion on that succeeds for nobody — but a caller passing
+// a typed nil would otherwise install a placer that panics on first use.
+func asPlacer(b Base) Placer {
+	if b == nil {
+		return nil
+	}
+	p, ok := b.(Placer)
+	if !ok || p == nil {
+		return nil
+	}
+	return p
+}
+
 // Store is the write path: one active memtable, at most one flushing
 // memtable, and a location map naming what has reached the federation.
 type Store struct {
@@ -214,11 +271,27 @@ type Store struct {
 	live  map[Handle]int    // content references per handle
 	order []Handle          // handles in ring order, oldest first
 
-	journal  Journal
-	base     Base
-	dek      []byte
-	keyID    int64
-	onUpload func(string, int64, time.Duration)
+	journal Journal
+	base    Base
+	// placer is base again, when it can answer where a chunk the base
+	// generation holds is stored — the cross-generation dedup lookup. Nil
+	// for a base that cannot, which changes nothing except that a chunk
+	// the volume already holds is stored a second time.
+	placer Placer
+	// baseHitGen is the OLDEST base generation any chunk in chunkLoc was
+	// borrowed from, or zero if none was. It is the whole of what a seal
+	// needs to know whether its borrowed rows are still good: the base
+	// only moves under a repack, and a repack is the only thing that can
+	// stop a stored chunk being stored (Sealer.stillStored).
+	baseHitGen uint64
+	// baseRecheckAll forces that check regardless. Recovery sets it: a
+	// journal records WHERE a chunk is and not which generation put it
+	// there, so a replayed session that holds borrowed locations cannot
+	// say whether the base has moved under them and must assume it has.
+	baseRecheckAll bool
+	dek            []byte
+	keyID          int64
+	onUpload       func(string, int64, time.Duration)
 	// baseRefs holds, per ADOPTED handle, the base generation's own
 	// content records for that file (base.go). An extent is either these,
 	// or a ring record, or a location-map entry — the three places bytes
@@ -360,6 +433,7 @@ func newStore(opts Options) (*Store, error) {
 		index:      make(map[Handle]Record),
 		live:       make(map[Handle]int),
 		base:       opts.Base,
+		placer:     asPlacer(opts.Base),
 		journal:    opts.Journal,
 		dek:        opts.DEK,
 		keyID:      opts.KeyID,

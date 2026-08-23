@@ -1303,6 +1303,9 @@ func writeStats(store *memtable.Store) *stats.WriteStats {
 		UploadedBytes:  st.UploadedBytes,
 		UploadedChunks: st.UploadedChunks,
 		DedupedChunks:  st.DedupedChunks,
+
+		BaseDedupedChunks: st.BaseDedupedChunks,
+		BaseDedupedBytes:  st.BaseDedupedBytes,
 	}
 }
 
@@ -1736,6 +1739,7 @@ func (g *genSession) sealLocked(ctx context.Context, follow bool) (*publish.Resu
 		ph.Seals++
 		sum.SealedGeneration = res.Superblock.Generation
 		sum.SealedChunks = int64(res.Stats.ChunksAdded)
+		sum.SealedDedupedChunks = int64(res.Stats.ChunksDeduped)
 		sum.SealedCatalogs = int64(res.Stats.Catalogs)
 		sum.SealedPacks = int64(len(res.NewPacks))
 	})

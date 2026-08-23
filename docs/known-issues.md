@@ -370,6 +370,56 @@ the control). The two gaps are pinned by nothing, which is the honest state
 of them: they are properties of the caching contract, not behaviours to
 assert.
 
+### KL-9. Cross-generation dedup is per generation, not per session: a session larger than the ring cuts some chunks where the ring flushed
+
+The default write path recognises content the generation it is building on
+already holds (`genfs.Placed`), and for the workload that matters — one
+image per generation — it realises the chunker's full potential: measured
+149,224,395 bytes for four related container images against
+`--no-memtable`'s 149,221,054, where before it was 272,755,301
+(`docs/design-apptainer.md`, and `scripts/apptainer-docker.sh` section 8b
+is the harness).
+
+What it does **not** fix is where the boundaries come from. The flush
+chunks one batch of the ring at a time (`chunkInode`,
+`internal/memtable/flush.go`), so the first chunk of a batch begins where
+the batch begins and the last one ends where it ends, and neither is a
+content boundary. A chunk with a boundary the ring chose is a chunk no
+other generation will ever produce, so it can neither be recognised nor be
+recognisable.
+
+**How much it costs, measured.** The damage is two chunks per batch, so it
+scales as the chunk size over the BATCH size, and the shipped defaults are
+the bad end of that ratio: a batch is `promoteAt`, which is
+`DefaultPackTarget` = 2 MiB, against a 4 MiB average chunk.
+
+| session shape | chunks cut on content | bytes |
+|---|---|---|
+| one 68 MB file (fits the 72 MiB ring; no batch fires) | 14 of 14 | 100% |
+| four 68 MB files, one session | 17 of 87 | 28% |
+
+So: **publish one image per generation.** Several large files in one
+`mount-gen --rw` session dedup against a later generation only partially,
+and two ~93%-identical files in the SAME session dedup against each other
+hardly at all (measured before this work: 273,007,591 of 273,846,272
+logical).
+
+Not fixed because the fix is not local. A batch would have to defer its
+trailing partial chunk to the next batch so the next one resumes at a
+content boundary, which means the batch no longer consumes a fixed prefix
+of the ring, which puts it in the middle of the backpressure rule
+(`appendLocked`, `promoteAt`, and the ring-full path that must always make
+progress). It is W2b in `docs/design-apptainer.md`.
+
+**Pinned by an executable test: YES**, for the invariant and the direction
+rather than for the numbers —
+`memtable.TestFlushBatchBoundariesLimitWhatCanBeDeduped` asserts that a
+session inside the ring cuts EVERY chunk on content, which is what the
+whole cross-generation claim rests on, and that a session overflowing it
+has not collapsed to zero. The two rows above need production chunker
+parameters and a quarter of a gigabyte, so they are recorded here rather
+than asserted; the apptainer harness reproduces the first one on every run.
+
 ---
 
 ## `CHANGELOG.md` v0.1.0 *Known limitations*: status on main

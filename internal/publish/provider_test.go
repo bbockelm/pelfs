@@ -9,6 +9,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/bbockelm/pelfs/internal/catalog"
@@ -169,12 +170,22 @@ func (m *memSource) ProvidedPacks(ctx context.Context) ([]packstore.SealedPack, 
 // to say that nothing did.
 type countingObjStore struct {
 	pelicanobj.Store
-	puts int
+	// Both counters are atomic because packs upload CONCURRENTLY: the
+	// uploader runs several in flight, so a plain int here is a data race
+	// that only shows up once a test writes enough content to cut more
+	// than one pack at a time.
+	puts atomic.Int64
+	// putBytes is what actually went on the wire. It is the user-visible
+	// claim wherever the question is "did this cost bandwidth" rather than
+	// "did this cost a round trip", which is what the cross-generation
+	// dedup tests assert on.
+	putBytes atomic.Int64
 }
 
 func (c *countingObjStore) Put(ctx context.Context, key string, in io.Reader) error {
 	if strings.HasPrefix(key, packstore.PackDirKey+"/") {
-		c.puts++
+		c.puts.Add(1)
+		in = &countingReader{rd: in, n: &c.putBytes}
 	}
 	return c.Store.Put(ctx, key, in)
 }
@@ -219,7 +230,7 @@ func TestSealPublishesContentTheSourcePacked(t *testing.T) {
 	if err := src.store.Flush(ctx); err != nil {
 		t.Fatal(err)
 	}
-	sessionPuts := obj.puts
+	sessionPuts := obj.puts.Load()
 
 	res, err := publish.Publish(ctx, publish.Options{
 		Source: src, Inner: obj, SpoolDir: t.TempDir(),
@@ -270,7 +281,7 @@ func TestSealPublishesContentTheSourcePacked(t *testing.T) {
 			t.Fatalf("%s does not read back byte-exact", name)
 		}
 	}
-	t.Logf("session uploaded %d packs, the seal added %d", sessionPuts, obj.puts-sessionPuts)
+	t.Logf("session uploaded %d packs, the seal added %d", sessionPuts, obj.puts.Load()-sessionPuts)
 }
 
 func bytesPattern(n int, seed uint64) []byte {

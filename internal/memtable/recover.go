@@ -246,6 +246,21 @@ func Recover(opts Options, d Durable) (*Store, *Report, error) {
 		s.chunkLoc[k] = v
 	}
 	s.packs = append([]packstore.SealedPack(nil), d.Packs...)
+	// A location naming a pack this session did not write is one the
+	// previous incarnation BORROWED from the base generation, and the
+	// journal does not say which generation that was. A repack could have
+	// dropped it while nothing was running, so the seal has to check
+	// rather than assume — see Sealer.stillStored.
+	ours := make(map[string]struct{}, len(s.packs))
+	for _, sp := range s.packs {
+		ours[sp.Name] = struct{}{}
+	}
+	for _, loc := range s.chunkLoc {
+		if _, mine := ours[loc.Pack]; !mine {
+			s.baseRecheckAll = true
+			break
+		}
+	}
 
 	if err := s.readopt(d, found); err != nil {
 		return nil, nil, err

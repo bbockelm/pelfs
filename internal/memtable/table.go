@@ -1,5 +1,34 @@
 package memtable
 
+import (
+	"context"
+
+	"github.com/bbockelm/pelfs/internal/chunkid"
+	"github.com/bbockelm/pelfs/internal/genfs"
+)
+
+// Placer is the part of a Base that answers "does the generation I am
+// building on already store these bytes". *genfs.FS satisfies it.
+//
+// It is separate from Base, and consulted by type assertion, because it is
+// an OPTIMIZATION and a Base that cannot answer must stay a usable Base:
+// every measurement harness and most tests supply one, and a store with no
+// placer behind it is exactly today's store.
+//
+// The contract is three-valued and only two values are on the wire. A hit
+// means "stored, in a pack this generation lists, confirmed against that
+// pack's own signed-for trailer". A miss means "not cheaply", NEVER
+// "absent" — the caller's answer to a miss is to store the bytes again,
+// which is always correct because identity is content.
+type Placer interface {
+	Placed(ctx context.Context, id chunkid.Identity) (genfs.Placement, bool)
+	// Generation names the generation the answers are about. A caller that
+	// recorded one has to be able to notice it moved: under a live mount
+	// only a repack moves it, and a repack is the only thing that can stop
+	// a stored chunk being stored.
+	Generation() uint64
+}
+
 // batch is one pack run's worth of extents, taken from the ring's tail.
 //
 // It replaces the frozen table the store used to swap to. With a ring

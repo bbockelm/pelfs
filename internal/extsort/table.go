@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 
-	"golang.org/x/sys/unix"
+	"github.com/bbockelm/pelfs/internal/mmapfile"
 )
 
 // Table is a sorted result materialized once and searched many times.
@@ -29,7 +29,7 @@ type Table struct {
 	keyLen int
 
 	// mapped is the whole file, or nil when the records never left memory.
-	mapped []byte
+	mapped *mmapfile.Mapping
 	// mem is the sorter's buffer, borrowed when nothing spilled.
 	mem  []byte
 	path string
@@ -91,15 +91,31 @@ func (s *Sorter) Table() (*Table, error) {
 		return nil, err
 	}
 	if t.n == 0 {
-		// unix.Mmap refuses a zero length, and an empty table needs no map.
+		// Mapping refuses a zero length on every platform — mmap by rule,
+		// Windows because a zero-length file has no section — and an empty
+		// table needs no map anyway.
 		return t, nil
 	}
-	b, err := unix.Mmap(int(f.Fd()), 0, t.n*t.recLen, unix.PROT_READ, unix.MAP_SHARED)
+	// WHAT THIS SITE RELIES ON, since Windows mappings are stricter than
+	// mmap in three ways (internal/mmapfile):
+	//
+	//   - The file is COMPLETE before it is mapped. Every record has been
+	//     written and the buffer flushed, so the file's size is exactly
+	//     t.n*t.recLen and it never changes again. Nothing here resizes a
+	//     mapped file, which Windows cannot do at all.
+	//   - The mapping OUTLIVES the *os.File. f is closed by the defer
+	//     above the moment Table returns, and the mapping stays valid:
+	//     Windows keeps the file alive through the section object, as Unix
+	//     does through the fd the kernel holds.
+	//   - The file is REMOVED while nothing maps it. Close unmaps first
+	//     and removes second (see there), because on Windows a live
+	//     mapping pins the file and the remove would fail.
+	mm, err := mmapfile.Map(f, t.n*t.recLen, mmapfile.ReadOnly)
 	if err != nil {
 		os.Remove(t.path) //nolint:errcheck
-		return nil, fmt.Errorf("extsort: map %s: %w", t.path, err)
+		return nil, fmt.Errorf("extsort: %w", err)
 	}
-	t.mapped = b
+	t.mapped = mm
 	return t, nil
 }
 
@@ -109,7 +125,7 @@ func (t *Table) Len() int { return t.n }
 // At returns the i'th record in key order. The slice aliases the table
 // and stays valid until Close.
 func (t *Table) At(i int) []byte {
-	b := t.mapped
+	b := t.mapped.Bytes()
 	if b == nil {
 		b = t.mem
 	}
@@ -133,11 +149,13 @@ func (t *Table) Lookup(key []byte) (rec []byte, i, n int) {
 	return t.At(i), i, n
 }
 
-// Close unmaps and removes the table.
+// Close unmaps and removes the table, IN THAT ORDER: on Windows a live
+// mapping pins its backing file, so removing first would fail with a
+// sharing violation and leave the table behind.
 func (t *Table) Close() error {
 	var first error
 	if t.mapped != nil {
-		if err := unix.Munmap(t.mapped); err != nil {
+		if err := t.mapped.Close(); err != nil {
 			first = err
 		}
 		t.mapped = nil

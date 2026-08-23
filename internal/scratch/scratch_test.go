@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"testing"
 	"time"
@@ -244,7 +245,15 @@ func TestPIDAliveAnswersForRealProcesses(t *testing.T) {
 			t.Fatalf("pid %d reports as alive", pid)
 		}
 	}
-	cmd := exec.Command("/usr/bin/true")
+	// A child that exits immediately, reaped by Run. Named per platform
+	// because there is no portable "do nothing" program: /usr/bin/true is
+	// not on Windows and cmd.exe is not on Unix. The point of the child is
+	// only to give the test a pid it KNOWS is finished.
+	name, args := "/usr/bin/true", []string(nil)
+	if runtime.GOOS == "windows" {
+		name, args = "cmd.exe", []string{"/c", "exit", "0"}
+	}
+	cmd := exec.Command(name, args...)
 	if err := cmd.Run(); err != nil {
 		t.Skipf("cannot run a child to reap: %v", err)
 	}

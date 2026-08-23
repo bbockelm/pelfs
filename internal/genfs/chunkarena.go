@@ -6,7 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"golang.org/x/sys/unix"
+	"github.com/bbockelm/pelfs/internal/mmapfile"
 )
 
 // The decoded-chunk tier: ONE file, not one file per chunk.
@@ -239,8 +239,11 @@ type arenaRegion struct {
 // chunkArena is the tier: the mapping, its two cursors, the index, and the
 // gate that chooses between them.
 type chunkArena struct {
-	f    *os.File
-	mm   []byte
+	f *os.File
+	// mm is the mapping and mmb its bytes, cached because a read copies
+	// out of it on every hit.
+	mm   *mmapfile.Mapping
+	mmb  []byte
 	size int64
 
 	// idx maps identity to place. Sharded because every read consults it
@@ -426,12 +429,26 @@ func newChunkArena(dir string, size int64) (*chunkArena, error) {
 		f.Close() //nolint:errcheck
 		return nil, err
 	}
-	mm, err := unix.Mmap(int(f.Fd()), 0, int(size), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
+	// WHAT THIS SITE RELIES ON, since Windows mappings are stricter than
+	// mmap in three ways (internal/mmapfile):
+	//
+	//   - The file is at its FINAL SIZE before it is mapped. The Truncate
+	//     above sets it, and nothing ever resizes it again: the arena is a
+	//     fixed budget and its allocator wraps rather than grows. Windows
+	//     cannot resize a file that is mapped, and there is no remap.
+	//   - The size is POSITIVE. size <= 0 returned above, so the
+	//     zero-length case — which Windows refuses outright, having no
+	//     section to make — never reaches here.
+	//   - The file is NOT removed or renamed while mapped. It is left in
+	//     place at Close and truncated by the next Open; the only remove is
+	//     the size <= 0 path above, which never mapped it. On Windows a
+	//     live mapping would pin it.
+	mm, err := mmapfile.Map(f, int(size), mmapfile.ReadWrite)
 	if err != nil {
 		f.Close() //nolint:errcheck
-		return nil, fmt.Errorf("genfs: mmap chunk arena %s: %w", path, err)
+		return nil, fmt.Errorf("genfs: chunk arena %s: %w", path, err)
 	}
-	a := &chunkArena{f: f, mm: mm, size: size}
+	a := &chunkArena{f: f, mm: mm, mmb: mm.Bytes(), size: size}
 	p := probationBytes(size)
 	a.probation = arenaRegion{base: 0, size: p}
 	a.main = arenaRegion{base: p, size: size - p}
@@ -455,7 +472,12 @@ func (a *chunkArena) Close() error {
 	if a == nil {
 		return nil
 	}
-	if err := unix.Munmap(a.mm); err != nil {
+	// a.mmb is deliberately NOT cleared. Nothing may read the arena after
+	// Close — that was already true of the mapping it names — and clearing
+	// it would be a WRITE to a field the hot read path reads, which the
+	// race detector would rightly complain about even though the mapping
+	// is what actually went away.
+	if err := a.mm.Close(); err != nil {
 		a.f.Close() //nolint:errcheck
 		return err
 	}
@@ -495,7 +517,7 @@ func (a *chunkArena) read(idHex string, off int64, window []byte) bool {
 		s.mu.RUnlock()
 		return false
 	}
-	copy(window, a.mm[s.off+off:s.off+off+int64(len(window))])
+	copy(window, a.mmb[s.off+off:s.off+off+int64(len(window))])
 	if !s.served.Load() {
 		s.served.Store(true)
 	}
@@ -551,7 +573,7 @@ func (a *chunkArena) put(idHex string, plain []byte) {
 		s.mu.Unlock()
 		return
 	}
-	copy(a.mm[s.off:s.off+s.length], plain)
+	copy(a.mmb[s.off:s.off+s.length], plain)
 	s.filled = true
 	s.mu.Unlock()
 	sh.mu.Lock()

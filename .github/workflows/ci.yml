@@ -21,7 +21,7 @@ permissions:
 
 jobs:
   unit:
-    # go vet + go test ./... + three cross-builds. 34s of tests locally.
+    # go vet + go test ./... + four cross-builds. 34s of tests locally.
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -49,11 +49,113 @@ jobs:
       # diagnosis instead of a hunt. Always let Go's timeout fire first.
       - name: Unit tests
         run: CGO_ENABLED=0 go test -count=1 -timeout 8m ./...
+      # windows/amd64 is in here as well as in the `windows` job below, and
+      # deliberately: this step runs in seconds on a runner that is already
+      # warm, so a Windows build break is reported by the FIRST job to
+      # finish rather than by the slowest one. The windows job is what
+      # vets and runs tests; this is the tripwire.
       - name: Cross-builds (cgo-free)
         run: |
-          CGO_ENABLED=0 GOOS=linux  GOARCH=amd64 go build -o /dev/null ./cmd/pelfs
-          CGO_ENABLED=0 GOOS=linux  GOARCH=arm64 go build -o /dev/null ./cmd/pelfs
-          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -o /dev/null ./cmd/pelfs
+          CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -o /dev/null ./cmd/pelfs
+          CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -o /dev/null ./cmd/pelfs
+          CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -o /dev/null ./cmd/pelfs
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o /dev/null ./cmd/pelfs
+
+  windows:
+    # THE WINDOWS GATE. It exists because a WebDAV frontend for Windows is
+    # the next thing to be built, and a port that is not compiled every day
+    # is a port that rots between one commit and the next.
+    #
+    # What it proves: the whole tree builds and vets for windows/amd64, and
+    # the packages whose behaviour is platform-independent actually PASS
+    # there rather than merely compiling.
+    #
+    # WHAT IS DELIBERATELY NOT RUN, and why, because a skip list nobody
+    # explained is a skip list nobody revisits:
+    #
+    #   - internal/rawfuse has no Windows files at all (`//go:build
+    #     !windows`): go-fuse is the Unix kernel protocol in Go types and
+    #     cannot be ported. cmd/pelfs therefore has no FUSE backend here,
+    #     which is what cmd/pelfs/fusefront_windows.go says out loud.
+    #   - cmd/pelfs, internal/genfs, internal/overlay, internal/publish,
+    #     internal/merge, internal/repack, internal/fsck, internal/reach,
+    #     internal/rescue, internal/vfsbilly, internal/nfsmount,
+    #     internal/testvol: every one of them either mounts, shells out to
+    #     a Unix binary, or turns on unlinking a file that is still open —
+    #     which POSIX allows and Windows refuses. Those are real, listed
+    #     defects (docs/TODO.md, winport-agent), not flakes, and they get
+    #     fixed before their packages join this list.
+    #   - internal/fsperm and internal/idmap: os.Getuid() is -1 on Windows,
+    #     so the credential these packages are about does not exist. A
+    #     green run here would mean nothing.
+    #   - internal/control: the control socket is AF_UNIX in the state
+    #     directory. Windows has AF_UNIX, but not unlink-on-close, so a
+    #     stale socket file makes the next bind fail.
+    #   - internal/rotate: the retired-key archive is mode 0400, which Go
+    #     maps to FILE_ATTRIBUTE_READONLY, and Windows refuses to
+    #     delete or rename over a read-only file.
+    #   - internal/memtable runs its RING and BUFFER tests only. Those are
+    #     the mmap-backed types this port rewrote, so they are the point;
+    #     the rest of the package includes pack-cache eviction, which
+    #     unlinks files a reader still holds open.
+    #   - No mount gates, no Docker gates, no fuzzing. None of them have a
+    #     Windows form.
+    #
+    # Budget: build + vet dominate, and a Windows runner is the slowest in
+    # the matrix. The -timeout is well under the job cap for the reason the
+    # unit lane's is -- Go's own deadline prints a goroutine dump naming
+    # the test, a killed runner prints nothing.
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.0"
+      # ./... and not ./cmd/pelfs: the point is that no package in the tree
+      # has drifted, including the ones whose tests are skipped below.
+      - name: Build the whole tree
+        run: go build ./...
+        env:
+          CGO_ENABLED: "0"
+      - name: Vet
+        run: go vet ./...
+        env:
+          CGO_ENABLED: "0"
+      # Named packages, not ./... with exclusions: an explicit list fails
+      # when a package is ADDED and nobody decided which side of the line
+      # it is on, which is the failure worth having.
+      - name: Unit tests (platform-independent packages)
+        run: >
+          go test -count=1 -timeout 10m
+          ./internal/mmapfile/
+          ./internal/extsort/
+          ./internal/catalog/
+          ./internal/superblock/
+          ./internal/entrycodec/
+          ./internal/chunkid/
+          ./internal/packstore/
+          ./internal/packidx/
+          ./internal/manifest/
+          ./internal/refs/
+          ./internal/stats/
+          ./internal/scratch/
+          ./internal/retention/
+          ./internal/mpi/
+          ./internal/lease/
+          ./internal/version/
+          ./internal/ui/
+        env:
+          CGO_ENABLED: "0"
+      # The mmap port, specifically. internal/mmapfile is the new code and
+      # internal/extsort above is one of its four callers; these are the
+      # other two, and they are the ones that write THROUGH a mapping and
+      # then delete the file it was made from -- the operation Windows
+      # refuses while a mapping is live.
+      - name: The mmap-backed memtable types
+        run: go test -count=1 -timeout 5m -run "^Test(Ring|Buffer|DefaultRing)" ./internal/memtable/
+        env:
+          CGO_ENABLED: "0"
 
   race:
     # The whole suite under the race detector. Only the op-sequence stress
@@ -394,13 +496,13 @@ jobs:
 
   build-release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [unit, race, e2e, integration, fuzz, opfuzz, hostile, mount-gate, crash, big-tree]
+    needs: [unit, windows, race, e2e, integration, fuzz, opfuzz, hostile, mount-gate, crash, big-tree]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
       fail-fast: true
       matrix:
-        goos: [linux, darwin]
+        goos: [linux, darwin, windows]
         goarch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v4
@@ -427,9 +529,15 @@ jobs:
           set -euo pipefail
           dist="pelfs_${GITHUB_REF_NAME}_${GOOS}_${GOARCH}"
           mkdir -p "$dist"
+          # Windows will not execute a file without the extension, and the
+          # release is a tarball on every platform because the runner this
+          # builds on is Linux -- cross-compiling is the whole story here,
+          # so there is no zip step to add and no second runner to add it on.
+          exe=""
+          [ "$GOOS" = windows ] && exe=".exe"
           CGO_ENABLED=0 go build -trimpath \
             -ldflags "-X github.com/bbockelm/pelfs/internal/version.release=${GITHUB_REF_NAME}" \
-            -o "$dist/pelfs" ./cmd/pelfs
+            -o "$dist/pelfs$exe" ./cmd/pelfs
           cp README.md CHANGELOG.md LICENSE "$dist/"
           tar -czf "${dist}.tar.gz" "$dist"
           ls -l "${dist}.tar.gz"

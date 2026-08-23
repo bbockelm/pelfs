@@ -28,6 +28,21 @@
 // maintenance lease on another branch, a merge. So the question this
 // sweeper asks is not "who is entitled to write" but "who is still
 // running", and only the OS can answer that.
+//
+// WHAT PIDAlive PROMISES, since the OS-specific halves live in
+// pidalive_unix.go and pidalive_windows.go and the contract has to hold
+// for both. It is deliberately lopsided: FALSE MEANS THIS PACKAGE
+// DELETES A DIRECTORY, so false is the answer that has to be earned, and
+// it is returned only where the OS positively says there is no such
+// process (ESRCH; ERROR_INVALID_PARAMETER from OpenProcess). Every other
+// outcome — the process exists and belongs to somebody else, the OS
+// refuses to say, the call fails for a reason this code did not
+// anticipate — reports ALIVE. The cost of a wrong "alive" is a directory
+// swept a week later by the reuse-age backstop; the cost of a wrong
+// "dead" is a live session's spool deleted from under it mid-upload.
+//
+// (cmd/pelfs's own pidAlive answers a different question — whether a
+// mount this user started is still up — and is stricter on purpose.)
 package scratch
 
 import (
@@ -37,7 +52,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -72,8 +86,11 @@ const (
 	// test.
 	DefaultOrphanAge = 24 * time.Hour
 	// DefaultReuseAge is the backstop under the one hole pid ownership
-	// has: pids are reused, freely so across a reboot, and a stranded
-	// directory whose number has been inherited by some long-lived daemon
+	// has: pids are reused, freely so across a reboot — and far more
+	// freely than that on Windows, where they are handle-table indices
+	// handed out in small multiples of four (see pidalive_windows.go) — and
+	// a stranded directory whose number has been inherited by some
+	// long-lived daemon
 	// would otherwise be protected forever. A live run refreshes its own
 	// directory's mtime continuously — a spool is written to for as long
 	// as it is used — so this expires only for a directory that has been
@@ -109,21 +126,6 @@ func Owner(name string) (int, bool) {
 		return pid, true
 	}
 	return 0, false
-}
-
-// PIDAlive reports whether a process is still running.
-//
-// EPERM counts as alive: the signal was refused because the process
-// exists and belongs to somebody else, and "somebody else's process" is a
-// reason to leave its directory alone, not to delete it. (cmd/pelfs's own
-// pidAlive answers a different question — whether a mount this user
-// started is still up — and is stricter on purpose.)
-func PIDAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	err := syscall.Kill(pid, 0)
-	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
 // Options tunes a sweep. The zero value is the production setting; tests

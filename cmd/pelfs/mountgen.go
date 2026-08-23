@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/go-git/go-billy/v5"
-	"github.com/hanwen/go-fuse/v2/fuse"
 
 	"github.com/bbockelm/pelfs/internal/chunkid"
 	"github.com/bbockelm/pelfs/internal/control"
@@ -30,7 +29,6 @@ import (
 	"github.com/bbockelm/pelfs/internal/overlay"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/publish"
-	"github.com/bbockelm/pelfs/internal/rawfuse"
 	"github.com/bbockelm/pelfs/internal/refs"
 	"github.com/bbockelm/pelfs/internal/repack"
 	"github.com/bbockelm/pelfs/internal/scratch"
@@ -298,7 +296,7 @@ func cmdMountGen(args []string) int {
 	if len(command) > 0 {
 		a.subshell = true
 	}
-	if rawfuse.PassedFD(pos[1]) {
+	if fusePassedFD(pos[1]) {
 		if a.subshell {
 			return exitErr(fmt.Errorf("a passed /dev/fuse descriptor (%s) has no path to run a command in: "+
 				"the parent that opened it owns the mountpoint, and this process never learns where it is. "+
@@ -687,14 +685,14 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	// `/dev/fd/3` is `ENOTDIR` — which is exactly how a --fusemount driver
 	// used to die before it ever reached the mount (docs/design-apptainer.md,
 	// W1).
-	passedFD := rawfuse.PassedFD(mountpoint)
+	passedFD := fusePassedFD(mountpoint)
 	if !passedFD {
 		if err := os.MkdirAll(mountpoint, 0755); err != nil {
 			return fail(err)
 		}
 	}
 
-	var srv *fuse.Server
+	var srv fuseServer
 	var nfsSrv *nfsmount.Server
 	if rw {
 		// The write path: a crash-safe local overlay shadows the immutable
@@ -755,9 +753,9 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		}
 	case "fuse", "":
 		if rw {
-			srv, err = rawfuse.MountRW(mountpoint, g.ov, o.debug)
+			srv, err = fuseMountRW(mountpoint, g.ov, o.debug)
 		} else {
-			srv, err = rawfuse.Mount(mountpoint, g.gfs, o.debug)
+			srv, err = fuseMount(mountpoint, g.gfs, o.debug)
 		}
 	default:
 		return fail(fmt.Errorf("unknown --backend %q (want fuse or nfs)", backend))
@@ -862,7 +860,7 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	if poll > 0 && nfsSrv != nil {
 		ui.Info("--poll ignored with --backend nfs (NFS caching is client-driven; there is no invalidation channel to push to)")
 	} else if poll > 0 && !rw && tag == "" {
-		r := rawfuse.NewRefresher(g.gfs, srv, func(c context.Context) (*superblock.Superblock, error) {
+		r := srv.NewRefresher(g.gfs, func(c context.Context) (*superblock.Superblock, error) {
 			f, err := rstore.Fetch(c, branch)
 			if err != nil {
 				return nil, err
@@ -1212,9 +1210,9 @@ func (g *genSession) runPrefetch(ctx context.Context, mode string) error {
 }
 
 // follow drives the live-refresh poller and counts the swaps it applied.
-// rawfuse.Refresher.Run does the polling but reports only to the log; the
+// The frontend's own Run does the polling but reports only to the log; the
 // swap count belongs in the session statistics.
-func (g *genSession) follow(ctx context.Context, r *rawfuse.Refresher, every time.Duration) {
+func (g *genSession) follow(ctx context.Context, r fuseRefresher, every time.Duration) {
 	tick := time.NewTicker(every)
 	defer tick.Stop()
 	for {
@@ -1523,20 +1521,6 @@ func (g *genSession) reportPhaseSplit() {
 // last, after every other deferred step has marked itself.
 func (g *genSession) reportTeardown() {
 	g.down.report(g.down.sentence("torn down"))
-}
-
-// processCPU is this process's user+system time. Seals are mostly
-// chunking and SQLite, so CPU well below wall time points at the network
-// and CPU near wall time points at us.
-func processCPU() time.Duration {
-	var ru syscall.Rusage
-	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {
-		return 0
-	}
-	tv := func(t syscall.Timeval) time.Duration {
-		return time.Duration(t.Sec)*time.Second + time.Duration(t.Usec)*time.Microsecond
-	}
-	return tv(ru.Utime) + tv(ru.Stime)
 }
 
 // sealLocked publishes the overlay as the next generation. follow says

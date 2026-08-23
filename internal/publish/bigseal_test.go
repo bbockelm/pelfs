@@ -12,7 +12,6 @@ import (
 	"runtime/pprof"
 	"strconv"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -450,19 +449,6 @@ func timedSeal(t *testing.T, label string, inner *meterStore, ov *overlay.FS, pr
 		inner.since(mark), res.Stats.Catalogs, res.Stats.CatalogsReused, res.Stats.Dirs,
 		res.Stats.SubtreesPruned, len(res.NewPacks), res.Stats.ChunksAdded)
 	return res
-}
-
-// processCPU is user+system CPU for the whole process, which is what the
-// seal-cost line a session prints reports as its CPU number.
-func processCPU() time.Duration {
-	var ru syscall.Rusage
-	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {
-		return 0
-	}
-	tv := func(t syscall.Timeval) time.Duration {
-		return time.Duration(t.Sec)*time.Second + time.Duration(t.Usec)*time.Microsecond
-	}
-	return tv(ru.Utime) + tv(ru.Stime)
 }
 
 // meterStore counts the bytes and requests a phase moves in each

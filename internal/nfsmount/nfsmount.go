@@ -3,6 +3,7 @@ package nfsmount
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -119,6 +120,20 @@ func (s *Server) Mount(mountPoint, volumeName string) error {
 	// with -t nfs. Keeping both here means Linux CI can exercise the NFS
 	// frontend even though its reason for existing is macOS without
 	// macFUSE.
+	// WINDOWS IS REFUSED HERE, not left to fail as an exec. The default
+	// below is macOS's mount_nfs and the only override is Linux's mount(8),
+	// so a Windows build used to fall through to `mount_nfs` and report
+	// `executable file not found in %PATH%` — an error about a program the
+	// user never asked for. Windows does have an NFS client (Client for
+	// NFS, `mount.exe`), but it is an optional feature, it speaks a
+	// different option vocabulary, and it has never been exercised against
+	// this server; claiming support by guessing at its flags would be
+	// worse than saying so.
+	if runtime.GOOS == "windows" {
+		return fmt.Errorf("the NFS backend cannot attach a mount on Windows: " +
+			"pelfs drives the platform's own NFS client, and the Windows one (Client for NFS) " +
+			"is an optional feature this code has never been tested against")
+	}
 	name, args := "mount_nfs", []string{"-o", strings.Join(opts, ","), "127.0.0.1:/", mountPoint}
 	if runtime.GOOS == "linux" {
 		linuxOpts := []string{
@@ -140,6 +155,13 @@ func (s *Server) Mount(mountPoint, volumeName string) error {
 // Unmount detaches the filesystem, escalating to forced unmount after a few
 // polite attempts.
 func Unmount(mountPoint string) error {
+	// Nothing was ever mounted (Mount refuses on Windows), so there is
+	// nothing to detach — and the escalation below would have run `umount`
+	// and then macOS's `diskutil`, because the only platform test in it is
+	// for Linux.
+	if runtime.GOOS == "windows" {
+		return errors.New("the NFS backend cannot unmount on Windows: nothing it could have mounted exists")
+	}
 	var lastErr error
 	for attempt := 0; attempt < 6; attempt++ {
 		var cmds [][]string

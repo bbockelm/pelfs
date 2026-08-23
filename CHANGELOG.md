@@ -2,6 +2,55 @@
 
 ## Unreleased
 
+### Windows builds (`GOOS=windows`), and the port that made them possible
+
+`CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build ./...` now succeeds, a CI
+job holds it there, and release tags carry `windows/amd64` and
+`windows/arm64` binaries. This is the groundwork for a Windows frontend —
+**it is not one**. `pelfs mount` and `pelfs shell` do not work on Windows and
+say so; everything that does not attach a filesystem does.
+
+The platform-specific code is now split behind build tags rather than
+assumed:
+
+- **`internal/mmapfile` is new**: one package for every memory mapping in
+  the tree. There are four, and two of them (`internal/memtable`'s ring and
+  buffer) were not in the original survey. Windows mappings are stricter
+  than `mmap` in three ways that all four callers depend on — a zero-length
+  file cannot be mapped, a mapping cannot survive a resize of its file, and
+  a live mapping PINS the file against deletion — so each call site now
+  states which of the three it relies on, and `Table.Close`,
+  `Buffer.Remove` and `Ring.Remove` unmap before they unlink. `Ring.Remove`
+  did not close its file at all before; it does now.
+- **Process liveness**, which the scratch sweeper uses to decide whether to
+  DELETE a directory, has a real Windows implementation:
+  `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` plus
+  `GetExitCodeProcess`. Both calls are needed — a Windows process object
+  outlives the process while any handle to it is held, so an OpenProcess
+  that succeeds proves nothing — and the answer is deliberately lopsided:
+  only a positive "no such process" reports dead, and access-denied or any
+  unrecognised failure reports alive.
+- **The FUSE frontend is excluded, not stubbed.** `internal/rawfuse` carries
+  `//go:build !windows` (go-fuse is the Unix kernel protocol expressed in Go
+  types and cannot be ported), so a Windows build does not contain it, and
+  `pelfs mount --backend fuse` there fails during argument handling with a
+  sentence naming the missing dependency rather than the platform.
+- **The NFS frontend cross-compiles unchanged** — our go-nfs fork,
+  `internal/vfsbilly` and `internal/nfsmount` are pure Go — and is kept in
+  the Windows build. `nfsmount.Mount` and `Unmount` now refuse there instead
+  of falling through to the macOS branch and reporting `mount_nfs:
+  executable file not found in %PATH%`, then reaching for `diskutil`.
+- **`pelfs umount` refuses on Windows** rather than pretending. The Unix
+  path sends `SIGTERM` because the exit path seals the overlay into the next
+  generation; Windows offers a detached process only `TerminateProcess`,
+  which would strand the session unsealed while telling the user it had been
+  published.
+
+`internal/rotate`'s `syncDir`, the `errno` comparisons in
+`internal/nfsmount/diag.go`, and everything that unlinks a file another
+handle still holds open remain Unix-shaped, and are listed rather than
+fixed. See `docs/TODO.md` (winport-agent) for the full audit.
+
 ### `pelfs mount-gen` is an apptainer `--fusemount` driver
 
 A job can now mount a pelfs volume **inside its own container**, with no

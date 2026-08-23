@@ -20,7 +20,7 @@ import (
 	"hash/crc32"
 	"os"
 
-	"golang.org/x/sys/unix"
+	"github.com/bbockelm/pelfs/internal/mmapfile"
 )
 
 // recordMagic marks the start of a buffer record. A freshly created
@@ -76,7 +76,11 @@ type Record struct {
 // once written, which is the whole reason resolution can hand out a
 // source under a lock and read outside it.
 type Buffer struct {
-	f    *os.File
+	f *os.File
+	// mm is the mapping and data its bytes. See internal/mmapfile for the
+	// three ways Windows mappings are stricter than mmap; this file
+	// depends on all three (CreateBuffer, OpenBuffer, Remove).
+	mm   *mmapfile.Mapping
 	data []byte
 	end  int
 	seq  uint64
@@ -99,12 +103,18 @@ func CreateBuffer(path string, size int, seq uint64) (*Buffer, error) {
 		f.Close() //nolint:errcheck
 		return nil, err
 	}
-	data, err := unix.Mmap(int(f.Fd()), 0, size, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
+	// The Truncate above gave the file its FINAL size, which is what makes
+	// this mappable on Windows: a mapping there cannot outlive a resize,
+	// and a zero-length file cannot be mapped at all (size >= recordHeader
+	// is checked above). The comment on this function already says the
+	// file is preallocated so appends never extend it; on Windows that is
+	// not an optimization, it is the only way this works.
+	mm, err := mmapfile.Map(f, size, mmapfile.ReadWrite)
 	if err != nil {
 		f.Close() //nolint:errcheck
-		return nil, fmt.Errorf("memtable: mmap %s: %w", path, err)
+		return nil, fmt.Errorf("memtable: %s: %w", path, err)
 	}
-	return &Buffer{f: f, data: data, seq: seq}, nil
+	return &Buffer{f: f, mm: mm, data: mm.Bytes(), seq: seq}, nil
 }
 
 // OpenBuffer maps an existing buffer file and scans it, returning every
@@ -125,12 +135,15 @@ func OpenBuffer(path string, seq uint64) (*Buffer, []Record, error) {
 		f.Close() //nolint:errcheck
 		return nil, nil, fmt.Errorf("memtable: buffer %s is %d bytes, too small to hold a record", path, size)
 	}
-	data, err := unix.Mmap(int(f.Fd()), 0, size, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
+	// Mapped at the size the file already has and never resized, which is
+	// what Windows requires; the too-small check above also rules out the
+	// zero-length file Windows cannot map.
+	mm, err := mmapfile.Map(f, size, mmapfile.ReadWrite)
 	if err != nil {
 		f.Close() //nolint:errcheck
-		return nil, nil, fmt.Errorf("memtable: mmap %s: %w", path, err)
+		return nil, nil, fmt.Errorf("memtable: %s: %w", path, err)
 	}
-	b := &Buffer{f: f, data: data, seq: seq}
+	b := &Buffer{f: f, mm: mm, data: mm.Bytes(), seq: seq}
 	recs := b.scan()
 	return b, recs, nil
 }
@@ -234,7 +247,7 @@ func (b *Buffer) At(off, length int) []byte {
 // Sync flushes the mapping. The design leaves open whether to call this
 // at file-close boundaries; nothing in this package calls it on its own,
 // so the cost stays measurable rather than assumed.
-func (b *Buffer) Sync() error { return unix.Msync(b.data, unix.MS_SYNC) }
+func (b *Buffer) Sync() error { return b.mm.Flush() }
 
 // Path returns the buffer file's path.
 func (b *Buffer) Path() string { return b.f.Name() }
@@ -245,7 +258,7 @@ func (b *Buffer) Close() error {
 	if b.data == nil {
 		return nil
 	}
-	err := unix.Munmap(b.data)
+	err := b.mm.Close()
 	b.data = nil
 	if cerr := b.f.Close(); err == nil {
 		err = cerr
@@ -255,6 +268,10 @@ func (b *Buffer) Close() error {
 
 // Remove closes the buffer and deletes its file. This is how a flushed
 // table's space is reclaimed.
+//
+// CLOSE FIRST, and not only for tidiness: on Windows a live mapping pins
+// its backing file, so a remove that ran before the unmap would fail with
+// a sharing violation and leak the buffer file.
 func (b *Buffer) Remove() error {
 	path := b.f.Name()
 	err := b.Close()

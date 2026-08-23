@@ -12,7 +12,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
-	"syscall"
 	"time"
 
 	"github.com/bbockelm/pelfs/internal/control"
@@ -173,7 +172,7 @@ func cmdMount(args []string) int {
 	child.Stdin = nil
 	child.Stdout = logFile
 	child.Stderr = logFile
-	child.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	child.SysProcAttr = daemonSysProcAttr()
 	if err := child.Start(); err != nil {
 		return exitErr(fmt.Errorf("spawn daemon: %w", err))
 	}
@@ -220,8 +219,8 @@ func cmdUmount(args []string) int {
 			_ = os.Remove(e.path)
 			return 0
 		}
-		if err := syscall.Kill(e.info.PID, syscall.SIGTERM); err != nil {
-			return exitErr(fmt.Errorf("signal pid %d: %w", e.info.PID, err))
+		if err := signalStop(e.info.PID); err != nil {
+			return exitErr(err)
 		}
 		ui.Info("waiting for {mountpoint} to unmount and flush...", "mountpoint", e.info.MountPoint)
 		// A umount that hangs is a seal that is still uploading, and the
@@ -367,11 +366,4 @@ func readMountInfo(path string) (*mountInfo, error) {
 		return nil, err
 	}
 	return &info, nil
-}
-
-func pidAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	return syscall.Kill(pid, 0) == nil
 }

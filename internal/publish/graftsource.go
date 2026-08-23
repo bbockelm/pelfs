@@ -45,9 +45,14 @@ type GraftSource struct {
 	// mount is the path the tree is grafted at, cleaned and absolute.
 	mount string
 	nodes map[uint64]*node
-	// content is the chunkref list per grafted file inode; body holds the
+	// content is the spidered file per grafted inode; body holds the
 	// whole file for the small ones the spider kept (graft.InlineKeep).
-	content map[uint64][]catalog.ChunkRef
+	//
+	// The chunkref rows are built from it ON DEMAND rather than held: a
+	// spider result carries block identities (32 bytes each) and publish
+	// asks for one file's rows at a time, so materializing every row up
+	// front would triple the resident cost of a large graft for no gain.
+	content map[uint64]*graft.File
 	body    map[uint64][]byte
 	root    uint64
 	next    uint64
@@ -114,7 +119,7 @@ func NewGraftSource(o GraftSourceOptions) (*GraftSource, error) {
 	s := &GraftSource{
 		mount:   mount,
 		nodes:   make(map[uint64]*node),
-		content: make(map[uint64][]catalog.ChunkRef),
+		content: make(map[uint64]*graft.File),
 		body:    make(map[uint64][]byte),
 		root:    1,
 		next:    2,
@@ -138,7 +143,8 @@ func NewGraftSource(o GraftSourceOptions) (*GraftSource, error) {
 	if _, err := s.mkdirAll(dirs, mount); err != nil {
 		return nil, err
 	}
-	for _, f := range o.Result.Files {
+	for i := range o.Result.Files {
+		f := &o.Result.Files[i]
 		full := path.Join(mount, strings.TrimPrefix(f.Path, "/"))
 		parent, err := ensure(path.Dir(full))
 		if err != nil {
@@ -161,7 +167,7 @@ func NewGraftSource(o GraftSourceOptions) (*GraftSource, error) {
 		if f.Body != nil {
 			s.body[ino] = f.Body
 		} else {
-			s.content[ino] = f.Refs
+			s.content[ino] = f
 		}
 		pn := s.nodes[parent]
 		pn.children = append(pn.children, SrcEntry{Name: path.Base(full), Node: n})
@@ -279,11 +285,11 @@ func (s *GraftSource) ProvidedContent(_ context.Context, ino uint64) (genfs.Cont
 		// them out of the dedup set and wrongly force a copy-up on write.
 		return genfs.Content{Length: nd.n.Length, Inline: b}, true, nil
 	}
-	refs, ok := s.content[ino]
+	f, ok := s.content[ino]
 	if !ok {
 		return genfs.Content{}, false, nil
 	}
-	return genfs.Content{Length: nd.n.Length, Refs: refs, External: true}, true, nil
+	return genfs.Content{Length: nd.n.Length, Refs: f.Refs(), External: true}, true, nil
 }
 
 // ProvidedPacks is empty, and that is the answer rather than a stub: a

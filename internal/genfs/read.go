@@ -200,7 +200,11 @@ func (fs *FS) ContentOf(ctx context.Context, ino uint64) (Content, error) {
 			// option. Records whose location the next generation does not
 			// state are exactly the hazard this check exists to prevent;
 			// grafts move the boundary of "listed", they do not remove it.
-			if fs.graftHolds(r.Identity) {
+			held, err := fs.graftHolds(ctx, r.Identity)
+			if err != nil {
+				return Content{}, fmt.Errorf("genfs: inode %d references chunk %s: %w", ino, idHex, err)
+			}
+			if held {
 				out.External = true
 			} else if _, ok := fs.packIndex.lookup(idHex); !ok {
 				return Content{}, fmt.Errorf("genfs: inode %d references chunk %s, present in no listed pack", ino, idHex)
@@ -336,7 +340,15 @@ func (fs *FS) readChunkAt(ctx context.Context, r *catalog.ChunkRef, chunkOff int
 	// every pack — so the other order would sweep a whole generation's
 	// trailers before every grafted read.
 	if fs.grafts != nil {
-		if e, gl, ok := fs.grafts.locate(r.Identity); ok {
+		e, gl, ok, err := fs.grafts.locate(ctx, r.Identity)
+		if err != nil {
+			// NOT a fall-through to the pack index. A graft that could
+			// not be consulted is a graft whose bytes cannot be found,
+			// and reporting "present in no listed pack" for it would
+			// name the volume as damaged for a third party's outage.
+			return fmt.Errorf("genfs: chunk %s: %w", idHex, err)
+		}
+		if ok {
 			return fs.graftChunkAt(ctx, e, gl, idHex, chunkOff, window)
 		}
 	}

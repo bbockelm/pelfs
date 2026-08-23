@@ -140,13 +140,34 @@ type GraftEntry struct {
 	// Size is the index object's length, so a reader can budget the fetch
 	// before it makes it — the role IndexRef.Size plays.
 	Size int64 `cbor:"size"`
-	// Block is the fixed block size, Blocks how many the index holds, and
-	// Bytes the logical size of the grafted tree. The last two are
-	// reportable facts (`pelfs graft --list`, fsck) that cost nothing to
-	// record and a whole index fetch to recompute.
-	Block  int64  `cbor:"block"`
-	Blocks uint64 `cbor:"blocks"`
-	Bytes  int64  `cbor:"bytes"`
+	// Block is the BASE block size and BlockMax the ceiling; an object
+	// larger than Block*BlocksPerObject is cut at a power-of-two multiple
+	// of Block, up to BlockMax (internal/graft, blocks.go).
+	//
+	// The three of them are the RULE, not a description, and they are
+	// recorded because a refresh that cut differently would move every
+	// identity in the graft and be a new graft rather than a refresh.
+	// Per-object block sizes needed no change to the index format — a
+	// record already carries a per-block length, because the last block
+	// of every object is short — but the rule has nowhere else to live.
+	//
+	// A generation written before these existed reads as BlockMax == 0
+	// and BlocksPerObject == 0, which internal/graft interprets as "one
+	// global size", exactly what such a generation was cut with.
+	Block           int64  `cbor:"block"`
+	BlockMax        int64  `cbor:"block_max,omitempty"`
+	BlocksPerObject uint32 `cbor:"blocks_per_object,omitempty"`
+	// Blocks is how many blocks the index holds and Bytes the logical
+	// size of the grafted tree; Files and Objects how many files the
+	// graft serves and how many source objects they live in. All four are
+	// reportable facts (`pelfs graft --list`, fsck, `--prefetch`) that
+	// cost nothing to record and an index fetch to recompute — and
+	// Bytes is what a prefetch budget has to size a graft from, since a
+	// graft has no pack sizes.
+	Blocks  uint64 `cbor:"blocks"`
+	Bytes   int64  `cbor:"bytes"`
+	Files   uint64 `cbor:"files,omitempty"`
+	Objects uint64 `cbor:"objects,omitempty"`
 }
 
 func (g GraftEntry) RefName() string { return g.Path }

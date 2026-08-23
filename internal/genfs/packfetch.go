@@ -173,7 +173,12 @@ func (fs *FS) fillChunks(ctx context.Context, refs []catalog.ChunkRef) {
 		// are contiguous in it, more reliably than pack entries are) and is
 		// on the design doc's ranked work.
 		if fs.grafts != nil {
-			if _, _, ok := fs.grafts.locate(r.Identity); ok {
+			// The error is dropped rather than propagated, and that is
+			// right HERE and nowhere else: this whole function is a
+			// best-effort coalescer, and an index it could not consult
+			// simply means this chunk is not coalesced. The single-chunk
+			// path asks again and reports the failure in context.
+			if _, _, ok, err := fs.grafts.locate(ctx, r.Identity); ok || err != nil {
 				continue
 			}
 		}

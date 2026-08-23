@@ -2,9 +2,9 @@ package genfs
 
 import (
 	"context"
-	"encoding/hex"
 	"fmt"
 	"io"
+	"sync"
 	"sync/atomic"
 
 	"github.com/bbockelm/pelfs/internal/chunkid"
@@ -52,11 +52,40 @@ type graftTable struct {
 	// openGrafts, so there is no mode to select here.
 	verify chunkid.Hasher
 	stats  graftCounters
+
+	// memo remembers what an index lookup answered, because at scale a
+	// lookup is a REQUEST rather than a map read (internal/graft/remote.go
+	// reads a large index by window). Two callers ask about the same
+	// identity in quick succession — fillChunks probes it to decide
+	// whether to coalesce, then readChunkAt resolves it — and without a
+	// memo that is two round trips for one block.
+	//
+	// A negative answer is memoized too: "no graft holds this" is what
+	// every packed chunk read asks, and re-asking the network for it
+	// would make a graft's presence a tax on the rest of the volume.
+	memoMu sync.Mutex
+	memo   map[string]graftMemo
 }
+
+// graftMemo is one remembered lookup. hit false means no graft holds the
+// identity; an ERROR is never memoized, because "the index was
+// unreachable for a moment" must not become this mount's permanent answer.
+type graftMemo struct {
+	e   *graftEntry
+	loc graft.Loc
+	hit bool
+}
+
+// graftMemoMax bounds the memo. It is a cap and not an LRU: the working
+// set of a mount is what it is re-reading, and dropping the whole table
+// when it grows past the cap costs one lookup per identity afterwards
+// rather than the bookkeeping an eviction order would need on a path that
+// is already one network request deep.
+const graftMemoMax = 1 << 16
 
 type graftEntry struct {
 	sb    superblock.GraftEntry
-	index *graft.Index
+	index *graft.Reader
 	// store is the transport for this graft's SOURCE prefix, built by the
 	// caller's GraftOpener. It is a different store from fs.inner: a graft
 	// is a different prefix, and often a different federation.
@@ -101,9 +130,7 @@ func (fs *FS) GraftStats() GraftStats {
 	g := fs.grafts
 	var blocks int
 	for i := range g.entries {
-		if g.entries[i].index != nil {
-			blocks += g.entries[i].index.Len()
-		}
+		blocks += int(g.entries[i].sb.Blocks)
 	}
 	return GraftStats{
 		Grafts:   len(g.entries),
@@ -169,10 +196,16 @@ func (fs *FS) openGrafts(ctx context.Context, o Options) error {
 		return fmt.Errorf("genfs: this generation names %d graft(s) but no graft opener was "+
 			"supplied, so no external source may be read", len(o.SB.Grafts))
 	}
-	t := &graftTable{verify: chunkid.NewHasher(nil)}
+	t := &graftTable{verify: chunkid.NewHasher(nil), memo: make(map[string]graftMemo)}
 	for _, g := range o.SB.Grafts {
-		ix, err := graft.Fetch(ctx, o.Inner, g)
-		if err != nil {
+		// Loaded here rather than lazily, deliberately. A graft is not a
+		// hint: it is the only record of where its bytes live, so a mount
+		// that deferred the failure would look healthy and answer an
+		// error for every file under the graft. What is loaded is the
+		// RESIDENT part — for an index too large to hold, the header, the
+		// source-object names and the samples, not the table.
+		ix := graft.OpenReader(o.Inner, g)
+		if err := ix.Load(ctx); err != nil {
 			return fmt.Errorf("genfs: %w", err)
 		}
 		// The mount, not the generation, decides which sources it is
@@ -202,30 +235,63 @@ func (fs *FS) closeGrafts() {
 	}
 }
 
-// graftLocate finds which graft, if any, holds an identity.
-func (t *graftTable) locate(id []byte) (*graftEntry, graft.Loc, bool) {
+// locate finds which graft, if any, holds an identity.
+//
+// THE THREE ANSWERS ARE DISTINCT and callers must keep them so: found,
+// held by no graft (ok false, err nil), and could not ask (err). The
+// third may never be collapsed into the second — a grafted chunkref
+// resolves in no pack by construction, so a caller that shrugged at an
+// unreachable index would go on to report "present in no listed pack",
+// a sentence that means DAMAGE everywhere else in this system.
+func (t *graftTable) locate(ctx context.Context, id []byte) (*graftEntry, graft.Loc, bool, error) {
+	key := string(id)
+	t.memoMu.Lock()
+	m, seen := t.memo[key]
+	t.memoMu.Unlock()
+	if seen {
+		return m.e, m.loc, m.hit, nil
+	}
 	for i := range t.entries {
 		e := &t.entries[i]
 		if e.index == nil {
 			continue
 		}
-		if l, ok := e.index.Lookup(id); ok {
-			return e, l, true
+		l, ok, err := e.index.Lookup(ctx, id)
+		if err != nil {
+			return nil, graft.Loc{}, false, err
+		}
+		if ok {
+			t.remember(key, graftMemo{e: e, loc: l, hit: true})
+			return e, l, true, nil
 		}
 	}
-	return nil, graft.Loc{}, false
+	t.remember(key, graftMemo{})
+	return nil, graft.Loc{}, false, nil
+}
+
+func (t *graftTable) remember(key string, m graftMemo) {
+	t.memoMu.Lock()
+	defer t.memoMu.Unlock()
+	if len(t.memo) >= graftMemoMax {
+		t.memo = make(map[string]graftMemo, graftMemoMax/4)
+	}
+	t.memo[key] = m
 }
 
 // graftHolds reports whether the graft table can resolve an identity. It
 // is what makes ContentOf's absence check graft-aware: an identity in no
 // pack but in a graft is located, not missing.
-func (fs *FS) graftHolds(id []byte) bool {
+func (fs *FS) graftHolds(ctx context.Context, id []byte) (bool, error) {
 	if fs.grafts == nil {
-		return false
+		return false, nil
 	}
-	_, _, ok := fs.grafts.locate(id)
-	return ok
+	_, _, ok, err := fs.grafts.locate(ctx, id)
+	return ok, err
 }
+
+// GraftEntries reports the graft roots with the bytes each covers, for
+// callers deciding what a prefetch can and cannot promise.
+func (fs *FS) graftEntries() []superblock.GraftEntry { return fs.Grafts() }
 
 // readGraftChunk fetches and verifies one grafted block.
 //
@@ -313,21 +379,12 @@ func (fs *FS) graftChunkAt(ctx context.Context, e *graftEntry, l graft.Loc, idHe
 	return nil
 }
 
-// graftIdentities reports every identity the grafts hold, for the callers
-// that need to know an identity is external rather than merely absent:
-// publish's dedup exclusion and fsck's classification.
-func (fs *FS) graftIdentities(fn func(idHex string)) {
-	if fs.grafts == nil {
-		return
-	}
-	for i := range fs.grafts.entries {
-		ix := fs.grafts.entries[i].index
-		if ix == nil {
-			continue
-		}
-		for j := 0; j < ix.Len(); j++ {
-			// packidx exposes At on the table; the index wraps it.
-			fn(hex.EncodeToString(ix.KeyAt(j)))
-		}
-	}
-}
+// Enumerating every identity a graft holds is deliberately NOT offered.
+//
+// The spike had a graftIdentities helper for "publish's dedup exclusion
+// and fsck's classification", and nothing called it: publish learns an
+// identity is external from Content.External, which is a property of the
+// record rather than a question for the table. A deep fsck WILL want to
+// walk a graft's blocks, and the shape that suits it is a sequential
+// stream of the index object, not a resident set — at 10.5 million blocks
+// the set is 336 MB and the stream is a few ranged reads.

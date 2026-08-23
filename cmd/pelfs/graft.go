@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -16,30 +19,41 @@ import (
 	"github.com/bbockelm/pelfs/internal/ui"
 )
 
-// `pelfs graft <volume> <path> <source>` — SPIKE.
+// `pelfs graft <volume> <path> <source>`.
 //
-// Spiders a foreign Pelican prefix, records a fixed-size block digest for
-// every byte of it, and publishes a generation that serves the tree at
-// <path> with no copy of the data under the volume's own prefix.
+// Spiders a foreign Pelican prefix, records a block digest for every byte
+// of it, and publishes a generation that serves the tree at <path> with
+// no copy of the data under the volume's own prefix.
 //
-// What is proven and what is not is in docs/design-graft.md. The two
-// limits a user would hit first: the graft replaces the tree rather than
-// being spliced into it (so this is `pelfs init` then `pelfs graft`, not
-// a graft into a populated volume), and `--refresh`, `--remove` and
-// `--list` are argued in the doc but not implemented here.
+// What is proven and what is not is in docs/design-graft.md. The limit a
+// user would hit first: the graft REPLACES the tree rather than being
+// spliced into it, so this is `pelfs init` then `pelfs graft`, not a
+// graft into a populated volume.
 
 func cmdGraft(args []string) int {
 	var (
 		pubkeyHex string
 		block     int64
+		blockMax  int64
+		perObject int
 		branch    string
 		list      bool
+		refresh   bool
+		conc      int
+		span      int64
+		restart   bool
 	)
 	o, pos, err := parseArgs("graft", args, 1, 3, func(fs *flag.FlagSet, o *cmdOpts) {
 		fs.StringVar(&pubkeyHex, "volume-pubkey", "", "hex Ed25519 volume key to trust (default: pin on first use)")
-		fs.Int64Var(&block, "block", graft.DefaultBlock, "fixed block size the spider cuts and digests at")
+		fs.Int64Var(&block, "block", graft.DefaultBlock, "base (smallest) block the spider cuts and digests at")
+		fs.Int64Var(&blockMax, "block-max", graft.DefaultBlockMax, "largest block the per-object ladder will climb to; equal to --block disables the ladder")
+		fs.IntVar(&perObject, "blocks-per-object", graft.DefaultBlocksPerObject, "blocks one object may be cut into before its block size doubles")
 		fs.StringVar(&branch, "branch", "main", "branch to seal onto")
 		fs.BoolVar(&list, "list", false, "report the grafts this volume serves and exit")
+		fs.BoolVar(&refresh, "refresh", false, "re-spider the graft already recorded at <path>, reusing its source and block rule")
+		fs.IntVar(&conc, "concurrency", 0, "ranged reads of the source in flight (default: the transfer pool)")
+		fs.Int64Var(&span, "span", graft.DefaultSpanBytes, "most bytes one ranged read of the source covers")
+		fs.BoolVar(&restart, "restart", false, "discard the checkpoint and re-read the whole source")
 	})
 	if err != nil {
 		return exitErr(err)
@@ -65,17 +79,48 @@ func cmdGraft(args []string) int {
 			return 0
 		}
 		for _, g := range head.Superblock.Grafts {
-			ui.Info("{path} <- {source} ({blocks} blocks of {block}, {bytes} bytes)",
-				"path", g.Path, "source", g.Source,
-				"blocks", g.Blocks, "block", g.Block, "bytes", g.Bytes)
+			ui.Info("{path} <- {source} ({files} files, {bytes} bytes in {blocks} blocks; "+
+				"index {index} bytes, read {mode})",
+				"path", g.Path, "source", g.Source, "files", g.Files,
+				"bytes", g.Bytes, "blocks", g.Blocks, "index", g.Size,
+				"mode", indexReadMode(g))
 		}
 		return 0
 	}
 
-	if len(pos) != 3 {
-		return exitErr(fmt.Errorf("usage: pelfs graft <volume> <path> <source-url>"))
+	policy := graft.BlockPolicy{Block: block, Max: blockMax, PerObject: perObject}
+	var mountPath, source string
+	switch {
+	case refresh:
+		// A refresh must cut IDENTICALLY or every identity moves and it is
+		// a new graft rather than a refresh, so the source and the rule
+		// come out of the recorded entry rather than off the command line.
+		if len(pos) != 2 {
+			return exitErr(fmt.Errorf("usage: pelfs graft --refresh <volume> <path>"))
+		}
+		mountPath = cleanGraftPath(pos[1])
+		var found bool
+		for _, g := range head.Superblock.Grafts {
+			if g.Path == mountPath {
+				source, policy, found = g.Source, policyOf(g), true
+			}
+		}
+		if !found {
+			return exitErr(fmt.Errorf("this generation serves no graft at %s (`pelfs graft --list %s` shows what it does serve)",
+				mountPath, pos[0]))
+		}
+		ui.Info("refreshing {path} from {source}, cut as it was cut before ({block}-{blockmax} bytes, {per} blocks per object)",
+			"path", mountPath, "source", source, "block", policy.Block,
+			"blockmax", policy.Max, "per", policy.PerObject)
+	default:
+		if len(pos) != 3 {
+			return exitErr(fmt.Errorf("usage: pelfs graft <volume> <path> <source-url>"))
+		}
+		mountPath, source = cleanGraftPath(pos[1]), pos[2]
 	}
-	mountPath, source := pos[1], pos[2]
+	if err := policy.Validate(); err != nil {
+		return exitErr(err)
+	}
 
 	// THE SECURITY DECISION, enforced at the writer as well as the reader.
 	//
@@ -114,18 +159,69 @@ func cmdGraft(args []string) int {
 			"(docs/design-graft.md, \"Encryption\")", pos[0]))
 	}
 
-	start := time.Now()
-	ui.Info("spidering {source}", "source", source)
-	res, err := graft.Spider(ctx, graft.SpiderOptions{Src: src, Block: block})
+	// THE CHECKPOINT. A graft reads every byte of the source once, which
+	// at TB scale is hours; a walk that could not survive a Ctrl-C, an
+	// eviction or a token expiring would not be usable at that size. It is
+	// also what makes a refresh cost only what CHANGED.
+	ckptPath := graft.CheckpointPath(stateDir, mountPath, source)
+	if restart {
+		if err := os.Remove(ckptPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return exitErr(err)
+		}
+	}
+	ckpt, discarded, err := graft.OpenCheckpoint(ckptPath, graft.CheckpointHeader{
+		Source: source, Mount: mountPath, Block: policy.Block, BlockMax: policy.Max,
+		PerObject: policy.PerObject, Hasher: "blake3-256",
+	})
+	if err != nil {
+		return exitErr(err)
+	}
+	defer ckpt.Close() //nolint:errcheck
+	if discarded != "" {
+		ui.Warn("starting the walk from the beginning: {why}", "why", discarded)
+	} else if n := ckpt.Resumed(); n > 0 {
+		ui.Info("resuming: {bytes} bytes of this source were already digested "+
+			"(each is re-checked against the source listing before it is trusted)",
+			"bytes", n)
+	}
+
+	spool := filepath.Join(stateDir, "graft", "spool")
+	if err := os.MkdirAll(spool, 0700); err != nil {
+		return exitErr(err)
+	}
+	defer os.RemoveAll(spool) //nolint:errcheck
+	idx, err := graft.NewWriter(spool, policy.Block)
+	if err != nil {
+		return exitErr(err)
+	}
+	defer idx.Close() //nolint:errcheck
+
+	ui.Info("spidering {source}: every byte is read ONCE to digest it, which is network you pay "+
+		"now and never again — the volume stores no copy of it", "source", source)
+	res, err := graft.Spider(ctx, graft.SpiderOptions{
+		Src: src, Index: idx, Policy: policy, Checkpoint: ckpt,
+		Concurrency: conc, SpanBytes: span,
+		Progress: reportGraftProgress,
+	})
 	if err != nil {
 		return exitErr(err)
 	}
 	if len(res.Files) == 0 {
 		return exitErr(fmt.Errorf("graft source %s holds no objects", source))
 	}
-	spidered := time.Since(start)
+	if err := ckpt.Close(); err != nil {
+		return exitErr(err)
+	}
+	ui.Info("digested {hashed} bytes in {elapsed} ({rate}/s); {resumed} bytes were already "+
+		"checkpointed and were not read again",
+		"hashed", res.BytesHashed, "elapsed", res.Elapsed.Round(time.Second),
+		"rate", int64(graft.Progress{BytesHashed: res.BytesHashed, Elapsed: res.Elapsed}.Rate()),
+		"resumed", res.BytesResumed)
 
-	entry, err := graft.Put(ctx, inner, cleanGraftPath(mountPath), source, res.Index, res.Bytes)
+	entry, err := idx.Publish(ctx, inner, graft.PublishOptions{
+		Mount: mountPath, Source: source, Policy: policy,
+		Bytes: res.Bytes, Files: len(res.Files) - res.Inlined,
+	})
 	if err != nil {
 		return exitErr(err)
 	}
@@ -178,15 +274,60 @@ func cmdGraft(args []string) int {
 			"({inlinedbytes} bytes) and are not grafted: they no longer depend on the source",
 			"inlined", res.Inlined, "keep", graft.InlineKeep, "inlinedbytes", res.InlinedBytes)
 	}
-	ui.Info("{blocks} blocks of {block} bytes digested in {spidered}; index is {index} bytes",
-		"blocks", entry.Blocks, "block", entry.Block,
-		"spidered", spidered.Round(time.Millisecond), "index", entry.Size)
+	ui.Info("{blocks} blocks across {objects} source objects; index is {index} bytes, read {mode}",
+		"blocks", entry.Blocks, "objects", entry.Objects,
+		"index", entry.Size, "mode", indexReadMode(entry))
 	// The honest sentence about what was just published, said at the one
 	// moment the person doing it is paying attention: the volume now
 	// depends on somebody else's storage staying exactly as it is.
 	ui.Info("this volume now depends on {source}; a change there fails reads under {path} "+
 		"rather than serving wrong bytes", "source", source, "path", entry.Path)
+	ui.Info("the checkpoint at {path} is kept: `pelfs graft --refresh {volume} {mount}` will "+
+		"re-read only what changed", "path", ckptPath, "volume", pos[0], "mount", entry.Path)
 	return 0
+}
+
+// reportGraftProgress is the line a person watching an hours-long walk
+// sees. The owner's standing complaint about operations that go quiet for
+// minutes is the reason it exists, and the reason it is on a TIMER rather
+// than per object: a graft of one enormous file has no per-object event
+// to hang a line on.
+func reportGraftProgress(p graft.Progress) {
+	done := p.BytesResumed + p.BytesHashed
+	pct := 0
+	if p.BytesTotal > 0 {
+		pct = int(done * 100 / p.BytesTotal)
+	}
+	ui.Info("spidering: {done}/{total} bytes ({pct}%), {objects}/{objtotal} objects, "+
+		"{blocks} blocks, {rate} bytes/s, about {eta} left",
+		"done", done, "total", p.BytesTotal, "pct", pct,
+		"objects", p.ObjectsDone, "objtotal", p.Objects, "blocks", p.Blocks,
+		"rate", int64(p.Rate()), "eta", p.ETA().Round(time.Second))
+}
+
+// policyOf recovers the block rule a recorded graft was cut with. A
+// generation written before the ladder existed carries a zero ceiling,
+// which means "one global size" — exactly what it was cut with.
+func policyOf(g superblock.GraftEntry) graft.BlockPolicy {
+	p := graft.BlockPolicy{Block: g.Block, Max: g.BlockMax, PerObject: int(g.BlocksPerObject)}
+	if p.Max == 0 {
+		p.Max = p.Block
+	}
+	if p.PerObject == 0 {
+		p.PerObject = 1 << 30 // never doubles: the pre-ladder behaviour
+	}
+	return p
+}
+
+// indexReadMode says whether a mount will hold this index or window it,
+// which is the difference between one round trip at mount and one small
+// one per distinct block read. It is a fact worth printing because it is
+// the thing that changes as a graft grows.
+func indexReadMode(g superblock.GraftEntry) string {
+	if g.Size <= 4<<20 {
+		return "whole"
+	}
+	return "by window"
 }
 
 // cleanGraftPath normalizes a graft mount path.

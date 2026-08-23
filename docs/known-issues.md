@@ -30,6 +30,12 @@ open item in `docs/TODO.md`, and **re-verified at `0c2baf0`** by
 release-agent for the v0.2.0 release. What was audited and found already
 fixed is listed at the bottom, so nobody re-files it.
 
+**Re-audited at `b037b03`** by docsync-agent, for the `pelfs browse`
+surfaces only: KI-11 and KL-11 through KL-14 were filed from that work,
+two rows were added to the table at the bottom, and the KI/KL entries that
+predate it were not re-checked (they were current at `0c2baf0` and nothing
+in `pelfs browse` touches them).
+
 Every entry below was checked against the code at `0c2baf0`: all six KI
 and all six KL entries were still true. (KL-8 was filed after that audit,
 with the `--fusemount` work; KL-10 was filed and then closed after it, and
@@ -198,6 +204,86 @@ own clock.
 **Pinned by an executable test: NO, and cannot be.** Fixing it means
 deciding whether a repack's ledger stamp is inside the injectable clock —
 a repack-semantics call.
+
+---
+
+### KI-10. `fsync` through the NFS frontend still returns success without making anything durable
+
+**Severity: medium, correctness of a promise.** Since v0.2.1 a FUSE mount's
+`Fsync`/`FsyncDir` make the session durable on local disk and return OK only
+once that holds (`internal/rawfuse/rw.go`, `overlay.FS.Sync`). An
+NFS-backed mount does not, and pelfs never gets the chance to: NFSv3 COMMIT
+is handled inside the `go-nfs` fork by `onCommit`
+(`nfs_oncommit.go`), which is a deliberate no-op — *"note this is a no-op,
+as we always push writes to the backing store"* — and writes `NFSStatusOk`
+plus the server's write verifier without consulting the filesystem at all.
+For a billy filesystem backed by real files that comment is nearly true;
+for pelfs, whose write buffer is an mmap'd ring and whose two databases run
+`synchronous=NORMAL`, it is not.
+
+So the exact shape of what is left: an application on an NFS mount that
+calls `fsync(2)`, gets success, and then loses the machine can lose those
+writes. It is the same defect the FUSE side had, one layer down and in a
+dependency.
+
+The fix is a FORK change and that is why it is filed rather than done.
+`billy.Filesystem` has no commit operation and neither does go-nfs's
+`Handler`, so there is no seam to implement: it needs either a capability
+interface `onCommit` consults (the shape `billy.CapabilityCheck` and
+`nfs.PermissionChecker` already use, so the precedent is there) or a
+`Commit` method the fork's handler calls when the filesystem offers one.
+`overlay.FS.Sync` is then the one-line body, and its coalescing makes a
+COMMIT free when FUSE or a previous COMMIT has just synced.
+
+**Pinned by an executable test: NO.** The no-op is in the dependency, so
+nothing in this repo's tests reaches it, and the observable difference is
+what survives a MACHINE crash — which no Go test on any platform this runs
+on can produce. What would pin it is a fork-side test that a COMMIT reaches
+the filesystem at all, and that belongs in the fork.
+
+### KI-11. A failed mutation in the file manager resolves to `undefined`, so a failed rename looks successful
+
+**Severity: medium, and it is the only entry here that can cost a user
+their belief about the volume.** In the browser file manager, a rename,
+move, copy, delete or folder-create that the server REFUSES is reported to
+the component as success. The user sees the new name; the volume has the
+old one.
+
+**Mechanism.** `RestDataProvider.send()` in
+`@svar-ui/filemanager-data-provider` throws on `!res.ok` and then attaches
+`.catch` **after** that throw in the promise chain, so every failure is
+swallowed and the promise resolves to `undefined`. The component treats a
+resolved promise as a completed action. This is upstream's code, not ours:
+`PelfsDataProvider` (`webui/frontend/src/api/provider.ts`) overrides
+`send()` to fix the two OTHER defects in the same method — `setHeaders()`
+never reaching the wire, and mutations shipping as `text/plain` — but it
+calls `super.send()`, so this one is untouched.
+
+**What the server does right, which is why this is a client-side entry.**
+Every refusal is a real status with a real body: 403 from `internal/fsperm`
+through `internal/vfsbilly`, 409 on a concurrent publish, 415 on a wrong
+content type, and per-id result arrays on batch operations so a batch whose
+fourth rename hit `EACCES` reports exactly that. None of it reaches the
+screen.
+
+**Not fixed yet because the honest fix is a decision, not a patch.**
+Either override the whole promise chain (a second copy of upstream's
+method, which rots on every component upgrade), or wrap the provider so
+every action's result is inspected before the component sees it, or carry
+a patch upstream. The third is the only one that does not leave pelfs
+owning a copy of somebody's method.
+
+**Meanwhile, the visible surfaces are honest:** the WebDAV endpoint and
+`curl` against `/api/v1/*` both return the real status, so a user who
+doubts a rename can check it — which is worth stating because it is the
+only workaround there is.
+
+**Pinned by an executable test: NO.** It is a defect in a JavaScript
+dependency's promise chain; the Go-side contract replay
+(`internal/webapi/contract_test.go`) asserts what the server answers, which
+is correct, and cannot observe what the component then does with it. A
+Playwright assertion on a refused rename is the test that would pin it and
+it is not written.
 
 ---
 
@@ -422,6 +508,112 @@ has not collapsed to zero. The two rows above need production chunker
 parameters and a quarter of a gigabyte, so they are recorded here rather
 than asserted; the apptainer harness reproduces the first one on every run.
 
+### KL-11. A background `pelfs mount` registers machine-globally even under `--state-dir`
+
+`--state-dir` now covers everything a **foreground** session creates —
+`pelfs shell`, `pelfs mount-gen`, `pelfs browse` create nothing outside the
+root their own flags select, including the mount record that used to be
+derived from `$XDG_STATE_HOME/pelfs` regardless of the flag. **`pelfs
+mount` is the deliberate exception**, because it detaches: its whole
+contract is that a shell finds it afterwards by prefix — `pelfs status`,
+`pelfs umount <prefix>`, `pelfs ctl <prefix> publish`, the sequence
+`scripts/mount-gate-test.sh` runs — and a reader cannot be told about a
+`--state-dir` it never saw. A live background mount that cannot be stopped
+by name is a worse bug than the one being fixed, so that one record stays
+in the machine-wide registry, like a pid file.
+
+What was fixed for it instead: **the registry no longer accumulates.** The
+retraction at exit removes the `vol-<id>` directory as well as the record
+when nothing else is in it, so a session that comes and goes leaves the
+state root exactly as it found it. Directories that already hold a volume's
+state are untouched — the removal only succeeds on an empty one.
+
+**Pinned by an executable test: YES.**
+`TestABackgroundMountRegistersMachineGlobally`
+(`cmd/pelfs/statedir_test.go`) asserts the exception itself — the record IS
+found by prefix in the default root, with no flag — so **changing it is a
+decision rather than an accident**, and the foreground half is pinned by a
+walk of two directory trees that fails on any path created outside
+`--state-dir`.
+
+### KL-12. The WebDAV adapter hides symlinked DIRECTORIES
+
+A symlink to a regular file is followed over `/dav/`, so `lib.so ->
+lib.so.1` is the file it names. A symlink to a **directory** is hidden from
+listings and counted, which is narrower than `docs/design-windows.md`'s
+"follow within the volume".
+
+**Mechanism, and why hiding is the honest answer.** Path resolution in
+`internal/vfsbilly` is component-by-component and does not traverse a
+symlinked directory component — `resolveDir` requires every component to
+BE a directory. So a followed directory link would appear in a listing as a
+collection whose own PROPFIND then failed: a folder a client can see,
+cannot open, and gets an error from. Hiding it is a smaller lie than that,
+and it is counted rather than swallowed (`vfsdav.Counts.DirectorySymlinks`),
+so a caller can say how many. Dangling links, FIFOs, sockets and device
+nodes are hidden and counted for the same reason: no client could render
+them.
+
+Not fixed because the fix is component-wise link resolution in
+`internal/vfsbilly`, which is a change to the layer every frontend shares
+rather than to this adapter. Neither can escape the volume in the meantime:
+an absolute link target is resolved against the VOLUME root
+(`vfsbilly.resolveFollow`), so there is no host path to reach.
+
+**Pinned by an executable test: YES**, for the policy and the counting
+(`internal/vfsdav/vfsdav_test.go`), which means the test **fails loudly if
+directory links are ever followed** — telling whoever implemented the
+resolution to delete this entry.
+
+### KL-13. A property set over WebDAV does not outlive the process
+
+PROPPATCH works — it has to, or `litmus`'s `props` suite collapses and
+every client that writes a scratch property gets a 403 — but the dead-
+property store is **in memory** (`internal/vfsdav/props.go`), so anything a
+client sets is gone when `pelfs browse` exits.
+
+Deliberate, for two reasons. A client's scratch properties (Cyberduck's,
+Finder's, litmus's) are worth exactly as long as the connection, and
+writing each one into the overlay would put them in a published generation
+forever. And the properties that *should* be durable are not dead
+properties at all: `Win32LastModifiedTime` and the `Win32FileAttributes`
+read-only bit are translations onto `vfsbilly.Chtimes` and `.Chmod`, which
+is `docs/design-windows.md` D6's surviving half and a separate work item.
+The consequence of that item still being open is that **mtime is not
+preserved across a WebDAV upload** (no `X-OC-Mtime` either).
+
+Keys are paths, so the store follows a rename and is dropped on a delete —
+an entry left behind under an old name would reappear on a file created
+there later, which is the one way an in-memory store can lie about the
+volume rather than merely forget.
+
+**Pinned by an executable test: YES** for the rename-follows and
+delete-drops behaviour (`internal/vfsdav`); the non-durability is a
+property of where the map lives and has nothing to assert.
+
+### KL-14. Under `--test-hooks`, the synthetic download source shadows the real one
+
+A `pelfs browse --test-hooks` session cannot mint a working download ticket
+for a real file in the volume: the synthetic source is registered **ahead
+of** the volume's (`browseServer.downloadSource`).
+
+This is the fix, not the bug, and it is recorded here so that nobody
+"corrects" it by reordering. A browser-driver run passes `--test-hooks`
+precisely to reach states the volume is not in, and a driver that had to
+create a file before it could exercise the ticket round trip would be
+testing the **upload** path instead of the ticket. Reordering reintroduces
+exactly that coupling.
+
+The blast radius is zero for users: the flag's own help text is
+`NEVER on a real volume: it lets the page be driven into states the volume
+is not in`, it is off in every real session, and the end-to-end gate
+(`make browse-gate`) runs **without** it, against the shipped binary, so
+the real source is what is actually proven.
+
+**Pinned by an executable test: YES** — the browser harness depends on the
+ordering, so a reorder fails it. What is NOT pinned is the reason, which is
+why it is written down here.
+
 ---
 
 ## `CHANGELOG.md` v0.1.0 *Known limitations*: status on main
@@ -477,6 +669,8 @@ pass does not re-file them.
 | **`fsync` over NFS makes nothing durable** (was KI-10) | **FIXED** by commit-agent, and NOT where this file said the fix was. The COMMIT no-op was real but unreachable: `onWrite` wrote the constant FILE_SYNC into the stability field of every WRITE reply, and a Linux client queues a page for commit only when the reply said UNSTABLE — so it never sent a COMMIT. Measured before the fix on this repo's own mount-gate container: `dd conv=fsync` produced 2 WRITEs and **0** COMMITs; after, 1 COMMIT. The fork (`d92cb75`, pinned in `go.mod`) now exports `nfs.Committer`, which both `onWrite` and `onCommit` consult; `internal/vfsbilly` implements it with `overlay.FS.Sync`, the same body the FUSE frontend's `Fsync` calls. Pinned by `internal/vfsbilly/commit_test.go` (a commit syncs, a repeat commit is free), `internal/nfsmount/diag_internal_test.go` (the wrapper must not over-claim the interface), the fork's own `nfs_oncommit_test.go`, and `commit_gate` in `scripts/mount-gate-test.sh`, which asserts against a real kernel NFS client that a COMMIT is SENT. |
 | **C2**, the "fsck lifts the cap" claim | **STALE** in that detail — `internal/fsck` does not touch `packIndex`. The rest of C2 survives as KI-8. |
 | **F11** dead/unwired inventory; **G4**, **G6** doc-staleness sweeps | Real work, but hygiene and prose rather than defects or limitations. They stay in `docs/TODO.md`, which is what a punchlist is for. |
+| **`golang.org/x/net` is in `go.mod` as `// indirect`** while `internal/vfsdav` imports `webdav` directly (reported by the WebDAV pass, and predicted to be "promoted by the next `go mod tidy`") | **STALE — the promotion already happened.** `go.mod`'s direct `require` block carries `golang.org/x/net v0.56.0` with **no** `// indirect` marker, at the same version it was pinned at as an indirect. `docs/design-windows.md`'s "The Go half is already compliant" was updated to say so. Nothing to file. |
+| **`internal/pelicanobj/fedstore.go`'s doc comment claimed the device flow "refuses to start when stdout is not a TTY"** (found while verifying the SSO hook; filed in `docs/TODO.md` under `webui-agent`) | **FIXED** by `d4c3767`. There is no `IsTerminal` check in pelican's `client/acquire_token.go`; the only gate is `opts.NonInteractive`, which pelfs does not set. The comment now states the correct behaviour **and why the distinction matters** — it is what lets a GUI surface the flow instead of a terminal — rather than merely deleting the wrong sentence. The same commit added `go.work`/`go.work.sum` to `.gitignore`, which `docs/design-webui.md`'s `go.mod` section asked for. |
 
 At `0c2baf0` the hostile corpus holds **no open finding**: all six entries
 in `internal/hostile/testdata/corpus/` are marker-free, i.e. each is a
@@ -508,6 +702,12 @@ COMMIT at all, which `/proc/self/mountstats` answers for free. It did not
 (zero, against a real kernel client), because the server was claiming
 FILE_SYNC for buffered writes. That is an ordinary assertion, and it is
 now `commit_gate` in `scripts/mount-gate-test.sh`.
+transaction count (KI-7), a wall clock in the wrong place (KI-9), a
+no-op in a dependency whose consequence is what survives a MACHINE crash
+(KI-10) — which is the one thing no test on any platform here can produce
+— and a swallowed rejection in a JavaScript dependency's promise chain
+(KI-11), which the corpus cannot express for the simpler reason that the
+corpus drives a filesystem and this one needs a browser.
 Both entries that needed a crash or a repack plus a look at the disk
 (KI-2, KI-3, now fixed) turned out to be expressible after all, in
 ordinary Go tests, once the question was asked in the right units: not

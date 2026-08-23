@@ -1,7 +1,13 @@
 # A Windows drive letter for pelfs: what a WebDAV export can and cannot buy
 
-Status: **researched, not built.** No pelfs code exists for this and none is
-proposed here as done. Every Windows-side claim below is either cited to
+Status: **researched; partly built, and the Windows half deliberately
+not.** The WebDAV frontend this document asked for exists — `internal/vfsdav`,
+mounted at `/dav/` by `pelfs browse` (`docs/design-webui.md`, U6) — so **D1,
+D2, D5 and D6 are DONE in a different shape than proposed**, and the
+Windows-specific items are dead or superseded. See "Ranked work items",
+where every item now carries a verdict.
+
+Everything else below is unchanged. Every Windows-side claim below is either cited to
 Microsoft's own documentation or marked as unverified with the experiment
 that would settle it — there is no Windows machine in this loop, and the
 document says so in the places where that matters. The one thing that *is*
@@ -105,13 +111,13 @@ the end.
 
 ### The Go half is already compliant
 
-`golang.org/x/net v0.56.0` is **already in the module graph** (`go.mod:116`,
-as `// indirect`), the `webdav` package is pure Go, and it is present in the
-module cache with `FileSystem`, `File`, `Dir`, `NewMemFS`, `NewMemLS`,
-`DeadPropsHolder` and `Handler`. Using it promotes an existing indirect
-requirement to direct — **no new module, no new licence, no cgo.** (`go.mod`
-is owned by another session; the change is one line and the version does not
-move.)
+`golang.org/x/net v0.56.0` was **already in the module graph** as
+`// indirect`; the `webdav` package is pure Go, with `FileSystem`, `File`,
+`Dir`, `NewMemFS`, `NewMemLS`, `DeadPropsHolder` and `Handler`. Using it
+promoted an existing indirect requirement to direct — **no new module, no
+new licence, no cgo** — and that promotion has happened:
+`golang.org/x/net v0.56.0` now sits in `go.mod`'s direct `require` block,
+without the `// indirect` marker, at the same version. Nothing moved.
 
 Measured, `scripts/webdav-litmus-docker.sh`, 2026-08-23, litmus 0.13 against
 `x/net/webdav`'s own `litmus_test_server.go` (memFS + memLS), no pelfs code:
@@ -120,7 +126,7 @@ Measured, `scripts/webdav-litmus-docker.sh`, 2026-08-23, litmus 0.13 against
 |---|---|
 | `basic` | 16/16 — **100.0%** |
 | `copymove` | 13/13 — **100.0%** |
-| `props` | 30/30 — **100.0%** |
+| `props` | 30/30 — **100.0%** — but see the note below: **29/30 is the honest ceiling** |
 | `locks` | 32/34 — 94.1% (`lock_shared`: LOCK → 501; `fail_complex_cond_put`) |
 
 Both `locks` failures are upstream and neither is on the path this design
@@ -129,6 +135,18 @@ exclusive lock to write. **That table is the ceiling for a pelfs WebDAV
 frontend and the floor a pelfs adapter must not fall below** — a new failure
 in `basic`, `copymove` or `props` after substituting the pelfs filesystem is
 the adapter's fault, and finding it costs one script run.
+
+**One correction, found when the adapter was actually measured: the `props`
+row above is not reproducible by a real server.** The example server this
+suite ran against passes `propfind_invalid2` **by hard-coding a 400**, with
+its own comment declaring the test obsolete and citing golang/go#8068. The
+test sends a body with an empty namespace declaration (`xmlns:bar=""`),
+which Go's `encoding/xml` accepts, so the **unmodified** handler answers 207
+and litmus scores it a failure. So the ceiling a pelfs adapter can hold
+without copying that special case is **`props 29/30`**, and that is what
+`scripts/webdav-adapter-litmus-docker.sh` asserts:
+`basic 16/16 · copymove 13/13 · props 29/30 · locks 32/34`. A 30/30 there
+would mean somebody added the hard-coded 400, not that the adapter improved.
 
 ---
 
@@ -280,23 +298,43 @@ Four layers, cheapest first. Three of them need no Windows at all.
 
 ## Ranked work items
 
-| | change | buys | effort | unblocks |
-|---|---|---|---|---|
-| **D1** | `internal/vfsdav`: a `webdav.FileSystem` + `File` over `internal/vfsbilly` (read-only), with `fsperm` applied as the NFS frontend applies it | the whole idea; a `webdav.Handler` that serves a pelfs volume | small — `billy.Filesystem` and `webdav.FileSystem` are nearly the same interface; `Stat`/`OpenFile`/`Readdir`/`Rename`/`RemoveAll` all exist already | everything below |
-| **D2** | `--backend webdav` in `cmd/pelfs`: bind `127.0.0.1:0`, generate a per-session digest credential, serve, and tear down with the mount | a mount that works on macOS today and can be driven by litmus | moderate; `runMountGen` already has the backend switch (`cmd/pelfs/mountgen.go:739`) and the teardown discipline | D3, D5, and the macOS second client |
-| **D3** | Windows attach/detach: `WNetAddConnection2W` / `WNetCancelConnection2W` via `mpr.dll` (`CONNECT_TEMPORARY`), password never on argv | the drive letter itself, with no admin | small, but Windows-only code with no local way to test it | the deliverable |
-| **D4** | The name-mapping layer (reserved chars, device names, trailing dot/space, case shadowing) with counters in the mount summary and `pelfs ctl stats` | a Linux-written volume that does not silently lose or overwrite files on Windows | moderate; the policy table above is the spec, and it is unit-testable with no client | trust in the view; a future write path |
-| **D5** | litmus wired into CI against the pelfs adapter (script exists) | the baseline table becomes a gate | hours | catching adapter regressions before a client does |
-| **D6** | `DeadPropsHolder` + `Win32*` properties, incl. `O_RDWR` on directories | timestamps survive; `tar`-shaped workflows work; Explorer shows truthful read-only/hidden bits | moderate | write path; anything that cares about mtime |
-| **D7** | `pelfs windows-setup` — one elevated step that raises `FileSizeLimitInBytes` and restarts `WebClient`, plus a **startup check that reads the value and names the files in the volume that exceed it** | the 68 MB SIF; and, more valuable, an honest error instead of `0x800700DF` | small | the owner's actual payload |
-| **D8** | The `windows-latest` CI job, both registry configurations | every unverified row below | moderate; it is the only place the answers exist | the confidence to call this supported |
-| **D9** | Write path: PUT/MKCOL/DELETE/MOVE/LOCK, and the mapping made lossless | a writable drive letter | real — and it wants D4 and D6 finished first | not on the critical path for the stated use case |
-| **D10** | WinFsp frontend (no cgo needed — [S16]) | real filesystem semantics: no 50 MB cap, no 1 MB directory cap, real partial reads | large: a third frontend, plus a driver install | the escape hatch if D7's admin step is unacceptable anyway |
+**Read the verdict column first.** This list was written for a drive letter
+over the Windows redirector. `docs/design-guiclients.md` then pivoted to
+SFTP-first and re-scored every item (its "What survives of D1-D10"), and
+`docs/design-webui.md` then built the WebDAV frontend on a browser-UI
+listener rather than a `--backend`. So an item can be *done*, *dead*, or
+*done in a shape this document did not propose* — and a reader who chases
+the `change` column without the verdict is chasing work that shipped or
+work that was deleted on purpose.
+
+| | change | verdict | buys | effort | unblocks |
+|---|---|---|---|---|---|
+| **D1** | `internal/vfsdav`: a `webdav.FileSystem` + `File` over `internal/vfsbilly` (read-only), with `fsperm` applied as the NFS frontend applies it | **DONE**, and read-write, not read-only — `internal/vfsdav`, mounted at `/dav/` by `pelfs browse`. "Nearly the same interface" was too cheap: `DeadPropsHolder` is mandatory, `Mkdir` and `RemoveAll` needed their own bodies (billy's `MkdirAll` answers 201 where MKCOL requires 409/405; billy's `Remove` refuses a non-empty directory), and a symlink must be followed on **OPEN** and not merely on `Stat` | the whole idea; a `webdav.Handler` that serves a pelfs volume | small — `billy.Filesystem` and `webdav.FileSystem` are nearly the same interface; `Stat`/`OpenFile`/`Readdir`/`Rename`/`RemoveAll` all exist already | everything below |
+| **D2** | `--backend webdav` in `cmd/pelfs`: bind `127.0.0.1:0`, generate a per-session digest credential, serve, and tear down with the mount | **SUPERSEDED.** There is no `--backend webdav`: the listener belongs to `pelfs browse`, which needed an HTTP server, an auth story and a durability panel anyway. The digest credential is dead too — Basic over loopback for everything, or OAuth Bearer for Cyberduck | a mount that works on macOS today and can be driven by litmus | moderate; `runMountGen` already has the backend switch (`cmd/pelfs/mountgen.go:739`) and the teardown discipline | D3, D5, and the macOS second client |
+| **D3** | Windows attach/detach: `WNetAddConnection2W` / `WNetCancelConnection2W` via `mpr.dll` (`CONNECT_TEMPORARY`), password never on argv | **DEAD**, as `docs/design-guiclients.md` already ruled. pelfs writes no Windows attach code; the drive letter comes from `rclone mount` or Mountain Duck | the drive letter itself, with no admin | small, but Windows-only code with no local way to test it | the deliverable |
+| **D4** | The name-mapping layer (reserved chars, device names, trailing dot/space, case shadowing) with counters in the mount summary and `pelfs ctl stats` | **DEAD as a requirement**, per the pivot. What shipped instead is the *counting* discipline, applied to a different hazard: `internal/vfsdav` counts the entries it cannot represent (directory symlinks, dangling links, FIFOs, sockets, devices) rather than swallowing them | a Linux-written volume that does not silently lose or overwrite files on Windows | moderate; the policy table above is the spec, and it is unit-testable with no client | trust in the view; a future write path |
+| **D5** | litmus wired into CI against the pelfs adapter (script exists) | **DONE** — `scripts/webdav-adapter-litmus-docker.sh`, at the corrected `props 29/30` ceiling | the baseline table becomes a gate | hours | catching adapter regressions before a client does |
+| **D6** | `DeadPropsHolder` + `Win32*` properties, incl. `O_RDWR` on directories | **HALF DONE, and the halves came apart.** `DeadPropsHolder` is not optional and shipped (without it every PROPPATCH is 403); it is an **in-memory** store, so a property set over WebDAV does not survive the process. The `Win32*` translations are **still open and still this document's item** — they are not dead properties at all but translations onto `Chtimes`/`Chmod` | timestamps survive; `tar`-shaped workflows work; Explorer shows truthful read-only/hidden bits | moderate | write path; anything that cares about mtime |
+| **D7** | `pelfs windows-setup` — one elevated step that raises `FileSizeLimitInBytes` and restarts `WebClient`, plus a **startup check that reads the value and names the files in the volume that exceed it** | **DEAD**, per the pivot: a 68,497,408-byte file transfers over SFTP with nothing configured | the 68 MB SIF; and, more valuable, an honest error instead of `0x800700DF` | small | the owner's actual payload |
+| **D8** | The `windows-latest` CI job, both registry configurations | **OPEN**, and now halved twice: one registry configuration (there is no registry value), and the WebDAV half is covered on Linux by litmus and three real clients. What is still unanswered is everything under "What cannot be verified without a Windows machine", plus whether `#bt=` survives Windows's URL opener (`docs/design-webui.md`) | every unverified row below | moderate; it is the only place the answers exist | the confidence to call this supported |
+| **D9** | Write path: PUT/MKCOL/DELETE/MOVE/LOCK, and the mapping made lossless | **DONE for the protocol, without the mapping.** PUT, MKCOL, DELETE, MOVE and PROPPATCH all work and are gated by litmus and by real clients; `LOCK` is `webdav.NewMemLS()` and Cyberduck does not lock. "The mapping made lossless" went with D4 | a writable drive letter | real — and it wants D4 and D6 finished first | not on the critical path for the stated use case |
+| **D10** | WinFsp frontend (no cgo needed — [S16]) | **DEAD**, per the pivot: `rclone mount` already is one | real filesystem semantics: no 50 MB cap, no 1 MB directory cap, real partial reads | large: a third frontend, plus a driver install | the escape hatch if D7's admin step is unacceptable anyway |
 
 ## Recommended minimal first milestone
 
-**A read-only WebDAV export, mounted as a drive letter, for files under
-47 MiB — D1, D2, D3, D5.** Concretely, what a person could use:
+**SUPERSEDED — do not build this.** D3 is dead, D2 was replaced by
+`pelfs browse`'s listener, and the export that shipped is read-**write**
+rather than read-only. What a person actually runs today is
+`pelfs browse [--rw] pelican://<federation>/<prefix>`, then points
+Cyberduck, Mountain Duck, rclone, WinSCP or `mount_webdav` at
+`http://127.0.0.1:PORT/dav/` — and on Windows the drive letter comes from
+`rclone mount`, free, with no registry write and no 47 MiB ceiling. The
+milestone below is kept as the record of what was proposed and why the
+pivot was worth taking.
+
+**The original proposal: a read-only WebDAV export, mounted as a drive
+letter, for files under 47 MiB — D1, D2, D3, D5.** Concretely, what a
+person could use:
 
 ```
 pelfs mount --ro --backend webdav pelican://<federation>/<prefix> W:

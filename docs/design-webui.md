@@ -1,15 +1,29 @@
 # A browser UI for pelfs: what it takes, and what it exposes
 
-Status: **verified where it could be, designed where it could not.** No
-pelfs code exists for this and none is proposed here as done. Four claims
-in the proposal were checked before anything was designed around them
-(section "The four verifications"), and **three of the four came back
-different from the assumption** — the licence, the data protocol, and the
-Cyberduck OAuth question, which turned out to be a yes. Every browser-platform claim in the threat
-model is cited to a spec, a browser's own release note, or the source of
-the library that implements it; the handful that could not be settled from
-here are collected at the end under "What could not be verified", each with
-the experiment that closes it.
+Status: **BUILT.** This began as a design written before any pelfs code
+existed. It is now a description of what shipped, reconciled against the
+tree at `b037b03` by docsync-agent. `pelfs browse` is a verb a person can
+run: `cmd/pelfs/browse.go` plus `internal/httpguard`,
+`internal/browsesession`, `internal/webapi`, `internal/vfsdav`,
+`internal/localoauth`, `internal/davprofile`, `internal/webui` and
+`webui/frontend`.
+
+**Where the implementation contradicted the design, the code won and this
+document changed.** Every such place is named once in "Where this document
+was wrong", immediately after the verdict, and then corrected in its own
+section in the document's own voice — so a reader who lands mid-document
+is never reading a plan that was overtaken. Nothing below is a proposal
+unless it says so.
+
+The four verifications that preceded the code stand, and **three of the
+four came back different from the assumption** — the licence, the data
+protocol, and the Cyberduck OAuth question, which turned out to be a yes.
+Every browser-platform claim in the threat model is still cited to a spec,
+a browser's own release note, or the source of the library that implements
+it. What "could not be verified" has shrunk a great deal: the U0 component
+probe and a container running **real Cyberduck (duck 9.5.3)** closed most
+of it. What survives is at the end, each with the experiment that closes
+it.
 
 This document is a **companion** to `docs/design-guiclients.md`, not a
 replacement. That document's verdict — export SFTP first, because it is
@@ -127,6 +141,48 @@ and `/debug/pprof` is never routable from a browser.
 
 ---
 
+## Where this document was wrong
+
+Seven implementation passes were run against this design, and each one
+reported back the places where the plan did not survive contact. This is
+the whole list in one table, so a reader who remembers the original can
+find what moved; every row is also corrected in its own section, and the
+section is where the argument lives. Nothing here is an apology for the
+design — most of it held — but a document that quietly absorbs its own
+corrections teaches the next reader to distrust all of it.
+
+| what this document said | what shipped, and why | corrected in |
+|---|---|---|
+| the threat-model table is **"fifteen assertions"** | it lists **sixteen** rows. `TestThreatModelTable` is those sixteen; `internal/httpguard` ships **39 assertions** in all | Testing, layer 1 |
+| **`Origin` absent on `/api/v1` → 403** | **wrong as written, and it would have refused every read the page makes**: a browser sends NO `Origin` on a same-origin GET. Implemented as *provenance* — a matching `Origin` **or** `Sec-Fetch-Site: same-origin` — with 403 for the request carrying neither | A1, control 3 |
+| the M1 terminal mock prints `http://127.0.0.1:49731/` | that URL has **no `#bt=` fragment**, so the page it opens has nothing to exchange and the mock's own next line ("paste that URL") is false. The full URL, fragment and all, is printed | Recommended minimal first milestone |
+| **`--no-open` is the middle ground** (A3) / **`--open`** is the flag (U3) | those contradict. Shipped: **`--open`, default off**, and the URL is printed either way | A3; U3 |
+| `phaseClock` is "what the progress stream should carry" | **it cannot.** `phaseClock` reports at the END of a seal and has no subscription. The stream carries job state and elapsed time instead | "Publish now" must be asynchronous |
+| a CSP **nonce** | must be base64**url**. `html/template` escapes `+` in an attribute to `&#43;`, so a standard-alphabet nonce works only by way of entity decoding | A5 |
+| `POST /oauth/token` on the API-minus-session surface | **cannot live there.** Cyberduck's back-channel POST sends no `Origin`/`Sec-Fetch-Site` (403 on provenance) and `application/x-www-form-urlencoded` (415 on the JSON rule). `httpguard.SurfaceToken` exists for it | The split; U7 |
+| A7 control 2: "an authenticated browser session is required", per request | **cannot be per-request.** A navigation cannot carry `X-Pelfs-Session` and the consent page runs no script. It is a per-process "is anyone signed in" gate; the weight is carried by the per-download `client_id` | A7, control 2 |
+| 2e: remember consent **per `client_id`** for the life of the process | **that reinstates the attack control 6 removes** — after one click a navigation could mint codes again. Consent is required on **every** `/authorize`; the no-re-prompt property lives on the **refresh token** | Verification 2e |
+| `Vendor` = `org.pelicanplatform.pelfs.local` | two concurrent sessions would collide on one profile identity. The `Vendor` **carries the listener port** | Verification 2f |
+| four Cyberduck behaviours "need a live Cyberduck to confirm" | **confirmed on the wire**, duck 9.5.3 (45464), 2026-08-23 | Verification 2g |
+| eleven SVAR routes, `{id}` per route | `net/http`'s `{id}` wildcard **does not match a bare `%2F`**, so `POST /api/v1/files/%2F` — create a folder at the root — 404s or falls through to the SPA. **Every id route needs an `{id...}` sibling.** Found independently by two passes | The routes, concretely |
+| the cap's numbers ride on the listing response | **they cannot.** The provider requires a bare array and drops response headers, so the numbers travel as `X-Pelfs-Listing-*` headers and as `GET /api/v1/info/{id}` | The routes, concretely |
+| `GET /files` (un-pathed) returns the whole tree, so drop it | **not droppable** — the component fetches it at boot. It means the **ROOT directory**, never the tree | Verification 3 |
+| — | opening a symlink **by its own path answers `ESTALE`**; resolve first. It bit the copy path and the download source as well as WebDAV | Verification 3; the WebDAV adapter |
+| two defects in the shipped SVAR provider | **three.** `setHeaders()` never reaches the wire; mutations ship as `text/plain` (415); and `send()`'s `.catch` sits AFTER the `!res.ok` throw, so **every failure resolves to `undefined` and a failed rename looks successful** | Verification 3 |
+| "does the component virtualize" is unknown | **it does not.** 100,000 entries measured 1,000,067 DOM nodes and **703 MB** of heap. Search is client-side over loaded data, so a capped listing is a **partial search** — and the user has to be told, in `webapi.PartialSearchNotice`'s exact words | Verification 3 |
+| seal on idle after `min(30 s, --snapshot-interval)` | **undefined at interval 0**, which a user types on purpose. Implemented as **off** | The correction: a browser CAN express seal-on-idle |
+| `sendBeacon` on `pagehide` shortens the wait | `pagehide` fires **before** the connection tears down, so comparing the two instants naively discards every beacon that worked. `idleHintLead` is the tolerance | same |
+| the reordered startup solves the prompt-before-the-page case | **it does not, on its own.** A prompt raised in the second between the browser launching and its stream attaching is caught by **SSE snapshots**, not by the ordering | The ordering problem |
+| litmus ceiling `props 30/30` | **29/30.** x/net's example server passes `propfind_invalid2` by hard-coding a 400 (citing golang/go#8068); the unmodified handler answers 207. The adapter holds the honest ceiling | Testing, layer 2 |
+| `DeadPropsHolder` is optional | **it is not** — without it every PROPPATCH is 403 | The WebDAV adapter |
+| a symlink is followed on `Stat` | it must be followed on **OPEN**. x/net sniffs 512 bytes of unknown-extension files, so a followed link vanished from its own listing | The WebDAV adapter |
+| `Mkdir` and `RemoveAll` come free from billy | **they do not.** `MkdirAll` answers 201 where MKCOL requires 409/405, and billy's `Remove` refuses a non-empty directory | The WebDAV adapter |
+| the WebDAV handler is a route in the table | **`vfsdav.New` reads write capability at CONSTRUCTION**, and the route table is built before the volume opens. The handler is built at `setReady`, behind a 503 delegator | Wiring |
+| — | `--test-hooks`'s synthetic download source sits **ahead of** the real one, so a `--test-hooks` session cannot ticket a real file. Recorded WITH the fix so nobody "fixes" it by reordering | Wiring |
+| **no `replace` in `go.mod`** | one shipped, deliberately, pinning PR 3672's head for `SetVerificationURLHandler`, with the drop condition written next to it | The `go.mod` question |
+
+---
+
 ## Architecture
 
 ```
@@ -139,20 +195,28 @@ and `/debug/pprof` is never routable from a browser.
       |                          (tcp4, random port, foreground)    |
       |                                                            |
       |  guard: Host allowlist -> net/http.CrossOriginProtection    |
-      |         -> Origin exact-match -> principal                  |
-      |         (two principals, never interchangeable)             |
+      |         -> Origin exact-match -> PROVENANCE -> principal     |
+      |         (internal/httpguard: nine named surfaces, THREE      |
+      |          principals, never interchangeable)                  |
       |                                                            |
       |  A  /               go:embed'd Vite bundle    (no secret)   |
       |     /assets/*                                              |
       |  B  /api/v1/*       first-party JSON API      X-Pelfs-      |
       |                     (SVAR provider contract)  Session: tok  |
+      |                     + /api/v1/session, /beacon: body-borne  |
       |  D  /events         SSE: SSO prompts, seal    Session: tok  |
-      |                     state, upload progress                 |
+      |                     state, publish job        (in ?s=)      |
       |  E  /d/<ticket>     ticketed download GET     ticket only   |
       |                     (no session token accepted)            |
       |                                                            |
-      |  C  /dav/*          x/net/webdav.Handler      HTTP Basic    |
+      |  C  /dav/*          x/net/webdav.Handler      Basic OR      |
+      |                     via internal/vfsdav       Bearer,       |
       |                     (external clients only)   per-client    |
+      |  F  /oauth/authorize  consent page, no script  navigation   |
+      |                       (mints nothing on GET)   + a click    |
+      |  G  /oauth/token      RFC 6749 back channel    code+PKCE    |
+      |                       (NOT the B surface's      or refresh  |
+      |                        rules -- see The split)  token      |
       +----------------------------+-------------------------------+
                                    |
                     internal/vfsbilly  (billy.Filesystem)
@@ -166,6 +230,13 @@ and `/debug/pprof` is never routable from a browser.
                                    |
                  oauth2.SetVerificationURLHandler  ---> D
 ```
+
+**F and G are one authorization server split across two surfaces**, and
+the split is not cosmetic: F is reached by a browser navigation and can
+therefore require no header of ours, while G is reached by a Java HTTP
+client that sends no browser signal at all. Putting G on B's rules — which
+this document originally did — answers 403 and 415 to every exchange
+Cyberduck attempts. See "The split".
 
 Three properties of that picture are load-bearing and worth naming.
 
@@ -182,8 +253,9 @@ exists: `webdav.FileSystem` is five methods
 `x/net@v0.56.0/webdav/file.go:40`) and `billyFS` already implements every
 one of them under a different name.
 
-**Two principals, never interchangeable.** The browser session (A, B, D)
-and the external-client credential (C) are separate secrets with separate
+**Two principals, never interchangeable — three, once downloads exist.**
+The browser session (A, B, D), the external-client credential (C, minted
+by F/G) and the download ticket (E) are separate secrets with separate
 lifetimes and separate scopes. A session token presented at `/dav/*` is
 rejected; a Basic credential presented at `/api/v1/*` is rejected. Two
 middlewares, no shared code path, and a test for each of the four
@@ -490,10 +562,21 @@ a profile that has no password field.
 **(iv) An authorization-code store.** Single-use, 60-second TTL, bound to
 the `client_id`, the exact `redirect_uri`, and the PKCE challenge.
 
-#### 2e. Consent: require one gesture, once per profile
+#### 2e. Consent: one gesture, on every authorization
 
-**Recommendation: same-session does *not* imply consent — require exactly
-one click, and remember it per `client_id`.**
+**Same-session does *not* imply consent — require exactly one click, on
+every `/authorize`.** This section originally said "and remember it per
+`client_id` for the life of the process". **That was wrong, and it was
+wrong in the direction that matters:** remembering consent at `/authorize`
+reinstates precisely the primitive control 6 exists to remove. After one
+legitimate click, a navigation the user did not make could mint codes
+again — which is the whole attack, with one extra step. So the gesture is
+required every time, and the property the "remember it" clause was
+reaching for is delivered where the client actually needs it: **the
+refresh token.** Cyberduck's `OAuth2RequestInterceptor` refreshes before
+each request goes out and never revisits `/authorize` while a refresh
+works, so a reconnect within the session does not re-prompt anyway. The
+user-visible friction is identical and the endpoint keeps its property.
 
 The argument for "no consent screen" is real: the user just downloaded this
 profile from this page, double-clicked it, and is watching. Asking again is
@@ -509,15 +592,21 @@ click Authorize on a screen that says what is being authorized". So:
 - a consent screen naming the client (`Cyberduck`), the scope
   (`read` / `read+write`), the volume, and the redirect target;
 - one click, requiring a real user gesture on the page;
-- remembered per `client_id` **for the life of the process only**, so a
-  refresh or a re-connect during the same `pelfs browse` session does not
-  re-prompt, and the next session does.
+- **required on every authorization**, never remembered at `/authorize`;
+- and, as shipped, the gesture is **structural rather than advisory**:
+  `GET /oauth/authorize` has no code path that writes a `Location` header
+  at all, the `POST` requires a 32-byte consent ticket that exists only in
+  the HTML of the consent page, and that page's CSP is `script-src 'none'`
+  — so there is no `form.submit()` available on that document to anybody,
+  including us. The claim is not "we did not write an auto-submit"; it is
+  "an auto-submit cannot execute here". `internal/localoauth`'s package
+  comment is the specification and the tests are beside it.
 
 #### 2f. The profile, concretely
 
 ```xml
 <key>Protocol</key>              <string>dav</string>
-<key>Vendor</key>                <string>org.pelicanplatform.pelfs.local</string>
+<key>Vendor</key>                <string>org.pelicanplatform.pelfs.local.49731</string>
 <key>Description</key>           <string>pelfs — pelican://…/… (this session)</string>
 <key>Default Hostname</key>      <string>127.0.0.1</string>
 <key>Default Port</key>          <integer>49731</integer>
@@ -533,6 +622,18 @@ click Authorize on a screen that says what is being authorized". So:
 <key>Username Configurable</key> <false/>
 ```
 
+**The `Vendor` carries the port, and that is a correction to what this
+section first said.** A bare `org.pelicanplatform.pelfs.local` is a single
+profile identity, and Cyberduck registers profiles by vendor — so two
+`pelfs browse` sessions on the same machine would collide, the second
+profile silently taking over the first's bookmarks and its OAuth
+endpoints, which point at a port the second session does not own.
+`davprofile.VendorPrefix` is the stem and the listener's port is appended
+(`internal/davprofile/davprofile.go`, `Params.vendor`); the generated
+`.duck` bookmark's `Provider` names the same string, which is what makes
+the bookmark resolve to the OAuth-configured profile rather than the
+built-in `dav`.
+
 Note what is **not** there: `Authorization` (omitted deliberately, 2b),
 `OAuth PKCE` (omitted so the parent's `true` applies), and any secret other
 than the `client_id` — which is itself minted per download, so possessing
@@ -542,19 +643,43 @@ Installation is by double-click, or *Preferences → Profiles*; the same
 mechanism and the same core serve **Mountain Duck**, whose only difference
 is its handler scheme — which the loopback redirect sidesteps entirely.
 
-#### 2g. What needs a live Cyberduck, and the contingency
+#### 2g. What a live Cyberduck confirmed, and the contingency
 
-**Needs a live Cyberduck ≥ 9.1.3 to confirm** (all four are in "What could
-not be verified"): that the loopback provider is selected for this redirect
-URI shape; that an explicit port is required; that a `dav` profile with
-`Password Configurable = false` and OAuth keys presents no password prompt;
-and that `duck`, the CLI, can complete the loopback flow headlessly — its
-custom-scheme flow is documented broken on headless Linux and the tracking
-issue is open [W15]. The one public report of somebody trying WebDAV+OAuth
-says the dialog never appeared [W9], on a profile with a **blank**
-`OAuth Client ID` — which by `isOAuthConfigurable()` means OAuth was never
-enabled at all, so it is more likely a misconfiguration than a defect. That
-is a hypothesis, not a finding.
+**This subsection used to be a list of four things that needed a live
+Cyberduck. They were run.** `scripts/oauth-cyberduck-docker.sh` drives
+**real Cyberduck** — `duck` is the same protocol stack as the desktop app
+and Mountain Duck: the same `DAVSession`, the same
+`OAuth2RequestInterceptor`, the same
+`BrowserOAuth2AuthorizationCodeProvider` — against a live pelfs
+authorization server, with `curl` playing the human at the consent screen.
+Measured 2026-08-23, **duck 9.5.3 (45464)**, curl 8.14.1,
+`debian:stable-slim`, aarch64: **22 checks, 0 failing**, the run itself
+`--network none`. So the following move from *read out of the source* to
+**observed on the wire**:
+
+| claim, formerly unverified | what was observed |
+|---|---|
+| a **non-blank `OAuth Client ID` is the switch** | the session went straight to "Start new OAuth flow" with credentials `user='anonymous', password=''` — no password prompt, no password field, nothing typed. `Password Configurable = false` plus OAuth keys does suppress the prompt (item 5a, closed) |
+| **PKCE `S256` is sent unprompted** | the URL Cyberduck built carries `code_challenge_method=S256`, so *requiring* it costs the primary client nothing |
+| the **loopback provider is selected** for this redirect shape | `Evaluate redirect URI http://127.0.0.1:52001/pelfs/oauth/callback`, then `Started OAuth callback server … Await callback` |
+| the **`redirect_uri` is echoed verbatim** | byte for byte the profile's string, which is what makes an exact-string allowlist workable rather than aspirational |
+| a **read-only token answers 403, not 401** | which matters: a 401 sends a client with no password field back looking for a password |
+| `duck --profile <file>` registers a generated profile | `Register profile Profile{parent=dav, vendor=org.pelicanplatform.pelfs.local.9997}` — and note the port in the vendor (2f) |
+| `Scopes` as a plist `<array>` | arrives as a space-delimited `scope` parameter |
+| **`duck` can complete the flow headlessly** | it does not need a browser at all: it prints the authorization URL and waits on its own loopback listener. The custom-scheme flow that is documented broken on headless Linux [W15] is not this path |
+
+Two of the design's refusals were exercised in the same run and are also
+observations rather than intentions: a callback URL off by one port answers
+**400**, an unknown `client_id` answers **400**, an authorization with no
+`S256` challenge answers **400**, a `GET` of `/authorize` emits **no
+`Location`**, and a refused Bearer is **not** offered `WWW-Authenticate:
+Basic` (item 5b, closed — the challenge does have to be narrowed).
+
+The one public report of somebody trying WebDAV+OAuth says the dialog never
+appeared [W9], on a profile with a **blank** `OAuth Client ID` — which by
+`isOAuthConfigurable()` means OAuth was never enabled at all. That remains
+a hypothesis about somebody else's configuration, and it is consistent with
+everything above.
 
 **Contingency, one paragraph.** If the flow cannot be made to work, the
 `/dav/*` endpoint keeps its HTTP Basic path — a per-client credential
@@ -613,33 +738,125 @@ default. The *route contract* is a protocol, and reimplementing a protocol
 from its observable behaviour is exactly what pelfs already does for NFSv3
 and would do for WebDAV. Read it, cite it, write our own.
 
-**The two questions this verification did NOT answer, and they decide
-whether the component is usable on a pelfs volume at all.** Both are
-listed in "What could not be verified" with the experiment; they are named
-here because they are the highest-risk unknowns in the whole design:
+**The two questions this verification could not answer decided whether
+the component was usable on a pelfs volume at all.** They were the
+highest-risk unknowns in the design and they were closed by the U0 probe —
+the real component, in a real browser, against a logging stub
+(`webui/frontend/probe`, measurements in
+`internal/webui/testdata/svar-contract/u0-measurements.json`). Both
+answers changed the code.
 
-1. **Does the component load directories lazily?** `GET /files` with no
-   id returns the entire tree. A pelfs volume's scale is stated in this
-   repo's own CI as 62,500 files proven end-to-end (`CHANGELOG`, work item
-   E7) with the format's binding constraint at millions
-   (`docs/TODO.md` A2: *"cap hit at ~6-14M files"*). A component that
-   wants the whole array up front is unusable at that scale, full stop.
-   `GET /files/{path}` exists in the contract, which is strong evidence
-   that per-directory loading is supported — but *whether the component
-   requests subdirectories on expand*, rather than expecting the caller to
-   supply everything, was not established from the docs.
-2. **Does its grid virtualize?** A directory with 100,000 entries is
-   ordinary on a pelfs volume and fatal to a non-virtualized DOM list.
-   `@svar-ui/react-grid` is the underlying table; whether it windows rows
-   is unverified.
+**1. It IS lazy — but only because the app makes it so.** Entries the
+server marks `lazy: true` make the store emit `request-data` when the
+folder is *navigated into*; the answer goes back as `provide-data`. The
+shipped `RestDataProvider` **registers no handler for `request-data` at
+all**, so without the wiring in `webui/frontend/src/api/provider.ts`
+(`wireLazyLoading`) nothing loads. Three further facts from the recording,
+each of which is a shape in the server:
 
-Until both are answered, the design's fallback is stated and cheap: the
-JSON API **caps a directory response** at a configured N (start at 5,000 —
-the number `scripts/sftp-clients-docker.sh` already proves a real client
-handles, `dir-5000: ok`), returns a truncation marker, and the UI shows
-"showing 5,000 of 412,006 — narrow the path or use the WebDAV endpoint".
-A cap the user is told about is a limitation; an unbounded response that
-hangs the tab is a defect.
+- expanding a folder in the **sidebar tree** does not load it; only
+  navigation does (`set-path` is the only action that emits `request-data`);
+- the store emits `request-data` **twice** for one navigation, which on a
+  100k-entry directory is two full listings — so `internal/webapi`
+  single-flights listings by path rather than trusting the far side's own
+  in-flight guard;
+- a folder already loaded is **never re-listed** except by the breadcrumb
+  refresh button.
+
+**And `GET /files` — the un-pathed form — is not droppable.** This section
+first read it as "returns the whole tree, so replace it". It does not: the
+component fetches it **at boot**, and it means the **ROOT directory**,
+never the tree. Dropping it would have meant a page that never renders.
+
+**2. It does NOT virtualize.** Every entry becomes DOM, in both card and
+table mode, and scrolling to the bottom of a 100,000-entry directory
+changes nothing because everything was already rendered. Measured:
+
+| entries | cards mode | table mode | DOM nodes | JS heap |
+|---|---|---|---|---|
+| 1,000 | 0.1 s | 0.07 s | 10,067 | 13 MB |
+| 5,000 | 0.3 s | 0.4 s | 50,067 | 40 MB |
+| 20,000 | 1.4 s | 2.3 s | 200,067 | 148 MB |
+| 50,000 | 6.3 s | 9.4 s | 500,067 | 364 MB |
+| 100,000 | 18.1 s | 37.5 s | 1,000,067 | **703 MB** |
+
+**So the response cap is the design, not a fallback**, and 5,000 is a
+defensible number rather than a round one: it renders in under half a
+second, and it is also the number `scripts/sftp-clients-docker.sh` already
+proves a real client handles (`dir-5000: ok`). `webapi.DefaultCap` is
+5,000.
+
+**The cap has a consequence this document did not state, and it is the one
+a user meets: search is CLIENT-SIDE over what is already loaded.** So a
+capped listing is also a **partial search** — a user who searches a capped
+folder and finds nothing will conclude the file is not there. Two facts
+have to be in the same sentence or one of them misleads, so there is
+exactly one wording of it, `webapi.PartialSearchNotice`, and every surface
+takes the sentence from there:
+
+> Showing 5,000 of 412,006 entries in this folder. Search matches only
+> what is loaded, so it is searching these 5,000 rows and not the whole
+> folder — narrow the path, or use the WebDAV endpoint to see all of it.
+
+**The numbers cannot ride on the listing body.** The provider hands
+`loadFiles` the parsed body and nothing else, so the array must BE the
+array — a `{entries: [...], total: N}` envelope is not something the
+component can consume, and it drops response headers on that path too. So
+the truth travels three ways: the array itself, `X-Pelfs-Listing-Returned`
+/ `-Total` / `-Cap` / `-Truncated` / `-Hidden` on the response, and
+`GET /api/v1/info/{id}` as JSON for the callers (the app shell, `curl`)
+that can read a body.
+
+#### Three defects in the shipped provider, not two
+
+Two were found by the U0 probe and are documented in
+`webui/frontend/probe/README.md`; the third was found later, by the pass
+that wired the component to the real API, and it is the worst of them.
+
+1. **`RestDataProvider.send()` never reads `this._customHeaders`.** It
+   overrides the base `Rest.send()` and spreads only its `customHeaders`
+   argument, so `provider.setHeaders({...})` — the documented way to
+   attach a credential — is **silently dropped**. The session token is
+   header-borne by design (there is no cookie), so this is not a nicety:
+   it is the credential.
+2. **Every mutating request goes out as `Content-Type:
+   text/plain;charset=UTF-8`**, because the provider sets no content type
+   and that is `fetch`'s default for a string body. `text/plain` is one of
+   the three types an HTML form can send, so the threat model's
+   "mutating route with `text/plain` → 415" row would reject every write
+   the file manager makes.
+3. **`send()`'s `.catch` sits after the `!res.ok` throw**, so **every
+   failure resolves to `undefined`** — and a failed rename is
+   indistinguishable, in the UI, from a successful one. This is the one
+   that costs a user data rather than a request: they see the new name,
+   the volume has the old one. It is **not** fixed by the two-line
+   override that fixes (1) and (2), because it is in the base class's
+   promise chain; it is recorded in `docs/known-issues.md` rather than
+   claimed as handled.
+
+`PelfsDataProvider` (`webui/frontend/src/api/provider.ts`) overrides
+`send()` and fixes the first two in three lines, which is why the probe ran
+before the app was written. The recording shows the difference on the wire.
+
+**And the component phones home unless told not to.** The default theme
+renders `<link rel=stylesheet
+href=https://cdn.svar.dev/fonts/wxi/wx-icons.css>` plus a preconnect, and
+the default icon callback builds `https://cdn.svar.dev/icons/…` URLs per
+file extension. Both were caught on the wire by the probe. `<Willow
+fonts={false}>` and `icons="simple"` turn them off; with both off the page
+makes **zero** requests off loopback, which `vite.config.ts`'s
+no-remote-assets plugin then keeps true. A localhost tool that fetches from
+a CDN is a localhost tool that does not work on a login node, and it is
+also a CSP the app would have had to widen.
+
+#### One more thing the volume does that the contract does not anticipate
+
+**Opening a symlink by its own path answers `ESTALE`.** The link inode is
+not a file to read; it has to be resolved first. This bit three places
+before it was understood as one thing — the WebDAV adapter's `OpenFile`,
+the JSON API's copy path, and the download source — and the fix is the
+same in all three: resolve the terminal link, take the handle on the
+resolved path, and answer `Stat` about the name the caller asked for.
 
 ### Verification 4 — the toolchain: Vite under `go generate`, bundle committed
 
@@ -1060,6 +1277,29 @@ property of the code rather than of a router:
    browser send `Origin: null` on form submissions and `no-cors` fetches
    [B27], so `null` must be treated as *absent-and-therefore-rejected* on
    authenticated routes, never as a pass.
+
+   **3b. PROVENANCE, which is what this rule actually is.** An earlier
+   draft of this document, and the test table below, said "`Origin` absent
+   on an `/api/v1` request → 403". **That is wrong as written and it would
+   have refused every read the real page makes:** current browsers send NO
+   `Origin` header on a same-origin GET, by the Fetch spec. What is
+   required is *positive evidence that the request came from our own page*,
+   and there are two acceptable forms of it — a matching `Origin`, **or**
+   `Sec-Fetch-Site: same-origin`. It is the request carrying **neither**
+   that gets the 403. That is `CrossOriginProtection`'s documented
+   fail-open gap closed, and it is set on every surface that carries a
+   credential of ours (`internal/httpguard`, `policy.provenance`).
+
+   **The consequence for anyone driving this with `curl`, because it will
+   look like a bug:** a non-browser client sends neither header, so
+   `curl http://127.0.0.1:PORT/api/v1/files` answers 403 no matter how
+   correct the session token is. It needs
+   `-H 'Sec-Fetch-Site: same-origin'` (or an exact `Origin`). This is
+   working as intended — a header a browser refuses to let a page forge is
+   exactly the signal being asked for — and it is why the surfaces that a
+   non-browser legitimately reaches (`SurfaceToken`, `SurfaceExternal`,
+   `SurfaceTicket`, `SurfaceNavigation`, `SurfaceApp`) do not carry the
+   requirement at all.
 4. **`X-Pelfs-Session: <token>` required on every `/api/v1/*` route,
    including GET.** This is the credential *and* the preflight trigger:
    by F6 a non-safelisted request header forces an `OPTIONS` preflight
@@ -1218,10 +1458,24 @@ navigation. There is simply no reason to take the F4 exposure to get it.
 
 **The paranoid variant, offered and not the default:** write the URL to a
 `0600` file in the state directory and print the path, so the token never
-enters any process's argv. That defeats one-click launch, which is the
-point of the feature. `--no-open` is the middle ground: print the URL, let
-the user paste it. The token is then in their clipboard and shell but never
-in argv.
+enters any process's argv. That defeats one-click launch.
+
+**The flag is `--open`, and it is OFF by default.** This document
+originally proposed `--no-open` in this paragraph and `--open` in work item
+U3, which contradict each other; the shipped verb resolves it in the safer
+direction. **The URL is printed unconditionally**, first, before any
+opener runs, and `--open` additionally hands it to the platform's opener.
+So the default behaviour is exactly the "middle ground" above — the token
+is in the terminal and the user's clipboard, never in a browser-launcher's
+argv — and one-click launch is one word of typing away. It also means the
+fallback for the one thing still unverified here (whether `#bt=` survives
+Windows's opener) is a line the user has already been given rather than a
+recovery step.
+
+`openInBrowser` takes an argv rather than a shell, so the `#` is not a
+comment character on macOS or Linux; Windows goes through
+`rundll32 url.dll,FileProtocolHandler` rather than `cmd /c start`, which
+eats `&` and treats a bare URL with a fragment inconsistently.
 
 #### A4. Port scanning and drive-by discovery
 
@@ -1264,6 +1518,22 @@ federation becomes code in the UI.
   base-uri 'none'; form-action 'none'; frame-ancestors 'none'`.
   (`'unsafe-inline'` for styles only, and only if the bundler needs it —
   check, and drop it if not.)
+
+**Two things the implementation had to get right that this list does not
+say.** First, M1's page is one hand-written HTML file with its script
+inline, which `script-src 'self'` forbids and `'unsafe-inline'` would make
+pointless, so the page carries a **per-response nonce** instead
+(`default-src 'none'; script-src 'nonce-…'; style-src 'nonce-…'; …`) —
+one file, and an injected `<script>` still cannot run.
+
+Second, **the nonce must be base64url, not standard base64.** CSP's nonce
+grammar accepts both alphabets, but the page is rendered through
+`html/template`, which escapes a `+` in an attribute value to `&#43;`. A
+standard-alphabet nonce therefore reaches the browser as a different
+string than the header names, and works only by way of the parser's entity
+decoding — which is one browser's behaviour away from a page whose script
+silently stops running. `base64.RawURLEncoding` has no `+` and no `/`, so
+the question does not arise (`cmd/pelfs/browse.go`, `servePage`).
 
 **And the one structural answer, if inline preview is ever wanted:** serve
 previews from a **second listener on a second random port**, which is a
@@ -1324,9 +1594,27 @@ top-level navigation is the one thing LNA does **not** gate in Chromium.
    else (A1, A2). A rebound `Host` must never reach this handler — recall
    from A2 that rebinding is precisely what defeated Transmission's custom
    header [B28].
-2. **An authenticated browser session is required.** `/oauth/authorize`
-   without a valid session renders a page saying "open pelfs from your
-   terminal first", never a login form and never a redirect.
+2. **A live browser session is required — and it is a PER-PROCESS fact,
+   not a per-request one.** `/oauth/authorize` with no session at all
+   renders a page saying "open pelfs from your terminal first", never a
+   login form and never a redirect.
+
+   **Why it cannot be per-request**, stated because the weaker check is
+   easy to mistake for the stronger one and because a later reader will
+   want to "tighten" it: this route is reached by a **navigation**
+   Cyberduck opens, so the request cannot carry `X-Pelfs-Session` (control
+   7). The session token lives in `sessionStorage`, which is scoped to the
+   tab that minted it — so the *new tab* Cyberduck opens could not read it
+   even if script were available, and the consent page runs none by
+   design. There is no request-level session binding available on this
+   route on a loopback origin. Any design that claims one is claiming it
+   from a cookie, and a cookie on `127.0.0.1` is shared with every other
+   local service the browser talks to (F4). So control 2 answers "is
+   anybody signed in to this process", which is a real gate — it means a
+   `pelfs browse` nobody has opened cannot be driven to mint anything —
+   and **the weight is carried by control 4**, the per-download
+   `client_id`, together with control 6. This is a limitation and it is
+   named as one at `localoauth.SessionPresence` rather than papered over.
 3. **`redirect_uri` is matched against an exact-string allowlist** — the
    one URL pelfs itself wrote into the profile it generated, including
    scheme, host, **port** and path. Not a prefix match, not a host match,
@@ -1340,14 +1628,21 @@ top-level navigation is the one thing LNA does **not** gate in Chromium.
 5. **PKCE `S256` is required**, not merely accepted. Cyberduck sends it by
    default (`isOAuthPKCE()` → `true` [W13]), so requiring it costs nothing
    and means a stolen code is useless without the verifier.
-6. **One real user gesture, on a consent screen** (Verification 2e). This
-   is the control that specifically defeats the silent-drive attack: an
-   `/authorize` that cannot complete without a click cannot be completed by
-   a navigation the user did not make. The screen names the client, the
-   scope, the volume and the redirect target — so a user who *is* driven
-   there sees an authorization request they did not ask for, which is the
-   only signal a human can act on. Remembered per `client_id` for the life
-   of the process, so a reconnect within the session does not re-prompt.
+6. **One real user gesture, on a consent screen, on EVERY authorization**
+   (Verification 2e). This is the control that specifically defeats the
+   silent-drive attack: an `/authorize` that cannot complete without a
+   click cannot be completed by a navigation the user did not make. The
+   screen names the client, the scope, the volume and the redirect target —
+   so a user who *is* driven there sees an authorization request they did
+   not ask for, which is the only signal a human can act on.
+
+   **This document originally said "remembered per `client_id` for the
+   life of the process". Do not reinstate that.** Remembering consent at
+   `/authorize` gives the attack back everything this control takes away:
+   after one legitimate click, a later navigation mints codes silently. The
+   convenience it was buying — no re-prompt on a reconnect — is delivered
+   by the **refresh token** instead, which is where the client actually
+   asks for it (Verification 2e).
 7. **`X-Pelfs-Session`-style header rules do not apply here and cannot.**
    `/oauth/authorize` is reached by a *navigation* Cyberduck triggers, so
    it cannot require a custom header — which is exactly why controls 3, 4
@@ -1430,7 +1725,27 @@ protocols, not one. What it must not be is two *filesystems*.
 | **Events** | `/events?s=<token>` | the same token, in the query because `EventSource` cannot set headers | SSE: SSO prompts, durability state, upload and publish progress | carry file content, or a federation token |
 | **Download** | `/d/<ticket>` | single-use ticket only; **session token rejected** | serve bytes to a plain navigation | ever return `Content-Type: text/html` for user content |
 | **WebDAV** | `/dav/*` | `Authorization: Bearer` (Cyberduck, via the OAuth flow) **or** HTTP Basic, per-client (everything else) | external clients: Cyberduck, Mountain Duck, WinSCP, rclone, macOS `mount_webdav`, `duck` | accept the session token, or emit any `Access-Control-Allow-*` header |
-| **OAuth** | `/oauth/authorize`, `/oauth/token` | a browser session **plus one consent gesture**; then PKCE + a per-download `client_id` | issuing DAV credentials to Cyberduck with no typing | redirect anywhere not on the exact-string allowlist, or complete without a user gesture |
+| **OAuth (navigation)** | `/oauth/authorize` | a live browser session **plus one consent gesture, every time**; then PKCE + a per-download `client_id` | issuing DAV credentials to Cyberduck with no typing | redirect anywhere not on the exact-string allowlist, or complete without a user gesture |
+| **OAuth (back channel)** | `/oauth/token` | the authorization code + PKCE verifier, or a refresh token, **in the body** | the exchange Cyberduck's HTTP client makes with no browser involved | require a browser-only signal — see below |
+
+**`POST /oauth/token` is its own surface, and the reason is worth the
+extra row.** This document originally put it on "the API surface minus the
+session requirement". That cannot work, and it fails at 100% rather than
+at the margin: the caller is not a browser and is not our page — it is
+Cyberduck's Apache HttpClient (or rclone's, or `curl`) making a
+back-channel POST. It sends no `Origin` and no `Sec-Fetch-Site`, so the
+provenance rule answers **403**; and its body is
+`application/x-www-form-urlencoded`, which RFC 6749 §4.1.3 mandates, so the
+JSON rule answers **415**. A profile pointed at such an endpoint fails
+*every* exchange. `httpguard.SurfaceToken` keeps everything that still
+applies to a non-browser POST — the `Host` allowlist, `CrossOriginProtection`
+(an unsafe method with `Sec-Fetch-Site: same-site` is still rejected, and
+by F3 another loopback port is same-site), the exact-`Origin` match
+whenever an `Origin` is present at all, no cookie in, no `Set-Cookie` out,
+no `Access-Control-Allow-*`, and the full security-header set — and drops
+exactly the two rules a non-browser cannot satisfy.
+`localoauth.TestTokenEndpointCannotLiveOnSurfaceExchange` pins it, so
+nobody moves the route back for consistency's sake.
 
 ### What the JSON surface owes WebDAV
 
@@ -1491,14 +1806,66 @@ model depends on:
   directly on the download surface — avoids `iofs` entirely and the
   problem does not arise.
 
-The adapter work is therefore small and known: `internal/vfsdav` wraps
-`billyFS` as a `webdav.FileSystem` (five methods, all present), and wraps
-`billy.File` as a `webdav.File` (which needs `Readdir(count int)` — the
-one method billy puts on the *filesystem* rather than the file, so the
-wrapper holds a path and calls `billyFS.ReadDir`). Locks: `webdav.NewMemLS()`,
-and `docs/design-guiclients.md` already establishes that Cyberduck does not
-lock and that the two known litmus `locks` failures are therefore off the
-path.
+### The adapter, and the four places "five methods, all present" was too cheap
+
+This document said the adapter was "five methods, all present" and
+therefore nearly free. The *shape* was right — `internal/vfsdav` wraps
+`billyFS` as a `webdav.FileSystem` and `billy.File` as a `webdav.File`
+(which needs `Readdir(count int)`, the one method billy puts on the
+*filesystem* rather than the file, so the wrapper holds a path and calls
+`billyFS.ReadDir`); locks are `webdav.NewMemLS()`, and
+`docs/design-guiclients.md` already establishes that Cyberduck does not
+lock, so the two known litmus `locks` failures are off the path.
+
+**But four of the five methods could not be a pass-through, and each one
+was a wrong status code or a lost file rather than a style question.**
+
+- **`DeadPropsHolder` is not optional.** x/net handles the ten live `DAV:`
+  properties itself and hands everything else to a `File` that implements
+  `webdav.DeadPropsHolder`. Without one, **every PROPPATCH is answered
+  403** and the `props` suite drops well below the ceiling the adapter has
+  to hold. `internal/vfsdav/props.go` is an in-memory store, deliberately:
+  a client's scratch properties (Cyberduck's, Finder's, litmus's) are
+  worth exactly as long as the connection, and writing each into the
+  overlay would put them in a published generation forever. The
+  properties that *should* be durable — `Win32LastModifiedTime`, the
+  `Win32FileAttributes` read-only bit — are not dead properties at all;
+  they are translations onto `Chtimes` and `Chmod`, which is
+  `docs/design-windows.md`'s own work item. The consequence is stated
+  where a user meets it rather than discovered: **a property set over
+  WebDAV is gone when the process exits.**
+- **A symlink must be followed on OPEN, not only on `Stat`.** An open of
+  the link inode answers `ESTALE` on the first read — and x/net reads
+  **512 bytes of every file whose extension has no MIME type**
+  (`findContentType`), so a followed link **vanished from its own
+  listing**. `OpenFile` takes the handle on the resolved path and answers
+  `Stat` about the requested one: the bytes come from the target, the name
+  the client sees is the name it asked for.
+- **`Mkdir` cannot be `MkdirAll`.** MKCOL distinguishes two failures and
+  billy collapses both: a missing or non-directory parent must be
+  `os.ErrNotExist`, which x/net turns into **409 Conflict**, and an
+  existing name must be `os.ErrExist`, which becomes **405**. `MkdirAll`
+  would create the parents and answer **201** in the first case, which is
+  a protocol violation that looks like success.
+- **`RemoveAll` cannot be `Remove`.** WebDAV defines DELETE as
+  `Depth: infinity` on a collection; billy's `Remove` unlinks one name and
+  refuses a non-empty directory. The recursion is the adapter's,
+  depth-first, never on the root itself — and **a symlink is removed as
+  itself**, because following one there would delete the *target* and
+  leave the link, which is the one mistake a recursive delete cannot take
+  back.
+
+**What the adapter deliberately does not show.** A symlink to a regular
+file is followed. A symlink to a **directory** is hidden and counted,
+which is narrower than `docs/design-windows.md`'s "follow within the
+volume" — path resolution in `internal/vfsbilly` is component-by-component
+and does not traverse a symlinked directory component, so a followed
+directory link would list as a collection whose PROPFIND then failed.
+Hiding it is the honest answer until component-wise link resolution
+exists; it is in `docs/known-issues.md` as an open limitation rather than
+buried here. Dangling links, FIFOs, sockets and device nodes are hidden
+and counted for the same reason: no client could render them. Hidden
+entries are **counted, not swallowed**, so a caller can say so.
 
 ### The routes, concretely
 
@@ -1507,15 +1874,51 @@ for reasons the contract itself creates:
 
 | SVAR route | pelfs | why |
 |---|---|---|
-| `GET /files`, `GET /files/{path}` | **kept**, `{path}` form only, with a response cap | the un-pathed form returns the whole tree; see Verification 3 |
-| `GET /info`, `GET /info/{id}` | kept | this is where the drive/capacity panel comes from — and it is the natural home for the **durability counters** |
+| `GET /files` | **kept, and it is not optional** | it means the **ROOT directory**, not the tree, and the component fetches it at boot. Dropping it is a page that never renders |
+| `GET /files/{path}` | kept, one directory, capped | see Verification 3 |
+| `GET /info`, `GET /info/{id}` | kept, and it grew a job | the un-`id`'d form is the drive/capacity panel and the **durability counters**; the `{id}` form is where the listing's true counts and `PartialSearchNotice` are served, because the array cannot carry them |
 | `POST /files/{id}` (`NewFile`) | kept | mkdir and touch |
 | `PUT /files/{id}` (rename) | kept | one `billyFS.Rename` |
 | `PUT /files` (move/copy, batch) | kept, per-id results | see "semantic restraint" above |
 | `DELETE /files` | kept, per-id results | ditto |
-| `POST /upload` | **kept as-is for now** | it is a single multipart POST with no progress and no resume [W4]; resumable upload is deferred — see below |
+| `POST /upload` | **kept as-is for now** | it is a single multipart POST with no progress and no resume [W4]; resumable upload is deferred — see below. Streamed with `r.MultipartReader()`, never `ParseMultipartForm`, and through `.pelfs-part` |
 | `GET /direct` | **replaced** by `/d/<ticket>` | a download must not be an ambient-credential GET; see the threat model |
-| `GET /preview`, `GET /icons/...` | dropped in M3 | previews render user content; see "the stored-XSS problem" |
+| `GET /preview`, `GET /icons/...` | dropped | previews render user content; see "the stored-XSS problem". The component's own CDN icon callback is turned off with `icons="simple"` (Verification 3) |
+
+**Eight routes, eleven patterns, and every id route is registered TWICE.**
+That is not tidiness; it is a hole in `net/http`'s router that two
+implementation passes hit independently.
+
+The component sends an id as a full path percent-encoded into **one**
+segment — `/api/v1/files/%2Fdir-0%2Fdir-1`. `ServeMux` matches that as a
+single segment and `PathValue` returns it decoded exactly once, which is
+what makes both the ordinary case and a filename containing the literal
+characters `%2F` work; `r.URL.Path` has already collapsed the `%2F` into a
+real slash and is unusable. So `{id}` is the contract.
+
+Its hole, found by probing `net/http` rather than by reading it: **a
+segment that is exactly `%2F` does not match a `{id}` wildcard at all.**
+Unescaped it is a trailing empty segment and the matcher answers 404 — or,
+worse, falls through to the SPA and returns HTML to a caller expecting
+JSON. The component reaches the root listing through the un-pathed form so
+it never notices, but **"create a folder in the root" is
+`POST /api/v1/files/%2F`** and would 404 for exactly this reason.
+
+The `{id...}` sibling closes it. It is strictly less specific, so it takes
+nothing away from `{id}`; it catches the bare `%2F` (`PathValue` gives
+`/`) and, as a bonus, the unescaped form a person types at a terminal
+(`/api/v1/files/dir/sub`). `webapi.Routes` registers both for every id
+route and `routing_test.go` fails a table that forgets one.
+
+**And the cap's numbers travel beside the array, never inside it.** The
+provider requires a bare JSON array from `loadFiles` and drops response
+headers on that path, so:
+
+| carrier | who reads it |
+|---|---|
+| the array | the component |
+| `X-Pelfs-Listing-Returned` / `-Total` / `-Cap` / `-Truncated` / `-Hidden` | anything that can read a response header — the app shell, `curl`, a gate script |
+| `GET /api/v1/info/{id}` | the app shell, for the numbers **and** for `PartialSearchNotice`'s exact sentence, so no surface re-words it |
 
 ### Upload: whole-file for now, and the ceiling that implies
 
@@ -1580,6 +1983,50 @@ capability is there and only the protocol is missing.
 
 ---
 
+## Wiring: the two things that only appeared when the pieces were connected
+
+Every surface above was built and tested on its own before anything was
+mounted on one listener, which was the right order — and it left exactly
+two facts that no single-package test could have found. Both are recorded
+here **with their fixes**, because in each case the shape that looks wrong
+is the correct one and a later reader's instinct will be to "clean it up".
+
+**1. The WebDAV handler cannot be a line in the route table.**
+`vfsdav.New` reads the filesystem's **write capability at
+construction** — `billy.CapabilityCheck(bfs, …)` — so it cannot be built
+before there is a filesystem. But the route table is built **before the
+volume opens**, deliberately, and that ordering is not negotiable: it is
+what guarantees a device-flow prompt has a page to appear on (see "The
+ordering problem"). So `/dav/` is registered to a **delegator** that
+answers **503 with `Retry-After: 2`** until `setReady` installs the real
+handler.
+
+Two details are load-bearing. It is **503 and not 401**: the credential is
+not the problem, and a WebDAV client told 401 goes looking for a password
+it was never meant to have. And the alternative — a lazy
+`billy.Filesystem` that answered the capability question from
+`browseArgs.rw` — was rejected on purpose, because it would put a *second
+opinion* about writability next to billy's, and billy's is the one every
+other surface asks. One model, one answerer (`internal/fsperm`'s own
+discipline).
+
+**2. `--test-hooks`'s synthetic download source sits AHEAD of the real
+one, and that is the fix, not the bug.** The consequence has to be stated
+plainly because it looks like an oversight: **a `--test-hooks` session
+cannot mint a working ticket for a real file in the volume.** The
+synthetic source shadows the volume's.
+
+That is deliberate. A browser-driver run passes `--test-hooks` precisely
+to reach states the volume is not in, and a driver that had to create a
+file before it could exercise the ticket round trip would be testing the
+*upload* path instead of the ticket. The flag is off in every real session
+— its help text says `NEVER on a real volume` — so the real source is what
+a user ever meets. **Do not "fix" this by reordering:** the reorder makes
+the ticket test depend on the upload path, which is the coupling the flag
+exists to avoid.
+
+---
+
 ## Durability, and the one ambiguity that must never reach the screen
 
 `docs/design-guiclients.md` did this analysis and it is not redone here.
@@ -1618,15 +2065,42 @@ connection-count heuristic because there is exactly one stream per tab and
 the SPA opens it on load. So:
 
 - **seal on idle** = the last `/events` stream closed, **and** no write on
-  any surface, for `min(30 s, --snapshot-interval)`;
+  any surface, for `min(30 s, --snapshot-interval)` — **and that formula
+  is undefined at interval 0, which this document did not notice.**
+  `--snapshot-interval 0` means "seal only at unmount", and it is a thing a
+  user types on purpose: a session that must publish exactly once, at a
+  moment of its own choosing. `min(30 s, 0)` is 0, which as a quiet window
+  means "seal immediately" — the opposite of what was asked for. **Idle
+  sealing is automatic publishing, so at interval 0 it is OFF**
+  (`idleQuietWindow` returns 0 and the sealer does not run). A session that
+  wants idle sealing and no periodic checkpoints makes the interval long
+  rather than zero;
 - with the **pressure path's backoff**, which is not optional: the
   existing pressure path doubles its wait to the interval on failure, and
   an idle seal retrying every 30 s against a broken federation would
   reproduce the "same warning forever" failure that backoff exists to
   prevent (`docs/design-guiclients.md`, item (a));
 - and `navigator.sendBeacon` on `visibilitychange`/`pagehide` as a *hint*
-  that shortens the wait, never as the trigger — a beacon is best-effort
-  by specification and a durability decision must not rest on one.
+  that shortens the wait to 5 s, never as the trigger — a beacon is
+  best-effort by specification and a durability decision must not rest on
+  one.
+
+**The beacon needed a tolerance, and without it the hint never fired
+once.** `pagehide` fires **before** the connection tears down, so the
+beacon's arrival almost always *precedes* the unsubscribe that starts the
+quiet window, by a few milliseconds. The obvious comparison — "is the
+beacon newer than `idleSince`?" — therefore discards **every beacon that
+did its job**, silently, and the feature reads as implemented and does
+nothing. `idleHintLead` (5 s) is how far *before* the stream closed a
+beacon still counts. Two further properties fall out of the same
+ordering and are worth naming: a beacon cannot *start* a window (the
+window only runs while the stream set is empty), and a beacon from a tab
+that is merely hidden — `visibilitychange` on a minimise or a tab switch —
+arrives while its stream is still open and therefore changes nothing.
+
+And the beacon cannot carry `X-Pelfs-Session`, because `sendBeacon` sets
+no request headers; the token is in the body, checked in constant time by
+the same verifier the guard uses, on `SurfaceExchange`.
 
 The WebDAV surface still cannot express it, exactly as the earlier
 document says. The difference is that the browser surface can, and the two
@@ -1675,9 +2149,24 @@ respect:
 - **`POST /api/v1/publish` returns `202` with a job id**, and progress
   arrives on `/events`. A handler that blocked on `checkpoint` would hold
   an HTTP request open for minutes, hit every intermediary timeout there
-  is, and give the user a spinner with no information. The seal already
-  emits phase timings through `phaseClock` (`mountgen.go:1422-1495`) —
-  that is what the progress stream should carry.
+  is, and give the user a spinner with no information. The job runs on the
+  **session** context, not the request's — a request context is cancelled
+  the moment the 202 is written, which would abort the seal it just
+  accepted.
+
+  **`phaseClock` cannot carry the progress, and this document said it
+  should.** `phaseClock` reports at the *end* of a seal and has no
+  subscription: there is nothing to read from it while the seal is
+  running, so a stream fed from it would be silent for the whole minutes
+  and then complete. What the stream carries instead is the **job**:
+  `{id, state, reason, started, ended, summary, error}` where `state` is
+  `running`/`done`/`failed`, plus elapsed time — enough for "publishing,
+  1m12s" and for saying afterwards *which* generation the user is looking
+  at and whether they asked for it (`reason` is `user` for the button and
+  `idle` for the seal that runs when the last tab closes; a generation the
+  user did not ask for is otherwise indistinguishable from one they forgot
+  asking for). Per-phase progress during a seal is a change to
+  `phaseClock`, not to this surface, and it is not made here.
 - **A second concurrent request gets `409`**, not a queue. `g.mu` already
   serializes it; the API should say so rather than let two requests
   silently become one.
@@ -1849,6 +2338,21 @@ is guaranteed to be loadable before anything can prompt. This is a real
 ordering requirement on new code, not an observation, and it is the reason
 the SSO milestone is not simply "add a card".
 
+**But the ordering does not, on its own, solve the case it was written
+for — SSE snapshots do, and the registry section above is where to say
+so.** "Loadable" is not "loaded". A prompt raised in the second between
+the browser being launched and the page's `/events` stream attaching has
+no stream to be pushed to, and the ordering cannot shrink that window to
+zero: it is the browser's cold start, not ours. What closes it is that
+**the registry is the state and `/events` carries snapshots, not deltas**:
+the first frame a stream ever receives contains every live prompt, and so
+does `GET /api/v1/info`. Nothing is delivered only on the edge, so a
+prompt cannot be missed by arriving early — and, for the same reason, a
+stream that drops and reconnects (a suspended laptop, a network blip)
+cannot show a stale or half-updated view, and needs no `Last-Event-ID`
+replay. The cost is bytes on the wire: a few hundred, at 500 ms, for one
+tab on loopback.
+
 ### One doc-comment defect found while verifying this
 
 `internal/pelicanobj/fedstore.go:130` says the priming is best-effort
@@ -1868,16 +2372,47 @@ if opts.NonInteractive { ... }
 
 So the flow *does* start without a TTY, and the URL goes to stderr
 regardless. This is good news for the web UI — nothing has to be tricked
-into running — but the comment should be corrected, because it currently
-tells a reader the opposite of what the code does. (Not this document's
-change to make; filed in `docs/TODO.md` under `webui-agent`.)
+into running.
+
+**FIXED** (`d4c3767`). `fedstore.go`'s comment now says what the code does,
+and says why the distinction matters rather than merely deleting the wrong
+sentence: *"It does NOT mean a terminal is required … That distinction is
+what lets a GUI surface the flow instead of a terminal."* The same commit
+added `go.work` and `go.work.sum` to `.gitignore`, which this document's
+`go.mod` section asked for and which was one `git add` away from putting a
+developer's local pelican checkout in CI.
 
 ---
 
 ## The `go.mod` question: land it upstream, carry no `replace`
 
-**Recommendation: no `replace` in `go.mod`. Offer `e55347e5a` upstream,
-and sequence the milestones so nothing waits on it.**
+**What actually shipped: the PR was opened, it has not merged, and
+`go.mod` carries a `replace` after all** — pinned to the PR's own head on
+the fork it is proposed from (`bbockelm/pelican
+v0.0.0-20260823165605-e55347e5a951`), with the drop condition written in a
+comment beside it. The reasoning below is why that is a *cost* rather than
+a free choice, and it is unchanged; what changed is the trade. The three
+costs are paid, and two of the three mitigations from this section are the
+reason it is survivable:
+
+- it pins **the PR's head commit on a fork**, not a local path, so CI can
+  fetch it and the integration job can still build a whole pelican server
+  from whatever it resolves to;
+- it sits **two commits past** what `go.mod` required before it
+  (`d01f207b7f71`), and the change is purely additive;
+- and the comment says **DROP THIS the moment 3672 merges**, naming the
+  reason: a rebasable fork branch has stranded a pin here once already
+  (`f4e6111`).
+
+The sequencing argument below still did its job — M1 through M3 were built
+before the hook was needed, so nothing waited on it, and only U13 depends
+on the pin. Read the rest of this section as the standing case for
+deleting the `replace`, not as a description of the tree.
+
+---
+
+**Original recommendation: no `replace` in `go.mod`. Offer `e55347e5a`
+upstream, and sequence the milestones so nothing waits on it.**
 
 **The conflict is real and immediate.** `aebd30e` — *"deps: track upstream
 pelican; the fork is no longer needed"*, landed 2026-08-22 by another
@@ -1967,7 +2502,8 @@ the security properties that a browser cannot be trusted to enforce:
 | `Host: evil.example.com:PORT` (DNS rebinding), everything else correct | **421** |
 | `Host: 127.0.0.1:PORT`, `Origin: http://127.0.0.1:OTHER` (same-site, wrong origin) | **403** |
 | `Origin: null` (a `no-referrer` form post) on an authenticated route | **403** |
-| `Origin` absent on a `/api/v1` request | **403** |
+| `Origin` absent **and no fetch metadata either** on a `/api/v1` request | **403** |
+| `Origin` absent but `Sec-Fetch-Site: same-origin` — a real same-origin GET | **200** |
 | `Sec-Fetch-Site: same-site` (a page on another loopback port) | **403** |
 | `X-Pelfs-Session` absent, or wrong, or from a previous session | **401** |
 | bootstrap token reused | **401**, and the first use still valid |
@@ -1980,9 +2516,32 @@ the security properties that a browser cannot be trusted to enforce:
 | any response on any surface carrying `Access-Control-Allow-*` | **fail the test** |
 | a mutating `/api/v1` route reached with `Content-Type: text/plain` | **415** |
 
-Fifteen assertions, no browser, milliseconds. Every one of them is a
-regression somebody could introduce by adding a middleware in the wrong
-order, and none of them is visible in a manual test.
+**Sixteen rows, not the "fifteen" this document used to claim** — it said
+fifteen and then listed sixteen, and the count was wrong in the direction
+that lets a row go missing unnoticed. `TestThreatModelTable` in
+`internal/httpguard/httpguard_test.go` is those sixteen, in this order,
+with each row named for the attack rather than the mechanism.
+
+**One row had to be split, because as written it was wrong.** "`Origin`
+absent → 403" cannot mean absent alone: current browsers send no `Origin`
+on a same-origin GET, so that rule would refuse every read the real page
+makes. The requirement is *provenance* — a matching `Origin` **or**
+`Sec-Fetch-Site: same-origin` — so both halves are rows: the request
+carrying neither is a 403, and the same-origin GET carrying only fetch
+metadata is a 200. A table that asserted only the refusal would have
+passed while the product did not work.
+
+Beside those sixteen, `internal/httpguard` ships assertions the design did
+not ask for and the implementation could not do without — a `Host` with no
+port, an incoming `Cookie` never reaching a handler, an outgoing
+`Set-Cookie` being stripped, a safe method being unable to publish, the
+stream taking its token from the query, the ticket surface ignoring a
+session header, the navigation surface needing no custom header, the
+external surface keeping its own credential, the API body being capped, and
+five for `SurfaceToken`. **39 assertions in the package**, no browser,
+milliseconds. Every one is a regression somebody could introduce by adding
+a middleware in the wrong order, and none of them is visible in a manual
+test.
 
 ### 2. litmus, against the pelfs adapter
 
@@ -1991,10 +2550,31 @@ order, and none of them is visible in a manual test.
 litmus 0.13, 2026-08-23. Its header already names the intended second use:
 *"Re-run this when x/net moves, and again with the pelfs adapter
 substituted for memFS — a NEW failure in `basic`, `copymove` or `props` is
-the adapter's, and is the signal this script exists to give."* Point it at
-`internal/vfsdav` and the ceiling becomes a gate. The two known `locks`
-failures stay known: memLS implements exclusive locks only, and
-`docs/design-guiclients.md` establishes that Cyberduck does not lock.
+the adapter's, and is the signal this script exists to give."*
+`scripts/webdav-adapter-litmus-docker.sh` is that second use, against
+`internal/vfsdav`. The two known `locks` failures stay known: memLS
+implements exclusive locks only, and `docs/design-guiclients.md`
+establishes that Cyberduck does not lock.
+
+**But the `props` ceiling for a real server is 29/30, not 30/30, and this
+document quoted the wrong number as a target.** The 30/30 baseline is
+x/net's *example* server, which passes `propfind_invalid2` **by
+hard-coding a 400** — its own comment says the test is obsolete and cites
+golang/go#8068:
+
+```go
+// Thus, we assume that the propfind_invalid2 test is obsolete, and
+if r.Header.Get("X-Litmus") == "props: 3 (propfind_invalid2)" { … }
+```
+
+The test sends a body with an empty namespace declaration
+(`xmlns:bar=""`); Go's `encoding/xml` accepts one, so the **unmodified**
+handler answers 207 and litmus scores it a failure. So `props 29/30` is
+the honest ceiling for anything that is not special-casing a litmus
+header, and the pelfs adapter holds it rather than copying the
+special case. Expected, and asserted by the script: **`basic 16/16 ·
+copymove 13/13 · props 29/30 · locks 32/34`.** A 30/30 here would mean
+somebody added the hard-coded 400, not that the adapter improved.
 
 ### 3. `duck` and `rclone` as real external clients
 
@@ -2149,28 +2729,42 @@ Pelican Platform product" — costs nothing and prevents the one
 misunderstanding a borrowed mark can cause. The permission covers using the
 mark; it does not make pelfs the product.
 
+**What shipped: option 1, and no redraw.** `webui/frontend/public/brand/`
+holds the mark copied **byte for byte** from the pelican tree, with a
+`NOTICE.txt` recording its size, its sha256, its provenance, the PI's
+permission, and the fact that it has not been traced, redrawn or altered.
+The favicon is **type only** — a rounded square in `#0885ff` carrying the
+`fs` — so no derivative of the bird exists anywhere in this repository.
+Option 2, the compound favicon, is where a real vector mark would go if one
+is ever supplied; the file says so. The footer line is in `BrandFooter`.
+
 ---
 
 ## Ranked work items
 
-| | change | buys | effort | needs Node? |
-|---|---|---|---|---|
-| **U0** | The M0 probe: run the real SVAR component against a logging stub, record the request sequence, answer "does it lazy-load" and "does it virtualize", and measure `vite build`'s real gzipped output | the two unknowns that could invalidate M4, and the fixture layer 5 replays | hours, once | yes, once |
-| **U1** | `internal/httpguard`: `Host` allowlist, `net/http.CrossOriginProtection`, exact-`Origin` match, `X-Pelfs-Session` requirement, `application/json` requirement, security headers, the 15-row test table | the entire threat model, before anything is exposed | small, and it is the load-bearing code | no |
-| **U2** | `internal/browsesession`: bootstrap token (single-use, fragment-delivered, TTL, constant-time), header-borne session token, download tickets | one principal with a real lifecycle | small | no |
-| **U3** | `pelfs browse [--rw]`: bind `127.0.0.1:0` tcp4, serve, `--open`, foreground, seal at exit, print the URL | a verb a person can run | small; `runMountGen` has the teardown discipline and `nfsmount.Serve` is the listener template | no |
-| **U4** | The connection page: **one hand-written HTML file**, no React, no build. Volume, mode, durability panel over SSE, "Publish now" | M1 in full, with no toolchain | small, and bounded on purpose | **no** |
-| **U5** | `POST /api/v1/publish` as 202 + SSE progress, `409` on concurrent, dirty counts on `GET /api/v1/info`, lease-state banner | the durability UX, honestly | small; `checkpoint` and `phaseClock` exist | no |
-| **U6** | `internal/vfsdav`: `webdav.FileSystem`/`webdav.File` over `billyFS`, `webdav.NewMemLS()`, mounted at `/dav/` | external clients on the same listener | small; five methods, all present. This is `docs/design-windows.md` D1 | no |
-| **U7** | `internal/localoauth`: `/oauth/authorize` + `/oauth/token`, authorization-code + PKCE `S256`, per-download `client_id`, exact-`redirect_uri` allowlist, consent screen with a real gesture, in-memory-only grants; **Bearer acceptance on `/dav/*`** | the Cyberduck/Mountain Duck double-click, and it is the *primary* external-client path | **real, and security-critical**; pure Go, no new module | no |
-| **U8** | The generated `.cyberduckprofile` download (Verification 2f), plus a `.duck` bookmark, plus HTTP Basic per-client credentials as the contingency and as every other client's path | connect-by-click for Cyberduck; connect-at-all for WinSCP, rclone, `mount_webdav` | small | no |
-| **U9** | litmus gate against the adapter; `duck` + rclone gate over **both** unix socket and TCP; a Bearer-path integration test | the WebDAV half proven by three independent clients | hours; both scripts exist | no |
-| **U10** | Seal on idle: last `/events` stream closed + quiet window, with the pressure path's backoff; `sendBeacon` as a hint only | an upload becomes durable without the user knowing what a checkpoint is | moderate; the trigger is new, the sealing is not | no |
-| **U11** | The JSON API: the SVAR route contract under `/api/v1`, per-directory listing with a cap, per-id batch results, `.pelfs-part` convention, whole-file upload via `r.MultipartReader()` (**never** `ParseMultipartForm`) | the app's data plane | moderate | no |
-| **U12** | The Vite + React + SVAR app; `internal/webui` with `//go:generate` + committed `dist/` + `//go:embed`; `third_party.txt`; the regenerate-and-diff CI job; the `wx-*` lockfile check | the file manager | moderate | **only under `go generate`** |
-| **U13** | The SSO card: `SetVerificationURLHandler` installed in `runBrowse`, the prompt registry, the reordered startup, prompts on `/events` | "authorize with your institution" in a page instead of a URL in a terminal | small **once the hook is upstream** | no |
-| **U14** | The one Playwright cross-origin spec, with `--host-resolver-rules` | the browser half of the threat model | small, off the PR path | yes |
-| **U15** | Resumable upload: `tus` server + `uppy` client at `api.intercept("upload-file")` | a 68 MB SIF that survives a dropped link | moderate — and **deferred**, by decision | yes |
+**U0 through U14 are DONE.** U15 is deferred by decision. The `status`
+column is the reconciliation; the `change` column is left as it was
+written, so that what was asked for and what arrived are both readable —
+except where the description itself was wrong, which is marked.
+
+| | change | status | buys | effort | needs Node? |
+|---|---|---|---|---|---|
+| **U0** | The M0 probe: run the real SVAR component against a logging stub, record the request sequence, answer "does it lazy-load" and "does it virtualize", and measure `vite build`'s real gzipped output | **DONE** — `webui/frontend/probe`, recording + measurements in `internal/webui/testdata/svar-contract/`. Both answers changed the code: lazy YES (with wiring), virtualize NO (703 MB at 100k) | the two unknowns that could invalidate M4, and the fixture layer 5 replays | hours, once | yes, once |
+| **U1** | `internal/httpguard`: `Host` allowlist, `net/http.CrossOriginProtection`, exact-`Origin` match, `X-Pelfs-Session` requirement, `application/json` requirement, security headers, the 15-row test table | **DONE** — and the table is **16 rows, not 15**; the package ships 39 assertions. The `Origin`-absent row was wrong and became a provenance pair | the entire threat model, before anything is exposed | small, and it is the load-bearing code | no |
+| **U2** | `internal/browsesession`: bootstrap token (single-use, fragment-delivered, TTL, constant-time), header-borne session token, download tickets | **DONE** | one principal with a real lifecycle | small | no |
+| **U3** | `pelfs browse [--rw]`: bind `127.0.0.1:0` tcp4, serve, `--open`, foreground, seal at exit, print the URL | **DONE** — `--open` defaults OFF and the URL is printed either way, resolving this document's own `--open`/`--no-open` contradiction | a verb a person can run | small; `runMountGen` has the teardown discipline and `nfsmount.Serve` is the listener template | no |
+| **U4** | The connection page: **one hand-written HTML file**, no React, no build. Volume, mode, durability panel over SSE, "Publish now" | **DONE** — `cmd/pelfs/browse.html`, one file, with a per-response **base64url** CSP nonce rather than `'unsafe-inline'` | M1 in full, with no toolchain | small, and bounded on purpose | **no** |
+| **U5** | `POST /api/v1/publish` as 202 + SSE progress, `409` on concurrent, dirty counts on `GET /api/v1/info`, lease-state banner | **DONE** — but **not** via `phaseClock`, which cannot carry it: the stream carries job state and elapsed | the durability UX, honestly | small; `checkpoint` and `phaseClock` exist | no |
+| **U6** | `internal/vfsdav`: `webdav.FileSystem`/`webdav.File` over `billyFS`, `webdav.NewMemLS()`, mounted at `/dav/` | **DONE** — "five methods, all present" was too cheap: `DeadPropsHolder` is mandatory, `Mkdir`/`RemoveAll` needed their own bodies, and a symlink must be followed on OPEN. Ceiling `props 29/30`, not 30/30 | external clients on the same listener | small; five methods, all present. This is `docs/design-windows.md` D1 | no |
+| **U7** | `internal/localoauth`: `/oauth/authorize` + `/oauth/token`, authorization-code + PKCE `S256`, per-download `client_id`, exact-`redirect_uri` allowlist, consent screen with a real gesture, in-memory-only grants; **Bearer acceptance on `/dav/*`** | **DONE** — with two corrections: `POST /oauth/token` needs `httpguard.SurfaceToken`, and consent is required on **every** `/authorize` (2e's per-`client_id` memory reinstated the attack) | the Cyberduck/Mountain Duck double-click, and it is the *primary* external-client path | **real, and security-critical**; pure Go, no new module | no |
+| **U8** | The generated `.cyberduckprofile` download (Verification 2f), plus a `.duck` bookmark, plus HTTP Basic per-client credentials as the contingency and as every other client's path | **DONE** — the `Vendor` carries the listener port, or two sessions collide | connect-by-click for Cyberduck; connect-at-all for WinSCP, rclone, `mount_webdav` | small | no |
+| **U9** | litmus gate against the adapter; `duck` + rclone gate over **both** unix socket and TCP; a Bearer-path integration test | **DONE** — plus `scripts/oauth-cyberduck-docker.sh`, which is **real Cyberduck** (duck 9.5.3) completing the flow headlessly, and `make browse-gate` driving the shipped binary end to end | the WebDAV half proven by three independent clients | hours; both scripts exist | no |
+| **U10** | Seal on idle: last `/events` stream closed + quiet window, with the pressure path's backoff; `sendBeacon` as a hint only | **DONE** — `min(30 s, --snapshot-interval)` is undefined at 0 and ships as OFF; the beacon needed `idleHintLead` because `pagehide` precedes the teardown | an upload becomes durable without the user knowing what a checkpoint is | moderate; the trigger is new, the sealing is not | no |
+| **U11** | The JSON API: the SVAR route contract under `/api/v1`, per-directory listing with a cap, per-id batch results, `.pelfs-part` convention, whole-file upload via `r.MultipartReader()` (**never** `ParseMultipartForm`) | **DONE** — every id route needs an `{id...}` sibling (`{id}` does not match a bare `%2F`), the cap's numbers ride on headers and `/info/{id}`, and `GET /files` is the ROOT and not droppable | the app's data plane | moderate | no |
+| **U12** | The Vite + React + SVAR app; `internal/webui` with `//go:generate` + committed `dist/` + `//go:embed`; `third_party.txt`; the regenerate-and-diff CI job; the `wx-*` lockfile check | **DONE** — `.github/workflows/webui.yml` regenerates twice and diffs, and fails on any `wx-*` in the lockfile | the file manager | moderate | **only under `go generate`** |
+| **U13** | The SSO card: `SetVerificationURLHandler` installed in `runBrowse`, the prompt registry, the reordered startup, prompts on `/events` | **DONE** — and the reordered startup is not what closes the early-prompt case; SSE **snapshots** are | "authorize with your institution" in a page instead of a URL in a terminal | small **once the hook is upstream** | no |
+| **U14** | The one Playwright cross-origin spec, with `--host-resolver-rules` | **DONE** — `webui/frontend/tests/cross-origin.spec.ts`, in the `browser (threat model)` job, off the Go PR path | the browser half of the threat model | small, off the PR path | yes |
+| **U15** | Resumable upload: `tus` server + `uppy` client at `api.intercept("upload-file")` | **DEFERRED**, by decision. Unchanged | a 68 MB SIF that survives a dropped link | moderate — and **deferred**, by decision | yes |
 
 ---
 
@@ -2183,10 +2777,21 @@ mark; it does not make pelfs the product.
 
 ```
 pelfs browse pelican://<federation>/<prefix>
-  opening http://127.0.0.1:49731/  in your browser
+  open http://127.0.0.1:49731/#bt=IjRVMk5FN0hLZE5NLTBnN0k in your browser
   (if it did not open, paste that URL — the link is single-use, 2-minute expiry)
-  Ctrl-C to stop; the session seals on exit.
+  Ctrl-C to stop; read-only, so there is nothing to seal.
 ```
+
+**Three corrections to that mock, all of them in the printed line.** This
+document first showed `opening http://127.0.0.1:49731/` with **no
+fragment**, which is a URL the page cannot use: the bootstrap token lives
+in `#bt=…` and without it there is nothing to exchange for a session — so
+the mock's own next line, "paste that URL", was false. The full URL is
+printed, fragment and all. `open` rather than `opening` because `--open`
+is **off by default** (A3), and the line says what the user should do
+rather than what the program is doing. And the last line varies with the
+mode, because "the session seals on exit" is not true of the default:
+read-only has nothing to seal.
 
 and the page shows:
 
@@ -2202,6 +2807,14 @@ and the page shows:
     (not yet built: WebDAV — M2; SFTP — docs/design-guiclients.md)
 ```
 
+**That last line is now stale, and pleasantly so:** "Connect another
+program" is real. The page adds a program, hands back a
+`.cyberduckprofile` or a `.duck` bookmark or a username and password, and
+lists and revokes every credential the session has handed out — and says
+that all of it dies when the process does. M2 landed. The other line that
+is still true, and deliberately so, is that **this page does not browse
+files**: it says so, and names what does.
+
 **Why this is the right minimum, and not a consolation prize.** It delivers
 the two things a file manager cannot: **a publish button** and **an honest
 answer to "is my data in the federation yet"**. Those are the two questions
@@ -2216,7 +2829,24 @@ dozen lines of inline vanilla JS for the SSE subscription, `go:embed`ed as a
 single file. And it exercises **every** control in the threat model, each of
 which U1's table tests.
 
-**Then, in order:**
+**All six milestones landed, and the order held.** M1 = U1+U2+U3+U4+U5,
+M2 = U6+U7+U8+U9, M3 = U10+U11, M4 = U12, M5 = U13, M6's Playwright half
+= U14; only U15 (resumable upload) is outstanding, by decision.
+
+**One honest caveat about M4 at `b037b03`:** the app, the bundle, the
+committed `dist/`, the notices and both CI jobs exist and gate themselves,
+but `pelfs browse` still serves **M1's hand-written page** at `/` —
+`internal/webui`'s embedded bundle is not yet mounted on the route table.
+So the file manager is built and proven against a replayed contract, and a
+user running `pelfs browse` today gets the durability page, the credential
+desk, the JSON data plane and WebDAV. Mounting the bundle is a route-table
+line, not a milestone. **M4's
+gate was the right gate and it very nearly fired:** the component does
+not virtualize, so the answer was not "reconsider the component" but "the
+cap is the design" — which is a smaller change only because U0 ran before
+the app was written rather than after.
+
+**Then, in order (as planned):**
 
 - **M2 = U6 + U7 + U8 + U9.** WebDAV on the same listener, **the OAuth
   authorization server**, the generated Cyberduck profile, and three
@@ -2233,114 +2863,106 @@ which U1's table tests.
   committed. **Gated on U0's two answers** — if the component cannot load a
   directory lazily, stop here and reconsider the component rather than
   shipping a UI that dies on a real volume.
-- **M5 = U13.** The SSO card, when the hook is upstream.
-- **M6 = U14 + U15.** The Playwright spec, and resumable upload.
+- **M5 = U13.** The SSO card, when the hook is upstream. *(It is not
+  upstream: PR 3672 is open, and `go.mod` carries a `replace` on the PR's
+  head. See "The `go.mod` question".)*
+- **M6 = U14 + U15.** The Playwright spec, and resumable upload. *(The
+  spec shipped; resumable upload did not.)*
 
-**What M1 deliberately does not do:** browse files, upload, download, or
-show a directory listing. The page says so, and names what does those today
-(`pelfs mount`, and a WebDAV client once M2 lands). A person who expected a
-file manager and got a publish button needs to be told that in one
-sentence, on the page — not in a release note.
+**What M1 deliberately did not do:** browse files, upload, download, or
+show a directory listing. The page said so, and named what did those
+(`pelfs mount`, and a WebDAV client once M2 landed). A person who expected
+a file manager and got a publish button needed to be told that in one
+sentence, on the page — not in a release note. **M3 and M4 did those
+things**, and the discipline survived the promotion: the file manager still
+says out loud what it is *not* showing you, which is the capped-listing
+sentence (`webapi.PartialSearchNotice`), and the durability panel is still
+the part of the page that cannot be replaced by a file manager.
 
 ---
 
 ## What could not be verified
 
-In the order they would change the plan. Each names the experiment that
-closes it; none is closed by more reading.
+**Most of this list is closed.** It is kept, rather than deleted, because
+a document that silently drops its own unknowns leaves no record of which
+ones were answered by an experiment and which by an assumption. Closed
+items name what closed them; the four that are still open are marked
+**OPEN** and are the only ones worth acting on.
 
-1. **Whether the SVAR file manager loads directories lazily.** The route
-   contract has `GET /files/{path}`, which is strong evidence, but nothing
-   in the documentation states that the component *requests* a subdirectory
-   on expand rather than expecting the whole array up front. **This can
-   invalidate M4 by itself**, because `GET /files` with no id returns the
-   entire tree and a pelfs volume's scale is millions of entries
-   (`docs/TODO.md` A2: *"cap hit at ~6-14M files"*). Closed by U0: run the
-   real component against a stub that logs every request and expand a
-   nested folder.
-2. **Whether `@svar-ui/react-grid` virtualizes its rows.** A
-   100,000-entry directory is ordinary here. Same probe, same session:
-   render a directory of 100,000 stub entries and watch. If it does not
-   virtualize, the response cap is not a fallback, it is the design.
+1. **Whether the SVAR file manager loads directories lazily.**
+   **CLOSED — yes, but only with wiring of ours.** The U0 probe drove the
+   real component against a logging stub: entries marked `lazy: true` make
+   the store emit `request-data` on *navigation* (not on a sidebar
+   expand), and the shipped `RestDataProvider` registers no handler for it
+   at all. See Verification 3.
+2. **Whether `@svar-ui/react-grid` virtualizes its rows.**
+   **CLOSED — it does not.** 100,000 entries measured 1,000,067 DOM nodes
+   and 703 MB of heap, 18.1 s in cards mode and 37.5 s in table mode. So
+   the response cap is the design and not a fallback, and 5,000 renders in
+   under half a second. The consequence this document had not foreseen is
+   that search is client-side, so a capped listing is a partial search —
+   which is why `webapi.PartialSearchNotice` exists and why there is
+   exactly one wording of it.
 3. **The real bundle size, and whether `vite build` is byte-reproducible.**
-   Measured: the SVAR component and its ten dependencies at **166,892 bytes
-   minified / 50,143 gzipped** [W5]. *Not* measured: React's runtime,
-   because bundlephobia reports only `react-dom@19`'s re-export stub at
-   3,681 bytes, which is not the real number. And **not established at
-   all**: whether two runs of the pinned toolchain produce identical bytes.
-   The bundle is committed by decision, so reproducibility is no longer a
-   question of *whether* to commit — it is what makes the
-   regenerate-and-diff gate trustworthy instead of flaky. Closed by running
-   `go generate ./internal/webui` twice in the CI job and diffing, which is
-   cheaper than learning it from a contributor's PR.
+   **CLOSED by construction rather than by measurement**: the
+   regenerate-and-diff job (`.github/workflows/webui.yml`) runs the build
+   **twice** and diffs, so non-determinism is a red job rather than a
+   surprise in somebody's PR. The pinned toolchain and
+   `pnpm install --frozen-lockfile` are what make that gate trustworthy.
 4. **Whether Cyberduck's WebDAV OAuth path actually completes against a
-   loopback redirect.** This is now the **highest-stakes** unknown in the
-   plan, because M2 is built on it. The code path is read and quoted
-   [W12][W13][W14][W18], the feature is in the 9.1.3 changelog [W11], and
-   the one public report of somebody trying it says the dialog never
-   appeared [W9] — plausibly because that profile left `OAuth Client ID`
-   blank, which by `isOAuthConfigurable()` means OAuth was never enabled at
-   all. That is a hypothesis, not a finding. **Closed by a spike against a
-   real Cyberduck ≥ 9.1.3 desktop before U7 is written**, not after: a
-   throwaway Go server with hard-coded `/authorize` and `/token` and a
-   generated profile answers it in an afternoon, and it answers items 5,
-   5a and 5b below at the same time.
-   - **5a. Whether `Password Configurable = false` plus OAuth keys really
-     suppresses the password prompt** on a `dav` profile, or whether
-     something in the `login()` probe still challenges.
-   - **5b. Whether an unauthorized `/dav/` response must avoid
-     `WWW-Authenticate: Basic` when a Bearer token was offered.** Inferred
-     from the `login()` HEAD/PROPFIND probe, not observed; it decides
-     whether the DAV middleware needs to vary its challenge by what the
-     client presented.
+   loopback redirect.** **CLOSED — it does.** duck 9.5.3 (45464),
+   2026-08-23, 22 checks, 0 failing, `--network none`; see Verification
+   2g for the line-by-line. And with it:
+   - **5a.** `Password Configurable = false` plus OAuth keys **does**
+     suppress the password prompt: `user='anonymous', password=''`, no
+     field, nothing typed. **CLOSED.**
+   - **5b.** An unauthorized `/dav/` response **must** avoid
+     `WWW-Authenticate: Basic` when a Bearer token was offered.
+     **CLOSED, and the answer was yes** — the challenge is narrowed, and
+     the read-only case answers **403 rather than 401** for the same
+     reason: a 401 sends a client with no password field back looking for
+     a password.
 5. **Whether `LoopbackOAuth2AuthorizationCodeProvider` needs an explicit
-   port in the profile's redirect URI.** The provider takes the port from
-   the URI and uses `0` (OS-chosen) when none is given, which would make
-   the `redirect_uri` sent to the authorization server disagree with the
-   port the listener is on. This is an inference from quoted code, not a
-   tested behaviour. Closed by the same prototype; the safe move meanwhile
-   is to always write an explicit port.
+   port in the profile's redirect URI.** **CLOSED.** Cyberduck echoed the
+   profile's `redirect_uri` **verbatim**, port and all, and a callback off
+   by one port answers 400. The safe move was free and it is what shipped.
 6. **Whether `duck` (the CLI) can complete an OAuth flow headlessly via a
-   loopback redirect.** With a custom-scheme redirect it is documented
-   broken on headless Linux and the tracking issue is open [W15]; with a
-   loopback redirect it *should* work — the provider runs its own
-   `HttpServer` and needs no OS scheme handler — and nobody has reported
-   doing it. It matters because `duck` is the cheapest real-client CI gate
-   (`docs/design-guiclients.md`), and because a headless-hostile OAuth flow
-   would mean the CI gate exercises the Basic path while users exercise the
-   Bearer path — the worst split there is. Closed by trying it in
-   `ghcr.io/iterate-ch/cyberduck`; until then U9 must gate **both** paths,
-   the Bearer one with a Go-level integration test rather than a client.
+   loopback redirect.** **CLOSED — yes, and it needs no browser at all.**
+   It prints the authorization URL and waits on its own loopback listener,
+   so `curl` can play the human's click. That removes the worst outcome
+   this item was written against — a CI gate exercising the Basic path
+   while users exercise the Bearer path.
 7. **The remaining `@svar-ui` transitive licences beyond the eleven
-   verified.** The eleven checked are the package plus its complete direct
-   `dependencies` list, all MIT. A `pnpm licenses list --json` over a real
-   install is what proves the *transitive* closure, and it is also the
-   command that generates `internal/webui/third_party.txt`, so it is not extra work.
+   verified.** **CLOSED.** `internal/webui/third_party.txt` is generated
+   from a real install and committed, the CI job fails on any `wx-*`
+   package in the lockfile, and `internal/webui/webui_test.go` fails if a
+   copyleft licence name appears in the notices.
 8. **Whether Cyberduck prompts for a client ID when the profile omits
-   one.** The documentation claims it does; the OAuth code path's behaviour
-   with a blank client ID appears from `isOAuthConfigurable()` to be "OAuth
-   is off", which contradicts it. Only matters if a profile ever ships
-   without one, and the recommendation is that none does.
+   one.** **OPEN, and it does not matter.** The documentation claims it
+   does; `isOAuthConfigurable()` says a blank client id means OAuth is
+   off. No pelfs-generated profile omits one, so this only decides how to
+   read somebody else's bug report.
 9. **Whether `#bt=` in the fragment survives every platform opener.**
-   `open`, `xdg-open` and `start` are three programs with three parsers, and
-   a `#` is a shell comment character. The URL must be quoted, and the
-   round trip must be tested on all three platforms — a fragment silently
-   dropped by an opener is a launch that fails with no diagnostic. Closed
-   by trying it; the fallback (print the URL) already exists.
+   **PARTLY CLOSED.** Nothing goes through a shell — `exec.Command` takes
+   an argv — so the fragment survives on macOS (`open`) and Linux
+   (`xdg-open`). **Windows is OPEN:** it goes through
+   `rundll32 url.dll,FileProtocolHandler` rather than `cmd /c start`,
+   which was chosen because `start` eats `&` and handles a bare URL with a
+   fragment inconsistently, but no Windows machine has run it. The
+   fallback is the printed URL, which is why it is printed first and
+   unconditionally.
 10. **Whether Safari has shipped any Local Network Access behaviour.**
-    WebKit standards-position #520 is open with no position, labelled
-    `concerns: venue`, and Chrome Platform Status records Safari as "No
-    signal" [B17]. It matters only for how much of A1 the browser handles;
-    the design does not rely on LNA either way. Closed by reading a Safari
-    release note, or by testing.
+    **OPEN, and the design does not rely on LNA either way** (F7's own
+    spec text forbids relying on it). Closed by reading a Safari release
+    note, or by testing.
 11. **Whether the `/events?s=<token>` query-string form is acceptable in
-    practice.** `EventSource` cannot set request headers, so the SSE stream
-    carries the session token in a same-origin query string. It never
-    becomes a navigation and never enters history, and the only access log
-    is ours — but if that is judged wrong, the alternative is `fetch()` with
-    a `ReadableStream` body reader, which can set headers and costs perhaps
-    forty more lines of client code. A decision, not an unknown, recorded
-    here because it is the one place a credential appears in a URL.
+    practice.** **A decision, taken and shipped.** `EventSource` cannot
+    set request headers, so the stream carries the session token in a
+    same-origin query string; it never becomes a navigation, never enters
+    history, and the only access log is ours. The alternative — `fetch()`
+    with a `ReadableStream` reader — remains available at a cost of a few
+    dozen lines of client code. Recorded because it is the one place a
+    credential appears in a URL.
 12. **Two questions this design made moot rather than answered**, recorded
     so a future reader does not re-open them: whether `Secure` cookies work
     on `http://127.0.0.1` (Chrome yes [B23], Firefox yes [B24], Safari
@@ -2351,6 +2973,22 @@ closes it; none is closed by more reading.
     [B21] — it is nonetheless treated as reject-when-wrong rather than
     require-always, so that a client without it is not locked out of a
     surface whose real credential is a header.
+
+**Four things went the other way — unknowns this document did not have.**
+They are listed so the next design's "what could not be verified" section
+knows to look for this shape:
+
+- **`net/http`'s `{id}` wildcard does not match a bare `%2F`.** Not in the
+  documentation; found by probing the router. Two implementation passes
+  hit it independently, which is the signal that it was the design's
+  omission rather than one author's mistake.
+- **`html/template` escapes `+` in an attribute**, which makes a
+  standard-base64 CSP nonce work only by way of entity decoding.
+- **`pagehide` fires before the connection tears down**, so the obvious
+  beacon comparison discards every beacon that worked.
+- **x/net's WebDAV handler sniffs 512 bytes of any file whose extension
+  has no MIME type**, which is how a followed symlink disappeared from its
+  own listing.
 
 ---
 

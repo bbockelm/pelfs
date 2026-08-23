@@ -7,7 +7,7 @@ require (
 	github.com/go-git/go-billy/v5 v5.9.1
 	github.com/hanwen/go-fuse/v2 v2.11.0
 	github.com/klauspost/compress v1.19.1
-	github.com/pelicanplatform/pelican v0.0.0-20260813210837-7a5e7ab292c3
+	github.com/pelicanplatform/pelican v0.0.0-20260823003933-d01f207b7f71
 	github.com/willscott/go-nfs v0.0.4
 	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78
 	golang.org/x/sys v0.47.0
@@ -129,24 +129,6 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
-
-// Fork replace, branch pelfs-overwrite-scopes of
-// https://github.com/bbockelm/pelican (commit 991d3b616). A fork replace
-// rather than a local path, so CI runners can fetch it.
-//
-// It carries more than the scope fix it was created for, and pelfs does
-// not merely prefer the fork — it does not COMPILE without it:
-//
-//   - uploads request storage.modify when Client.EnableOverwrites is set;
-//     upstream still hardcodes MethodPut with config.TokenWrite
-//   - TransferEngine.Walk and .List, called directly by fedstore.go
-//   - director-response cache keyed per flavor, so a writer is never
-//     handed the cache a reader populated
-//   - service-digest checksum defaults, and a LazyStat transfer option
-//
-// Dropping this therefore needs all of those upstream, not just the
-// first. Checked against pelican main on 2026-08-17: still required.
-replace github.com/pelicanplatform/pelican => github.com/bbockelm/pelican v0.0.0-20260822203357-885e9818ade8
 
 // Fork replace: LINK misparsed its own arguments and answered failures
 // with an undersized reply, so hard links reached clients as EIO;

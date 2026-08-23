@@ -177,13 +177,13 @@ func (f *allFS) Commit(path string) error {
 // for a commit that does nothing -- fsync(2) returning success over data
 // no layer ever made durable, which is KI-10 restored one level up.
 func TestDiagnosePreservesTheCommitInterface(t *testing.T) {
-	if _, ok := diagnose(memfs.New()).(nfs.Committer); ok {
+	if _, ok := diagnose(memfs.New(), nil).(nfs.Committer); ok {
 		t.Error("wrapper claims nfs.Committer for a filesystem that has none: go-nfs would answer " +
 			"UNSTABLE to writes and commit them nowhere")
 	}
 
 	inner := &commitFS{Filesystem: memfs.New()}
-	wrapped := diagnose(inner)
+	wrapped := diagnose(inner, nil)
 	c, ok := wrapped.(nfs.Committer)
 	if !ok {
 		t.Fatal("wrapper dropped nfs.Committer, so COMMIT goes back to answering without asking")
@@ -203,14 +203,14 @@ func TestDiagnosePreservesTheCommitInterface(t *testing.T) {
 
 	// A commit that fails must still fail through the wrapper: it is the
 	// only reply an application's fsync(2) is waiting on.
-	failing := diagnose(&commitFS{Filesystem: memfs.New(), fail: syscall.ENOSPC})
+	failing := diagnose(&commitFS{Filesystem: memfs.New(), fail: syscall.ENOSPC}, nil)
 	if err := failing.(nfs.Committer).Commit("/a.c"); !errors.Is(err, syscall.ENOSPC) {
 		t.Errorf("a failed commit came back as %v, want ENOSPC", err)
 	}
 
 	// And the full combination, which is the one the mount actually runs.
 	all := &allFS{chmodFS: chmodFS{Filesystem: memfs.New()}, granted: nfs.PermissionRead}
-	full := diagnose(all)
+	full := diagnose(all, nil)
 	if _, ok := full.(billy.Change); !ok {
 		t.Error("wrapper dropped billy.Change from the four-way shape")
 	}
@@ -239,7 +239,7 @@ func TestDiagnosePreservesTheCommitInterface(t *testing.T) {
 // filesystem behind it, and every ACCESS would come back granting nothing
 // -- a mount on which nothing can be opened at all.
 func TestDiagnosePreservesTheInterfacesGoNFSAsserts(t *testing.T) {
-	plain := diagnose(memfs.New())
+	plain := diagnose(memfs.New(), nil)
 	if _, ok := plain.(billy.Change); ok {
 		t.Error("wrapper claims billy.Change for a filesystem that has none")
 	}
@@ -250,7 +250,7 @@ func TestDiagnosePreservesTheInterfacesGoNFSAsserts(t *testing.T) {
 		t.Error("wrapper dropped WriteCapability")
 	}
 
-	changeable := diagnose(&chmodFS{Filesystem: memfs.New()})
+	changeable := diagnose(&chmodFS{Filesystem: memfs.New()}, nil)
 	if _, ok := changeable.(billy.Change); !ok {
 		t.Fatal("wrapper dropped billy.Change")
 	}
@@ -258,7 +258,7 @@ func TestDiagnosePreservesTheInterfacesGoNFSAsserts(t *testing.T) {
 		t.Error("wrapper invented nfs.PermissionChecker for a changeable filesystem")
 	}
 
-	checker := diagnose(&permFS{Filesystem: memfs.New(), granted: nfs.PermissionRead})
+	checker := diagnose(&permFS{Filesystem: memfs.New(), granted: nfs.PermissionRead}, nil)
 	pc, ok := checker.(nfs.PermissionChecker)
 	if !ok {
 		t.Fatal("wrapper dropped nfs.PermissionChecker")
@@ -271,7 +271,7 @@ func TestDiagnosePreservesTheInterfacesGoNFSAsserts(t *testing.T) {
 	both := diagnose(&changePermFS{
 		chmodFS: chmodFS{Filesystem: memfs.New()},
 		granted: nfs.PermissionRead | nfs.PermissionWrite,
-	})
+	}, nil)
 	if _, ok := both.(billy.Change); !ok {
 		t.Error("wrapper dropped billy.Change from a filesystem that also checks permissions")
 	}
@@ -313,7 +313,7 @@ func TestChangeErrorsCarryAnNFSStatus(t *testing.T) {
 			eioReportedAt.Store(0)
 			eioSuppressed.Store(0)
 
-			fs := diagnose(&chmodFS{Filesystem: memfs.New(), fail: tc.err})
+			fs := diagnose(&chmodFS{Filesystem: memfs.New(), fail: tc.err}, nil)
 			err := fs.(billy.Change).Chmod("/a.c", 0o644)
 			var st *nfs.NFSStatusError
 			if !errors.As(err, &st) {

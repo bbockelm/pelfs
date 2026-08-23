@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -164,10 +165,32 @@ type genSession struct {
 	down *phaseClock
 	// downOnce draws the teardown boundary exactly once, from whichever
 	// path first notices the session is over: the payload exiting, a
-	// signal, or an unmount performed from outside this process. The
-	// racing candidates are on different goroutines, so the Once is what
-	// makes the clock's fields safe as well as the boundary singular.
+	// signal, an eject in the Finder, or an unmount performed from outside
+	// this process. The racing candidates are on different goroutines, so
+	// the Once is what makes the clock's fields safe as well as the
+	// boundary singular.
 	downOnce sync.Once
+	// ending is the same boundary as a FACT other goroutines can read.
+	//
+	// THIS IS THE ONE THING THE TWO AUTOMATIC-PUBLISH TRIGGERS SHARE. A
+	// session has more than one thing watching for "publish now": the
+	// periodic checkpointer, and -- on a browse session -- the idle sealer
+	// (idleseal.go), which fires when the last tab has been gone a while.
+	// Neither of them can see the teardown boundary through downOnce,
+	// because a sync.Once has no reader. So an automatic publish could
+	// start on the far side of it: after the payload exited, after a
+	// signal, after a Finder eject, at the moment the exit path is about
+	// to seal everything anyway. Nothing is corrupted when that happens --
+	// g.mu serializes the seals -- but the exit blocks on a publish nobody
+	// is waiting for any more, and the phase breakdown charges a
+	// checkpoint to a teardown.
+	//
+	// One bool, set by the same beginTeardown that draws the line, is what
+	// makes "the session is ending" answerable by whoever asks, however
+	// the session came to be ending. atomic because the readers are on
+	// their own goroutines and the writer is on whichever goroutine
+	// noticed first.
+	ending atomic.Bool
 
 	// The periodic checkpointer's lifecycle, so the exit path can JOIN it
 	// instead of racing it. Stopping is two signals rather than one:
@@ -249,6 +272,25 @@ type genArgs struct {
 	// background is set only by the `pelfs mount` daemon child, and it
 	// decides ONE thing: where the mount record goes. See registryRoot.
 	background bool
+	// finder makes the mount a Finder-visible macOS volume, and
+	// volumeName is what it should be called (cmd/pelfs/finder.go). Both
+	// are inert everywhere else: the default mount is deliberately
+	// invisible, because that is what every script, every gate and every
+	// Linux user has always got.
+	finder     bool
+	volumeName string
+}
+
+// registerFinderFlags puts --finder and --volume-name on a command that
+// mounts. Per command rather than in registerFlags, because they mean
+// nothing to `pelfs gc` or `pelfs tag` -- and not on `pelfs shell` at all,
+// which mounts on a temporary directory it deletes at exit: a volume in
+// the Finder sidebar whose name is pelfs-mnt-1234567 and which vanishes
+// when a subshell exits is not the thing this flag is for.
+func registerFinderFlags(fs *flag.FlagSet, a *genArgs) {
+	fs.BoolVar(&a.finder, "finder", false, "macOS only: mount a browsable volume that shows up in the Finder sidebar under "+
+		"a chosen name, refusing the Finder's own bookkeeping files; ejecting it in the Finder seals and ends the session")
+	fs.StringVar(&a.volumeName, "volume-name", "", "with --finder, the name the volume answers to (default: the last component of the prefix)")
 }
 
 // FOREGROUND, AND THE TRAILING -f APPTAINER ADDS.
@@ -301,6 +343,7 @@ func cmdMountGen(args []string) int {
 		fs.DurationVar(&a.poll, "poll", 0, "read-only: re-check the branch head this often and swap generations live (0 = pinned, the reproducible-batch default)")
 		fs.StringVar(&a.signingKeyPath, "signing-key", "", signingKeyUsage)
 		fs.Bool("foreground", false, "no-op: mount-gen always serves in the foreground. Accepted, before or after the mountpoint, because apptainer passes `-f` to a --fusemount driver")
+		registerFinderFlags(fs, &a)
 	})
 	if err != nil {
 		return exitErr(err)
@@ -317,8 +360,18 @@ func cmdMountGen(args []string) int {
 		if a.backend, err = passedFDBackend(o); err != nil {
 			return exitErr(err)
 		}
-	} else if a.backend, err = resolveBackend(o); err != nil {
-		return exitErr(err)
+	} else {
+		if a.finder {
+			finderBackend(o)
+		}
+		if a.backend, err = resolveBackend(o); err != nil {
+			return exitErr(err)
+		}
+	}
+	if a.finder {
+		if err := checkFinder(a.backend); err != nil {
+			return exitErr(err)
+		}
 	}
 	return runMountGen(o, pos[0], pos[1], command, a)
 }
@@ -487,6 +540,65 @@ func (g *genSession) reportSessionUpload(pack string, bytes int64, elapsed time.
 		"size", ui.ByteCount(bytes), "elapsed", elapsed.Round(time.Millisecond))
 }
 
+// mountEndReason is why a served mount session is over, and there is
+// exactly one place that decides it.
+type mountEndReason int
+
+const (
+	// endSignalled: SIGTERM or SIGINT. `pelfs umount` sends one, and so
+	// does Ctrl-C in a foreground `mount-gen`.
+	endSignalled mountEndReason = iota
+	// endEjected: the mount is no longer in the kernel's mount table.
+	// On macOS that is the Finder's eject button; anywhere it can happen,
+	// it is somebody having detached the mount from outside.
+	endEjected
+)
+
+// awaitMountEnd blocks until a served NFS mount session is over, and says
+// which edge ended it.
+//
+// WHY THIS IS ONE FUNCTION, AND WHY IT IS NOT THE IDLE SEALER.
+//
+// pelfs now has two things that watch a live session and act on their own.
+// They look alike from a distance -- a goroutine, a tick, a condition, an
+// automatic publish -- and they answer different questions:
+//
+//   - IDLE SEALING (idleseal.go) asks "should this session publish NOW?"
+//     Its evidence is the browse server's set of open SSE streams plus
+//     overlay write pressure, and its outcome is a CHECKPOINT: the session
+//     keeps serving, the tab may come back, and it may fire again later,
+//     with a backoff if the federation refused the last one.
+//   - THIS asks "is this session OVER?" Its evidence is the kernel's mount
+//     table, and its outcome is a TEARDOWN: seal once, at exit, and exit.
+//     It fires at most once and has nothing to retry.
+//
+// Merging them would produce a function whose two halves share a ticker
+// and nothing else, and whose only common parameter is the semantic
+// difference itself ("...and then exit?"). So they stay separate -- but the
+// eject watch is deliberately NOT a second thing that can seal. It is one
+// more edge on the single select that already ends a mount session, so the
+// teardown after it (beginTeardown, unmount, stopSession, drainCheckpoints,
+// sealAtExit) is the same code a signal has always run, in the same order,
+// with the same guarantee: drainCheckpoints joins a checkpoint that is
+// already sealing, and sealAtExit takes g.mu, so an eject that lands in the
+// middle of a publish waits for it rather than racing it.
+//
+// What the two DO share is one fact -- genSession.ending, set by
+// beginTeardown -- so that whichever edge ends the session, an automatic
+// publish trigger that samples afterwards sees a session that is ending and
+// starts nothing new. docs/finder.md has the same argument in prose.
+//
+// A nil ejected channel blocks forever, which is what makes a mount without
+// --finder behave exactly as it did when this was a bare `<-sigs`.
+func awaitMountEnd(sigs <-chan os.Signal, ejected <-chan struct{}) mountEndReason {
+	select {
+	case <-sigs:
+		return endSignalled
+	case <-ejected:
+		return endEjected
+	}
+}
+
 // runMountGen serves one generation. Reached from `pelfs mount-gen` and,
 // for a v2 volume, from `pelfs shell`.
 func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genArgs) int {
@@ -501,6 +613,28 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	}
 	if err := os.MkdirAll(stateDir, 0700); err != nil {
 		return exitErr(err)
+	}
+
+	// Where a Finder volume goes, and what it is called, is decided before
+	// anything else happens: the mountpoint it resolves to is the one the
+	// session records, reports and mounts on -- so it has to be settled
+	// before the genSession that carries it is built and before the
+	// statistics file names it. An empty mountpoint means "choose one",
+	// which only `pelfs mount --finder` passes.
+	var vol finderVolume
+	if a.finder {
+		v, err := finderMount(prefix, a.volumeName, mountpoint)
+		if err != nil {
+			return exitErr(err)
+		}
+		vol = v
+		mountpoint = vol.MountPoint
+	} else if mountpoint == "" {
+		// Unreachable through either command -- `mount-gen` requires the
+		// path and `pelfs mount` defaults it -- and asserted rather than
+		// assumed, because an empty mountpoint reaches os.MkdirAll and
+		// mount_nfs as the current directory.
+		return exitErr(errors.New("no mountpoint: only a --finder mount may leave the choice to pelfs"))
 	}
 
 	g := &genSession{
@@ -759,10 +893,13 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		} else {
 			bfs = vfsbilly.NewReadOnly(g.gfs)
 		}
-		nfsSrv, err = nfsmount.Serve(bfs)
+		nfsSrv, err = nfsmount.Serve(bfs, nfsmount.ServeOptions{HideFinderFiles: a.finder})
 		if err == nil {
 			defer g.down.timed("server", func() { nfsSrv.Close() }) //nolint:errcheck
-			err = nfsSrv.Mount(mountpoint, "pelfs")
+			err = nfsSrv.Mount(mountpoint, nfsmount.MountOptions{
+				VolumeName: vol.Name,
+				Browsable:  a.finder,
+			})
 		}
 	case "fuse", "":
 		if rw {
@@ -804,6 +941,9 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	}
 	ui.Info("generation {generation} mounted {mode} on {mountpoint} (catalog-native)",
 		"generation", sb.Generation, "mode", mode, "mountpoint", mountpoint)
+	if a.finder {
+		reportFinderVolume(vol, rw)
+	}
 	if passedFD {
 		// Said out loud because both halves are surprising: the mount
 		// options this process asked for went nowhere (the parent's
@@ -893,6 +1033,16 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		// seal (with --rw) happens on the way out just as it does for a
 		// signalled mount — a failing command still gets its teardown, and
 		// still carries its status out.
+		//
+		// NO EJECT WATCH HERE, and that is the right answer rather than an
+		// omission: the payload is the thing that ends this session, and
+		// tearing down under a subshell whose cwd is the mountpoint would
+		// take the user's shell away mid-command. `pelfs shell` cannot
+		// reach this with --finder at all (the flag is not registered on
+		// it), so the only way in is `mount-gen --finder --subshell`,
+		// where an eject leaves the payload running over a detached mount
+		// until it exits on its own -- visible, and better than the
+		// alternative.
 		code = runInMount(o, prefix, mountpoint, command)
 		// Everything from here on is teardown: the user has stopped
 		// working and is now waiting on us.
@@ -912,7 +1062,35 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		sigs := make(chan os.Signal, 1)
 		signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
 		if nfsSrv != nil {
-			<-sigs
+			// THE EJECT EDGE. A signal is not the only way a Finder volume
+			// ends: the volume has an eject button, and pressing it is how
+			// a Mac user says they are done. Eject detaches the mount and
+			// tells the server nothing — we are the server, and a client
+			// that has unmounted simply stops sending RPCs — so without a
+			// watch on the mount table this would sit here forever with
+			// the session's unsealed overlay in it. The user would have
+			// every reason to think they had finished, and the next reboot
+			// or `kill` would strand the generation.
+			//
+			// Ejecting therefore means exactly what `pelfs umount` means,
+			// and it means it BY THE SAME CODE: the watch contributes one
+			// more edge to awaitMountEnd, and everything after it — the
+			// teardown boundary, the unmount, the checkpoint drain, the
+			// seal at exit — is the sequence a signal has always run.
+			// There is no second teardown driver and no second sealer.
+			//
+			// The watch runs only for a browsable mount, because that is
+			// the only kind with an eject button; an outside `umount` of
+			// an ordinary mount still waits for its signal, as it always
+			// has, and `pelfs umount` sends one.
+			var ejected <-chan struct{}
+			if a.finder {
+				ejected = nfsmount.WatchUnmount(sessionCtx, mountpoint)
+			}
+			if awaitMountEnd(sigs, ejected) == endEjected {
+				ui.Info("{mountpoint} is no longer mounted (ejected in the Finder, or unmounted from outside): "+
+					"sealing and exiting, the same as `pelfs umount`", "mountpoint", mountpoint)
+			}
 			g.beginTeardown()
 			if unmountErr = nfsmount.Unmount(mountpoint); unmountErr != nil {
 				ui.Error("unmount: {error}", "error", unmountErr)
@@ -1509,9 +1687,24 @@ func (c *phaseClock) sentence(lead string) string {
 // statements away from the clock would be a split nobody could defend.
 func (g *genSession) beginTeardown() {
 	g.downOnce.Do(func() {
+		// Set FIRST, inside the Once: a trigger that samples between the
+		// clock starting and the flag being set would see a session that
+		// is measurably tearing down and still say it may publish.
+		g.ending.Store(true)
 		g.down.begin()
 		g.stats.SetPhase(stats.PhaseTeardown)
 	})
+}
+
+// isEnding reports whether teardown has begun, for the automatic-publish
+// triggers that must not start new work across that line. See the `ending`
+// field for why this is a fact on the session rather than a channel each
+// trigger arranges for itself.
+func (g *genSession) isEnding() bool {
+	if g == nil {
+		return false
+	}
+	return g.ending.Load()
 }
 
 // reportPhaseSplit is the answer to "was any of this published while I

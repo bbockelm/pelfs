@@ -46,6 +46,15 @@ package main
 //     code can never have two of its own in flight, and it claims the
 //     browseServer publish slot first, which is the same slot the
 //     "Publish now" button takes and answers a second click with 409.
+//   - A SESSION THAT IS ENDING MUST NOT START A NEW AUTOMATIC PUBLISH.
+//     Whatever ended it -- Ctrl-C here, a signal or a Finder eject on a
+//     mount session (mountgen.go's awaitMountEnd) -- the exit path is about
+//     to seal everything this would have sealed, and sealAtExit takes the
+//     same g.mu. Starting one anyway is not a corruption, it is a wait
+//     nobody is left to care about and a checkpoint charged to a teardown.
+//     genSession.ending is the fact, set by beginTeardown, and it is the
+//     ONE thing this trigger and the eject watch share: two triggers, two
+//     different questions, one answer to "is the session over".
 //
 // # Why the pressure path's backoff and not a new one
 //
@@ -128,6 +137,11 @@ type idleSealer struct {
 	pressure func() (int64, int)
 	// seal is genSession.checkpoint. Same reason.
 	seal func(context.Context) (string, error)
+	// ending reports whether the session's teardown has begun
+	// (genSession.ending). Injected like the two above so a test can drive
+	// the boundary without a volume; nil means "not ending", which is what
+	// a fixture with no session wants.
+	ending func() bool
 	// now is the clock. Injected for the tests, which move it in whole
 	// hours rather than sleeping: this repo deleted a timing-based lease
 	// test as vacuous once, and a sleep-synchronised test of a
@@ -171,6 +185,7 @@ func newIdleSealer(b *browseServer, g *genSession, interval time.Duration) *idle
 		b:        b,
 		pressure: g.pressure,
 		seal:     g.checkpoint,
+		ending:   g.isEnding,
 		now:      b.nowTime,
 		window:   idleQuietWindow(interval),
 		interval: interval,
@@ -249,6 +264,14 @@ func (s *idleSealer) step(ctx context.Context) {
 // them in one place is how a later change keeps them all.
 func (s *idleSealer) due() bool {
 	if s.window <= 0 {
+		return false
+	}
+	// The session is over. Checked FIRST, before anything is sampled: the
+	// exit path seals whatever is staged, and a publish started across
+	// that line is one the teardown then has to wait for. See the file
+	// comment's fifth requirement, and awaitMountEnd in mountgen.go for
+	// the other trigger that respects the same fact.
+	if s.ending != nil && s.ending() {
 		return false
 	}
 	streams, idleSince, hint := s.b.idleSignal()

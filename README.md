@@ -173,6 +173,30 @@ macOS shows its one-time "would like to access files on a network volume"
 permission prompt (TCC) for that app — click Allow once per app
 (Terminal, Finder, ...).
 
+### In the Finder, like a volume
+
+```
+pelfs mount --rw --finder pelican://<federation>/<prefix>
+```
+
+`--finder` (macOS, NFS backend) makes the mount a **Mac volume**: it appears
+in the Finder sidebar under Locations, named after the prefix or after
+`--volume-name`, with an eject button that seals the session and exits —
+the same thing `pelfs umount` does. It mounts on `/Volumes/<name>` when that
+directory exists and is yours, else on `~/Volumes/<name>`, and it prints the
+one-time `sudo mkdir`/`chown` that moves it into `/Volumes`.
+
+It also **refuses the Finder's bookkeeping files** (`.DS_Store`, and the
+metadata daemons' directories), which on a `--rw` mount would otherwise be
+sealed into the volume's history forever and re-published every time a
+window moves.
+
+Without `--finder` nothing changes: a pelfs mount stays invisible to the
+GUI, which is what scripts and CI depend on. `docs/finder.md` has the rest —
+the eject and `.DS_Store` reasoning, what is deliberately *not* filtered,
+why eject and the web UI's idle sealing are two mechanisms rather than one,
+and why the mount does not go through macOS's NetFS.
+
 ## Batch / JupyterLab usage (e.g. inside an HTCondor job)
 
 For a user working interactively inside a job sandbox, the intended pattern
@@ -249,7 +273,8 @@ volume's data keys — the same key must be supplied on every later mount;
 (where the overlay, caches, trust pin, and signing key live), `--poll`
 (read-only mounts follow the branch head live), `--no-seal`,
 `--volume-pubkey`, `--ignore-volume-lease` (proceed past a pelfs v0.1.0
-volume-wide lease — see *Caveats*), and the two maintenance switches
+volume-wide lease — see *Caveats*), `--finder` / `--volume-name` (macOS: a
+volume in the Finder sidebar), and the two maintenance switches
 `--no-auto-repack` / `--no-auto-gc`.
 
 ## Messages

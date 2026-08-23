@@ -36,6 +36,12 @@ two rows were added to the table at the bottom, and the KI/KL entries that
 predate it were not re-checked (they were current at `0c2baf0` and nothing
 in `pelfs browse` touches them).
 
+**KI-11 was closed at `b16784d`** by mount-app-agent, the pass that put the
+file manager on the route table — the same pass that made the defect
+reachable by a user at all, since until then nothing served the app. Its row
+is in the table at the bottom, with what the entry got wrong about its own
+mechanism.
+
 **Re-verified at `b16784d`** by release2-agent for the v0.2.1 release,
 this time over every entry rather than one surface. The file now holds
 **7 KI (4-9, 11) and 15 KL (1-9, 11-16)** — KL-15 and KL-16 are new here,
@@ -226,50 +232,6 @@ deciding whether a repack's ledger stamp is inside the injectable clock —
 a repack-semantics call.
 
 ---
-
-### KI-11. A failed mutation in the file manager resolves to `undefined`, so a failed rename looks successful
-
-**Severity: medium, and it is the only entry here that can cost a user
-their belief about the volume.** In the browser file manager, a rename,
-move, copy, delete or folder-create that the server REFUSES is reported to
-the component as success. The user sees the new name; the volume has the
-old one.
-
-**Mechanism.** `RestDataProvider.send()` in
-`@svar-ui/filemanager-data-provider` throws on `!res.ok` and then attaches
-`.catch` **after** that throw in the promise chain, so every failure is
-swallowed and the promise resolves to `undefined`. The component treats a
-resolved promise as a completed action. This is upstream's code, not ours:
-`PelfsDataProvider` (`webui/frontend/src/api/provider.ts`) overrides
-`send()` to fix the two OTHER defects in the same method — `setHeaders()`
-never reaching the wire, and mutations shipping as `text/plain` — but it
-calls `super.send()`, so this one is untouched.
-
-**What the server does right, which is why this is a client-side entry.**
-Every refusal is a real status with a real body: 403 from `internal/fsperm`
-through `internal/vfsbilly`, 409 on a concurrent publish, 415 on a wrong
-content type, and per-id result arrays on batch operations so a batch whose
-fourth rename hit `EACCES` reports exactly that. None of it reaches the
-screen.
-
-**Not fixed yet because the honest fix is a decision, not a patch.**
-Either override the whole promise chain (a second copy of upstream's
-method, which rots on every component upgrade), or wrap the provider so
-every action's result is inspected before the component sees it, or carry
-a patch upstream. The third is the only one that does not leave pelfs
-owning a copy of somebody's method.
-
-**Meanwhile, the visible surfaces are honest:** the WebDAV endpoint and
-`curl` against `/api/v1/*` both return the real status, so a user who
-doubts a rename can check it — which is worth stating because it is the
-only workaround there is.
-
-**Pinned by an executable test: NO.** It is a defect in a JavaScript
-dependency's promise chain; the Go-side contract replay
-(`internal/webapi/contract_test.go`) asserts what the server answers, which
-is correct, and cannot observe what the component then does with it. A
-Playwright assertion on a refused rename is the test that would pin it and
-it is not written.
 
 ---
 
@@ -731,6 +693,7 @@ pass does not re-file them.
 | **The dedup sidecar after a repack** (was KI-3) | **FIXED** by spool-agent (`a7d336a`), both halves in one operation: `publish.RestampDedupIndex`, called from `repack.execute` after the flip, rewrites the sidecar with exactly the rows the sweep's reachable set still reaches and stamps it with the generation the repack published. Filtering without restamping would be a file nobody reads; restamping without filtering would promise chunks the repack has just dropped — which is why they are one function and not two. Pinned by `TestASealAfterARepackStillDeduplicates` (`internal/repack/dedup_test.go:67`), which measures the bytes the post-repack seal puts on the wire for a 3 MiB file the generation already stores. Its ASSERTION is a ceiling (`dedup_test.go:174`, under half the file); the observed 4 KiB with the fix against 3.15 MiB without it is a logged number, not a pinned one. |
 | **A crash between a flush's publish and its location record loses that batch** (was KL-10) | **FIXED** by durability-agent: `publish` no longer reclaims the ring region a batch came from. It queues the region (`Store.locating`) and `journalLocated` releases it, so until the `Located` record binding handles to packs is durable the ring is still where recovery finds those extents — and a crash in the window loses nothing rather than one flush batch (2 MiB at the shipped pack target). Only a PREFIX is released, because that is all a ring can release: four upload workers finish out of order, so a batch is marked done and the tail advances over however many done batches sit at the front. `Flush` waits for the queue to drain, which is what makes "a flush means recorded" true as well as "a flush means uploaded". Pinned by `memtable.TestACrashBeforeTheLocatedRecordLosesNothing` and `memtable.TestTheRingIsNotReclaimedUntilTheLocatedRecordIsDurable` (`internal/memtable/losswindow_test.go`) — one through `Store.Durable`/`Recover`, one at the ring itself, neither killing anything. The cost was the reason it was deferred and it was MEASURED rather than argued (`memtable.TestMeasureRingHoldBackpressure`, `PELFS_RINGHOLD_MEASURE=1`): holding the ring moves the uplink's cost from the seal into the write phase and leaves end-to-end throughput alone. |
 | **`fsync` over NFS makes nothing durable** (was KI-10) | **FIXED** by commit-agent, and NOT where this file said the fix was. The COMMIT no-op was real but unreachable: `onWrite` wrote the constant FILE_SYNC into the stability field of every WRITE reply, and a Linux client queues a page for commit only when the reply said UNSTABLE — so it never sent a COMMIT. Measured before the fix on this repo's own mount-gate container: `dd conv=fsync` produced 2 WRITEs and **0** COMMITs; after, 1 COMMIT. The fork (`d92cb75`, pinned in `go.mod`) now exports `nfs.Committer`, which both `onWrite` and `onCommit` consult; `internal/vfsbilly` implements it with `overlay.FS.Sync`, the same body the FUSE frontend's `Fsync` calls. Pinned by `internal/vfsbilly/commit_test.go` (a commit syncs, a repeat commit is free), `internal/nfsmount/diag_internal_test.go` (the wrapper must not over-claim the interface), the fork's own `nfs_oncommit_test.go`, and `commit_gate` in `scripts/mount-gate-test.sh`, which asserts against a real kernel NFS client that a COMMIT is SENT. |
+| **A refused mutation in the file manager resolved to `undefined`, so a failed rename looked successful** (was KI-11) | **FIXED** by mount-app-agent, and the mechanism was not the one this file named. The entry said `PelfsDataProvider` "calls `super.send()`", so upstream's swallowed rejection reached the app: it does not — `send()` is a full override that does its own fetch and REJECTS on `!res.ok`, which was true when the entry was written. What actually kept the lie on the screen is a step further on: the STORE applies every mutation optimistically (`@svar-ui/filemanager-store`'s `rename-file` renames the node and re-parents its children before the provider is reached), and a rejection rolls none of that back — so the banner said "that did not happen" beside a row showing that it had. Of the three options this file offered, the second was taken: `PelfsDataProvider.getHandlers` (`webui/frontend/src/api/provider.ts`) wraps each of the five mutating handlers, and on a rejection RE-LISTS the directories the event touched and hands the answer to the store as `provide-data`, which replaces that directory outright. Deliberately not an inverse operation: undoing a rename in the store means keeping a second model of the volume, and the first case that model gets wrong is a batch whose fourth id failed. No copy of upstream's promise chain, so no re-read on every component upgrade. **Pinned by two executable tests**, which the entry said were the missing thing: `A REFUSED RENAME DOES NOT STAY ON THE SCREEN` and `a refused delete leaves the file where it was` (`webui/frontend/tests/filemanager.spec.ts`), driving a real 403 from a read-only path in the mock volume (`mockEntry.ro`, `internal/webui/mockapi_test.go`) and asserting BOTH halves — that the user is told, with the server's reason, and that the row is back under its original name. |
 | **C2**, the "fsck lifts the cap" claim | **STALE** in that detail — `internal/fsck` does not touch `packIndex`. The rest of C2 survives as KI-8. |
 | **F11** dead/unwired inventory; **G4**, **G6** doc-staleness sweeps | Real work, but hygiene and prose rather than defects or limitations. They stay in `docs/TODO.md`, which is what a punchlist is for. |
 | **`golang.org/x/net` is in `go.mod` as `// indirect`** while `internal/vfsdav` imports `webdav` directly (reported by the WebDAV pass, and predicted to be "promoted by the next `go mod tidy`") | **STALE — the promotion already happened.** `go.mod`'s direct `require` block carries `golang.org/x/net v0.56.0` with **no** `// indirect` marker, at the same version it was pinned at as an indirect. `docs/design-windows.md`'s "The Go half is already compliant" was updated to say so. Nothing to file. |
@@ -754,10 +717,16 @@ Nothing left in this file is expressible as a plan, which is why they
 are here:
 a memory ceiling reached only at a hundred million objects (KI-8), a
 missing stats field (KI-4, KI-5), an error class thrown away (KI-6), a
-transaction count (KI-7), a wall clock in the wrong place (KI-9), and a
-swallowed rejection in a JavaScript dependency's promise chain (KI-11),
-which the corpus cannot express for the simpler reason that the corpus
-drives a filesystem and that one needs a browser.
+transaction count (KI-7), and a wall clock in the wrong place (KI-9).
+
+KI-11 was the one entry the corpus could not express for a different
+reason — it needed a BROWSER, not a filesystem — and that turned out to be
+a statement about the corpus rather than about the bug: the assertion was
+perfectly ordinary once it was made in Playwright, where a suite already
+existed. The lesson worth keeping is the one in its row below: the entry
+named the wrong mechanism (`super.send()`, which the code does not call)
+and the right symptom, and a reader who had fixed only what it named would
+have changed nothing.
 
 KI-10 was the second entry whose halves came apart the way KL-10's did,
 and it is worth one paragraph because the resolution was not the one this

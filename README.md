@@ -217,8 +217,9 @@ volume's data keys — the same key must be supplied on every later mount;
 `$PELFS_KEY_PASSPHRASE` unlocks a passphrase-protected PEM), `--state-dir`
 (where the overlay, caches, trust pin, and signing key live), `--poll`
 (read-only mounts follow the branch head live), `--no-seal`,
-`--volume-pubkey`, and the two maintenance switches `--no-auto-repack` /
-`--no-auto-gc`.
+`--volume-pubkey`, `--ignore-volume-lease` (proceed past a pelfs v0.1.0
+volume-wide lease — see *Caveats*), and the two maintenance switches
+`--no-auto-repack` / `--no-auto-gc`.
 
 ## Messages
 
@@ -337,7 +338,9 @@ successor key it already minted instead of generating a second one.
 These are the ones that change how you use it. Defects that are found and
 not yet fixed, and the limitations that are accepted on purpose, are
 tracked in [`docs/known-issues.md`](docs/known-issues.md) — every entry
-there says whether an executable test pins it.
+there says whether an executable test pins it. What changed in a given
+release, and what to do about it when upgrading, is in
+[`CHANGELOG.md`](CHANGELOG.md).
 
 - **Single writer per BRANCH.** The advisory lease is detection, not mutual
   exclusion: the transport has no compare-and-swap. A seal that would
@@ -366,6 +369,26 @@ there says whether an executable test pins it.
     the seal's refusal to publish over a moved ref, which is the real
     protection in every case. Do not run a v0.1.0 client against a volume a
     v0.2 client is writing.
+- **The NFS backend enforces POSIX permissions, and they are the MOUNT's
+  permissions.** Since v0.2.0 an NFS-backed mount checks mode bits the way
+  the kernel does — class by class with the first match deciding, write and
+  search on a parent directory for anything that creates or removes a name,
+  search on every path component, the sticky-bit rule, ownership for
+  `chmod`/`utimes` — so a write a v0.1.0 mount would have accepted through
+  a mode-0444 file is now refused with `EACCES`, `access(2)` and `test -w`
+  answer honestly, and `tar -p` works. **There is no flag to turn this
+  off.**
+
+  Whose permissions: every request is evaluated as the identity that
+  started the server — its uid, gid, groups and effective capabilities,
+  through the same id map that decides whose name the mount puts on a
+  file. The AUTH_UNIX credential in each NFS request is deliberately NOT
+  consulted, because the export is loopback and any local process can dial
+  127.0.0.1 and claim any uid. So this is **fidelity** — the same answer
+  through the NFS backend as through FUSE — and **not access control**: do
+  not treat a pelfs NFS export as a multi-user boundary. The reasoning is
+  written out in `docs/go-nfs-patches.md`. FUSE mounts are unchanged; the
+  kernel checks those (`default_permissions`).
 - The origin must permit GET/PUT/DELETE and listing on the prefix (i.e. a
   token with read/modify scopes for the namespace); `pelfs` checks this up
   front and says which scope is missing.
@@ -380,8 +403,15 @@ there says whether an executable test pins it.
 
   The windows still apply and are the reason a repack followed straight
   away by a sweep frees nothing: an object goes when it is past the grace
-  window (72h by default, set per volume with `pelfs init --grace`) AND no
-  longer named by any of the last `Params.RetainK` generations. So the
+  window (72h by default, set per volume with `pelfs init --grace`, with a
+  one-hour floor) AND no longer named by any of the last `Params.RetainK`
+  generations. A long window buys less than it looks like it buys: the
+  condemned ledgers hold about 517 rows against a 48 KiB cap, so past
+  roughly `517 x --snapshot-interval` — ~43h at the 5-minute default, which
+  the 72h default is already past — the byte cap binds before the window
+  does, and repacks pace to the room left. Nothing a branch head or tag
+  names is affected; if you need a real pin, tag it. `pelfs init --grace`
+  says so when the value you pass collides. So the
   bytes come back a while after the work that made them collectable, on
   their own. `pelfs ctl <mount> status` reports `last_gc_at` and
   `reclaimed_bytes`; the statistics file carries a `maintenance` section
@@ -432,8 +462,17 @@ there says whether an executable test pins it.
   is refused: every object in a volume is reachable from a ref, so a volume
   with none has no head to mount, nothing for a new branch to start from,
   and no way back from the CLI.
-- There is no **merge**. Two branches that have diverged stay diverged; what
-  exists is branching, tagging and deleting, not reconciling.
+- **`pelfs merge` exists now, with three edges worth knowing.** It reads no
+  file content — both sides are already chunked — so a merge is cheap, but
+  it is report-first and refuses conflicts by default. `--keep-both` writes
+  theirs as `name (from <branch>).ext` and **nothing ever cleans those
+  copies up**, which is why it is opt-in. It cannot duplicate a
+  modify/delete conflict, since "both" would mean resurrecting a deleted
+  file under a name nobody chose. And two branches cut before per-branch
+  inode lineages existed cannot be merged at all: the merge names the
+  colliding inodes and the number one side must be shifted above, and
+  **there is no renumbering tool** in this release. Merge before you
+  rotate — see the rotation section above.
 - **Key rotation exists now** (`pelfs rotate`), with two sharp edges that are
   properties of the format rather than of the command. The pin is per VOLUME,
   so rotating one branch retires the pin for the whole volume and siblings

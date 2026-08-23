@@ -2,6 +2,51 @@
 
 ## Unreleased
 
+### `pelfs browse` is a file manager, a WebDAV server, and a credential desk
+
+The pieces existed and none of them was connected. `pelfs browse` now
+mounts all of them on its one loopback listener:
+
+- **A JSON data plane** at `/api/v1/files`, `/api/v1/info/{id}` and
+  `/api/v1/upload`: list, create, rename, move, copy, delete and whole-file
+  upload, over the same volume, the same namespace and the same permission
+  model every other frontend sees.
+- **A WebDAV endpoint** at `/dav/`, for the programs that are already good
+  at moving files — Cyberduck, Mountain Duck, rclone, WinSCP,
+  `mount_webdav`, the Windows redirector.
+- **An authorization server** at `/oauth/authorize` and `/oauth/token`, so
+  a downloaded `.cyberduckprofile` connects with one double-click and no
+  password at all.
+- **Downloads that carry no credential in the URL**: the page asks an
+  authenticated route for a single-use 30-second ticket and navigates to
+  `/d/<ticket>`, because an `<a href>` cannot set a request header and an
+  ambient-credential GET is the hole DNS rebinding exploits.
+
+**"Connect another program"** on the page is real now, where M1 said "not
+yet built": add a program, save the profile or the bookmark, take the
+username and password for everything else, and see and revoke every
+credential this session has handed out. Nothing persists — every secret is
+`crypto/rand` into memory — so quitting `pelfs browse` revokes all of it.
+
+A read-only session (still the default) can hand out a read-only WebDAV
+credential and nothing more: a writable one is refused at registration, by
+name, and the same refusal is checked again at grant time and at request
+time.
+
+**One correction to what M1 wrote down**, because it would have broken
+every Cyberduck connection: `POST /oauth/token` is on the guard's token
+surface, not on its exchange surface. Cyberduck's back-channel POST carries
+no `Origin` and no `Sec-Fetch-Site` (the exchange surface answers 403) and
+sends `application/x-www-form-urlencoded`, which RFC 6749 mandates (the
+exchange surface answers 415). The route table now says so, and two tests
+pin it.
+
+All of it is gated end to end by `make browse-gate`: the shipped binary
+against a fakeorigin, curl playing the browser, **real Cyberduck** playing
+the WebDAV client, and then a second, fresh `pelfs` that mounts the
+published generation from an empty state directory and reads every byte
+back out of the federation — including the file Cyberduck uploaded.
+
 ### `pelfs browse` publishes when the last tab closes
 
 A browser tab has no unmount. A drag-and-drop of 200 documents at ~2 MB
@@ -282,11 +327,34 @@ entries for inodes the metadata never committed, and the metadata may never
 name content the journal lacks, so a durable namespace over an unsynced
 journal is precisely the state that rule forbids.
 
-**An NFS-backed mount does not get this yet.** NFSv3 COMMIT is answered
-inside the `go-nfs` fork by a handler that is a hard-coded no-op — its own
-comment says writes are always pushed to the backing store, which for pelfs
-they are not — so pelfs never sees the operation and cannot answer it
-honestly. Filed as KI-10; the fix is a fork change, not a pelfs one.
+**An NFS-backed mount gets this too, and the fix was not where it looked.**
+NFSv3 COMMIT was answered inside the `go-nfs` fork by a hard-coded no-op —
+its own comment said writes are always pushed to the backing store, which
+for pelfs they are not. But adding a hook to COMMIT would have fixed
+nothing, because the handler was unreachable: the fork wrote the constant
+FILE_SYNC into the stability field of every WRITE reply, whatever the
+client asked for. That field is a promise about what the server ACHIEVED,
+and a Linux client believes it — it queues a page for commit only when the
+reply said UNSTABLE — so it never sent a COMMIT at all. Measured on a real
+kernel client before the fix: `dd conv=fsync` produced 2 WRITEs and **zero**
+COMMITs. The lie was in the WRITE reply first.
+
+The fork now carries one optional interface, `nfs.Committer`, that both
+procedures consult. A filesystem that implements it is taken to be holding
+data a crash could take: an unstable write is answered UNSTABLE and left
+for a later COMMIT, a synchronous write is committed before the reply, and
+COMMIT calls the filesystem and reports what it says. `internal/vfsbilly`
+implements it with the same `overlay.Sync` the FUSE frontend calls, so both
+frontends make one promise. A filesystem that does not implement it — every
+existing go-nfs user — behaves exactly as before.
+
+**The NFS cost is higher than the FUSE cost, and it is not optional.** An
+NFSv3 client commits on `close(2)` as well as on `fsync(2)`
+(`nfs_file_flush` → `nfs_wb_all`), so a write-heavy NFS workload pays a
+durability pass per file written rather than one per `fsync`. The
+coalescing below makes the repeats free; it does not make the first one
+free. That is what `fsync` costs, and the alternative was answering it with
+a lie.
 
 **A chatty application pays once.** Repeat calls with nothing written
 between them are coalesced against the overlay's own mutation counter and

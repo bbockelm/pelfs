@@ -1,6 +1,6 @@
 ARCH  := $(shell go env GOARCH)
 
-.PHONY: all build linux test e2e integration mount-gate opfuzz hostile hostile-long hostile-encrypted hostile-retro unprivileged crash big-tree vet clean
+.PHONY: all build linux test e2e integration mount-gate browse-gate opfuzz hostile hostile-long hostile-encrypted hostile-retro unprivileged crash big-tree vet clean
 
 all: build
 
@@ -24,6 +24,14 @@ e2e:
 
 mount-gate:
 	./scripts/mount-gate-docker.sh
+
+# `pelfs browse` end to end: the shipped binary against a fakeorigin, curl
+# as the browser, REAL Cyberduck (`duck`) as the WebDAV client, and a
+# SECOND, FRESH pelfs mounting the published generation from an empty state
+# directory to prove the bytes reached the federation. ~90s after the
+# image build; the run itself is --network none.
+browse-gate:
+	./scripts/browse-gate-docker.sh
 
 integration:
 	./scripts/integration-pelican.sh

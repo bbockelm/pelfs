@@ -679,10 +679,13 @@ umount_ro
 say "8b. write-path dedup: is a pelfs volume an image DISTRIBUTION channel?"
 # The chunker's POTENTIAL is measured by internal/dedupbench (CDC finds
 # ~93% between a base SIF and the same sandbox plus one file). This asks
-# what the WRITE PATH actually realizes, which is a different number: the
-# default packs during the session out of an in-memory, per-session index,
-# and --no-memtable stages and chunks everything at the seal, where the
-# SQLite dedup sidecar (internal/publish/dedup.go) spans generations.
+# what the WRITE PATH actually realizes, which used to be a different
+# number: the default path packed during the session against an in-memory,
+# per-session index and realized NOTHING across generations, while
+# --no-memtable staged everything to the seal where the SQLite sidecar
+# spans them. Since W2 the default path asks the base generation's own
+# pack index (genfs.Placed), so the two columns should now agree to within
+# the metadata a generation costs.
 dedup_gen() { # $1 label, $2 origin dir, $3 state dir, $4 mnt, $5 extra flag, $6.. cp args
   local label="$1" org="$2" st="$3" mp="$4" flag="$5"; shift 5
   local safe; safe=$(echo "$label" | tr -c 'a-zA-Z0-9' '-')
@@ -690,11 +693,20 @@ dedup_gen() { # $1 label, $2 origin dir, $3 state dir, $4 mnt, $5 extra flag, $6
   mkdir -p "$org" "$st" "$mp"
   "$PELFS" mount-gen --rw $flag --state-dir "$st" --stats-file "$js" \
     "$DPFX" "$mp" -- /bin/sh -c "cp $* $mp/" > "$LOGDIR/dedup-$safe.log" 2>&1
-  local up ded
-  up=$(jqn '.put.bytes' "$js"); ded=$(jqn '.write.deduped_chunks' "$js")
-  printf '    %-42s uploaded=%-12s deduped_chunks=%-4s origin=%s\n' \
-    "$label" "$up" "$ded" "$(du -sb "$org" | cut -f1)"
-  note "DEDUP|$label|uploaded=$up|deduped_chunks=$ded|origin=$(du -sb "$org" | cut -f1)"
+  local up ded base sealed
+  up=$(jqn '.put.bytes' "$js")
+  # Three counters, because there are three mechanisms and only one of them
+  # used to be reported. base_deduped_* is the memtable path recognising
+  # content the BASE GENERATION already holds (the cross-generation case);
+  # deduped_chunks includes that plus the within-session repeats;
+  # sealed_deduped_chunks is publish's own, which is what --no-memtable
+  # uses and what reported zero everywhere before it existed.
+  ded=$(jqn '.write.deduped_chunks' "$js")
+  base=$(jqn '.write.base_deduped_bytes' "$js")
+  sealed=$(jqn '.sealed_deduped_chunks' "$js")
+  printf '    %-42s uploaded=%-12s deduped=%-4s base_bytes=%-11s sealed_deduped=%-5s origin=%s\n' \
+    "$label" "$up" "$ded" "$base" "$sealed" "$(du -sb "$org" | cut -f1)"
+  note "DEDUP|$label|uploaded=$up|deduped_chunks=$ded|base_deduped_bytes=$base|sealed_deduped_chunks=$sealed|origin=$(du -sb "$org" | cut -f1)"
 }
 DPORT=19100
 for MODE in default no-memtable; do
@@ -715,8 +727,8 @@ for MODE in default no-memtable; do
   kill $DPID 2>/dev/null
 done
 echo "  (a gen2 far below gen1 is cross-generation dedup working; equal is none.)"
-echo "  NOTE: deduped_chunks is incremented only on the memtable path"
-echo "        (internal/memtable/seal.go), so the path that DOES dedup reports 0."
+echo "  (the two modes' final origin sizes should now agree; the default path"
+echo "   asks the base generation's pack index, --no-memtable the sidecar.)"
 
 say "9. the origin's shape"
 du -sh /work/origin | sed 's/^/    origin total: /'

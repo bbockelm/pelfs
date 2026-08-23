@@ -78,7 +78,7 @@ func TestSealAnOverlayWhoseContentIsAMemtable(t *testing.T) {
 	if err := store.Flush(ctx); err != nil {
 		t.Fatal(err)
 	}
-	sessionPuts := obj.puts
+	sessionPuts := obj.puts.Load()
 
 	res, err := publish.Seal(ctx, publish.Options{
 		Overlay: ov, Inner: obj, SpoolDir: t.TempDir(),
@@ -148,7 +148,7 @@ func TestSealAnOverlayWhoseContentIsAMemtable(t *testing.T) {
 	}
 	t.Logf("session uploaded %d packs, the seal added %d; adopted %d files (%d bytes) by reference; "+
 		"a 5-byte patch re-chunked %d bytes against a largest base chunk of %d",
-		sessionPuts, obj.puts-sessionPuts, st.AdoptedFiles, st.AdoptedBytes, st.RechunkedBytes, largest)
+		sessionPuts, obj.puts.Load()-sessionPuts, st.AdoptedFiles, st.AdoptedBytes, st.RechunkedBytes, largest)
 }
 
 func lookupInode(t *testing.T, ov *overlay.FS, name string) uint64 {

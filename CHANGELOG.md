@@ -2,6 +2,61 @@
 
 ## Unreleased
 
+### WebDAV: a pelfs volume in Cyberduck, WinSCP, rclone or Finder
+
+pelfs volumes can now be served over **WebDAV** — `internal/vfsdav`, a
+`webdav.FileSystem` over the same layer the NFS frontend mounts, so a person
+on Windows or macOS can browse, download and upload with a client they already
+have and no FUSE, no kext and no administrator. Nothing exposes it yet: the
+listener and the credential that will belongs to `pelfs browse`, and this is
+the surface it mounts.
+
+What it is held to is measured, not asserted. `litmus`, the WebDAV compliance
+suite, scores the adapter **basic 16/16, copymove 13/13, props 29/30, locks
+32/34** — identical, test for test, to what the same suite scores against
+`x/net/webdav`'s own in-memory example server, which is the ceiling any Go
+WebDAV server can reach. And three real clients drive it in a container with
+no network: **Cyberduck's CLI** (the same protocol stack as Cyberduck and
+Mountain Duck), **rclone** over both a TCP port and a unix socket, and
+**curl**. A 68,497,408-byte file — the size the Windows WebDAV *redirector*
+refuses outright — transfers byte-for-byte through Cyberduck's stack, and
+`Range` requests are served exactly, so a client can resume a download.
+
+Two things a pelfs volume has that WebDAV has no way to say, handled rather
+than ignored: a symlink to a file is **followed**, so `lib.so -> lib.so.1` is
+the file it names instead of an empty one; and the entries no client could
+render — a link to a directory, a dangling link, a fifo, a socket, a device
+node — are hidden and **counted**, so a tree that looks smaller than it is can
+say so.
+
+The surface emits no `Access-Control-Allow-*` header on any response, ever.
+That is not an omission: without one, a web page on another origin cannot get
+a preflight for PROPFIND, PUT, MKCOL, MOVE, COPY, DELETE, PROPPATCH or LOCK,
+so the entire WebDAV write surface is unreachable from a browser by
+construction. A test asserts it on every verb, in every authentication state.
+
+### The NFS owner override no longer reaches a frontend that did not ask for it
+
+The layer both mounts share granted one deliberate exception to the mode bits:
+the owner of a file may write it through the NFS frontend whatever the mode
+says. That is knfsd's own rule and it is why `tar -p` can extract a read-only
+file over NFS — NFSv3 has no open operation, so by the time a write arrives,
+the open it belongs to was already decided, correctly, on the client from our
+own ACCESS reply.
+
+WebDAV and SFTP have a real open, and for them that check is the ONLY one
+there will ever be. A frontend built on the shared layer inherited the
+exception anyway, so a WebDAV `PUT` would have emptied a `0444` file that the
+kernel, a FUSE mount and this server's own ACCESS reply all refuse — two
+frontends disagreeing about the same file, which is the defect the permission
+work in v0.2.0 existed to end.
+
+The exception is now something a frontend must **ask for by name**, and the
+name says who is entitled to it. The NFS mount is unchanged, `tar -p` over a
+real kernel NFS mount still extracts a read-only tree intact, and a test
+refuses any future frontend that reaches for the NFS constructors: it fails
+with the reason and the constructor to use instead.
+
 ### A browser UI that builds with no Node, and the probe that decided its shape
 
 `pelfs` now carries a browser UI inside the binary. The mechanics of that

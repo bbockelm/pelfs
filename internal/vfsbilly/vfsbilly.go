@@ -83,6 +83,11 @@ type billyFS struct {
 	// (internal/idmap).
 	ids  idmap.Map
 	dirs *dirCache
+	// openSem says who answered open(2) for this binding, which is the only
+	// thing the owner override in mayOpen turns on. The zero value —
+	// OpenAnsweredHere — grants nothing, so a frontend built by a future
+	// constructor that forgets to name it is refused rather than let through.
+	openSem OpenSemantics
 }
 
 var (
@@ -100,28 +105,49 @@ var (
 	_ nfs.PermissionChecker = (*billyFS)(nil)
 )
 
-// New returns a billy.Filesystem over a read-write overlay. Nodes it
-// creates are owned by the invoking user: the volume is a single-user
-// scratch space and the mount must be able to write what it made.
+// New returns a billy.Filesystem over a read-write overlay FOR THE NFS
+// FRONTEND. Nodes it creates are owned by the invoking user: the volume is
+// a single-user scratch space and the mount must be able to write what it
+// made.
+//
+// It is the NFSv3 binding specifically — OpenAnsweredByClient, the owner
+// override on the data path (mayOpen). A FRONTEND WITH A REAL OPEN MUST NOT
+// USE THIS: call NewFor(ov, cred, OpenAnsweredHere) instead, and read
+// OpenSemantics in perm.go for the one paragraph that says why. The
+// call-site allowlist in owneroverride_test.go enforces it.
 func New(ov *overlay.FS) billy.Filesystem { return NewAs(ov, ProcessCred()) }
 
-// NewAs is New with the identity named explicitly. The mount serves, and
-// checks permissions, as cred — see perm.go for why that identity is the
-// server's own and not the caller's AUTH_UNIX credential. It exists so the
-// permission matrix can be exercised at this interface without the test
-// process having to BE four different users.
+// NewAs is New with the identity named explicitly — and, like New, the NFS
+// binding. The mount serves, and checks permissions, as cred — see perm.go
+// for why that identity is the server's own and not the caller's AUTH_UNIX
+// credential. It exists so the permission matrix can be exercised at this
+// interface without the test process having to BE four different users.
 func NewAs(ov *overlay.FS, cred Cred) billy.Filesystem {
-	return &billyFS{rd: ov, ov: ov, uid: cred.UID, gid: cred.GID, cred: cred,
-		ids: volumeOwner(ov, cred), dirs: newDirCache()}
+	return NewFor(ov, cred, OpenAnsweredByClient)
 }
 
-// NewReadOnly returns a billy.Filesystem over an immutable generation.
+// NewFor is NewAs with the open semantics named too, which is what a
+// frontend other than NFS must use: sem decides whether this layer grants
+// knfsd's owner override on the data path, and only a protocol whose open
+// was already answered on the client is entitled to it (OpenSemantics).
+func NewFor(ov *overlay.FS, cred Cred, sem OpenSemantics) billy.Filesystem {
+	return &billyFS{rd: ov, ov: ov, uid: cred.UID, gid: cred.GID, cred: cred,
+		ids: volumeOwner(ov, cred), dirs: newDirCache(), openSem: sem}
+}
+
+// NewReadOnly returns a billy.Filesystem over an immutable generation, for
+// the NFS frontend — see New.
 func NewReadOnly(fs *genfs.FS) billy.Filesystem { return NewReadOnlyAs(fs, ProcessCred()) }
 
 // NewReadOnlyAs is NewReadOnly with the identity named explicitly.
 func NewReadOnlyAs(fs *genfs.FS, cred Cred) billy.Filesystem {
+	return NewReadOnlyFor(fs, cred, OpenAnsweredByClient)
+}
+
+// NewReadOnlyFor is NewFor over an immutable generation.
+func NewReadOnlyFor(fs *genfs.FS, cred Cred, sem OpenSemantics) billy.Filesystem {
 	return &billyFS{rd: fs, uid: cred.UID, gid: cred.GID, cred: cred,
-		ids: volumeOwner(fs, cred), dirs: newDirCache()}
+		ids: volumeOwner(fs, cred), dirs: newDirCache(), openSem: sem}
 }
 
 // volumeOwner reads the identity a volume was created under, from its
@@ -496,11 +522,20 @@ func (b *billyFS) OpenFile(filename string, flag int, perm os.FileMode) (billy.F
 //
 // # The owner override, and exactly how far it reaches
 //
-// Every OpenFile a served filesystem sees comes from the DATA PATH: READ
+// It reaches only a binding whose CALLER asked for it
+// (OpenAnsweredByClient — see OpenSemantics in perm.go). That is NFSv3 and
+// nothing else, and the rest of this section is why the distinction is the
+// whole justification rather than a detail of it.
+//
+// Every OpenFile the NFS frontend makes comes from the DATA PATH: READ
 // opens O_RDONLY, WRITE opens O_RDWR, and SETATTR-with-a-size opens
 // O_WRONLY|O_EXCL to truncate. NFSv3 has no OPEN operation at all, so
 // none of these is the client's open(2) — that was answered on the client,
-// from our ACCESS reply (Permitted below), before any of them was sent.
+// from our ACCESS reply (Permitted below), before any of them was sent. A
+// frontend that DOES have an open — WebDAV's PUT, SFTP's SSH_FXP_OPEN, an
+// HTTP handler calling OpenFile — is in the opposite position: this check
+// is the only open check there will ever be for it, so it gets
+// OpenAnsweredHere and no override.
 //
 // So this is knfsd's nfsd_open, which passes NFSD_MAY_OWNER_OVERRIDE
 // (fs/nfsd/vfs.c): the file's OWNER is allowed through whatever the mode
@@ -538,7 +573,10 @@ func (b *billyFS) mayOpen(name string, n genfs.Node, mutates bool) error {
 	if b.mayNode(n, want) {
 		return nil
 	}
-	if n.Type == catalog.TypeFile && b.ownsNode(n) {
+	// And the override reaches only a binding that ASKED for it. A frontend
+	// with a real open (WebDAV, SFTP) answers open(2) here and nowhere else,
+	// so for it this check is the open check — see OpenSemantics in perm.go.
+	if b.openSem == OpenAnsweredByClient && n.Type == catalog.TypeFile && b.ownsNode(n) {
 		return nil
 	}
 	return accessErr("open", name)

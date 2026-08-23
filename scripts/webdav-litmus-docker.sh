@@ -29,6 +29,26 @@
 # adapter substituted for memFS -- a NEW failure in `basic`, `copymove` or
 # `props` is the adapter's, and is the signal this script exists to give.
 #
+# THE ADAPTER RUN NOW EXISTS: scripts/webdav-adapter-litmus-docker.sh, which
+# holds this table with ONE CORRECTION TO IT (vfsdav-agent, 2026-08-23).
+#
+# `props 30/30` above is NOT a property of x/net's handler. The example server
+# this script runs passes propfind_invalid2 by HARD-CODING it -- from
+# litmus_test_server.go, verbatim:
+#
+#   // Thus, we assume that the propfind_invalid2 test is obsolete, and
+#   // hard-code the 400 Bad Request response that the test expects.
+#   if r.Header.Get("X-Litmus") == "props: 3 (propfind_invalid2)" {
+#           http.Error(w, "400 Bad Request", http.StatusBadRequest)
+#
+# The test wants a 400 for an XML body with an empty namespace prefix
+# declaration; Go's encoding/xml accepts one (golang/go#8068). Verified by
+# hand against this very server with the hard-code path avoided: it answers
+# 207. So the honest ceiling for a real server is `props 29/30`, and that is
+# the number the adapter is held to. Nothing in this script changed -- the
+# table above is what IT measures, and the sentence you would otherwise draw
+# from it ("a 30th failure is the adapter's fault") is the one that is wrong.
+#
 # Everything runs in Docker (litmus is a 2011 C tarball that does not build
 # against a modern glibc without the CFLAGS below, and nothing about it
 # belongs on a laptop). Needs network on first build: the litmus tarball and

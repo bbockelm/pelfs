@@ -1,5 +1,72 @@
 # Changelog
 
+## Unreleased
+
+**`pelfs browse` opens the file manager.** `GET /` is now the React file
+manager — `internal/webui`'s committed bundle, on the route table — and the
+hand-written connection page moved to **`GET /connect`**, where the credential
+desk, the generated Cyberduck profile and the federation-login cards live.
+Until this change the bundle was built, licence-checked, size-capped and
+gated by two CI jobs while nothing served it: `pelfs browse` answered `/` with
+the connection page, and the ~450 KB of embedded bundle was not linked into
+the binary at all. **This supersedes the *Not in this release* note under
+v0.2.1**, which described that state accurately when it was written.
+
+The file manager took `/` because that is what the verb promises. A user
+whose front door is a credential desk has been handed the plumbing rather
+than the tool. Each page carries exactly one anchor to the other, and the
+round trip is driven in both directions by the browser suite — because a link
+from a single-page app to another page on its own origin is the one navigation
+that could silently cost a user their session.
+
+**Both pages keep the durability panel**, in the same words, from the same
+`/events` snapshot. Deleting the second rendering and linking to the first
+would have been less code and the wrong trade: the sentence about what is and
+is not published is what this whole surface exists to put in front of
+somebody, and a user who has to navigate to read it does not read it. There is
+one answer with two renderings — the server's snapshot, which both pages are
+clients of — and a test reads both sources and fails if the words drift apart.
+
+**Two things the file manager owed the session, and only owed once it was the
+page a user lands on:**
+
+- The **idle-seal hint**. Closing the tab now shortens the wait before the
+  session seals from thirty seconds to about five, the same
+  `navigator.sendBeacon` the connection page always sent. The seal itself never
+  depended on it — the trigger is the event stream closing — so the effect was
+  25 seconds of delay on the one surface that can actually stage files.
+- **Waiting for the volume.** `pelfs browse` binds and prints its URL before it
+  opens the volume, deliberately, so that a federation login prompt has a page
+  to appear on. The file manager asked the data plane for a listing once, at
+  load, and treated a refusal as final — so opening the printed URL promptly,
+  which `--open` does for you, showed "the JSON data plane did not answer" until
+  a manual reload. The page now takes its readiness from the same event stream
+  the durability panel reads, and shows the panel and the connection banner
+  while it waits.
+
+### Fixed
+
+- **A rename the server refused no longer looks like one that worked.** The
+  file grid applies a change the moment you ask for it, and a refusal — a 403
+  on a path this session may not write, a 409 during a publish — left the new
+  name on the screen with an error message beside it. Of the two, a user
+  believes the screen. A refused rename, move, copy, delete or folder-create
+  now re-reads the affected directories from the volume, so the row is the
+  volume's row again and the message says only what did not happen. Two browser
+  assertions pin it.
+- The federation-login prompt (the device-code card) is now visible from the
+  file manager, as a banner naming what is waiting and linking to the card.
+  Before, a user whose institution was asking them to log in sat at `/`
+  watching a listing that was never going to arrive.
+
+### Changed
+
+- The page footer is gone, along with the line saying pelfs is not an official
+  Pelican Platform product. That attribution stays where it belongs — in
+  `NOTICE`, and in `brand/NOTICE.txt` beside the mark it is about, which the
+  binary serves. The third-party licence notices are still linked from the
+  page, in the status line.
+
 ## v0.2.1
 
 v0.2.0 made an NFS mount enforce the mode bits and a writable mount collect
@@ -692,6 +759,11 @@ are untouched — the removal only succeeds on an empty one.
 
 ### Not in this release
 
+*(Superseded before this release was tagged: `pelfs browse` now serves the
+file manager at `/` and the connection page at `/connect`. See
+**Unreleased**, above. The rest of this section — the build machinery, the
+provider defects, the no-network property — is unchanged and still true.)*
+
 **The React file manager is built, committed and tested — and no shipped
 verb serves it.** `internal/webui` carries a bundle built from the MIT SVAR
 component by `go generate` and embedded with `//go:embed`, a licence gate,
@@ -722,14 +794,17 @@ licences and the full licence text each one requires be carried with a
 distribution.
 
 The component was measured before it was adopted, which is where the API's
-5,000-entry cap comes from, and two defects in its shipped data provider
-were found the same way: `setHeaders()` never reaches the wire, so the
-session credential would have been silently absent, and every mutating
-request goes out as `Content-Type: text/plain`, which is the one content
-type an HTML form can send and which the threat model answers with 415.
-Both are fixed in a two-line override inside a subclass, and both are
-pinned by tests that will say so if a future release makes the subclass
-unnecessary. The UI also loads nothing off the network — the component's
+5,000-entry cap comes from, and **three** defects in its shipped data
+provider were found the same way — two on the wire and one by reading the
+method afterwards. `setHeaders()` never reaches the wire, so the session
+credential would have been silently absent; every mutating request goes out
+as `Content-Type: text/plain`, which is the one content type an HTML form can
+send and which the threat model answers with 415; and its error handling
+catches its own throw, so every failure resolved to success. All three are
+fixed in an override inside a subclass, and all three are pinned by tests
+that will say so if a future release makes the subclass unnecessary. (The
+third had a second half that the override could not reach — see *Fixed*
+under **Unreleased**.) The UI also loads nothing off the network — the component's
 default theme injects a CDN stylesheet link and its default icons are CDN
 URLs per file extension, and three separate checks (one in the build, one
 in Go, one in a real browser) keep them off, because a localhost tool that

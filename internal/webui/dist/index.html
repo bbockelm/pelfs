@@ -1,6 +1,6 @@
 <!doctype html>
-<script type="module" crossorigin src="./assets/index-D3PgmEg1.js"></script>
-<link rel="stylesheet" crossorigin href="./assets/index-BBN7vCZe.css">
+<script type="module" crossorigin src="./assets/index-BmHHMDoL.js"></script>
+<link rel="stylesheet" crossorigin href="./assets/index-C5oDKC9B.css">
 
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -13,8 +13,13 @@
      knows their data is fine. The same message cmd/pelfs/browse.html carries,
      for the same reason: a file manager is a React app, so with scripting off
      there is nothing at all on the screen. -->
+<!-- The class rather than a style attribute, and that is the
+     Content-Security-Policy talking: the server serves this page under
+     `style-src 'self'` with no 'unsafe-inline' (cmd/pelfs/browse.go, appCSP),
+     which refuses an inline style attribute. The linked stylesheet still
+     loads with scripting off, so the rule lands. -->
 <noscript>
-  <div data-testid="noscript" style="margin: 2rem auto; max-width: 40rem; font-family: system-ui, sans-serif">
+  <div data-testid="noscript" class="pelfs-noscript">
     This page needs JavaScript to list files and to show what is published.
     Nothing is wrong with your data: <code>pelfs browse</code> is still running in
     your terminal, and Ctrl-C there stops it (sealing, if you started it with

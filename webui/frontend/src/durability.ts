@@ -12,6 +12,13 @@ import type { BrowseState } from "./api/types";
  * three glyphs and the same sentences, and internal/webui/durability_test.go
  * fails if the two drift apart.
  *
+ * The wiring pass gave both surfaces addresses -- `/` is this app, `/connect`
+ * is browse.html -- and did NOT make either panel a link to the other. A link
+ * would be the wrong reconciliation: the sentence is what closes the trap, and
+ * a user who has to navigate to read it is a user who does not read it. The
+ * authority both panels quote is the SERVER's snapshot, not each other, so
+ * there is one answer with two renderings rather than two answers.
+ *
  * THE GLYPHS ARE THREE DIFFERENT CHARACTERS ON PURPOSE. The failure mode the
  * whole panel exists to prevent is a green check on the staged row: a file
  * that looks uploaded and is not in the federation is the worst possible
@@ -75,13 +82,20 @@ export function describe(s: BrowseState | null): DurabilityLine {
   }
   const sending =
     s.upload_backlog > 0 ? ` ${GLYPH.sending} sending ${bytes(s.upload_backlog)}.` : "";
+  // The idle clause is not decoration: it is the promise that closing this
+  // tab publishes rather than abandoning. Said only when the server says
+  // idle sealing is on for this session, and in cmd/pelfs/browse.html's
+  // words, because the two surfaces have one vocabulary.
+  const idle = s.idle_seal_s && s.idle_seal_s > 0
+    ? `, or ${secs(s.idle_seal_s)} after this tab closes`
+    : "";
   return {
     state: "staged",
     glyph: GLYPH.staged,
     text:
       `${s.staged_files} file${s.staged_files === 1 ? "" : "s"} (${bytes(s.staged_bytes)}) ` +
-      `on this machine only — next automatic publish in ${secs(s.next_publish_s)} ` +
-      `(sooner under write pressure).${sending}`,
+      `on this machine only — next automatic publish in ${secs(s.next_publish_s)}` +
+      `${idle} (sooner under write pressure).${sending}`,
   };
 }
 

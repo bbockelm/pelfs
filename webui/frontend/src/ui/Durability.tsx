@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { BrowseState } from "../api/types";
 import { publish } from "../api/control";
+import { CONNECT } from "../routes";
 import {
   GLYPH,
   LEASE_WORDS,
@@ -123,14 +124,30 @@ export function Durability({
         <span data-testid="publish-hint" className="pelfs-muted">
           {PUBLISH_HINT[pstate]}
         </span>
-        {/* NO LINK TO THE CONNECTION PAGE, deliberately, until the wiring
-            pass decides where each surface lives: M1 serves its page at "/",
-            which is also where this bundle would be mounted, and a link that
-            reloads this app would spend nothing but the user's session (the
-            bootstrap token is single-use). When both pages have addresses,
-            one anchor goes here. */}
+        {/* The anchor the wiring pass owed this panel. `/connect` is the
+            connection page: the credential desk, the generated Cyberduck
+            profile, and the federation-login cards. A plain <a>, not a
+            fetch and not a reload of this app -- the session token lives in
+            sessionStorage, which is per-ORIGIN and survives a same-origin
+            navigation, so following it costs nothing and coming back costs
+            nothing. (What it must NOT be is a link that re-enters the
+            bootstrap exchange: that token is single-use and already
+            spent.) */}
+        <a className="pelfs-link" href={CONNECT} data-testid="connect-link">
+          Connect another program →
+        </a>
       </div>
-      <p data-testid="publish-status" data-job-state={job?.state ?? "none"} className="pelfs-muted">
+      <p
+        data-testid="publish-status"
+        data-job-state={job?.state ?? "none"}
+        // The job the panel is WATCHING, which is not always the job this tab
+        // started: a 409 hands back the id of the publish that already holds
+        // the overlay, and the panel follows that one. A driver asserting "the
+        // second request names the job the page is watching" needs the id on
+        // the element, not in the prose.
+        data-job-id={job?.id ?? ""}
+        className="pelfs-muted"
+      >
         {jobText}
       </p>
 

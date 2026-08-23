@@ -93,19 +93,5 @@ body {
   color: var(--pelfs-ink-muted);
 }
 
-/* ---- the disclaimer, which is not optional --------------------------- */
-
-.pelfs-footer {
-  border-top: 1px solid var(--pelfs-rule);
-  padding: 0.75rem 1rem;
-  font-size: 0.75rem;
-  color: var(--pelfs-ink-muted);
-  display: flex;
-  gap: 1rem;
-  flex-wrap: wrap;
-  align-items: baseline;
-}
-
-.pelfs-footer a {
-  color: var(--pelfs-primary);
-}
+/* No footer rules: there is no footer. See Brand.tsx for whose call that
+   was and where the attribution went instead. */

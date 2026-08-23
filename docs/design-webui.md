@@ -2,8 +2,10 @@
 
 Status: **BUILT.** This began as a design written before any pelfs code
 existed. It is now a description of what shipped, reconciled against the
-tree at `b037b03` by docsync-agent. `pelfs browse` is a verb a person can
-run: `cmd/pelfs/browse.go` plus `internal/httpguard`,
+tree at `b037b03` by docsync-agent and re-checked at `b16784d` by
+mount-app-agent, the pass that put the file manager on the route table and
+gave the two surfaces their addresses (`/` and `/connect`). `pelfs browse` is
+a verb a person can run: `cmd/pelfs/browse.go` plus `internal/httpguard`,
 `internal/browsesession`, `internal/webapi`, `internal/vfsdav`,
 `internal/localoauth`, `internal/davprofile`, `internal/webui` and
 `webui/frontend`.
@@ -168,7 +170,7 @@ corrections teaches the next reader to distrust all of it.
 | the cap's numbers ride on the listing response | **they cannot.** The provider requires a bare array and drops response headers, so the numbers travel as `X-Pelfs-Listing-*` headers and as `GET /api/v1/info/{id}` | The routes, concretely |
 | `GET /files` (un-pathed) returns the whole tree, so drop it | **not droppable** — the component fetches it at boot. It means the **ROOT directory**, never the tree | Verification 3 |
 | — | opening a symlink **by its own path answers `ESTALE`**; resolve first. It bit the copy path and the download source as well as WebDAV | Verification 3; the WebDAV adapter |
-| two defects in the shipped SVAR provider | **three.** `setHeaders()` never reaches the wire; mutations ship as `text/plain` (415); and `send()`'s `.catch` sits AFTER the `!res.ok` throw, so **every failure resolves to `undefined` and a failed rename looks successful** | Verification 3 |
+| two defects in the shipped SVAR provider | **three, and then a fourth thing that is not the provider's.** `setHeaders()` never reaches the wire; mutations ship as `text/plain` (415); and `send()`'s `.catch` sits AFTER the `!res.ok` throw, so every failure resolves to `undefined`. Overriding `send()` fixes all three and is **not enough**: the STORE applies every mutation optimistically and rolls nothing back, so a refused rename still kept its new name on the screen with the error banner beside it. Closed by re-listing from the server, in `PelfsDataProvider.getHandlers` | Verification 3 |
 | "does the component virtualize" is unknown | **it does not.** 100,000 entries measured 1,000,067 DOM nodes and **703 MB** of heap. Search is client-side over loaded data, so a capped listing is a **partial search** — and the user has to be told, in `webapi.PartialSearchNotice`'s exact words | Verification 3 |
 | seal on idle after `min(30 s, --snapshot-interval)` | **undefined at interval 0**, which a user types on purpose. Implemented as **off** | The correction: a browser CAN express seal-on-idle |
 | `sendBeacon` on `pagehide` shortens the wait | `pagehide` fires **before** the connection tears down, so comparing the two instants naively discards every beacon that worked. `idleHintLead` is the tolerance | same |
@@ -2723,11 +2725,13 @@ bird untouched so the mark stays recognizable:
    place a compound mark earns its keep, because there is no room for a
    wordmark.
 
-Whichever is chosen: **the page must say what pelfs is not.** One line in
-the footer — "an independent tool for Pelican federations; not an official
-Pelican Platform product" — costs nothing and prevents the one
-misunderstanding a borrowed mark can cause. The permission covers using the
-mark; it does not make pelfs the product.
+Whichever is chosen, this document argued that **the page must say what
+pelfs is not** — one line in the footer, "an independent tool for Pelican
+federations; not an official Pelican Platform product". **It does not, and
+that was decided by the person whose call it is:** the Pelican Project's PI,
+who granted the permission, asked for the footer off the page. The
+attribution is not gone, only off the screen, where nobody was reading it;
+see below for where it lives.
 
 **What shipped: option 1, and no redraw.** `webui/frontend/public/brand/`
 holds the mark copied **byte for byte** from the pelican tree, with a
@@ -2736,7 +2740,16 @@ permission, and the fact that it has not been traced, redrawn or altered.
 The favicon is **type only** — a rounded square in `#0885ff` carrying the
 `fs` — so no derivative of the bird exists anywhere in this repository.
 Option 2, the compound favicon, is where a real vector mark would go if one
-is ever supplied; the file says so. The footer line is in `BrandFooter`.
+is ever supplied; the file says so.
+
+**And there is no footer.** `NOTICE.txt` is what carries the attribution and
+the permission, it ships beside the asset it is about, and the binary serves
+it at `/brand/NOTICE.txt` — asserted by `internal/webui/webui_test.go`, so it
+cannot quietly stop travelling with the mark. The repository's own `NOTICE`
+says the same thing. What the deleted footer was carrying that IS an
+obligation rather than a statement — the MIT notices for the 30 bundled
+packages — moved to the app's status line, because a person who has nothing
+but the binary has to be able to reach them from what it serves.
 
 ---
 
@@ -2833,15 +2846,28 @@ which U1's table tests.
 M2 = U6+U7+U8+U9, M3 = U10+U11, M4 = U12, M5 = U13, M6's Playwright half
 = U14; only U15 (resumable upload) is outstanding, by decision.
 
-**One honest caveat about M4 at `b037b03`:** the app, the bundle, the
-committed `dist/`, the notices and both CI jobs exist and gate themselves,
-but `pelfs browse` still serves **M1's hand-written page** at `/` —
-`internal/webui`'s embedded bundle is not yet mounted on the route table.
-So the file manager is built and proven against a replayed contract, and a
-user running `pelfs browse` today gets the durability page, the credential
-desk, the JSON data plane and WebDAV. Mounting the bundle is a route-table
-line, not a milestone. **M4's
-gate was the right gate and it very nearly fired:** the component does
+**And the two surfaces have two addresses.** `GET /` is the file manager —
+`internal/webui`'s committed bundle, on the route table — and `GET /connect`
+is M1's hand-written page: the credential desk, the SSO cards, and its own
+copy of the durability panel. The file manager took `/` because it is what
+the verb promises; a user whose front door is a credential desk has been
+handed the plumbing. Each page carries exactly one anchor to the other
+(`webui/frontend/src/ui/Durability.tsx`, `cmd/pelfs/browse.html`'s nav), and
+`webui/frontend/tests/connect.spec.ts` drives the round trip in both
+directions — because the one navigation that could silently cost a user
+their session is a link from a single-page app to another page on its own
+origin.
+
+BOTH pages keep the durability panel, and that was the decision worth
+arguing. Deleting the second rendering and linking to the first would have
+been less code; it would also have made the sentence this whole design
+exists to put in front of somebody into something they had to navigate to
+read. So there is one ANSWER — the server's `/events` snapshot, which both
+pages are clients of — with two renderings, and
+`internal/webui/durability_test.go` reads both sources and fails if the
+words drift apart.
+
+**M4's gate was the right gate and it very nearly fired:** the component does
 not virtualize, so the answer was not "reconsider the component" but "the
 cap is the design" — which is a smaller change only because U0 ran before
 the app was written rather than after.

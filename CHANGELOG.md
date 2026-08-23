@@ -2,6 +2,58 @@
 
 ## Unreleased
 
+### A file manager in the browser, and it never says "uploaded" when it means "on this laptop"
+
+`pelfs browse`'s page could tell you whether your data was in the federation
+and publish it on request; it could not show you a file. The browser UI now
+carries a real file manager — list, create, rename, copy, move, delete,
+upload and download — built on the MIT SVAR React component, bundled by Vite
+under `go generate`, and committed so that `go build`, `go vet`, `go test` and
+every cross-build still need no Node at all.
+
+**The durability panel sits above the files, not behind a tab, and both
+surfaces speak one vocabulary.** A finished upload puts bytes in the local
+overlay: durable against `kill -9`, invisible to the federation until the
+next checkpoint — and for a couple of hundred documents that fires neither
+write-pressure trigger, so nothing is published for up to five minutes while
+the user closes the laptop and tells a collaborator the data is there. The
+upload therefore answers with what it actually did, the panel above it agrees,
+and the two states have DIFFERENT GLYPHS rather than two shades of one colour.
+The hand-written connection page and the React app render that distinction
+from the same `/events` snapshot with the same words, and a Go test fails if
+either side is reworded on its own.
+
+**Two limits are admitted in sentences instead of being discovered.** The
+component does not virtualize — 100,000 entries measured at 703 MB of heap and
+17.7 s to open — so a listing is capped, and a capped folder says how many
+entries it really holds and what to use instead. Its search is client-side
+over loaded data only and asks the server nothing, so the line above the
+search box says so before anyone types and says it more loudly while a search
+is running. "No results" and "not in your volume" are different statements.
+
+**A download is a ticket, not an ambient credential.** An `<a href>` cannot
+send a request header, so a download authorized by the session token would
+have to be authorized by a credential the browser attaches to any GET — which
+is the hole DNS rebinding turned into arbitrary RPC in CVE-2018-5702. An
+authenticated call mints a single-use 30-second ticket instead, and the URL in
+the browser's download history is already spent by the time it is written
+there.
+
+### The browser gate now tests the browser half of the threat model
+
+`scripts/webui-playwright.sh` grew from two example specs into a suite that
+asserts, in a real Chromium against the real binary: no `Set-Cookie` and an
+empty `document.cookie` after a full session; the session token in
+`sessionStorage` and nothing in `localStorage`; a single-use bootstrap token
+whose second use fails visibly, and which never survives in the address bar; a
+ticketed download that works with no credential and 404s on replay; a rebound
+`Host` answered 421; a cross-site page that cannot read a response, submit a
+form, load an `<img>`, frame the app, or preflight a `PROPFIND`; an SSE
+reconnect that leaves no stale view; the `<noscript>` message; and not one
+request leaving 127.0.0.1 for the whole session. `retries: 0`, no fixed
+sleeps, expect-polling only — a browser gate that needs a rerun to go green
+teaches people to rerun the next real failure too.
+
 ### `fsync` now does something, and says what it did
 
 `fsync(2)` and `fsyncdir(2)` on a pelfs mount returned success

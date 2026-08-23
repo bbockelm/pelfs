@@ -98,6 +98,34 @@ if [[ "${PELFS_WEBUI_SKIP_BROWSER_INSTALL:-}" != "1" ]]; then
     "${PNPM[@]}" exec playwright install chromium
 fi
 
+# THE ATTACKER ORIGIN, and it has to be a server of its own.
+#
+# The obvious shortcut -- point the browser at OUR server under the mapped
+# hostname and call that the attacker page -- does not work for the battery,
+# and quietly: `pelfs browse` answers a rebound Host with 421 and every
+# response carries `Content-Security-Policy: default-src 'none'; form-action
+# 'none'`, so a fetch or a form submission from that page is stopped by OUR
+# OWN CSP before it is stopped by anything the test is about. The spec would
+# pass while proving nothing. (Keeping the 421 assertion itself is right: that
+# IS the rebinding case.)
+#
+# So: a five-line static server on its own port, serving one empty page, with
+# no CSP and no relationship to pelfs. Chromium's --host-resolver-rules maps
+# the hostname for every port, so http://attacker.test:<its port>/ is a
+# genuinely cross-site origin whose requests to pelfs are refused -- or not --
+# on their merits.
+node -e 'require("http").createServer(function(q,s){s.writeHead(200,{"content-type":"text/html; charset=utf-8"});s.end("<!doctype html><meta charset=utf-8><title>attacker</title><body>a page the user merely visited")}).listen(0,"127.0.0.1",function(){console.log("ATTACKER "+this.address().port)})' >"$W/attacker.log" 2>&1 &
+PIDS+=($!)
+wait_for_line "$W/attacker.log" '^ATTACKER ' "the attacker page server"
+ATTACKER_PORT="$(sed -n 's/^ATTACKER //p' "$W/attacker.log" | head -1)"
+export PELFS_WEBUI_ATTACKER_URL="http://${PELFS_WEBUI_ATTACKER_HOST:-attacker.test}:$ATTACKER_PORT/"
+echo "== attacker page at $PELFS_WEBUI_ATTACKER_URL =="
+
+# The session token the suite exchanges is cached here rather than in the
+# system temp directory, so a run leaves nothing behind and two concurrent
+# runs cannot read each other's.
+export PELFS_WEBUI_SESSION_DIR="$W"
+
 echo "== building pelfs =="
 (cd "$REPO" && CGO_ENABLED=0 go build -o "$W/pelfs" ./cmd/pelfs)
 
@@ -133,7 +161,17 @@ if [[ "$MODE" == browse ]]; then
 
     # --rw so the suite can exercise the publish path; the page is read-only
     # otherwise and "Publish now" is not reachable at all.
-    "$W/pelfs" browse --rw --state-dir "$W/state" "$PREFIX" >"$W/browse.log" 2>&1 &
+    #
+    # --test-hooks is what makes the states the suite has to cover REACHABLE:
+    # a fresh volume is clean, so "staged but not published" cannot happen by
+    # itself, and a lease that has gone stale, been interrupted or been lost
+    # cannot be arranged from outside at all. The flag is off by default, it
+    # announces itself in the terminal and in a banner on the page, and it
+    # sits on the authenticated API surface -- see cmd/pelfs/browse.go's
+    # serveTestHook for why it is a flag rather than a build tag: a build tag
+    # would mean the browser suite drives a DIFFERENT BINARY from the one CI
+    # ships, which is the one property a browser test exists to check.
+    "$W/pelfs" browse --rw --test-hooks --state-dir "$W/state" "$PREFIX" >"$W/browse.log" 2>&1 &
     PIDS+=($!)
     # The FRAGMENT is what identifies the launch URL. The log also contains
     # the volume prefix, which is itself an http://127.0.0.1 URL on this
@@ -162,10 +200,19 @@ else
         CGO_ENABLED=0 go test ./internal/webui -run TestServeEmbeddedForBrowserSuite \
         -count=1 -timeout 12m -v >"$W/serve.log" 2>&1) &
     PIDS+=($!)
-    wait_for_line "$W/serve.log" '^PELFS_WEBUI_URL=' "the embedded server's URL"
+    wait_for_line "$W/serve.log" '^PELFS_WEBUI_BOOTSTRAP=' "the embedded server's bootstrap token"
     export PELFS_WEBUI_URL="$(sed -n 's/^PELFS_WEBUI_URL=//p' "$W/serve.log" | head -1)"
+    # The embedded server runs the REAL internal/browsesession and a mock JSON
+    # API (internal/webui/mockapi_test.go), so the app's own credential flow --
+    # single-use bootstrap in the fragment, header-borne session token,
+    # ticketed download -- is what the suite drives here. The token is handed
+    # over separately for the same reason it is in browse mode: a fragment is
+    # not sent to the server, so the suite has to put it back on the URL
+    # itself. Waiting for the BOOTSTRAP line also waits for the URL line,
+    # which is printed first.
+    export PELFS_WEBUI_BOOTSTRAP="$(sed -n 's/^PELFS_WEBUI_BOOTSTRAP=//p' "$W/serve.log" | head -1)"
     export PELFS_WEBUI_MODE=embed
-    echo "== serving $PELFS_WEBUI_URL (embedded bundle only; \`pelfs browse\` not in this binary) =="
+    echo "== serving $PELFS_WEBUI_URL (embedded bundle + mock API; \`pelfs browse\` not in this binary) =="
 fi
 
 set +e

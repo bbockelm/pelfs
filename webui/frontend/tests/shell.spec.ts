@@ -1,13 +1,6 @@
-import { expect, test } from "@playwright/test";
+import { MODE, card, expect, openPelfs, test } from "./pelfs";
 
 // The example spec: one file that proves the harness end to end.
-//
-// The specs that matter are the threat-model ones, and they are not here --
-// they belong to a dedicated agent, and the fifteen-row table in
-// docs/design-webui.md is their source. What this file proves is that a real
-// browser can reach a real pelfs server started by
-// scripts/webui-playwright.sh, at a URL and with a single-use credential both
-// chosen at runtime, and see the page the binary served.
 //
 // It runs in both of the harness's modes and asserts what is true of each:
 //
@@ -16,35 +9,40 @@ import { expect, test } from "@playwright/test";
 //                (cmd/pelfs/browse.html), which is the contract its header
 //                comment promises: "Every element a test asserts on carries
 //                data-testid".
-//   embed mode   the committed React bundle served by internal/webui, for
-//                when `pelfs browse` is not in the binary yet. Selectors are
-//                webui/frontend/src's own hooks.
-const mode = process.env.PELFS_WEBUI_MODE ?? "embed";
+//   embed mode   the committed React bundle served by internal/webui, against
+//                the mock JSON API in internal/webui/mockapi_test.go.
+//                Selectors are webui/frontend/src's own hooks.
+//
+// It used to assert, in embed mode, that the page showed its "the data plane
+// is not built yet" placeholder. That placeholder is now the FAILURE state --
+// there is an API to talk to -- so asserting on it would have made a broken
+// data plane look like a passing test.
 const volume = process.env.PELFS_WEBUI_VOLUME;
 
-test("the page is served, and names the volume it is serving", async ({ page }) => {
-  const bootstrap = process.env.PELFS_WEBUI_BOOTSTRAP;
-  // The bootstrap token is delivered in the URL FRAGMENT, never the query
-  // string: a fragment is not sent to the server, does not enter an access
-  // log, and does not survive into a Referer.
-  await page.goto(bootstrap ? `/#bt=${encodeURIComponent(bootstrap)}` : "/");
+test("the page is served, and names the volume it is serving", async ({ page, session }) => {
+  await openPelfs(page, session);
 
-  if (mode === "browse") {
+  if (MODE === "browse") {
     await expect(page.getByTestId("volume")).toBeVisible();
     if (volume) await expect(page.getByTestId("volume")).toContainText(volume);
     // The wordmark: "pel" in the text colour, "fs" in the brand blue.
     await expect(page.locator("h1 .fs")).toHaveText("fs");
   } else {
     await expect(page.getByTestId("pelfs-shell")).toBeVisible();
-    await expect(page.getByTestId("pelfs-status")).toBeVisible();
+    // A real listing, from a real request that carried the session header.
+    await expect(card(page, "/README.txt")).toBeVisible();
+    // And the volume the API named, in the header.
+    await expect(page.getByTestId("pelfs-brand")).toContainText("pelican://");
   }
 });
 
 test("the mark is used with permission, and the page says what pelfs is not", async ({ page }) => {
   test.skip(
-    mode !== "embed",
+    MODE !== "embed",
     "the brand assets are in the React bundle; M1's page is hand-written HTML with its own header",
   );
+  // No session on purpose: the brand, the disclaimer and the notices link are
+  // page furniture and must be there even when the app cannot start.
   await page.goto("/");
 
   const brand = page.getByTestId("pelfs-brand");
@@ -66,12 +64,14 @@ test("the mark is used with permission, and the page says what pelfs is not", as
   expect(await notices.text()).toContain("@svar-ui/react-filemanager");
 });
 
-test("the page loads nothing off loopback", async ({ page }) => {
+test("the page loads nothing off loopback on first paint", async ({ page, session }) => {
   // The measurement the U0 probe made, as a standing assertion. The default
   // SVAR theme injects a stylesheet link to cdn.svar.dev and its default icon
   // callback builds CDN URLs per file extension; both are off, and this is
   // what notices if a rebuild turns them back on. It is worth running against
   // M1's page too: a hand-written page can grow a font link just as easily.
+  // The whole-session version, which is where a runtime-built icon URL would
+  // appear, is loopback.spec.ts.
   const offHost: string[] = [];
   page.on("request", (r) => {
     const u = new URL(r.url());
@@ -79,7 +79,7 @@ test("the page loads nothing off loopback", async ({ page }) => {
       offHost.push(`${r.method()} ${u.origin}${u.pathname}`);
     }
   });
-  await page.goto("/");
+  await openPelfs(page, session);
   // Poll rather than sleep: give a late request a chance to appear, and fail
   // on the first one that does. There is no setTimeout anywhere in this suite.
   await expect(async () => {

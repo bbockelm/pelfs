@@ -39,7 +39,7 @@ func TestPassedFDMountpoint(t *testing.T) {
 	}{
 		{"/dev/fd/3", true},
 		{"/dev/fd/17", true},
-		{"/dev/fd/0", false},  // stdin is never a mounted fuse device
+		{"/dev/fd/0", false}, // stdin is never a mounted fuse device
 		{"/dev/fd/-1", false},
 		{"/dev/fd/", false},
 		{"/dev/fd/3x", false},

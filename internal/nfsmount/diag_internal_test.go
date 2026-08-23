@@ -151,7 +151,7 @@ func (f *changePermFS) Permitted(string) (nfs.Permission, error) { return f.gran
 // filesystem behind it, and every ACCESS would come back granting nothing
 // -- a mount on which nothing can be opened at all.
 func TestDiagnosePreservesTheInterfacesGoNFSAsserts(t *testing.T) {
-	plain := diagnose(memfs.New())
+	plain := diagnose(memfs.New(), nil)
 	if _, ok := plain.(billy.Change); ok {
 		t.Error("wrapper claims billy.Change for a filesystem that has none")
 	}
@@ -162,7 +162,7 @@ func TestDiagnosePreservesTheInterfacesGoNFSAsserts(t *testing.T) {
 		t.Error("wrapper dropped WriteCapability")
 	}
 
-	changeable := diagnose(&chmodFS{Filesystem: memfs.New()})
+	changeable := diagnose(&chmodFS{Filesystem: memfs.New()}, nil)
 	if _, ok := changeable.(billy.Change); !ok {
 		t.Fatal("wrapper dropped billy.Change")
 	}
@@ -170,7 +170,7 @@ func TestDiagnosePreservesTheInterfacesGoNFSAsserts(t *testing.T) {
 		t.Error("wrapper invented nfs.PermissionChecker for a changeable filesystem")
 	}
 
-	checker := diagnose(&permFS{Filesystem: memfs.New(), granted: nfs.PermissionRead})
+	checker := diagnose(&permFS{Filesystem: memfs.New(), granted: nfs.PermissionRead}, nil)
 	pc, ok := checker.(nfs.PermissionChecker)
 	if !ok {
 		t.Fatal("wrapper dropped nfs.PermissionChecker")
@@ -183,7 +183,7 @@ func TestDiagnosePreservesTheInterfacesGoNFSAsserts(t *testing.T) {
 	both := diagnose(&changePermFS{
 		chmodFS: chmodFS{Filesystem: memfs.New()},
 		granted: nfs.PermissionRead | nfs.PermissionWrite,
-	})
+	}, nil)
 	if _, ok := both.(billy.Change); !ok {
 		t.Error("wrapper dropped billy.Change from a filesystem that also checks permissions")
 	}
@@ -225,7 +225,7 @@ func TestChangeErrorsCarryAnNFSStatus(t *testing.T) {
 			eioReportedAt.Store(0)
 			eioSuppressed.Store(0)
 
-			fs := diagnose(&chmodFS{Filesystem: memfs.New(), fail: tc.err})
+			fs := diagnose(&chmodFS{Filesystem: memfs.New(), fail: tc.err}, nil)
 			err := fs.(billy.Change).Chmod("/a.c", 0o644)
 			var st *nfs.NFSStatusError
 			if !errors.As(err, &st) {

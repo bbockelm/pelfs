@@ -2,6 +2,53 @@
 
 ## Unreleased
 
+### `pelfs mount --finder`: a pelfs volume in the Finder
+
+```
+pelfs mount --rw --finder pelican://<federation>/<prefix>
+```
+
+On macOS the volume now appears in the **Finder sidebar under Locations**,
+named after the prefix (or `--volume-name "Survey Data"`), with an eject
+button. `docs/finder.md` is the whole story; the four parts:
+
+- **Visible.** The mount drops `nobrowse`, the option that keeps a mount
+  out of the macOS GUI, and lands on `/Volumes/<name>` when that directory
+  exists and is yours, else on `~/Volumes/<name>`. `/Volumes` is mode 755
+  root:wheel, so pelfs cannot create a directory there; the fallback prints
+  the one-time `sudo mkdir` + `chown` that moves the volume in. macOS's own
+  NetFS route to `/Volumes` was investigated and turned down — with the
+  evidence, including the URL form that really does carry a port through to
+  `mount_nfs` — in `docs/finder.md`.
+- **Named.** `mount_nfs` has no `volname` option, so which of the two
+  candidate sources macOS uses for a volume's name — the mount point's last
+  component, or the exported path — cannot be established without mounting.
+  Both are set to the chosen name, so the answer is the same either way.
+- **Ejectable.** Ejecting in the Finder unmounts the volume and tells the
+  server nothing: pelfs IS the server, and a client that unmounts simply
+  stops sending RPCs. Such a session used to sit waiting for a signal that
+  would never come, holding an **unsealed overlay** while the user believed
+  they had finished. A `--finder` session now polls the mount table
+  (`getfsstat(2)` with `MNT_NOWAIT`: one syscall, no RPC) and treats its
+  mount's disappearance exactly as `pelfs umount` — stop serving, drain
+  checkpoints, seal, exit. A mount table that cannot be read is never
+  treated as an unmount.
+- **Not polluted.** The Finder writes a `.DS_Store` in every directory a
+  user opens, and on a `--rw` mount those writes are chunked, packed,
+  uploaded, sealed and published — then rewritten the next time a window
+  moves. A `--finder` mount answers as though those names did not exist
+  (`ENOENT` to a lookup, `EACCES` to a create), which is the same answer a
+  read-only network volume gives, and the reason browsing an SMB share you
+  cannot write to leaves nothing behind. `._name` sidecars and `.Trashes`
+  are deliberately **left alone**: refusing them would break a copy and a
+  Move to Trash respectively.
+
+Nothing changes without the flag: the default mount is still invisible to
+the GUI, which is what every script, every gate and every Linux user
+relies on. Related fix along the way: `nfsmount.Unmount` now treats a path
+that is no longer a mount point as success, instead of failing six commands
+over three seconds and reporting a clean teardown as a failed one.
+
 ### `pelfs mount-gen` is an apptainer `--fusemount` driver
 
 A job can now mount a pelfs volume **inside its own container**, with no

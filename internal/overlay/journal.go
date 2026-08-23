@@ -36,6 +36,10 @@ import (
 //     used, for the same reason.
 type contentJournal struct {
 	db *sql.DB
+	// path is the database file, kept because Sync has to reach it as a
+	// FILE: there is no way to ask a database/sql driver for its
+	// descriptor, and fsync is a thing you do to one (see sync.go).
+	path string
 	// append is prepared once. It runs on every write in the session, and
 	// re-parsing the same INSERT each time is pure overhead on the one
 	// path where the overhead is visible: a streaming write is nothing
@@ -107,7 +111,29 @@ func openContentJournal(dir string) (*contentJournal, error) {
 		db.Close() //nolint:errcheck
 		return nil, fmt.Errorf("overlay: content journal: %w", err)
 	}
-	return &contentJournal{db: db, append: stmt}, nil
+	return &contentJournal{db: db, path: filepath.Join(dir, contentDBName), append: stmt}, nil
+}
+
+// Sync makes durable every operation this journal has accepted: the
+// operation log that says which extent holds which part of which file,
+// and the location map binding extents to packs.
+//
+// This is the half of an application's fsync(2) that answers "what is this
+// file made of". The other half — the extent BYTES — is the ring's
+// mapping, and memtable.Store.Sync does that one first, because a record
+// naming bytes that never reached the disk is the one direction this
+// arrangement forbids (see the reconciliation rule above).
+func (j *contentJournal) Sync() error {
+	if err := syncPath(j.path); err != nil {
+		return fmt.Errorf("overlay: sync content journal: %w", err)
+	}
+	// The WAL after the database, for the reason syncDBLocked spells out:
+	// a durable reset log over a database that did not get the frames
+	// loses them.
+	if err := syncPath(j.path + "-wal"); err != nil {
+		return fmt.Errorf("overlay: sync content journal log: %w", err)
+	}
+	return nil
 }
 
 // journalSchemaVersion is bumped whenever the tables change shape.

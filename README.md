@@ -417,6 +417,26 @@ release, and what to do about it when upgrading, is in
   not treat a pelfs NFS export as a multi-user boundary. The reasoning is
   written out in `docs/go-nfs-patches.md`. FUSE mounts are unchanged; the
   kernel checks those (`default_permissions`).
+- **`fsync` means "recoverable by remounting this state directory". It does
+  NOT mean "in the federation".** Since v0.2.1 an `fsync(2)` on a pelfs
+  mount does real work and answers honestly: the write buffer's mapping is
+  msync'd, the journal saying which file those bytes belong to is fsync'd,
+  and the metadata holding the name and length is fsync'd, in that order.
+  Kill the process, cut the power, reboot, remount the same state
+  directory: the writes are there. Before v0.2.1 it returned success
+  without doing any of that.
+
+  The edge to read twice: **on ephemeral job scratch that is not the
+  guarantee you want.** An HTCondor slot's scratch is wiped when the job is
+  evicted, and the state directory goes with it — every byte `fsync`
+  covered included, whether or not it returned success. What survives an
+  eviction is a CHECKPOINT: `--snapshot-interval` to have one happen on a
+  cadence, or `pelfs ctl <mount> publish` at the points your job knows are
+  worth keeping. Federation durability is a publish. A laptop or a
+  long-lived host, where the state directory outlives the process, gets
+  exactly what it asks for. A directory `fsync` does the same work, because
+  the two databases in a state directory may not be made durable in the
+  other order.
 - The origin must permit GET/PUT/DELETE and listing on the prefix (i.e. a
   token with read/modify scopes for the namespace); `pelfs` checks this up
   front and says which scope is missing.

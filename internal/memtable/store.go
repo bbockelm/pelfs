@@ -186,6 +186,19 @@ type Stats struct {
 	// process.
 	RingUsed int64
 	RingFree int64
+	// RingSyncs counts msyncs of the ring's mapping — the durable half of
+	// an application's fsync(2), which is a cost that exists only when
+	// something asked for it. It is here so the COALESCING above it is
+	// checkable: a chatty application that fsyncs after every write with
+	// nothing between the calls has to leave this number alone (see
+	// Store.Sync, and Sync in internal/overlay).
+	RingSyncs int64
+	// JournalSyncs counts the same thing one layer up: how many times the
+	// journal was asked to make its records durable. Separate from
+	// RingSyncs because they answer different halves of a file — where the
+	// bytes are, and which file they belong to — and a Sync that did one
+	// and not the other would be durable in a shape nothing can recover.
+	JournalSyncs int64
 }
 
 // noteBaseHitLocked records that a chunk was borrowed from generation gen

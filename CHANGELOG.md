@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+### `fsync` now does something, and says what it did
+
+`fsync(2)` and `fsyncdir(2)` on a pelfs mount returned success
+unconditionally, without making anything durable. An application that
+called `fsync`, checked the result, and believed its data was safe — which
+is the only reason to call it — was believing nothing.
+
+They now do the work and return success only once it holds: the write
+buffer's mapping is msync'd, the journal recording which file those bytes
+belong to is fsync'd, and the metadata database holding the name, mode and
+length is fsync'd. In THAT order, so no layer is ever durable ahead of the
+one it names. Kill the process, cut the power, reboot, remount the same
+state directory: the writes are there.
+
+**What it means is "recoverable by remounting THIS state directory", and
+that is not federation durability.** On ephemeral job scratch — an HTCondor
+slot that gets wiped on eviction — the state directory dies with the slot,
+and every byte `fsync` covered goes with it whether or not `fsync` returned
+success. What survives an eviction is a CHECKPOINT: `--snapshot-interval`
+to have one happen on a cadence, or `pelfs ctl <mount> publish` at the
+points a job knows are worth keeping. A laptop or a long-lived host, where
+the state directory outlives the process, gets exactly the guarantee it
+asks for. Making `fsync` a federation round trip was the alternative and it
+was rejected: for the sqlite-in-a-container workload that makes an
+application call `fsync` at all, it would be minutes per call.
+
+A directory `fsync` is the same call, deliberately. It asks for namespace
+durability, which is a real question here because the namespace is a
+database — but it cannot be answered alone: the content journal may hold
+entries for inodes the metadata never committed, and the metadata may never
+name content the journal lacks, so a durable namespace over an unsynced
+journal is precisely the state that rule forbids.
+
+**A chatty application pays once.** Repeat calls with nothing written
+between them are coalesced against the overlay's own mutation counter and
+cost a lock and a comparison — no msync, no fsync, no syscall. The first
+call of a session is never coalesced away, because that counter belongs to
+this process and a resumed state directory may hold another session's
+unsynced work. `--no-memtable` mounts are covered too: the staging store
+tracks the bodies it owes, so a sync costs writes-since-the-last-fsync
+rather than one call per dirty file.
+
 ### WebDAV: a pelfs volume in Cyberduck, WinSCP, rclone or Finder
 
 pelfs volumes can now be served over **WebDAV** — `internal/vfsdav`, a

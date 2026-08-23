@@ -1,4 +1,4 @@
-package vfsbilly
+package fsperm
 
 import (
 	"os"
@@ -82,18 +82,18 @@ func TestClassSelectionIsFirstMatchWins(t *testing.T) {
 		name     string
 		uid, gid uint32
 		mode     uint32
-		want     perm
+		want     Perm
 		wantOK   bool
 	}{
-		{"owner class grants", 10, 99, 0o600, permRead | permWrite, true},
-		{"owner class denies without falling through", 10, 99, 0o066, permWrite, false},
-		{"primary group counts", 99, 20, 0o060, permWrite, true},
-		{"a supplementary group counts", 99, 30, 0o060, permWrite, true},
-		{"group denies without falling through to other", 99, 30, 0o006, permWrite, false},
-		{"other class is the last resort", 99, 99, 0o006, permWrite, true},
+		{"owner class grants", 10, 99, 0o600, PermRead | PermWrite, true},
+		{"owner class denies without falling through", 10, 99, 0o066, PermWrite, false},
+		{"primary group counts", 99, 20, 0o060, PermWrite, true},
+		{"a supplementary group counts", 99, 30, 0o060, PermWrite, true},
+		{"group denies without falling through to other", 99, 30, 0o006, PermWrite, false},
+		{"other class is the last resort", 99, 99, 0o006, PermWrite, true},
 	} {
-		if got := me.allowed(tc.uid, tc.gid, tc.mode, false, tc.want); got != tc.wantOK {
-			t.Errorf("%s: allowed(%d:%d %04o, %s) = %v, want %v",
+		if got := me.Allowed(tc.uid, tc.gid, tc.mode, false, tc.want); got != tc.wantOK {
+			t.Errorf("%s: Allowed(%d:%d %04o, %s) = %v, want %v",
 				tc.name, tc.uid, tc.gid, tc.mode, tc.want, got, tc.wantOK)
 		}
 	}
@@ -102,16 +102,16 @@ func TestClassSelectionIsFirstMatchWins(t *testing.T) {
 	// not conjure an execute bit onto a file that has none for anybody --
 	// the one exception the kernel makes.
 	root := Cred{UID: 0, Caps: CapDACOverride}
-	if !root.allowed(10, 20, 0o000, true, permRead|permWrite|permExec) {
+	if !root.Allowed(10, 20, 0o000, true, PermRead|PermWrite|PermExec) {
 		t.Error("CAP_DAC_OVERRIDE did not open a 0000 directory")
 	}
-	if !root.allowed(10, 20, 0o000, false, permRead|permWrite) {
+	if !root.Allowed(10, 20, 0o000, false, PermRead|PermWrite) {
 		t.Error("CAP_DAC_OVERRIDE did not open a 0000 file for read and write")
 	}
-	if root.allowed(10, 20, 0o666, false, permExec) {
+	if root.Allowed(10, 20, 0o666, false, PermExec) {
 		t.Error("CAP_DAC_OVERRIDE invented an execute bit on a file that has none")
 	}
-	if !root.allowed(10, 20, 0o111, false, permExec) {
+	if !root.Allowed(10, 20, 0o111, false, PermExec) {
 		t.Error("CAP_DAC_OVERRIDE refused a file that does have an execute bit")
 	}
 }

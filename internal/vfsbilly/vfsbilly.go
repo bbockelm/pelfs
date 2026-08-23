@@ -283,13 +283,13 @@ func (b *billyFS) mayTraverse(c context.Context, ino uint64) error {
 // to be the ownership the caller can SEE.
 func (b *billyFS) mayDir(p dirPerm, want perm) bool {
 	uid, gid := b.ids.Apply(p.uid, p.gid)
-	return b.cred.allowed(uid, gid, p.mode, true, want)
+	return b.cred.Allowed(uid, gid, p.mode, true, want)
 }
 
 // mayNode is mayDir for an object named by node.
 func (b *billyFS) mayNode(n genfs.Node, want perm) bool {
 	uid, gid := b.ids.Apply(n.UID, n.GID)
-	return b.cred.allowed(uid, gid, n.Mode, n.Type == catalog.TypeDir, want)
+	return b.cred.Allowed(uid, gid, n.Mode, n.Type == catalog.TypeDir, want)
 }
 
 // dirWritable resolves a directory's attributes and requires write and
@@ -317,7 +317,7 @@ func (b *billyFS) maySticky(op, path string, dir dirPerm, target genfs.Node) err
 	}
 	duid, _ := b.ids.Apply(dir.uid, dir.gid)
 	tuid, _ := b.ids.Apply(target.UID, target.GID)
-	if b.cred.UID == tuid || b.cred.UID == duid || b.cred.Caps.has(CapFOwner) {
+	if b.cred.UID == tuid || b.cred.UID == duid || b.cred.Caps.Has(CapFOwner) {
 		return nil
 	}
 	return permErr(op, path)
@@ -930,7 +930,7 @@ func (b *billyFS) setAttr(op, name string, in overlay.SetAttrIn, permitted func(
 // CAP_FOWNER standing in for them.
 func (b *billyFS) owner(n genfs.Node) error {
 	uid, _ := b.ids.Apply(n.UID, n.GID)
-	if b.cred.owns(uid) {
+	if b.cred.Owns(uid) {
 		return nil
 	}
 	return syscall.EPERM
@@ -971,7 +971,7 @@ func (b *billyFS) chown(op, name string, uid, gid int) error {
 func (b *billyFS) chowner(uid, gid int) func(genfs.Node) error {
 	return func(n genfs.Node) error {
 		cur, curg := b.ids.Apply(n.UID, n.GID)
-		return b.cred.mayChown(cur, curg, uid, gid)
+		return b.cred.MayChown(cur, curg, uid, gid)
 	}
 }
 

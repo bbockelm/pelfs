@@ -249,6 +249,28 @@ volume's data keys — the same key must be supplied on every later mount;
 volume-wide lease — see *Caveats*), and the two maintenance switches
 `--no-auto-repack` / `--no-auto-gc`.
 
+## Credentials on macOS
+
+The Pelican client keeps its OAuth2 refresh tokens in an encrypted
+credential wallet, and remembers the password protecting it only for the
+life of one process — so on macOS every `pelfs` command asks again. pelfs
+takes the password from your **login Keychain** instead.
+
+Nothing to switch on. The first time you type the password at a terminal,
+pelfs offers to save it; after that it opens the wallet without asking —
+including for a detached `pelfs mount`, which has no terminal to be asked
+at, and for `pelfs browse`, where the prompt would otherwise arrive in the
+terminal you were just told you would not need. The item is called *pelfs
+(Pelican credential wallet)* in Keychain Access, and its Account is the
+path of the wallet it opens — **delete that item to revoke it**. If the
+password stops working (you changed it), pelfs says so, drops the stale
+value, and offers to store the new one.
+
+Set `$PELFS_NO_KEYCHAIN=1` to turn all of it off: no reads, no offers.
+It does not reach for Pelican's `$PELICAN_CLIENT_NOPASSWORD`, which stores
+the wallet *unencrypted*; the point here is the opposite trade — keep it
+encrypted, and let the OS hold the key.
+
 ## Messages
 
 Everything pelfs says goes to stderr, prefixed `pelfs:` so it stays

@@ -16,6 +16,8 @@ import (
 	"github.com/pelicanplatform/pelican/client"
 	"github.com/pelicanplatform/pelican/config"
 	"github.com/pelicanplatform/pelican/param"
+
+	"github.com/bbockelm/pelfs/internal/pelcred"
 )
 
 // fedStore stores objects in a Pelican federation via the Pelican client
@@ -85,7 +87,32 @@ func newFedStore(ctx context.Context, cfg Config) (*fedStore, error) {
 	opts = append(opts, client.WithAcquireToken(cfg.AcquireToken))
 
 	if cfg.AcquireToken && cfg.TokenPath == "" {
+		// Open the credential wallet from the macOS Keychain before
+		// priming.
+		//
+		// This is a DIFFERENT prompt from the device flow below, and the
+		// difference is the whole reason for the call. The device flow
+		// needs no terminal (see primeCredential's comment) and `pelfs
+		// browse` renders it as a card on the page. The wallet password
+		// prompt is the opposite on both counts: config.GetPassword
+		// refuses outright when stdin is not a character device, and when
+		// it is, it puts that terminal into raw mode -- and it comes
+		// FIRST, because client.AcquireToken opens the wallet before it
+		// can know an OAuth client is wanted. So on macOS, where Pelican's
+		// password cache dies with the process, a locked wallet stops
+		// every verb here in a terminal: a detached `pelfs mount` cannot
+		// answer it at all, and a `pelfs browse` answers it in the
+		// terminal the user was just told they would not need, before the
+		// SSO card is reachable.
+		//
+		// A no-op everywhere but macOS, and a no-op there when the user
+		// has no stored password; the returned call offers to remember one
+		// they had to type. Best-effort throughout -- the worst outcome of
+		// it all going wrong is the prompt that was already there. See
+		// internal/pelcred.
+		remember := pelcred.Unlock(ctx)
 		primeCredential(ctx, strings.TrimRight(cfg.PrefixURL, "/"))
+		remember()
 	}
 
 	// Transfer-only options: accept either CRC32C (the client default) or

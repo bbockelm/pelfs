@@ -145,6 +145,7 @@ jobs:
           ./internal/lease/
           ./internal/version/
           ./internal/ui/
+          ./internal/pelcred/
         env:
           CGO_ENABLED: "0"
       # The mmap port, specifically. internal/mmapfile is the new code and

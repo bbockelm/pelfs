@@ -188,6 +188,19 @@ func Static(bfs billy.Filesystem) VolumeFunc {
 // truncated a 0444 file the kernel, FUSE and the NFS ACCESS reply all refuse
 // would be the same bug internal/vfsbilly's owneroverride_test.go was
 // written to catch.
+//
+// A READ-ONLY SESSION HAS NO OVERLAY — `pelfs browse` without --rw leaves
+// genSession.ov nil — so it is not this constructor's case. Build that one
+// as
+//
+//	vfsbilly.NewReadOnlyFor(g.gfs, cred, vfsbilly.OpenAnsweredHere)
+//
+// which is the same semantics over the published generation, and which this
+// package does not wrap only because there is no *genfs.FS to test such a
+// wrapper against without exporting one from internal/testvol. Everything
+// downstream of the binding is identical: writable() asks billy whether the
+// filesystem has the write capability, and a read-only one refuses every
+// mutation with ErrReadOnly before it reaches the volume.
 func NewVolume(ov *overlay.FS, cred vfsbilly.Cred) billy.Filesystem {
 	return vfsbilly.NewFor(ov, cred, vfsbilly.OpenAnsweredHere)
 }

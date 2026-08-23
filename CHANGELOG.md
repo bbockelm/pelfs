@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### A crash no longer leaves a file that reads at full length with zeros in it
+
+A crash could leave a file that came back at **exactly the size it was
+written**, full of bytes nobody wrote. Nothing a user can run revealed it:
+`stat` said the file was whole, `cmp` was the only thing that disagreed,
+and the recovered session then sealed those zeros into a signed generation
+that `pelfs fsck --deep` called consistent.
+
+The two halves of a file's state are durable at different moments. The
+operation log records a write when it happens, so the file's LENGTH
+survives any crash after it; the record of where the bytes went is written
+only once the flush's packs have landed. A crash in between left recovery
+holding a content row at its full length with nothing behind part of it —
+and a gap in an extent map reads as zeros, which is right for a sparse file
+and a lie here.
+
+Recovery now **cuts the file back to the first byte it cannot serve**, in
+both places a length lives: the extent map and the overlay's node row,
+which is the one `stat` answers and a read clamps to. What comes back is a
+genuine prefix of what was written, or nothing, and the recovery report
+names the cut as well as the loss. A short file after a crash is a failure
+a user can see; a full-length file of zeros is not. Genuine holes are
+untouched — a write past the end of a file still reads as zeros, because
+nothing was lost there.
+
+`docs/known-issues.md` KL-10 has the loss itself: one flush batch (2 MiB at
+the shipped defaults), how often a crash lands in the window, and the
+ordering change that would close it.
+
 ### Cross-generation dedup on the default write path
 
 Writing a file whose content the volume already holds now costs the
@@ -17,6 +46,10 @@ real origin (`scripts/apptainer-docker.sh` section 8b):
 |---|---|---|
 | before | 272,755,301 | 149,221,054 |
 | after | **149,224,395** | 149,221,054 |
+
+Re-measured on the same harness after the recovery fix above:
+**149,224,374** against `--no-memtable`'s 149,221,048, which is the same
+pair of numbers to within the 26 bytes a generation's catalog rows move by.
 
 A derived image costs 4.9 MB instead of 68 MB, and a re-push of an
 unchanged one costs essentially nothing. **`--no-memtable` is no longer

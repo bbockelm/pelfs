@@ -289,9 +289,13 @@ type Store struct {
 	// there, so a replayed session that holds borrowed locations cannot
 	// say whether the base has moved under them and must assume it has.
 	baseRecheckAll bool
-	dek            []byte
-	keyID          int64
-	onUpload       func(string, int64, time.Duration)
+	// truncated is what a recovery cut back, kept for the caller that has
+	// to apply the same cut to the overlay's node lengths. Nil in every
+	// store that was not recovered.
+	truncated []Truncation
+	dek       []byte
+	keyID     int64
+	onUpload  func(string, int64, time.Duration)
 	// baseRefs holds, per ADOPTED handle, the base generation's own
 	// content records for that file (base.go). An extent is either these,
 	// or a ring record, or a location-map entry — the three places bytes

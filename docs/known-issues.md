@@ -420,6 +420,70 @@ has not collapsed to zero. The two rows above need production chunker
 parameters and a quarter of a gigabyte, so they are recorded here rather
 than asserted; the apptainer harness reproduces the first one on every run.
 
+### KL-10. A crash between a flush's publish and its location record loses that batch — one pack target's worth, already uploaded
+
+A flush is durable in two steps and the gap between them is real.
+`publish` (`internal/memtable/flush.go`) installs the batch's locations,
+drops its records from the ring index, and **reclaims the ring region they
+sat in** — which moves the tail hint in the ring file header, so
+`OpenRing` will not walk them again. Only after that does `runFlush` wait
+for the batch's packs to land and write the `Located` record that says
+where they went. A crash in that window leaves a state directory whose
+operation log knows the file (the op log is appended on the write itself)
+and whose location map has nothing for it: the bytes are usually already
+on the federation, and nothing left behind says which pack they are in.
+
+**Size of the loss: exactly one flush batch**, because that is the unit
+`publish` reclaims. At the shipped defaults a batch is `promoteAt` =
+`DefaultPackTarget` = 2 MiB, and the crash gate reproduces it at exactly
+2,097,216 bytes / 24 extents / 8 files of 256 KiB every time it fires.
+
+**How often, measured** (`scripts/crash-recovery-docker.sh`, 256 KiB
+files, loopback origin, arm64 laptop):
+
+| kill timing | runs | runs that lost a batch |
+|---|---|---|
+| the gate's own detection loop (a `find` of the origin plus `sleep 0.1`) | 155 | 6 |
+| the same kill with the sleep and the mount-side `find` removed, so it fires on the first uploaded object | 43 | 24 |
+
+So the window is the length of one batch's uploads, and how often a crash
+lands in it is entirely a question of when the crash happens — the gate's
+polling granularity is what makes it look like a 5% flake rather than the
+1-in-3 it is at the moment the gate is aiming for.
+
+**This is loss, not silent loss, and the distinction is the whole of why
+it is here rather than in the section above.** Recovery reports it by
+inode and byte range, and since `crossgen-recovery-agent` it also CUTS the
+file back to the first byte it cannot serve rather than leaving the
+content row at its old length with a hole in it (`memtable.Truncation`,
+`overlay.applyRecoveredTruncations`). Before that cut existed the file
+came back at its exact original size reading zeros, sealed those zeros
+into a signed generation, and passed `fsck --deep` — which is the failure
+`scripts/crash-recovery-docker.sh` check 3 exists to catch, and did catch.
+
+**Not fixed, and the fix is one that needs its own measurements.** The
+ordering can be closed: defer the reclaim (`s.reclaimTo` and
+`releaseLocked`, both in `publish`) until after `journalLocated` has
+succeeded, and a crash in the window then finds the records still in the
+ring and loses nothing. `PromotableRange` tolerates a lagging tail — `to`
+is `tail + (head - tail - distance)`, so the tail cancels and the batch
+boundary does not move — and `cutLocked` already skips records `publish`
+removed from the index. What it changes is the write path's backpressure:
+the ring's tail would stop advancing until a batch's uploads land, so a
+slow uplink turns upload backlog into writer stall, and that is a
+throughput trade against `scripts/bench-untar-nfs-docker.sh` rather than a
+correctness fix. It was deliberately left out of the cross-generation
+dedup landing so that neither change has to be reviewed or reverted
+through the other.
+
+**Pinned by an executable test: YES**, for the honesty half —
+`memtable.TestARecoveredFileIsCutBackRatherThanServedAsZeros` and its
+three siblings (`internal/memtable/holerecovery_test.go`) plus
+`overlay.TestARecoveredCutIsAppliedToTheNodeLength` drive exactly this
+boundary through `Store.Durable` and `Recover` with no signal and no
+sleep. The LOSS itself has no test because there is nothing to assert yet
+— it is what the contract permits.
+
 ---
 
 ## `CHANGELOG.md` v0.1.0 *Known limitations*: status on main
@@ -480,8 +544,13 @@ regression that must PASS. That is a good state and worth checking against
 whenever this file gains an entry — a bug the corpus can express belongs
 there rather than here, because there it fails on its own.
 
-Nothing left in this file is expressible as a plan, which is why they are
-here:
+KL-10 is the one entry whose HONESTY half is expressible in ordinary Go
+tests and is (`internal/memtable/holerecovery_test.go`); what stays here is
+its remaining half, a loss the contract permits and a fix that is a
+throughput trade.
+
+Nothing else left in this file is expressible as a plan, which is why they
+are here:
 a memory ceiling reached only at a hundred million objects (KI-8), a
 missing stats field (KI-4, KI-5), an error class thrown away (KI-6), a
 transaction count (KI-7), and a wall clock in the wrong place (KI-9).

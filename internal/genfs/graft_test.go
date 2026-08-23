@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/ed25519"
 	crand "crypto/rand"
+	"errors"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -28,32 +30,43 @@ import (
 // graftFixture publishes a volume whose whole tree is grafted from a
 // second prefix on the same origin, and hands back both stores.
 type graftFixture struct {
-	inner, src *pelicanobj.Config
 	innerStore pelicanobj.Store
 	srcStore   pelicanobj.Store
-	srcDir     string
-	sb         *superblock.Superblock
-	entry      superblock.GraftEntry
-	files      map[string][]byte
+	// srcServer serves ONLY the graft source prefix, so a test can take
+	// the third party offline without touching the volume's own storage.
+	// That separation is the whole point of the offline test: a graft's
+	// availability is the intersection of two storage systems, and the
+	// question is what happens when the one you do not own goes away.
+	srcServer *httptest.Server
+	srcDir    string
+	sb        *superblock.Superblock
+	entry     superblock.GraftEntry
+	files     map[string][]byte
 }
+
+// offline stops the graft source. The volume's own prefix keeps working.
+func (f *graftFixture) offline() { f.srcServer.Close() }
 
 func newGraftFixture(t *testing.T, policy graft.BlockPolicy) *graftFixture {
 	t.Helper()
 	ctx := context.Background()
 	root := t.TempDir()
-	srv := httptest.NewServer(fakeorigin.Handler(root))
-	t.Cleanup(srv.Close)
+	volSrv := httptest.NewServer(fakeorigin.Handler(root))
+	t.Cleanup(volSrv.Close)
+	srcSrv := httptest.NewServer(fakeorigin.Handler(root))
+	t.Cleanup(srcSrv.Close)
 
-	newStore := func(prefix string) pelicanobj.Store {
-		s, err := pelicanobj.New(ctx, pelicanobj.Config{PrefixURL: srv.URL + "/" + prefix})
+	newStore := func(base, prefix string) pelicanobj.Store {
+		s, err := pelicanobj.New(ctx, pelicanobj.Config{PrefixURL: base + "/" + prefix})
 		if err != nil {
 			t.Fatalf("pelicanobj.New: %v", err)
 		}
 		return s
 	}
 	f := &graftFixture{
-		innerStore: newStore("vol"),
-		srcStore:   newStore("ext"),
+		innerStore: newStore(volSrv.URL, "vol"),
+		srcStore:   newStore(srcSrv.URL, "ext"),
+		srcServer:  srcSrv,
 		srcDir:     filepath.Join(root, "ext"),
 		files:      map[string][]byte{},
 	}
@@ -104,7 +117,7 @@ func newGraftFixture(t *testing.T, policy graft.BlockPolicy) *graftFixture {
 		t.Fatalf("Spider: %v", err)
 	}
 	entry, err := w.Publish(ctx, f.innerStore, graft.PublishOptions{
-		Mount: "/ext", Source: srv.URL + "/ext", Policy: policy,
+		Mount: "/ext", Source: srcSrv.URL + "/ext", Policy: policy,
 		Bytes: res.Bytes, Files: len(res.Files) - res.Inlined,
 	})
 	if err != nil {
@@ -255,7 +268,7 @@ func TestPrefetchCountsGraftedBytesInsteadOfFailingThem(t *testing.T) {
 	ctx := context.Background()
 	f := newGraftFixture(t, graft.BlockPolicy{Block: 4096, Max: 16384, PerObject: 2})
 	fs := openFS(t, f.innerStore, f.sb, genfs.Options{GraftOpener: f.opener()})
-	rep, err := fs.Prefetch(ctx, 4)
+	rep, err := fs.Prefetch(ctx, genfs.PrefetchOptions{Workers: 4})
 	if err != nil {
 		t.Fatalf("Prefetch: %v", err)
 	}
@@ -318,3 +331,166 @@ func TestABigIndexIsReadByWindowRatherThanFetched(t *testing.T) {
 		t.Fatal("a windowed index resolved to the wrong bytes")
 	}
 }
+
+// TestPrefetchAllMakesGraftedBlocksLocalAndReadsThemOffline is the real
+// test of a prefetch, and it is the one that was missing: prefetch the
+// graft, take the SOURCE away, and read.
+//
+// The volume's own prefix stays up throughout, so a failure here cannot be
+// confused for a broken volume — what is being removed is exactly the
+// third party a graft depends on.
+func TestPrefetchAllMakesGraftedBlocksLocalAndReadsThemOffline(t *testing.T) {
+	ctx := context.Background()
+	f := newGraftFixture(t, graft.BlockPolicy{Block: 4096, Max: 16384, PerObject: 2})
+	cache := t.TempDir()
+	fs := openFS(t, f.innerStore, f.sb, genfs.Options{GraftOpener: f.opener(), CacheDir: cache})
+
+	rep, err := fs.Prefetch(ctx, genfs.PrefetchOptions{Workers: 4, Grafts: true})
+	if err != nil {
+		t.Fatalf("Prefetch: %v", err)
+	}
+	if rep.Failed != 0 {
+		t.Fatalf("prefetch reported %d failures: %v", rep.Failed, rep.Sample)
+	}
+	if rep.Grafted == 0 {
+		t.Fatal("the fixture grafted nothing, so this proves nothing")
+	}
+	if rep.GraftLocal != rep.Grafted {
+		t.Fatalf("prefetch made %d of %d grafted blocks local", rep.GraftLocal, rep.Grafted)
+	}
+	if !rep.FullyLocal() {
+		t.Fatal("every pack and every grafted block is local and the report still says it is not")
+	}
+	if rep.GraftFetched != rep.GraftedBytes {
+		t.Fatalf("prefetch transferred %d bytes for %d bytes of grafted content",
+			rep.GraftFetched, rep.GraftedBytes)
+	}
+	before := fs.GraftStats()
+	t.Logf("prefetch: %d grafted blocks, %s local, cache holds %d blocks in %s",
+		rep.GraftLocal, ui(rep.GraftLocalBytes), before.Cache.Blocks, ui(before.Cache.Bytes))
+
+	// THE SOURCE GOES AWAY. Nothing under /ext can be fetched any more.
+	f.offline()
+
+	for name, want := range f.files {
+		if len(want) <= graft.InlineKeep {
+			continue // copied into the catalog, not grafted: not the test
+		}
+		ino := lookupPath(t, fs, "/ext/"+name)
+		got := make([]byte, len(want))
+		if _, err := fs.Read(ctx, ino, 0, got); err != nil {
+			t.Fatalf("%s: reading a PREFETCHED grafted file with the source offline: %v", name, err)
+		}
+		if string(got) != string(want) {
+			t.Fatalf("%s: the offline read returned the wrong bytes", name)
+		}
+	}
+	// A read straddling a block boundary, offline, because that is the
+	// shape a whole-object digest could never have verified.
+	ino := lookupPath(t, fs, "/ext/data/multi.bin")
+	want := f.files["data/multi.bin"][16000:18000]
+	got := make([]byte, 2000)
+	if _, err := fs.Read(ctx, ino, 16000, got); err != nil {
+		t.Fatalf("straddling offline read: %v", err)
+	}
+	if string(got) != string(want) {
+		t.Fatal("the straddling offline read returned the wrong bytes")
+	}
+
+	after := fs.GraftStats()
+	if after.Failures != before.Failures {
+		t.Fatalf("%d graft fetches were attempted after the source went away; the reads did not "+
+			"come from the local cache", after.Failures-before.Failures)
+	}
+	if after.Cached <= before.Cached {
+		t.Fatal("no read was served from the local graft cache")
+	}
+	t.Logf("offline reads: %d served from the local cache, %d source fetches attempted",
+		after.Cached-before.Cached, after.Failures-before.Failures)
+}
+
+// TestAPrefetchedGraftSurvivesARemount: the cache outlives the process,
+// exactly as the pack cache does, because re-fetching is somebody else's
+// bandwidth as well as yours.
+func TestAPrefetchedGraftSurvivesARemount(t *testing.T) {
+	ctx := context.Background()
+	f := newGraftFixture(t, graft.BlockPolicy{Block: 4096, Max: 16384, PerObject: 2})
+	cache := t.TempDir()
+	fs := openFS(t, f.innerStore, f.sb, genfs.Options{GraftOpener: f.opener(), CacheDir: cache})
+	rep, err := fs.Prefetch(ctx, genfs.PrefetchOptions{Workers: 4, Grafts: true})
+	if err != nil || rep.GraftLocal != rep.Grafted {
+		t.Fatalf("Prefetch: %v (%d/%d local)", err, rep.GraftLocal, rep.Grafted)
+	}
+	if err := fs.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// A second mount over the SAME cache directory, with the source dead.
+	f.offline()
+	fs2 := openFS(t, f.innerStore, f.sb, genfs.Options{GraftOpener: f.opener(), CacheDir: cache})
+	ino := lookupPath(t, fs2, "/ext/data/nested/big.bin")
+	want := f.files["data/nested/big.bin"]
+	got := make([]byte, len(want))
+	if _, err := fs2.Read(ctx, ino, 0, got); err != nil {
+		t.Fatalf("reading a grafted file on a REMOUNT with the source offline: %v", err)
+	}
+	if string(got) != string(want) {
+		t.Fatal("the remounted read returned the wrong bytes")
+	}
+}
+
+// TestPrefetchRefusesAGraftThatCannotFitTheCache. This is where the honest
+// refusal belongs -- not "grafts cannot be prefetched", which is untrue,
+// but "this graft is larger than your cache", with both numbers.
+func TestPrefetchRefusesAGraftThatCannotFitTheCache(t *testing.T) {
+	ctx := context.Background()
+	f := newGraftFixture(t, graft.BlockPolicy{Block: 4096, Max: 16384, PerObject: 2})
+	// A cache far too small for the ~770 KB of grafted content.
+	fs := openFS(t, f.innerStore, f.sb, genfs.Options{
+		GraftOpener: f.opener(), CacheDir: t.TempDir(), CacheBytes: 64 << 10,
+	})
+	_, err := fs.Prefetch(ctx, genfs.PrefetchOptions{Workers: 2, Grafts: true})
+	var budget *genfs.PrefetchBudgetError
+	if !errors.As(err, &budget) {
+		t.Fatalf("a graft larger than the cache was accepted: %v", err)
+	}
+	if budget.GraftBytes == 0 {
+		t.Fatal("the refusal does not say how much of the need is grafted")
+	}
+	if len(budget.GraftRoots) == 0 || budget.GraftRoots[0].Path != "/ext" {
+		t.Fatalf("the refusal does not name the graft: %+v", budget.GraftRoots)
+	}
+	for _, want := range []string{"grafted from", "/ext", "--prefetch packs"} {
+		if !strings.Contains(budget.Error(), want) {
+			t.Fatalf("the refusal does not mention %q: %v", want, budget)
+		}
+	}
+	t.Logf("refused: %v", budget)
+
+	// And the packs-only mode still works on the same volume, which is the
+	// whole point of having the refusal name it.
+	rep, err := fs.Prefetch(ctx, genfs.PrefetchOptions{Workers: 2})
+	if err != nil {
+		t.Fatalf("--prefetch packs on a volume whose graft does not fit: %v", err)
+	}
+	if rep.FullyLocal() {
+		t.Fatal("packs-only prefetch claimed a grafted volume is fully local")
+	}
+	if rep.Grafted == 0 || rep.GraftLocal != 0 {
+		t.Fatalf("packs-only prefetch fetched %d grafted blocks; it must fetch none", rep.GraftLocal)
+	}
+}
+
+// ui is a byte count for a log line, kept local so the test does not
+// depend on the CLI's formatter.
+func ui(n int64) string {
+	switch {
+	case n >= 1<<20:
+		return fmtSize(n>>20, "MiB")
+	case n >= 1<<10:
+		return fmtSize(n>>10, "KiB")
+	}
+	return fmtSize(n, "B")
+}
+
+func fmtSize(n int64, unit string) string { return strconv.FormatInt(n, 10) + " " + unit }

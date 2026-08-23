@@ -34,6 +34,7 @@ cleanup() {
     fi
   done
   [ -n "${ORIGIN_PID:-}" ] && kill "$ORIGIN_PID" 2>/dev/null || true
+  [ -n "${EXT_PID:-}" ] && kill "$EXT_PID" 2>/dev/null || true
   [ -n "${MOUNT_PID:-}" ] && kill "$MOUNT_PID" 2>/dev/null || true
   rm -rf "$WORK"
 }
@@ -61,16 +62,24 @@ else
 fi
 
 mkdir -p "$WORK/origin" "$WORK/mnt" "$WORK/rw"
+# TWO SEPARATE ORIGIN PROCESSES over one directory, and the separation is
+# load-bearing rather than tidy: the graft SOURCE has to be killable
+# without touching the volume's own storage. A graft makes a volume's
+# availability the intersection of two storage systems, and the only honest
+# test of "the bytes are local now" is to remove the one you do not own.
 "$WORK/fakeorigin" -listen 127.0.0.1:18997 -root "$WORK/origin" &
 ORIGIN_PID=$!
+"$WORK/fakeorigin" -listen 127.0.0.1:18998 -root "$WORK/origin" &
+EXT_PID=$!
 for _ in $(seq 50); do curl -fsS "http://127.0.0.1:18997/" >/dev/null 2>&1 && break; sleep 0.1; done
+for _ in $(seq 50); do curl -fsS "http://127.0.0.1:18998/" >/dev/null 2>&1 && break; sleep 0.1; done
 
-# TWO PREFIXES ON ONE ORIGIN. /vol is the pelfs volume; /ext is a foreign
-# tree that pelfs did not write and will never copy. That is the whole
-# point of the arrangement: nothing under /vol/packs/ will ever hold the
-# bytes that come back from /ext.
+# /vol is the pelfs volume, served by the first origin; /ext is a foreign
+# tree that pelfs did not write and will never copy, served by the second.
+# Nothing under /vol/packs/ will ever hold the bytes that come back
+# from /ext.
 VOL="http://127.0.0.1:18997/vol"
-EXT="http://127.0.0.1:18997/ext"
+EXT="http://127.0.0.1:18998/ext"
 
 echo
 echo "===================================================================="
@@ -310,73 +319,156 @@ unmount_at "$WORK/mnt"; wait "$MOUNT_PID" 2>/dev/null || true; MOUNT_PID=
 
 echo
 echo "===================================================================="
-echo "  7. --prefetch: the three honest modes"
+echo "  7. --prefetch all: fetch the graft, then TAKE THE SOURCE AWAY"
 echo "===================================================================="
 # --prefetch all promises "everything this generation references is now
-# local, and I failed loudly if it could not be". A graft cannot keep that
-# promise: the bytes are not in a pack and were never going to be. So
-# there are three modes, and this section tests two of them.
+# local, and I failed loudly if it could not be". A graft can keep that
+# promise -- the bytes go in the LOCAL CACHE, verified against the identity
+# the signed catalog names. That is NOT a materialization: no lease, no new
+# generation, nothing ungrafted, the volume untouched.
 #
-#   all    REFUSE, deliberately, naming the graft.
-#   packs  make the packs local, WARN about the grafted bytes, mount.
-#
-# The third -- materialize the grafted blocks into local packs -- is a
-# WRITE and is designed in docs/design-graft.md rather than built here.
+# The only test of that promise worth running is an offline one.
 
-echo "-- --prefetch all must REFUSE, and must say 'graft' rather than 'no listed pack' --"
-set +e
-"$WORK/pelfs" mount-gen --prefetch all --state-dir "$WORK/state-pf" "$VOL" "$WORK/mnt" >"$WORK/pf.log" 2>&1 &
+echo "-- --prefetch all must MOUNT and report the volume fully local --"
+"$WORK/pelfs" mount-gen --prefetch all --stats-file "$WORK/pf.json" \
+    --state-dir "$WORK/state-pf" "$VOL" "$WORK/mnt" >"$WORK/pf.log" 2>&1 &
 MOUNT_PID=$!
-up=no
-for _ in $(seq 60); do [ -e "$WORK/mnt/ext/data/small.txt" ] && { up=yes; break; }; sleep 0.1; done
-set -e
-if [ "$up" = yes ]; then
-  echo "FAIL: --prefetch all mounted a volume whose grafted bytes are NOT local" >&2
-  unmount_at "$WORK/mnt"; exit 1
-fi
-wait "$MOUNT_PID" 2>/dev/null || true; MOUNT_PID=
-grep -i 'prefetch' "$WORK/pf.log" | tail -3 | sed 's/^/    /'
-grep -qi 'GRAFTED' "$WORK/pf.log" || {
-  echo "FAIL: the refusal did not name the graft as the reason" >&2
+wait_for "$WORK/mnt/ext/data/small.txt" || {
+  echo "FAIL: --prefetch all refused to mount a grafted volume" >&2
   cat "$WORK/pf.log" >&2; exit 1
 }
-grep -qi 'prefetch packs' "$WORK/pf.log" || {
-  echo "FAIL: the refusal did not offer the way forward" >&2
+grep -i 'prefetch' "$WORK/pf.log" | tail -4 | sed 's/^/    /'
+grep -q 'fully local: true' "$WORK/pf.log" || {
+  echo "FAIL: --prefetch all mounted without reporting the volume fully local" >&2
   cat "$WORK/pf.log" >&2; exit 1
 }
-if grep -qi 'no listed pack' "$WORK/pf.log"; then
-  echo "FAIL: the refusal still says 'present in no listed pack', which means DAMAGE" >&2
-  echo "      everywhere else in this system. A graft is not damage." >&2
-  exit 1
-fi
-echo "PASS: --prefetch all refuses by name, offers --prefetch packs, and does not cry damage"
+grep -qi 'not a materialization' "$WORK/pf.log" || {
+  echo "FAIL: prefetch did not distinguish a local copy from a materialization" >&2
+  cat "$WORK/pf.log" >&2; exit 1
+}
+echo "PASS: --prefetch all fetched the graft into the local cache and said so"
 
 echo
-echo "-- --prefetch packs must MOUNT, warn, and not claim the volume is local --"
-"$WORK/pelfs" mount-gen --prefetch packs --stats-file "$WORK/pf2.json" --state-dir "$WORK/state-pf2" "$VOL" "$WORK/mnt" >"$WORK/pf2.log" 2>&1 &
+echo "-- NOW KILL THE GRAFT SOURCE. The volume's own origin stays up. --"
+kill "$EXT_PID" 2>/dev/null || true
+wait "$EXT_PID" 2>/dev/null || true
+EXT_PID=
+# Prove it is really gone, so a passing read below cannot be luck.
+if curl -fsS --max-time 2 "$EXT/data/small.txt" >/dev/null 2>&1; then
+  echo "FAIL: the graft source is still answering; the offline test proves nothing" >&2
+  exit 1
+fi
+echo "the graft source at $EXT is unreachable (curl fails); $VOL is still up"
+
+echo "-- and every grafted byte must still read, from the local cache --"
+# Per file rather than `diff -r`, because by now the tree is deliberately
+# MIXED: section 6 ungrafted exactblock.bin into local packs and added a
+# local newfile.txt, so the mount and the reference copy are not the same
+# set of files any more. These three are the ones still served from the
+# graft, and they are the ones that matter here.
+cmp "$WORK/ref/data/multiblock.bin"  "$WORK/mnt/ext/data/multiblock.bin"
+cmp "$WORK/ref/data/small.txt"       "$WORK/mnt/ext/data/small.txt"
+cmp "$WORK/ref/data/nested/mid.bin"  "$WORK/mnt/ext/data/nested/mid.bin"
+echo "PASS: every still-grafted file read back byte-for-byte WITH THE SOURCE OFFLINE"
+# And the already-local parts are unaffected, which is what says the
+# offline read above came from the graft cache and not from the packs.
+cat "$WORK/mnt/ext/data/exactblock.bin" >/dev/null
+grep -q 'made locally' "$WORK/mnt/ext/data/newfile.txt"
+echo "PASS: the locally packed files in the same tree still read too"
+want=$(dd if="$WORK/ref/data/multiblock.bin" bs=1 skip=1048000 count=2000 2>/dev/null | sha256sum | cut -d' ' -f1)
+got=$(dd if="$WORK/mnt/ext/data/multiblock.bin" bs=1 skip=1048000 count=2000 2>/dev/null | sha256sum | cut -d' ' -f1)
+[ "$want" = "$got" ] || { echo "FAIL: an offline read across a block boundary returned wrong bytes" >&2; exit 1; }
+echo "PASS: an offline read across a 1 MiB block boundary is correct"
+
+unmount_at "$WORK/mnt"; wait "$MOUNT_PID" 2>/dev/null || true; MOUNT_PID=
+if [ -f "$WORK/pf.json" ]; then
+  echo "-- the machine-readable half --"
+  grep -o '"prefetch_complete":[^,}]*' "$WORK/pf.json" || echo "    prefetch_complete absent"
+  grep -o '"prefetch_grafted_bytes":[^,}]*' "$WORK/pf.json" || true
+  grep -o '"prefetch_graft_local_bytes":[^,}]*' "$WORK/pf.json" || true
+  grep -qE "\"prefetch_complete\": *true" "$WORK/pf.json" || {
+    echo "FAIL: the stats do not record the volume as fully local" >&2; exit 1; }
+  echo "PASS: prefetch_complete is true, and the grafted bytes are accounted for as local"
+fi
+
+echo
+echo "-- a REMOUNT over the same cache still reads offline (the cache outlives the process) --"
+"$WORK/pelfs" mount-gen --state-dir "$WORK/state-pf" "$VOL" "$WORK/mnt" >"$WORK/pf-remount.log" 2>&1 &
+MOUNT_PID=$!
+wait_for "$WORK/mnt/ext/data/small.txt" || {
+  echo "FAIL: the remount did not come up" >&2; cat "$WORK/pf-remount.log" >&2; exit 1; }
+cmp "$WORK/ref/data/nested/mid.bin" "$WORK/mnt/ext/data/nested/mid.bin"
+cmp "$WORK/ref/data/multiblock.bin" "$WORK/mnt/ext/data/multiblock.bin"
+echo "PASS: a fresh process served the grafted tree from the cache the last one filled"
+unmount_at "$WORK/mnt"; wait "$MOUNT_PID" 2>/dev/null || true; MOUNT_PID=
+
+echo
+echo "===================================================================="
+echo "  8. the other two modes, and the refusal that is actually useful"
+echo "===================================================================="
+# Bring the source back so `packs` mode has something to be remote.
+"$WORK/fakeorigin" -listen 127.0.0.1:18998 -root "$WORK/origin" &
+EXT_PID=$!
+for _ in $(seq 50); do curl -fsS "http://127.0.0.1:18998/" >/dev/null 2>&1 && break; sleep 0.1; done
+
+echo "-- --prefetch packs must MOUNT, WARN, and not claim the volume is local --"
+"$WORK/pelfs" mount-gen --prefetch packs --stats-file "$WORK/pf2.json" \
+    --state-dir "$WORK/state-pf2" "$VOL" "$WORK/mnt" >"$WORK/pf2.log" 2>&1 &
 MOUNT_PID=$!
 wait_for "$WORK/mnt/ext/data/small.txt" || {
   echo "FAIL: --prefetch packs refused to mount a grafted volume" >&2
   cat "$WORK/pf2.log" >&2; exit 1
 }
-# The grafted bytes still read -- from the source, which is the point.
 cmp "$WORK/ref/data/nested/mid.bin" "$WORK/mnt/ext/data/nested/mid.bin"
 grep -i 'prefetch' "$WORK/pf2.log" | tail -4 | sed 's/^/    /'
-grep -qi 'cannot be made local' "$WORK/pf2.log" || {
-  echo "FAIL: --prefetch packs mounted without warning that grafted bytes are remote" >&2
+grep -qi 'this mode does not fetch it' "$WORK/pf2.log" || {
+  echo "FAIL: --prefetch packs mounted without warning that grafted bytes stay remote" >&2
+  cat "$WORK/pf2.log" >&2; exit 1
+}
+grep -q 'fully local: false' "$WORK/pf2.log" || {
+  echo "FAIL: --prefetch packs did not say the volume is not fully local" >&2
   cat "$WORK/pf2.log" >&2; exit 1
 }
 unmount_at "$WORK/mnt"; wait "$MOUNT_PID" 2>/dev/null || true; MOUNT_PID=
-if [ -f "$WORK/pf2.json" ]; then
-  echo "-- and the machine-readable half of the warning --"
-  grep -o '"prefetch_complete":[^,}]*' "$WORK/pf2.json" || echo "    prefetch_complete absent (false)"
-  grep -o '"prefetch_grafted_bytes":[^,}]*' "$WORK/pf2.json" || true
-  if grep -q '"prefetch_complete":true' "$WORK/pf2.json"; then
-    echo "FAIL: the stats claim a grafted volume is fully local" >&2
-    exit 1
-  fi
-  echo "PASS: prefetch_complete is not true while grafted bytes are remote"
+if grep -qE "\"prefetch_complete\": *true" "$WORK/pf2.json" 2>/dev/null; then
+  echo "FAIL: the stats claim a packs-only prefetch left a grafted volume fully local" >&2
+  exit 1
 fi
+echo "PASS: --prefetch packs mounts, warns by name, and reports not-fully-local"
+
+echo
+echo "-- and a cache too small must refuse with BOTH NUMBERS, not a categorical no --"
+set +e
+"$WORK/pelfs" mount-gen --prefetch all --cache-size 200K \
+    --state-dir "$WORK/state-pf3" "$VOL" "$WORK/mnt" >"$WORK/pf3.log" 2>&1 &
+MOUNT_PID=$!
+up=no
+for _ in $(seq 40); do [ -e "$WORK/mnt/ext/data/small.txt" ] && { up=yes; break; }; sleep 0.1; done
+set -e
+if [ "$up" = yes ]; then
+  echo "FAIL: --prefetch all mounted with a cache far too small to hold the graft" >&2
+  unmount_at "$WORK/mnt"; exit 1
+fi
+wait "$MOUNT_PID" 2>/dev/null || true; MOUNT_PID=
+grep -i 'prefetch' "$WORK/pf3.log" | tail -3 | sed 's/^/    /'
+grep -qi 'grafted from' "$WORK/pf3.log" || {
+  echo "FAIL: the refusal does not say how much is grafted or from where" >&2
+  cat "$WORK/pf3.log" >&2; exit 1
+}
+grep -qi 'cache budget is' "$WORK/pf3.log" || {
+  echo "FAIL: the refusal does not carry the budget it could not fit in" >&2
+  cat "$WORK/pf3.log" >&2; exit 1
+}
+grep -qi 'prefetch packs' "$WORK/pf3.log" || {
+  echo "FAIL: the refusal does not offer the way forward" >&2
+  cat "$WORK/pf3.log" >&2; exit 1
+}
+if grep -qi 'no listed pack' "$WORK/pf3.log"; then
+  echo "FAIL: the refusal says 'present in no listed pack', which means DAMAGE" >&2
+  echo "      everywhere else in this system. A graft is not damage." >&2
+  exit 1
+fi
+echo "PASS: the refusal is about SIZE, carries both numbers, names the graft, and offers a way on"
 
 echo
 echo "===================================================================="

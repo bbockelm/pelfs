@@ -240,6 +240,10 @@ type FS struct {
 	// (graft.go). A nil table is the whole of the cost grafts impose on a
 	// volume that has none.
 	grafts *graftTable
+	// graftCache is the local disk tier for grafted blocks
+	// (graftcache.go), nil on a volume with no grafts or a mount with
+	// whole-pack caching turned off.
+	graftCache *graftCache
 
 	// swapMu makes a generation swap atomic with respect to filesystem
 	// operations: every operation holds it for READ for its whole

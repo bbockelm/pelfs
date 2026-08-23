@@ -162,6 +162,12 @@ type Summary struct {
 	// "local", and prefetch_complete is false whenever they are non-zero.
 	PrefetchGraftedChunks int64 `json:"prefetch_grafted_chunks,omitempty"`
 	PrefetchGraftedBytes  int64 `json:"prefetch_grafted_bytes,omitempty"`
+	// PrefetchGraftLocalBytes is how much of that is on THIS machine's
+	// disk, verified, when the pass finished. Equal to
+	// PrefetchGraftedBytes after a successful `--prefetch all`; smaller
+	// after `--prefetch packs`, which does not fetch grafted content.
+	// prefetch_complete is false whenever they differ.
+	PrefetchGraftLocalBytes int64 `json:"prefetch_graft_local_bytes,omitempty"`
 
 	// ResidentInodes is how many inodes the mount is holding resolved, and
 	// ResidencyEvicted how many a residency cap has dropped. The second is

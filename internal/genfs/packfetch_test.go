@@ -316,7 +316,7 @@ func TestPrefetchCachesPacksAcrossOpens(t *testing.T) {
 	f := newPackFixture(t, "9ac0de01-0004-4002-8003-a0b0c0d0e0f0", 4<<20)
 	fs := f.open(t, genfs.Options{})
 
-	rep, err := fs.Prefetch(context.Background(), 4)
+	rep, err := fs.Prefetch(context.Background(), genfs.PrefetchOptions{Workers: 4})
 	if err != nil {
 		t.Fatalf("Prefetch: %v", err)
 	}
@@ -354,7 +354,7 @@ func TestPrefetchCachesPacksAcrossOpens(t *testing.T) {
 func TestTruncatedCachedPackIsNotServed(t *testing.T) {
 	f := newPackFixture(t, "9ac0de01-0005-4002-8003-a0b0c0d0e0f0", 4<<20)
 	fs := f.open(t, genfs.Options{})
-	if _, err := fs.Prefetch(context.Background(), 4); err != nil {
+	if _, err := fs.Prefetch(context.Background(), genfs.PrefetchOptions{Workers: 4}); err != nil {
 		t.Fatalf("Prefetch: %v", err)
 	}
 	packs := cachedPacks(t, f.cache)
@@ -430,7 +430,7 @@ func TestPackCacheEvicts(t *testing.T) {
 func TestPackCacheCanBeDisabled(t *testing.T) {
 	f := newPackFixture(t, "9ac0de01-0007-4002-8003-a0b0c0d0e0f0", 4<<20)
 	fs := f.open(t, genfs.Options{PackCacheBytes: -1})
-	if _, err := fs.Prefetch(context.Background(), 4); !errors.Is(err, genfs.ErrPrefetchNeedsPackCache) {
+	if _, err := fs.Prefetch(context.Background(), genfs.PrefetchOptions{Workers: 4}); !errors.Is(err, genfs.ErrPrefetchNeedsPackCache) {
 		t.Fatalf("Prefetch with whole-pack caching off: %v, want ErrPrefetchNeedsPackCache", err)
 	}
 	if packs := cachedPacks(t, f.cache); len(packs) != 0 {
@@ -455,7 +455,7 @@ func TestPrefetchRefusesAGenerationLargerThanTheCache(t *testing.T) {
 	// question is whether the REFUSED prefetch adds to that.
 	wasCached := len(cachedPacks(t, f.cache))
 	before := f.inner.gets.Load()
-	rep, err := fs.Prefetch(context.Background(), 4)
+	rep, err := fs.Prefetch(context.Background(), genfs.PrefetchOptions{Workers: 4})
 	var budget *genfs.PrefetchBudgetError
 	if !errors.As(err, &budget) {
 		t.Fatalf("Prefetch of a ~36 MiB generation into a 5 MiB cache: %v (report %+v)", err, rep)

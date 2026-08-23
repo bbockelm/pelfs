@@ -5,11 +5,12 @@ in parallel, block-digested, published into a signed generation, and read
 back byte-for-byte through a real Linux kernel mount, with no copy of the
 data under the volume's own prefix — and when the source changes
 underneath the signed generation the read fails closed, naming the graft,
-the object and the fix. Since the first round it has gained the four
-things that make it usable at the size it is for: a **resumable**
-parallel walk, a **per-object block size**, an index read **by window**
-rather than fetched whole, and a `--prefetch` that tells the truth about
-grafted bytes instead of refusing to mount. The end-to-end is
+the object and the fix. Since the first round it has gained the things
+that make it usable at the size it is for: a **resumable** parallel walk,
+a **per-object block size**, an index read **by window** rather than
+fetched whole, and a `--prefetch all` that **fetches the grafted blocks
+into a local cache** — proven by killing the graft source and reading the
+tree anyway. The end-to-end is
 `scripts/graft-spike-docker.sh`, and the transcript is in "The spike"
 below.
 
@@ -55,11 +56,14 @@ are fixable; neither is a reason not to do this.
 | `internal/graft/checkpoint.go` | the append-only resume log |
 | `internal/superblock` | `GraftEntry` (+`BlockMax`, `BlocksPerObject`, `Files`, `Objects`), `Superblock.Grafts`, `GraftBudgetBytes` |
 | `internal/genfs/graft.go` | the resolver (memoized, ctx-carrying), the reader-side veto, unconditional verification, `GraftStats` |
-| `internal/genfs/prefetch.go` | grafted refs counted rather than failed; `PrefetchReport.FullyLocal` |
+| `internal/genfs/prefetch.go` | grafted blocks fetched into the local cache (`PrefetchOptions.Grafts`), budget refusal with both numbers, `PrefetchReport.FullyLocal` |
+| `internal/genfs/graftcache.go` | the local disk tier: self-describing blobs under `packs/`, resident identity→(blob, offset) map, verified on every read |
+| `internal/genfs/gencache.go` | two-pass eviction: prefetched graft blobs go last, and the loss is counted |
 | `internal/publish/graftsource.go` | `GraftSource`: a `publish.Source` + `ContentProvider` over a spider result |
 | `cmd/pelfs/graft.go` | `pelfs graft`, `--refresh`, `--list`, the block/concurrency knobs, the scheme allowlist, the mount's `GraftOpener` |
 | `cmd/pelfs/mountgen.go` | `--prefetch all｜packs｜background` and what each promises |
-| `internal/genfs/graft_test.go` | the whole read path in the ORDINARY lane: good read, straddling read, fail-closed, no-opener refusal, prefetch arithmetic, a windowed index |
+| `internal/genfs/graft_test.go` | the whole read path in the ORDINARY lane: good read, straddling read, fail-closed, no-opener refusal, prefetch arithmetic, a windowed index, and **offline reads after a prefetch** |
+| `internal/genfs/graftcache_internal_test.go` | the storage shape (one file per blob, not per block), reopen, torn blobs, both eviction passes |
 | `scripts/graft-spike-{test,docker}.sh` | the mount-backed end-to-end, now including resume and the prefetch modes |
 
 `go build ./...`, `go vet ./...`, `go test ./...` are green (38 packages,
@@ -398,7 +402,7 @@ decision, 🟢 fine as is.
 | Subsystem | What it assumes | What a graft does to it | Verdict |
 |---|---|---|---|
 | `genfs.ContentOf` (`read.go:152`) | every non-hole identity is in a listed pack, else abort | **would abort every seal over a grafted subtree.** Fixed in the spike: the graft table is consulted first, and `Content.External` is set. | 🔴 → fixed |
-| `--prefetch all` (`genfs/prefetch.go`) | everything referenced is in a pack; failures are fatal | **refused to mount**, reporting grafted chunks as `present in no listed pack` — the sentence that means damage. Fixed: grafted refs are counted, not failed; `all` refuses *by name* and offers `--prefetch packs`, which mounts and warns. Decision 13. | 🔴 → fixed |
+| `--prefetch all` (`genfs/prefetch.go`) | everything referenced is in a pack; failures are fatal | **refused to mount**, reporting grafted chunks as `present in no listed pack` — the sentence that means damage. Fixed: grafted blocks are FETCHED into a local cache tier of their own, verified on the way in, and read offline afterwards; the only refusal left is about cache size and carries both numbers. Decision 13. | 🔴 → fixed |
 | `fsck` (`walk.go:263`) | ditto | **reports every grafted file as `missing-chunk`, exit 1.** Needs graft-awareness *and* a severity axis (Decision 4). | 🔴 |
 | Dedup sidecar (`publish/dedup.go`, `rememberReusedChunks`) | an identity in the set means "a listed pack holds these bytes" | **silent data loss** if graft identities enter it: a locally written file's chunk is elided from upload because a third party holds the same block, and no graft record names it. **Not a coincidence** — a graft block is a whole file whenever the file is under the block size, and CDC cuts such a file into one chunk of the same bytes. Fixed in the spike via `Content.External` → `rememberExcept`. | 🟠 → fixed |
 | `memtable.Adopt` (`base.go:67`) | base records can be carried by reference | would leave a written file half-grafted. Fixed: `External` → `adoptByReading` (Decision 3). | 🟠 → fixed |
@@ -1000,77 +1004,253 @@ than quietly laundering.
 
 ---
 
-## Decision 13 — `--prefetch` has three honest modes, and `all` refuses
+## Decision 13 — `--prefetch all` FETCHES the graft, and reads it offline
 
-**Decision: `all` refuses a grafted volume by name; `packs` makes the
-packed content local, warns, and mounts; `background` is `packs`
-asynchronously. Materializing is designed and not built, because it is a
-write.**
+**Decision: `--prefetch all` fetches every grafted block into the local
+cache, verifies each against the identity the signed catalog names, and
+mounts. `--prefetch packs` makes the packed content local and says out
+loud that the grafted content is still remote. The only refusal left is
+about SIZE, and it carries both numbers.**
 
-The insight is the right one and it reframes the whole problem: **fully
-prefetching a graft and materializing it are the same operation.** There
-is no pack to cache, so "make these bytes local" means writing them into
-local packs — a new generation, the lease, the publish path. That is not
-something a mount flag should do on the way up.
+An earlier round of this design refused instead, on the argument that
+"fully prefetching a graft is the same operation as materializing it." That
+argument is **wrong**, and the correction is the whole of this decision:
 
-So there are three modes rather than one:
+| | writes to | needs | afterwards |
+|---|---|---|---|
+| **materialize** | PUBLISHED packs, under the volume's prefix | the write lease, a new generation | the file is not grafted any more, for everyone, forever |
+| **prefetch** | the LOCAL CACHE, on this machine | nothing | the file is still grafted, the volume is byte-for-byte unchanged, and this machine happens to have the bytes |
 
-| mode | promise | grafted bytes |
-|---|---|---|
-| `all` | everything referenced is local, and I failed loudly if it could not be | **refuse the mount**, naming the graft and its source |
-| `packs` | every pack is local; reads under a graft still go to the network | counted and WARNED about; `prefetch_complete` stays false |
-| materialize | copy the grafted blocks into local packs | *designed below, not built* |
+A prefetch is a read-side operation. It is exactly what somebody who typed
+`--prefetch all` asked for, and there was never a reason it could not be
+done. Refusing was the wrong default.
 
-**The default is refusal, and here is why.** `--prefetch` is already
-opt-in — the default is `none` — so a user who typed `all` asked for a
-guarantee. The useful answer to "I cannot give you that" is to say so with
-the alternative attached, not to hand back a weaker thing under the same
-name. `--prefetch packs` is one word away and means what it says.
+### What it does
 
-What changed underneath, and it matters more than the flag: grafted refs
-are **counted, not failed**. The spike reported them through
-`noteFailure`, which produced `chunk 68c99c16…: present in no listed
-pack` — a sentence that means DAMAGE everywhere else in this system
-(`fsck`'s missing-chunk, `reach`'s `Unresolved`). A graft is not damage.
-`PrefetchReport` now carries `Grafted`, `GraftedBytes` and `GraftRoots`,
-and the ONLY way to ask whether a volume is local is
-`PrefetchReport.FullyLocal()`, which is `Failed == 0 && Grafted == 0`. No
-caller can conclude "local" from a zero failure count any more, which is
-the invariant you asked for: **`--prefetch` never claims a volume is fully
-local when grafted bytes are not.** The machine-readable half is
-`prefetch_complete` in the stats JSON, plus `prefetch_grafted_chunks` and
-`prefetch_grafted_bytes`.
+`PrefetchOptions{Grafts: true}` walks the generation, collects the grafted
+chunk references it finds, and fetches each block **through
+`readGraftChunk` — the same function the read path uses**, with a pin flag
+set. That is deliberate rather than convenient: it means a prefetched
+block is verified before it is written, by the same unconditional check,
+and there is no second path on which an unverified byte could reach the
+disk. What ends up cached is exactly what a read would have accepted.
 
-Both are asserted in the end-to-end, including that the refusal does *not*
-contain the string "no listed pack".
+### Storage shape: blobs under `packs/`, and the lesson it must not undo
 
-### Mode 3, materialize — designed, not built
+**Not one file per block.** That is the inode explosion `chunkarena.go`
+was built to end — 6,646 files down to 1 on a 166 MiB tree — and a graft
+is where it would be worst: 10 TB at the 1 MiB floor is ten and a half
+million blocks.
 
-It is an **import**, and it reuses machinery that already exists:
+**Not the arena either.** The arena is a bounded *decode* cache: a fixed
+mmap'd reservation, 256 MiB by default, capped at `CacheBytes/8`, with a
+cursor that overwrites. A prefetch is not a decode cache — it is asked to
+hold what it was told to hold.
 
-1. `genfs.ContentOf` already reports `External` for a grafted file, and
-   `memtable.Adopt` already routes an External record to
-   `adoptByReading` — the same three lines that make a write ungraft one
-   file (Decision 3). Materializing a whole graft is that path, driven
-   over the tree instead of by a `write()`.
-2. The bytes therefore come through the **verified** read path, so a
-   materialization cannot launder changed source bytes into a pack. This
-   is the property that makes it safe, and it is already tested by the
-   end-to-end's "delete the source object" assertion.
-3. They are re-chunked by FastCDC and packed by `publish`, so the result
-   dedups against the rest of the volume — which a graft's fixed blocks
-   never could (Decision 2).
-4. The output is a **new generation** whose superblock drops the
-   `GraftEntry` for that path (or keeps it, if only part of the tree was
-   imported — which argues for making the unit a subtree, not the graft).
+So: **blobs under `packs/`**, next to the cached packs, cut at 256 MiB —
+the same order as `maxWholePackBytes`, for the same two reasons (eviction
+should take back a bounded unit, and a process killed mid-prefetch should
+lose a bounded unit). Each blob is **one file** and is self-describing:
 
-What it needs that does not exist: the **write lease**, because it
-publishes; a resumable driver, because importing 10 TB has exactly the
-interruption problem the spider had and should reuse the same checkpoint
-shape; and a decision about the half-imported state, which is why the
-honest first version is `pelfs graft --materialize <path>` operating on a
-whole graft root rather than a `--prefetch` value. It is **not** a mount
-flag: `--prefetch` may not change the volume.
+```
+[block bytes ...][n × {32-byte identity, u64 offset, u32 length}][footer]
+```
+
+Two choices inside that are worth stating.
+
+**One file, not a blob plus a sidecar index.** Eviction deletes *files*,
+and a pair can be split — leaving an index that points at nothing, or data
+nothing can find. A blob that carries its own table cannot lose it.
+
+**Under `packs/`, not in a directory of its own.** Everything that already
+accounts for the cache — the LRU sweep, the single byte budget, `DirUsage`
+reporting, `pelfs cache` — walks `cacheDirNames`, and putting the blobs
+there means **all of it keeps working with no change**. A blob is named
+`g-<hex>.gcache`, which cannot collide with a pack (`p-<unixnano>-<hex>`),
+and the in-flight one is `.gcache.tmp`, which the eviction sweep already
+skips and `sweepPackTmp` already cleans up after a crash.
+
+The identity → (blob, offset, length) map is **resident**, which sounds
+like the thing `internal/graft`'s windowed reader exists to avoid and is
+not: this map describes what is **on this disk**, so it is bounded by the
+cache budget over the block size. A 100 GB cache at the 1 MiB floor is
+~100,000 entries, about 5 MB. The graft may be 10 TB; the cache is not.
+
+### The cache is a pure HINT, because every read is verified
+
+A block served from the cache is hashed against the identity the signed
+catalog names, exactly as one off the wire is. That is not
+belt-and-braces — it is what lets this whole tier be a hint. A corrupt
+blob, a stale index entry, a file truncated by a killed process: every one
+of them produces a hash that does not match, which is treated as a **miss**
+and refetched. The cache can make a read slow; it cannot make a read
+wrong, and it cannot make a read fail.
+
+One distinction is kept carefully, in `readGraftChunk`: **a mismatch from
+the CACHE is a miss; a mismatch from the SOURCE is "the graft source has
+changed" and fails closed.** Blurring them would either hide a changed
+source behind a refetch loop, or accuse a third party of changing when a
+local file rotted. They are counted apart too (`Cached`, `CacheBad`).
+
+The cache also **survives process exit**, exactly as the pack cache does,
+and for a stronger reason: re-fetching is somebody else's bandwidth as
+well as yours.
+
+### Reads populate it too, not only prefetch
+
+Gated on the same switch as whole-pack caching (`PackCacheBytes` negative
+turns both off — a mount with less disk than bandwidth has said what it
+wants). Without it, a graft's central hazard would be paid on every
+re-read forever, and `--prefetch` would be the only way to avoid it. With
+it, a warm cache builds itself and a prefetch is the way to say "all of
+it, now".
+
+### The budget: refuse up front, with both numbers
+
+This is where the honest refusal lives. Prefetching 10 TB into a 100 GB
+cache cannot work, and that — not "grafts cannot be prefetched" — is the
+thing worth refusing.
+
+**Refuse up front, not fetch-what-fits.** The precedent is already in the
+file and the argument is identical: `PrefetchBudgetError` refuses a pack
+set larger than the budget because "fetching it anyway would evict the
+front of the set to make room for the back and leave the mount both slow
+and incomplete". A partial graft warm is worse than that, because *which*
+part you got depends on walk order — an unpredictable outcome from a flag
+that exists to make outcomes predictable. And the user is not stranded:
+`--prefetch packs` mounts, and read-driven caching warms what is actually
+touched.
+
+The check has two stages. A **cheap one before anything is walked**, off
+`GraftEntry.Bytes` in the signed superblock — which is why that field is
+recorded — so the 10-TB-into-100-GB case is answered without touching a
+catalog. Then the **exact combined check** once the pack set is known.
+Grafted bytes count against the budget *only when the pass intends to
+fetch them*, so `--prefetch packs` still works on a volume whose graft
+dwarfs the disk. (That was a real bug in the first cut: it refused
+packs-only mode for bytes nobody had asked for.)
+
+What the user sees:
+
+```
+ERROR pelfs: prefetch: refusing to mount: making this generation local needs 3.9 MiB
+— 3.9 MiB grafted from /ext <- http://127.0.0.1:18998/ext (3.9 MiB) — and the local
+cache budget is 187.5 KiB. Raise --cache-size above 3.9 MiB, or use `--prefetch packs`
+to make the packed content local and read the grafted content from its source
+```
+
+and with packs in the mix, `… needs 4.1 GiB — 210 MiB in 12 packs and 3.9
+GiB grafted from /sw <- pelican://osg-htc.org/sw (3.9 GiB) — and the local
+cache budget is 3.6 GiB.` The pack clause is omitted when the cheap check
+fired, because "0 B in 0 packs" there would describe a walk that never
+happened.
+
+### Eviction, and what `FullyLocal()` can honestly mean
+
+This is the subtle part, and the answer is **preferred, not immortal**.
+
+Two things are both true. A cached graft block is **re-fetchable**, so
+evicting one is always safe — the read path falls back to the source —
+which means it is never worth failing a write or filling a disk to keep
+one. That rules out an unconditional pin. But plain LRU takes prefetched
+blobs **first**, because the moment a prefetch finishes they are the
+oldest thing in the cache and the next catalog spill is the newest. A
+prefetch whose bytes are evicted before anything reads them did nothing.
+That rules out no pin at all.
+
+So the sweep is two passes (`gencache.go`, on the shape `pinnedCatalogs`
+already established):
+
+1. Everything else first, down to the low-water mark, skipping blobs a
+   prefetch filled.
+2. Only if the cache is **still over its CAP** — not merely over the
+   low-water mark — the prefetched blobs go too.
+
+And when pass 2 fires it is **recorded**: `GraftCacheStats.PinnedEvicted`
+counts the bytes taken back. That is the number that says a `--prefetch
+all` report stopped being true, and nobody should have to infer it.
+
+`FullyLocal()` is therefore documented as **a statement about the moment
+the pass returned**, and it is defined as `Failed == 0 && GraftLocal ==
+Grafted` — never `Failed == 0`, so no caller can reach "local" from a zero
+failure count. This is not a new weakness introduced by grafts: it was
+already true of packs, which are evictable and were the oldest thing in
+the cache after a prefetch too. What is new is that it is written down,
+that eviction prefers to take something else, and that the loss is
+counted.
+
+Machine-readable: `prefetch_complete`, `prefetch_grafted_chunks`,
+`prefetch_grafted_bytes`, `prefetch_graft_local_bytes`.
+
+### Keeping the two words apart, in the CLI and everywhere else
+
+The mount says it, every time:
+
+```
+prefetched 4 of 4 grafted blocks (2.9 MiB local, 2.9 MiB transferred from the graft
+source); the files are still grafted and the volume is unchanged — this is a local
+copy, not a materialization
+```
+
+and `--prefetch packs` says the other half:
+
+```
+WARN prefetch: /ext is GRAFTED from http://…/ext and this mode does not fetch it —
+reads under it will go to http://…/ext (2.9 MiB of grafted content in this
+generation). `--prefetch all` fetches and verifies it into the local cache
+```
+
+`pelfs graft --list` still names the source after a prefetch, because the
+volume still depends on it: another reader has none of your cache, and
+your own cache is evictable. Prefetch is a local convenience; only
+materialize removes the dependency.
+
+### Mode 3, materialize — still designed, still not built
+
+It reuses machinery that exists: `genfs.ContentOf` already reports
+`External`, and `memtable.Adopt` already routes an External record to
+`adoptByReading`, so the bytes come through the **verified** read path and
+a materialization cannot launder changed source bytes into a pack. They
+are then re-chunked by FastCDC and packed by `publish`, so the result
+dedups against the rest of the volume — which a graft's fixed blocks never
+could.
+
+What it still needs: the **write lease**, a resumable driver (importing
+10 TB has exactly the interruption problem the spider had, and should
+reuse the same checkpoint shape), and a decision about the half-imported
+state — which argues for making the unit a subtree. It is `pelfs graft
+--materialize`, not a mount flag, because `--prefetch` may not change the
+volume.
+
+### Proven offline, which is the only test that counts
+
+`scripts/graft-spike-test.sh` now runs **two fakeorigin processes** over
+one directory, so the graft source can be killed without touching the
+volume's own storage. Section 7:
+
+```
+prefetched 1 packs … fully local: true
+prefetched 4 of 4 grafted blocks (2.9 MiB local, 2.9 MiB transferred …)
+
+-- NOW KILL THE GRAFT SOURCE. The volume's own origin stays up. --
+the graft source at http://127.0.0.1:18998/ext is unreachable (curl fails);
+http://127.0.0.1:18997/vol is still up
+
+PASS: every still-grafted file read back byte-for-byte WITH THE SOURCE OFFLINE
+PASS: the locally packed files in the same tree still read too
+PASS: an offline read across a 1 MiB block boundary is correct
+"prefetch_complete": true
+"prefetch_graft_local_bytes": 3021440
+PASS: a fresh process served the grafted tree from the cache the last one filled
+```
+
+The last line is the remount: a second `mount-gen` over the same cache
+directory, still offline, still correct — the cache outlives the process.
+In the ordinary lane, `TestPrefetchAllMakesGraftedBlocksLocalAndReadsThem
+Offline` asserts the same thing plus that **zero** source fetches were
+attempted after the source went away, and
+`TestPrefetchedBlobsAreEvictedLastAndTheLossIsRecorded` drives both
+eviction passes.
 
 ---
 
@@ -1169,32 +1349,60 @@ PASS: the refreshed graft serves the NEW bytes of the changed file
 
 ### `--prefetch`, which used to be the section that failed
 
-```
--- --prefetch all must REFUSE, and must say 'graft' rather than 'no listed pack' --
-ERROR pelfs: prefetch: refusing to mount: --prefetch all promises every byte is local,
-and 2.9 MiB of this generation is GRAFTED (/ext <- http://127.0.0.1:18997/ext) — those
-bytes live at a foreign prefix and there is no pack to cache, so no transfer can make
-them local. Use `--prefetch packs` to make the packed content local and read the grafted
-content from its source, or `--prefetch none`. Copying a graft in is a materialization
-(a write and a new generation), not a prefetch
-PASS: --prefetch all refuses by name, offers --prefetch packs, and does not cry damage
+Two fakeorigin processes over one directory, so the graft SOURCE can be
+killed without touching the volume's own storage. That separation is the
+whole test: a graft makes a volume's availability the intersection of two
+storage systems, and the only honest proof that the bytes are local is to
+remove the one you do not own.
 
--- --prefetch packs must MOUNT, warn, and not claim the volume is local --
-WARN pelfs: prefetch: /ext is GRAFTED from http://127.0.0.1:18997/ext and cannot be made
-local — there is no pack to cache. Reads under it will still go to
-http://127.0.0.1:18997/ext (2.9 MiB of grafted content in this generation)
-WARN pelfs: prefetch: this volume is NOT fully local: 4 chunks (2.9 MiB) live at a graft
-source. Copying them in would be a materialization — a write, a new generation — not a
-prefetch
-INFO pelfs: prefetched 1 packs (1 already cached) across 5 files, 1.0 MiB local; fully
-local: false
+```
+-- --prefetch all must MOUNT and report the volume fully local --
+INFO pelfs: prefetched 1 packs (1 already cached) across 5 files, 1.0 MiB local; fully local: true
+INFO pelfs: prefetched 4 of 4 grafted blocks (2.9 MiB local, 2.9 MiB transferred from the
+graft source); the files are still grafted and the volume is unchanged — this is a local
+copy, not a materialization
+PASS: --prefetch all fetched the graft into the local cache and said so
+
+-- NOW KILL THE GRAFT SOURCE. The volume's own origin stays up. --
+the graft source at http://127.0.0.1:18998/ext is unreachable (curl fails);
+http://127.0.0.1:18997/vol is still up
+
+PASS: every still-grafted file read back byte-for-byte WITH THE SOURCE OFFLINE
+PASS: the locally packed files in the same tree still read too
+PASS: an offline read across a 1 MiB block boundary is correct
+"prefetch_complete": true
 "prefetch_grafted_bytes": 3021440
-PASS: prefetch_complete is not true while grafted bytes are remote
+"prefetch_graft_local_bytes": 3021440
+PASS: a fresh process served the grafted tree from the cache the last one filled
 ```
 
-The test also asserts that the refusal does **not** contain the string
-"no listed pack", because that sentence means damage everywhere else in
-this system and a graft is not damage.
+The tree at that point is deliberately MIXED — section 6 ungrafted one
+file into local packs and added a local one — so the offline reads are
+checked per file rather than with `diff -r`, and the packed files are
+checked too. That is what says the grafted reads came from the graft cache
+and not from a pack.
+
+The other two modes, and the refusal:
+
+```
+-- --prefetch packs must MOUNT, WARN, and not claim the volume is local --
+WARN pelfs: prefetch: /ext is GRAFTED from http://…/ext and this mode does not fetch it
+— reads under it will go there (2.9 MiB of grafted content in this generation).
+`--prefetch all` fetches and verifies it into the local cache
+INFO pelfs: … fully local: false
+PASS: --prefetch packs mounts, warns by name, and reports not-fully-local
+
+-- and a cache too small must refuse with BOTH NUMBERS, not a categorical no --
+ERROR pelfs: prefetch: refusing to mount: making this generation local needs 3.9 MiB —
+3.9 MiB grafted from /ext <- http://127.0.0.1:18998/ext (3.9 MiB) — and the local cache
+budget is 187.5 KiB. Raise --cache-size above 3.9 MiB, or use `--prefetch packs` to make
+the packed content local and read the grafted content from its source
+PASS: the refusal is about SIZE, carries both numbers, names the graft, and offers a way on
+```
+
+The test also asserts that no message anywhere contains "no listed pack",
+because that sentence means damage everywhere else in this system and a
+graft is not damage.
 
 ### What is still NOT proven
 
@@ -1215,7 +1423,18 @@ Said plainly:
   block on a windowed index. The speculation trick in Decision 9 makes
   both nearly free and is not built.
 - **No `--remove`**, no `merge` support, no `grafts/` retention key space,
-  no `GraftStats` in the stats JSON.
+  no `GraftStats` in the stats JSON (the PREFETCH graft counters are
+  there; the read-path ones are not yet).
+- **No `pelfs cache` awareness of graft blobs as a category.** They are
+  counted — they live under `packs/`, which is the point — but a user
+  reading the breakdown sees them as pack bytes. A `graft` line in
+  `DirUsage` would need the blobs in a directory of their own, which
+  would cost the free accounting; the honest fix is to split the `packs`
+  row by filename prefix at report time.
+- **A prefetched graft is not durable against eviction**, by design
+  (Decision 13). Pass 2 of the sweep can take it back if the cache goes
+  over its cap, and `PinnedEvicted` records that. Nothing yet SURFACES
+  that number to the user mid-session.
 - **No test of concurrent readers of one graft block**, of a source that
   fails mid-read, or of a graft across a nested-catalog boundary.
 - **The resume is tested against process exit, not against a kill in the
@@ -1234,7 +1453,7 @@ items are done** in this round.
 |---|---|---|---|
 | 1 | **Graft into a populated volume** — a `Source` that splices a spidered tree over the previous generation, on `mergeSource`'s pattern | without it the feature is `init`-then-`graft` only, which is not the use case | 3–4 d |
 | 2 | **`fsck`: a `Severity` axis, then graft awareness** | `fsck` reports every grafted file as damaged and exits 1. The severity change must land first and is a contract change — see the boundary note in Decision 4 | 2 d + 2 d |
-| 3 | ~~`--prefetch`: count grafts rather than failing them~~ | **done** — Decision 13; three modes, `FullyLocal()`, stats fields, end-to-end assertions | — |
+| 3 | ~~`--prefetch`: FETCH grafted blocks into a local cache tier~~ | **done** — Decision 13; blobs under `packs/`, verified on the way in, offline reads proven, two-pass eviction, budget refusal with both numbers | — |
 | 4 | ~~Ranged-window index lookup~~ | **done** — Decision 9; `graft.Reader`, whole under 4 MiB, windowed above | — |
 | 5 | ~~`pelfs graft --refresh`~~ / **`--remove`** | refresh is done and costs only what changed (Decision 11). `--remove` is still named in no error message and unbuilt | 0.5 d |
 | 6 | **`grafts/` in the retention key space** | index objects leak forever today, and they are now large | 0.5 d |
@@ -1245,7 +1464,8 @@ items are done** in this round.
 | 11 | **`--no-graft` and `--graft-allow` mount flags** | the reader's veto is all-or-nothing today | 1 d |
 | 12 | **A distinct errno/error class for graft-integrity failure** | `returning EIO for an unrecognized error` in the log, still | 0.5 d |
 | 13 | **Re-derive `GraftEntry.Path` at report time, or record the root inode** | renaming a grafted directory makes `--list` lie | 0.5 d |
-| 14 | **`pelfs graft --materialize`** | the third prefetch mode (Decision 13); reuses `adoptByReading` and `publish`, needs the lease and a resumable driver | 3–4 d |
+| 14 | **`pelfs graft --materialize`** | permanently ungraft a subtree (Decision 13) — distinct from prefetch, which is now built; reuses `adoptByReading` and `publish`, needs the lease and a resumable driver | 3–4 d |
+| 17 | **Report graft blobs as their own line in `pelfs cache`, and surface `PinnedEvicted`** | a prefetched graft that got evicted is invisible to the user today | 0.5 d |
 | 15 | **Use the source's advertised object digest** in `fsck --check-grafts` and to gate `--refresh` | strictly stronger than the size+mtime gate, and it is the thing to build instead of TOFU (Decision 12) | 1–2 d |
 | 16 | **Arena sizing for graft-heavy mounts** | the arena is tuned against decode cost, and a graft trades in round trips | investigation |
 

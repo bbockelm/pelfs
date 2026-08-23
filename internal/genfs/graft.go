@@ -103,6 +103,14 @@ type graftCounters struct {
 	failures atomic.Int64
 	mismatch atomic.Int64
 	resolved atomic.Int64
+	// cached counts blocks served from the LOCAL disk tier
+	// (graftcache.go) and never asked of the source, which is the number
+	// that says what a prefetch bought.
+	cached atomic.Int64
+	// cacheBad counts cached blocks that did not hash to what was asked
+	// for. It is a rotted local file, NOT a changed source, and the two
+	// are counted apart because they mean opposite things.
+	cacheBad atomic.Int64
 }
 
 // GraftStats is a snapshot of the graft tier's counters.
@@ -120,6 +128,13 @@ type GraftStats struct {
 	// Mismatch is the number that matters: it is the source having changed
 	// under a signed generation, and it is never zero for a benign reason.
 	Failures, Mismatch int64
+	// Cached counts blocks served from this machine's disk instead of
+	// from the source, and CacheBad blocks that were on disk and did not
+	// verify — a rotted local file, refetched, never an accusation
+	// against the source.
+	Cached, CacheBad int64
+	// Cache is the disk tier itself (graftcache.go).
+	Cache GraftCacheStats
 }
 
 // GraftStats reports the graft tier's counters since Open.
@@ -140,6 +155,9 @@ func (fs *FS) GraftStats() GraftStats {
 		Bytes:    g.stats.bytes.Load(),
 		Failures: g.stats.failures.Load(),
 		Mismatch: g.stats.mismatch.Load(),
+		Cached:   g.stats.cached.Load(),
+		CacheBad: g.stats.cacheBad.Load(),
+		Cache:    fs.graftCache.stats(),
 	}
 }
 
@@ -196,6 +214,14 @@ func (fs *FS) openGrafts(ctx context.Context, o Options) error {
 		return fmt.Errorf("genfs: this generation names %d graft(s) but no graft opener was "+
 			"supplied, so no external source may be read", len(o.SB.Grafts))
 	}
+	// The local disk tier, on the same budget and in the same directory as
+	// the cached packs (graftcache.go). It is created only for a volume
+	// that actually serves grafts, and only where whole-pack caching is on
+	// — a mount with less disk than bandwidth has said what it wants, and
+	// this is the same trade.
+	if fs.packCacheCap > 0 {
+		fs.graftCache = newGraftCache(fs.packDir)
+	}
 	t := &graftTable{verify: chunkid.NewHasher(nil), memo: make(map[string]graftMemo)}
 	for _, g := range o.SB.Grafts {
 		// Loaded here rather than lazily, deliberately. A graft is not a
@@ -223,8 +249,11 @@ func (fs *FS) openGrafts(ctx context.Context, o Options) error {
 	return nil
 }
 
-// closeGrafts releases graft source transports.
+// closeGrafts releases graft source transports and finalizes whatever
+// cache blob is open, so that the last blocks fetched survive this
+// process rather than being swept as an abandoned temp file.
 func (fs *FS) closeGrafts() {
+	fs.graftCache.flush()
 	if fs.grafts == nil {
 		return
 	}
@@ -304,7 +333,22 @@ func (fs *FS) graftEntries() []superblock.GraftEntry { return fs.Grafts() }
 // with no obligation to this volume and no signature over its content —
 // the identity check is the ONLY thing standing between a changed source
 // and a wrong read. There is no configuration in which it is skipped.
-func (fs *FS) readGraftChunk(ctx context.Context, e *graftEntry, l graft.Loc, idHex string) ([]byte, error) {
+func (fs *FS) readGraftChunk(ctx context.Context, e *graftEntry, l graft.Loc, idHex string, pin bool) ([]byte, error) {
+	// THE LOCAL TIER FIRST, and verified on the way out exactly as a
+	// block off the wire is. That is what lets the cache be a pure hint: a
+	// blob that rotted, was truncated by a killed process, or is indexed
+	// wrongly produces a hash that does not match, and the answer to that
+	// is to forget it and ask the source — never to serve it, and never to
+	// accuse the source of having changed.
+	if buf, ok := fs.graftCache.get(idHex); ok {
+		if id := fs.grafts.verify.Sum(buf); id.Hex() == idHex {
+			fs.grafts.stats.cached.Add(1)
+			fs.grafts.stats.resolved.Add(1)
+			return buf, nil
+		}
+		fs.graftCache.forget(idHex)
+		fs.grafts.stats.cacheBad.Add(1)
+	}
 	fs.grafts.stats.fetches.Add(1)
 	rc, err := e.store.Get(ctx, l.Key, l.Off, l.Length)
 	if err != nil {
@@ -345,6 +389,11 @@ func (fs *FS) readGraftChunk(ctx context.Context, e *graftEntry, l graft.Loc, id
 	}
 	fs.grafts.stats.bytes.Add(int64(len(buf)))
 	fs.grafts.stats.resolved.Add(1)
+	// Verified, so it may be kept. A grafted read is the one read in this
+	// system that leaves the volume's own prefix, and keeping the block
+	// means the next reader of it does not — which is worth a disk write
+	// for the same reason caching a whole pack is.
+	fs.graftCache.put(idHex, buf, pin)
 	return buf, nil
 }
 
@@ -366,7 +415,7 @@ func (fs *FS) readGraftChunk(ctx context.Context, e *graftEntry, l graft.Loc, id
 // and a graft-heavy mount is competing for it against a different
 // currency.
 func (fs *FS) graftChunkAt(ctx context.Context, e *graftEntry, l graft.Loc, idHex string, chunkOff int64, window []byte) error {
-	buf, err := fs.readGraftChunk(ctx, e, l, idHex)
+	buf, err := fs.readGraftChunk(ctx, e, l, idHex, false)
 	if err != nil {
 		return err
 	}

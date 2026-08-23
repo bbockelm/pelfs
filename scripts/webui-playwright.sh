@@ -40,6 +40,14 @@ FRONT="$REPO/webui/frontend"
 W="$(mktemp -d)"
 PIDS=()
 
+# EVERY path this harness touches lives under $W. --state-dir covers the
+# volume's own state, but pelfs also derives a per-volume directory from
+# stateRoot() (cmd/pelfs/daemon.go), which is $XDG_STATE_HOME/pelfs or
+# ~/.local/state/pelfs -- so a run without this line leaves an empty vol-<id>
+# directory in the developer's real state root. Measured: it did.
+export XDG_STATE_HOME="$W/xdg"
+mkdir -p "$XDG_STATE_HOME"
+
 cleanup() {
     for pid in "${PIDS[@]:-}"; do
         kill "$pid" 2>/dev/null || true

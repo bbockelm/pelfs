@@ -82,7 +82,20 @@ type mockEntry struct {
 	// staged is true for an entry this session created: the mock's stand-in
 	// for "in the overlay, not in the federation".
 	staged bool
-	body   string
+	// ro makes every mutation of this entry answer 403, the way
+	// internal/fsperm does through internal/vfsbilly on a path the session may
+	// not write. It exists for ONE assertion the browser suite has to be able
+	// to make: that a refused rename does not stay on the screen.
+	//
+	// A refusal cannot be arranged any other way here. The real 403 comes from
+	// a mode bit on a real volume, a fresh volume has no such path, and
+	// creating one through the UI would be testing the upload path instead of
+	// the refusal. Intercepting the request in the browser was the other
+	// option and it would have proved less: a fulfilled route is the suite
+	// asserting against its own fixture, where this is the app meeting a
+	// server that says no.
+	ro   bool
+	body string
 }
 
 // mockAPI is one volume, in memory, plus the durability state the page reads.
@@ -137,6 +150,9 @@ func (a *mockAPI) seed() {
 		add(d, true, 0)
 	}
 	add("/README.txt", false, 42)
+	// The one path this volume refuses to change. See mockEntry.ro.
+	add("/read-only.dat", false, 4096)
+	a.ent["/read-only.dat"].ro = true
 	add("/data/sample.root", false, 68497408)
 	add("/data/runs/run-001.txt", false, 1024)
 	add("/plots/figure-1.png", false, 204800)
@@ -334,6 +350,10 @@ func (a *mockAPI) rename(w http.ResponseWriter, r *http.Request) {
 		writeMockJSON(w, http.StatusNotFound, map[string]string{"error": "no such path"})
 		return
 	}
+	if e.ro {
+		refuseMockWrite(w, id)
+		return
+	}
 	to := join(path.Dir(id), req.Name)
 	a.movePath(e, to)
 	a.stage(1, 0)
@@ -367,6 +387,16 @@ func (a *mockAPI) batch(w http.ResponseWriter, r *http.Request) {
 			results = append(results, map[string]any{"id": id, "error": "no such path"})
 			continue
 		}
+		// A MOVE of a read-only entry is refused per id, which is the
+		// partial-failure case: the batch is a 200 and the app still has to
+		// say that one of them did not happen. (A COPY is not refused: the
+		// source is only read.)
+		if e.ro && req.Operation != "copy" {
+			results = append(results, map[string]any{
+				"id": id, "error": "permission denied: this session may not write " + id,
+			})
+			continue
+		}
 		to := join(req.Target, path.Base(id))
 		if _, clash := a.ent[to]; clash {
 			results = append(results, map[string]any{"id": id, "error": "the target already has that name"})
@@ -397,6 +427,10 @@ func (a *mockAPI) remove(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	for _, id := range req.IDs {
+		if e, ok := a.ent[id]; ok && e.ro {
+			refuseMockWrite(w, id)
+			return
+		}
 		for k := range a.ent {
 			if k == id || strings.HasPrefix(k, id+"/") {
 				delete(a.ent, k)
@@ -484,6 +518,15 @@ func (l *limitWriter) Write(p []byte) (int, error) {
 }
 
 // movePath moves an entry and everything under it. Called with a.mu held.
+// refuseMockWrite is the answer internal/fsperm produces, in the shape
+// internal/httpguard lets through: a real status and a real body, so the app's
+// `explain` has something to put on the screen.
+func refuseMockWrite(w http.ResponseWriter, id string) {
+	writeMockJSON(w, http.StatusForbidden, map[string]string{
+		"error": "permission denied: this session may not write " + id,
+	})
+}
+
 func (a *mockAPI) movePath(e *mockEntry, to string) {
 	from := e.id
 	for k, v := range a.ent {

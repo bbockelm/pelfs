@@ -17,14 +17,24 @@ import { MODE, expect, openPelfs, resetHooks, test, testHook } from "./pelfs";
  *     to "published" when it is not, and the words move with it.
  *
  * A fresh volume cannot be staged by itself, and a lease cannot be made stale
- * from outside, so the states come from M1's `--test-hooks` route. It sets no
- * state on the volume -- it only changes what the page is TOLD -- which is
- * exactly what a driver test needs and the least dangerous thing that works.
+ * from outside, so the states come from `--test-hooks`. It sets no state on the
+ * volume -- it only changes what the page is TOLD -- which is exactly what a
+ * driver test needs and the least dangerous thing that works.
+ *
+ * WHICH PANEL THIS DRIVES CHANGED IN THE WIRING PASS and the assertions did
+ * not, which is the point of them. Before, `/` was M1's hand-written page and
+ * these selectors were its ids; now `/` is the React app and they are the
+ * app's. The suite did not need editing here because the two surfaces were
+ * built to one vocabulary (webui/frontend/src/durability.ts,
+ * cmd/pelfs/browse.html, and internal/webui/durability_test.go which fails if
+ * they drift) -- so this file is also the standing proof that the vocabulary
+ * really is one. The connection page's copy of the panel is driven at
+ * /connect by connect.spec.ts.
  */
 test.describe("durability", () => {
   test.skip(
     MODE !== "browse",
-    "the durability panel is `pelfs browse`'s; the embed server has no volume to be staged",
+    "these states come from --test-hooks against a real volume; the embed server has neither",
   );
 
   test.afterEach(async ({ playwright, session }) => {

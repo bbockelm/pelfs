@@ -1,11 +1,18 @@
 <!doctype html>
 <!--
-  The pelfs browse page: one hand-written file, no bundler, no framework,
-  no third-party JavaScript. docs/design-webui.md's M1 is deliberately
-  bounded to this, and the boundary buys two things — `go build ./...`
-  needs no Node, and the Content-Security-Policy can be strict enough
-  (script-src 'nonce-…', no 'unsafe-inline') that a file in the volume
-  cannot become code in this origin.
+  The pelfs CONNECTION page, served at /connect: one hand-written file, no
+  bundler, no framework, no third-party JavaScript. docs/design-webui.md's M1
+  is deliberately bounded to this, and the boundary buys two things —
+  `go build ./...` needs no Node, and the Content-Security-Policy can be
+  strict enough (script-src 'nonce-…', no 'unsafe-inline') that a file in the
+  volume cannot become code in this origin.
+
+  The file manager is the OTHER page, at `/` (internal/webui's bundle). This
+  one owns the credential desk, the SSO cards and the generated Cyberduck
+  profile, and it keeps its own durability panel — the same words, from the
+  same /events snapshot, because a page a user may sit on for the length of a
+  Cyberduck setup must not be the one page that cannot say whether the data is
+  published. internal/webui/durability_test.go fails if the two drift.
 
   It ships NO state. Everything on screen arrives over /events, which
   carries a complete snapshot per frame, so a reconnect cannot leave a
@@ -68,6 +75,8 @@
   .glyph.staged { color: var(--staged); }
   .glyph.published { color: var(--published); }
   .glyph.sending { color: var(--brand); }
+  .nav { margin: .6rem 0 0; font-size: .92rem; }
+  .nav a { color: var(--brand); }
   .legend { display: flex; gap: 1.4rem; flex-wrap: wrap; color: var(--muted); font-size: .86rem; }
   /* The SSO card. Brand-light rather than a warning colour: being asked to
      log in is normal, not a fault. */
@@ -151,6 +160,13 @@
     <div class="sub" data-testid="lease">lease: —</div>
   </div>
 
+  <!-- The other half of the pair. `/` is the file manager and this is
+       `/connect`; each page carries exactly one anchor to the other, so
+       neither becomes a dead end. A plain <a>, not a fetch: the session
+       token is in sessionStorage, which is per-ORIGIN and survives a
+       same-origin navigation, so following this link costs nothing. -->
+  <nav class="nav"><a href="/" data-testid="app-link">← Files</a></nav>
+
   <div class="banner" data-testid="phase-banner">
     connecting to the federation — this is where your institution may ask you to
     approve access. The terminal shows the same prompt.
@@ -195,8 +211,11 @@
   <div class="connect" data-testid="connect-another-program">
     <h2>Connect another program</h2>
     <p data-testid="connect-blurb">
-      This page still does not browse files. What it does now is hand the job to a
-      program that is good at it: this session speaks WebDAV at
+      This page does not browse files — <a href="/">the file manager</a>
+      does, on this session's main page. What this page does is hand the job to a
+      program that is better at it than any browser: one that can copy a whole
+      directory, resume after a dropped connection, and keep going while you do
+      something else. This session speaks WebDAV at
       <code data-testid="dav-url">—</code>, and adding a program below produces a
       Cyberduck or Mountain Duck profile that connects with one double-click and no
       password, plus a username and password for everything else — rclone, WinSCP,
@@ -239,9 +258,6 @@
 
   <footer>
     <div id="stream-status" data-testid="stream-status">connecting…</div>
-    <div data-testid="footer-disclaimer">
-      an independent tool for Pelican federations; not an official Pelican Platform product
-    </div>
   </footer>
 </main>
 

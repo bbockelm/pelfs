@@ -378,21 +378,23 @@ func readSSEEvent(t *testing.T, br *bufio.Reader, want string) string {
 	}
 }
 
-// TestPageIsOneFileWithANonceAndTheTestIDsAPlaywrightSuiteNeeds.
+// TestPageIsOneFileWithANonceAndTheTestIDsAPlaywrightSuiteNeeds, at
+// /connect, which is where the hand-written page lives now that / is the
+// file manager.
 //
 // The test ids are a contract, not decoration: a driver suite that selects
 // on prose breaks the first time somebody rewords a sentence, and these
 // sentences are meant to be reworded.
 func TestPageIsOneFileWithANonceAndTheTestIDsAPlaywrightSuiteNeeds(t *testing.T) {
 	f := newBrowseFixture(t, true, false)
-	res := f.do("GET", "/", "", "")
+	res := f.do("GET", "/connect", "", "")
 	body, err := io.ReadAll(res.Body)
 	res.Body.Close() //nolint:errcheck
 	if err != nil {
 		t.Fatal(err)
 	}
 	if res.StatusCode != 200 {
-		t.Fatalf("GET /: %d", res.StatusCode)
+		t.Fatalf("GET /connect: %d", res.StatusCode)
 	}
 	page := string(body)
 
@@ -427,7 +429,7 @@ func TestPageIsOneFileWithANonceAndTheTestIDsAPlaywrightSuiteNeeds(t *testing.T)
 	}
 	// Two nonces per response, so the page cannot be cached and replayed
 	// with a stale nonce.
-	second := f.do("GET", "/", "", "")
+	second := f.do("GET", "/connect", "", "")
 	secondCSP := second.Header.Get("Content-Security-Policy")
 	second.Body.Close() //nolint:errcheck
 	if secondCSP == csp {
@@ -439,7 +441,11 @@ func TestPageIsOneFileWithANonceAndTheTestIDsAPlaywrightSuiteNeeds(t *testing.T)
 		"volume", "mode", "branch-generation", "lease", "lease-banner", "phase-banner",
 		"durability", "durability-legend", "glyph-staged", "glyph-sending", "glyph-published",
 		"publish-button", "publish-hint", "publish-status", "connect-another-program",
-		"stream-status", "footer-disclaimer", "noscript", "test-hooks-banner", "body",
+		"stream-status", "noscript", "test-hooks-banner", "body",
+		// The anchor to the other surface. Each page carries exactly one,
+		// so neither is a dead end; without it a user who followed the
+		// file manager's link to the credential desk has no way back.
+		"app-link",
 		// The credential surface (U7/U8). The form and the two tables are
 		// in the shipped HTML; the rows, the revoke buttons and the panel
 		// that shows a password once are built by the script, so those ids
@@ -473,8 +479,12 @@ func TestPageIsOneFileWithANonceAndTheTestIDsAPlaywrightSuiteNeeds(t *testing.T)
 	if !strings.Contains(page, "does not browse files") {
 		t.Error("the page does not say what it cannot do")
 	}
-	if !strings.Contains(page, "not an official Pelican Platform product") {
-		t.Error("the page is missing the branding disclaimer")
+	// ...and, since the wiring pass, WHERE the thing it cannot do lives.
+	// "This page does not browse files" was the whole answer when there was
+	// no file manager; it is half an answer now, and the missing half is one
+	// anchor.
+	if !strings.Contains(page, `href="/"`) {
+		t.Error("the page does not link to the file manager at /")
 	}
 	// No JavaScript at all is a real state a driver test will produce.
 	if !strings.Contains(page, "<noscript>") {
@@ -515,6 +525,123 @@ func glyphFor(t *testing.T, page, id string) string {
 		t.Fatalf("no glyph for %s", id)
 	}
 	return m[1]
+}
+
+// THE FILE MANAGER IS ON THE ROUTE TABLE, which is the property this whole
+// wiring pass exists to establish.
+//
+// It is worth a Go test and not only a Playwright one, because for four
+// commits internal/webui's bundle was built, licence-checked, size-capped,
+// notice-generated and gated by two CI jobs while `pelfs browse` served
+// something else at `/` — and every one of those gates passed. A gate on the
+// bundle's CONTENTS cannot notice that nothing serves it. This is the gate on
+// the route table.
+//
+// The four assertions are the four things that were actually wrong or could
+// be, in the order they were found:
+//
+//  1. `/` answers with the bundle's shell rather than the connection page.
+//  2. The shell's own script and stylesheet are FETCHABLE at the paths it
+//     names. There is no catch-all on this listener (see routes), so a bundle
+//     whose asset names moved would 404 rather than falling back to
+//     index.html — which is the failure mode a catch-all hides until a user
+//     meets a white page.
+//  3. The CSP lets the bundle's own code run and nothing else. The guard's
+//     default is `default-src 'none'`, which renders the app as a blank page
+//     with two console violations; that is what happened the first time this
+//     route existed, and it is why appCSP is not optional.
+//  4. A path nobody registered is still a 404.
+func TestTheFileManagerIsServedAtRoot(t *testing.T) {
+	f := newBrowseFixture(t, true, false)
+
+	res := f.do("GET", "/", "", "")
+	body, err := io.ReadAll(res.Body)
+	res.Body.Close() //nolint:errcheck
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.StatusCode != 200 {
+		t.Fatalf("GET /: %d", res.StatusCode)
+	}
+	page := string(body)
+	if !strings.Contains(page, `id="root"`) {
+		t.Errorf("GET / is not the bundle's shell:\n%.200s", page)
+	}
+	// The connection page's own markers must NOT be here: that is the
+	// regression this test is named for.
+	if strings.Contains(page, `data-testid="connect-another-program"`) {
+		t.Error("GET / is still serving the connection page")
+	}
+	// The no-JavaScript notice travels with the shell, because a React app
+	// with scripting off is a blank page and this tool is holding somebody's
+	// unpublished data.
+	if !strings.Contains(page, `data-testid="noscript"`) {
+		t.Error("the app shell has no noscript fallback")
+	}
+	if ct := res.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Errorf("Content-Type %q, want text/html", ct)
+	}
+	// index.html must never be cached: a stale one across a pelfs upgrade is
+	// a UI calling an API that has moved.
+	if cc := res.Header.Get("Cache-Control"); cc != "no-store" {
+		t.Errorf("Cache-Control %q on the shell, want no-store", cc)
+	}
+
+	// (2) every asset the shell names, at the path it names it.
+	refs := regexp.MustCompile(`(?:src|href)="\./(assets/[^"]+)"`).FindAllStringSubmatch(page, -1)
+	if len(refs) < 2 {
+		t.Fatalf("the shell names %d assets; want at least a script and a stylesheet", len(refs))
+	}
+	for _, m := range refs {
+		a := f.do("GET", "/"+m[1], "", "")
+		a.Body.Close() //nolint:errcheck
+		if a.StatusCode != 200 {
+			t.Errorf("GET /%s: %d — the shell names an asset the route table does not serve", m[1], a.StatusCode)
+		}
+		// Content-hashed, so the name changes when the bytes do.
+		if cc := a.Header.Get("Cache-Control"); !strings.Contains(cc, "immutable") {
+			t.Errorf("GET /%s: Cache-Control %q, want an immutable cache", m[1], cc)
+		}
+	}
+
+	// (3) the policy. 'self' rather than a nonce, because every byte of the
+	// bundle's script and style is a file; 'unsafe-inline' would give away
+	// exactly the protection A5 needs.
+	csp := res.Header.Get("Content-Security-Policy")
+	for _, want := range []string{
+		"script-src 'self'", "style-src 'self'", "connect-src 'self'",
+		"frame-ancestors 'none'", "form-action 'none'", "base-uri 'none'",
+	} {
+		if !strings.Contains(csp, want) {
+			t.Errorf("the app's CSP lacks %s: %q", want, csp)
+		}
+	}
+	if strings.Contains(csp, "unsafe-inline") || strings.Contains(csp, "unsafe-eval") {
+		t.Errorf("the app's CSP relaxes inline code: %q", csp)
+	}
+	if strings.Contains(csp, "default-src 'none'; frame-ancestors") {
+		t.Error("the app is being served under the guard's default policy, " +
+			"which refuses its own script: appHandler must set appCSP")
+	}
+
+	// The notices, which the app's status line links and the MIT licences
+	// require to travel with the binary.
+	tp := f.do("GET", "/third_party.txt", "", "")
+	tpBody, _ := io.ReadAll(tp.Body)
+	tp.Body.Close() //nolint:errcheck
+	if tp.StatusCode != 200 || !strings.Contains(string(tpBody), "@svar-ui/react-filemanager") {
+		t.Errorf("GET /third_party.txt: %d", tp.StatusCode)
+	}
+
+	// (4) no catch-all: an unregistered path is a 404, not the shell served
+	// under a name that suggests it means something.
+	for _, path := range []string{"/no-such-page", "/api/v1/fil", "/assets/nope.js"} {
+		miss := f.do("GET", path, "", "")
+		miss.Body.Close() //nolint:errcheck
+		if miss.StatusCode != 404 {
+			t.Errorf("GET %s: %d, want 404", path, miss.StatusCode)
+		}
+	}
 }
 
 // TestPprofIsNotOnTheWebListener, on the REAL route table rather than a
@@ -863,11 +990,25 @@ func TestRunBrowseEndToEnd(t *testing.T) {
 		}
 		return res
 	}
+	// `/` is the file manager: internal/webui's bundle, whose durability
+	// panel is in the JavaScript rather than in the markup. The marker that
+	// belongs in a Go test is therefore the SHELL — the mount point React
+	// renders into and the hashed script that renders it — not a test id
+	// that only exists after the bundle has run.
 	page := get("/", "")
 	pageBody, _ := io.ReadAll(page.Body)
 	page.Body.Close() //nolint:errcheck
-	if page.StatusCode != 200 || !strings.Contains(string(pageBody), `data-testid="durability"`) {
-		t.Fatalf("GET /: %d", page.StatusCode)
+	if page.StatusCode != 200 || !strings.Contains(string(pageBody), `id="root"`) {
+		t.Fatalf("GET / (the file manager): %d, body %.120q", page.StatusCode, pageBody)
+	}
+	// And `/connect` is the hand-written page, which does carry the panel in
+	// its markup. Both must answer before the volume has finished opening:
+	// that is the whole reason the listener comes first.
+	conn := get("/connect", "")
+	connBody, _ := io.ReadAll(conn.Body)
+	conn.Body.Close() //nolint:errcheck
+	if conn.StatusCode != 200 || !strings.Contains(string(connBody), `data-testid="durability"`) {
+		t.Fatalf("GET /connect: %d", conn.StatusCode)
 	}
 
 	req, err := http.NewRequest("POST", base+"/api/v1/session",

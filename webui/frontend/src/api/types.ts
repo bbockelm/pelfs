@@ -51,9 +51,33 @@ export type BrowseState = {
   upload_backlog: number;
   /** A floor, not a promise: write pressure can fire a checkpoint sooner. */
   next_publish_s: number;
+  /**
+   * The idle-seal window, in seconds, or absent when idle sealing is off for
+   * this session (a read-only browse, or --no-idle-seal). It is the second
+   * half of the durability sentence -- "or 30s after this tab closes" -- and
+   * saying it is the promise that closing the tab publishes rather than
+   * abandons.
+   */
+  idle_seal_s?: number;
   publish?: PublishJob;
+  /**
+   * Federation logins waiting on the user (U13). The CARDS live on the
+   * connection page at /connect, which owns the dismiss control; the file
+   * manager needs the count so it can say a login is waiting rather than
+   * leaving a user on `/` wondering why nothing loads.
+   */
+  prompts?: SsoPrompt[];
   test_hooks: boolean;
   streams: number;
+};
+
+/** cmd/pelfs/ssoprompt.go's ssoPrompt. One device flow awaiting the user. */
+export type SsoPrompt = {
+  id: string;
+  url: string;
+  code?: string;
+  age_s: number;
+  expired?: boolean;
 };
 
 export type PublishJob = {

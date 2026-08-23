@@ -1,6 +1,6 @@
 <!doctype html>
-<script type="module" crossorigin src="./assets/index-2sYAWalP.js"></script>
-<link rel="stylesheet" crossorigin href="./assets/index-B5OtIGl6.css">
+<script type="module" crossorigin src="./assets/index-D3PgmEg1.js"></script>
+<link rel="stylesheet" crossorigin href="./assets/index-BBN7vCZe.css">
 
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -9,3 +9,15 @@
 <title>pelfs</title>
 <link rel="icon" href="./brand/favicon.svg" />
 <div id="root"></div>
+<!-- Cheap, and it is the difference between a blank page and a person who
+     knows their data is fine. The same message cmd/pelfs/browse.html carries,
+     for the same reason: a file manager is a React app, so with scripting off
+     there is nothing at all on the screen. -->
+<noscript>
+  <div data-testid="noscript" style="margin: 2rem auto; max-width: 40rem; font-family: system-ui, sans-serif">
+    This page needs JavaScript to list files and to show what is published.
+    Nothing is wrong with your data: <code>pelfs browse</code> is still running in
+    your terminal, and Ctrl-C there stops it (sealing, if you started it with
+    <code>--rw</code>). To move files without a browser, use <code>pelfs mount</code>.
+  </div>
+</noscript>

@@ -39,9 +39,14 @@ function Probe({ data, drive }: { data: Entry[]; drive: unknown }) {
         icons="simple"
         data={data}
         drive={drive as never}
-        init={(api: never) => {
+        // `api` is inferred (IApi) rather than annotated: an annotation of
+        // `never` here does not typecheck at all -- a `(api: never) => void`
+        // cannot stand in for a `(api: IApi) => void`, because a parameter
+        // position is contravariant -- and `pnpm exec tsc --noEmit`, which CI
+        // runs, failed on exactly that line.
+        init={(api) => {
           window.__probe = { ...window.__probe, api, provider, shipped };
-          wireLazyLoading(api as never, provider);
+          wireLazyLoading(api as unknown as Parameters<typeof wireLazyLoading>[0], provider);
           (api as unknown as { setNext: (p: unknown) => void }).setNext(provider);
         }}
       />

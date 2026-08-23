@@ -127,10 +127,17 @@ func newFedStore(ctx context.Context, cfg Config) (*fedStore, error) {
 // satisfies all of them -- no further device flows.
 //
 // Best-effort by design. A failure here is not a mount failure: it may just
-// mean nobody is at a terminal to approve anything (the device flow refuses
-// to start when stdout is not a TTY), and every operation still acquires its
-// own credential the way it always did. All this buys is doing it once, at a
+// mean nobody approved anything, and every operation still acquires its own
+// credential the way it always did. All this buys is doing it once, at a
 // moment the user is watching.
+//
+// It does NOT mean a terminal is required. This comment used to claim the
+// device flow refuses to start when stdout is not a TTY; pelican has no such
+// gate -- there is no IsTerminal check in client/acquire_token.go, and the
+// only thing that suppresses the flow is opts.NonInteractive, which pelfs
+// does not set. That distinction is what lets a GUI surface the flow instead
+// of a terminal: see oauth2.SetVerificationURLHandler, the hook
+// docs/design-webui.md builds the SSO card on.
 func primeCredential(ctx context.Context, prefixURL string) {
 	pUrl, err := client.ParseRemoteAsPUrl(ctx, prefixURL)
 	if err != nil {

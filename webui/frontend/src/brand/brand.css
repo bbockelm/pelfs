@@ -1,0 +1,111 @@
+/*
+ * The palette, in ONE place.
+ *
+ * The three brand values are read from the Pelican Platform's own source,
+ * not from a screenshot: web_ui/frontend/components/ThemeProvider.tsx:34-39
+ * in the pelican checkout gives primary #0885ff, primary.light #CFE4FF and
+ * secondary #FFFFFA. The public branding page agrees on the first two.
+ *
+ * The durability colours are pelfs's own, and deliberately NOT shades of the
+ * brand blue: the whole point of the durability panel is that "on this
+ * machine only" and "in the federation" are unmistakably different, and
+ * doing that in two blues would fail at the one job it has.
+ */
+:root {
+  --pelfs-primary: #0885ff;
+  --pelfs-primary-light: #cfe4ff;
+  --pelfs-secondary: #fffffa;
+
+  /* pelfs's own two, for durability state only. */
+  --pelfs-local-only: #b45309; /* amber-700: on this machine only */
+  --pelfs-federated: #15803d; /* green-700: in the federation */
+
+  --pelfs-ink: #101828;
+  --pelfs-ink-muted: #5b6472;
+  --pelfs-rule: #e4e7ec;
+  --pelfs-ground: var(--pelfs-secondary);
+
+  --pelfs-font:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --pelfs-font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+/* The UI is a localhost tool, not a website: it inherits the platform's
+   dark-mode preference rather than shipping a theme switcher. */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --pelfs-ink: #e8eaed;
+    --pelfs-ink-muted: #9aa4b2;
+    --pelfs-rule: #2b313b;
+    --pelfs-ground: #12161c;
+    --pelfs-local-only: #f0a034;
+    --pelfs-federated: #4ade80;
+  }
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--pelfs-ground);
+  color: var(--pelfs-ink);
+  font-family: var(--pelfs-font);
+}
+
+/* ---- the wordmark ---------------------------------------------------- */
+
+.pelfs-brand {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+}
+
+.pelfs-brand__mark {
+  /* The mark is used unmodified, at its own aspect ratio. Nothing is drawn
+     on top of it, which is why this treatment is a wordmark and not a logo
+     edit -- see docs/design-webui.md, "Branding". */
+  height: 28px;
+  width: auto;
+  display: block;
+}
+
+.pelfs-brand__word {
+  font-size: 1.25rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1;
+  color: var(--pelfs-ink);
+}
+
+/* The "FS", subtly: two letters in the brand blue at the end of the
+   wordmark. The bird is untouched. */
+.pelfs-brand__word em {
+  font-style: normal;
+  color: var(--pelfs-primary);
+}
+
+.pelfs-brand__sub {
+  font-size: 0.75rem;
+  color: var(--pelfs-ink-muted);
+}
+
+/* ---- the disclaimer, which is not optional --------------------------- */
+
+.pelfs-footer {
+  border-top: 1px solid var(--pelfs-rule);
+  padding: 0.75rem 1rem;
+  font-size: 0.75rem;
+  color: var(--pelfs-ink-muted);
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+  align-items: baseline;
+}
+
+.pelfs-footer a {
+  color: var(--pelfs-primary);
+}

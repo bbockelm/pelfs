@@ -1,0 +1,235 @@
+{
+  "what": "The wire protocol of @svar-ui/react-filemanager, recorded from the real component.",
+  "why": "docs/design-webui.md, 'Testing' layer 5: record once with Node, replay forever in Go.",
+  "recordedAt": "2026-08-23T20:03:41.407Z",
+  "browser": "chromium 148.0.7778.96",
+  "component": {
+    "@svar-ui/react-filemanager": "2.6.0",
+    "@svar-ui/filemanager-data-provider": "2.6.0",
+    "react": "19.1.1"
+  },
+  "provider": "webui/frontend/src/api/provider.ts (PelfsDataProvider), except the last step, which uses the component's own RestDataProvider",
+  "apiBase": "/api/v1",
+  "externalRequests": [],
+  "steps": [
+    {
+      "step": "boot",
+      "gesture": "load the page",
+      "note": "the root listing and the drive info, and nothing else",
+      "requests": [
+        {
+          "method": "GET",
+          "path": "/api/v1/files",
+          "query": "",
+          "contentType": null,
+          "sessionHeader": "PROBE-SESSION-TOKEN",
+          "bodyBytes": 0,
+          "body": null,
+          "status": 200
+        },
+        {
+          "method": "GET",
+          "path": "/api/v1/info",
+          "query": "",
+          "contentType": null,
+          "sessionHeader": "PROBE-SESSION-TOKEN",
+          "bodyBytes": 0,
+          "body": null,
+          "status": 200
+        }
+      ]
+    },
+    {
+      "step": "open-folder",
+      "gesture": "double-click the \"/dir-0\" card",
+      "note": "one listing for the folder navigated into",
+      "requests": [
+        {
+          "method": "GET",
+          "path": "/api/v1/files/%2Fdir-0",
+          "query": "",
+          "contentType": null,
+          "sessionHeader": "PROBE-SESSION-TOKEN",
+          "bodyBytes": 0,
+          "body": null,
+          "status": 200
+        }
+      ]
+    },
+    {
+      "step": "open-nested-folder",
+      "gesture": "double-click \"/dir-0/dir-1\"",
+      "note": "the id is the full path, percent-encoded into ONE path segment",
+      "requests": [
+        {
+          "method": "GET",
+          "path": "/api/v1/files/%2Fdir-0%2Fdir-1",
+          "query": "",
+          "contentType": null,
+          "sessionHeader": "PROBE-SESSION-TOKEN",
+          "bodyBytes": 0,
+          "body": null,
+          "status": 200
+        }
+      ]
+    },
+    {
+      "step": "revisit-loaded-folder",
+      "gesture": "breadcrumb back, then re-open /dir-0",
+      "note": "NO request: a loaded folder is cached in the store for the life of the page",
+      "requests": []
+    },
+    {
+      "step": "refresh",
+      "gesture": "click the breadcrumb refresh icon",
+      "note": "the only gesture that re-lists a folder the store already has",
+      "requests": [
+        {
+          "method": "GET",
+          "path": "/api/v1/files/%2Fdir-0",
+          "query": "",
+          "contentType": null,
+          "sessionHeader": "PROBE-SESSION-TOKEN",
+          "bodyBytes": 0,
+          "body": null,
+          "status": 200
+        }
+      ]
+    },
+    {
+      "step": "create-folder",
+      "gesture": "\"Add new folder\"",
+      "note": "POST files/{parent}; the response id is authoritative, the client renames to match",
+      "requests": [
+        {
+          "method": "POST",
+          "path": "/api/v1/files/%2Fdir-0",
+          "query": "",
+          "contentType": "application/json",
+          "sessionHeader": "PROBE-SESSION-TOKEN",
+          "bodyBytes": 37,
+          "body": "{\"name\":\"new-folder\",\"type\":\"folder\"}",
+          "status": 200
+        }
+      ]
+    },
+    {
+      "step": "rename",
+      "gesture": "Rename (Ctrl+R)",
+      "note": "PUT files/{id} with operation=rename",
+      "requests": [
+        {
+          "method": "PUT",
+          "path": "/api/v1/files/%2Fdir-0%2Ffile-0.txt",
+          "query": "",
+          "contentType": "application/json",
+          "sessionHeader": "PROBE-SESSION-TOKEN",
+          "bodyBytes": 43,
+          "body": "{\"operation\":\"rename\",\"name\":\"renamed.txt\"}",
+          "status": 200
+        }
+      ]
+    },
+    {
+      "step": "copy",
+      "gesture": "Copy then Paste (Ctrl+C, Ctrl+V)",
+      "note": "PUT files (no id) with operation=copy and a batch of ids",
+      "requests": [
+        {
+          "method": "PUT",
+          "path": "/api/v1/files",
+          "query": "",
+          "contentType": "application/json",
+          "sessionHeader": "PROBE-SESSION-TOKEN",
+          "bodyBytes": 72,
+          "body": "{\"operation\":\"copy\",\"ids\":[\"/dir-0/file-1.txt\"],\"target\":\"/dir-0/dir-2\"}",
+          "status": 200
+        }
+      ]
+    },
+    {
+      "step": "move",
+      "gesture": "drag-and-drop, or Cut then Paste",
+      "note": "PUT files with operation=move",
+      "requests": [
+        {
+          "method": "PUT",
+          "path": "/api/v1/files",
+          "query": "",
+          "contentType": "application/json",
+          "sessionHeader": "PROBE-SESSION-TOKEN",
+          "bodyBytes": 72,
+          "body": "{\"operation\":\"move\",\"ids\":[\"/dir-0/file-2.txt\"],\"target\":\"/dir-0/dir-1\"}",
+          "status": 200
+        }
+      ]
+    },
+    {
+      "step": "delete",
+      "gesture": "Delete",
+      "note": "DELETE files with a batch of ids IN THE BODY, not in the path",
+      "requests": [
+        {
+          "method": "DELETE",
+          "path": "/api/v1/files",
+          "query": "",
+          "contentType": "application/json",
+          "sessionHeader": "PROBE-SESSION-TOKEN",
+          "bodyBytes": 29,
+          "body": "{\"ids\":[\"/dir-0/file-3.txt\"]}",
+          "status": 200
+        }
+      ]
+    },
+    {
+      "step": "upload",
+      "gesture": "Upload file",
+      "note": "ONE multipart POST via fetch: no XHR, no progress events, no chunking, no resume",
+      "requests": [
+        {
+          "method": "POST",
+          "path": "/api/v1/upload",
+          "query": "?id=%2Fdir-0",
+          "contentType": "multipart/form-data; boundary=----WebKitFormBoundaryvL9ZNB0VP13vTm6a",
+          "sessionHeader": "PROBE-SESSION-TOKEN",
+          "bodyBytes": 4397,
+          "body": "<multipart, 4397 bytes>",
+          "status": 200
+        }
+      ]
+    },
+    {
+      "step": "search",
+      "gesture": "type \"file\" in the toolbar search box",
+      "note": "NO request: search is client-side over what is already loaded, so a capped listing means a partial search",
+      "requests": []
+    },
+    {
+      "step": "as-shipped-provider",
+      "gesture": "the component's own RestDataProvider, with setHeaders() called",
+      "note": "THE DEFECT: no X-Pelfs-Session header, and text/plain on the mutation. RestDataProvider.send() ignores this._customHeaders and sets no content type.",
+      "requests": [
+        {
+          "method": "GET",
+          "path": "/api/v1/files/%2Fdir-2",
+          "query": "",
+          "contentType": null,
+          "sessionHeader": null,
+          "bodyBytes": 0,
+          "body": null,
+          "status": 200
+        },
+        {
+          "method": "POST",
+          "path": "/api/v1/files/%2Fdir-2",
+          "query": "",
+          "contentType": "text/plain;charset=UTF-8",
+          "sessionHeader": null,
+          "bodyBytes": 37,
+          "body": "{\"name\":\"as-shipped\",\"type\":\"folder\"}",
+          "status": 200
+        }
+      ]
+    }
+  ]
+}

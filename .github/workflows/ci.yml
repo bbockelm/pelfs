@@ -405,6 +405,38 @@ jobs:
       - name: Mount a published generation and benchmark it
         run: ./scripts/mount-gate-docker.sh
 
+  browse-gate:
+    # THE WHOLE OF `pelfs browse`, END TO END, WITH NOTHING MOCKED: the
+    # shipped binary against a fakeorigin, driven by curl as the browser and
+    # by REAL Cyberduck (`duck`, its own CLI and its own protocol stack) as
+    # the WebDAV client, and then verified by a SECOND, FRESH pelfs that
+    # mounts the published generation from an empty state directory.
+    #
+    # That last step is why this is a durability gate and not an HTTP one.
+    # Every check before it can pass with a broken seal; `pelfs shell --ro`
+    # reading the bytes back out of the federation is the one that cannot.
+    #
+    # It is its own job rather than a leg of e2e because it needs an image
+    # e2e does not have (Cyberduck's apt repository) and because a failure
+    # here means something different: e2e red is the filesystem, this red is
+    # the browser surface. Measured 33 checks in ~90s, most of it the JVM.
+    #
+    # The image build needs network; the RUN is --network none, and the only
+    # thing it talks to is a fakeorigin on its own loopback.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.0"
+      - name: Enable FUSE
+        run: |
+          sudo modprobe fuse
+          sudo chmod 666 /dev/fuse
+      - name: pelfs browse end to end, with real Cyberduck and a real mount
+        run: ./scripts/browse-gate-docker.sh
+
   crash:
     # kill -9 a read-write mount while it is mid-flush, remount the same
     # state dir, and hold recovery to its contract. The repo had no test
@@ -496,7 +528,7 @@ jobs:
 
   build-release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [unit, windows, race, e2e, integration, fuzz, opfuzz, hostile, mount-gate, crash, big-tree]
+    needs: [unit, windows, race, e2e, integration, fuzz, opfuzz, hostile, mount-gate, browse-gate, crash, big-tree]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -538,7 +570,11 @@ jobs:
           CGO_ENABLED=0 go build -trimpath \
             -ldflags "-X github.com/bbockelm/pelfs/internal/version.release=${GITHUB_REF_NAME}" \
             -o "$dist/pelfs$exe" ./cmd/pelfs
-          cp README.md CHANGELOG.md LICENSE "$dist/"
+          # NOTICE is not optional: Apache-2.0 section 4(d) requires it
+          # travel with the distribution, and it is also where the Pelican
+          # Platform mark's permission and the "not an official Pelican
+          # product" disclaimer are recorded.
+          cp README.md CHANGELOG.md LICENSE NOTICE "$dist/"
           tar -czf "${dist}.tar.gz" "$dist"
           ls -l "${dist}.tar.gz"
       # The runner is linux/amd64, so one of the four can actually be run.

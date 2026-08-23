@@ -472,12 +472,72 @@ func (r *raw) RemoveXAttr(cancel <-chan struct{}, header *fuse.InHeader, attr st
 	return fuse.OK
 }
 
-// Flush and Fsync succeed: the overlay commits one SQLite transaction per
-// operation, so everything already returned is durable by the time these
-// run. Neither op publishes — sealing the overlay into a new generation
-// for the federation is a separate, explicit step.
+// Flush succeeds without doing anything, which is what `close(2)` means:
+// POSIX does not promise durability at close, and an application that
+// needs it calls fsync. The overlay commits one SQLite transaction per
+// operation, so everything Flush could report on has already returned.
 func (r *raw) Flush(cancel <-chan struct{}, input *fuse.FlushIn) fuse.Status { return fuse.OK }
 
-func (r *raw) Fsync(cancel <-chan struct{}, input *fuse.FsyncIn) fuse.Status { return fuse.OK }
+// Fsync makes this session's writes durable ON THIS MACHINE and returns OK
+// only once that holds. It used to return OK unconditionally, which told an
+// application that checked the result that its data was safe when nothing
+// at all had been made durable.
+//
+// What the answer now means, exactly: **the writes are recoverable by
+// remounting THIS state directory.** The ring holding the bytes is
+// msync'd, the journal saying which file they belong to is fsync'd, and
+// the metadata giving that file a name is fsync'd — in that order, so no
+// layer is durable ahead of the one it names. Kill the process, cut the
+// power, reboot: `pelfs mount` over the same state directory comes back
+// with those writes in it.
+//
+// What it does NOT mean is that the data is in the federation, and the
+// difference has a sharp edge. **A job on ephemeral scratch gets nothing
+// from this.** An HTCondor slot's scratch is wiped when the job is
+// evicted, and the state directory goes with it — every byte this call
+// covered included, whether or not it returned OK. What survives an
+// eviction is a CHECKPOINT: `--snapshot-interval` to have one happen on a
+// cadence, or `pelfs ctl publish` at the points a job knows are worth
+// keeping. Federation durability is a publish, and fsync is not one.
+//
+// A federation round trip per fsync was the alternative and it was
+// rejected: for the sqlite-in-a-container workload that makes an
+// application call fsync at all, it is minutes per call.
+//
+// It is also whole-session rather than per-file, which is STRONGER than
+// asked for and cheaper than it sounds: the state directory is one ring
+// and two databases, so there is no per-file unit to sync, and repeated
+// calls with nothing between them are coalesced away (internal/overlay,
+// Sync).
+func (r *raw) Fsync(cancel <-chan struct{}, input *fuse.FsyncIn) fuse.Status {
+	return r.sync()
+}
 
-func (r *raw) FsyncDir(cancel <-chan struct{}, input *fuse.FsyncIn) fuse.Status { return fuse.OK }
+// FsyncDir is the same call, and that is a decision rather than a
+// copy-paste.
+//
+// A directory fsync asks for NAMESPACE durability — the entries in this
+// directory survive a crash — and that is a real question here, because
+// the namespace lives in the metadata database. But it cannot be answered
+// on its own. The two databases in a state directory live under a
+// one-directional rule: the content journal may hold entries for inodes
+// the metadata never committed, and the metadata may NEVER name content
+// the journal lacks. Making the namespace durable without the content
+// journal underneath it constructs exactly the state that rule forbids —
+// a durable name for bytes whose record is still in a page cache — so a
+// directory fsync here necessarily carries the content with it.
+func (r *raw) FsyncDir(cancel <-chan struct{}, input *fuse.FsyncIn) fuse.Status {
+	return r.sync()
+}
+
+func (r *raw) sync() fuse.Status {
+	if r.ov == nil {
+		// A read-only binding holds nothing of its own; every byte it
+		// serves is already a signed object on the federation.
+		return fuse.OK
+	}
+	if err := r.ov.Sync(); err != nil {
+		return errStatus(err)
+	}
+	return fuse.OK
+}

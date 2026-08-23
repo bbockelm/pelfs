@@ -1,11 +1,10 @@
 # go-nfs: the fork we carry, and what is left in it
 
 The loopback-NFS backend runs on [willscott/go-nfs](https://github.com/willscott/go-nfs).
-Eight of its behaviors were wrong for us: four are fixed on a fork, one was
-fixed upstream, two are handled inside pelfs (an error translation, and the
-whole POSIX permission check), and one is tolerated as it stands. This note
-records what the fork holds and why it exists rather than a set of local
-wrappers.
+Eight of its behaviors were wrong for us: five are fixed on a fork, one was
+fixed upstream, and two are handled inside pelfs (an error translation, and
+the whole POSIX permission check). This note records what the fork holds
+and why it exists rather than a set of local wrappers.
 
 The pin lives in `go.mod`:
 
@@ -292,14 +291,101 @@ match the same probe run against a local tree. That gate runs on the FUSE
 backend too, where the answers come from the kernel's own `default_permissions`
 check: the two legs together are the statement that the frontends agree.
 
-## Tolerated: COMMIT is a no-op
+## Fixed on the fork: COMMIT, and the WRITE reply that made it unreachable
 
-`onCommit` replies OK without flushing, documented as "we always push writes
-to the backing store". That is true for the filesystem we serve:
-`internal/vfsbilly` has no write-handle cache — the overlay commits each
-Write to its staging file before returning — so there is nothing buffered
-for a COMMIT to flush. Durability beyond that is the seal at exit and the
-periodic checkpoint, which is pelfs's actual promise.
+**This section used to say the opposite**, and the paragraph it replaces is
+worth keeping in mind as a shape of mistake rather than deleted quietly. It
+argued that `onCommit`'s no-op was fine because "we always push writes to
+the backing store", which for `internal/vfsbilly` reads as: there is no
+write-handle cache, the overlay commits each Write to its staging file
+before returning, so nothing is buffered for a COMMIT to flush. Every
+clause of that is true and the conclusion does not follow. "Committed to
+the staging file" is a statement about the pelfs PROCESS; `fsync(2)` is a
+question about the MACHINE, and the answer runs through an mmap'd ring and
+two SQLite connections at `synchronous=NORMAL`. The FUSE frontend was fixed
+first (`overlay.FS.Sync`) and made the gap visible, and it was filed as
+KI-10.
+
+**The defect was not in COMMIT.** `onWrite` wrote the constant `fileSync`
+into the stability field of every WRITE reply, whatever the client had
+asked for. That field reports what the server ACHIEVED (RFC 1813, 3.3.7)
+and a client believes it: Linux queues a page for commit only when the
+reply said UNSTABLE (`nfs_write_completion`), so a server claiming
+FILE_SYNC has announced there is nothing left to commit. The COMMIT
+handler was therefore DEAD CODE — a no-op nothing called. Measured on the
+mount-gate container, `dd conv=fsync` over the mount: **2 WRITEs, 0
+COMMITs** before, 2 WRITEs and 1 COMMIT after. A commit hook alone would
+have changed nothing observable, which is the trap this one was worth
+checking for first.
+
+Both halves now sit behind one optional interface:
+
+    type Committer interface{ Commit(path string) error }
+
+A filesystem that implements it is taken to be holding data a crash could
+take. `onWrite` answers an unstable request UNSTABLE and leaves it for a
+COMMIT; a data-sync or file-sync request is committed before the reply and
+answered FILE_SYNC. `onCommit` calls `Commit` and reports its failure —
+through `statusFromWriteError`, so ENOSPC, EDQUOT and EFBIG survive as
+themselves — instead of answering OK. A filesystem that does NOT implement
+it keeps the historical behavior exactly, which is what every other go-nfs
+user has today.
+
+The interface is whole-file on purpose: RFC 1813 (3.3.21) lets a server
+commit more of a file than it was asked to, so the offset and count
+arguments stay unread, as they already were. `internal/vfsbilly` implements
+it as `overlay.FS.Sync` — the same body `rawfuse`'s `Fsync` calls, so both
+frontends make one promise — and ignores the path, because the durability
+unit here is the session.
+
+**The cost this opts a filesystem into is the part to read before copying
+the pattern, and it does not arrive through COMMIT.** A Linux client sends
+a small file's whole body as a FILE_SYNC write rather than an unstable one,
+because that saves it a COMMIT round trip (`nfs_writepages` →
+`FLUSH_COND_STABLE`: one request in the list becomes `NFS_FILE_SYNC`). RFC
+1813 makes FILE_SYNC a requirement rather than a hint — the data must be on
+stable storage before the reply — so `onWrite` commits inline, once per
+file, for an application that never called `fsync`. knfsd pays the same
+toll (`nfsd_vfs_write` sets `RWF_SYNC` for a stable write). COMMIT-on-close
+exists too (`nfs_file_flush` → `nfs_wb_all`) but only fires when there ARE
+unstable pages, i.e. for files large enough to need more than one write —
+and those cost ONE commit for the whole file.
+
+Measured here, 500 small files copied onto the mount with no `fsync` in the
+workload:
+
+| state directory on | before | after |
+|---|---|---|
+| tmpfs | 332 ms | 246 ms |
+| a real disk | 392 ms | **1239 ms** |
+
+**The tmpfs row is why the benchmarks did not see this.** Every
+containerized gate in this repository keeps its scratch on tmpfs, where
+`fsync` is free: `scripts/bench-untar-nfs-docker.sh` reports 66.08s before
+and 66.22s after for 50k files, RPCs per file 5.41 both — a wash that says
+nothing about a real disk. Anyone re-measuring this should put the state
+directory on real storage first.
+
+`overlay.Sync`'s coalescing does not help here, because every file changes
+something; what it makes free is a repeat with nothing between, which is
+the `fsync`-storm case rather than the create-heavy one.
+
+The write verifier needed no change and is documented rather than altered.
+It is `Server.ID`, eight random bytes minted per `Serve` when the caller
+did not set them, so it differs across server restarts and is stable within
+one — exactly what lets a client notice that the instance holding its
+unstable writes is gone and resend. It only started to matter once
+unstable replies existed, so the fork's tests pin it now.
+
+Gated by `nfs_oncommit_test.go` on the fork (the unstable reply, the
+synchronous commit-before-reply, the write-through filesystem's unchanged
+answer, a failing commit's status, and the verifier), by
+`internal/vfsbilly/commit_test.go` and `internal/nfsmount/diag_internal_test.go`
+here, and by `commit_gate` in `scripts/mount-gate-test.sh`, which asserts
+against a REAL kernel NFS client — reading the client's own
+`/proc/self/mountstats` — that an `fsync(2)` through the mount sends a
+COMMIT at all. That last one is the assertion the whole fix turns on, and
+it is client-side evidence rather than server-side intent.
 
 ## Appendix: considered and not taken
 
@@ -311,9 +397,13 @@ Recorded so they are not re-proposed.
   once the four interception points above are closed, and it is why the
   fork exists at all.
 - **A patch honoring an optional `Sync() error` on the backend's
-  `billy.File`.** Easy, and written once. Not carried, because nothing here
-  needs it — see "COMMIT is a no-op" — and a fork should hold only what is
-  load-bearing. Revisit if a backend ever buffers writes.
+  `billy.File`.** Written once and not carried, on the reasoning that
+  nothing here needed it. That reasoning was wrong (see the COMMIT section
+  above), but so was the SHAPE: a per-`billy.File` `Sync` is reachable only
+  from a handler that holds the file open, and COMMIT holds nothing —
+  go-nfs is stateless between RPCs, and the file a COMMIT names may never
+  have been opened by this server at all. The interface that landed is on
+  the FILESYSTEM, which is where a stateless server can reach it.
 - **Persisting EXCLUSIVE verifiers in the file's timestamps**, as RFC 1813
   suggests. Rejected in favour of an in-memory table with a TTL: the
   property that matters — never truncating a file whose name someone else

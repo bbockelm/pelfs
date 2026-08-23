@@ -1,0 +1,29 @@
+pelfs
+Copyright the pelfs authors.
+
+This product includes software developed as part of the pelfs project,
+licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Trademarks
+----------
+
+The Pelican Platform mark (webui/frontend/public/brand/PelicanPlatformLogo_Icon.png)
+is used with the permission of the Pelican Project's Principal Investigator.
+
+pelfs is an independent tool for Pelican federations. It is NOT an official
+Pelican Platform product, and it is not endorsed by or affiliated with the
+Pelican Project beyond that permission. Apache-2.0 section 6 grants no
+trademark rights; the permission recorded here is separate from the licence.
+
+Full provenance for the mark, including its checksum and the source file it
+was copied from, is in webui/frontend/public/brand/NOTICE.txt.
+
+Third-party software
+--------------------
+
+The browser UI embedded in the pelfs binary bundles third-party JavaScript.
+Every bundled package, its version and its licence -- with the full licence
+text each licence requires be carried with the distribution -- is listed in
+internal/webui/third_party.txt, which is generated from the frontend's
+lockfile by `go generate ./internal/webui` and served by the running UI at
+/third_party.txt.

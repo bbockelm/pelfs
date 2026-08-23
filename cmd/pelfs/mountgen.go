@@ -100,10 +100,19 @@ func newSessionID() string {
 // next seal grows from. A mid-session checkpoint advances it, which is the
 // only state a checkpoint changes (see checkpoint).
 type genSession struct {
-	prefix     string
-	branch     string
-	tag        string
-	stateDir   string
+	prefix   string
+	branch   string
+	tag      string
+	stateDir string
+	// stateRoot is the root this invocation's flags select — the same
+	// answer cmdOpts.stateRoot gives — and it is where the mount record
+	// goes. It is a FIELD rather than a call to defaultStateRoot() from
+	// publishMountRecord because that call was the bug: a session pointed
+	// entirely at a temp directory still created a vol-<id> directory in
+	// the user's home for its record. Empty in a session built without
+	// one (a test); publishMountRecord then falls back to stateDir, never
+	// to the home directory.
+	stateRoot  string
 	mountpoint string
 	backend    string
 	sessionID  string
@@ -237,6 +246,9 @@ type genArgs struct {
 	noMemtable              bool
 	signingKeyPath, backend string
 	poll                    time.Duration
+	// background is set only by the `pelfs mount` daemon child, and it
+	// decides ONE thing: where the mount record goes. See registryRoot.
+	background bool
 }
 
 // FOREGROUND, AND THE TRAILING -f APPTAINER ADDS.
@@ -496,6 +508,7 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		branch:         branch,
 		tag:            tag,
 		stateDir:       stateDir,
+		stateRoot:      registryRoot(o, a.background),
 		mountpoint:     mountpoint,
 		backend:        backend,
 		sessionID:      newSessionID(),
@@ -2575,6 +2588,17 @@ func (g *genSession) startControl() *control.Server {
 	return srv
 }
 
+// recordRoot is where this session's mount record goes: the root its own
+// invocation selected, and never a directory nothing on its command line
+// named. A session assembled without a root (a test) records beside its
+// own state, which is somewhere the test already owns.
+func (g *genSession) recordRoot() string {
+	if g.stateRoot != "" {
+		return g.stateRoot
+	}
+	return g.stateDir
+}
+
 // publishMountRecord makes the session discoverable by prefix, so
 // `pelfs ctl`, `pelfs status`, and `pelfs umount` all find the session by
 // prefix. It returns the retraction.
@@ -2585,7 +2609,7 @@ func (g *genSession) startControl() *control.Server {
 // is always a valid `pelfs ctl` target for the other.
 func (g *genSession) publishMountRecord() func() {
 	noop := func() {}
-	dir := volDir(g.prefix)
+	dir := volDirIn(g.recordRoot(), g.prefix)
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return noop
 	}
@@ -2620,6 +2644,12 @@ func (g *genSession) publishMountRecord() func() {
 	return func() {
 		if info, err := readMountInfo(path); err == nil && info.PID == os.Getpid() {
 			_ = os.Remove(path)
+			// And the directory, if this session's record was the only
+			// thing in it. Leaving it behind is how the state root filled
+			// up with empty vol-<id> directories, one per run of a
+			// harness: os.Remove refuses a non-empty directory, so a
+			// volume whose state really does live here is untouched.
+			_ = os.Remove(dir)
 		}
 	}
 }

@@ -17,6 +17,7 @@
 //	pelfs repack-plan <prefix>       report what a repack would rewrite
 //	pelfs repack [--apply] <prefix>  rewrite mostly-dead packs, publish a generation
 //	pelfs cache  [clear] <prefix>    show, or free, the local cache
+//	pelfs browse [--rw] <prefix>     a page on 127.0.0.1: durability, and publish
 //	pelfs rotate [--apply] <prefix>  replace the volume signing key
 //	pelfs rescue [--apply] <prefix>  rebuild refs from packs after a disaster
 package main
@@ -73,6 +74,8 @@ func main() {
 		code = cmdRepack(os.Args[2:])
 	case "cache":
 		code = cmdCache(os.Args[2:])
+	case "browse":
+		code = cmdBrowse(os.Args[2:])
 	case "rotate":
 		code = cmdRotate(os.Args[2:])
 	case "rescue":
@@ -100,8 +103,10 @@ Usage:
   pelfs shell  [flags] <prefix>                           mount + subshell
   pelfs shell  [flags] <prefix> -- <command> [args...]    mount + run one command
   pelfs mount  [flags] [--rw] <prefix> [mountpoint]       background mount
-  pelfs umount <prefix-or-mountpoint>                     stop a background mount
-  pelfs status                                            list background mounts
+  pelfs umount [--state-dir d] <prefix-or-mountpoint>     stop a background mount
+  pelfs status [--state-dir d]                            list background mounts
+                                                          (--state-dir where the session
+                                                          was started with one)
   pelfs gc     [flags] [--delete] <prefix>                sweep unreferenced packs
   pelfs tag    [flags] <prefix> <name>                    freeze the branch head under
                                                           a name, retained until --rm
@@ -127,6 +132,10 @@ Usage:
                                                           publish a generation
   pelfs cache  [clear] [flags] <prefix>                   show (or free) the local
                                                           cache this volume is using
+  pelfs browse [--rw] [--open] [flags] <prefix>           serve a page on 127.0.0.1 that
+                                                          says what is published and what
+                                                          is only on this machine, with a
+                                                          publish button; Ctrl-C seals
   pelfs rotate [--apply] [flags] <prefix>                 replace the volume signing key
                                                           through the custody chain; reports
                                                           what it would break by default

@@ -68,6 +68,17 @@ mkdir -p sub/dir
 head -c 8388608 /dev/urandom > sub/dir/rand.bin
 sha256sum sub/dir/rand.bin | cut -d" " -f1 > rand.sha
 cat rand.sha
+# fsync(2) and a directory fsync through a real FUSE mount on a real
+# kernel. Both `conv=fsync` and `sync <path>` fail if the filesystem
+# answers with an error, and with `set -e` that fails the session -- which
+# is the only check that the ops are wired at all and that the msync and
+# the two database fsyncs succeed HERE rather than only on a laptop. Since
+# v0.2.1 they do work, so an error is a regression rather than the old
+# unconditional OK.
+dd if=/dev/urandom of=fsynced.bin bs=64k count=16 conv=fsync 2>/dev/null
+sync fsynced.bin
+sync sub/dir
+echo "fsync answered ok"
 ' > "$WORK/run1.log" 2>&1
 grep -q "created volume" "$WORK/run1.log" || { echo "FAIL: the empty prefix was not initialized"; exit 1; }
 grep -q "sealed generation" "$WORK/run1.log" || { echo "FAIL: session 1 did not seal"; exit 1; }
@@ -79,7 +90,10 @@ SHA1=$(grep -E '^[0-9a-f]{64}$' "$WORK/run1.log" | head -1)
 [ ! -e "$WORK/origin/e2e/ns/meta/lease.json" ] || {
   echo "FAIL: a v0.2 writer wrote the legacy whole-volume lease; two writers on different branches would " \
        "then exclude each other through it"; exit 1; }
-echo "   wrote rand.bin sha256=$SHA1"
+grep -q "fsync answered ok" "$WORK/run1.log" || {
+  echo "FAIL: fsync(2) or a directory fsync through the mount returned an error"
+  tail -20 "$WORK/run1.log"; exit 1; }
+echo "   wrote rand.bin sha256=$SHA1, and fsync answered"
 
 echo "== stats summary from session 1 =="
 [ -f "$WORK/stats1.json" ] || { echo "FAIL: stats file missing"; exit 1; }
@@ -98,6 +112,11 @@ assert s["object_errors_total"] == 0, s
 # in both, would make "nothing was uploaded while I was working" unsafe to
 # believe. This session ran with --snapshot-interval 0, so the honest
 # answer is that every uploaded byte belongs to teardown.
+#
+# Which makes the session-phase zero below do double duty: the session
+# above called fsync(2) three times, and fsync is deliberately NOT a
+# federation round trip. A byte in the session phase would mean it had
+# quietly become one.
 assert s["pelfs_stats_version"] == 3, s
 ses, tear = s["session_phase"], s["teardown_phase"]
 for kind in ("get", "put", "delete", "other"):

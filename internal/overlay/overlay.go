@@ -198,6 +198,15 @@ type FS struct {
 	// nil means read the tables.
 	rows *rowCache
 
+	// syncedSeq is the seq the last durability pass covered and synced says
+	// whether there has been one, which is how an fsync with nothing new
+	// under it costs a lock and a comparison (sync.go). Both are guarded
+	// by mu, like seq itself.
+	syncedSeq uint64
+	synced    bool
+	// syncCounters is what fsync has cost, sampled without the lock.
+	syncCounters
+
 	// seq counts mutating operations; modSeq records, per inode, the seq
 	// of its last modification. Snapshot names the seq it froze, and
 	// Rebase drops exactly the state whose last modification is at or

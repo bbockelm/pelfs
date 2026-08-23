@@ -88,3 +88,41 @@ const (
 
 // ProcessCred reads the identity of this process; see fsperm.
 func ProcessCred() Cred { return fsperm.ProcessCred() }
+
+// WHO ANSWERED open(2) — the one question the owner override turns on.
+//
+// mayOpen grants knfsd's NFSD_MAY_OWNER_OVERRIDE, and its entire
+// justification is a property of NFSv3 and of no other protocol: NFSv3 has
+// no OPEN operation, so every OpenFile the NFS frontend makes belongs to an
+// open the CLIENT already decided, from the ACCESS reply Permitted gave it.
+// Overriding the mode bits there second-guesses nothing; it merely declines
+// to re-answer a question that was answered correctly a moment ago.
+//
+// WebDAV, SFTP and an HTTP handler have a real open. For them the open is
+// answered HERE, by this layer, and it is the only place it is answered —
+// so an override makes this layer truncate a 0444 file that the kernel,
+// FUSE's `default_permissions` and Permitted's own ACCESS reply all refuse.
+// That is the "two frontends disagree about the same file" defect
+// internal/fsperm exists to prevent, arriving through the back door.
+//
+// So the override is a property of THE CALLER, not of this layer, and every
+// binding says which it is. The zero value is the safe one: a frontend that
+// says nothing gets no override.
+type OpenSemantics uint8
+
+const (
+	// OpenAnsweredHere is the safe default and the zero value. This process
+	// performs the open, so the mode check here IS the open check and there
+	// is nothing to defer to. Every frontend with a real open — WebDAV
+	// (internal/vfsdav), SFTP, a plain HTTP PUT — uses this.
+	OpenAnsweredHere OpenSemantics = iota
+	// OpenAnsweredByClient is NFSv3 and nothing else. The client answered
+	// open(2) from our ACCESS reply before the first READ or WRITE was sent,
+	// so the file's owner is let through the mode bits on the DATA PATH
+	// exactly as knfsd's nfsd_open does — which is what makes `tar -p`
+	// extract a read-only file over NFS instead of leaving it empty.
+	// scripts/mount-gate-test.sh has the gate. Read mayOpen before using
+	// this from anything that is not the NFS frontend: nothing else is
+	// entitled to it, and nothing else needs it.
+	OpenAnsweredByClient
+)

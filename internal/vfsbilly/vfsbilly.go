@@ -83,6 +83,11 @@ type billyFS struct {
 	// (internal/idmap).
 	ids  idmap.Map
 	dirs *dirCache
+	// openSem says who answered open(2) for this binding, which is the only
+	// thing the owner override in mayOpen turns on. The zero value —
+	// OpenAnsweredHere — grants nothing, so a frontend built by a future
+	// constructor that forgets to name it is refused rather than let through.
+	openSem OpenSemantics
 }
 
 var (
@@ -98,30 +103,57 @@ var (
 	// the client asked about -- so a drifting signature would not fail to
 	// build either; it would quietly go back to lying.
 	_ nfs.PermissionChecker = (*billyFS)(nil)
+	// COMMIT is answered through this one, and so -- less obviously -- is
+	// the stability field of every WRITE reply. A signature that drifted
+	// from it would not fail to build; it would put the frontend back to
+	// claiming FILE_SYNC for writes it has only buffered, which is a
+	// silent return of KI-10. See Commit below.
+	_ nfs.Committer = (*billyFS)(nil)
 )
 
-// New returns a billy.Filesystem over a read-write overlay. Nodes it
-// creates are owned by the invoking user: the volume is a single-user
-// scratch space and the mount must be able to write what it made.
+// New returns a billy.Filesystem over a read-write overlay FOR THE NFS
+// FRONTEND. Nodes it creates are owned by the invoking user: the volume is
+// a single-user scratch space and the mount must be able to write what it
+// made.
+//
+// It is the NFSv3 binding specifically — OpenAnsweredByClient, the owner
+// override on the data path (mayOpen). A FRONTEND WITH A REAL OPEN MUST NOT
+// USE THIS: call NewFor(ov, cred, OpenAnsweredHere) instead, and read
+// OpenSemantics in perm.go for the one paragraph that says why. The
+// call-site allowlist in owneroverride_test.go enforces it.
 func New(ov *overlay.FS) billy.Filesystem { return NewAs(ov, ProcessCred()) }
 
-// NewAs is New with the identity named explicitly. The mount serves, and
-// checks permissions, as cred — see perm.go for why that identity is the
-// server's own and not the caller's AUTH_UNIX credential. It exists so the
-// permission matrix can be exercised at this interface without the test
-// process having to BE four different users.
+// NewAs is New with the identity named explicitly — and, like New, the NFS
+// binding. The mount serves, and checks permissions, as cred — see perm.go
+// for why that identity is the server's own and not the caller's AUTH_UNIX
+// credential. It exists so the permission matrix can be exercised at this
+// interface without the test process having to BE four different users.
 func NewAs(ov *overlay.FS, cred Cred) billy.Filesystem {
-	return &billyFS{rd: ov, ov: ov, uid: cred.UID, gid: cred.GID, cred: cred,
-		ids: volumeOwner(ov, cred), dirs: newDirCache()}
+	return NewFor(ov, cred, OpenAnsweredByClient)
 }
 
-// NewReadOnly returns a billy.Filesystem over an immutable generation.
+// NewFor is NewAs with the open semantics named too, which is what a
+// frontend other than NFS must use: sem decides whether this layer grants
+// knfsd's owner override on the data path, and only a protocol whose open
+// was already answered on the client is entitled to it (OpenSemantics).
+func NewFor(ov *overlay.FS, cred Cred, sem OpenSemantics) billy.Filesystem {
+	return &billyFS{rd: ov, ov: ov, uid: cred.UID, gid: cred.GID, cred: cred,
+		ids: volumeOwner(ov, cred), dirs: newDirCache(), openSem: sem}
+}
+
+// NewReadOnly returns a billy.Filesystem over an immutable generation, for
+// the NFS frontend — see New.
 func NewReadOnly(fs *genfs.FS) billy.Filesystem { return NewReadOnlyAs(fs, ProcessCred()) }
 
 // NewReadOnlyAs is NewReadOnly with the identity named explicitly.
 func NewReadOnlyAs(fs *genfs.FS, cred Cred) billy.Filesystem {
+	return NewReadOnlyFor(fs, cred, OpenAnsweredByClient)
+}
+
+// NewReadOnlyFor is NewFor over an immutable generation.
+func NewReadOnlyFor(fs *genfs.FS, cred Cred, sem OpenSemantics) billy.Filesystem {
 	return &billyFS{rd: fs, uid: cred.UID, gid: cred.GID, cred: cred,
-		ids: volumeOwner(fs, cred), dirs: newDirCache()}
+		ids: volumeOwner(fs, cred), dirs: newDirCache(), openSem: sem}
 }
 
 // volumeOwner reads the identity a volume was created under, from its
@@ -496,11 +528,20 @@ func (b *billyFS) OpenFile(filename string, flag int, perm os.FileMode) (billy.F
 //
 // # The owner override, and exactly how far it reaches
 //
-// Every OpenFile a served filesystem sees comes from the DATA PATH: READ
+// It reaches only a binding whose CALLER asked for it
+// (OpenAnsweredByClient — see OpenSemantics in perm.go). That is NFSv3 and
+// nothing else, and the rest of this section is why the distinction is the
+// whole justification rather than a detail of it.
+//
+// Every OpenFile the NFS frontend makes comes from the DATA PATH: READ
 // opens O_RDONLY, WRITE opens O_RDWR, and SETATTR-with-a-size opens
 // O_WRONLY|O_EXCL to truncate. NFSv3 has no OPEN operation at all, so
 // none of these is the client's open(2) — that was answered on the client,
-// from our ACCESS reply (Permitted below), before any of them was sent.
+// from our ACCESS reply (Permitted below), before any of them was sent. A
+// frontend that DOES have an open — WebDAV's PUT, SFTP's SSH_FXP_OPEN, an
+// HTTP handler calling OpenFile — is in the opposite position: this check
+// is the only open check there will ever be for it, so it gets
+// OpenAnsweredHere and no override.
 //
 // So this is knfsd's nfsd_open, which passes NFSD_MAY_OWNER_OVERRIDE
 // (fs/nfsd/vfs.c): the file's OWNER is allowed through whatever the mode
@@ -538,7 +579,10 @@ func (b *billyFS) mayOpen(name string, n genfs.Node, mutates bool) error {
 	if b.mayNode(n, want) {
 		return nil
 	}
-	if n.Type == catalog.TypeFile && b.ownsNode(n) {
+	// And the override reaches only a binding that ASKED for it. A frontend
+	// with a real open (WebDAV, SFTP) answers open(2) here and nowhere else,
+	// so for it this check is the open check — see OpenSemantics in perm.go.
+	if b.openSem == OpenAnsweredByClient && n.Type == catalog.TypeFile && b.ownsNode(n) {
 		return nil
 	}
 	return accessErr("open", name)
@@ -875,6 +919,59 @@ func (b *billyFS) Capabilities() billy.Capability {
 		caps |= billy.WriteCapability | billy.ReadAndWriteCapability | billy.TruncateCapability
 	}
 	return caps
+}
+
+// Committer — what fsync(2) means on an NFS mount of this filesystem.
+//
+// It is `overlay.FS.Sync`, the same body the FUSE frontend's Fsync and
+// FsyncDir call (internal/rawfuse/rw.go), and therefore the same promise:
+// when it returns, everything this session has written is recoverable by
+// remounting THIS state directory — the ring's mapping is msync'd, the
+// content journal is fsync'd, and the metadata database is fsync'd. It is
+// NOT a federation round trip; read the file comment in
+// internal/overlay/sync.go, which is the one place that distinction is
+// written out in full.
+//
+// WHY THIS IS NOT MERELY THE COMMIT HANDLER. NFSv3 has no OPEN and no
+// close, and it has no separate "make it durable" op that a client reaches
+// only from fsync: the durability contract is the stability field on every
+// WRITE reply plus COMMIT, and go-nfs used to hard-code the first to
+// FILE_SYNC. A client believes that field — Linux queues a page for
+// commit only when the reply said UNSTABLE — so it would never send a
+// COMMIT, and a commit hook alone would have been unreachable code. What
+// implementing this interface actually buys is that go-nfs now answers
+// UNSTABLE for the writes it has only buffered, which is what makes the
+// COMMIT arrive.
+//
+// THE PATH IS IGNORED, and that is the interface's own allowance (RFC
+// 1813, 3.3.21: a server may commit more of the file than it was asked
+// to). There is nothing finer to do here anyway: the durability unit is
+// the session — one ring, one journal, two databases — so a per-file sync
+// would cost exactly what a whole-session sync costs.
+//
+// THE COST, AND WHY THE COALESCING IS LOAD-BEARING HERE AND NOT MERELY
+// NICE. An NFSv3 client commits on close(2) as well as on fsync(2)
+// (nfs_file_flush -> nfs_wb_all), so this is called about once per file
+// written, not once per fsync — a tar extraction of fifty thousand files
+// is fifty thousand commits. overlay.Sync returns without touching the
+// disk when nothing has changed since the last pass, which makes the
+// second commit of an unchanged file free; it does not make the first one
+// free, and a write-heavy NFS workload pays a sync per file. That is what
+// fsync costs, and the alternative was answering it with a lie.
+//
+// A READ-ONLY BINDING HAS NOTHING OF ITS OWN TO SYNC and answers OK,
+// matching rawfuse's Fsync on the same binding. Refusing would be worse
+// than pointless: a client that opened a file read-only still commits on
+// close, and an error there surfaces as a failed close(2) on a mount that
+// was never asked to change anything.
+func (b *billyFS) Commit(path string) error {
+	if b.ov == nil {
+		return nil
+	}
+	if err := b.ov.Sync(); err != nil {
+		return pe("commit", path, err)
+	}
+	return nil
 }
 
 // Change — SETATTR support.

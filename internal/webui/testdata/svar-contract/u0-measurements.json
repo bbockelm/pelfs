@@ -1,0 +1,150 @@
+{
+  "measuredAt": "2026-08-23T20:04:01.956Z",
+  "browser": "chromium 148.0.7778.96",
+  "lazy": {
+    "atBoot": {
+      "requests": [
+        "GET /api/v1/files",
+        "GET /api/v1/info"
+      ],
+      "dom": {
+        "cards": 8,
+        "rows": 0,
+        "domNodes": 152,
+        "scrollHeightPx": 740,
+        "clientHeightPx": 740,
+        "jsHeapMB": 10
+      }
+    },
+    "afterOpeningOneFolder": {
+      "requests": [
+        "GET /api/v1/files",
+        "GET /api/v1/info",
+        "GET /api/v1/files/%2Fdir-0"
+      ]
+    },
+    "afterOpeningANestedFolder": {
+      "requests": [
+        "GET /api/v1/files",
+        "GET /api/v1/info",
+        "GET /api/v1/files/%2Fdir-0",
+        "GET /api/v1/files/%2Fdir-0%2Fdir-1"
+      ]
+    },
+    "afterRevisitingALoadedFolder": {
+      "requests": [
+        "GET /api/v1/files",
+        "GET /api/v1/info",
+        "GET /api/v1/files/%2Fdir-0",
+        "GET /api/v1/files/%2Fdir-0%2Fdir-1"
+      ]
+    },
+    "verdict": "LAZY: one listing per directory, on navigation into it"
+  },
+  "virtualization": {
+    "sweep": [
+      {
+        "entries": 1000,
+        "cardsMode": {
+          "openMs": 98,
+          "cards": 1000,
+          "domNodes": 10067,
+          "jsHeapMB": 13,
+          "scrollHeightPx": 73530,
+          "clientHeightPx": 73530
+        },
+        "tableMode": {
+          "tableMs": 91,
+          "rows": 1001,
+          "domNodes": 7093,
+          "jsHeapMB": 13
+        },
+        "domNodesBeforeScroll": 7093,
+        "domNodesAfterScroll": 7093,
+        "requestsAfterScroll": 3
+      },
+      {
+        "entries": 5000,
+        "cardsMode": {
+          "openMs": 320,
+          "cards": 5000,
+          "domNodes": 50067,
+          "jsHeapMB": 40,
+          "scrollHeightPx": 366790,
+          "clientHeightPx": 366790
+        },
+        "tableMode": {
+          "tableMs": 421,
+          "rows": 5001,
+          "domNodes": 35093,
+          "jsHeapMB": 40
+        },
+        "domNodesBeforeScroll": 35093,
+        "domNodesAfterScroll": 35093,
+        "requestsAfterScroll": 3
+      },
+      {
+        "entries": 20000,
+        "cardsMode": {
+          "openMs": 1448,
+          "cards": 20000,
+          "domNodes": 200067,
+          "jsHeapMB": 148,
+          "scrollHeightPx": 1466790,
+          "clientHeightPx": 1466790
+        },
+        "tableMode": {
+          "tableMs": 2258,
+          "rows": 20001,
+          "domNodes": 140093,
+          "jsHeapMB": 148
+        },
+        "domNodesBeforeScroll": 140093,
+        "domNodesAfterScroll": 140093,
+        "requestsAfterScroll": 3
+      },
+      {
+        "entries": 50000,
+        "cardsMode": {
+          "openMs": 5733,
+          "cards": 50000,
+          "domNodes": 500067,
+          "jsHeapMB": 364,
+          "scrollHeightPx": 3666790,
+          "clientHeightPx": 3666790
+        },
+        "tableMode": {
+          "tableMs": 8871,
+          "rows": 50001,
+          "domNodes": 350093,
+          "jsHeapMB": 364
+        },
+        "domNodesBeforeScroll": 350093,
+        "domNodesAfterScroll": 350093,
+        "requestsAfterScroll": 3
+      },
+      {
+        "entries": 100000,
+        "cardsMode": {
+          "openMs": 17744,
+          "cards": 100000,
+          "domNodes": 1000067,
+          "jsHeapMB": 703,
+          "scrollHeightPx": 7333530,
+          "clientHeightPx": 7333530
+        },
+        "tableMode": {
+          "tableMs": 33321,
+          "rows": 100001,
+          "domNodes": 700093,
+          "jsHeapMB": 703
+        },
+        "domNodesBeforeScroll": 700093,
+        "domNodesAfterScroll": 700093,
+        "requestsAfterScroll": 3
+      }
+    ],
+    "verdict": "NOT VIRTUALIZED: 100000 entries produced 100000 card elements and 1000067 DOM nodes. The API's response cap is the design, not a fallback."
+  },
+  "externalRequests": []
+}

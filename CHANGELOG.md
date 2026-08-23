@@ -86,6 +86,58 @@ is used unmodified — not traced, not redrawn, nothing drawn on top — and the
 `NOTICE`, says plainly that pelfs is **not** an official Pelican Platform
 product.
 
+### `pelfs browse`: a page that says whether your data is in the federation
+
+`pelfs browse [--rw] [--open] <prefix>` opens a volume, serves one
+hand-written page on `127.0.0.1` at a random port, and answers the two
+questions a file manager cannot: **is this staged on my laptop or is it in
+the federation**, and **publish it now**. It does not browse files, and the
+page says so in a sentence rather than leaving somebody to discover it —
+`pelfs mount` is still how bytes move. Read-only unless `--rw`; foreground,
+so Ctrl-C is the unmount and the session seals on the way out exactly as a
+mount does. The URL is printed whether or not `--open` launches a browser,
+because a login node has no opener.
+
+The durability line never merges the two facts into one checkmark: a filled
+amber dot for "on this machine only", with the file count, the bytes and
+how long until the next automatic publish, and a green check for "in the
+federation (generation N)". A lease that has gone `stale`, `interrupted` or
+`lost` — a laptop that slept, another writer that took the branch — is a
+banner the moment it is known, rather than a surprise at the seal.
+`Publish now` answers **202 with a job id** and reports progress on a
+Server-Sent-Events stream, because the seal holds the overlay's lock for as
+long as it takes and a synchronous request would be a spinner with no
+information in it; a second click while one is running gets **409** naming
+the job that holds the lock, not a queue.
+
+**There are no cookies, anywhere.** A cookie set for `127.0.0.1` has no
+port isolation at all (RFC 6265bis §8.5), so it is sent to every other
+local service the browser is made to contact — a notebook, a dev server,
+anything. So the launch URL carries a single-use 120-second bootstrap token
+in its **fragment**, the page exchanges it once for a session token it
+keeps in `sessionStorage` (which *is* port-scoped) and sends as a request
+header, and nothing this process mints outlives it. The new
+`internal/httpguard` puts the rest in one place and one order: an exact
+`Host` allowlist that answers `421` to anything else (this is the
+DNS-rebinding defence, and it is the only thing that works —
+CVE-2018-5702 is the case where a custom header *was* the CSRF defence and
+rebinding walked through it), `net/http.CrossOriginProtection` with both of
+its documented gaps closed, an exact `Origin` match, `application/json` on
+anything that mutates, a strict `Content-Security-Policy` with a
+per-response nonce, and no `Access-Control-Allow-*` header on any surface
+ever. Sixteen rows of table test pin all of it, and one of them asserts
+that `/debug/pprof` — which the control socket exposes on the strength of
+being a 0600 unix socket — is not routable from a browser at all.
+
+Downloads are ticketed even though this milestone has nothing to download:
+`POST /api/v1/download` mints a single-use 30-second ticket and
+`GET /d/<ticket>` accepts no session credential, because an `<a href>`
+cannot carry a request header and exempting GET from the credential rule is
+precisely the hole rebinding exploits. The design is
+`docs/design-webui.md`; a WebDAV endpoint on the same listener, an OAuth
+authorization server for Cyberduck, and the JSON API are the milestones
+after this one.
+
 ### A crash between a flush and its location record no longer loses that flush
 
 A write's LENGTH became durable immediately — `Store.Write` appends to the

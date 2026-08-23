@@ -1,0 +1,402 @@
+<!doctype html>
+<!--
+  The pelfs browse page: one hand-written file, no bundler, no framework,
+  no third-party JavaScript. docs/design-webui.md's M1 is deliberately
+  bounded to this, and the boundary buys two things — `go build ./...`
+  needs no Node, and the Content-Security-Policy can be strict enough
+  (script-src 'nonce-…', no 'unsafe-inline') that a file in the volume
+  cannot become code in this origin.
+
+  It ships NO state. Everything on screen arrives over /events, which
+  carries a complete snapshot per frame, so a reconnect cannot leave a
+  stale view. The only values the server interpolates are the CSP nonce and
+  the volume name.
+
+  Every element a test asserts on carries data-testid. That is not
+  decoration: a browser-driver suite that selects on prose breaks the first
+  time somebody rewords a sentence, and the sentences here are meant to be
+  reworded.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pelfs — {{.Volume}}</title>
+<style nonce="{{.Nonce}}">
+  :root {
+    /* Pelican Platform's palette, from web_ui/frontend/components/ThemeProvider.tsx. */
+    --brand: #0885ff;
+    --brand-light: #CFE4FF;
+    --ground: #FFFFFA;
+    --ink: #1a2029;
+    --muted: #5b6672;
+    --rule: #dfe4ea;
+    /* pelfs's own two colours, and they are deliberately NOT brand chrome:
+       the whole point of the durability panel is that "on this machine"
+       and "in the federation" are unmistakably different, and doing that
+       in two shades of the brand blue would fail. */
+    --staged: #b45309;
+    --published: #157f3d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 2.5rem 1.5rem;
+    background: var(--ground); color: var(--ink);
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  main { max-width: 44rem; margin: 0 auto; }
+  h1 { font-size: 1.35rem; font-weight: 600; margin: 0; letter-spacing: -0.01em; }
+  h1 .pel { color: var(--ink); }
+  h1 .fs { color: var(--brand); }
+  h1 .vol { font-weight: 400; color: var(--muted); font-size: 1rem; word-break: break-all; }
+  .row { display: flex; gap: 1rem; align-items: baseline; justify-content: space-between; flex-wrap: wrap; }
+  .badge {
+    font-size: .8rem; padding: .12rem .5rem; border-radius: 999px;
+    background: var(--brand-light); color: #10365e; white-space: nowrap;
+  }
+  .sub { color: var(--muted); font-size: .92rem; margin-top: .15rem; }
+  hr { border: 0; border-top: 1px solid var(--rule); margin: 1.4rem 0; }
+  .banner {
+    padding: .7rem .9rem; border-radius: .4rem; margin: 1rem 0;
+    background: var(--brand-light); border: 1px solid #a9cdf7;
+  }
+  .banner.warn { background: #fdf3e3; border-color: #e6c98a; }
+  .banner.bad { background: #fdecec; border-color: #e9a7a7; }
+  .banner[hidden] { display: none; }
+  #durability { font-size: 1.05rem; margin: .2rem 0 1rem; }
+  .glyph { font-weight: 700; margin-right: .35rem; }
+  .glyph.staged { color: var(--staged); }
+  .glyph.published { color: var(--published); }
+  .glyph.sending { color: var(--brand); }
+  .legend { display: flex; gap: 1.4rem; flex-wrap: wrap; color: var(--muted); font-size: .86rem; }
+  button {
+    font: inherit; font-weight: 600; cursor: pointer;
+    background: var(--brand); color: #fff; border: 1px solid #036;
+    border-radius: .35rem; padding: .45rem 1rem;
+  }
+  button:disabled { background: #e8ebee; color: #8b949e; border-color: var(--rule); cursor: not-allowed; }
+  .publishrow { display: flex; gap: .8rem; align-items: center; flex-wrap: wrap; }
+  #publish-hint, #publish-status { color: var(--muted); font-size: .9rem; }
+  .connect h2 { font-size: 1rem; margin: 0 0 .2rem; }
+  .connect p { margin: 0; color: var(--muted); font-size: .92rem; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .9em; }
+  footer { margin-top: 2rem; color: var(--muted); font-size: .8rem; }
+  #stream-status { font-size: .8rem; color: var(--muted); }
+</style>
+</head>
+<body data-phase="connecting" data-testid="body">
+
+<noscript>
+  <!-- Cheap, and it is the difference between a blank page and a person
+       who knows their data is fine. -->
+  <div class="banner warn" data-testid="noscript">
+    This page needs JavaScript to show what is staged and what is published.
+    Nothing is wrong with your data: <code>pelfs browse</code> is still running in
+    your terminal, and Ctrl-C there stops it (sealing, if you started it with
+    <code>--rw</code>).
+  </div>
+</noscript>
+
+<main>
+  <div class="row">
+    <h1><span class="pel">pel</span><span class="fs">fs</span>
+      <span class="vol" data-testid="volume">{{.Volume}}</span></h1>
+    <span class="badge" data-testid="mode">read-only</span>
+  </div>
+  <div class="row">
+    <div class="sub" data-testid="branch-generation">branch —, generation —</div>
+    <div class="sub" data-testid="lease">lease: —</div>
+  </div>
+
+  <div class="banner" data-testid="phase-banner">
+    connecting to the federation — this is where your institution may ask you to
+    approve access. The terminal shows the same prompt.
+  </div>
+
+  <div class="banner warn" data-testid="test-hooks-banner" hidden>
+    <strong>--test-hooks is on.</strong> This session accepts a route that overrides
+    what this page reports, so what you see below may not be what the volume holds.
+    It exists for the browser-driver test suite. Never use it on real data.
+  </div>
+
+  <div class="banner bad" data-testid="lease-banner" hidden></div>
+
+  <hr>
+
+  <p id="durability" data-testid="durability">reading the overlay…</p>
+
+  <div class="legend" data-testid="durability-legend">
+    <span><span class="glyph staged" data-testid="glyph-staged">●</span>on this machine only</span>
+    <span><span class="glyph sending" data-testid="glyph-sending">◔</span>sending</span>
+    <span><span class="glyph published" data-testid="glyph-published">✓</span>in the federation</span>
+  </div>
+
+  <hr>
+
+  <div class="publishrow">
+    <button id="publish" data-testid="publish-button" data-publish-state="unknown" disabled>
+      Publish now
+    </button>
+    <span id="publish-hint" data-testid="publish-hint"></span>
+  </div>
+  <p id="publish-status" data-testid="publish-status"></p>
+
+  <hr>
+
+  <div class="connect" data-testid="connect-another-program">
+    <h2>Connect another program</h2>
+    <p>
+      Not yet built. This page cannot browse, upload or download files — it exists to
+      tell you whether your data is in the federation, and to publish it when you say so.
+      To move files today, use <code>pelfs mount</code>.
+      A WebDAV endpoint on this same port is M2; SFTP is assessed in
+      <code>docs/design-guiclients.md</code>.
+    </p>
+  </div>
+
+  <footer>
+    <div id="stream-status" data-testid="stream-status">connecting…</div>
+    <div data-testid="footer-disclaimer">
+      an independent tool for Pelican federations; not an official Pelican Platform product
+    </div>
+  </footer>
+</main>
+
+<script nonce="{{.Nonce}}">
+(() => {
+  "use strict";
+  const SESSION_HEADER = {{.SessionHdr}};
+  // sessionStorage, not localStorage and not a cookie. It is scoped to the
+  // ORIGIN — port included — so another local service cannot read it, and
+  // it dies with the tab. A cookie for 127.0.0.1 would be sent to every
+  // other service on 127.0.0.1 the browser is made to contact
+  // (RFC 6265bis 8.5), which is the whole reason this design has none.
+  const KEY = "pelfs.session";
+  const el = (id) => document.getElementById(id);
+  const t = (name) => document.querySelector(`[data-testid="${name}"]`);
+
+  const bytes = (n) => {
+    if (!n) return "0 B";
+    const u = ["B", "KB", "MB", "GB", "TB"];
+    let i = 0, v = n;
+    while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+    return `${v < 10 && i > 0 ? v.toFixed(1) : Math.round(v)} ${u[i]}`;
+  };
+  const secs = (s) => {
+    if (s <= 0) return "any moment now";
+    const m = Math.floor(s / 60), r = s % 60;
+    return m > 0 ? `${m}m${String(r).padStart(2, "0")}s` : `${r}s`;
+  };
+
+  let token = null, dirty = 0;
+
+  // The bootstrap token arrives in the FRAGMENT, is exchanged once, and is
+  // wiped out of the address bar before anything else runs. A fragment is
+  // never sent in a request line and never appears in a Referer, so the
+  // only place it lingers is this tab's history entry — which
+  // replaceState removes.
+  async function authenticate() {
+    const stored = sessionStorage.getItem(KEY);
+    const m = /(?:^|[#&])bt=([A-Za-z0-9_-]+)/.exec(location.hash);
+    if (m) history.replaceState(null, "", location.pathname);
+    if (stored) return stored;
+    if (!m) {
+      fail("this tab has no pelfs session. The launch link is single-use, so a new tab " +
+           "cannot inherit one: start `pelfs browse` again to get a fresh link.");
+      return null;
+    }
+    const res = await fetch("/api/v1/session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ bootstrap: m[1] }),
+    });
+    if (!res.ok) {
+      fail("this launch link has expired or was already used (it is good for one open, " +
+           "for two minutes). Run `pelfs browse` again for a new one.");
+      return null;
+    }
+    const body = await res.json();
+    sessionStorage.setItem(KEY, body.session);
+    return body.session;
+  }
+
+  function fail(msg) {
+    const b = t("phase-banner");
+    b.className = "banner bad";
+    b.textContent = msg;
+    b.hidden = false;
+    b.setAttribute("data-testid", "session-error");
+    document.body.dataset.phase = "no-session";
+  }
+
+  function render(s) {
+    document.body.dataset.phase = s.phase;
+    t("volume").textContent = s.volume;
+    t("mode").textContent = s.mode;
+    t("branch-generation").textContent =
+      `branch ${s.branch}, generation ${s.phase === "ready" ? s.generation : "—"}`;
+    t("lease").textContent = `lease: ${s.lease}`;
+    t("lease").dataset.leaseState = s.lease;
+    t("test-hooks-banner").hidden = !s.test_hooks;
+
+    const phase = t("phase-banner");
+    if (s.phase === "ready") {
+      phase.hidden = true;
+    } else if (s.phase === "failed") {
+      phase.className = "banner bad";
+      phase.textContent = `pelfs could not open this volume: ${s.error}`;
+      phase.hidden = false;
+    }
+
+    // A lease this session no longer holds means everything the user does
+    // from here is going to fail at the seal, so it is a banner the moment
+    // it is known rather than a surprise at exit.
+    const lb = t("lease-banner");
+    const leaseWords = {
+      stale: "This session's branch lease is past its TTL — the laptop may have slept. " +
+             "Another writer was entitled to take the branch during that window; " +
+             "a publish now will re-check and may refuse.",
+      interrupted: "This session's lease object has vanished. pelfs will resolve it against " +
+                   "the branch head at the next publish.",
+      lost: "Another client has taken this branch. This session can no longer publish; " +
+            "its staged work is still on this machine and is not lost.",
+    };
+    if (leaseWords[s.lease]) {
+      lb.textContent = leaseWords[s.lease];
+      lb.hidden = false;
+    } else {
+      lb.hidden = true;
+    }
+
+    // Durability. Two glyphs, never one: a file that looks uploaded and is
+    // not in the federation is the worst ambiguity this page could carry,
+    // because the user's next action is to close the laptop and tell a
+    // collaborator the data is there.
+    dirty = s.staged_files;
+    const d = t("durability");
+    if (s.phase !== "ready") {
+      d.textContent = "reading the overlay…";
+      d.dataset.durability = "unknown";
+    } else if (s.mode === "read-only") {
+      d.innerHTML = `<span class="glyph published">✓</span>` +
+        `read-only. everything here is in the federation (generation ${s.generation}).`;
+      d.dataset.durability = "published";
+    } else if (s.staged_files === 0 && s.dirty_nodes === 0) {
+      d.innerHTML = `<span class="glyph published">✓</span>` +
+        `nothing staged. everything here is in the federation (generation ${s.generation}).`;
+      d.dataset.durability = "published";
+    } else {
+      const sending = s.upload_backlog > 0
+        ? ` <span class="glyph sending">◔</span>sending ${bytes(s.upload_backlog)}.`
+        : "";
+      d.innerHTML = `<span class="glyph staged">●</span>` +
+        `${s.staged_files} file${s.staged_files === 1 ? "" : "s"} ` +
+        `(${bytes(s.staged_bytes)}) on this machine only` +
+        ` — next automatic publish in ${secs(s.next_publish_s)}` +
+        ` (sooner under write pressure).${sending}`;
+      d.dataset.durability = "staged";
+    }
+
+    // The button.
+    const btn = el("publish"), hint = el("publish-hint");
+    const job = s.publish;
+    let state = "ready";
+    if (s.phase !== "ready") state = "connecting";
+    else if (s.mode === "read-only") state = "read-only";
+    else if (job && job.state === "running") state = "running";
+    else if (s.staged_files === 0 && s.dirty_nodes === 0) state = "nothing";
+    btn.dataset.publishState = state;
+    btn.disabled = state !== "ready";
+    hint.textContent = {
+      ready: "",
+      connecting: "(waiting for the volume)",
+      "read-only": "(read-only session — restart with --rw to publish)",
+      running: "(publishing — this holds the overlay, so writes wait)",
+      nothing: "(nothing to publish)",
+    }[state];
+
+    const st = el("publish-status");
+    if (!job) {
+      st.textContent = "";
+      st.dataset.jobState = "none";
+    } else {
+      st.dataset.jobState = job.state;
+      st.dataset.jobId = job.id;
+      if (job.state === "running") {
+        const s0 = Math.round((Date.now() - Date.parse(job.started)) / 1000);
+        st.textContent = `publishing… (${s0}s) — the seal freezes the overlay, so uploads resume in a moment`;
+      } else if (job.state === "failed") {
+        st.textContent = `publish failed: ${job.error}`;
+      } else {
+        st.textContent = `published: ${job.summary}`;
+      }
+    }
+  }
+
+  async function publish() {
+    const btn = el("publish");
+    btn.disabled = true;
+    const res = await fetch("/api/v1/publish", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", [SESSION_HEADER]: token },
+      body: "{}",
+    });
+    const body = await res.json().catch(() => ({}));
+    const st = el("publish-status");
+    // 202 is the normal answer and progress arrives on the stream; 409
+    // means another publish already holds the overlay's lock.
+    if (res.status === 409) {
+      st.textContent = `a publish is already running (job ${body.job}) — watching it`;
+    } else if (!res.ok) {
+      st.textContent = `publish refused: ${body.error || res.status}`;
+    }
+  }
+
+  function stream() {
+    // EventSource cannot set a request header, so the token is in the
+    // query string. It never becomes a navigation, never enters history,
+    // and the only access log is ours.
+    const es = new EventSource(`/events?s=${encodeURIComponent(token)}`);
+    const status = el("stream-status");
+    es.addEventListener("state", (e) => {
+      status.textContent = "live";
+      status.dataset.stream = "open";
+      render(JSON.parse(e.data));
+    });
+    es.addEventListener("bye", () => {
+      status.textContent = "pelfs browse has exited — this page is now a snapshot";
+      status.dataset.stream = "closed";
+      document.body.dataset.phase = "exited";
+      es.close();
+    });
+    es.onerror = () => {
+      // Every frame is a full snapshot, so a reconnect needs no replay:
+      // the browser reopens the stream on its own and the next frame is
+      // the whole truth again.
+      if (es.readyState === EventSource.CONNECTING) {
+        status.textContent = "reconnecting…";
+        status.dataset.stream = "reconnecting";
+      } else {
+        status.textContent = "disconnected — is pelfs browse still running?";
+        status.dataset.stream = "closed";
+      }
+    };
+  }
+
+  // A generic "leave site?" dialog is not ours to word and browsers
+  // suppress it without prior interaction, so it is a hint and never the
+  // durability mechanism: the session seals at exit either way.
+  window.addEventListener("beforeunload", (e) => {
+    if (dirty > 0) e.preventDefault();
+  });
+
+  el("publish").addEventListener("click", publish);
+  authenticate().then((tok) => {
+    if (!tok) return;
+    token = tok;
+    stream();
+  });
+})();
+</script>
+</body>
+</html>

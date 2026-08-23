@@ -1,16 +1,20 @@
 # Grafts: serving a foreign Pelican tree as part of a pelfs volume
 
-Status: **spiked, and the spike reads.** A grafted tree is spidered,
-block-digested, published into a signed generation, and read back
-byte-for-byte through a real Linux kernel mount, with no copy of the data
-under the volume's own prefix — and when the source changes underneath the
-signed generation the read fails closed, naming the graft, the object and
-the fix. Both runs are `scripts/graft-spike-docker.sh`, and the transcript
-is in "The spike" below.
+Status: **spiked, then built out for scale.** A grafted tree is spidered
+in parallel, block-digested, published into a signed generation, and read
+back byte-for-byte through a real Linux kernel mount, with no copy of the
+data under the volume's own prefix — and when the source changes
+underneath the signed generation the read fails closed, naming the graft,
+the object and the fix. Since the first round it has gained the four
+things that make it usable at the size it is for: a **resumable**
+parallel walk, a **per-object block size**, an index read **by window**
+rather than fetched whole, and a `--prefetch` that tells the truth about
+grafted bytes instead of refusing to mount. The end-to-end is
+`scripts/graft-spike-docker.sh`, and the transcript is in "The spike"
+below.
 
-The design content is the six decisions, the interaction inventory, and the
-ranked work. The prototype is deliberately small and is marked SPIKE in
-every file it touches.
+The design content is the decisions, the interaction inventory, and the
+ranked work.
 
 ---
 
@@ -44,12 +48,19 @@ are fixable; neither is a reason not to do this.
 
 | | |
 |---|---|
-| `internal/graft` | the index format (identity → object/offset/length, on `internal/packidx`), the spider, `Fetch`/`Put` |
-| `internal/superblock` | `GraftEntry`, `Superblock.Grafts`, `GraftBudgetBytes` |
-| `internal/genfs/graft.go` | the resolver, the reader-side veto, unconditional verification, `GraftStats` |
+| `internal/graft/graft.go` | the index format (v2), the streaming `Writer` (extsort + `packidx.StreamWriter`, no resident table), `Index`, `Publish` |
+| `internal/graft/remote.go` | `Reader`: whole under 4 MiB, header-plus-window above it, the `mpi/remote.go` pattern |
+| `internal/graft/blocks.go` | `BlockPolicy`: the per-object block-size ladder |
+| `internal/graft/spider.go` | the parallel walk (span tasks), progress, the two-listing consistency check |
+| `internal/graft/checkpoint.go` | the append-only resume log |
+| `internal/superblock` | `GraftEntry` (+`BlockMax`, `BlocksPerObject`, `Files`, `Objects`), `Superblock.Grafts`, `GraftBudgetBytes` |
+| `internal/genfs/graft.go` | the resolver (memoized, ctx-carrying), the reader-side veto, unconditional verification, `GraftStats` |
+| `internal/genfs/prefetch.go` | grafted refs counted rather than failed; `PrefetchReport.FullyLocal` |
 | `internal/publish/graftsource.go` | `GraftSource`: a `publish.Source` + `ContentProvider` over a spider result |
-| `cmd/pelfs/graft.go` | `pelfs graft`, `pelfs graft --list`, the scheme allowlist, the mount's `GraftOpener` |
-| `scripts/graft-spike-{test,docker}.sh` | the mount-backed spike |
+| `cmd/pelfs/graft.go` | `pelfs graft`, `--refresh`, `--list`, the block/concurrency knobs, the scheme allowlist, the mount's `GraftOpener` |
+| `cmd/pelfs/mountgen.go` | `--prefetch all｜packs｜background` and what each promises |
+| `internal/genfs/graft_test.go` | the whole read path in the ORDINARY lane: good read, straddling read, fail-closed, no-opener refusal, prefetch arithmetic, a windowed index |
+| `scripts/graft-spike-{test,docker}.sh` | the mount-backed end-to-end, now including resume and the prefetch modes |
 
 `go build ./...`, `go vet ./...`, `go test ./...` are green (38 packages,
 0 failures), and `scripts/mount-gate-docker.sh` still passes.
@@ -101,25 +112,27 @@ bind at very different sizes.
   `GraftBudgetBytes = 16 KiB` carries **~76 roots**. The superblock never
   grows with the number of grafted files, which is the same discipline
   `Manifests` imposed on the pack list.
-- The **index fetch** binds first, and today it binds hard, because the
-  spike fetches each index **whole** at mount. At 50 MB (1 TB) that is a
-  slow but survivable mount; at 5 GB (100 TB) it is not a mount at all.
-  This is a spike limitation and not a design one: `packidx` already
-  supports exactly the fix — `Header.Window(key)` plus a sampled prefix, the
-  ranged-window lookup `internal/mpi/remote.go` uses for the multi-pack
-  index at the same 100M-object target. The graft index was deliberately
-  built on `packidx` so that this is a change of caller, not of format.
+- The **index fetch** bound first, and the spike bound hard on it by
+  fetching each index **whole** at mount. That is fixed:
+  `internal/graft/remote.go` reads an index whole under 4 MiB and by
+  header-plus-window above it, exactly as `internal/mpi/remote.go` does
+  for the multi-pack index at the same 100M-object target — a change of
+  caller, not of format, because the graft index was built on `packidx`
+  for this reason. Decision 9 has the arithmetic and the integrity
+  argument that licenses reading without a whole-object hash.
 
-So the honest answer: **with the ranged-window fetch implemented, a graft
-scales to the same 100M objects the rest of the format targets.** Without
-it — i.e. today — keep grafts under about 10 GB of source data.
+So the honest answer: **a graft scales to the same 100M objects the rest
+of the format targets**, and the per-object block ladder (Decision 10)
+keeps the index for a realistic 10 TB tree near 123 MB rather than 480.
 
 The other cost is time, and it is unavoidable: the spider **streams every
 byte of the source once**. That is O(source) bandwidth at graft time and
 O(0) storage forever, against a copy's O(source) in both, forever. It is
-also the moment at which the source is known to be self-consistent, and
-nothing detects a source mutated mid-walk except the per-object
-length check the spider already does.
+also the moment at which the source is known to be self-consistent —
+Decision 11 makes that an enforced claim (two listings, and an abort) and
+makes the walk parallel, resumable and visible, which is what turns
+"O(source) once" from a sentence into something a person can actually
+run against 10 TB.
 
 ---
 
@@ -168,8 +181,9 @@ a graft and a pack of the same file share nothing. Accepted.
 
 **Block size is a different trade from chunk size.** A CDC chunk is sized
 to maximize dedup across edits. A graft block is sized to trade index size
-against read amplification, and nothing about it dedups. 1 MiB is the
-default; the knob is `pelfs graft --block`.
+against read amplification, and nothing about it dedups. That trade turned
+out to be the one that could not be settled with a single number —
+Decision 10.
 
 ### Verification is unconditional, unlike for packed chunks
 
@@ -348,6 +362,26 @@ upstream file is republished — which is what a graft is *for*. So a
 land **before** graft checking does. That is a change to `fsck`'s contract
 and should be its own commit.
 
+**Boundary, stated because this round stopped at it.** The severity axis
+was explicitly out of scope for the scale and prefetch work, and nothing
+here touches `fsck`. Two consequences a reader should not have to
+discover:
+
+- `pelfs fsck` on a grafted volume still reports **every grafted file** as
+  `missing-chunk` and exits 1. `checkChunkRef` (`internal/fsck/walk.go:263`)
+  has the same absence check `genfs.ContentOf` and `genfs.Prefetch` both
+  had, and both of those have now been taught that a graft is a location
+  rather than a hole. `fsck` is the third and last one, and its fix is
+  mechanically the same — ask the graft table first — but it cannot land
+  without the severity tier, because a stale graft must WARN.
+- Nothing here added a way for `fsck` to enumerate a graft's blocks. The
+  spike had a `graftIdentities` helper that nothing called; it was removed
+  rather than kept, because at 10.5M blocks the resident set it built is
+  336 MB and the shape a deep `fsck` wants is a sequential stream of the
+  index object — a few ranged reads. That streaming enumerator is the one
+  piece of new mechanism the `fsck` work will need from `internal/graft`,
+  and it is small.
+
 Note also that `checkChunkRef` (`internal/fsck/walk.go:263`) will report
 **every grafted file as damaged** today — `chunk %s resolves in no listed
 pack`. Making fsck graft-aware is not optional polish; without it `fsck` is
@@ -364,10 +398,11 @@ decision, 🟢 fine as is.
 | Subsystem | What it assumes | What a graft does to it | Verdict |
 |---|---|---|---|
 | `genfs.ContentOf` (`read.go:152`) | every non-hole identity is in a listed pack, else abort | **would abort every seal over a grafted subtree.** Fixed in the spike: the graft table is consulted first, and `Content.External` is set. | 🔴 → fixed |
-| `--prefetch all` (`genfs/prefetch.go`) | everything referenced is in a pack; failures are fatal | **refuses to mount.** Measured: `prefetch: 4 pack(s) could not be made local ([chunk 68c99c16…: present in no listed pack …]); refusing to mount`. Must skip grafts and count them separately; prefetching foreign bytes should be **opt-in** (`--prefetch grafts`), never the default. | 🔴 |
+| `--prefetch all` (`genfs/prefetch.go`) | everything referenced is in a pack; failures are fatal | **refused to mount**, reporting grafted chunks as `present in no listed pack` — the sentence that means damage. Fixed: grafted refs are counted, not failed; `all` refuses *by name* and offers `--prefetch packs`, which mounts and warns. Decision 13. | 🔴 → fixed |
 | `fsck` (`walk.go:263`) | ditto | **reports every grafted file as `missing-chunk`, exit 1.** Needs graft-awareness *and* a severity axis (Decision 4). | 🔴 |
 | Dedup sidecar (`publish/dedup.go`, `rememberReusedChunks`) | an identity in the set means "a listed pack holds these bytes" | **silent data loss** if graft identities enter it: a locally written file's chunk is elided from upload because a third party holds the same block, and no graft record names it. **Not a coincidence** — a graft block is a whole file whenever the file is under the block size, and CDC cuts such a file into one chunk of the same bytes. Fixed in the spike via `Content.External` → `rememberExcept`. | 🟠 → fixed |
 | `memtable.Adopt` (`base.go:67`) | base records can be carried by reference | would leave a written file half-grafted. Fixed: `External` → `adoptByReading` (Decision 3). | 🟠 → fixed |
+| Graft index fetch | `graft.Fetch` read every index WHOLE at mount and hashed it | at 10 TB that is a 123 MB fetch before the first byte is served, and at 100 TB it is not a mount. Fixed: `graft.Reader` reads whole under 4 MiB and header-plus-window above, on `mpi/remote.go`'s pattern. Decision 9. | 🔴 → fixed |
 | `reach` / `gc` | `Report.Unresolved` counts identities in no pack; it is "damage, fsck's business" | grafted identities inflate `Unresolved` silently, destroying it as a damage signal. **GC itself is safe** — it only deletes under `packs/`, `mpi/`, `manifest/` in this volume's prefix, so it can neither collect a foreign object nor a graft index it doesn't know about. That last part is the actual bug: `grafts/` has **no live-set key space**, so index objects leak forever. Needs a `scanHashNamed` arm. | 🟠 |
 | `repack` | drives from the pack side | **never touches external content**, correctly. But `repackedSuperblock` copies field-by-field (`execute.go:800`) — `Grafts` survives by value-copy today, which is luck rather than intent and should be explicit. `Worthwhile` judges from pack count alone, so a 95%-graft volume is judged by its 5%. | 🟡 |
 | Decoded-chunk arena | it amortizes **decode**; keyed by identity hex | a graft block has no decode to amortize — it amortizes a **round trip**, worth strictly more. Sharing it is right, and sharing it **by identity** is what makes it safe: the arena's shard function reads chars 0–1 of the key and its ghost filter chars 0–16, so a synthetic key like `graft:<url>:<off>` would collapse every graft block into one of 64 shards. Open question: the arena is a fixed reservation *tuned against decode cost*, and a graft-heavy mount competes for it in a different currency. | 🟡 |
@@ -552,6 +587,491 @@ graft source: reads under a grafted path will fetch http://127.0.0.1:18997/ext
    changing between mounts of the same branch is a real event, and the
    machinery for pinning-and-warning is already in `refs`.
 
+
+---
+
+## Decision 9 — "100,000 files and 10 TB: does that all go in the superblock?"
+
+**No. The superblock gains ONE entry, 215 bytes, for the graft root — and
+it would gain exactly one if the tree were 10 files or 10 million.** The
+100,000 files are ordinary catalog rows, in ordinary catalogs, in ordinary
+packs. What DOES grow with the tree is the graft index, and that is where
+the work went.
+
+Here is the whole of it, in the three places a big graft could have
+landed:
+
+| | 100,000 files, 10 TB | grows with |
+|---|---|---|
+| **superblock** | **one 215-byte `GraftEntry`** | number of graft ROOTS, never files |
+| **catalogs** | 100,000 nodes + edges, ~2.7M chunkrefs | the same as any packed tree of that shape; `SMax` splits them like any other |
+| **graft index** | **~123 MB** (2.7M blocks × 48 B, with the ladder) | total bytes / block size |
+
+The superblock's discipline is deliberate and is the same one `Manifests`
+imposed on the pack list: *only the roots live there*, bounded by
+`GraftBudgetBytes = 16 KiB`, and the identity → (object, offset, length)
+table is a hash-named object the entry names. A graft root is an
+operator-scale thing — a person types the URL — so tens are plausible and
+thousands are a misuse of the feature rather than a volume that grew.
+
+### The index was the gating item, and it is now read by window
+
+The spike fetched each index **whole at mount** and hashed it. At 459
+bytes that is right; at 123 MB it is a bad mount, and at the 5 GB of a
+100 TB graft it is not a mount at all. This was ranked item 4 and it has
+been promoted and built, because it is the difference between the feature
+and the actual use case.
+
+`internal/graft/remote.go` is the `internal/mpi/remote.go` reader, against
+the same `packidx` sampling:
+
+- **under 4 MiB** (about 87,000 blocks) the object still comes down whole
+  and its hash is still checked. One round trip either way, the stronger
+  check applies, and every lookup afterwards is free.
+- **above it**, the reader fetches a PREFIX — header, the source-object
+  string table, and the samples — and thereafter one ~48 KB window per
+  lookup. The graft stride is 1024 records rather than `packidx`'s 4096,
+  because a graft entry is 48 bytes where a multi-pack entry is 16 and the
+  default stride would make every lookup a 196 KB window.
+
+What stays resident is two things, and neither scales with blocks:
+
+| resident | 10 TB / 100k objects |
+|---|---|
+| samples (count/1024 identities) | ~84 KB |
+| the source-object string table | ~6 MB (100,000 keys × 60 chars) |
+
+### The integrity argument that licenses it — this is the part worth reading
+
+A windowed reader cannot check the superblock's BLAKE3 over the whole
+index. The spike's own comment said that check was "the whole reason a
+graft can be trusted at all", and **that was an overstatement**, which is
+what unblocks this.
+
+What an index produces is a **location**. The bytes that come back from
+that location are hashed and compared against the identity the **signed
+catalog** names, unconditionally, with no configuration that disables it
+(`genfs.readGraftChunk`). So a substituted, corrupted or truncated index
+can send a reader to the wrong object, to the wrong offset, or to nothing
+at all — and every one of those ends in a **failed read**. None of them
+ends in an accepted byte. The index is exactly as trusted as a multi-pack
+index, for exactly the reason `mpi` gives.
+
+What the whole-object hash was *also* doing is bounding the reader's
+appetite, and that is replaced the way `mpi` replaced it: every length off
+the wire is held against `GraftEntry.Size`, which the signature does
+cover, before a byte is allocated. `TestWindowedReaderRefusesAnIndexThat
+DoesNotFitItsOwnSize` is that rule.
+
+### What it costs: one extra small round trip per distinct block
+
+A windowed lookup is a request. Two callers ask about the same identity in
+quick succession — `fillChunks` probes it to decide whether to coalesce,
+then `readChunkAt` resolves it — so `graftTable` memoizes, including
+NEGATIVE answers, because "no graft holds this" is what every packed chunk
+read asks and re-asking the network for it would make a graft's presence a
+tax on the rest of the volume. An error is never memoized.
+
+That still leaves one lookup per distinct block on a large graft. **The
+fix is free and is not built:** a file's blocks are contiguous in one
+source object, so having resolved block *i* to `(key, off, len)`, block
+*i+1* is almost always at `(key, off+len, len)`. A reader can fetch that
+speculatively and **the identity check already verifies the guess** — a
+wrong speculation costs one wasted fetch and cannot cost correctness. That
+is the right shape for the coalescing work (ranked item 5) to take.
+
+---
+
+## Decision 10 — Block size is chosen PER OBJECT, and the format already allowed it
+
+**Decision: a recorded ladder — floor 1 MiB, ceiling 8 MiB, doubling once
+an object would exceed 32 blocks. `--block`, `--block-max` and
+`--blocks-per-object` are the knobs, and all three are recorded in the
+superblock entry.**
+
+You are right that a graft cannot cheat this: verification needs a whole
+block, so **the block size IS the minimum verified read**. That makes it
+one knob with two opposed costs and no third option — index size
+(`bytes/block × 48`) against read amplification (the block itself).
+
+One global value has to be wrong for one of them, because a real tree is
+not one size. A CVMFS software area is hundreds of thousands of files of a
+few KB next to a handful of multi-GB payloads, and the number that keeps
+the index small on the payloads is the number that makes every small-file
+read absurd:
+
+| | blocks | index | minimum verified read |
+|---|---|---|---|
+| one global 1 MiB | 10.5M | 480 MB | 1 MiB, on everything |
+| one global 8 MiB | 1.4M | 64 MB | **8 MiB, on a 4 KiB read of a 200 KB file** |
+| the ladder | 2.7M | 123 MB | 4 MiB on a 100 MB file, 1 MiB on a 1 MB file, **the file itself** under 1 MiB |
+
+(Those three rows are `TestTheOwnersCase`, run rather than remembered.)
+
+### The format change, stated plainly, and why it is small
+
+**The index needed no change at all.** A record already carries a
+per-block LENGTH, because the last block of every object is short; cutting
+different objects at different sizes uses a field that was always there,
+and `genfs` reads `Loc.Length` bytes whatever it is. The chunkrefs carry
+`LogicalOffset` and `LLen`, so the read path maps an offset to a block
+without knowing any global block size.
+
+What DID have to change is the **superblock entry**, because the RULE has
+nowhere else to live and a refresh that cut differently would move every
+identity in the graft:
+
+```go
+Block           int64  `cbor:"block"`                        // the floor
+BlockMax        int64  `cbor:"block_max,omitempty"`          // the ceiling
+BlocksPerObject uint32 `cbor:"blocks_per_object,omitempty"`  // the trigger
+```
+
+Both new fields are `omitempty` and a generation written without them
+reads as `BlockMax == 0`, which `graft.BlockPolicy` interprets as "one
+global size" — exactly what such a generation was cut with. This is the
+right moment to make the change and it is made.
+
+### The rule
+
+```
+block = Block
+while size/block > BlocksPerObject and block < BlockMax: block *= 2
+```
+
+The invariant it buys is that the index is bounded by the OBJECT COUNT
+(at most `BlocksPerObject` records each) as well as by the byte count. So
+a tree of a few enormous files cannot produce an index that must be
+windowed at all, and a tree of many small files — where each file is one
+short block anyway — is untouched by the ladder.
+
+The honest justification for "large objects get large blocks" is not that
+big files are less important. It is that **a random 4 KiB read of a 10 GB
+file is rare and a random 4 KiB read of a 200 KB file is common**, and in
+the second case the block is the file. Where that assumption is wrong —
+a multi-TB columnar file read by scattered small ranges — `--block-max` is
+one flag, and setting it equal to `--block` turns the ladder off.
+
+---
+
+## Decision 11 — The walk: parallel, resumable, and it says what it is doing
+
+The spider is the only expensive thing a graft ever does, and you are
+right that it dominates: verifiable ranged reads need a digest per block,
+so grafting **reads every byte of the source once**.
+
+### Parallelism, and where the default came from
+
+Fixed blocks are independent, so the work is embarrassingly parallel in
+two dimensions — across objects, and within one large object. **The same
+mechanism serves both**, which is why there is no second code path for the
+big-file case: the unit of work is a **span**, a contiguous run of blocks
+inside one object, fetched by one ranged GET and hashed block by block. A
+tree of small objects produces one span each; a 100 GB object produces
+hundreds. `DefaultSpanBytes` is 32 MiB, bounded by BYTES rather than block
+count so the request size does not move when the ladder changes the block
+size.
+
+The default concurrency is **measured, not chosen**.
+`TestSpiderThroughputTable` (`PELFS_GRAFT_BENCH=1`) walks a 456 MB tree of
+204 objects against `cmd/fakeorigin`'s handler at three simulated
+round-trip times, on a 12-core M2 Pro whose BLAKE3 floor is 1.7 GB/s per
+core:
+
+| workers | RTT 0 | RTT 5 ms | RTT 20 ms |
+|---|---|---|---|
+| 1 | 1984 | 280 | 86 |
+| 2 | 2521 | 439 | 178 |
+| 4 | 3244 | 887 | 353 |
+| 8 | 3614 | 1434 | 594 |
+| 16 | 3753 | 1643 | 1009 |
+| 32 | **3873** | **2023** | 1433 |
+| 64 | 3656 | 1693 | **1695** |
+
+(MB/s. The latency term is the point: with none, a loopback origin answers
+before a second request can be issued and the table measures BLAKE3 and
+nothing else.)
+
+**Two knees, and the default has to sit between them.** With no latency
+the walk is CPU-bound and flattens at 8 — everything past it is
+contention, and 64 is already *slower* than 32. With latency it is
+round-trip-bound and keeps climbing to 32 and beyond, because a worker
+spends its time waiting.
+
+**`DefaultConcurrency = 16`**: within 4% of the zero-latency ceiling, 70%
+of the 20 ms ceiling, and nowhere near where more workers make an origin
+somebody else operates unhappy. It does not invent a third pool — a
+`pelicanobj.TransferWorkers` larger than 16 is an operator who has already
+said what their client should do, and it wins. `--concurrency` is how you
+say a source is further away.
+
+Applied to the case in question: 10 TB at the measured 1.4 GB/s is about
+two hours, once, ever.
+
+### Resumability
+
+**The unit of durability is the OBJECT.** An append-only log next to the
+volume's state gets one record per source object, written only after every
+block of it has been hashed *and* its delivered length has been checked
+against its listed length. A half-hashed object leaves no record and is
+redone; nothing partial is ever resumed, which keeps the resume logic to a
+comparison rather than a reconciliation.
+
+- **What a crash costs.** Each record is flushed with `write(2)` as it is
+  made, so process death — Ctrl-C, OOM, a token expiring, an eviction —
+  loses **nothing**. `fsync` runs on a 5-second timer instead, because an
+  fsync per object would dominate a tree of small files and would only buy
+  protection against the one failure this is not about. A torn tail (the
+  machine died mid-write) is dropped on load: records are length-prefixed
+  and CRC'd, the reader stops at the first that does not check out, and
+  the log is append-only so a bad tail can never take good records with
+  it.
+- **How a resumed run proves it is the same source.** Two gates, neither
+  of which costs a request. The header records the source, the mount, the
+  block rule and the identity function — a run whose parameters differ is
+  not a resume, and the log is discarded *and said to be discarded*. Each
+  record carries the size and mtime the listing reported when it was
+  hashed; a resumed run re-lists (which it must do anyway to know what to
+  walk) and compares. Changed size or mtime → re-hash. Vanished → drop.
+  Appeared → hash.
+- **What that cannot see** is a rewrite preserving size AND mtime. That is
+  the same blind spot `fsck`'s cheap mode has, it is stated rather than
+  papered over, and the per-block identity check at READ time catches it,
+  fails closed and names the object.
+- **The log is KEPT on success**, and that is what makes `--refresh` cost
+  what changed rather than what exists. Measured in the end-to-end: a
+  refresh of an unchanged 3,970,037-byte tree reads **0 bytes**; after one
+  400,000-byte file is rewritten it reads **400,000 bytes**.
+
+### A source that moves mid-walk
+
+The listing taken at the start is the walk's manifest; **the same listing
+is taken again at the end**, and anything that appeared, vanished, or
+changed size or mtime **aborts the graft**.
+
+This is the failure mode with no later defence: an index describing two
+different versions of a tree has every block verifying, every file length
+self-consistent, and describes a tree that never existed at any instant.
+It has to be caught here or never. Aborting is affordable *precisely
+because of the checkpoint* — the re-run re-hashes only what moved.
+
+Per-object, the same rule is enforced twice more: a span must deliver
+exactly the bytes it asked for, and nothing may follow the last block of
+an object (an object that GREW under the walk would otherwise be indexed
+at its old length).
+
+### Progress
+
+On a **timer**, not per object, because a walk of one enormous file has no
+per-object event to hang a line on and going quiet for minutes is the
+complaint this exists to answer:
+
+```
+spidering: 41231515648/10995116277760 bytes (0%), 412/100000 objects,
+39328 blocks, 1465341644 bytes/s, about 1h52m30s left
+```
+
+and the walk opens by saying what it is: *"every byte is read ONCE to
+digest it, which is network you pay now and never again — the volume
+stores no copy of it"*.
+
+### What the walk no longer holds
+
+The spike held every record in a `packidx.Builder` and every identity in a
+dedup set — about 150 bytes a block, so ~1.5 GB resident for a 10 TB graft
+before the object was encoded. Records now go to `internal/extsort` (the
+same external sort the seal path uses for this exact problem) and come
+back in key order to a `packidx.StreamWriter`, which keeps only the
+samples. Memory is the extsort budget plus the string table, both
+independent of the block count.
+
+One resident cost remains and is stated rather than hidden: a spider
+result carries 32 bytes per block for the identities (336 MB at 10 TB),
+because `publish` pulls one file's records at a time and something must
+hold them until it asks. The rows themselves are built ON DEMAND
+(`graft.File.Refs`), which is the difference between 336 MB and a
+gigabyte. Reading them back from the checkpoint instead would remove even
+that, and is the next thing to do if it bites.
+
+---
+
+## Decision 12 — Trust-on-first-use: costed, and refused as the default
+
+You asked for TOFU to be designed and costed rather than dismissed. Here
+it is, and the recommendation at the end is **not to ship it yet** — with
+a specific thing to build instead.
+
+### What it would be
+
+Record the block layout from the LISTING alone. No byte is read; a 10 TB
+graft becomes a few seconds. Then pin each block's digest on first read
+and compare on every read after that.
+
+The mechanism problem is immediate: **a chunkref must carry an identity,
+and there is no digest to put there.** The only workable shape is a
+SYNTHETIC identity — `BLAKE3(graft-nonce ‖ object key ‖ offset ‖ length)`
+— which is a stable *name* rather than a digest. That drags four things
+with it:
+
+1. `genfs` must know the graft is TOFU and **skip the identity check** on
+   any block not yet pinned. The fail-closed guarantee is off for exactly
+   the reads that have never happened.
+2. The pin store is **local** — under the cache dir, per machine. So a
+   volume shared with ten people has ten independent baselines, and a
+   source that changed before reader B's first read is invisible to B
+   forever. TOFU gives drift detection *per reader, from that reader's
+   first read*; it is not a statement the volume can make.
+3. **The two location layers stop being interchangeable.** A synthetic
+   identity can never equal a pack chunk's, so "if a graft block happens
+   to equal a pack chunk, either location serves the same bytes" — the
+   best property in Decision 2 — is gone for that graft.
+4. **Ungraft-on-write becomes a laundering path.** A copy-up reads through
+   the base path and repacks; for a TOFU graft those bytes are unverified,
+   so writing one byte into a grafted file can move unverified third-party
+   content into a signed pack under the volume's own prefix. That is a
+   worse outcome than a failed read and it is not obvious from the flag.
+
+### The comparison
+
+| | eager (what is built) | TOFU |
+|---|---|---|
+| graft time, 10 TB | ~2 h (measured rate), once, ever | seconds |
+| network at graft time | 10 TB | one listing |
+| index size | 123 MB | 123 MB — **identical**, the layout is the same |
+| source changed BEFORE the graft | caught: the walk *is* the check | not caught — it signs whatever is there, unseen |
+| source changed mid-walk | caught (two listings) | not applicable, and no claim of self-consistency is possible |
+| source changed AFTER the graft | caught on first read, by every reader | caught only after *this* reader has read *this* block once |
+| can a wrong byte be served | never | yes, on any block this reader has not read before |
+| guarantee for a SHARED volume | one, signed, the same for everyone | none; each reader has a private baseline |
+| `fsck --check-grafts` | cheap: HEAD per object; deep: rehash | **nothing to verify until it has been read**; a deep run can only *establish* pins, and establishing them means reading every byte — the eager walk, done too late to be authoritative |
+| ungraft-on-write | verified bytes enter the pack | unverified bytes can enter a signed pack |
+| cost of choosing wrong | hours you did not need to spend | a signed namespace whose contents you never saw |
+
+### Both CAN coexist — the question is whether the weaker one stays weak
+
+Yes, mechanically: `--verify=eager｜tofu`, the mode recorded in
+`GraftEntry`, the reader given a second veto axis so a mount can refuse a
+TOFU graft the way it can refuse a source, and a mount line saying "*N
+blocks under /ext have never been verified*" every time.
+
+But the honest risk is behavioural, and it is the reason for the
+recommendation. **A `--verify` flag whose weaker value is one keystroke
+away is the value everyone uses the day the walk takes two hours**, and
+the failure it enables is silent. Every other weakening in this design is
+loud: a missing index fails the mount, a changed byte fails the read, an
+encrypted volume is refused outright. This one is quiet by construction.
+
+### The sharper finding: TOFU's real competitor is not "read everything"
+
+The premise — "for the CVMFS-style case the source is trusted at graft
+time" — deserves a second look, because **CVMFS's own model is the
+opposite of TOFU**: a CVMFS catalog carries a content hash for every file,
+computed by the publisher, and the client verifies. The reason such a
+source feels trustworthy is precisely that its bytes are *already*
+content-addressed upstream.
+
+So the right move for that case is not to stop verifying. It is to **get
+the digests from whoever already computed them**. Pelican advertises a
+whole-object checksum; that cannot verify a range (Decision 2, and
+`pelicanobj/fedstore.go:240` from the other direction), so it cannot
+replace block digests on the read path — but it can do two things worth
+having:
+
+- make `fsck --check-grafts` cheap and *meaningful* rather than
+  size-and-mtime shaped;
+- make `--refresh` skip objects whose advertised digest is unchanged,
+  which is strictly stronger than the size+mtime gate the checkpoint uses
+  today.
+
+And if a source ever offers **per-range or per-block** digests, the eager
+walk becomes nearly free without giving up one thing — which is a better
+place to spend the effort than making unverified reads possible.
+
+### Recommendation
+
+**Do not add `--verify=tofu` now.** The eager walk costs about two hours
+for the 10 TB case, is paid once ever (the checkpoint makes every later
+refresh cost only what changed), and is what every other guarantee in this
+design is built on. Revisit it only when someone presents a source they
+trust, cannot afford to read, and *cannot get digests from* — and if it
+ships then, it ships with the mode in the superblock, a reader-side
+refusal, an unmissable mount line, and ungraft-on-write refused rather
+than quietly laundering.
+
+---
+
+## Decision 13 — `--prefetch` has three honest modes, and `all` refuses
+
+**Decision: `all` refuses a grafted volume by name; `packs` makes the
+packed content local, warns, and mounts; `background` is `packs`
+asynchronously. Materializing is designed and not built, because it is a
+write.**
+
+The insight is the right one and it reframes the whole problem: **fully
+prefetching a graft and materializing it are the same operation.** There
+is no pack to cache, so "make these bytes local" means writing them into
+local packs — a new generation, the lease, the publish path. That is not
+something a mount flag should do on the way up.
+
+So there are three modes rather than one:
+
+| mode | promise | grafted bytes |
+|---|---|---|
+| `all` | everything referenced is local, and I failed loudly if it could not be | **refuse the mount**, naming the graft and its source |
+| `packs` | every pack is local; reads under a graft still go to the network | counted and WARNED about; `prefetch_complete` stays false |
+| materialize | copy the grafted blocks into local packs | *designed below, not built* |
+
+**The default is refusal, and here is why.** `--prefetch` is already
+opt-in — the default is `none` — so a user who typed `all` asked for a
+guarantee. The useful answer to "I cannot give you that" is to say so with
+the alternative attached, not to hand back a weaker thing under the same
+name. `--prefetch packs` is one word away and means what it says.
+
+What changed underneath, and it matters more than the flag: grafted refs
+are **counted, not failed**. The spike reported them through
+`noteFailure`, which produced `chunk 68c99c16…: present in no listed
+pack` — a sentence that means DAMAGE everywhere else in this system
+(`fsck`'s missing-chunk, `reach`'s `Unresolved`). A graft is not damage.
+`PrefetchReport` now carries `Grafted`, `GraftedBytes` and `GraftRoots`,
+and the ONLY way to ask whether a volume is local is
+`PrefetchReport.FullyLocal()`, which is `Failed == 0 && Grafted == 0`. No
+caller can conclude "local" from a zero failure count any more, which is
+the invariant you asked for: **`--prefetch` never claims a volume is fully
+local when grafted bytes are not.** The machine-readable half is
+`prefetch_complete` in the stats JSON, plus `prefetch_grafted_chunks` and
+`prefetch_grafted_bytes`.
+
+Both are asserted in the end-to-end, including that the refusal does *not*
+contain the string "no listed pack".
+
+### Mode 3, materialize — designed, not built
+
+It is an **import**, and it reuses machinery that already exists:
+
+1. `genfs.ContentOf` already reports `External` for a grafted file, and
+   `memtable.Adopt` already routes an External record to
+   `adoptByReading` — the same three lines that make a write ungraft one
+   file (Decision 3). Materializing a whole graft is that path, driven
+   over the tree instead of by a `write()`.
+2. The bytes therefore come through the **verified** read path, so a
+   materialization cannot launder changed source bytes into a pack. This
+   is the property that makes it safe, and it is already tested by the
+   end-to-end's "delete the source object" assertion.
+3. They are re-chunked by FastCDC and packed by `publish`, so the result
+   dedups against the rest of the volume — which a graft's fixed blocks
+   never could (Decision 2).
+4. The output is a **new generation** whose superblock drops the
+   `GraftEntry` for that path (or keeps it, if only part of the tree was
+   imported — which argues for making the unit a subtree, not the graft).
+
+What it needs that does not exist: the **write lease**, because it
+publishes; a resumable driver, because importing 10 TB has exactly the
+interruption problem the spider had and should reuse the same checkpoint
+shape; and a decision about the half-imported state, which is why the
+honest first version is `pelfs graft --materialize <path>` operating on a
+whole graft root rather than a `--prefetch` value. It is **not** a mount
+flag: `--prefetch` may not change the volume.
+
 ---
 
 ## The spike
@@ -567,7 +1087,7 @@ kernel, real FUSE, `--network none`, a `fakeorigin` serving **two prefixes**
 source tree: 4 files, 3970037 bytes
 grafted 3 files (3970016 bytes) at /ext from http://127.0.0.1:18997/ext
 1 files under 65536 bytes were stored inline in the catalog (21 bytes) and are not grafted
-6 blocks of 1048576 bytes digested in 5ms; index is 459 bytes
+5 blocks across 3 source objects; index is 396 bytes, read whole
 
 grafted tree:      3970037 bytes at http://127.0.0.1:18997/ext
 volume pack bytes: 2689 bytes under http://127.0.0.1:18997/vol/packs
@@ -631,67 +1151,106 @@ admitting it is unrecognized is not.
 Section 5, quoted in full under Decision 3. The load-bearing move is
 deleting the source object for the written file: it reads anyway.
 
-### And the one that fails today
+### Resume, and a refresh that costs what changed
 
 ```
-6. EVIDENCE, not a pass/fail: what --prefetch all does today
-mount came up: no
-ERROR pelfs: prefetch: 4 pack(s) could not be made local ([chunk 68c99c16…:
-present in no listed pack chunk 5b1a264d…: present in no listed pack …]);
-refusing to mount
+-- a re-run of an unchanged source --
+resuming: 3970037 bytes of this source were already digested
+digested 0 bytes in 0s; 3970037 bytes were already checkpointed and were not read again
+PASS: the refresh read ZERO bytes of source data -- the checkpoint carried it
+PASS: the refreshed generation serves the same bytes
+
+-- and a source that CHANGED costs only the file that changed --
+digested 400000 bytes in 0s; 3670037 bytes were already checkpointed
+the refresh read 400000 bytes for a 400000-byte change in a 3970037-byte tree
+PASS: only the changed file was re-read
+PASS: the refreshed graft serves the NEW bytes of the changed file
 ```
 
-Recorded as evidence rather than asserted as pass or fail, because it is
-a measurement of the gap rather than a test of the fix.
+### `--prefetch`, which used to be the section that failed
 
-### What the spike does NOT prove
+```
+-- --prefetch all must REFUSE, and must say 'graft' rather than 'no listed pack' --
+ERROR pelfs: prefetch: refusing to mount: --prefetch all promises every byte is local,
+and 2.9 MiB of this generation is GRAFTED (/ext <- http://127.0.0.1:18997/ext) — those
+bytes live at a foreign prefix and there is no pack to cache, so no transfer can make
+them local. Use `--prefetch packs` to make the packed content local and read the grafted
+content from its source, or `--prefetch none`. Copying a graft in is a materialization
+(a write and a new generation), not a prefetch
+PASS: --prefetch all refuses by name, offers --prefetch packs, and does not cry damage
 
-Said plainly, because it is a spike:
+-- --prefetch packs must MOUNT, warn, and not claim the volume is local --
+WARN pelfs: prefetch: /ext is GRAFTED from http://127.0.0.1:18997/ext and cannot be made
+local — there is no pack to cache. Reads under it will still go to
+http://127.0.0.1:18997/ext (2.9 MiB of grafted content in this generation)
+WARN pelfs: prefetch: this volume is NOT fully local: 4 chunks (2.9 MiB) live at a graft
+source. Copying them in would be a materialization — a write, a new generation — not a
+prefetch
+INFO pelfs: prefetched 1 packs (1 already cached) across 5 files, 1.0 MiB local; fully
+local: false
+"prefetch_grafted_bytes": 3021440
+PASS: prefetch_complete is not true while grafted bytes are remote
+```
 
-- **It grafts over an empty root.** `pelfs init` then `pelfs graft`. Grafting
-  into a volume that already has content needs the source to merge the
-  previous generation's tree with the spidered one — the job `mergeSource`
-  already does over two generations. **Nothing in the read path or the
-  format changes**; the writer is what is unfinished. This is ranked work
-  item 1.
-- **The index is fetched whole at mount.** Fine at 459 bytes, not fine at
-  50 MB. Ranked item 3.
-- **The spider is single-threaded** and holds a `map[Identity]struct{}` of
-  every block (~5 GB at the 100M-block target). Ranked item 4.
+The test also asserts that the refusal does **not** contain the string
+"no listed pack", because that sentence means damage everywhere else in
+this system and a graft is not damage.
+
+### What is still NOT proven
+
+Said plainly:
+
+- **It grafts over an empty root.** `pelfs init` then `pelfs graft`.
+  Grafting into a volume that already has content needs the source to
+  merge the previous generation's tree with the spidered one — the job
+  `mergeSource` already does over two generations. **Nothing in the read
+  path or the format changes**; the writer is what is unfinished. Ranked
+  item 1, and it is now the largest remaining gap between this and a
+  feature.
+- **`fsck` still reports every grafted file as damaged** and exits 1. It
+  needs a severity axis first, which is a contract change and is
+  deliberately NOT touched here — see the boundary note under Decision 4.
 - **Grafted reads are not coalesced.** `fillChunks` skips them, so a
-  multi-block read is one request per block. Adjacent graft blocks are
-  *more* reliably contiguous in their source object than pack entries are
-  in a pack, so this should be easy and is ranked item 5.
-- **No `--refresh`, no `--remove`, no fsck integration, no stats
-  publication.**
+  multi-block read is one request per block, plus one index lookup per
+  block on a windowed index. The speculation trick in Decision 9 makes
+  both nearly free and is not built.
+- **No `--remove`**, no `merge` support, no `grafts/` retention key space,
+  no `GraftStats` in the stats JSON.
 - **No test of concurrent readers of one graft block**, of a source that
   fails mid-read, or of a graft across a nested-catalog boundary.
+- **The resume is tested against process exit, not against a kill in the
+  middle of a span.** The unit of durability is the object, so a killed
+  span costs that object; that is argued, and it is not yet asserted by a
+  test that actually kills something mid-walk.
 
 ---
 
 ## Ranked implementation work
 
-Effort is calendar-days for someone who knows this codebase.
+Effort is calendar-days for someone who knows this codebase. **Struck
+items are done** in this round.
 
 | # | Work | Why it is here | Effort |
 |---|---|---|---|
 | 1 | **Graft into a populated volume** — a `Source` that splices a spidered tree over the previous generation, on `mergeSource`'s pattern | without it the feature is `init`-then-`graft` only, which is not the use case | 3–4 d |
-| 2 | **`fsck`: a `Severity` axis, then graft awareness** | `fsck` reports every grafted file as damaged and exits 1 today. The severity change must land first and is a contract change | 2 d + 2 d |
-| 3 | **`--prefetch`: skip grafts, count them, add opt-in `--prefetch grafts`** | `--prefetch all` refuses to mount a grafted volume (measured) | 1–2 d |
-| 4 | **Ranged-window index lookup** (`packidx.Header.Window`, as `mpi/remote.go` does) | the only thing between the current design and the 100M-object target | 2–3 d |
-| 5 | **`pelfs graft --refresh` and `--remove`** | named in a user-facing error message that currently cannot be followed | 2 d |
-| 6 | **`grafts/` in the retention key space** | index objects leak forever today | 0.5 d |
-| 7 | **Coalesce adjacent graft blocks in `fillChunks`** | one request per 1 MiB block on every sequential read | 1 d |
+| 2 | **`fsck`: a `Severity` axis, then graft awareness** | `fsck` reports every grafted file as damaged and exits 1. The severity change must land first and is a contract change — see the boundary note in Decision 4 | 2 d + 2 d |
+| 3 | ~~`--prefetch`: count grafts rather than failing them~~ | **done** — Decision 13; three modes, `FullyLocal()`, stats fields, end-to-end assertions | — |
+| 4 | ~~Ranged-window index lookup~~ | **done** — Decision 9; `graft.Reader`, whole under 4 MiB, windowed above | — |
+| 5 | ~~`pelfs graft --refresh`~~ / **`--remove`** | refresh is done and costs only what changed (Decision 11). `--remove` is still named in no error message and unbuilt | 0.5 d |
+| 6 | **`grafts/` in the retention key space** | index objects leak forever today, and they are now large | 0.5 d |
+| 7 | **Coalesce adjacent graft blocks, and SPECULATE the next block's location** | one request per block, plus one index lookup per block on a windowed index. The identity check makes a wrong guess free (Decision 9) | 1–2 d |
 | 8 | **`merge`: `ProvidedGrafts`, and make `sameRef` location-aware** | merge on a grafted volume fails loudly now; making it work needs both | 2–3 d |
 | 9 | **Publish `GraftStats` into the stats JSON; wrap the graft store in `stats.WrapStorage`** | third-party traffic is invisible in the summary | 1 d |
-| 10 | **Spider: parallelism, and `extsort` instead of an in-memory identity set** | ~5 GB of RSS at the target scale, and O(source) time single-streamed | 2 d |
+| 10 | ~~Spider: parallelism, and `extsort` instead of an in-memory identity set~~ | **done** — Decision 11; plus the checkpoint, the progress ticker, and the two-listing consistency check, none of which were on this list and all of which the size demanded | — |
 | 11 | **`--no-graft` and `--graft-allow` mount flags** | the reader's veto is all-or-nothing today | 1 d |
-| 12 | **A distinct errno/error class for graft-integrity failure** | `returning EIO for an unrecognized error` in the log | 0.5 d |
+| 12 | **A distinct errno/error class for graft-integrity failure** | `returning EIO for an unrecognized error` in the log, still | 0.5 d |
 | 13 | **Re-derive `GraftEntry.Path` at report time, or record the root inode** | renaming a grafted directory makes `--list` lie | 0.5 d |
-| 14 | **Arena sizing for graft-heavy mounts** | the arena is tuned against decode cost, and a graft trades in round trips | investigation |
+| 14 | **`pelfs graft --materialize`** | the third prefetch mode (Decision 13); reuses `adoptByReading` and `publish`, needs the lease and a resumable driver | 3–4 d |
+| 15 | **Use the source's advertised object digest** in `fsck --check-grafts` and to gate `--refresh` | strictly stronger than the size+mtime gate, and it is the thing to build instead of TOFU (Decision 12) | 1–2 d |
+| 16 | **Arena sizing for graft-heavy mounts** | the arena is tuned against decode cost, and a graft trades in round trips | investigation |
 
-Items 1–3 are the difference between a spike and a feature. 4 is the
-difference between a feature and one that scales.
+Item 1 is now the only thing between this and a usable feature; item 2 is
+the only thing between it and a volume `fsck` can be run on.
 
 ---
 
@@ -728,13 +1287,14 @@ and I did not choose that default because it would make the feature
 unusable out of the box. That is a trade I would want you to make
 deliberately rather than inherit from this spike.
 
-**4. The interaction surface is large and mostly not done.** Look at the
-inventory table: four 🔴 rows and five 🟠. The spike closed the two that
-would have caused silent wrongness, and the rest are loud failures — which
-is the right order — but a feature that requires touching `fsck`,
-`prefetch`, `merge`, `retention`, `stats` and `rescue` before it is
-coherent is a feature with a long tail. The estimate above sums to roughly
-four to five weeks, and I would not trust it to better than 50%.
+**4. The interaction surface is large and still not done.** The inventory
+table had four 🔴 rows and five 🟠. Three of the reds are now closed
+(`ContentOf`, `--prefetch`, the whole-index fetch) and the two 🟠 that
+would have caused silent wrongness were closed in the first round — but
+`fsck` and `merge` are still red, and a feature that requires touching
+`fsck`, `merge`, `retention`, `stats` and `rescue` before it is coherent
+is a feature with a long tail. What remains in the ranked table sums to
+roughly two to three weeks, and I would not trust it to better than 50%.
 
 **5. It is a second way to do something pelfs already does well.** The
 chunker plus cross-generation dedup means ingesting a tree you don't own is

@@ -150,7 +150,59 @@ unmount_at "$WORK/mnt"; wait "$MOUNT_PID" 2>/dev/null || true; MOUNT_PID=
 
 echo
 echo "===================================================================="
-echo "  4. THE FAILURE CASE: the source changes under a signed generation"
+echo "  4. RESUME: a re-run of an unchanged source reads nothing"
+echo "===================================================================="
+# A graft reads every byte of the source once. At TB scale that is hours,
+# and hours must survive a Ctrl-C, an eviction or a token expiring. The
+# checkpoint is what makes that true -- and the same mechanism is what
+# makes `--refresh` cost only what CHANGED.
+"$WORK/pelfs" graft --state-dir "$WORK/state" --refresh "$VOL" /ext 2>&1 | tee "$WORK/refresh.log" | sed 's/^/    /'
+grep -qi 'resuming' "$WORK/refresh.log" || {
+  echo "FAIL: a refresh of an unchanged source did not resume from the checkpoint" >&2
+  exit 1
+}
+if ! grep -qE 'digested 0 bytes|digested" *"0"|hashed=0' "$WORK/refresh.log"; then
+  # The line reads "digested N bytes in ...; M bytes were already checkpointed".
+  hashed=$(grep -o 'digested [0-9]* bytes' "$WORK/refresh.log" | head -1 | awk '{print $2}')
+  if [ "${hashed:-1}" != "0" ]; then
+    echo "FAIL: a refresh of an unchanged source re-read $hashed bytes" >&2
+    exit 1
+  fi
+fi
+echo "PASS: the refresh read ZERO bytes of source data -- the checkpoint carried it"
+
+# And the refreshed generation still reads.
+"$WORK/pelfs" mount-gen --state-dir "$WORK/state-ro4" "$VOL" "$WORK/mnt" 2>"$WORK/mount-err4.log" &
+MOUNT_PID=$!
+wait_for "$WORK/mnt/ext/data/small.txt" || { echo "mount did not come up" >&2; cat "$WORK/mount-err4.log" >&2; exit 1; }
+cmp "$WORK/ref/data/small.txt" "$WORK/mnt/ext/data/small.txt"
+cmp "$WORK/ref/data/nested/mid.bin" "$WORK/mnt/ext/data/nested/mid.bin"
+echo "PASS: the refreshed generation serves the same bytes"
+unmount_at "$WORK/mnt"; wait "$MOUNT_PID" 2>/dev/null || true; MOUNT_PID=
+
+echo
+echo "-- and a source that CHANGED costs only the file that changed --"
+head -c 400000 /dev/urandom > "$WORK/origin/ext/data/nested/mid.bin"
+cp "$WORK/origin/ext/data/nested/mid.bin" "$WORK/ref/data/nested/mid.bin"
+"$WORK/pelfs" graft --state-dir "$WORK/state" --refresh "$VOL" /ext 2>&1 | tee "$WORK/refresh2.log" | sed 's/^/    /'
+hashed=$(grep -o 'digested [0-9]* bytes' "$WORK/refresh2.log" | head -1 | awk '{print $2}')
+echo "the refresh read $hashed bytes for a 400000-byte change in a $SRC_BYTES-byte tree"
+if [ "${hashed:-0}" -eq 0 ] || [ "${hashed:-0}" -gt 900000 ]; then
+  echo "FAIL: a one-file change cost $hashed bytes; the checkpoint is not doing its job" >&2
+  exit 1
+fi
+echo "PASS: only the changed file was re-read"
+
+"$WORK/pelfs" mount-gen --state-dir "$WORK/state-ro5" "$VOL" "$WORK/mnt" 2>"$WORK/mount-err5.log" &
+MOUNT_PID=$!
+wait_for "$WORK/mnt/ext/data/nested/mid.bin" || { echo "mount did not come up" >&2; cat "$WORK/mount-err5.log" >&2; exit 1; }
+cmp "$WORK/ref/data/nested/mid.bin" "$WORK/mnt/ext/data/nested/mid.bin"
+echo "PASS: the refreshed graft serves the NEW bytes of the changed file"
+unmount_at "$WORK/mnt"; wait "$MOUNT_PID" 2>/dev/null || true; MOUNT_PID=
+
+echo
+echo "===================================================================="
+echo "  5. THE FAILURE CASE: the source changes under a signed generation"
 echo "===================================================================="
 # One byte, in the middle of the second block of the multi-block file. The
 # file's LENGTH is unchanged, so nothing about the namespace looks wrong --
@@ -203,7 +255,7 @@ cp "$WORK/ref/data/multiblock.bin" "$WORK/origin/ext/data/multiblock.bin"
 
 echo
 echo "===================================================================="
-echo "  5. UNGRAFT ON WRITE, at FILE granularity"
+echo "  6. UNGRAFT ON WRITE, at FILE granularity"
 echo "===================================================================="
 "$WORK/pelfs" mount --rw --state-dir "$WORK/state" --no-lease --snapshot-interval 0 "$VOL" "$WORK/rw"
 wait_for "$WORK/rw/ext/data/small.txt" || { echo "rw mount did not come up" >&2; exit 1; }
@@ -258,23 +310,73 @@ unmount_at "$WORK/mnt"; wait "$MOUNT_PID" 2>/dev/null || true; MOUNT_PID=
 
 echo
 echo "===================================================================="
-echo "  6. EVIDENCE, not a pass/fail: what --prefetch all does today"
+echo "  7. --prefetch: the three honest modes"
 echo "===================================================================="
 # --prefetch all promises "everything this generation references is now
 # local, and I failed loudly if it could not be". A graft cannot keep that
-# promise: the bytes are not in a pack and were never going to be. This
-# section records what the unmodified code does about it, because the
-# design doc's claim about prefetch should be a measurement.
+# promise: the bytes are not in a pack and were never going to be. So
+# there are three modes, and this section tests two of them.
+#
+#   all    REFUSE, deliberately, naming the graft.
+#   packs  make the packs local, WARN about the grafted bytes, mount.
+#
+# The third -- materialize the grafted blocks into local packs -- is a
+# WRITE and is designed in docs/design-graft.md rather than built here.
+
+echo "-- --prefetch all must REFUSE, and must say 'graft' rather than 'no listed pack' --"
 set +e
 "$WORK/pelfs" mount-gen --prefetch all --state-dir "$WORK/state-pf" "$VOL" "$WORK/mnt" >"$WORK/pf.log" 2>&1 &
 MOUNT_PID=$!
 up=no
 for _ in $(seq 60); do [ -e "$WORK/mnt/ext/data/small.txt" ] && { up=yes; break; }; sleep 0.1; done
 set -e
-echo "mount came up: $up"
-echo "-- what prefetch said --"
-grep -i 'prefetch\|graft\|no listed pack' "$WORK/pf.log" | tail -6 | sed 's/^/    /'
-if [ "$up" = yes ]; then unmount_at "$WORK/mnt"; wait "$MOUNT_PID" 2>/dev/null || true; MOUNT_PID=; fi
+if [ "$up" = yes ]; then
+  echo "FAIL: --prefetch all mounted a volume whose grafted bytes are NOT local" >&2
+  unmount_at "$WORK/mnt"; exit 1
+fi
+wait "$MOUNT_PID" 2>/dev/null || true; MOUNT_PID=
+grep -i 'prefetch' "$WORK/pf.log" | tail -3 | sed 's/^/    /'
+grep -qi 'GRAFTED' "$WORK/pf.log" || {
+  echo "FAIL: the refusal did not name the graft as the reason" >&2
+  cat "$WORK/pf.log" >&2; exit 1
+}
+grep -qi 'prefetch packs' "$WORK/pf.log" || {
+  echo "FAIL: the refusal did not offer the way forward" >&2
+  cat "$WORK/pf.log" >&2; exit 1
+}
+if grep -qi 'no listed pack' "$WORK/pf.log"; then
+  echo "FAIL: the refusal still says 'present in no listed pack', which means DAMAGE" >&2
+  echo "      everywhere else in this system. A graft is not damage." >&2
+  exit 1
+fi
+echo "PASS: --prefetch all refuses by name, offers --prefetch packs, and does not cry damage"
+
+echo
+echo "-- --prefetch packs must MOUNT, warn, and not claim the volume is local --"
+"$WORK/pelfs" mount-gen --prefetch packs --stats-file "$WORK/pf2.json" --state-dir "$WORK/state-pf2" "$VOL" "$WORK/mnt" >"$WORK/pf2.log" 2>&1 &
+MOUNT_PID=$!
+wait_for "$WORK/mnt/ext/data/small.txt" || {
+  echo "FAIL: --prefetch packs refused to mount a grafted volume" >&2
+  cat "$WORK/pf2.log" >&2; exit 1
+}
+# The grafted bytes still read -- from the source, which is the point.
+cmp "$WORK/ref/data/nested/mid.bin" "$WORK/mnt/ext/data/nested/mid.bin"
+grep -i 'prefetch' "$WORK/pf2.log" | tail -4 | sed 's/^/    /'
+grep -qi 'cannot be made local' "$WORK/pf2.log" || {
+  echo "FAIL: --prefetch packs mounted without warning that grafted bytes are remote" >&2
+  cat "$WORK/pf2.log" >&2; exit 1
+}
+unmount_at "$WORK/mnt"; wait "$MOUNT_PID" 2>/dev/null || true; MOUNT_PID=
+if [ -f "$WORK/pf2.json" ]; then
+  echo "-- and the machine-readable half of the warning --"
+  grep -o '"prefetch_complete":[^,}]*' "$WORK/pf2.json" || echo "    prefetch_complete absent (false)"
+  grep -o '"prefetch_grafted_bytes":[^,}]*' "$WORK/pf2.json" || true
+  if grep -q '"prefetch_complete":true' "$WORK/pf2.json"; then
+    echo "FAIL: the stats claim a grafted volume is fully local" >&2
+    exit 1
+  fi
+  echo "PASS: prefetch_complete is not true while grafted bytes are remote"
+fi
 
 echo
 echo "===================================================================="

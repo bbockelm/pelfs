@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/bbockelm/pelfs/internal/catalog"
+	"github.com/bbockelm/pelfs/internal/superblock"
 )
 
 // Prefetch makes a whole generation LOCAL.
@@ -61,7 +62,35 @@ type PrefetchReport struct {
 	// Skipped counts refs with nothing to fetch: holes, and files stored
 	// inline in a catalog.
 	Skipped int
+	// Grafted counts chunk references this pass CANNOT make local, and
+	// GraftedBytes their logical size, because they live at a foreign
+	// prefix rather than in a pack (graft.go).
+	//
+	// They are counted rather than failed, and the distinction is the
+	// whole of the prefetch/graft question. A pack that will not download
+	// is DAMAGE or an outage; a grafted block is working exactly as
+	// designed and simply cannot be moved by a pass that moves packs —
+	// there is no pack to cache. Reporting it as a failure (which is what
+	// this pass used to do, and it refused the mount) said the volume was
+	// broken when it was not.
+	//
+	// What a caller may NOT do is treat a report with Grafted > 0 as
+	// "everything is local". Making those bytes local means WRITING them
+	// into local packs, which is a materialization — a new generation,
+	// the lease, and the publish path — not a prefetch.
+	Grafted      int
+	GraftedBytes int64
+	// GraftRoots names the grafts those chunks belong to, so a refusal or
+	// a warning can name what it is talking about instead of printing a
+	// list of hashes.
+	GraftRoots []superblock.GraftEntry
 }
+
+// FullyLocal reports whether the generation is now entirely on this
+// machine. It is deliberately the ONLY way to ask, so that no caller can
+// conclude "local" from a zero failure count while grafted bytes are
+// still one federation away.
+func (r *PrefetchReport) FullyLocal() bool { return r.Failed == 0 && r.Grafted == 0 }
 
 // PrefetchBudgetError is the refusal a generation too large for the local
 // cache earns. It is a distinct type because the two callers want opposite
@@ -253,6 +282,31 @@ func (fs *FS) referencedPacks(ctx context.Context, rep *PrefetchReport) (map[str
 		}
 		fs.noteFailure(rep, fmt.Sprintf("%s %s: present in no listed pack", what, idHex[:min(16, len(idHex))]))
 	}
+	// Grafted refs are counted, not failed. The graft table is asked
+	// FIRST for the same reason the read path asks it first: a grafted
+	// identity is in no pack by construction, and packIndex.lookup would
+	// answer "absent" — the sentence that means damage everywhere else.
+	graftedRef := func(ctx context.Context, r *catalog.ChunkRef) (bool, error) {
+		if fs.grafts == nil {
+			return false, nil
+		}
+		e, _, ok, err := fs.grafts.locate(ctx, r.Identity)
+		if err != nil {
+			return false, err
+		}
+		if !ok {
+			return false, nil
+		}
+		rep.Grafted++
+		rep.GraftedBytes += r.LLen
+		for _, g := range rep.GraftRoots {
+			if g.Path == e.sb.Path {
+				return true, nil
+			}
+		}
+		rep.GraftRoots = append(rep.GraftRoots, e.sb)
+		return true, nil
+	}
 	locateInto(fs.cats.rootHex, "root catalog")
 
 	var walk func(ino uint64) error
@@ -303,6 +357,13 @@ func (fs *FS) referencedPacks(ctx context.Context, rep *PrefetchReport) (map[str
 					r := &ext.refs[i]
 					if len(r.Identity) == 0 {
 						rep.Skipped++ // hole or inline: nothing to fetch
+						continue
+					}
+					grafted, err := graftedRef(ctx, r)
+					if err != nil {
+						return fmt.Errorf("prefetch: %q: %w", e.Name, err)
+					}
+					if grafted {
 						continue
 					}
 					locateInto(hex.EncodeToString(r.Identity), "chunk")

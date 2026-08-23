@@ -431,6 +431,11 @@ func TestPageIsOneFileWithANonceAndTheTestIDsAPlaywrightSuiteNeeds(t *testing.T)
 		"durability", "durability-legend", "glyph-staged", "glyph-sending", "glyph-published",
 		"publish-button", "publish-hint", "publish-status", "connect-another-program",
 		"stream-status", "footer-disclaimer", "noscript", "test-hooks-banner", "body",
+		// U13's card. The container is in the shipped HTML; the card,
+		// its URL, its code and its dismiss button are built by the
+		// script from the state document, so those ids live in the
+		// script rather than the markup and the check below covers them.
+		"sso-cards",
 	} {
 		if !strings.Contains(page, `data-testid="`+id+`"`) {
 			t.Errorf("the page has no data-testid=%q", id)
@@ -456,6 +461,24 @@ func TestPageIsOneFileWithANonceAndTheTestIDsAPlaywrightSuiteNeeds(t *testing.T)
 	// No JavaScript at all is a real state a driver test will produce.
 	if !strings.Contains(page, "<noscript>") {
 		t.Error("the page has no noscript fallback")
+	}
+	// The SSO card's ids and the beacon, which the script builds rather
+	// than the markup carrying. They are as much a contract as the ones
+	// above: a driver suite selects on them, and the beacon is half of
+	// U10's hint.
+	for _, want := range []string{
+		`"sso-card"`, `"sso-url"`, `"sso-code"`, `"sso-dismiss"`, `"sso-note"`,
+		`navigator.sendBeacon`, `"/api/v1/beacon"`, `"pagehide"`, `"visibilitychange"`,
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("the page's script does not carry %s", want)
+		}
+	}
+	// A card is built with createElement and textContent. innerHTML with an
+	// issuer-supplied URL in it would be the one place this page could be
+	// made to execute somebody else's string.
+	if strings.Contains(page, "innerHTML = `<div class=\"sso\"") {
+		t.Error("the SSO card is built with innerHTML")
 	}
 }
 

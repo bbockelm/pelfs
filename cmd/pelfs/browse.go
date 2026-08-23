@@ -163,6 +163,7 @@ func runBrowse(o *cmdOpts, prefix string, a browseArgs) int {
 		prefix:     prefix,
 		branch:     a.branch,
 		stateDir:   stateDir,
+		stateRoot:  o.stateRoot(),
 		backend:    "browse",
 		sessionID:  newSessionID(),
 		started:    time.Now(),
@@ -234,7 +235,25 @@ func runBrowse(o *cmdOpts, prefix string, a browseArgs) int {
 		}
 	}
 
-	// ---- 2. Now the volume. This is where a device-flow prompt fires,
+	// ---- 2. The device-flow hook, which is step 3 of
+	// docs/design-webui.md's ordering: after the page is servable, before
+	// anything can prompt.
+	//
+	// THIS IS THE ONLY PLACE IN PELFS THAT INSTALLS IT. The hook is
+	// process-wide (an atomic.Pointer in pelican's oauth2), so installing
+	// it in internal/pelicanobj — where the flow actually fires, from
+	// primeCredential — would change `pelfs mount` and `pelfs get` too, and
+	// their user is at a terminal that already gets the URL. See
+	// cmd/pelfs/ssoprompt.go for what the handler may and may not do; the
+	// short version is that it blocks the user's own login, so it does one
+	// map insert and returns.
+	//
+	// Removed on the way out rather than left installed: this process
+	// outlives the volume only during teardown, and a prompt raised then
+	// has nowhere to go — the streams are already closed.
+	defer installPromptHandler(bs)()
+
+	// ---- 3. Now the volume. This is where a device-flow prompt fires,
 	// and by construction the page is already loadable when it does.
 	fail := func(err error) int {
 		bs.setFailed(err)
@@ -384,9 +403,24 @@ func runBrowse(o *cmdOpts, prefix string, a browseArgs) int {
 		ui.Info("checkpointing every {interval} (--snapshot-interval 0 disables); "+
 			"the page says when the next one is due",
 			"interval", o.snapshotInterval)
+		// Seal on idle (U10). A tab has no unmount, and 200 documents at
+		// ~2 MB fire neither write-pressure trigger, so without this a
+		// finished drag-and-drop can sit unpublished until the interval
+		// comes round — with the browser closed and the user telling a
+		// collaborator the data is there.
+		//
+		// The ticker is created here rather than inside run() so the defer
+		// that stops it belongs to the function that owns the session.
+		idle := newIdleSealer(bs, g, o.snapshotInterval)
+		idleTick := time.NewTicker(idleSampleInterval)
+		defer idleTick.Stop()
+		go idle.run(sessionCtx, idleTick.C)
+		ui.Info("the session also publishes on its own once the last browser tab "+
+			"has been gone for {window} with nothing written",
+			"window", idle.window)
 	}
 
-	// ---- 3. Serve until interrupted. Ctrl-C is the unmount: this verb is
+	// ---- 4. Serve until interrupted. Ctrl-C is the unmount: this verb is
 	// deliberately not a daemon, because a background browse session that
 	// seals on a signal nobody sends is how data gets left staged for a
 	// week.
@@ -403,7 +437,7 @@ func runBrowse(o *cmdOpts, prefix string, a browseArgs) int {
 		}
 	}
 
-	// ---- 4. Teardown, in runMountGen's order.
+	// ---- 5. Teardown, in runMountGen's order.
 	g.beginTeardown()
 	// Streams first: closing them lets Shutdown return instead of waiting
 	// on a response that is open by design.
@@ -501,6 +535,13 @@ type browseServer struct {
 	args     browseArgs
 	interval time.Duration
 	sessions *browsesession.Manager
+	// prompts is the device-flow prompt registry (U13). It exists before
+	// the volume does, because that is when the first flow fires.
+	prompts *promptRegistry
+	// now is the clock. nil means time.Now; a test sets it once, at
+	// construction, before anything else can read it. Nothing mutates it
+	// afterwards, which is why it needs no lock.
+	now func() time.Time
 
 	mu sync.Mutex
 	// g is nil until the volume is open. phase is what the page shows in
@@ -524,6 +565,21 @@ type browseServer struct {
 	// exactly this set: "the last /events stream closed" is a real event
 	// on the same footing as an SSH channel close.
 	streams map[chan struct{}]struct{}
+	// streamsIdleSince is when the set last became empty, and the zero
+	// time while any stream is open. It is set by the unsubscribe that
+	// EMPTIES the set — so closing one of two tabs is not an event — and
+	// zeroed by any subscribe, which is what makes a reconnecting browser
+	// (the page asks for `retry: 1000`) unable to trigger a seal.
+	//
+	// It starts at the session's own start rather than at zero: a session
+	// whose browser never attached — --open on a login node, or a WebDAV
+	// client on this same listener once U6 lands — is idle in exactly the
+	// sense that matters, and the quiet window then runs from its last
+	// write.
+	streamsIdleSince time.Time
+	// beaconAt is the last sendBeacon hint. A hint, never a trigger: see
+	// idleHintedWindow.
+	beaconAt time.Time
 	// doneCh is closed once, when the process is leaving, so every stream
 	// can say goodbye and return; Server.Shutdown would otherwise wait
 	// forever on a response that is open by design.
@@ -550,8 +606,13 @@ type testOverrides struct {
 }
 
 type publishJob struct {
-	ID      string    `json:"id"`
-	State   string    `json:"state"` // running | done | failed | idle
+	ID    string `json:"id"`
+	State string `json:"state"` // running | done | failed | idle
+	// Reason is who asked: "user" for the button, "idle" for the seal that
+	// runs when the last tab has been gone for a quiet window (U10). The
+	// page says which, because a generation the user did not ask for is
+	// otherwise indistinguishable from one they forgot asking for.
+	Reason  string    `json:"reason,omitempty"`
 	Started time.Time `json:"started"`
 	Ended   time.Time `json:"ended,omitzero"`
 	Summary string    `json:"summary,omitempty"`
@@ -559,7 +620,7 @@ type publishJob struct {
 }
 
 func newBrowseServer(prefix string, a browseArgs, interval time.Duration, m *browsesession.Manager) *browseServer {
-	return &browseServer{
+	b := &browseServer{
 		prefix:      prefix,
 		args:        a,
 		interval:    interval,
@@ -569,6 +630,21 @@ func newBrowseServer(prefix string, a browseArgs, interval time.Duration, m *bro
 		streams:     map[chan struct{}]struct{}{},
 		over:        testOverrides{on: a.testHooks},
 	}
+	b.streamsIdleSince = b.lastPublish
+	// The registry's fan-out is b.nudge, and the registry calls it on its
+	// own goroutine: the device-flow hook runs on the goroutine driving the
+	// flow and BLOCKS it, so nothing it calls may wait on a mutex a slow
+	// state() sample could be holding.
+	b.prompts = newPromptRegistry(b.nowTime, b.nudge)
+	return b
+}
+
+// nowTime is the server's clock: time.Now unless a test injected one.
+func (b *browseServer) nowTime() time.Time {
+	if b.now != nil {
+		return b.now()
+	}
+	return time.Now()
 }
 
 // routes is THE ROUTE TABLE, and the seam the later milestones mount onto.
@@ -597,6 +673,18 @@ func (b *browseServer) routes(g *httpguard.Guard) http.Handler {
 	r.HandleFunc(httpguard.SurfaceAPI, "GET /api/v1/info", b.serveInfo)
 	r.HandleFunc(httpguard.SurfaceAPI, "POST /api/v1/publish", b.servePublish)
 	r.HandleFunc(httpguard.SurfaceAPI, "POST /api/v1/download", b.serveMintTicket)
+	// The SSO card's one control (U13). A prompt is dismissible because the
+	// hook is ONE-WAY: nothing tells us the flow finished, failed or
+	// expired, so a card the user has dealt with can only be taken off the
+	// screen by the user.
+	r.HandleFunc(httpguard.SurfaceAPI, "POST /api/v1/sso/dismiss", b.serveDismissPrompt)
+	// The idle-seal hint (U10). SurfaceExchange, not SurfaceAPI, and that
+	// is forced rather than chosen: navigator.sendBeacon cannot set a
+	// request header, so X-Pelfs-Session cannot be on it. Exchange is the
+	// surface class whose rules are exactly right for that — every
+	// provenance and content-type check, with the credential in the body —
+	// and the handler checks the session token itself.
+	r.HandleFunc(httpguard.SurfaceExchange, "POST /api/v1/beacon", b.serveBeacon)
 	r.HandleFunc(httpguard.SurfaceStream, "GET /events", b.serveEvents)
 	// The ticketed download. M1 registers no Source, so a redeemed ticket
 	// 404s — the MECHANISM is what this milestone owes U11, and it is
@@ -688,8 +776,17 @@ type browseState struct {
 	// so where a person will see it.
 	TestHooks bool `json:"test_hooks"`
 	// Streams is how many /events subscribers there are, which is the
-	// signal U10 will seal on.
+	// signal U10 seals on.
 	Streams int `json:"streams"`
+	// IdleSealS is the quiet window an unattended session seals after, in
+	// seconds, and 0 when idle sealing is off (read-only, or
+	// --snapshot-interval 0). It is on the document so the page can promise
+	// what will happen when the tab closes rather than leaving it a
+	// surprise.
+	IdleSealS int64 `json:"idle_seal_s,omitempty"`
+	// Prompts are the live device-flow cards (U13): what the user must do
+	// to authorize this session. Never a token — see ssoPrompt.
+	Prompts []ssoPrompt `json:"prompts,omitempty"`
 }
 
 func (b *browseServer) setReady(g *genSession, ctx context.Context) {
@@ -736,9 +833,18 @@ func (b *browseServer) state() browseState {
 		Publish:   job,
 		TestHooks: over.on,
 		Streams:   streams,
+		// Sampled OUTSIDE b.mu: the registry has its own lock and the
+		// device-flow goroutine that writes it must never wait behind a
+		// state sample. A prompt raised before any browser attached is on
+		// the first frame every stream receives, which is what stops it
+		// being lost.
+		Prompts: b.prompts.Cards(),
 	}
 	if b.args.rw {
 		st.Mode = "read-write"
+		if w := idleQuietWindow(b.interval); w > 0 {
+			st.IdleSealS = int64(w.Seconds())
+		}
 	}
 	if g == nil {
 		return st
@@ -844,7 +950,7 @@ func (b *browseServer) servePublish(w http.ResponseWriter, _ *http.Request) {
 			"error": "a publish is already running", "job": id})
 		return
 	}
-	job := &publishJob{ID: newJobID(), State: "running", Started: time.Now()}
+	job := &publishJob{ID: newJobID(), State: "running", Reason: "user", Started: b.nowTime()}
 	b.job = job
 	stall := b.over.publishStall
 	b.mu.Unlock()
@@ -861,16 +967,7 @@ func (b *browseServer) servePublish(w http.ResponseWriter, _ *http.Request) {
 			}
 		}
 		summary, err := g.checkpoint(ctx)
-		b.mu.Lock()
-		job.Ended = time.Now()
-		if err != nil {
-			job.State, job.Error = "failed", err.Error()
-		} else {
-			job.State, job.Summary = "done", summary
-			b.lastPublish = job.Ended
-		}
-		b.mu.Unlock()
-		b.nudge()
+		b.finishJob(job, summary, err)
 	}()
 	b.nudge()
 	writeBrowseJSON(w, http.StatusAccepted, map[string]any{
@@ -920,6 +1017,62 @@ func (b *browseServer) serveMintTicket(w http.ResponseWriter, r *http.Request) {
 		"url": "/d/" + tk,
 		"ttl": browsesession.TicketTTL.String(),
 	})
+}
+
+// ---- the idle hint -------------------------------------------------------
+
+// serveBeacon records a `navigator.sendBeacon` hint that the tab is going
+// away, which SHORTENS the idle-seal wait and can never start one.
+//
+// Three properties, and the first two are the reason this is not simply
+// "seal when the beacon arrives":
+//
+//   - A beacon is best-effort BY SPECIFICATION. Browsers may drop it, and
+//     they always drop it when the process dies. A durability decision that
+//     rested on one would be wrong exactly when it mattered most.
+//   - visibilitychange fires when a tab is merely HIDDEN — switched away
+//     from, or minimised — with the stream still open and the user still
+//     working. So the hint only has an effect while the stream set is
+//     empty, which is a fact the sealer checks and this handler does not
+//     have to know.
+//   - It cannot carry X-Pelfs-Session, because sendBeacon sets no request
+//     headers. The token is in the body instead, checked here in
+//     constant time by the same verifier the guard uses.
+func (b *browseServer) serveBeacon(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Session string `json:"session"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeBrowseJSON(w, http.StatusBadRequest, map[string]string{"error": "expected a JSON body"})
+		return
+	}
+	if !b.sessions.ValidSession(req.Session) {
+		writeBrowseJSON(w, http.StatusUnauthorized, map[string]string{"error": "no valid session"})
+		return
+	}
+	b.mu.Lock()
+	b.beaconAt = b.nowTime()
+	b.mu.Unlock()
+	// 204: sendBeacon discards the response, and there is nothing to say.
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ---- the SSO card --------------------------------------------------------
+
+// serveDismissPrompt takes one device-flow card off the screen. See
+// promptRegistry.Dismiss for why dismissal is a user action rather than
+// something the flow's completion could do.
+func (b *browseServer) serveDismissPrompt(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeBrowseJSON(w, http.StatusBadRequest, map[string]string{"error": "expected a JSON body"})
+		return
+	}
+	found := b.prompts.Dismiss(req.ID)
+	b.nudge()
+	writeBrowseJSON(w, http.StatusOK, map[string]bool{"dismissed": found})
 }
 
 // ---- events --------------------------------------------------------------
@@ -1017,13 +1170,77 @@ func (b *browseServer) subscribe() (nudge chan struct{}, done chan struct{}) {
 		b.doneCh = make(chan struct{})
 	}
 	b.streams[nudge] = struct{}{}
+	// A tab is attached, so no quiet window is running. This is the line
+	// that makes an SSE reconnect — which happens routinely, one second
+	// after any blip — unable to cause a seal.
+	b.streamsIdleSince = time.Time{}
 	return nudge, b.doneCh
 }
 
 func (b *browseServer) unsubscribe(nudge chan struct{}) {
 	b.mu.Lock()
 	delete(b.streams, nudge)
+	// Only the unsubscribe that EMPTIES the set starts the window: two
+	// windows open means one closing is not idle.
+	if len(b.streams) == 0 {
+		b.streamsIdleSince = b.nowTime()
+	}
 	b.mu.Unlock()
+}
+
+// idleSignal is everything the idle sealer needs to know about the
+// browser: how many streams are attached, when the set became empty, and
+// when the last sendBeacon hint arrived.
+func (b *browseServer) idleSignal() (streams int, idleSince, hint time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.streams), b.streamsIdleSince, b.beaconAt
+}
+
+// claimIdleJob takes the publish slot for an automatic seal, and reports
+// false when it cannot have it.
+//
+// It is the same slot the "Publish now" button takes, which is what makes
+// the two mutually exclusive: genSession.checkpoint holds g.mu across the
+// entire seal, so a second concurrent caller would wait minutes and then
+// publish nothing. A user clicking Publish while this runs gets the 409
+// servePublish already sends, with this job's id to follow.
+//
+// It refuses once the session is going away (b.closed, which teardown's
+// FIRST step sets), so nothing new starts while the exit path is joining:
+// sealAtExit publishes whatever is left, so refusing here loses nothing.
+// The WaitGroup is incremented under the same lock that observes closed,
+// which is what makes "no Add after Wait" a property rather than a hope.
+func (b *browseServer) claimIdleJob() (*publishJob, *genSession, context.Context, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed || b.g == nil || !b.g.rw {
+		return nil, nil, nil, false
+	}
+	if b.job != nil && b.job.State == "running" {
+		return nil, nil, nil, false
+	}
+	job := &publishJob{ID: newJobID(), State: "running", Reason: "idle", Started: b.nowTime()}
+	b.job = job
+	b.publishWG.Add(1)
+	return job, b.g, b.ctx, true
+}
+
+// finishJob records how a publish ended. Shared by the button's goroutine
+// and the idle sealer so that "what the page shows when a publish ends" has
+// one implementation. It does NOT touch publishWG: each caller owns its own
+// Add/Done pairing, which is where the teardown join is decided.
+func (b *browseServer) finishJob(job *publishJob, summary string, err error) {
+	b.mu.Lock()
+	job.Ended = b.nowTime()
+	if err != nil {
+		job.State, job.Error = "failed", err.Error()
+	} else {
+		job.State, job.Summary = "done", summary
+		b.lastPublish = job.Ended
+	}
+	b.mu.Unlock()
+	b.nudge()
 }
 
 // nudge wakes every stream. Non-blocking by construction: see subscribe.

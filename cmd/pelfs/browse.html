@@ -69,6 +69,23 @@
   .glyph.published { color: var(--published); }
   .glyph.sending { color: var(--brand); }
   .legend { display: flex; gap: 1.4rem; flex-wrap: wrap; color: var(--muted); font-size: .86rem; }
+  /* The SSO card. Brand-light rather than a warning colour: being asked to
+     log in is normal, not a fault. */
+  .sso {
+    padding: .8rem .9rem; border-radius: .4rem; margin: 1rem 0;
+    background: var(--brand-light); border: 1px solid #a9cdf7;
+  }
+  .sso[data-expired="true"] { background: #f4f5f6; border-color: var(--rule); color: var(--muted); }
+  .sso h2 { font-size: 1rem; margin: 0 0 .35rem; }
+  .sso .code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 1.25rem; font-weight: 700; letter-spacing: .12em;
+    user-select: all;
+  }
+  .sso .dismiss {
+    background: transparent; color: var(--muted); border: 1px solid var(--rule);
+    font-weight: 400; padding: .2rem .55rem; font-size: .85rem;
+  }
   button {
     font: inherit; font-weight: 600; cursor: pointer;
     background: var(--brand); color: #fff; border: 1px solid #036;
@@ -120,6 +137,12 @@
   </div>
 
   <div class="banner bad" data-testid="lease-banner" hidden></div>
+
+  <!-- The SSO cards (U13). A LIST, not a modal: two namespaces can each
+       open a device flow, and a modal would have to hide one of two things
+       the user has to do. Empty and hidden until a flow starts, which is
+       usually within a second of the page loading. -->
+  <div id="sso" data-testid="sso-cards" hidden></div>
 
   <hr>
 
@@ -229,8 +252,111 @@
     document.body.dataset.phase = "no-session";
   }
 
+  // ---- the SSO cards (U13) ------------------------------------------------
+  //
+  // Built with createElement and textContent, NEVER innerHTML: the URL and
+  // the code arrive from an issuer's device-flow response, which is data
+  // from off this machine. The server refuses anything that is not an
+  // absolute http(s) URL before it ever reaches here (approvalURL in
+  // cmd/pelfs/ssoprompt.go); the scheme test below is the second of two
+  // checks, because an href is the one place a `javascript:` string still
+  // executes with a CSP this strict.
+  //
+  // The card never says "authorization complete". It cannot: the hook that
+  // produced it is one-way and tells this process nothing about how the
+  // flow ended. What says the flow worked is the volume opening, which is
+  // the phase banner's job.
+  let promptSig = "";
+  function renderPrompts(list) {
+    const box = el("sso");
+    const sig = JSON.stringify(list);
+    // Rebuilding identical DOM every 500 ms would fight the user's own
+    // selection of the code they are trying to copy.
+    if (sig === promptSig) return;
+    promptSig = sig;
+    box.textContent = "";
+    box.hidden = list.length === 0;
+    for (const p of list) {
+      const card = document.createElement("div");
+      card.className = "sso";
+      card.setAttribute("data-testid", "sso-card");
+      card.dataset.promptId = p.id;
+      card.dataset.expired = String(!!p.expired);
+
+      const h = document.createElement("h2");
+      h.textContent = p.expired
+        ? "this sign-in request has expired"
+        : "your institution needs you to approve this session";
+      card.appendChild(h);
+
+      const line = document.createElement("p");
+      line.appendChild(document.createTextNode(
+        p.expired ? "The request was for " : "Open "));
+      if (/^https?:\/\//i.test(p.url)) {
+        const a = document.createElement("a");
+        a.href = p.url;
+        a.textContent = p.url;
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        a.setAttribute("data-testid", "sso-url");
+        line.appendChild(a);
+      } else {
+        const span = document.createElement("span");
+        span.textContent = p.url;
+        span.setAttribute("data-testid", "sso-url");
+        line.appendChild(span);
+      }
+      card.appendChild(line);
+
+      if (p.code) {
+        const c = document.createElement("p");
+        c.appendChild(document.createTextNode("and enter this code: "));
+        const code = document.createElement("span");
+        code.className = "code";
+        code.textContent = p.code;
+        code.setAttribute("data-testid", "sso-code");
+        c.appendChild(code);
+        card.appendChild(c);
+      }
+
+      const note = document.createElement("p");
+      note.className = "sub";
+      note.setAttribute("data-testid", "sso-note");
+      note.textContent = p.expired
+        ? "Codes are short-lived. If pelfs still needs this, it will ask again; " +
+          "the terminal running pelfs browse shows the same prompt."
+        : "Waiting for you to approve at your institution. The terminal running " +
+          "pelfs browse shows the same URL, and nothing here is a credential.";
+      card.appendChild(note);
+
+      const btn = document.createElement("button");
+      btn.className = "dismiss";
+      btn.type = "button";
+      btn.dataset.dismiss = p.id;
+      btn.setAttribute("data-testid", "sso-dismiss");
+      btn.textContent = p.expired ? "Dismiss" : "Dismiss (I have done this)";
+      card.appendChild(btn);
+
+      box.appendChild(card);
+    }
+  }
+
+  // One delegated listener rather than per-card handlers: an inline onclick
+  // would need 'unsafe-inline' in the CSP, which is the protection this
+  // page is built around.
+  el("sso").addEventListener("click", (e) => {
+    const id = e.target && e.target.dataset && e.target.dataset.dismiss;
+    if (!id) return;
+    fetch("/api/v1/sso/dismiss", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", [SESSION_HEADER]: token },
+      body: JSON.stringify({ id }),
+    }).catch(() => {});
+  });
+
   function render(s) {
     document.body.dataset.phase = s.phase;
+    renderPrompts(s.prompts || []);
     t("volume").textContent = s.volume;
     t("mode").textContent = s.mode;
     t("branch-generation").textContent =
@@ -289,11 +415,17 @@
       const sending = s.upload_backlog > 0
         ? ` <span class="glyph sending">◔</span>sending ${bytes(s.upload_backlog)}.`
         : "";
+      // The idle clause is not decoration: it is the promise that closing
+      // this tab publishes rather than abandoning. Said only when the
+      // server says idle sealing is on for this session.
+      const idle = s.idle_seal_s > 0
+        ? `, or ${secs(s.idle_seal_s)} after this tab closes`
+        : "";
       d.innerHTML = `<span class="glyph staged">●</span>` +
         `${s.staged_files} file${s.staged_files === 1 ? "" : "s"} ` +
         `(${bytes(s.staged_bytes)}) on this machine only` +
         ` — next automatic publish in ${secs(s.next_publish_s)}` +
-        ` (sooner under write pressure).${sending}`;
+        `${idle} (sooner under write pressure).${sending}`;
       d.dataset.durability = "staged";
     }
 
@@ -327,6 +459,10 @@
         st.textContent = `publishing… (${s0}s) — the seal freezes the overlay, so uploads resume in a moment`;
       } else if (job.state === "failed") {
         st.textContent = `publish failed: ${job.error}`;
+      } else if (job.reason === "idle") {
+        // A generation nobody clicked for. Saying so is the difference
+        // between a reassuring line and a confusing one.
+        st.textContent = `published automatically after the last tab closed: ${job.summary}`;
       } else {
         st.textContent = `published: ${job.summary}`;
       }
@@ -388,6 +524,31 @@
   // durability mechanism: the session seals at exit either way.
   window.addEventListener("beforeunload", (e) => {
     if (dirty > 0) e.preventDefault();
+  });
+
+  // The idle-seal HINT (U10), and it is only ever a hint: sendBeacon is
+  // best-effort by specification and the server never treats it as a
+  // trigger. All it can do is shorten a wait that has already started,
+  // which means the visibilitychange case below usually changes nothing —
+  // a hidden tab still holds its stream open, and a session with a stream
+  // is not idle. It costs one request and it is the difference between
+  // sealing five seconds after the tab closes and thirty.
+  //
+  // sendBeacon can set no request headers, so the session token travels in
+  // the body as a JSON Blob (which is also what makes the request's
+  // Content-Type application/json, and therefore acceptable to the guard).
+  function beacon() {
+    if (!token || !navigator.sendBeacon) return;
+    try {
+      navigator.sendBeacon("/api/v1/beacon",
+        new Blob([JSON.stringify({ session: token })], { type: "application/json" }));
+    } catch (_) { /* best-effort, by definition */ }
+  }
+  // pagehide rather than unload: unload is not fired at all on mobile and
+  // is deprecated for exactly this use.
+  window.addEventListener("pagehide", beacon);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") beacon();
   });
 
   el("publish").addEventListener("click", publish);

@@ -101,8 +101,10 @@ Usage:
   pelfs shell  [flags] <prefix>                           mount + subshell
   pelfs shell  [flags] <prefix> -- <command> [args...]    mount + run one command
   pelfs mount  [flags] [--rw] <prefix> [mountpoint]       background mount
-  pelfs umount <prefix-or-mountpoint>                     stop a background mount
-  pelfs status                                            list background mounts
+  pelfs umount [--state-dir d] <prefix-or-mountpoint>     stop a background mount
+  pelfs status [--state-dir d]                            list background mounts
+                                                          (--state-dir where the session
+                                                          was started with one)
   pelfs gc     [flags] [--delete] <prefix>                sweep unreferenced packs
   pelfs tag    [flags] <prefix> <name>                    freeze the branch head under
                                                           a name, retained until --rm

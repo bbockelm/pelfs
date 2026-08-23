@@ -343,6 +343,19 @@ func (v *Volume) Chmod(ino uint64, mode uint32) {
 	}
 }
 
+// Chown sets the ownership the CATALOG stores, which is not always what a
+// mount reports: internal/idmap translates the volume's own identity and
+// nothing else, so a test that cares which permission class a caller falls
+// into has to name the stored owner rather than inherit whoever ran the
+// test.
+func (v *Volume) Chown(ino uint64, uid, gid uint32) {
+	v.t.Helper()
+	u, g := uid, gid
+	if _, err := v.ov.SetAttr(context.Background(), ino, overlay.SetAttrIn{UID: &u, GID: &g}); err != nil {
+		v.t.Fatalf("chown inode %d: %v", ino, err)
+	}
+}
+
 func (v *Volume) Truncate(ino uint64, size int64) {
 	v.t.Helper()
 	s := size

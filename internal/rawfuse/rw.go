@@ -9,6 +9,7 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 
 	"github.com/bbockelm/pelfs/internal/catalog"
+	"github.com/bbockelm/pelfs/internal/fsperm"
 	"github.com/bbockelm/pelfs/internal/genfs"
 	"github.com/bbockelm/pelfs/internal/overlay"
 )
@@ -23,12 +24,28 @@ const (
 // half behaves exactly as Bind's — the overlay serves the merged view
 // through the same read interface — and mutating ops go to the overlay.
 func BindRW(ov *overlay.FS) fuse.RawFileSystem {
-	return newRaw(ov, ov)
+	return newRaw(ov, ov, nil)
+}
+
+// BindRWChecked is BindRW for a mount whose options pelfs did not choose;
+// see BindChecked and perm.go.
+func BindRWChecked(ov *overlay.FS) fuse.RawFileSystem {
+	cred := fsperm.ProcessCred()
+	return newRaw(ov, ov, &cred)
+}
+
+// BindRWCheckedAs is BindRWChecked with the identity named explicitly; see
+// BindCheckedAs.
+func BindRWCheckedAs(ov *overlay.FS, cred fsperm.Cred) fuse.RawFileSystem {
+	return newRaw(ov, ov, &cred)
 }
 
 // MountRW serves ov at mountpoint read-write and returns the running
 // server once the mount is complete.
 func MountRW(mountpoint string, ov *overlay.FS, debug bool) (*fuse.Server, error) {
+	if PassedFD(mountpoint) {
+		return mount(mountpoint, BindRWChecked(ov), debug, false)
+	}
 	return mount(mountpoint, BindRW(ov), debug, false)
 }
 
@@ -111,8 +128,12 @@ func (r *raw) Create(cancel <-chan struct{}, input *fuse.CreateIn, name string, 
 	if r.ov == nil {
 		return fuse.EROFS
 	}
+	ctx := ctxOf(cancel)
+	if st := r.mayCreateIn(ctx, &input.InHeader, input.NodeId); st != fuse.OK {
+		return st
+	}
 	r.dirty.mark(input.NodeId)
-	n, err := r.ov.Create(ctxOf(cancel), input.NodeId, name,
+	n, err := r.ov.Create(ctx, input.NodeId, name,
 		input.Mode&^uint32(syscall.S_IFMT), input.Uid, input.Gid)
 	if err != nil {
 		return errStatus(err)
@@ -134,6 +155,9 @@ func (r *raw) Mknod(cancel <-chan struct{}, input *fuse.MknodIn, name string, ou
 		return fuse.EINVAL // mknod of a directory or symlink
 	}
 	ctx := ctxOf(cancel)
+	if st := r.mayCreateIn(ctx, &input.InHeader, input.NodeId); st != fuse.OK {
+		return st
+	}
 	mode := input.Mode &^ uint32(syscall.S_IFMT)
 	r.dirty.mark(input.NodeId)
 	var n overlay.Node
@@ -155,8 +179,12 @@ func (r *raw) Mkdir(cancel <-chan struct{}, input *fuse.MkdirIn, name string, ou
 	if r.ov == nil {
 		return fuse.EROFS
 	}
+	ctx := ctxOf(cancel)
+	if st := r.mayCreateIn(ctx, &input.InHeader, input.NodeId); st != fuse.OK {
+		return st
+	}
 	r.dirty.mark(input.NodeId)
-	n, err := r.ov.Mkdir(ctxOf(cancel), input.NodeId, name,
+	n, err := r.ov.Mkdir(ctx, input.NodeId, name,
 		input.Mode&^uint32(syscall.S_IFMT), input.Uid, input.Gid)
 	if err != nil {
 		return errStatus(err)
@@ -170,8 +198,12 @@ func (r *raw) Symlink(cancel <-chan struct{}, header *fuse.InHeader, pointedTo, 
 	if r.ov == nil {
 		return fuse.EROFS
 	}
+	ctx := ctxOf(cancel)
+	if st := r.mayCreateIn(ctx, header, header.NodeId); st != fuse.OK {
+		return st
+	}
 	r.dirty.mark(header.NodeId)
-	n, err := r.ov.Symlink(ctxOf(cancel), header.NodeId, linkName, pointedTo, header.Uid, header.Gid)
+	n, err := r.ov.Symlink(ctx, header.NodeId, linkName, pointedTo, header.Uid, header.Gid)
 	if err != nil {
 		return errStatus(err)
 	}
@@ -211,8 +243,12 @@ func (r *raw) Link(cancel <-chan struct{}, input *fuse.LinkIn, name string, out 
 	if r.ov == nil {
 		return fuse.EROFS
 	}
+	ctx := ctxOf(cancel)
+	if st := r.mayCreateIn(ctx, &input.InHeader, input.NodeId); st != fuse.OK {
+		return st
+	}
 	r.dirty.mark(input.NodeId, input.Oldnodeid)
-	n, err := r.ov.Link(ctxOf(cancel), input.Oldnodeid, input.NodeId, name)
+	n, err := r.ov.Link(ctx, input.Oldnodeid, input.NodeId, name)
 	if err != nil {
 		return errStatus(err)
 	}
@@ -225,6 +261,9 @@ func (r *raw) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name string)
 		return fuse.EROFS
 	}
 	ctx := ctxOf(cancel)
+	if st := r.mayRemoveFrom(ctx, header, header.NodeId, name); st != fuse.OK {
+		return st
+	}
 	r.dirty.mark(header.NodeId)
 	if n, err := r.fs.Lookup(ctx, header.NodeId, name); err == nil {
 		// A surviving hardlink keeps the inode addressable, so its nlink
@@ -241,8 +280,12 @@ func (r *raw) Rmdir(cancel <-chan struct{}, header *fuse.InHeader, name string) 
 	if r.ov == nil {
 		return fuse.EROFS
 	}
+	ctx := ctxOf(cancel)
+	if st := r.mayRemoveFrom(ctx, header, header.NodeId, name); st != fuse.OK {
+		return st
+	}
 	r.dirty.mark(header.NodeId)
-	if err := r.ov.Rmdir(ctxOf(cancel), header.NodeId, name); err != nil {
+	if err := r.ov.Rmdir(ctx, header.NodeId, name); err != nil {
 		return errStatus(err)
 	}
 	return fuse.OK
@@ -260,6 +303,14 @@ func (r *raw) Rename(cancel <-chan struct{}, input *fuse.RenameIn, oldName, newN
 		return fuse.ENOSYS
 	}
 	ctx := ctxOf(cancel)
+	// Both ends: the name leaves one directory and enters another, and the
+	// sticky rule applies to the departure exactly as it does to an unlink.
+	if st := r.mayRemoveFrom(ctx, &input.InHeader, input.NodeId, oldName); st != fuse.OK {
+		return st
+	}
+	if st := r.mayRemoveFrom(ctx, &input.InHeader, input.Newdir, newName); st != fuse.OK {
+		return st
+	}
 	src, err := r.fs.Lookup(ctx, input.NodeId, oldName)
 	if err != nil {
 		return errStatus(err)
@@ -328,6 +379,10 @@ func (r *raw) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse.A
 	if r.ov == nil {
 		return fuse.EROFS
 	}
+	ctx := ctxOf(cancel)
+	if st := r.maySetAttr(ctx, input); st != fuse.OK {
+		return st
+	}
 	var in overlay.SetAttrIn
 	if mode, ok := input.GetMode(); ok {
 		in.Mode = &mode
@@ -348,7 +403,7 @@ func (r *raw) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse.A
 		in.MtimeNS = &ns
 	}
 	r.dirty.mark(input.NodeId)
-	n, err := r.ov.SetAttr(ctxOf(cancel), input.NodeId, in)
+	n, err := r.ov.SetAttr(ctx, input.NodeId, in)
 	if err != nil {
 		return errStatus(err)
 	}
@@ -381,8 +436,14 @@ func (r *raw) SetXAttr(cancel <-chan struct{}, input *fuse.SetXAttrIn, attr stri
 	if r.ov == nil {
 		return fuse.EROFS
 	}
+	ctx := ctxOf(cancel)
+	// The kernel's xattr_permission: setting or removing one costs write
+	// permission on the object.
+	if st := r.may(ctx, &input.InHeader, input.NodeId, fsperm.PermWrite); st != fuse.OK {
+		return st
+	}
 	r.dirty.mark(input.NodeId)
-	if err := r.ov.SetXattr(ctxOf(cancel), input.NodeId, attr, data); err != nil {
+	if err := r.ov.SetXattr(ctx, input.NodeId, attr, data); err != nil {
 		return errStatus(err)
 	}
 	return fuse.OK
@@ -392,8 +453,12 @@ func (r *raw) RemoveXAttr(cancel <-chan struct{}, header *fuse.InHeader, attr st
 	if r.ov == nil {
 		return fuse.EROFS
 	}
+	ctx := ctxOf(cancel)
+	if st := r.may(ctx, header, header.NodeId, fsperm.PermWrite); st != fuse.OK {
+		return st
+	}
 	r.dirty.mark(header.NodeId)
-	err := r.ov.RemoveXattr(ctxOf(cancel), header.NodeId, attr)
+	err := r.ov.RemoveXattr(ctx, header.NodeId, attr)
 	if errors.Is(err, genfs.ErrNotExist) {
 		// Absence of the attribute, not of the inode: the xattr protocol
 		// spells that ENODATA/ENOATTR.

@@ -18,6 +18,7 @@ package rawfuse
 import (
 	"context"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"errors"
@@ -29,6 +30,7 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 
 	"github.com/bbockelm/pelfs/internal/catalog"
+	"github.com/bbockelm/pelfs/internal/fsperm"
 	"github.com/bbockelm/pelfs/internal/genfs"
 	"github.com/bbockelm/pelfs/internal/idmap"
 	"github.com/bbockelm/pelfs/internal/overlay"
@@ -80,15 +82,37 @@ type reader interface {
 
 // Bind wraps a genfs generation as a read-only raw FUSE filesystem.
 func Bind(fs *genfs.FS) fuse.RawFileSystem {
-	return newRaw(fs, nil)
+	return newRaw(fs, nil, nil)
 }
 
-func newRaw(rd reader, ov *overlay.FS) *raw {
+// BindChecked is Bind for a mount whose options pelfs did not choose, so
+// nothing else is applying the mode bits: this binding enforces them
+// itself, as this process (perm.go). Mount does it for a passed /dev/fuse
+// descriptor.
+func BindChecked(fs *genfs.FS) fuse.RawFileSystem {
+	cred := fsperm.ProcessCred()
+	return newRaw(fs, nil, &cred)
+}
+
+// BindCheckedAs is BindChecked with the mount's identity named explicitly
+// rather than read from the process, for tests that must not depend on
+// whose uid ran them — the same reason internal/vfsbilly has NewAs. The
+// identity is both what requests from that uid are evaluated as AND what
+// the volume's own ownership is reported as, because a check against a
+// number the mount does not report is a check against a fiction.
+func BindCheckedAs(fs *genfs.FS, cred fsperm.Cred) fuse.RawFileSystem {
+	return newRaw(fs, nil, &cred)
+}
+
+func newRaw(rd reader, ov *overlay.FS, cred *fsperm.Cred) *raw {
 	r := &raw{
 		RawFileSystem: fuse.NewDefaultRawFileSystem(),
 		fs:            rd,
 		ov:            ov,
 		dirs:          make(map[uint64]*dirHandle),
+	}
+	if cred != nil {
+		r.perm = &checker{self: *cred}
 	}
 	if ov != nil {
 		r.dirty = newDirtySet(ov)
@@ -104,20 +128,53 @@ func newRaw(rd reader, ov *overlay.FS) *raw {
 	// the root of is one this cannot help, and uid 0 is the identity most
 	// worth mapping anyway.
 	if n, err := rd.GetAttr(context.Background(), genfs.RootInode); err == nil {
-		r.ids = idmap.Owner(n.UID, n.GID)
+		if cred != nil {
+			r.ids = idmap.OwnerTo(n.UID, n.GID, cred.UID, cred.GID)
+		} else {
+			r.ids = idmap.Owner(n.UID, n.GID)
+		}
 	}
 	return r
+}
+
+// PassedFD reports whether mountpoint is a /dev/fuse descriptor someone
+// else opened and mounted, rather than a directory to mount on: the
+// libfuse "magic mountpoint" convention, `/dev/fd/N`, which is how
+// apptainer invokes a `--fusemount` driver.
+//
+// go-fuse implements it (fuse/server.go, parseFuseFd) and this mirrors its
+// parse, because three things outside this package have to agree with it:
+// nothing may mkdir such a "directory", nothing may try to unmount it, and
+// the permission model has to know that the mount options went nowhere
+// (perm.go).
+func PassedFD(mountpoint string) bool {
+	rest, ok := strings.CutPrefix(mountpoint, "/dev/fd/")
+	if !ok {
+		return false
+	}
+	n, err := strconv.Atoi(rest)
+	return err == nil && n > 0
 }
 
 // Mount serves fs at mountpoint (Linux FUSE / macFUSE) read-only and
 // returns the running server once the mount is complete.
 func Mount(mountpoint string, fs *genfs.FS, debug bool) (*fuse.Server, error) {
+	if PassedFD(mountpoint) {
+		return mount(mountpoint, BindChecked(fs), debug, true)
+	}
 	return mount(mountpoint, Bind(fs), debug, true)
 }
 
 func mount(mountpoint string, rfs fuse.RawFileSystem, debug, readOnly bool) (*fuse.Server, error) {
 	// Access stays ENOSYS: with default_permissions the kernel checks
 	// permissions itself from the attrs it already holds.
+	//
+	// On a PASSED descriptor none of these options are applied — go-fuse
+	// skips fusermount and mount(2) both, since the mount already exists —
+	// so `ro` is enforced by the read-only binding refusing every mutating
+	// op with EROFS, and `default_permissions` by BindChecked. They are
+	// still requested here because they cost nothing and because the day
+	// go-fuse learns to re-mount a passed fd they should apply.
 	options := []string{"default_permissions"}
 	if readOnly {
 		options = append([]string{"ro"}, options...)
@@ -162,6 +219,9 @@ type raw struct {
 	ov *overlay.FS
 	// dirty is the TTL predicate, nil alongside ov.
 	dirty *dirtySet
+	// perm is non-nil when THIS process is the permission authority for
+	// the mount, which is the passed-fd case and nothing else (perm.go).
+	perm *checker
 
 	lastFh atomic.Uint64
 	mu     sync.Mutex
@@ -334,7 +394,14 @@ func (r *raw) fillEntry(n *genfs.Node, out *fuse.EntryOut) {
 }
 
 func (r *raw) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name string, out *fuse.EntryOut) fuse.Status {
-	n, err := r.fs.Lookup(ctxOf(cancel), header.NodeId, name)
+	ctx := ctxOf(cancel)
+	// Search permission on the parent, on a dentry-cache miss. See perm.go
+	// for why that is the whole of what a userspace server can enforce
+	// about a path walk, and what it therefore does not cover.
+	if st := r.may(ctx, header, header.NodeId, fsperm.PermExec); st != fuse.OK {
+		return st
+	}
+	n, err := r.fs.Lookup(ctx, header.NodeId, name)
 	if err != nil {
 		return errStatus(err)
 	}
@@ -368,6 +435,12 @@ func (r *raw) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenOut
 	if writable && r.ov == nil {
 		return fuse.EROFS
 	}
+	// The load-bearing check on a mount pelfs is checking itself: an open
+	// is never served from cache, so this is the one the kernel would have
+	// made and the one a read of a mode-denying file has to fail at.
+	if st := r.may(ctxOf(cancel), &input.InHeader, input.NodeId, openWant(input.Flags)); st != fuse.OK {
+		return st
+	}
 	out.Fh = 0
 	if !writable && !r.isDirty(input.NodeId) {
 		out.OpenFlags |= fuse.FOPEN_KEEP_CACHE
@@ -390,7 +463,11 @@ func (r *raw) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {}
 // OpenDir lists once per opendir: the merged listing is snapshotted on the
 // handle and paged by ReadDir/ReadDirPlus.
 func (r *raw) OpenDir(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenOut) fuse.Status {
-	entries, err := r.fs.Readdir(ctxOf(cancel), input.NodeId)
+	ctx := ctxOf(cancel)
+	if st := r.may(ctx, &input.InHeader, input.NodeId, fsperm.PermRead); st != fuse.OK {
+		return st
+	}
+	entries, err := r.fs.Readdir(ctx, input.NodeId)
 	if err != nil {
 		return errStatus(err)
 	}

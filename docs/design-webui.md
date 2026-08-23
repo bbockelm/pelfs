@@ -2725,11 +2725,13 @@ bird untouched so the mark stays recognizable:
    place a compound mark earns its keep, because there is no room for a
    wordmark.
 
-Whichever is chosen: **the page must say what pelfs is not.** One line in
-the footer — "an independent tool for Pelican federations; not an official
-Pelican Platform product" — costs nothing and prevents the one
-misunderstanding a borrowed mark can cause. The permission covers using the
-mark; it does not make pelfs the product.
+Whichever is chosen, this document argued that **the page must say what
+pelfs is not** — one line in the footer, "an independent tool for Pelican
+federations; not an official Pelican Platform product". **It does not, and
+that was decided by the person whose call it is:** the Pelican Project's PI,
+who granted the permission, asked for the footer off the page. The
+attribution is not gone, only off the screen, where nobody was reading it;
+see below for where it lives.
 
 **What shipped: option 1, and no redraw.** `webui/frontend/public/brand/`
 holds the mark copied **byte for byte** from the pelican tree, with a
@@ -2738,7 +2740,16 @@ permission, and the fact that it has not been traced, redrawn or altered.
 The favicon is **type only** — a rounded square in `#0885ff` carrying the
 `fs` — so no derivative of the bird exists anywhere in this repository.
 Option 2, the compound favicon, is where a real vector mark would go if one
-is ever supplied; the file says so. The footer line is in `BrandFooter`.
+is ever supplied; the file says so.
+
+**And there is no footer.** `NOTICE.txt` is what carries the attribution and
+the permission, it ships beside the asset it is about, and the binary serves
+it at `/brand/NOTICE.txt` — asserted by `internal/webui/webui_test.go`, so it
+cannot quietly stop travelling with the mark. The repository's own `NOTICE`
+says the same thing. What the deleted footer was carrying that IS an
+obligation rather than a statement — the MIT notices for the 30 bundled
+packages — moved to the app's status line, because a person who has nothing
+but the binary has to be able to reach them from what it serves.
 
 ---
 

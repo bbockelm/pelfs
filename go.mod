@@ -10,6 +10,7 @@ require (
 	github.com/pelicanplatform/pelican v0.0.0-20260823003933-d01f207b7f71
 	github.com/willscott/go-nfs v0.0.4
 	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78
+	golang.org/x/net v0.56.0
 	golang.org/x/sys v0.47.0
 	golang.org/x/term v0.45.0
 	lukechampine.com/blake3 v1.4.1
@@ -113,7 +114,6 @@ require (
 	go.uber.org/multierr v1.11.0 // indirect
 	golang.org/x/arch v0.11.0 // indirect
 	golang.org/x/crypto v0.54.0 // indirect
-	golang.org/x/net v0.56.0 // indirect
 	golang.org/x/oauth2 v0.34.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/text v0.40.0 // indirect
@@ -142,3 +142,17 @@ require (
 // pelfs-nfs-fixes of https://github.com/bbockelm/go-nfs, based on
 // upstream master, whose commits are written to be offered upstream.
 replace github.com/willscott/go-nfs => github.com/bbockelm/go-nfs v0.0.5-0.20260822135043-13c05601d32d
+
+// PR 3672 (PelicanPlatform/pelican, "Allow callback-based overrides of the
+// device code handler") is OPEN, and pelfs needs what it adds:
+// oauth2.SetVerificationURLHandler, the hook that lets `pelfs browse` show a
+// federation device-flow prompt in the page instead of printing a URL to a
+// terminal nobody is watching (docs/design-webui.md, U13).
+//
+// This pins the PR's own head commit on the fork it is proposed from, rather
+// than a local path, so CI can fetch it -- the integration job builds a whole
+// pelican server from whatever this resolves to. DROP THIS the moment 3672
+// merges: the pin sits two commits past what go.mod required before it
+// (d01f207b7f71), the change is purely additive, and a rebasable fork branch
+// has stranded a pin here once already.
+replace github.com/pelicanplatform/pelican => github.com/bbockelm/pelican v0.0.0-20260823165605-e55347e5a951

@@ -214,36 +214,65 @@ func report(op, path, told string, err error) {
 // RPCs the mount supports. What is filtered, and why, is finderfiles.go.
 func diagnose(fs billy.Filesystem, hide func(string) bool) billy.Filesystem {
 	d := diagFS{Filesystem: fs, hide: hide}
-	// None of billy.Change, nfs.HardLinker or nfs.PermissionChecker is
-	// part of billy.Filesystem, and go-nfs decides whether SETATTR, LINK
-	// and an honest ACCESS are available at all by type-asserting for
-	// them. A wrapper that always implemented them would claim support the
-	// wrapped filesystem does not have -- and for the permission checker
-	// that is not merely a claim: go-nfs would ask a wrapper that cannot
-	// answer, and every ACCESS would come back denying everything. So the
-	// assertions are answered by which type is returned, one shape per
-	// combination.
+	// None of billy.Change, nfs.HardLinker, nfs.PermissionChecker or
+	// nfs.Committer is part of billy.Filesystem, and go-nfs decides
+	// whether SETATTR, LINK, an honest ACCESS and a real COMMIT are
+	// available at all by type-asserting for them. A wrapper that always
+	// implemented them would claim support the wrapped filesystem does not
+	// have -- and for two of the four that is not merely a claim. go-nfs
+	// would ask a permission checker that cannot answer, and every ACCESS
+	// would come back denying everything; it would take a Committer to
+	// mean the filesystem BUFFERS, and start answering UNSTABLE to writes
+	// while the commit that was supposed to redeem them did nothing. So
+	// the assertions are answered by which type is returned, one shape per
+	// combination. Sixteen of them, which is the honest cost of four
+	// independent optional interfaces in a language with no dynamic
+	// composition; the alternative is a wrapper that lies about one.
+	//
+	// The hide filter cuts across all sixteen because it lives in diagFS,
+	// which every shape embeds; the two halves that carry their own
+	// methods and so need it passed in are diagLinker (a hidden name
+	// cannot be linked TO) and, deliberately, not diagCommitter -- see
+	// there.
 	ch, changeable := fs.(billy.Change)
 	ln, linkable := fs.(nfs.HardLinker)
 	pc, checks := fs.(nfs.PermissionChecker)
+	cm, commits := fs.(nfs.Committer)
 	c := diagChangeFS{diagFS: d, ch: ch}
 	l := diagLinker{ln: ln, hide: hide}
 	p := diagPermitter{pc}
+	m := diagCommitter{cm}
 	switch {
+	case changeable && linkable && checks && commits:
+		return &diagChangeLinkPermCommitFS{c, l, p, m}
 	case changeable && linkable && checks:
 		return &diagChangeLinkPermFS{c, l, p}
+	case changeable && linkable && commits:
+		return &diagChangeLinkCommitFS{c, l, m}
+	case changeable && checks && commits:
+		return &diagChangePermCommitFS{c, p, m}
+	case linkable && checks && commits:
+		return &diagLinkPermCommitFS{d, l, p, m}
 	case changeable && linkable:
 		return &diagChangeLinkFS{c, l}
 	case changeable && checks:
 		return &diagChangePermFS{c, p}
+	case changeable && commits:
+		return &diagChangeCommitFS{c, m}
 	case linkable && checks:
 		return &diagLinkPermFS{d, l, p}
+	case linkable && commits:
+		return &diagLinkCommitFS{d, l, m}
+	case checks && commits:
+		return &diagPermCommitFS{d, p, m}
 	case changeable:
 		return &c
 	case linkable:
 		return &diagLinkFS{d, l}
 	case checks:
 		return &diagPermFS{d, p}
+	case commits:
+		return &diagCommitFS{d, m}
 	}
 	return &d
 }
@@ -308,6 +337,28 @@ func (d diagPermitter) Permitted(path string) (nfs.Permission, error) {
 	return p, explain("access", path, toldEIO, err)
 }
 
+// diagCommitter carries the COMMIT half. go-nfs places ENOSPC, EDQUOT and
+// EFBIG from a commit (statusFromWriteError, the same mapping the write
+// path uses) and answers NFS3ERR_IO for everything else, so the explainer
+// applies here exactly as it does elsewhere -- and it matters more than
+// most: a COMMIT is the only reply an application's fsync(2) is waiting
+// on, so an unexplained EIO there is an fsync failure with no cause
+// recorded anywhere.
+//
+// NO HIDE FILTER, unlike diagLinker. A COMMIT is issued against a file the
+// client already has a handle for, and on a mount with a filter there is
+// no way to get one for a hidden name: Create and an O_CREATE OpenFile
+// refuse it, Open and Lookup say it does not exist, and ReadDir does not
+// list it. A check here would be unreachable code claiming to be a
+// defence.
+type diagCommitter struct {
+	cm nfs.Committer
+}
+
+func (d diagCommitter) Commit(path string) error {
+	return explain("commit", path, toldEIO, d.cm.Commit(path))
+}
+
 type diagLinkFS struct {
 	diagFS
 	diagLinker
@@ -316,6 +367,11 @@ type diagLinkFS struct {
 type diagPermFS struct {
 	diagFS
 	diagPermitter
+}
+
+type diagCommitFS struct {
+	diagFS
+	diagCommitter
 }
 
 type diagChangeLinkFS struct {
@@ -328,10 +384,27 @@ type diagChangePermFS struct {
 	diagPermitter
 }
 
+type diagChangeCommitFS struct {
+	diagChangeFS
+	diagCommitter
+}
+
 type diagLinkPermFS struct {
 	diagFS
 	diagLinker
 	diagPermitter
+}
+
+type diagLinkCommitFS struct {
+	diagFS
+	diagLinker
+	diagCommitter
+}
+
+type diagPermCommitFS struct {
+	diagFS
+	diagPermitter
+	diagCommitter
 }
 
 type diagChangeLinkPermFS struct {
@@ -340,21 +413,67 @@ type diagChangeLinkPermFS struct {
 	diagPermitter
 }
 
+type diagChangeLinkCommitFS struct {
+	diagChangeFS
+	diagLinker
+	diagCommitter
+}
+
+type diagChangePermCommitFS struct {
+	diagChangeFS
+	diagPermitter
+	diagCommitter
+}
+
+type diagLinkPermCommitFS struct {
+	diagFS
+	diagLinker
+	diagPermitter
+	diagCommitter
+}
+
+type diagChangeLinkPermCommitFS struct {
+	diagChangeFS
+	diagLinker
+	diagPermitter
+	diagCommitter
+}
+
 var (
 	_ billy.Filesystem      = (*diagFS)(nil)
 	_ billy.Capable         = (*diagFS)(nil)
 	_ billy.Change          = (*diagChangeFS)(nil)
 	_ billy.Change          = (*diagChangeLinkFS)(nil)
 	_ billy.Change          = (*diagChangePermFS)(nil)
+	_ billy.Change          = (*diagChangeCommitFS)(nil)
 	_ billy.Change          = (*diagChangeLinkPermFS)(nil)
+	_ billy.Change          = (*diagChangeLinkCommitFS)(nil)
+	_ billy.Change          = (*diagChangePermCommitFS)(nil)
+	_ billy.Change          = (*diagChangeLinkPermCommitFS)(nil)
 	_ nfs.HardLinker        = (*diagLinkFS)(nil)
 	_ nfs.HardLinker        = (*diagChangeLinkFS)(nil)
 	_ nfs.HardLinker        = (*diagLinkPermFS)(nil)
+	_ nfs.HardLinker        = (*diagLinkCommitFS)(nil)
 	_ nfs.HardLinker        = (*diagChangeLinkPermFS)(nil)
+	_ nfs.HardLinker        = (*diagChangeLinkCommitFS)(nil)
+	_ nfs.HardLinker        = (*diagLinkPermCommitFS)(nil)
+	_ nfs.HardLinker        = (*diagChangeLinkPermCommitFS)(nil)
 	_ nfs.PermissionChecker = (*diagPermFS)(nil)
 	_ nfs.PermissionChecker = (*diagChangePermFS)(nil)
 	_ nfs.PermissionChecker = (*diagLinkPermFS)(nil)
+	_ nfs.PermissionChecker = (*diagPermCommitFS)(nil)
 	_ nfs.PermissionChecker = (*diagChangeLinkPermFS)(nil)
+	_ nfs.PermissionChecker = (*diagChangePermCommitFS)(nil)
+	_ nfs.PermissionChecker = (*diagLinkPermCommitFS)(nil)
+	_ nfs.PermissionChecker = (*diagChangeLinkPermCommitFS)(nil)
+	_ nfs.Committer         = (*diagCommitFS)(nil)
+	_ nfs.Committer         = (*diagChangeCommitFS)(nil)
+	_ nfs.Committer         = (*diagLinkCommitFS)(nil)
+	_ nfs.Committer         = (*diagPermCommitFS)(nil)
+	_ nfs.Committer         = (*diagChangeLinkCommitFS)(nil)
+	_ nfs.Committer         = (*diagChangePermCommitFS)(nil)
+	_ nfs.Committer         = (*diagLinkPermCommitFS)(nil)
+	_ nfs.Committer         = (*diagChangeLinkPermCommitFS)(nil)
 )
 
 // Capabilities is forwarded explicitly: it is not part of

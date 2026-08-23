@@ -193,6 +193,67 @@ answer() {
 # holds: root WITH CAP_DAC_OVERRIDE may write a 0444 file and root without
 # it may not, and both are correct. A gate that hardcoded either one would
 # be wrong in the other container.
+# nfs_op_count <mountpoint> <PROCEDURE> — how many of that NFSv3 procedure
+# the kernel client has sent on this mount. /proc/self/mountstats is the
+# client's own per-operation ledger, so it is evidence about the WIRE and
+# not about either end's intentions.
+nfs_op_count() {
+  local n
+  n=$(awk -v mp="mounted on $1 " -v op="$2:" '
+        /^device / { m = (index($0, mp) > 0) }
+        m && $1 == op { print $2; exit }
+      ' /proc/self/mountstats)
+  echo "${n:-0}"
+}
+
+# commit_gate <mount root> — fsync(2) on an NFS mount must reach the
+# filesystem, and the only proof of that is on the wire.
+#
+# THE DEFECT THIS PINS WAS NOT IN COMMIT (KI-10). go-nfs's COMMIT handler
+# was a documented no-op, but it was also DEAD CODE: onWrite wrote the
+# constant FILE_SYNC into the stability field of every WRITE reply,
+# whatever the client asked for. A Linux client believes that field — it
+# queues a page for commit only when the reply said UNSTABLE
+# (nfs_write_completion) — so it never sent a COMMIT at all. Measured on
+# this gate's own container before the fix:
+#
+#   after dd conv=fsync:   WRITE=2 COMMIT=0
+#
+# and after:               WRITE=2 COMMIT=1
+#
+# So the assertion is that a COMMIT is SENT, which is a statement about
+# what the WRITE replies claimed, and it is the one thing here that a
+# mutation to either half changes.
+#
+# WHAT THIS GATE DELIBERATELY DOES NOT CLAIM. The caller kills the server
+# and remounts the state directory, and the bytes are there — but they are
+# there WITHOUT the fix too, and saying so is the honest version. pelfs
+# writes each WRITE through to an mmap'd ring and a SQLite database before
+# the reply, and both are file-backed, so a PROCESS death cannot take
+# them. What fsync buys is survival of a MACHINE crash, which no container
+# can stage. The remount leg below is therefore a regression check on
+# recovery, not the proof of durability; the COMMIT count is the proof.
+commit_gate() {
+  local root="$1"
+  local before after
+
+  before=$(nfs_op_count "$root" COMMIT)
+  dd if=/dev/urandom of="$root/fsynced.bin" bs=64k count=32 conv=fsync 2>/dev/null || {
+    echo "nfs: dd conv=fsync failed on the mount" >&2; exit 1; }
+  sync "$root/fsynced.bin" || { echo "nfs: fsync of a file failed" >&2; exit 1; }
+  sync "$root" || { echo "nfs: fsync of a directory failed" >&2; exit 1; }
+  after=$(nfs_op_count "$root" COMMIT)
+
+  if [ "$after" -le "$before" ]; then
+    echo "nfs: fsync(2) through the mount sent NO COMMIT (count $before -> $after," >&2
+    echo "    WRITEs $(nfs_op_count "$root" WRITE)). The server is claiming FILE_SYNC for" >&2
+    echo "    writes it has only buffered, so the client has nothing to commit and" >&2
+    echo "    fsync returns success having made nothing durable. This is KI-10." >&2
+    exit 1
+  fi
+  echo "   fsync over NFS sent $((after - before)) COMMIT(s) for $(nfs_op_count "$root" WRITE) WRITEs"
+}
+
 permission_gate() {
   local label="$1" root="$2"
   local d="$root/permgate" ref="$WORK/permref" src="$WORK/permsrc"
@@ -721,6 +782,50 @@ done
 }
 deletion_gate "nfs" "$WORK/nfsmnt"
 permission_gate "nfs" "$WORK/nfsmnt"
+
+echo "== fsync: a COMMIT reaches the filesystem, and the session survives a kill -9 =="
+commit_gate "$WORK/nfsmnt"
+FSYNCED_SHA=$(sha256sum "$WORK/nfsmnt/fsynced.bin" | cut -d" " -f1)
+
+# Kill the server WITHOUT a clean unmount -- no seal, no lease release, no
+# umount -- and bring the same state directory back up.
+kill -9 "$NFS_PID" 2>/dev/null || true
+wait "$NFS_PID" 2>/dev/null || true
+NFS_PID=
+umount -f "$WORK/nfsmnt" 2>/dev/null || umount -l "$WORK/nfsmnt" 2>/dev/null || true
+# --steal-lease because the killed session never released its own: the
+# branch lease is held until it expires, and this is the same state
+# directory coming back, not a second writer.
+"$WORK/pelfs" mount-gen --rw --no-seal --steal-lease --backend nfs \
+  --state-dir "$WORK/state-del-nfs" "$PREFIX" "$WORK/nfsmnt" 2>"$WORK/nfs-recommit.log" &
+NFS_PID=$!
+up=0
+for _ in $(seq 200); do
+  mountpoint -q "$WORK/nfsmnt" && { up=1; break; }
+  kill -0 "$NFS_PID" 2>/dev/null || break
+  sleep 0.1
+done
+[ "$up" = "1" ] || {
+  echo "the remount after kill -9 did not come up:" >&2
+  sed 's/^/    /' "$WORK/nfs-recommit.log" >&2
+  exit 1
+}
+[ -f "$WORK/nfsmnt/fsynced.bin" ] || {
+  echo "the file fsync(2) reported durable is GONE after a kill -9 and a remount" >&2
+  sed 's/^/    /' "$WORK/nfs-recommit.log" >&2
+  exit 1
+}
+[ "$(sha256sum "$WORK/nfsmnt/fsynced.bin" | cut -d" " -f1)" = "$FSYNCED_SHA" ] || {
+  echo "the fsync'd file came back with different content after a kill -9" >&2
+  exit 1
+}
+grep -q "recovered .* extents from the previous session" "$WORK/nfs-recommit.log" || {
+  echo "the remount after a kill -9 said nothing about recovering the previous session" >&2
+  sed 's/^/    /' "$WORK/nfs-recommit.log" >&2
+  exit 1
+}
+echo "   the fsync'd bytes came back byte-exact after a kill -9 and a remount"
+
 unmount_at "$WORK/nfsmnt"
 kill "$NFS_PID" 2>/dev/null || true
 wait "$NFS_PID" 2>/dev/null || true

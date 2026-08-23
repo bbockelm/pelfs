@@ -17,6 +17,7 @@
 //	pelfs repack-plan <prefix>       report what a repack would rewrite
 //	pelfs repack [--apply] <prefix>  rewrite mostly-dead packs, publish a generation
 //	pelfs cache  [clear] <prefix>    show, or free, the local cache
+//	pelfs browse [--rw] <prefix>     a page on 127.0.0.1: durability, and publish
 //	pelfs rotate [--apply] <prefix>  replace the volume signing key
 //	pelfs rescue [--apply] <prefix>  rebuild refs from packs after a disaster
 package main
@@ -71,6 +72,8 @@ func main() {
 		code = cmdRepack(os.Args[2:])
 	case "cache":
 		code = cmdCache(os.Args[2:])
+	case "browse":
+		code = cmdBrowse(os.Args[2:])
 	case "rotate":
 		code = cmdRotate(os.Args[2:])
 	case "rescue":
@@ -98,8 +101,10 @@ Usage:
   pelfs shell  [flags] <prefix>                           mount + subshell
   pelfs shell  [flags] <prefix> -- <command> [args...]    mount + run one command
   pelfs mount  [flags] [--rw] <prefix> [mountpoint]       background mount
-  pelfs umount <prefix-or-mountpoint>                     stop a background mount
-  pelfs status                                            list background mounts
+  pelfs umount [--state-dir d] <prefix-or-mountpoint>     stop a background mount
+  pelfs status [--state-dir d]                            list background mounts
+                                                          (--state-dir where the session
+                                                          was started with one)
   pelfs gc     [flags] [--delete] <prefix>                sweep unreferenced packs
   pelfs tag    [flags] <prefix> <name>                    freeze the branch head under
                                                           a name, retained until --rm
@@ -125,6 +130,10 @@ Usage:
                                                           publish a generation
   pelfs cache  [clear] [flags] <prefix>                   show (or free) the local
                                                           cache this volume is using
+  pelfs browse [--rw] [--open] [flags] <prefix>           serve a page on 127.0.0.1 that
+                                                          says what is published and what
+                                                          is only on this machine, with a
+                                                          publish button; Ctrl-C seals
   pelfs rotate [--apply] [flags] <prefix>                 replace the volume signing key
                                                           through the custody chain; reports
                                                           what it would break by default
@@ -286,6 +295,13 @@ func parseArgsWithCommand(name string, args []string, minPos, maxPos int, extra 
 // thing this function knows: "no" without it sends a user to install a
 // package they already have.
 func fuseUsable() (bool, string) {
+	// ASKED OF THE BUILD FIRST, not of runtime.GOOS. A Windows build has
+	// no FUSE frontend compiled into it at all (cmd/pelfs/fusefront.go),
+	// so there is nothing for the probes below to probe, and the honest
+	// answer names the missing dependency rather than the platform.
+	if !fuseBuilt {
+		return false, fuseUnsupported
+	}
 	switch runtime.GOOS {
 	case "darwin":
 		if _, err := os.Stat("/Library/Filesystems/macfuse.fs"); err != nil {
@@ -330,6 +346,17 @@ func resolveBackend(o *cmdOpts) (string, error) {
 		if runtime.GOOS == "darwin" {
 			return "nfs", nil
 		}
+		// Windows before the Linux advice below, which is about privilege
+		// and would be nonsense here: there is no FUSE frontend in this
+		// binary and no NFS one either, so nothing this user can do to
+		// their host makes `pelfs mount` work. Everything that does not
+		// mount — publish, fsck, gc, repack, cache, status — does work, and
+		// saying so is the difference between a dead end and a limitation.
+		if runtime.GOOS == "windows" {
+			return "", fmt.Errorf("cannot mount on Windows: %s. "+
+				"pelfs has no Windows frontend yet, so `mount` and `shell` are the two commands "+
+				"that do not work here; everything that does not attach a filesystem does", why)
+		}
 		// NOT "or use --backend nfs". On Linux the loopback-NFS backend
 		// needs mount(2), which needs CAP_SYS_ADMIN, so advising it here
 		// sends an unprivileged user — the only kind that reaches this
@@ -370,6 +397,10 @@ func exitErr(err error) int {
 // there works with no privilege and no kernel extension, so it really is
 // the thing to try when macFUSE is absent.
 func mountAdvice(backend string) string {
+	if runtime.GOOS == "windows" {
+		return " (pelfs has no Windows frontend: the FUSE binding is Unix-only and the NFS backend " +
+			"drives the platform's own mount client, which pelfs does not speak on Windows)"
+	}
 	if runtime.GOOS == "darwin" && backend != "nfs" {
 		return " (macFUSE is not installed or not loaded; try --backend nfs, which needs no kernel extension)"
 	}

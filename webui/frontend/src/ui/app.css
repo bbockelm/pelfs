@@ -1,0 +1,182 @@
+/*
+ * The app's own chrome: the header, the durability panel, the notices and the
+ * status line. Everything inside the file manager is the component's.
+ *
+ * The colours come from src/brand/brand.css, which reads the Pelican
+ * Platform's palette from its own source. The two durability colours are
+ * pelfs's own and deliberately NOT shades of the brand blue -- the whole
+ * point of the panel is that "on this machine only" and "in the federation"
+ * are unmistakably different.
+ */
+
+.pelfs-app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.pelfs-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+  padding: 0.6rem 1rem;
+  border-bottom: 1px solid var(--pelfs-rule);
+}
+
+.pelfs-header__right {
+  display: flex;
+  align-items: baseline;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.pelfs-sub,
+.pelfs-muted {
+  color: var(--pelfs-ink-muted);
+  font-size: 0.82rem;
+}
+
+.pelfs-badge {
+  font-size: 0.78rem;
+  padding: 0.12rem 0.5rem;
+  border-radius: 999px;
+  background: var(--pelfs-primary-light);
+  color: #10365e;
+  white-space: nowrap;
+}
+
+/* ---- durability ------------------------------------------------------- */
+
+.pelfs-durability {
+  padding: 0.8rem 1rem 0.6rem;
+  border-bottom: 1px solid var(--pelfs-rule);
+}
+
+.pelfs-durability__line {
+  margin: 0 0 0.4rem;
+  font-size: 1rem;
+}
+
+.pelfs-glyph {
+  font-weight: 700;
+  margin-right: 0.35rem;
+}
+
+.pelfs-glyph--staged {
+  color: var(--pelfs-local-only);
+}
+
+.pelfs-glyph--sending {
+  color: var(--pelfs-primary);
+}
+
+.pelfs-glyph--published {
+  color: var(--pelfs-federated);
+}
+
+.pelfs-legend {
+  display: flex;
+  gap: 1.4rem;
+  flex-wrap: wrap;
+  color: var(--pelfs-ink-muted);
+  font-size: 0.82rem;
+  margin-bottom: 0.6rem;
+}
+
+.pelfs-publishrow {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  flex-wrap: wrap;
+}
+
+.pelfs-button {
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  background: var(--pelfs-primary);
+  color: #fff;
+  border: 1px solid #036;
+  border-radius: 0.35rem;
+  padding: 0.4rem 0.9rem;
+}
+
+.pelfs-button:disabled {
+  background: #e8ebee;
+  color: #8b949e;
+  border-color: var(--pelfs-rule);
+  cursor: not-allowed;
+}
+
+.pelfs-button--quiet {
+  background: transparent;
+  color: var(--pelfs-primary);
+  border-color: var(--pelfs-primary);
+}
+
+/* ---- notices and banners --------------------------------------------- */
+
+.pelfs-notices {
+  padding: 0.5rem 1rem 0;
+}
+
+.pelfs-notice {
+  margin: 0 0 0.35rem;
+  font-size: 0.85rem;
+  color: var(--pelfs-ink-muted);
+  max-width: 62rem;
+}
+
+.pelfs-notice--cap,
+.pelfs-notice--staged {
+  color: var(--pelfs-ink);
+  border-left: 3px solid var(--pelfs-local-only);
+  padding-left: 0.6rem;
+}
+
+.pelfs-banner {
+  margin: 0.6rem 1rem;
+  padding: 0.6rem 0.8rem;
+  border-radius: 0.4rem;
+  background: var(--pelfs-primary-light);
+  border: 1px solid #a9cdf7;
+  font-size: 0.9rem;
+}
+
+.pelfs-banner--warn {
+  background: #fdf3e3;
+  border-color: #e6c98a;
+  color: #4a3208;
+}
+
+.pelfs-banner--bad {
+  background: #fdecec;
+  border-color: #e9a7a7;
+  color: #5a1616;
+}
+
+/* ---- the grid, and the line under it --------------------------------- */
+
+.pelfs-main {
+  flex: 1;
+  min-height: 0;
+}
+
+.pelfs-main--prose {
+  padding: 1.5rem 1rem;
+  max-width: 44rem;
+}
+
+.pelfs-statusline {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+  align-items: baseline;
+  padding: 0.4rem 1rem;
+  border-top: 1px solid var(--pelfs-rule);
+  font-size: 0.8rem;
+  color: var(--pelfs-ink-muted);
+}

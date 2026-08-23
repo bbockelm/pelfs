@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/go-git/go-billy/v5"
-	"github.com/hanwen/go-fuse/v2/fuse"
 
 	"github.com/bbockelm/pelfs/internal/chunkid"
 	"github.com/bbockelm/pelfs/internal/control"
@@ -30,7 +29,6 @@ import (
 	"github.com/bbockelm/pelfs/internal/overlay"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/publish"
-	"github.com/bbockelm/pelfs/internal/rawfuse"
 	"github.com/bbockelm/pelfs/internal/refs"
 	"github.com/bbockelm/pelfs/internal/repack"
 	"github.com/bbockelm/pelfs/internal/scratch"
@@ -102,10 +100,19 @@ func newSessionID() string {
 // next seal grows from. A mid-session checkpoint advances it, which is the
 // only state a checkpoint changes (see checkpoint).
 type genSession struct {
-	prefix     string
-	branch     string
-	tag        string
-	stateDir   string
+	prefix   string
+	branch   string
+	tag      string
+	stateDir string
+	// stateRoot is the root this invocation's flags select — the same
+	// answer cmdOpts.stateRoot gives — and it is where the mount record
+	// goes. It is a FIELD rather than a call to defaultStateRoot() from
+	// publishMountRecord because that call was the bug: a session pointed
+	// entirely at a temp directory still created a vol-<id> directory in
+	// the user's home for its record. Empty in a session built without
+	// one (a test); publishMountRecord then falls back to stateDir, never
+	// to the home directory.
+	stateRoot  string
 	mountpoint string
 	backend    string
 	sessionID  string
@@ -246,6 +253,9 @@ type genArgs struct {
 	// Linux user has always got.
 	finder     bool
 	volumeName string
+	// background is set only by the `pelfs mount` daemon child, and it
+	// decides ONE thing: where the mount record goes. See registryRoot.
+	background bool
 }
 
 // registerFinderFlags puts --finder and --volume-name on a command that
@@ -318,7 +328,7 @@ func cmdMountGen(args []string) int {
 	if len(command) > 0 {
 		a.subshell = true
 	}
-	if rawfuse.PassedFD(pos[1]) {
+	if fusePassedFD(pos[1]) {
 		if a.subshell {
 			return exitErr(fmt.Errorf("a passed /dev/fuse descriptor (%s) has no path to run a command in: "+
 				"the parent that opened it owns the mountpoint, and this process never learns where it is. "+
@@ -547,6 +557,7 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		branch:         branch,
 		tag:            tag,
 		stateDir:       stateDir,
+		stateRoot:      registryRoot(o, a.background),
 		mountpoint:     mountpoint,
 		backend:        backend,
 		sessionID:      newSessionID(),
@@ -736,14 +747,14 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	// `/dev/fd/3` is `ENOTDIR` — which is exactly how a --fusemount driver
 	// used to die before it ever reached the mount (docs/design-apptainer.md,
 	// W1).
-	passedFD := rawfuse.PassedFD(mountpoint)
+	passedFD := fusePassedFD(mountpoint)
 	if !passedFD {
 		if err := os.MkdirAll(mountpoint, 0755); err != nil {
 			return fail(err)
 		}
 	}
 
-	var srv *fuse.Server
+	var srv fuseServer
 	var nfsSrv *nfsmount.Server
 	if rw {
 		// The write path: a crash-safe local overlay shadows the immutable
@@ -807,9 +818,9 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		}
 	case "fuse", "":
 		if rw {
-			srv, err = rawfuse.MountRW(mountpoint, g.ov, o.debug)
+			srv, err = fuseMountRW(mountpoint, g.ov, o.debug)
 		} else {
-			srv, err = rawfuse.Mount(mountpoint, g.gfs, o.debug)
+			srv, err = fuseMount(mountpoint, g.gfs, o.debug)
 		}
 	default:
 		return fail(fmt.Errorf("unknown --backend %q (want fuse or nfs)", backend))
@@ -917,7 +928,7 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	if poll > 0 && nfsSrv != nil {
 		ui.Info("--poll ignored with --backend nfs (NFS caching is client-driven; there is no invalidation channel to push to)")
 	} else if poll > 0 && !rw && tag == "" {
-		r := rawfuse.NewRefresher(g.gfs, srv, func(c context.Context) (*superblock.Superblock, error) {
+		r := srv.NewRefresher(g.gfs, func(c context.Context) (*superblock.Superblock, error) {
 			f, err := rstore.Fetch(c, branch)
 			if err != nil {
 				return nil, err
@@ -1291,9 +1302,9 @@ func (g *genSession) runPrefetch(ctx context.Context, mode string) error {
 }
 
 // follow drives the live-refresh poller and counts the swaps it applied.
-// rawfuse.Refresher.Run does the polling but reports only to the log; the
+// The frontend's own Run does the polling but reports only to the log; the
 // swap count belongs in the session statistics.
-func (g *genSession) follow(ctx context.Context, r *rawfuse.Refresher, every time.Duration) {
+func (g *genSession) follow(ctx context.Context, r fuseRefresher, every time.Duration) {
 	tick := time.NewTicker(every)
 	defer tick.Stop()
 	for {
@@ -1384,6 +1395,9 @@ func writeStats(store *memtable.Store) *stats.WriteStats {
 		UploadedBytes:  st.UploadedBytes,
 		UploadedChunks: st.UploadedChunks,
 		DedupedChunks:  st.DedupedChunks,
+
+		BaseDedupedChunks: st.BaseDedupedChunks,
+		BaseDedupedBytes:  st.BaseDedupedBytes,
 	}
 }
 
@@ -1604,20 +1618,6 @@ func (g *genSession) reportTeardown() {
 	g.down.report(g.down.sentence("torn down"))
 }
 
-// processCPU is this process's user+system time. Seals are mostly
-// chunking and SQLite, so CPU well below wall time points at the network
-// and CPU near wall time points at us.
-func processCPU() time.Duration {
-	var ru syscall.Rusage
-	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {
-		return 0
-	}
-	tv := func(t syscall.Timeval) time.Duration {
-		return time.Duration(t.Sec)*time.Second + time.Duration(t.Usec)*time.Microsecond
-	}
-	return tv(ru.Utime) + tv(ru.Stime)
-}
-
 // sealLocked publishes the overlay as the next generation. follow says
 // whether the MOUNT should then be moved onto what was published: true
 // for a mid-session checkpoint, which keeps serving afterwards, and false
@@ -1831,6 +1831,7 @@ func (g *genSession) sealLocked(ctx context.Context, follow bool) (*publish.Resu
 		ph.Seals++
 		sum.SealedGeneration = res.Superblock.Generation
 		sum.SealedChunks = int64(res.Stats.ChunksAdded)
+		sum.SealedDedupedChunks = int64(res.Stats.ChunksDeduped)
 		sum.SealedCatalogs = int64(res.Stats.Catalogs)
 		sum.SealedPacks = int64(len(res.NewPacks))
 	})
@@ -2534,6 +2535,17 @@ func (g *genSession) startControl() *control.Server {
 	return srv
 }
 
+// recordRoot is where this session's mount record goes: the root its own
+// invocation selected, and never a directory nothing on its command line
+// named. A session assembled without a root (a test) records beside its
+// own state, which is somewhere the test already owns.
+func (g *genSession) recordRoot() string {
+	if g.stateRoot != "" {
+		return g.stateRoot
+	}
+	return g.stateDir
+}
+
 // publishMountRecord makes the session discoverable by prefix, so
 // `pelfs ctl`, `pelfs status`, and `pelfs umount` all find the session by
 // prefix. It returns the retraction.
@@ -2544,7 +2556,7 @@ func (g *genSession) startControl() *control.Server {
 // is always a valid `pelfs ctl` target for the other.
 func (g *genSession) publishMountRecord() func() {
 	noop := func() {}
-	dir := volDir(g.prefix)
+	dir := volDirIn(g.recordRoot(), g.prefix)
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return noop
 	}
@@ -2579,6 +2591,12 @@ func (g *genSession) publishMountRecord() func() {
 	return func() {
 		if info, err := readMountInfo(path); err == nil && info.PID == os.Getpid() {
 			_ = os.Remove(path)
+			// And the directory, if this session's record was the only
+			// thing in it. Leaving it behind is how the state root filled
+			// up with empty vol-<id> directories, one per run of a
+			// harness: os.Remove refuses a non-empty directory, so a
+			// volume whose state really does live here is untouched.
+			_ = os.Remove(dir)
 		}
 	}
 }

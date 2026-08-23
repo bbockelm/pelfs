@@ -41,11 +41,19 @@ type memtableContent struct {
 
 var (
 	_ contentStore       = (*memtableContent)(nil)
+	_ contentSyncer      = (*memtableContent)(nil)
+	_ contentSyncer      = (*stagingContent)(nil)
 	_ ContentRecords     = (*memtableContent)(nil)
 	_ contentSnapshotter = (*memtableContent)(nil)
 	_ frozenContentStore = (*frozenMemtableContent)(nil)
 	_ ContentRecords     = (*frozenMemtableContent)(nil)
 )
+
+// Sync makes the memtable's own state durable without publishing any of
+// it: the ring's mapping and the journal under it (memtable.Store.Sync).
+// Nothing is chunked, packed or uploaded — see sync.go for what that
+// guarantee is worth and, more to the point, where it stops.
+func (m *memtableContent) Sync() error { return m.store.Sync() }
 
 // prepareSnapshot flushes with the mount still serving. It is the
 // expensive half — chunking, hashing and uploading whatever is in the

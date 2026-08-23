@@ -3,6 +3,7 @@ package nfsmount
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -142,6 +143,9 @@ func (s *Server) Mount(mountPoint string, opts MountOptions) error {
 		return fmt.Errorf("nfs server exited: %v", err)
 	default:
 	}
+	if err := mountRefusal(runtime.GOOS); err != nil {
+		return err
+	}
 	name, args := mountCommand(runtime.GOOS, s.Port, mountPoint, opts)
 	out, err := exec.Command(name, args...).CombinedOutput()
 	if err != nil {
@@ -187,6 +191,47 @@ func mountCommand(goos string, port int, mountPoint string, opts MountOptions) (
 	return "mount_nfs", []string{"-o", strings.Join(o, ","), export, mountPoint}
 }
 
+// mountRefusal is the reason this platform cannot attach a mount, or nil
+// where it can.
+//
+// WINDOWS IS REFUSED, not left to fail as an exec. mountCommand defaults
+// to macOS's mount_nfs and its only override is Linux's mount(8), so a
+// Windows build used to fall through to `mount_nfs` and report
+// `executable file not found in %PATH%` -- an error about a program the
+// user never asked for. Windows does have an NFS client (Client for NFS,
+// `mount.exe`), but it is an optional feature, it speaks a different
+// option vocabulary, and it has never been exercised against this server;
+// claiming support by guessing at its flags would be worse than saying so.
+//
+// A FUNCTION OF goos, for the same reason mountCommand is one: a refusal
+// that could only be observed by running on the platform it refuses is a
+// refusal nothing in this repository can check. Mount asks it about
+// runtime.GOOS; a test asks it about every platform.
+//
+// It is here rather than inside mountCommand because mountCommand answers
+// "what would the arguments be", and for Windows there is no honest answer
+// to give -- not even a refusal, since its return type has no room for one.
+func mountRefusal(goos string) error {
+	if goos != "windows" {
+		return nil
+	}
+	return errors.New("the NFS backend cannot attach a mount on Windows: " +
+		"pelfs drives the platform's own NFS client, and the Windows one (Client for NFS) " +
+		"is an optional feature this code has never been tested against")
+}
+
+// unmountRefusal is the same question for the detach side.
+//
+// Nothing was ever mounted (mountRefusal above), so there is nothing to
+// detach -- and the escalation in Unmount would have run `umount` and then
+// macOS's `diskutil`, because the only platform test in it is for Linux.
+func unmountRefusal(goos string) error {
+	if goos != "windows" {
+		return nil
+	}
+	return errors.New("the NFS backend cannot unmount on Windows: nothing it could have mounted exists")
+}
+
 // Unmount detaches the filesystem, escalating to forced unmount after a few
 // polite attempts.
 //
@@ -199,6 +244,13 @@ func mountCommand(goos string, port int, mountPoint string, opts MountOptions) (
 // one's message as the session's unmount error -- which is how a clean
 // teardown came to be recorded as a failed one.
 func Unmount(mountPoint string) error {
+	// Refused BEFORE the mount-table question below, which on Windows has
+	// no answer to give: Entries reports that it cannot READ a mount table,
+	// which is an error and not a "no", so the "already gone" shortcut
+	// would not fire and the escalation would run.
+	if err := unmountRefusal(runtime.GOOS); err != nil {
+		return err
+	}
 	if mounted, err := Mounted(mountPoint); err == nil && !mounted {
 		return nil
 	}

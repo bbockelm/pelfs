@@ -12,7 +12,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
-	"syscall"
 	"time"
 
 	"github.com/bbockelm/pelfs/internal/control"
@@ -21,8 +20,10 @@ import (
 
 const daemonEnv = "PELFS_MOUNT_DAEMON"
 
-// mountInfo is the state file a background mount maintains at
-// <stateRoot>/vol-<id>/mount.json.
+// mountInfo is the state file a session maintains at
+// <registry root>/vol-<id>/mount.json, where the registry root is the
+// machine-wide default for a background `pelfs mount` and the session's own
+// --state-dir for a foreground one. See registryRoot.
 type mountInfo struct {
 	PID        int    `json:"pid"`
 	Prefix     string `json:"prefix"`
@@ -93,7 +94,16 @@ func openDaemonLog(dir string) (*os.File, string, error) {
 	return f, path, nil
 }
 
-func stateRoot() string {
+// defaultStateRoot is where pelfs keeps per-prefix state when nothing on
+// the command line says otherwise: $XDG_STATE_HOME/pelfs, else
+// ~/.local/state/pelfs.
+//
+// It is the DEFAULT and not "the state root": every path pelfs creates has
+// to be reachable from the flags of the invocation that creates it, which
+// is what cmdOpts.stateRoot is for. Calling this function from a code path
+// that has a *cmdOpts in scope is the bug fixed in this file's history —
+// see stateRoot below.
+func defaultStateRoot() string {
 	if d := os.Getenv("XDG_STATE_HOME"); d != "" {
 		return filepath.Join(d, "pelfs")
 	}
@@ -104,9 +114,69 @@ func stateRoot() string {
 	return filepath.Join(home, ".local", "state", "pelfs")
 }
 
+// registryRoot is where a session publishes its mount record, and the two
+// answers are the two verbs' contracts rather than a preference.
+//
+// A FOREGROUND session — `pelfs shell`, `pelfs mount-gen`, `pelfs browse` —
+// records under its own root, so --state-dir covers it like everything
+// else. Nobody has to find such a session by name: the person who started
+// it is looking at it, and `pelfs ctl <state-dir> <verb>` reaches it.
+//
+// A BACKGROUND MOUNT is a detached daemon whose entire purpose is to be
+// found later by prefix — `pelfs status`, `pelfs umount <prefix>`,
+// `pelfs ctl <prefix> publish` — and that registry is machine-scoped by
+// nature, like a pid file. Putting it under a --state-dir the reader was
+// never told about would mean a live mount that cannot be stopped by name,
+// which is a worse failure than a directory in the state root that the
+// retraction now removes when it empties.
+func registryRoot(o *cmdOpts, background bool) string {
+	if background {
+		return defaultStateRoot()
+	}
+	return o.stateRoot()
+}
+
+// stateRoot is the root of everything THIS invocation may create, and
+// --state-dir wins.
+//
+// WHY THIS EXISTS. --state-dir used to cover the session's own state — the
+// overlay, the caches, the control socket, the signing key — while the
+// mount-record registry was derived from the default root independently of
+// the flag (publishMountRecord called volDir, which called stateRoot).
+// So a run pointed entirely at a temp directory still created
+// <home>/.local/state/pelfs/vol-<id>/, wrote mount.json into it, and left
+// the empty directory behind when the record was retracted at exit. That
+// was measured, not theorised: scripts/webui-playwright.sh's run counter
+// and the developer's state root went up together, one directory per run,
+// and the harness had to export XDG_STATE_HOME to work around it.
+//
+// The consequence of fixing it, stated because it is a behaviour change: a
+// FOREGROUND session started with --state-dir registers itself UNDER that
+// directory, so `pelfs status` and `pelfs umount` need the same --state-dir
+// (or the same XDG_STATE_HOME) to see it, and both take the flag for
+// exactly this reason. `pelfs ctl <state-dir> <verb>` already reached such
+// a session and still does. A background `pelfs mount` is the one
+// exception, and registryRoot says why.
+func (o *cmdOpts) stateRoot() string {
+	if o.stateDir != "" {
+		return o.stateDir
+	}
+	return defaultStateRoot()
+}
+
+// volDir is the per-prefix state directory in the DEFAULT root. Callers
+// use it only for the "--state-dir was not given" branch, where the two
+// are the same directory by construction.
 func volDir(prefix string) string {
+	return volDirIn(defaultStateRoot(), prefix)
+}
+
+// volDirIn is the per-prefix directory under an explicit root: the mount
+// record lives at <root>/vol-<id>/mount.json, whatever the root is, so one
+// glob finds every record any session in that root published.
+func volDirIn(root, prefix string) string {
 	sum := sha256.Sum256([]byte(prefix))
-	return filepath.Join(stateRoot(), "vol-"+hex.EncodeToString(sum[:6]))
+	return filepath.Join(root, "vol-"+hex.EncodeToString(sum[:6]))
 }
 
 // cmdMount mounts in the background: the parent re-execs itself as a
@@ -145,7 +215,12 @@ func cmdMount(args []string) int {
 		}
 	}
 
-	dir := volDir(prefix)
+	// The registry directory for a BACKGROUND mount, which is the default
+	// root even under --state-dir: see registryRoot for why this one verb
+	// is machine-scoped. The daemon's startup log lives beside its record,
+	// because a mount that failed to start has no state directory worth
+	// looking in and `pelfs mount` prints this path.
+	dir := volDirIn(registryRoot(o, true), prefix)
 	if o.stateDir == "" {
 		o.stateDir = dir // background mounts default to persistent state
 	}
@@ -169,7 +244,11 @@ func cmdMount(args []string) int {
 		}
 		// The daemon child IS the mount: runMountGen publishes the record
 		// this command's parent is waiting on, serves until SIGTERM, and
-		// seals on the way out.
+		// seals on the way out. It is the ONE session that registers
+		// machine-globally rather than under its own state root — the
+		// parent is about to return to a shell that will look for it by
+		// prefix.
+		a.background = true
 		ui.Debug("mount daemon (pid {pid}) starting: {prefix} on {mountpoint}, state {statedir}, backend {backend}",
 			"pid", os.Getpid(), "prefix", prefix, "mountpoint", mountpoint,
 			"statedir", o.stateDir, "backend", a.backend)
@@ -195,7 +274,7 @@ func cmdMount(args []string) int {
 	child.Stdin = nil
 	child.Stdout = logFile
 	child.Stderr = logFile
-	child.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	child.SysProcAttr = daemonSysProcAttr()
 	if err := child.Start(); err != nil {
 		return exitErr(fmt.Errorf("spawn daemon: %w", err))
 	}
@@ -224,12 +303,36 @@ func cmdMount(args []string) int {
 	return exitErr(fmt.Errorf("timed out waiting for the mount daemon; see %s", logPath))
 }
 
-func cmdUmount(args []string) int {
-	if len(args) != 1 {
-		return exitErr(errors.New("usage: pelfs umount <prefix-or-mountpoint>"))
+// registryFlags parses the one flag a record READER needs: which root to
+// look in. It is not registerFlags — `pelfs status` has no use for
+// --token or --prefetch and offering them would be noise — but it is the
+// same flag by the same name, because a session started with
+// `--state-dir X` publishes its record under X (see cmdOpts.stateRoot) and
+// the reader has to be able to say so.
+func registryFlags(name string, args []string, maxPos int) (root string, pos []string, err error) {
+	o := &cmdOpts{}
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.StringVar(&o.stateDir, "state-dir", "",
+		"look for sessions registered under this directory (the --state-dir they were started with); default: $XDG_STATE_HOME/pelfs or ~/.local/state/pelfs")
+	if err := fs.Parse(args); err != nil {
+		return "", nil, err
 	}
-	target := args[0]
-	infos, err := listMounts()
+	if fs.NArg() > maxPos {
+		return "", nil, fmt.Errorf("expected at most %d positional arguments, got %d", maxPos, fs.NArg())
+	}
+	return o.stateRoot(), fs.Args(), nil
+}
+
+func cmdUmount(args []string) int {
+	root, pos, err := registryFlags("umount", args, 1)
+	if err != nil {
+		return exitErr(err)
+	}
+	if len(pos) != 1 {
+		return exitErr(errors.New("usage: pelfs umount [--state-dir dir] <prefix-or-mountpoint>"))
+	}
+	target := pos[0]
+	infos, err := listMounts(root)
 	if err != nil {
 		return exitErr(err)
 	}
@@ -242,8 +345,8 @@ func cmdUmount(args []string) int {
 			_ = os.Remove(e.path)
 			return 0
 		}
-		if err := syscall.Kill(e.info.PID, syscall.SIGTERM); err != nil {
-			return exitErr(fmt.Errorf("signal pid %d: %w", e.info.PID, err))
+		if err := signalStop(e.info.PID); err != nil {
+			return exitErr(err)
 		}
 		ui.Info("waiting for {mountpoint} to unmount and flush...", "mountpoint", e.info.MountPoint)
 		// A umount that hangs is a seal that is still uploading, and the
@@ -264,10 +367,14 @@ func cmdUmount(args []string) int {
 }
 
 func cmdStatus(args []string) int {
-	if len(args) != 0 {
-		return exitErr(errors.New("usage: pelfs status"))
+	root, pos, err := registryFlags("status", args, 0)
+	if err != nil {
+		return exitErr(err)
 	}
-	infos, err := listMounts()
+	if len(pos) != 0 {
+		return exitErr(errors.New("usage: pelfs status [--state-dir dir]"))
+	}
+	infos, err := listMounts(root)
 	if err != nil {
 		return exitErr(err)
 	}
@@ -362,8 +469,12 @@ type mountEntry struct {
 	info mountInfo
 }
 
-func listMounts() ([]mountEntry, error) {
-	matches, err := filepath.Glob(filepath.Join(stateRoot(), "vol-*", "mount.json"))
+// listMounts reads every mount record in one root. The root is a parameter
+// rather than a call to defaultStateRoot because a session started with
+// --state-dir registers itself there (see cmdOpts.stateRoot), so the reader
+// has to be told where to look.
+func listMounts(root string) ([]mountEntry, error) {
+	matches, err := filepath.Glob(filepath.Join(root, "vol-*", "mount.json"))
 	if err != nil {
 		return nil, err
 	}
@@ -389,11 +500,4 @@ func readMountInfo(path string) (*mountInfo, error) {
 		return nil, err
 	}
 	return &info, nil
-}
-
-func pidAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	return syscall.Kill(pid, 0) == nil
 }

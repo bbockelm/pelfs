@@ -183,10 +183,19 @@ func TestRingRecoveryStopsAtATornRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, live, err := OpenRing(path)
+	reopened, live, err := OpenRing(path)
 	if err != nil {
 		t.Fatalf("OpenRing: %v", err)
 	}
+	// Close it. A live mapping PINS its file on Windows, where unlink of an
+	// open file is refused, so discarding this handle failed the test in
+	// TempDir cleanup -- after the body had passed, naming a path instead of
+	// a cause. Unix hid it: there, unlink of an open file is ordinary.
+	defer func() {
+		if err := reopened.Close(); err != nil {
+			t.Errorf("close the reopened ring: %v", err)
+		}
+	}()
 	if len(live) != 2 {
 		t.Fatalf("recovered %d records, want the 2 before the torn one", len(live))
 	}

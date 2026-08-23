@@ -1109,10 +1109,21 @@ func TestFenceFailsClosed(t *testing.T) {
 	ctx := context.Background()
 	base := newStore(t)
 	deaf := &deafStore{Store: base}
-	l, err := Acquire(ctx, sleepOpts(deaf, "sess-a"))
+	// Drive the freshness gate off an injected clock. sleepOpts' TTL is one
+	// NANOSECOND, so this test used to rest on the wall clock advancing by
+	// more than that between Acquire and Fence -- true on Linux and macOS,
+	// false on Windows, whose clock granularity leaves the two calls in one
+	// tick. The gate's boundary is inclusive by design, so an age of exactly
+	// zero reads as fresh, Fence answers from memory, and a test about an
+	// unreachable federation passes without reaching for one.
+	clk := newClock()
+	opts := sleepOpts(deaf, "sess-a")
+	opts.now = clk.now
+	l, err := Acquire(ctx, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
+	clk.advance(time.Millisecond)
 	defer func() {
 		deaf.silence(false)
 		_ = l.Release(ctx)

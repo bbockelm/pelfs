@@ -1,0 +1,227 @@
+name: Web UI
+
+# A SEPARATE WORKFLOW, and that is the point.
+#
+# internal/webui/dist is a COMMITTED build artefact, and a committed artefact
+# rots silently unless something rebuilds it and compares. That check needs
+# Node; the rest of this repository does not, and must never learn to. So the
+# checks that need a JavaScript toolchain live here, on their own path filter,
+# and a Go-only pull request never waits for them. CI.yml is untouched.
+#
+# scripts/build-pelican-server.sh's header records what the alternative costs:
+# a job that "died with `/bin/sh: 1: pnpm: not found` forty lines into someone
+# else's Makefile -- which reads like a test failure and is not one".
+on:
+  push:
+    branches: [main]
+    paths:
+      - "webui/**"
+      - "internal/webui/**"
+      - "scripts/webui-build.sh"
+      - "scripts/webui-playwright.sh"
+      - ".github/workflows/webui.yml"
+  pull_request:
+    paths:
+      # The bundle's own sources and output.
+      - "webui/**"
+      - "internal/webui/**"
+      - "scripts/webui-build.sh"
+      - "scripts/webui-playwright.sh"
+      - ".github/workflows/webui.yml"
+      # And the server the browser suite drives. A change to the loopback
+      # server, its guard, or its session handling is exactly the change a
+      # real browser can falsify and a Go test cannot.
+      - "cmd/pelfs/browse.go"
+      - "cmd/pelfs/browse.html"
+      - "internal/httpguard/**"
+      - "internal/browsesession/**"
+  # Nothing here depends on the outside world except the npm registry and the
+  # browser download, so a weekly run is what notices a registry-side change
+  # (a yanked version, a moved tarball) before a contributor does.
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Pinned, both of them, and in the repository too: webui/frontend/.nvmrc
+  # holds the same Node version, and package.json's `packageManager` field
+  # holds the same pnpm version. An unpinned minor version of a bundler is a
+  # spurious diff, which is the failure mode that teaches people to ignore a
+  # red job.
+  NODE_VERSION: "24.1.0"
+  PNPM_VERSION: "10.15.0"
+
+jobs:
+  bundle:
+    # Rebuild the committed bundle and fail on any diff. Measured locally:
+    # install 2s, build 0.7s, notices 0.5s -- the job is dominated by
+    # checkout and setup, ~1 minute total.
+    name: regenerate and diff
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.0"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: webui/frontend/pnpm-lock.yaml
+
+      # THE LICENCE GUARD. @svar-ui/* is MIT; the retired `wx-*` generation of
+      # the same components is GPLv3 (wx-react-gantt@1.3.1 still says so on
+      # the registry). pelfs is Apache-2.0 and the bundle ships inside the
+      # binary, so a wx-* package is a relicensing event disguised as a
+      # version bump. It runs FIRST, before anything is built.
+      - name: No GPLv3 wx-* packages, and every bundled licence permissive
+        working-directory: webui/frontend
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run licence-check
+
+      # THE GATE. `go generate` runs scripts/webui-build.sh, which installs
+      # with --frozen-lockfile, builds, and regenerates the notices; --twice
+      # proves the output is byte-reproducible, which is what makes this gate
+      # trustworthy rather than flaky.
+      - name: Regenerate the bundle (twice, to prove determinism)
+        run: ./scripts/webui-build.sh --twice
+
+      - name: The committed bundle must match its sources
+        run: |
+          if ! git diff --exit-code -- internal/webui/dist internal/webui/third_party.txt; then
+            cat >&2 <<'MSG'
+
+          The committed bundle does not match webui/frontend.
+
+          internal/webui/dist and internal/webui/third_party.txt are generated and
+          committed on purpose: it is what lets `go build ./...` and
+          `go install ...@latest` work with no Node anywhere. The cost of that
+          choice is exactly this gate. To fix:
+
+              go generate ./internal/webui
+              git add internal/webui/dist internal/webui/third_party.txt
+
+          MSG
+            exit 1
+          fi
+
+      # The same properties, asserted from Go, with no Node in the room. They
+      # also run in the ordinary unit lane; running them here means a UI change
+      # cannot be merged on a green Go run alone.
+      - name: The Go-side assertions about the artefact
+        run: CGO_ENABLED=0 go test -count=1 ./internal/webui/
+
+      # The frontend's own type checking. Not a lint job with opinions: just
+      # "does this compile", which is the part that can break the build.
+      - name: Typecheck
+        working-directory: webui/frontend
+        run: pnpm exec tsc --noEmit
+
+      # A Go contributor with no Node must be unaffected, so prove it here
+      # rather than asserting it in a comment. Rather than trying to strip
+      # every directory a Node binary might live in -- which differs per
+      # runner image -- the tools are SHADOWED: a directory of stubs that
+      # exit 127 goes first on PATH, so any attempt to run them fails exactly
+      # as it would on a machine that never had them.
+      - name: A Node-free Go build still works
+        run: |
+          shadow="$(mktemp -d)"
+          for t in node npm pnpm corepack npx; do
+            printf '#!/bin/sh\necho "$0: not installed (Node-free build check)" >&2\nexit 127\n' > "$shadow/$t"
+            chmod +x "$shadow/$t"
+          done
+          godir="$(dirname "$(command -v go)")"
+          clean="$shadow:$godir:/usr/bin:/bin:/usr/sbin:/sbin"
+          if PATH="$clean" node --version >/dev/null 2>&1; then
+            echo "node is still runnable; this check would prove nothing" >&2
+            exit 1
+          fi
+          env -i \
+            PATH="$clean" HOME="$HOME" CGO_ENABLED=0 \
+            GOPATH="$(go env GOPATH)" GOMODCACHE="$(go env GOMODCACHE)" GOCACHE="$(go env GOCACHE)" \
+            sh -c 'go build ./... && go vet ./internal/webui/ && go test -count=1 ./internal/webui/'
+
+  browser:
+    # The browser half of the threat model, and the file manager driven
+    # against a mock JSON API. Measured locally on an M-series laptop: 14s
+    # wall clock for the whole gate in browse mode (build pelfs, start the
+    # attacker page server and fakeorigin, create a volume, serve, 30 specs in
+    # 9.3s) and 11s in embed mode (22 specs in 7.3s), plus ~11s to download
+    # the browser when the cache misses.
+    #
+    # NOT on the Go PR path, by the same rule as the bundle job: a Go-only
+    # change must not wait on a browser.
+    name: browser (threat model)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.0"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: webui/frontend/pnpm-lock.yaml
+
+      # The browser build is pinned by the @playwright/test version -- it
+      # refuses to run against a revision it was not built for -- so the cache
+      # key is that version, read out of the lockfile. Cached restore is a few
+      # seconds; a miss is a ~92 MiB download, measured at 11s. Caching rather
+      # than downloading per run is worth it not for the time but for the
+      # failure mode: a registry hiccup should not turn into a red gate.
+      - name: Playwright version (for the cache key)
+        id: pw
+        working-directory: webui/frontend
+        run: |
+          v="$(node -p "require('./package.json').devDependencies['@playwright/test']")"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        id: pwcache
+        with:
+          path: ~/.cache/ms-playwright
+          key: ms-playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
+      - name: Install the pinned browser
+        working-directory: webui/frontend
+        run: |
+          pnpm install --frozen-lockfile
+          # --with-deps only on a cache miss: it is an apt install, and it is
+          # the slow part.
+          if [ "${{ steps.pwcache.outputs.cache-hit }}" = "true" ]; then
+            pnpm exec playwright install-deps chromium
+          else
+            pnpm exec playwright install --with-deps chromium
+          fi
+
+      # Both modes. `pelfs browse` is the gate worth having -- a real binary,
+      # a real fakeorigin federation stub, a real volume, a single-use
+      # bootstrap token, and a real Chromium asserting the 421 on a rebound
+      # Host. The embed mode is the fallback the harness uses before that verb
+      # exists, and forcing it here keeps that path from rotting.
+      - name: Browser gate against the real binary
+        run: PELFS_WEBUI_SKIP_BROWSER_INSTALL=1 ./scripts/webui-playwright.sh
+      - name: Browser gate against the embedded bundle alone
+        run: |
+          PELFS_WEBUI_FORCE_MODE=embed PELFS_WEBUI_SKIP_BROWSER_INSTALL=1 \
+            ./scripts/webui-playwright.sh
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: |
+            webui/frontend/playwright-report/
+            webui/frontend/test-results/
+          retention-days: 7

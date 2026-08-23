@@ -8,3 +8,12 @@ docs/TODO.md
 # land here too.
 /pelican-src/
 /pelican-bin
+/fakeorigin
+/fakeorigin.exe
+/pelfs.exe
+
+# A go.work pointing at a local pelican checkout is a developer convenience,
+# never a property of the repository: it silently overrides go.mod for
+# everyone who has one, and CI must resolve the pinned module instead.
+go.work
+go.work.sum

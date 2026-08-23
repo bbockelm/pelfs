@@ -1,0 +1,11 @@
+node_modules/
+# Vite writes the bundle straight into internal/webui/dist (see
+# vite.config.ts), which is COMMITTED -- the opposite of pelican, which
+# ignores its build output and commits a placeholder. Nothing under
+# webui/frontend/ is generated, so nothing else is ignored here.
+/test-results/
+/playwright-report/
+# The U0 probe harness builds here. It is a measurement tool, not a
+# deliverable; the measurements it produces ARE committed, under
+# internal/webui/testdata/svar-contract/.
+/.probe-dist/

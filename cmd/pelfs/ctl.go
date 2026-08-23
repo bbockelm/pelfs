@@ -23,7 +23,7 @@ func cmdCtl(args []string) int {
 		out = args[3]
 	}
 
-	stateDir, err := findSessionState(target)
+	stateDir, err := findSessionState(defaultStateRoot(), target)
 	if err != nil {
 		return exitErr(err)
 	}
@@ -84,9 +84,16 @@ func cmdCtl(args []string) int {
 }
 
 // findSessionState resolves a prefix or mountpoint to a live session's
-// state directory via the mount records.
-func findSessionState(target string) (string, error) {
-	infos, err := listMounts()
+// state directory via the mount records in root.
+//
+// A session started with --state-dir registers under that directory rather
+// than the default root (see cmdOpts.stateRoot), and `pelfs ctl` takes no
+// flags of its own — its second positional argument is a verb. It does not
+// need one: the fallback below means `pelfs ctl <state-dir> status` reaches
+// such a session directly, which is what publishMountRecord's own warning
+// already tells the user to do.
+func findSessionState(root, target string) (string, error) {
+	infos, err := listMounts(root)
 	if err != nil {
 		return "", err
 	}

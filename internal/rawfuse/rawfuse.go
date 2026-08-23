@@ -1,3 +1,5 @@
+//go:build !windows
+
 // Package rawfuse is the raw FUSE binding (docs/design-packfs.md, on the
 // catalog-native mount): fuse.RawFileSystem mapped 1:1 onto the genfs
 // generation resolver (Bind, read-only) or onto the write overlay over that

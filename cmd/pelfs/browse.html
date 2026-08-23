@@ -1,0 +1,841 @@
+<!doctype html>
+<!--
+  The pelfs browse page: one hand-written file, no bundler, no framework,
+  no third-party JavaScript. docs/design-webui.md's M1 is deliberately
+  bounded to this, and the boundary buys two things — `go build ./...`
+  needs no Node, and the Content-Security-Policy can be strict enough
+  (script-src 'nonce-…', no 'unsafe-inline') that a file in the volume
+  cannot become code in this origin.
+
+  It ships NO state. Everything on screen arrives over /events, which
+  carries a complete snapshot per frame, so a reconnect cannot leave a
+  stale view. The only values the server interpolates are the CSP nonce and
+  the volume name.
+
+  Every element a test asserts on carries data-testid. That is not
+  decoration: a browser-driver suite that selects on prose breaks the first
+  time somebody rewords a sentence, and the sentences here are meant to be
+  reworded.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pelfs — {{.Volume}}</title>
+<style nonce="{{.Nonce}}">
+  :root {
+    /* Pelican Platform's palette, from web_ui/frontend/components/ThemeProvider.tsx. */
+    --brand: #0885ff;
+    --brand-light: #CFE4FF;
+    --ground: #FFFFFA;
+    --ink: #1a2029;
+    --muted: #5b6672;
+    --rule: #dfe4ea;
+    /* pelfs's own two colours, and they are deliberately NOT brand chrome:
+       the whole point of the durability panel is that "on this machine"
+       and "in the federation" are unmistakably different, and doing that
+       in two shades of the brand blue would fail. */
+    --staged: #b45309;
+    --published: #157f3d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 2.5rem 1.5rem;
+    background: var(--ground); color: var(--ink);
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  main { max-width: 44rem; margin: 0 auto; }
+  h1 { font-size: 1.35rem; font-weight: 600; margin: 0; letter-spacing: -0.01em; }
+  h1 .pel { color: var(--ink); }
+  h1 .fs { color: var(--brand); }
+  h1 .vol { font-weight: 400; color: var(--muted); font-size: 1rem; word-break: break-all; }
+  .row { display: flex; gap: 1rem; align-items: baseline; justify-content: space-between; flex-wrap: wrap; }
+  .badge {
+    font-size: .8rem; padding: .12rem .5rem; border-radius: 999px;
+    background: var(--brand-light); color: #10365e; white-space: nowrap;
+  }
+  .sub { color: var(--muted); font-size: .92rem; margin-top: .15rem; }
+  hr { border: 0; border-top: 1px solid var(--rule); margin: 1.4rem 0; }
+  .banner {
+    padding: .7rem .9rem; border-radius: .4rem; margin: 1rem 0;
+    background: var(--brand-light); border: 1px solid #a9cdf7;
+  }
+  .banner.warn { background: #fdf3e3; border-color: #e6c98a; }
+  .banner.bad { background: #fdecec; border-color: #e9a7a7; }
+  .banner[hidden] { display: none; }
+  #durability { font-size: 1.05rem; margin: .2rem 0 1rem; }
+  .glyph { font-weight: 700; margin-right: .35rem; }
+  .glyph.staged { color: var(--staged); }
+  .glyph.published { color: var(--published); }
+  .glyph.sending { color: var(--brand); }
+  .legend { display: flex; gap: 1.4rem; flex-wrap: wrap; color: var(--muted); font-size: .86rem; }
+  /* The SSO card. Brand-light rather than a warning colour: being asked to
+     log in is normal, not a fault. */
+  .sso {
+    padding: .8rem .9rem; border-radius: .4rem; margin: 1rem 0;
+    background: var(--brand-light); border: 1px solid #a9cdf7;
+  }
+  .sso[data-expired="true"] { background: #f4f5f6; border-color: var(--rule); color: var(--muted); }
+  .sso h2 { font-size: 1rem; margin: 0 0 .35rem; }
+  .sso .code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 1.25rem; font-weight: 700; letter-spacing: .12em;
+    user-select: all;
+  }
+  .sso .dismiss {
+    background: transparent; color: var(--muted); border: 1px solid var(--rule);
+    font-weight: 400; padding: .2rem .55rem; font-size: .85rem;
+  }
+  button {
+    font: inherit; font-weight: 600; cursor: pointer;
+    background: var(--brand); color: #fff; border: 1px solid #036;
+    border-radius: .35rem; padding: .45rem 1rem;
+  }
+  button:disabled { background: #e8ebee; color: #8b949e; border-color: var(--rule); cursor: not-allowed; }
+  .publishrow { display: flex; gap: .8rem; align-items: center; flex-wrap: wrap; }
+  #publish-hint, #publish-status { color: var(--muted); font-size: .9rem; }
+  .connect h2 { font-size: 1rem; margin: 0 0 .2rem; }
+  .connect p { margin: 0 0 .6rem; color: var(--muted); font-size: .92rem; }
+  .connect form { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; margin: .8rem 0; }
+  .connect input[type="text"] {
+    font: inherit; padding: .4rem .6rem; border: 1px solid var(--rule);
+    border-radius: .35rem; background: #fff; color: var(--ink); min-width: 14rem;
+  }
+  .connect label { font-size: .92rem; color: var(--muted); }
+  .connect label input { margin-right: .3rem; }
+  .cred {
+    padding: .8rem .9rem; border-radius: .4rem; margin: 1rem 0;
+    background: var(--brand-light); border: 1px solid #a9cdf7;
+  }
+  .cred h3 { font-size: .95rem; margin: 0 0 .4rem; }
+  .cred .files { display: flex; gap: .5rem; flex-wrap: wrap; margin: .6rem 0; }
+  .cred .files button { font-size: .88rem; padding: .35rem .7rem; }
+  .cred dl { display: grid; grid-template-columns: max-content 1fr; gap: .15rem .8rem; margin: .5rem 0 0; }
+  .cred dt { color: var(--muted); font-size: .86rem; }
+  .cred dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .86rem; user-select: all; word-break: break-all; }
+  .cred .once { color: var(--staged); font-size: .86rem; margin: .5rem 0 0; }
+  table.creds { border-collapse: collapse; width: 100%; margin: .6rem 0; font-size: .9rem; }
+  table.creds th { text-align: left; color: var(--muted); font-weight: 500; font-size: .82rem; }
+  table.creds th, table.creds td { padding: .3rem .5rem .3rem 0; border-bottom: 1px solid var(--rule); }
+  table.creds button {
+    background: transparent; color: var(--muted); border: 1px solid var(--rule);
+    font-weight: 400; padding: .15rem .5rem; font-size: .84rem;
+  }
+  table.creds[hidden], .cred[hidden], #connect-empty[hidden] { display: none; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .9em; }
+  footer { margin-top: 2rem; color: var(--muted); font-size: .8rem; }
+  #stream-status { font-size: .8rem; color: var(--muted); }
+</style>
+</head>
+<body data-phase="connecting" data-testid="body">
+
+<noscript>
+  <!-- Cheap, and it is the difference between a blank page and a person
+       who knows their data is fine. -->
+  <div class="banner warn" data-testid="noscript">
+    This page needs JavaScript to show what is staged and what is published.
+    Nothing is wrong with your data: <code>pelfs browse</code> is still running in
+    your terminal, and Ctrl-C there stops it (sealing, if you started it with
+    <code>--rw</code>).
+  </div>
+</noscript>
+
+<main>
+  <div class="row">
+    <h1><span class="pel">pel</span><span class="fs">fs</span>
+      <span class="vol" data-testid="volume">{{.Volume}}</span></h1>
+    <span class="badge" data-testid="mode">read-only</span>
+  </div>
+  <div class="row">
+    <div class="sub" data-testid="branch-generation">branch —, generation —</div>
+    <div class="sub" data-testid="lease">lease: —</div>
+  </div>
+
+  <div class="banner" data-testid="phase-banner">
+    connecting to the federation — this is where your institution may ask you to
+    approve access. The terminal shows the same prompt.
+  </div>
+
+  <div class="banner warn" data-testid="test-hooks-banner" hidden>
+    <strong>--test-hooks is on.</strong> This session accepts a route that overrides
+    what this page reports, so what you see below may not be what the volume holds.
+    It exists for the browser-driver test suite. Never use it on real data.
+  </div>
+
+  <div class="banner bad" data-testid="lease-banner" hidden></div>
+
+  <!-- The SSO cards (U13). A LIST, not a modal: two namespaces can each
+       open a device flow, and a modal would have to hide one of two things
+       the user has to do. Empty and hidden until a flow starts, which is
+       usually within a second of the page loading. -->
+  <div id="sso" data-testid="sso-cards" hidden></div>
+
+  <hr>
+
+  <p id="durability" data-testid="durability">reading the overlay…</p>
+
+  <div class="legend" data-testid="durability-legend">
+    <span><span class="glyph staged" data-testid="glyph-staged">●</span>on this machine only</span>
+    <span><span class="glyph sending" data-testid="glyph-sending">◔</span>sending</span>
+    <span><span class="glyph published" data-testid="glyph-published">✓</span>in the federation</span>
+  </div>
+
+  <hr>
+
+  <div class="publishrow">
+    <button id="publish" data-testid="publish-button" data-publish-state="unknown" disabled>
+      Publish now
+    </button>
+    <span id="publish-hint" data-testid="publish-hint"></span>
+  </div>
+  <p id="publish-status" data-testid="publish-status"></p>
+
+  <hr>
+
+  <div class="connect" data-testid="connect-another-program">
+    <h2>Connect another program</h2>
+    <p data-testid="connect-blurb">
+      This page still does not browse files. What it does now is hand the job to a
+      program that is good at it: this session speaks WebDAV at
+      <code data-testid="dav-url">—</code>, and adding a program below produces a
+      Cyberduck or Mountain Duck profile that connects with one double-click and no
+      password, plus a username and password for everything else — rclone, WinSCP,
+      <code>mount_webdav</code>, curl. Everything you add here dies when
+      <code>pelfs browse</code> exits: nothing is written to disk and nothing survives
+      the process.
+    </p>
+
+    <form data-testid="add-program-form" id="add-program">
+      <input type="text" id="program-label" data-testid="add-program-label"
+             placeholder="Cyberduck on this laptop" maxlength="64" autocomplete="off">
+      <label data-testid="add-program-write-label">
+        <input type="checkbox" id="program-write" data-testid="add-program-write" disabled>
+        may write
+      </label>
+      <button type="submit" id="add-program-button" data-testid="add-program-button" disabled>
+        Add a program
+      </button>
+      <span id="connect-hint" data-testid="connect-hint"></span>
+    </form>
+
+    <!-- The one panel on this page that holds a secret. It is built once,
+         from the response to the POST that minted it, and it is never
+         re-fetched: internal/localoauth keeps HMACs, so these two values
+         exist nowhere pelfs can read them back. -->
+    <div class="cred" id="credential-new" data-testid="credential-new" hidden></div>
+
+    <p id="connect-empty" data-testid="connect-empty" hidden>
+      Nothing is connected yet.
+    </p>
+    <table class="creds" id="client-list" data-testid="client-list" hidden>
+      <thead><tr><th>program</th><th>username</th><th>may write</th><th>connections</th><th></th></tr></thead>
+      <tbody id="client-rows"></tbody>
+    </table>
+    <table class="creds" id="grant-list" data-testid="grant-list" hidden>
+      <thead><tr><th>connection</th><th>scope</th><th>last used</th><th></th></tr></thead>
+      <tbody id="grant-rows"></tbody>
+    </table>
+  </div>
+
+  <footer>
+    <div id="stream-status" data-testid="stream-status">connecting…</div>
+    <div data-testid="footer-disclaimer">
+      an independent tool for Pelican federations; not an official Pelican Platform product
+    </div>
+  </footer>
+</main>
+
+<script nonce="{{.Nonce}}">
+(() => {
+  "use strict";
+  const SESSION_HEADER = {{.SessionHdr}};
+  // sessionStorage, not localStorage and not a cookie. It is scoped to the
+  // ORIGIN — port included — so another local service cannot read it, and
+  // it dies with the tab. A cookie for 127.0.0.1 would be sent to every
+  // other service on 127.0.0.1 the browser is made to contact
+  // (RFC 6265bis 8.5), which is the whole reason this design has none.
+  const KEY = "pelfs.session";
+  const el = (id) => document.getElementById(id);
+  const t = (name) => document.querySelector(`[data-testid="${name}"]`);
+
+  const bytes = (n) => {
+    if (!n) return "0 B";
+    const u = ["B", "KB", "MB", "GB", "TB"];
+    let i = 0, v = n;
+    while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+    return `${v < 10 && i > 0 ? v.toFixed(1) : Math.round(v)} ${u[i]}`;
+  };
+  const secs = (s) => {
+    if (s <= 0) return "any moment now";
+    const m = Math.floor(s / 60), r = s % 60;
+    return m > 0 ? `${m}m${String(r).padStart(2, "0")}s` : `${r}s`;
+  };
+
+  let token = null, dirty = 0;
+
+  // The bootstrap token arrives in the FRAGMENT, is exchanged once, and is
+  // wiped out of the address bar before anything else runs. A fragment is
+  // never sent in a request line and never appears in a Referer, so the
+  // only place it lingers is this tab's history entry — which
+  // replaceState removes.
+  async function authenticate() {
+    const stored = sessionStorage.getItem(KEY);
+    const m = /(?:^|[#&])bt=([A-Za-z0-9_-]+)/.exec(location.hash);
+    if (m) history.replaceState(null, "", location.pathname);
+    if (stored) return stored;
+    if (!m) {
+      fail("this tab has no pelfs session. The launch link is single-use, so a new tab " +
+           "cannot inherit one: start `pelfs browse` again to get a fresh link.");
+      return null;
+    }
+    const res = await fetch("/api/v1/session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ bootstrap: m[1] }),
+    });
+    if (!res.ok) {
+      fail("this launch link has expired or was already used (it is good for one open, " +
+           "for two minutes). Run `pelfs browse` again for a new one.");
+      return null;
+    }
+    const body = await res.json();
+    sessionStorage.setItem(KEY, body.session);
+    return body.session;
+  }
+
+  function fail(msg) {
+    const b = t("phase-banner");
+    b.className = "banner bad";
+    b.textContent = msg;
+    b.hidden = false;
+    b.setAttribute("data-testid", "session-error");
+    document.body.dataset.phase = "no-session";
+  }
+
+  // ---- the SSO cards (U13) ------------------------------------------------
+  //
+  // Built with createElement and textContent, NEVER innerHTML: the URL and
+  // the code arrive from an issuer's device-flow response, which is data
+  // from off this machine. The server refuses anything that is not an
+  // absolute http(s) URL before it ever reaches here (approvalURL in
+  // cmd/pelfs/ssoprompt.go); the scheme test below is the second of two
+  // checks, because an href is the one place a `javascript:` string still
+  // executes with a CSP this strict.
+  //
+  // The card never says "authorization complete". It cannot: the hook that
+  // produced it is one-way and tells this process nothing about how the
+  // flow ended. What says the flow worked is the volume opening, which is
+  // the phase banner's job.
+  let promptSig = "";
+  function renderPrompts(list) {
+    const box = el("sso");
+    const sig = JSON.stringify(list);
+    // Rebuilding identical DOM every 500 ms would fight the user's own
+    // selection of the code they are trying to copy.
+    if (sig === promptSig) return;
+    promptSig = sig;
+    box.textContent = "";
+    box.hidden = list.length === 0;
+    for (const p of list) {
+      const card = document.createElement("div");
+      card.className = "sso";
+      card.setAttribute("data-testid", "sso-card");
+      card.dataset.promptId = p.id;
+      card.dataset.expired = String(!!p.expired);
+
+      const h = document.createElement("h2");
+      h.textContent = p.expired
+        ? "this sign-in request has expired"
+        : "your institution needs you to approve this session";
+      card.appendChild(h);
+
+      const line = document.createElement("p");
+      line.appendChild(document.createTextNode(
+        p.expired ? "The request was for " : "Open "));
+      if (/^https?:\/\//i.test(p.url)) {
+        const a = document.createElement("a");
+        a.href = p.url;
+        a.textContent = p.url;
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        a.setAttribute("data-testid", "sso-url");
+        line.appendChild(a);
+      } else {
+        const span = document.createElement("span");
+        span.textContent = p.url;
+        span.setAttribute("data-testid", "sso-url");
+        line.appendChild(span);
+      }
+      card.appendChild(line);
+
+      if (p.code) {
+        const c = document.createElement("p");
+        c.appendChild(document.createTextNode("and enter this code: "));
+        const code = document.createElement("span");
+        code.className = "code";
+        code.textContent = p.code;
+        code.setAttribute("data-testid", "sso-code");
+        c.appendChild(code);
+        card.appendChild(c);
+      }
+
+      const note = document.createElement("p");
+      note.className = "sub";
+      note.setAttribute("data-testid", "sso-note");
+      note.textContent = p.expired
+        ? "Codes are short-lived. If pelfs still needs this, it will ask again; " +
+          "the terminal running pelfs browse shows the same prompt."
+        : "Waiting for you to approve at your institution. The terminal running " +
+          "pelfs browse shows the same URL, and nothing here is a credential.";
+      card.appendChild(note);
+
+      const btn = document.createElement("button");
+      btn.className = "dismiss";
+      btn.type = "button";
+      btn.dataset.dismiss = p.id;
+      btn.setAttribute("data-testid", "sso-dismiss");
+      btn.textContent = p.expired ? "Dismiss" : "Dismiss (I have done this)";
+      card.appendChild(btn);
+
+      box.appendChild(card);
+    }
+  }
+
+  // One delegated listener rather than per-card handlers: an inline onclick
+  // would need 'unsafe-inline' in the CSP, which is the protection this
+  // page is built around.
+  el("sso").addEventListener("click", (e) => {
+    const id = e.target && e.target.dataset && e.target.dataset.dismiss;
+    if (!id) return;
+    fetch("/api/v1/sso/dismiss", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", [SESSION_HEADER]: token },
+      body: JSON.stringify({ id }),
+    }).catch(() => {});
+  });
+
+  // ---- the credential surface (U7/U8) -------------------------------------
+  //
+  // Three routes, all on the session-authenticated API surface: list, mint,
+  // revoke. The interesting one is mint, because its response is the only
+  // one on this listener that carries a secret — the per-client Basic
+  // password and, inside the profile, the client id — and neither can be
+  // fetched again.
+  //
+  // THE FILES ARE SAVED FROM A BLOB, not from a link to a route. A download
+  // link is an <a href>, an <a href> cannot set X-Pelfs-Session, and a
+  // credential-bearing GET authorized by anything ambient is the hole DNS
+  // rebinding exploits. So the bytes arrive in the POST's response and
+  // never touch a URL, a history entry or an access log.
+  let davURL = "", canWrite = false, connectReady = false;
+
+  function api(path, method, body) {
+    const init = { method, headers: { [SESSION_HEADER]: token } };
+    if (body !== undefined) {
+      init.headers["Content-Type"] = "application/json";
+      init.body = JSON.stringify(body);
+    }
+    return fetch(path, init);
+  }
+
+  function saveBlob(name, type, content) {
+    const url = URL.createObjectURL(new Blob([content], { type }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    // Revoked on the next turn: Safari has historically needed the URL to
+    // still be live when the click is processed.
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+  }
+
+  function when(iso) {
+    if (!iso || iso.startsWith("0001-01-01")) return "never";
+    const d = new Date(iso);
+    return isNaN(d) ? "never" : d.toLocaleTimeString();
+  }
+
+  // The one panel that holds a secret, built with textContent throughout.
+  function showNewCredential(c) {
+    const box = el("credential-new");
+    box.textContent = "";
+    box.hidden = false;
+    box.dataset.ref = c.ref;
+
+    const h = document.createElement("h3");
+    h.setAttribute("data-testid", "credential-label");
+    h.textContent = `${c.label} — added`;
+    box.appendChild(h);
+
+    const files = document.createElement("div");
+    files.className = "files";
+    const ids = ["download-profile", "download-bookmark", "download-basic"];
+    (c.files || []).forEach((f, i) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.setAttribute("data-testid", ids[i] || "download-file");
+      btn.dataset.filename = f.name;
+      btn.textContent = f.kind;
+      btn.addEventListener("click", () => saveBlob(f.name, f.content_type, f.content));
+      files.appendChild(btn);
+    });
+    box.appendChild(files);
+
+    const dl = document.createElement("dl");
+    const pair = (term, value, id) => {
+      const dt = document.createElement("dt");
+      dt.textContent = term;
+      const dd = document.createElement("dd");
+      dd.textContent = value;
+      dd.setAttribute("data-testid", id);
+      dl.appendChild(dt);
+      dl.appendChild(dd);
+    };
+    pair("WebDAV URL", c.dav_url, "credential-dav-url");
+    pair("username", c.basic_user, "credential-basic-user");
+    pair("password", c.basic_password, "credential-basic-password");
+    box.appendChild(dl);
+
+    const once = document.createElement("p");
+    once.className = "once";
+    once.setAttribute("data-testid", "credential-notice");
+    once.textContent = c.notice;
+    box.appendChild(once);
+  }
+
+  function renderCredentials(list) {
+    davURL = list.dav_url || davURL;
+    t("dav-url").textContent = davURL;
+
+    const clients = list.clients || [], grants = list.grants || [];
+    el("connect-empty").hidden = clients.length > 0;
+
+    const cbody = el("client-rows");
+    cbody.textContent = "";
+    el("client-list").hidden = clients.length === 0;
+    for (const c of clients) {
+      const tr = document.createElement("tr");
+      tr.setAttribute("data-testid", "client-row");
+      tr.dataset.ref = c.ref;
+      tr.dataset.write = String(!!c.write);
+      tr.dataset.consented = String(!!c.consented);
+      tr.dataset.grants = String(c.grants || 0);
+      for (const v of [c.label, c.basic_user, c.write ? "yes" : "no", String(c.grants || 0)]) {
+        const td = document.createElement("td");
+        td.textContent = v;
+        tr.appendChild(td);
+      }
+      const td = document.createElement("td");
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.setAttribute("data-testid", "client-revoke");
+      btn.dataset.revokeClient = c.ref;
+      btn.textContent = "Revoke";
+      td.appendChild(btn);
+      tr.appendChild(td);
+      cbody.appendChild(tr);
+    }
+
+    const gbody = el("grant-rows");
+    gbody.textContent = "";
+    el("grant-list").hidden = grants.length === 0;
+    for (const g of grants) {
+      const tr = document.createElement("tr");
+      tr.setAttribute("data-testid", "grant-row");
+      tr.dataset.ref = g.ref;
+      tr.dataset.write = String(!!g.write);
+      for (const v of [g.label, (g.scopes || []).join(" "), when(g.last_used)]) {
+        const td = document.createElement("td");
+        td.textContent = v;
+        tr.appendChild(td);
+      }
+      const td = document.createElement("td");
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.setAttribute("data-testid", "grant-revoke");
+      btn.dataset.revokeGrant = g.ref;
+      btn.textContent = "Disconnect";
+      td.appendChild(btn);
+      tr.appendChild(td);
+      gbody.appendChild(tr);
+    }
+  }
+
+  async function refreshCredentials() {
+    if (!token) return;
+    const res = await api("/api/v1/credentials", "GET");
+    if (!res.ok) return;
+    renderCredentials(await res.json());
+  }
+
+  el("add-program").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const btn = el("add-program-button"), hint = el("connect-hint");
+    btn.disabled = true;
+    hint.textContent = "";
+    try {
+      const res = await api("/api/v1/credentials", "POST", {
+        label: el("program-label").value,
+        write: el("program-write").checked,
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        hint.textContent = body.error || `refused (${res.status})`;
+        hint.setAttribute("data-testid", "connect-error");
+        return;
+      }
+      hint.setAttribute("data-testid", "connect-hint");
+      showNewCredential(body);
+      el("program-label").value = "";
+      await refreshCredentials();
+    } finally {
+      btn.disabled = !connectReady;
+    }
+  });
+
+  // One delegated listener for both revoke buttons, for the same reason the
+  // SSO cards have one: an inline onclick would need 'unsafe-inline'.
+  document.addEventListener("click", async (e) => {
+    const d = e.target && e.target.dataset;
+    if (!d || (!d.revokeClient && !d.revokeGrant)) return;
+    const body = d.revokeClient ? { client: d.revokeClient } : { grant: d.revokeGrant };
+    // A revoked client's profile is dead for good, so the panel that showed
+    // its password goes with it rather than sitting there looking usable.
+    if (d.revokeClient && el("credential-new").dataset.ref === d.revokeClient) {
+      el("credential-new").hidden = true;
+      el("credential-new").textContent = "";
+    }
+    await api("/api/v1/credentials/revoke", "POST", body).catch(() => {});
+    await refreshCredentials();
+  });
+
+  function render(s) {
+    document.body.dataset.phase = s.phase;
+    renderPrompts(s.prompts || []);
+    t("volume").textContent = s.volume;
+    t("mode").textContent = s.mode;
+    t("branch-generation").textContent =
+      `branch ${s.branch}, generation ${s.phase === "ready" ? s.generation : "—"}`;
+    t("lease").textContent = `lease: ${s.lease}`;
+    t("lease").dataset.leaseState = s.lease;
+    t("test-hooks-banner").hidden = !s.test_hooks;
+
+    // The "Connect another program" controls. A read-only session may still
+    // hand out a credential — a WebDAV client that can only read is a
+    // perfectly good thing to want — but it may not hand out a writable
+    // one, and internal/localoauth refuses that at registration rather than
+    // trusting this checkbox. Disabling it here is the courtesy; the
+    // refusal is the control.
+    const writable = s.mode === "read-write";
+    if (writable !== canWrite) {
+      canWrite = writable;
+      el("program-write").disabled = !writable;
+      if (!writable) el("program-write").checked = false;
+      t("add-program-write-label").dataset.available = String(writable);
+    }
+    const ready = s.phase === "ready";
+    if (ready !== connectReady) {
+      connectReady = ready;
+      el("add-program-button").disabled = !ready;
+      el("connect-hint").textContent = ready ? "" : "(waiting for the volume)";
+      if (ready) refreshCredentials();
+    }
+
+    const phase = t("phase-banner");
+    if (s.phase === "ready") {
+      phase.hidden = true;
+    } else if (s.phase === "failed") {
+      phase.className = "banner bad";
+      phase.textContent = `pelfs could not open this volume: ${s.error}`;
+      phase.hidden = false;
+    }
+
+    // A lease this session no longer holds means everything the user does
+    // from here is going to fail at the seal, so it is a banner the moment
+    // it is known rather than a surprise at exit.
+    const lb = t("lease-banner");
+    const leaseWords = {
+      stale: "This session's branch lease is past its TTL — the laptop may have slept. " +
+             "Another writer was entitled to take the branch during that window; " +
+             "a publish now will re-check and may refuse.",
+      interrupted: "This session's lease object has vanished. pelfs will resolve it against " +
+                   "the branch head at the next publish.",
+      lost: "Another client has taken this branch. This session can no longer publish; " +
+            "its staged work is still on this machine and is not lost.",
+    };
+    if (leaseWords[s.lease]) {
+      lb.textContent = leaseWords[s.lease];
+      lb.hidden = false;
+    } else {
+      lb.hidden = true;
+    }
+
+    // Durability. Two glyphs, never one: a file that looks uploaded and is
+    // not in the federation is the worst ambiguity this page could carry,
+    // because the user's next action is to close the laptop and tell a
+    // collaborator the data is there.
+    dirty = s.staged_files;
+    const d = t("durability");
+    if (s.phase !== "ready") {
+      d.textContent = "reading the overlay…";
+      d.dataset.durability = "unknown";
+    } else if (s.mode === "read-only") {
+      d.innerHTML = `<span class="glyph published">✓</span>` +
+        `read-only. everything here is in the federation (generation ${s.generation}).`;
+      d.dataset.durability = "published";
+    } else if (s.staged_files === 0 && s.dirty_nodes === 0) {
+      d.innerHTML = `<span class="glyph published">✓</span>` +
+        `nothing staged. everything here is in the federation (generation ${s.generation}).`;
+      d.dataset.durability = "published";
+    } else {
+      const sending = s.upload_backlog > 0
+        ? ` <span class="glyph sending">◔</span>sending ${bytes(s.upload_backlog)}.`
+        : "";
+      // The idle clause is not decoration: it is the promise that closing
+      // this tab publishes rather than abandoning. Said only when the
+      // server says idle sealing is on for this session.
+      const idle = s.idle_seal_s > 0
+        ? `, or ${secs(s.idle_seal_s)} after this tab closes`
+        : "";
+      d.innerHTML = `<span class="glyph staged">●</span>` +
+        `${s.staged_files} file${s.staged_files === 1 ? "" : "s"} ` +
+        `(${bytes(s.staged_bytes)}) on this machine only` +
+        ` — next automatic publish in ${secs(s.next_publish_s)}` +
+        `${idle} (sooner under write pressure).${sending}`;
+      d.dataset.durability = "staged";
+    }
+
+    // The button.
+    const btn = el("publish"), hint = el("publish-hint");
+    const job = s.publish;
+    let state = "ready";
+    if (s.phase !== "ready") state = "connecting";
+    else if (s.mode === "read-only") state = "read-only";
+    else if (job && job.state === "running") state = "running";
+    else if (s.staged_files === 0 && s.dirty_nodes === 0) state = "nothing";
+    btn.dataset.publishState = state;
+    btn.disabled = state !== "ready";
+    hint.textContent = {
+      ready: "",
+      connecting: "(waiting for the volume)",
+      "read-only": "(read-only session — restart with --rw to publish)",
+      running: "(publishing — this holds the overlay, so writes wait)",
+      nothing: "(nothing to publish)",
+    }[state];
+
+    const st = el("publish-status");
+    if (!job) {
+      st.textContent = "";
+      st.dataset.jobState = "none";
+    } else {
+      st.dataset.jobState = job.state;
+      st.dataset.jobId = job.id;
+      if (job.state === "running") {
+        const s0 = Math.round((Date.now() - Date.parse(job.started)) / 1000);
+        st.textContent = `publishing… (${s0}s) — the seal freezes the overlay, so uploads resume in a moment`;
+      } else if (job.state === "failed") {
+        st.textContent = `publish failed: ${job.error}`;
+      } else if (job.reason === "idle") {
+        // A generation nobody clicked for. Saying so is the difference
+        // between a reassuring line and a confusing one.
+        st.textContent = `published automatically after the last tab closed: ${job.summary}`;
+      } else {
+        st.textContent = `published: ${job.summary}`;
+      }
+    }
+  }
+
+  async function publish() {
+    const btn = el("publish");
+    btn.disabled = true;
+    const res = await fetch("/api/v1/publish", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", [SESSION_HEADER]: token },
+      body: "{}",
+    });
+    const body = await res.json().catch(() => ({}));
+    const st = el("publish-status");
+    // 202 is the normal answer and progress arrives on the stream; 409
+    // means another publish already holds the overlay's lock.
+    if (res.status === 409) {
+      st.textContent = `a publish is already running (job ${body.job}) — watching it`;
+    } else if (!res.ok) {
+      st.textContent = `publish refused: ${body.error || res.status}`;
+    }
+  }
+
+  function stream() {
+    // EventSource cannot set a request header, so the token is in the
+    // query string. It never becomes a navigation, never enters history,
+    // and the only access log is ours.
+    const es = new EventSource(`/events?s=${encodeURIComponent(token)}`);
+    const status = el("stream-status");
+    es.addEventListener("state", (e) => {
+      status.textContent = "live";
+      status.dataset.stream = "open";
+      render(JSON.parse(e.data));
+    });
+    es.addEventListener("bye", () => {
+      status.textContent = "pelfs browse has exited — this page is now a snapshot";
+      status.dataset.stream = "closed";
+      document.body.dataset.phase = "exited";
+      es.close();
+    });
+    es.onerror = () => {
+      // Every frame is a full snapshot, so a reconnect needs no replay:
+      // the browser reopens the stream on its own and the next frame is
+      // the whole truth again.
+      if (es.readyState === EventSource.CONNECTING) {
+        status.textContent = "reconnecting…";
+        status.dataset.stream = "reconnecting";
+      } else {
+        status.textContent = "disconnected — is pelfs browse still running?";
+        status.dataset.stream = "closed";
+      }
+    };
+  }
+
+  // A generic "leave site?" dialog is not ours to word and browsers
+  // suppress it without prior interaction, so it is a hint and never the
+  // durability mechanism: the session seals at exit either way.
+  window.addEventListener("beforeunload", (e) => {
+    if (dirty > 0) e.preventDefault();
+  });
+
+  // The idle-seal HINT (U10), and it is only ever a hint: sendBeacon is
+  // best-effort by specification and the server never treats it as a
+  // trigger. All it can do is shorten a wait that has already started,
+  // which means the visibilitychange case below usually changes nothing —
+  // a hidden tab still holds its stream open, and a session with a stream
+  // is not idle. It costs one request and it is the difference between
+  // sealing five seconds after the tab closes and thirty.
+  //
+  // sendBeacon can set no request headers, so the session token travels in
+  // the body as a JSON Blob (which is also what makes the request's
+  // Content-Type application/json, and therefore acceptable to the guard).
+  function beacon() {
+    if (!token || !navigator.sendBeacon) return;
+    try {
+      navigator.sendBeacon("/api/v1/beacon",
+        new Blob([JSON.stringify({ session: token })], { type: "application/json" }));
+    } catch (_) { /* best-effort, by definition */ }
+  }
+  // pagehide rather than unload: unload is not fired at all on mobile and
+  // is deprecated for exactly this use.
+  window.addEventListener("pagehide", beacon);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") beacon();
+  });
+
+  el("publish").addEventListener("click", publish);
+  authenticate().then((tok) => {
+    if (!tok) return;
+    token = tok;
+    stream();
+  });
+})();
+</script>
+</body>
+</html>

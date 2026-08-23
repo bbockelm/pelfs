@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"syscall"
 	"unicode/utf8"
 
 	"github.com/bbockelm/pelfs/internal/nfsmount"
@@ -218,12 +217,9 @@ func usableMountPoint(path string) error {
 }
 
 // ownerOf is the uid that owns fi, or -1 when the platform did not say.
-func ownerOf(fi os.FileInfo) int {
-	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
-		return int(st.Uid)
-	}
-	return -1
-}
+// Its body is per-platform (finderown_unix.go, finderown_windows.go)
+// because the uid lives in a syscall.Stat_t that a Windows build has no
+// type for.
 
 func ownedByUs(fi os.FileInfo) bool {
 	owner := ownerOf(fi)

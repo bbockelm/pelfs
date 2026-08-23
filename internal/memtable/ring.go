@@ -9,7 +9,7 @@ import (
 	"os"
 	"sync/atomic"
 
-	"golang.org/x/sys/unix"
+	"github.com/bbockelm/pelfs/internal/mmapfile"
 )
 
 // Ring is the write buffer: an mmap'd circular log of extent records.
@@ -27,7 +27,11 @@ import (
 // ambiguity a wrapped pair of indices has, and it makes an extent's age —
 // how far behind the head it sits — a subtraction.
 type Ring struct {
-	f     *os.File
+	f *os.File
+	// mm is the mapping; whole is its bytes. internal/mmapfile spells out
+	// the three ways Windows mappings are stricter than mmap, and this
+	// type depends on all three — see mapRing and Remove.
+	mm    *mmapfile.Mapping
 	whole []byte // the whole mapping, file header included
 	data  []byte // the data region: whole[ringFileHdr:]
 	size  uint64 // len(data), fixed for the file's life
@@ -155,13 +159,20 @@ func CreateRing(path string, size int) (*Ring, error) {
 }
 
 func mapRing(f *os.File, size int) (*Ring, error) {
-	whole, err := unix.Mmap(int(f.Fd()), 0, ringFileHdr+size,
-		unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
+	// The file is at its FINAL size before this — CreateRing truncates to
+	// it, OpenRing maps the size the file already has — and it is never
+	// resized afterwards, which the comment above calls an avoidance of
+	// remapping under readers and which on Windows is a hard requirement:
+	// there is no remap, and a mapping cannot survive a resize. The size
+	// is also always positive (ringFileHdr is nonzero), so the zero-length
+	// file Windows refuses to map never arises.
+	mm, err := mmapfile.Map(f, ringFileHdr+size, mmapfile.ReadWrite)
 	if err != nil {
 		f.Close() //nolint:errcheck
-		return nil, fmt.Errorf("memtable: mmap ring: %w", err)
+		return nil, fmt.Errorf("memtable: ring: %w", err)
 	}
-	return &Ring{f: f, whole: whole, data: whole[ringFileHdr:], size: uint64(size)}, nil
+	whole := mm.Bytes()
+	return &Ring{f: f, mm: mm, whole: whole, data: whole[ringFileHdr:], size: uint64(size)}, nil
 }
 
 // writeFileHeader records the size and a HINT of where the live region
@@ -333,12 +344,12 @@ func (r *Ring) PromotableRange(distance uint64) (from, to uint64) {
 
 // Sync flushes the mapping. Durability is the caller's policy; the ring
 // only offers the primitive.
-func (r *Ring) Sync() error { return unix.Msync(r.whole, unix.MS_SYNC) }
+func (r *Ring) Sync() error { return r.mm.Flush() }
 
 func (r *Ring) Path() string { return r.f.Name() }
 
 func (r *Ring) Close() error {
-	err := unix.Munmap(r.whole)
+	err := r.mm.Close()
 	if cerr := r.f.Close(); err == nil {
 		err = cerr
 	}
@@ -346,7 +357,20 @@ func (r *Ring) Close() error {
 	return err
 }
 
-func (r *Ring) Remove() error { return os.Remove(r.f.Name()) }
+// Remove closes the ring and deletes its file.
+//
+// It CLOSES FIRST, which it did not used to. On Unix removing a mapped,
+// open file is ordinary and the mapping stays valid; on Windows both the
+// open handle and the live mapping pin the file, so the remove failed and
+// the ring file leaked. Closing first is correct on both.
+func (r *Ring) Remove() error {
+	path := r.f.Name()
+	err := r.Close()
+	if rerr := os.Remove(path); err == nil && !os.IsNotExist(rerr) {
+		err = rerr
+	}
+	return err
+}
 
 // OpenRing reopens a ring and recovers the records still live in it.
 //

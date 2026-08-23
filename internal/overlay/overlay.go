@@ -198,6 +198,15 @@ type FS struct {
 	// nil means read the tables.
 	rows *rowCache
 
+	// syncedSeq is the seq the last durability pass covered and synced says
+	// whether there has been one, which is how an fsync with nothing new
+	// under it costs a lock and a comparison (sync.go). Both are guarded
+	// by mu, like seq itself.
+	syncedSeq uint64
+	synced    bool
+	// syncCounters is what fsync has cost, sampled without the lock.
+	syncCounters
+
 	// seq counts mutating operations; modSeq records, per inode, the seq
 	// of its last modification. Snapshot names the seq it froze, and
 	// Rebase drops exactly the state whose last modification is at or
@@ -391,6 +400,10 @@ func Open(dir string, base *genfs.FS, opts Options) (*FS, error) {
 	content := contentStore(newStagingContent(stagingDir))
 	if opts.Memtable != nil {
 		content = newMemtableContent(opts.Memtable)
+		if err := applyRecoveredTruncations(db, opts.Memtable.RecoveredTruncations()); err != nil {
+			db.Close() //nolint:errcheck
+			return nil, err
+		}
 	}
 	return &FS{
 		base:       base,
@@ -403,6 +416,43 @@ func Open(dir string, base *genfs.FS, opts Options) (*FS, error) {
 		modSeq:     make(map[uint64]uint64),
 		snapEdges:  make(map[uint64]*snapshotState),
 	}, nil
+}
+
+// applyRecoveredTruncations brings the node lengths down to what a
+// recovered content store can actually serve.
+//
+// A file's length lives in TWO places, and only one of them is what a
+// reader sees. The content store holds the extent map; the node row holds
+// the length, and that is what stat answers and what Read clamps to
+// (read.go). They are written in one transaction on the live path, so they
+// never disagree — until a crash, where the operation log that records the
+// write is durable before the location record that says where the bytes
+// went. Recovery cuts the extent map back to the first byte it cannot
+// serve (memtable.Truncation); without the same cut here the node row
+// still claims the old length, the read is clamped to it, and the range
+// past the cut is answered out of an extent map that has nothing there —
+// which is to say with ZEROS. The file would come back at its full size,
+// wrong, and would seal that way.
+//
+// Only downward, and only for the inodes recovery named. A length that is
+// already at or below the cut is left exactly as it is: this reconciles a
+// crash, it does not police the invariant.
+func applyRecoveredTruncations(db *sql.DB, cuts []memtable.Truncation) error {
+	if len(cuts) == 0 {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	for _, c := range cuts {
+		if _, err := tx.Exec(`UPDATE onode SET length = ? WHERE inode = ? AND length > ?`,
+			c.Size, int64(c.Inode), c.Size); err != nil {
+			tx.Rollback() //nolint:errcheck
+			return fmt.Errorf("overlay: cut inode %d back to %d bytes after a recovery: %w", c.Inode, c.Size, err)
+		}
+	}
+	return tx.Commit()
 }
 
 // Close releases the database. Staging files and all dirty state persist

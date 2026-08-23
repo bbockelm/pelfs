@@ -111,9 +111,69 @@ type stagingContent struct {
 	// pins is one entry per live snapshot. They are guarded by the owning
 	// FS's lock, like everything else here.
 	pins []*snapPin
+	// unsynced is the inodes whose bodies have been written and not yet
+	// fsync'd, which is what an application's fsync has to cover (Sync).
+	//
+	// A SET rather than a sweep of the directory, because the alternative
+	// is the pathology: a `--no-memtable` mount with fifty thousand dirty
+	// files and an application that fsyncs after every write would pay
+	// fifty thousand fsyncs per call for one file's worth of new bytes.
+	// The set is bounded by the writes BETWEEN two fsyncs, so an
+	// application that never calls it never grows it past the session's
+	// dirty inodes — which the overlay already tracks one of (dirtySet) —
+	// and an application that calls it constantly keeps it near empty.
+	unsynced map[uint64]struct{}
+	// created records that a body's NAME is new since the last sync, so
+	// the directory entry needs a sync of its own. Without it the metadata
+	// can name an inode whose staging file is not durably in its
+	// directory, which reads back as content that is gone.
+	created bool
 }
 
-func newStagingContent(dir string) *stagingContent { return &stagingContent{dir: dir} }
+func newStagingContent(dir string) *stagingContent {
+	return &stagingContent{dir: dir, unsynced: map[uint64]struct{}{}}
+}
+
+// dirtyLocked notes that one inode's body has bytes no fsync has covered.
+// Called with the owning FS's lock held, like every other method here.
+func (c *stagingContent) dirtyLocked(ino uint64) {
+	if c.unsynced == nil {
+		c.unsynced = map[uint64]struct{}{}
+	}
+	c.unsynced[ino] = struct{}{}
+}
+
+// Sync fsyncs the bodies written since the last call, and the directory
+// holding them when any of their names are new.
+//
+// It is O(writes since the last fsync) rather than O(dirty files), which
+// is the whole reason the set above exists. Nothing here publishes: see
+// sync.go for what that guarantee covers and where it stops.
+func (c *stagingContent) Sync() error {
+	for ino := range c.unsynced {
+		if err := syncPath(c.path(ino)); err != nil {
+			return fmt.Errorf("overlay: sync staged inode %d: %w", ino, err)
+		}
+	}
+	if c.created {
+		// A directory is synced by fsync'ing the directory itself, which
+		// is what makes a name durable rather than just its bytes.
+		d, err := os.Open(c.dir)
+		if err != nil {
+			return err
+		}
+		err = d.Sync()
+		if cerr := d.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			return fmt.Errorf("overlay: sync staging directory: %w", err)
+		}
+		c.created = false
+	}
+	clear(c.unsynced)
+	return nil
+}
 
 // path is where one inode's body lives. Decimal, so nothing else in the
 // directory can collide with it.
@@ -126,6 +186,8 @@ func (c *stagingContent) Create(ino uint64) error {
 	if err != nil {
 		return err
 	}
+	c.created = true
+	c.dirtyLocked(ino)
 	return f.Close()
 }
 
@@ -155,6 +217,9 @@ func (c *stagingContent) Adopt(_ context.Context, ino uint64, length int64, base
 		os.Remove(fp) //nolint:errcheck
 		return err
 	}
+	// The BODY is already durable — Adopt syncs it above, because the row
+	// that publishes it commits next — but its NAME is not.
+	c.created = true
 	return nil
 }
 
@@ -219,6 +284,7 @@ func (c *stagingContent) WriteAt(_ context.Context, ino uint64, off int64, data 
 		f.Close() //nolint:errcheck
 		return err
 	}
+	c.dirtyLocked(ino)
 	return f.Close()
 }
 
@@ -228,6 +294,7 @@ func (c *stagingContent) Truncate(_ context.Context, ino uint64, size int64) err
 	if err := c.copyOut(ino, size); err != nil {
 		return err
 	}
+	c.dirtyLocked(ino)
 	return os.Truncate(c.path(ino), size)
 }
 

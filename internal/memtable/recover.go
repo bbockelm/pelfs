@@ -104,6 +104,34 @@ type LostRange struct {
 	Handle  Handle
 }
 
+// Truncation is one inode recovery cut back, and it is the price of not
+// serving a hole.
+//
+// An extent that cannot be resolved is content that is GONE, but the
+// content row that named it survives in the operation log — the op log is
+// written on the write itself, the location record only after the flush's
+// packs have landed — so the row still says how long the file is. Serving
+// that length means answering the lost range with zeros: a file that
+// reads at its full size, passes every length check, seals into a signed
+// generation, and is wrong. Nothing a user can run reveals it.
+//
+// So the file is cut at the FIRST lost byte instead. What is behind that
+// point is what was really written; what is at or past it is either gone
+// or unreachable without inventing the bytes in between, and a short file
+// is a failure a user can see. An interrupted copy leaves one on any
+// filesystem.
+type Truncation struct {
+	Inode uint64
+	// Size is where the file was cut: the offset of the first lost byte.
+	Size int64
+	// Was is the length the content row claimed.
+	Was int64
+	// Discarded is how many bytes of SURVIVING content sat past the cut
+	// and went with it. They were readable; they are dropped because
+	// serving them would mean serving a hole in front of them.
+	Discarded int64
+}
+
 // BufferReport is what one buffer file yielded.
 type BufferReport struct {
 	Path    string
@@ -135,6 +163,13 @@ type Report struct {
 	LostBytes int64
 	// LostInodes is the distinct inodes with at least one lost range.
 	LostInodes []uint64
+	// Truncations is the inodes cut back so that no lost range is served
+	// as zeros. Every one of them also appears in Lost — a file is only
+	// ever cut because something under it was lost — so this is the
+	// consequence, not a second kind of loss.
+	Truncations []Truncation
+	// DiscardedBytes totals the surviving content the cuts took with them.
+	DiscardedBytes int64
 }
 
 // Loss reports whether anything was lost.
@@ -165,6 +200,18 @@ func (r *Report) String() string {
 	fmt.Fprintf(&b, "memtable: DATA LOST: %d extents, %d bytes, across %d files:\n", len(r.Lost), r.LostBytes, len(r.LostInodes))
 	for _, l := range r.Lost {
 		fmt.Fprintf(&b, "  inode %d: bytes [%d,%d) are gone\n", l.Inode, l.FileOff, l.FileOff+int64(l.Length))
+	}
+	if len(r.Truncations) == 0 {
+		return b.String()
+	}
+	// Said separately from the loss, because it is a different fact about
+	// a different set of bytes: these files are SHORTER than the operation
+	// log says, and the alternative was serving the missing range as
+	// zeros.
+	fmt.Fprintf(&b, "memtable: %d files were CUT BACK to the first lost byte rather than served with a hole "+
+		"(%d bytes of surviving content went with the cuts):\n", len(r.Truncations), r.DiscardedBytes)
+	for _, t := range r.Truncations {
+		fmt.Fprintf(&b, "  inode %d: now %d bytes, was %d\n", t.Inode, t.Size, t.Was)
 	}
 	return b.String()
 }
@@ -246,15 +293,76 @@ func Recover(opts Options, d Durable) (*Store, *Report, error) {
 		s.chunkLoc[k] = v
 	}
 	s.packs = append([]packstore.SealedPack(nil), d.Packs...)
+	// A location naming a pack this session did not write is one the
+	// previous incarnation BORROWED from the base generation, and the
+	// journal does not say which generation that was. A repack could have
+	// dropped it while nothing was running, so the seal has to check
+	// rather than assume — see Sealer.stillStored.
+	ours := make(map[string]struct{}, len(s.packs))
+	for _, sp := range s.packs {
+		ours[sp.Name] = struct{}{}
+	}
+	for _, loc := range s.chunkLoc {
+		if _, mine := ours[loc.Pack]; !mine {
+			s.baseRecheckAll = true
+			break
+		}
+	}
 
 	if err := s.readopt(d, found); err != nil {
 		return nil, nil, err
 	}
 
 	lostInodes := make(map[uint64]struct{})
+	// resolves reports whether an extent reference still has bytes behind
+	// it: a record the ring gave back, or a location the flush recorded.
+	// Those are the only two places an extent can be, so anything else is
+	// gone.
+	resolves := func(h Handle) bool {
+		if _, ok := found[h]; ok {
+			return true
+		}
+		_, ok := s.handleLoc[h]
+		return ok
+	}
 	for _, row := range d.Rows {
-		c := &content{size: row.Size}
+		// The file is cut at the FIRST lost byte, and this is where that
+		// is decided — before any ref is installed, because a ref past
+		// the cut must not be installed at all.
+		//
+		// This is the difference between losing content and losing it
+		// quietly. The operation log records a write when it happens; the
+		// location record for the flush that carried it lands only once
+		// the packs have, so a crash in between leaves a content row at
+		// its full length with nothing behind part of it. A gap in an
+		// extent map READS AS ZEROS by design (content.go) — which is
+		// right for a sparse file, where nothing was ever written, and
+		// catastrophic here, where something was: the file comes back at
+		// exactly the length it should be, full of bytes that are not the
+		// ones that were written, and the seal then renders those zeros
+		// into a signed generation that fsck calls consistent. See
+		// Truncation.
+		//
+		// Only a LOST ref moves the cut. A genuine hole — a write past
+		// the end of a file, a truncate that grew one — has no ref at
+		// all, so it is not reachable from here and keeps reading as
+		// zeros, which is what it always meant.
+		cut := row.Size
 		for _, r := range row.Refs {
+			if !resolves(r.Handle) && r.FileOff < cut {
+				cut = r.FileOff
+			}
+		}
+		c := &content{size: cut}
+		var discarded int64
+		for _, r := range row.Refs {
+			// Past the cut and still readable: dropped anyway, because
+			// serving it would put a hole in front of it. Counted, so the
+			// report can say what the cut cost.
+			if r.FileOff >= cut && resolves(r.Handle) {
+				discarded += int64(r.Length)
+				continue
+			}
 			if _, ok := found[r.Handle]; ok {
 				c.refs = append(c.refs, r)
 				// Two counts, because an extent is either a ring record or
@@ -286,6 +394,12 @@ func Recover(opts Options, d Durable) (*Store, *Report, error) {
 		}
 		sort.Slice(c.refs, func(i, j int) bool { return c.refs[i].FileOff < c.refs[j].FileOff })
 		s.content[row.Inode] = c
+		if cut < row.Size {
+			rep.Truncations = append(rep.Truncations, Truncation{
+				Inode: row.Inode, Size: cut, Was: row.Size, Discarded: discarded,
+			})
+			rep.DiscardedBytes += discarded
+		}
 	}
 	// An adopted handle no surviving content row names is dead on arrival.
 	// readopt never establishes one now — deciding that BEFORE resolving it
@@ -297,6 +411,12 @@ func Recover(opts Options, d Durable) (*Store, *Report, error) {
 			delete(s.baseRefs, h)
 		}
 	}
+	// Held on the store as well as reported, because the report is for a
+	// human and this is for the caller that has to make the rest of the
+	// mount agree: the overlay's own node length is what stat and read
+	// clamp to, and a length it still believes would put the hole back
+	// (RecoveredTruncations).
+	s.truncated = rep.Truncations
 	for ino := range lostInodes {
 		rep.LostInodes = append(rep.LostInodes, ino)
 	}
@@ -476,4 +596,20 @@ func bufferSeqs(dir string) ([]uint64, error) {
 	}
 	sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
 	return seqs, nil
+}
+
+// RecoveredTruncations reports the inodes recovery cut back, so a caller
+// holding the other half of a file's state can cut it back too.
+//
+// It exists because the content store is not the only thing that says how
+// long a file is. The overlay's node row carries a length of its own, and
+// that is the one stat answers and the one a read clamps to — so a cut
+// that stopped here would leave the file reading at its old length with
+// zeros past the cut, which is the exact failure the cut exists to
+// prevent. Empty for a store that was not recovered, and for a recovery
+// that lost nothing.
+func (s *Store) RecoveredTruncations() []Truncation {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]Truncation(nil), s.truncated...)
 }

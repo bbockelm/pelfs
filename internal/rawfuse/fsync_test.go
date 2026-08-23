@@ -101,7 +101,7 @@ func TestFsyncDirMakesTheNamespaceDurableAndCarriesTheContent(t *testing.T) {
 		t.Fatalf("Fsync = %v", st)
 	}
 	if after := f.ov.SyncStats(); after.Passes != got.Passes {
-		t.Errorf("a file fsync after a directory fsync made another pass; "+
+		t.Errorf("a file fsync after a directory fsync made another pass; " +
 			"the directory fsync did not cover the content after all")
 	}
 }

@@ -18,9 +18,17 @@ import { MODE, card, expect, openPelfs, resetHooks, test } from "./pelfs";
  * not worth a browser and none of these are that.
  */
 test.describe("the file manager", () => {
+  // EMBED MODE, and no longer because the app is unreachable elsewhere --
+  // `pelfs browse` serves this same bundle at `/` since the wiring pass. It is
+  // because these assertions need a volume whose CONTENTS the test chose: a
+  // named file to list, a 6,000-entry directory for the cap, a path that
+  // refuses a rename. A fresh real volume has none of those, and creating them
+  // through the UI would be testing the upload path instead of the thing under
+  // test. The file manager against a REAL volume is the last describe block in
+  // this file, and it runs in browse mode.
   test.skip(
     MODE !== "embed",
-    "the React app is served by internal/webui; `pelfs browse` serves M1's page at / until the wiring pass",
+    "these assertions need the seeded mock volume (internal/webui/mockapi_test.go)",
   );
 
   // One volume serves the whole run, so a test that uploads a file would
@@ -194,6 +202,94 @@ test.describe("the file manager", () => {
     await expect(line).toContainText("in the federation");
   });
 
+  test("A REFUSED RENAME DOES NOT STAY ON THE SCREEN", async ({ page, session }) => {
+    // THE TEST THAT PINS KI-11, and the reason it is worth a browser.
+    //
+    // The store applies every mutation OPTIMISTICALLY: it renames the node and
+    // re-parents its children before the provider is reached at all. Upstream's
+    // `RestDataProvider.send` then attaches its `.catch` after its own
+    // `!res.ok` throw, so a refusal resolved to `undefined` and the promise
+    // never rejected -- and the row kept the new name. `PelfsDataProvider.send`
+    // fixed the swallowing; that alone left a banner saying "that did not
+    // happen" beside a row showing that it had, and of the two a user believes
+    // the row.
+    //
+    // So there are TWO assertions here and neither is sufficient alone:
+    //
+    //   1. the user is TOLD, in words, with the server's own reason in them;
+    //   2. the row is BACK, under its original name, and the name the user
+    //      typed is nowhere on the screen.
+    //
+    // Neither a Go test nor the contract replay can make the second one: the
+    // server's 403 is correct in both, and what the component then does with it
+    // is only observable in a browser.
+    //
+    // The refusal is a real HTTP 403 from the mock (mockEntry.ro), not an
+    // intercepted route -- so this drives the whole chain: the guard-shaped
+    // status, the provider's `explain`, the re-listing, and the store.
+    await openPelfs(page, session);
+    const before = card(page, "/read-only.dat");
+    await expect(before).toBeVisible();
+
+    // The mint of the rename, and the re-read that repairs it, are both
+    // watched: the repair is the mechanism, so a test that passed because the
+    // component happened not to apply the change would be worth nothing.
+    const calls: string[] = [];
+    page.on("request", (r) => {
+      const u = new URL(r.url());
+      if (u.pathname.startsWith("/api/v1/files")) calls.push(`${r.method()} ${u.pathname}`);
+    });
+
+    await before.click({ button: "right" });
+    await page.getByText("Rename", { exact: true }).first().click();
+    const input = page.locator(".wx-modal input, .wx-item input").first();
+    await input.fill("renamed-by-the-browser.dat");
+    await input.press("Enter");
+
+    // (1) the user is told, and the server's own sentence is in it.
+    const banner = page.getByTestId("pelfs-error");
+    await expect(banner).toBeVisible();
+    await expect(banner).toContainText("403");
+    await expect(banner).toContainText("permission denied");
+
+    // (2) the row is the volume's row again. This is the assertion KI-11 was
+    // filed for: before the fix this locator was absent and the renamed one
+    // was present, with the banner underneath saying otherwise.
+    await expect(before, "the refused rename must not survive on the screen").toBeVisible();
+    await expect(card(page, "/renamed-by-the-browser.dat")).toHaveCount(0);
+    await expect(page.locator("body")).not.toContainText("renamed-by-the-browser.dat");
+
+    // And the repair really was a re-read of the directory, not a guess about
+    // what the store had done.
+    expect(calls, `requests to /api/v1/files: ${calls.join(", ")}`).toContain(
+      "PUT /api/v1/files/%2Fread-only.dat",
+    );
+    await expect(async () => {
+      expect(
+        calls.filter((c) => c === "GET /api/v1/files"),
+        `root listings: ${calls.join(", ")}`,
+      ).not.toHaveLength(0);
+    }).toPass({ timeout: 2000 });
+  });
+
+  test("a refused delete leaves the file where it was", async ({ page, session }) => {
+    // The same mechanism through a different action, because `getHandlers`
+    // wraps all five and a fix that only covered rename would pass the test
+    // above and leave the worst case -- a delete -- looking successful.
+    await openPelfs(page, session);
+    const file = card(page, "/read-only.dat");
+    await expect(file).toBeVisible();
+
+    await file.click({ button: "right" });
+    await page.getByText("Delete", { exact: true }).first().click();
+    // The component confirms a delete; the button is in its own modal.
+    const confirm = page.locator(".wx-modal button", { hasText: /delete|ok|yes/i }).first();
+    if (await confirm.count()) await confirm.click();
+
+    await expect(page.getByTestId("pelfs-error")).toContainText("permission denied");
+    await expect(file, "a refused delete must not remove the row").toBeVisible();
+  });
+
   test("download goes through a ticket, and the page stays where it is", async ({
     page,
     session,
@@ -219,5 +315,61 @@ test.describe("the file manager", () => {
     expect(mints.some((p) => p === "/api/v1/download")).toBeTruthy();
     expect(mints.some((p) => p.startsWith("/d/"))).toBeTruthy();
     await expect(page.getByTestId("pelfs-shell")).toBeVisible();
+  });
+});
+
+/**
+ * THE FILE MANAGER AGAINST A REAL VOLUME, which is the assertion the wiring
+ * pass exists to make possible and the one nothing above can make.
+ *
+ * Everything in the describe block above runs against a mock: a real
+ * implementation of the eleven-route contract, but in memory, with no overlay,
+ * no packs, no federation and no seal. This one drag-and-drop goes through
+ * `pelfs browse --rw` into a real write overlay on a real v2 volume, and then
+ * publishes it to a fakeorigin federation -- so it is the whole trap this
+ * design was built to close, closed, in one test:
+ *
+ *   upload -> the grid shows the file, and the panel says ON THIS MACHINE ONLY
+ *          -> Publish now
+ *          -> the panel says IN THE FEDERATION, with a generation.
+ *
+ * IT PUBLISHES ON PURPOSE, and not only for the last assertion: the volume is
+ * shared by every spec in this run (one server, `fullyParallel: false`), and a
+ * test that left a file staged would make the next file's "nothing is staged
+ * yet" precondition false. Ending clean is the same discipline as the mock's
+ * reset hook, done the only way a real volume allows.
+ */
+test.describe("the file manager on a real volume", () => {
+  test.skip(MODE !== "browse", "needs `pelfs browse --rw` and a real overlay");
+
+  test("upload, staged, publish, in the federation", async ({ page, session }) => {
+    await openPelfs(page, session);
+    const line = page.getByTestId("durability");
+    // A fresh volume: nothing staged, and the panel says so rather than
+    // saying nothing.
+    await expect(line).toHaveAttribute("data-durability", "published");
+
+    await page.locator("input[type=file]").first().setInputFiles({
+      name: "measurement.dat",
+      mimeType: "application/octet-stream",
+      buffer: Buffer.from("bytes from a real overlay\n"),
+    });
+
+    // The file is in the volume the FUSE mount would show, and the page says
+    // exactly what that means.
+    await expect(card(page, "/measurement.dat")).toBeVisible();
+    const notice = page.getByTestId("upload-notice");
+    await expect(notice).toContainText("THIS MACHINE");
+    await expect(notice).toContainText("invisible to the federation");
+    await expect(line).toHaveAttribute("data-durability", "staged");
+    await expect(line).toContainText("on this machine only");
+
+    // And the seal, for real: fence, freeze, walk, upload, flip.
+    const button = page.getByTestId("publish-button");
+    await expect(button).toHaveAttribute("data-publish-state", "ready");
+    await button.click();
+    await expect(page.getByTestId("publish-status")).toHaveAttribute("data-job-state", "done");
+    await expect(line).toHaveAttribute("data-durability", "published");
+    await expect(line).toContainText("in the federation");
   });
 });

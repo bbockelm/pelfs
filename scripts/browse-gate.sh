@@ -122,11 +122,44 @@ BOOTSTRAP="${LAUNCH##*#bt=}"
 PORT="${ORIGIN##*:}"
 echo "   listening on $ORIGIN"
 
-# The page must be servable BEFORE the volume is open — that is the whole
+# BOTH PAGES must be servable BEFORE the volume is open — that is the whole
 # reason runBrowse binds first — so this is asserted before anything waits.
-code=$(curl -s -o "$WORK/page.html" -w '%{http_code}' -H 'Sec-Fetch-Site: none' "$ORIGIN/")
+#
+#   /          the file manager: internal/webui's committed bundle. What is
+#              checkable with curl is the shell and the hashed script it names,
+#              because everything else on that page is rendered by the script.
+#   /connect   the hand-written connection page, which carries the credential
+#              desk this gate goes on to drive.
+code=$(curl -s -o "$WORK/app.html" -w '%{http_code}' -H 'Sec-Fetch-Site: none' "$ORIGIN/")
+[ "$code" = 200 ] && grep -q 'id="root"' "$WORK/app.html"
+ck $? "app:served             $code, the file manager's shell at /"
+
+# The asset the shell names, at the path it names it. There is no catch-all on
+# this listener, so a bundle whose asset names moved is a white page — and this
+# is the check that says so rather than a user finding out.
+ASSET=$(sed -n 's/.*src="\.\/\(assets\/[^"]*\.js\)".*/\1/p' "$WORK/app.html" | head -1)
+code=$(curl -s -o "$WORK/app.js" -w '%{http_code}' -H 'Sec-Fetch-Site: same-origin' "$ORIGIN/$ASSET")
+[ "$code" = 200 ] && [ -s "$WORK/app.js" ]
+ck $? "app:asset              $code for /$ASSET, the script the shell names"
+
+# And the policy that lets that script run at all. The guard's default is
+# `default-src 'none'`, which renders the app blank; appHandler replaces it.
+csp=$(curl -s -o /dev/null -D - -H 'Sec-Fetch-Site: none' "$ORIGIN/" \
+  | tr -d '\r' | sed -n 's/^[Cc]ontent-[Ss]ecurity-[Pp]olicy: //p')
+case "$csp" in
+  *"script-src 'self'"*) case "$csp" in *unsafe-inline*) r=1 ;; *) r=0 ;; esac ;;
+  *) r=1 ;;
+esac
+ck $r "app:csp                script-src 'self', no 'unsafe-inline'"
+
+code=$(curl -s -o "$WORK/page.html" -w '%{http_code}' -H 'Sec-Fetch-Site: none' "$ORIGIN/connect")
 [ "$code" = 200 ] && grep -q 'data-testid="connect-another-program"' "$WORK/page.html"
-ck $? "page:served            $code, with the connect panel on it"
+ck $? "page:served            $code, the connect panel at /connect"
+
+# Each page names the other. A pair of surfaces on one port with no way
+# between them is two apps sharing a port.
+grep -q 'href="/"' "$WORK/page.html" && grep -q '/connect' "$WORK/app.js"
+ck $? "pages:linked           /connect points at /, and the bundle at /connect"
 
 # ---------------------------------------------------------------- 1. the session
 #

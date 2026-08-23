@@ -66,6 +66,41 @@ var dist embed.FS
 //go:embed third_party.txt
 var thirdParty string
 
+// CSP is the policy the bundle needs, and the one it must not be given more
+// than.
+//
+// It lives here rather than at the mount site because it is a fact about the
+// BUNDLE — which sources its own code comes from — and there is more than one
+// mount site: cmd/pelfs's route table serves it to users, and serve_test.go
+// serves it to the browser suite. Two copies of a policy is how the harness
+// comes to prove a page under rules the real server does not use.
+//
+// Every clause earns its place:
+//
+//   - script-src / style-src 'self': every byte of script and style in the
+//     bundle is a content-hashed file under assets/. So 'self' is exactly as
+//     tight as the connection page's per-response nonce and needs no secret.
+//     'unsafe-inline' must NEVER appear: docs/design-webui.md A5 is that the
+//     volume holds files the user did not write, and a stored-XSS payload
+//     that could satisfy script-src would run with the tab's session in
+//     reach. (The one inline style the page had — the noscript notice's —
+//     became a class for this reason.)
+//   - img-src 'self' data:: the brand PNG and the favicon are files; `data:`
+//     is for the icons the component inlines.
+//   - connect-src 'self': fetch and EventSource, and nothing else. This is
+//     what makes a bundled dependency that decided to phone home fail loudly
+//     rather than silently.
+//   - default-src 'none' plus the four hardening clauses: whatever is not
+//     named above cannot load at all.
+//
+// It is NOT set by Handler. Handler owns the bundle's caching and nothing
+// else, on the principle its doc comment states — a handler that
+// half-enforces a threat model is worse than one that plainly does not — so
+// the caller sets this, and cmd/pelfs's tests assert that the caller did.
+const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; " +
+	"img-src 'self' data:; connect-src 'self'; object-src 'none'; " +
+	"base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+
 // FS returns the built UI rooted at the bundle's top level, so index.html is
 // at "index.html".
 func FS() fs.FS {
@@ -79,9 +114,11 @@ func FS() fs.FS {
 }
 
 // ThirdParty returns the generated third-party notices. It is served at
-// /third_party.txt and linked from the UI's footer, because the obligation
-// the MIT licences impose has to be satisfiable by someone who has nothing
-// but the binary.
+// /third_party.txt and linked from the app's status line, because the
+// obligation the MIT licences impose has to be satisfiable by someone who has
+// nothing but the binary. (The link used to be in a page footer; the footer
+// was dropped — see webui/frontend/src/brand/Brand.tsx for whose call that
+// was — and the link moved rather than going with it.)
 func ThirdParty() string { return thirdParty }
 
 // Handler serves the embedded UI.
@@ -102,6 +139,14 @@ func ThirdParty() string { return thirdParty }
 //   - Unknown paths fall back to index.html so a client-side route survives
 //     a reload -- except under assets/, where a miss is a miss and must be a
 //     404 rather than an HTML page served as JavaScript.
+//
+// That second behaviour is a property of the HANDLER and not of pelfs: this
+// app has no client-side routes (there is no router in it -- the open
+// directory is component state, not the URL), so both mount sites give it four
+// EXACT patterns and the fallback is never reached. It stays because a bundle
+// handler that 404s a reload of a client-side route is a trap for whoever adds
+// the first route; what must not happen is a catch-all on the same listener as
+// the JSON API, which would answer a mistyped /api/v1/fil with an HTML page.
 func Handler() http.Handler {
 	files := FS()
 

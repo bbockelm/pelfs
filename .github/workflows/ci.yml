@@ -35,6 +35,19 @@ jobs:
           go-version: "1.26.0"
       - name: Vet
         run: CGO_ENABLED=0 go vet ./...
+      # gofmt is not a matter of taste here: two files reached main
+      # unformatted and two separate agents reported them as noise rather
+      # than fixing them, because nothing failed. `gofmt -l` names the
+      # files and exits 0 either way, so the emptiness is the assertion.
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l ./cmd ./internal)
+          if [ -n "$unformatted" ]; then
+            echo "these files are not gofmt'd:" >&2
+            echo "$unformatted" >&2
+            echo "run: gofmt -w $unformatted" >&2
+            exit 1
+          fi
       # ./... rather than ./internal/...: cmd/pelfs holds the tests for the
       # mount session itself -- the exit seal, the checkpoint cadence, what a
       # FAILED seal leaves behind. Every one of them stands up its own

@@ -170,6 +170,24 @@
   max-width: 44rem;
 }
 
+/* The no-JavaScript notice (index.html). A class and not a style attribute:
+   the page is served under `style-src 'self'` with no 'unsafe-inline', which
+   refuses the attribute -- and this is the one element that has to render
+   correctly when nothing else on the page does. */
+.pelfs-noscript {
+  margin: 2rem auto;
+  max-width: 40rem;
+  padding: 0 1rem;
+  font-family: var(--pelfs-font);
+}
+
+/* An anchor in the app's own chrome. The file manager's own links are the
+   component's; these are the two the page owns (the connection page, and the
+   third-party notices). */
+.pelfs-link {
+  color: var(--pelfs-primary);
+}
+
 .pelfs-statusline {
   display: flex;
   gap: 1rem;

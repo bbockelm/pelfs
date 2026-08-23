@@ -34,7 +34,7 @@ test.describe("the session credential", () => {
     const request = await playwright.request.newContext();
 
     await openPelfs(page, session);
-    await expect(page.getByTestId(MODE === "browse" ? "durability" : "pelfs-shell")).toBeVisible();
+    await expect(page.getByTestId("pelfs-shell")).toBeVisible();
 
     // A whole session, not just a load: state changes, a publish, a stream.
     if (MODE === "browse") {
@@ -57,7 +57,7 @@ test.describe("the session credential", () => {
     session,
   }) => {
     await openPelfs(page, session);
-    await expect(page.getByTestId(MODE === "browse" ? "durability" : "pelfs-shell")).toBeVisible();
+    await expect(page.getByTestId("pelfs-shell")).toBeVisible();
 
     const storage = await page.evaluate((key) => {
       const local: string[] = [];
@@ -95,7 +95,7 @@ test.describe("the session credential", () => {
     // Now the same thing where a person would see it: a fresh tab, the spent
     // link, and no stored session.
     await page.goto(`/#bt=${encodeURIComponent(bootstrap)}`);
-    const failure = page.getByTestId(MODE === "browse" ? "session-error" : "session-error");
+    const failure = page.getByTestId("session-error");
     await expect(failure).toBeVisible();
     await expect(failure).toContainText(/expired|already used|single-use|no pelfs session/i);
   });
@@ -117,7 +117,7 @@ test.describe("the session credential", () => {
       [SESSION_KEY, session] as [string, string],
     );
     await page.goto("/#bt=this-token-must-not-survive");
-    await expect(page.getByTestId(MODE === "browse" ? "durability" : "pelfs-shell")).toBeVisible();
+    await expect(page.getByTestId("pelfs-shell")).toBeVisible();
     expect(await page.evaluate(() => location.hash)).toBe("");
     expect(page.url()).not.toContain("this-token-must-not-survive");
   });

@@ -129,6 +129,13 @@ func TestOnlyTheNFSFrontendCallsTheOverrideConstructors(t *testing.T) {
 			switch d.Name() {
 			case ".git", "bin", "node_modules", "testdata":
 				return filepath.SkipDir
+			// Nested checkouts are not this repository's source. A linked
+			// git worktree (agents get one each, under .claude/worktrees)
+			// carries a full copy of cmd/pelfs, so walking into one reports
+			// every sibling's mountgen.go as an unauthorised caller -- a
+			// failure that says nothing about the tree being tested.
+			case ".claude", "worktrees":
+				return filepath.SkipDir
 			}
 			return nil
 		}

@@ -418,7 +418,7 @@ release, and what to do about it when upgrading, is in
   written out in `docs/go-nfs-patches.md`. FUSE mounts are unchanged; the
   kernel checks those (`default_permissions`).
 - **`fsync` means "recoverable by remounting this state directory". It does
-  NOT mean "in the federation".** Since v0.2.1 an `fsync(2)` on a pelfs
+  NOT mean "in the federation".** Since v0.2.1 an `fsync(2)` on a FUSE
   mount does real work and answers honestly: the write buffer's mapping is
   msync'd, the journal saying which file those bytes belong to is fsync'd,
   and the metadata holding the name and length is fsync'd, in that order.
@@ -437,6 +437,13 @@ release, and what to do about it when upgrading, is in
   exactly what it asks for. A directory `fsync` does the same work, because
   the two databases in a state directory may not be made durable in the
   other order.
+
+  **On an NFS-backed mount this is not yet true**, and the reason is one
+  layer down: NFSv3 COMMIT is answered by the `go-nfs` fork, whose handler
+  is a no-op on the stated grounds that writes are already pushed to the
+  backing store — which for pelfs they are not. So an `fsync` through an
+  NFS mount still returns success without making anything durable. Tracked
+  as KI-10 in [`docs/known-issues.md`](docs/known-issues.md).
 - The origin must permit GET/PUT/DELETE and listing on the prefix (i.e. a
   token with read/modify scopes for the namespace); `pelfs` checks this up
   front and says which scope is missing.

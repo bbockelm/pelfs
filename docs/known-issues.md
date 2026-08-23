@@ -33,7 +33,7 @@ fixed is listed at the bottom, so nobody re-files it.
 Every entry below was checked against the code at `0c2baf0`: all six KI
 and all six KL entries were still true. (KL-8 was filed after that audit,
 with the `--fusemount` work; KL-10 was filed and then closed after it, and
-is in the table at the bottom.) What had rotted was the citations —
+is in the table at the bottom; KI-10 was filed with the fsync work.) What had rotted was the citations —
 `internal/repack/execute.go` had moved ~83 lines under KI-9 — and one
 paragraph that had itself gone stale (removed).
 
@@ -197,6 +197,42 @@ own clock.
 **Pinned by an executable test: NO, and cannot be.** Fixing it means
 deciding whether a repack's ledger stamp is inside the injectable clock —
 a repack-semantics call.
+
+---
+
+### KI-10. `fsync` through the NFS frontend still returns success without making anything durable
+
+**Severity: medium, correctness of a promise.** Since v0.2.1 a FUSE mount's
+`Fsync`/`FsyncDir` make the session durable on local disk and return OK only
+once that holds (`internal/rawfuse/rw.go`, `overlay.FS.Sync`). An
+NFS-backed mount does not, and pelfs never gets the chance to: NFSv3 COMMIT
+is handled inside the `go-nfs` fork by `onCommit`
+(`nfs_oncommit.go`), which is a deliberate no-op — *"note this is a no-op,
+as we always push writes to the backing store"* — and writes `NFSStatusOk`
+plus the server's write verifier without consulting the filesystem at all.
+For a billy filesystem backed by real files that comment is nearly true;
+for pelfs, whose write buffer is an mmap'd ring and whose two databases run
+`synchronous=NORMAL`, it is not.
+
+So the exact shape of what is left: an application on an NFS mount that
+calls `fsync(2)`, gets success, and then loses the machine can lose those
+writes. It is the same defect the FUSE side had, one layer down and in a
+dependency.
+
+The fix is a FORK change and that is why it is filed rather than done.
+`billy.Filesystem` has no commit operation and neither does go-nfs's
+`Handler`, so there is no seam to implement: it needs either a capability
+interface `onCommit` consults (the shape `billy.CapabilityCheck` and
+`nfs.PermissionChecker` already use, so the precedent is there) or a
+`Commit` method the fork's handler calls when the filesystem offers one.
+`overlay.FS.Sync` is then the one-line body, and its coalescing makes a
+COMMIT free when FUSE or a previous COMMIT has just synced.
+
+**Pinned by an executable test: NO.** The no-op is in the dependency, so
+nothing in this repo's tests reaches it, and the observable difference is
+what survives a MACHINE crash — which no Go test on any platform this runs
+on can produce. What would pin it is a fork-side test that a COMMIT reaches
+the filesystem at all, and that belongs in the fork.
 
 ---
 
@@ -494,7 +530,9 @@ Nothing left in this file is expressible as a plan, which is why they
 are here:
 a memory ceiling reached only at a hundred million objects (KI-8), a
 missing stats field (KI-4, KI-5), an error class thrown away (KI-6), a
-transaction count (KI-7), and a wall clock in the wrong place (KI-9).
+transaction count (KI-7), a wall clock in the wrong place (KI-9), and a
+no-op in a dependency whose consequence is what survives a MACHINE crash
+(KI-10) — which is the one thing no test on any platform here can produce.
 Both entries that needed a crash or a repack plus a look at the disk
 (KI-2, KI-3, now fixed) turned out to be expressible after all, in
 ordinary Go tests, once the question was asked in the right units: not

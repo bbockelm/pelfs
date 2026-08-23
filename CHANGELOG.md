@@ -4,7 +4,7 @@
 
 ### `fsync` now does something, and says what it did
 
-`fsync(2)` and `fsyncdir(2)` on a pelfs mount returned success
+`fsync(2)` and `fsyncdir(2)` on a FUSE-backed pelfs mount returned success
 unconditionally, without making anything durable. An application that
 called `fsync`, checked the result, and believed its data was safe — which
 is the only reason to call it — was believing nothing.
@@ -34,6 +34,12 @@ database — but it cannot be answered alone: the content journal may hold
 entries for inodes the metadata never committed, and the metadata may never
 name content the journal lacks, so a durable namespace over an unsynced
 journal is precisely the state that rule forbids.
+
+**An NFS-backed mount does not get this yet.** NFSv3 COMMIT is answered
+inside the `go-nfs` fork by a handler that is a hard-coded no-op — its own
+comment says writes are always pushed to the backing store, which for pelfs
+they are not — so pelfs never sees the operation and cannot answer it
+honestly. Filed as KI-10; the fix is a fork change, not a pelfs one.
 
 **A chatty application pays once.** Repeat calls with nothing written
 between them are coalesced against the overlay's own mutation counter and

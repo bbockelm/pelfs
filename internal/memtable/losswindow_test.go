@@ -200,3 +200,61 @@ func TestTheRingIsNotReclaimedUntilTheLocatedRecordIsDurable(t *testing.T) {
 			"a tail that never advances is a writer that never gets its space back", s.ring.Used())
 	}
 }
+
+// A Located record that FAILS is a different animal from a failed pack run,
+// and the difference is a hang.
+//
+// A failed pack leaves its records in the ring index, so Flush clears the
+// error and packs them again — that is the recovery. A failed LOCATION
+// record cannot be retried: publish has already taken those records out of
+// the index, and the region they occupy can never be released, because it
+// is still the only place those extents exist. So the ring fills and stays
+// full, and a writer waiting for space is waiting for something that is
+// not coming. Before the error was made sticky, that writer parked on the
+// condition variable forever with no flush left alive to broadcast — a
+// mount that hangs instead of a mount that reports EIO.
+func TestAFailedLocationRecordFailsTheWriterInsteadOfHangingIt(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	obj := newCountingStore()
+	j := &crashingJournal{memJournal: newMemJournal()}
+	opts := losswindowOpts(dir)
+	opts.Obj, opts.Journal = obj, j
+	s, err := New(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close() //nolint:errcheck
+
+	// NEARLY THE WHOLE 1 MiB ring, and the size is the point. The hang
+	// needs a ring with no room AND nothing left to pack: 17 records of
+	// 60,048 bytes is 1,021,632 of 1,048,576. Fill less and a blocked
+	// writer finds its OWN later writes still in the index, cuts them,
+	// gets the next flush's failure, and returns an answer — which is why
+	// the first version of this test passed against the bug. The mutation
+	// run is what said so.
+	body := fill(60000, 91)
+	for i := 0; i < 17; i++ {
+		if err := s.Write(ctx, 1, int64(i*60000), body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Flush(ctx); !errors.Is(err, errLocatedNeverLanded) {
+		t.Fatalf("the first Flush returned %v, wanted the journal's failure", err)
+	}
+	// Every LATER Flush says so again. Reporting success over a ring that
+	// will never drain is what would let a seal publish on top of it — and
+	// this call is also what clears flushErr, which is what leaves the
+	// writer below with nothing but the sticky error to find.
+	if err := s.Flush(ctx); !errors.Is(err, errLocatedNeverLanded) {
+		t.Fatalf("a second Flush returned %v; the failure is not retryable and has to stay reported", err)
+	}
+	// So now: no room in the ring, nothing in the index to pack, and
+	// flushErr cleared. Without the sticky error this write starts a pack
+	// run that cuts an empty batch and then parks on the condition variable
+	// with no flush left alive to broadcast — forever. Nothing here waits
+	// on a timeout as an assertion; the hang IS the failure.
+	if err := s.Write(ctx, 2, 0, body); !errors.Is(err, errLocatedNeverLanded) {
+		t.Fatalf("a write into the frozen ring returned %v, wanted the journal's failure", err)
+	}
+}

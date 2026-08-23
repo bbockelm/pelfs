@@ -345,12 +345,19 @@ type Store struct {
 	// by the pack target: single digits at the shipped sizes, and never a
 	// function of the tree.
 	locating []locating
-	// locateStuck records that a Located record FAILED. The tail may never
-	// pass the region that record was going to describe, so no later batch
-	// may be reclaimed either, and the store says so rather than quietly
-	// reopening the window.
-	locateStuck bool
-	flushErr    error
+	// locateErr is the failure of a Located record, and it is STICKY.
+	//
+	// The tail may never pass the region that record was going to describe
+	// — it is still the only place those extents exist — so no later batch
+	// can be reclaimed either, and the ring will fill and stay full. That
+	// makes it a different animal from flushErr, which Flush clears and
+	// retries because a failed PACK run leaves its records in the index and
+	// can be packed again. This one cannot be retried: publish already took
+	// those records out of the index. So it is remembered, and every writer
+	// and every Flush is failed with it rather than being left to wait for
+	// space that is never coming back.
+	locateErr error
+	flushErr  error
 
 	nextHandle Handle
 	nextSeq    uint64
@@ -599,6 +606,13 @@ func (s *Store) appendLocked(ctx context.Context, rec *Record, payload []byte) (
 		if s.flushErr != nil {
 			return 0, s.flushErr
 		}
+		// A Located record that failed froze the tail for good, so the
+		// space this writer is waiting for is never coming back. Failing
+		// here is the difference between a mount that reports EIO and a
+		// mount that hangs.
+		if s.locateErr != nil {
+			return 0, s.locateErr
+		}
 		if !s.packing {
 			// Nothing is draining the ring, so start a run that takes
 			// everything: waiting on a packer that was never launched is
@@ -807,14 +821,16 @@ func (s *Store) locatedLocked(seq uint64, err error) {
 			// to see the error rather than wait for a record that is not
 			// coming.
 			s.locating = append(s.locating[:i], s.locating[i+1:]...)
-			s.locateStuck = true
+			if s.locateErr == nil {
+				s.locateErr = err
+			}
 		} else {
 			s.locating[i].done = true
 		}
 		break
 	}
 	n := 0
-	for !s.locateStuck && n < len(s.locating) && s.locating[n].done {
+	for s.locateErr == nil && n < len(s.locating) && s.locating[n].done {
 		if s.locating[n].to > s.reclaimTo {
 			s.reclaimTo = s.locating[n].to
 		}
@@ -868,6 +884,14 @@ func (s *Store) Flush(ctx context.Context) error {
 	// A failed pack left its records in the ring and still authoritative.
 	// Retrying is the recovery; discarding would lose them.
 	s.flushErr = nil
+	// A failed LOCATION record is the other case and is not retryable:
+	// publish has already taken those records out of the index, so there is
+	// nothing left to pack, and the ring region they sit in can never be
+	// released. Reporting it every time is what stops a seal proceeding
+	// over a store whose ring will never drain.
+	if s.locateErr != nil {
+		return s.locateErr
+	}
 	for {
 		if err := s.waitPackLocked(); err != nil {
 			return err

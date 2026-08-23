@@ -2,6 +2,95 @@
 
 ## Unreleased
 
+### `pelfs browse` publishes when the last tab closes
+
+A browser tab has no unmount. A drag-and-drop of 200 documents at ~2 MB
+fires neither write-pressure trigger — 1 GiB staged, 200,000 dirty inodes —
+so before this the work sat in the overlay until the five-minute checkpoint
+came round, while the user closed the laptop and told a collaborator the
+data was there.
+
+A `--rw` browse session now seals on its own once the last `/events` stream
+has been gone for `min(30s, --snapshot-interval)` with nothing written on
+any surface. The page says so ("… or 30s after this tab closes") and labels
+the resulting generation as one nobody clicked for.
+
+The distinctions that make this safe rather than annoying:
+
+- **A reconnecting browser does not trigger it.** An SSE stream drops and
+  re-establishes routinely, so the trigger is a quiet WINDOW after the
+  stream set becomes empty, and any stream that appears clears it.
+- **Two tabs open means one closing is not idle**: only the close that
+  empties the set starts the window.
+- **A closed lid seals when it wakes**, because the window is compared
+  against the clock rather than counted in samples.
+- **`navigator.sendBeacon` is a hint, never a trigger.** A beacon is
+  best-effort by specification; all it does is shorten a wait that is
+  already running, so a hidden-but-open tab changes nothing.
+- **A failed idle seal backs off** on the pressure path's own formula
+  (double, floored at the window, capped at the snapshot interval), because
+  a 30-second retry against a broken federation is the "same warning
+  forever" failure that backoff exists to prevent.
+- **It cannot re-enter a seal in flight**: it takes the same publish slot
+  the "Publish now" button takes, and it starts nothing once teardown has
+  begun.
+
+`--snapshot-interval 0` still means what it says: seal only at exit, no
+automatic publishing, idle sealing included.
+
+### The device-flow prompt shows up in the browser instead of the terminal
+
+`pelfs browse` installs pelican's `oauth2.SetVerificationURLHandler`, so
+"authorize with your institution" arrives as a card on the page — the URL,
+the code to type, and what pelfs is waiting for — rather than as a URL in a
+terminal the user was told they would not need.
+
+Details worth knowing, because the hook constrains them:
+
+- The hook is **process-wide** (one `atomic.Pointer`), so `pelfs browse` is
+  the only verb that installs it, and it removes it on the way out. `pelfs
+  mount` and `pelfs get` keep the terminal behaviour they always had, and
+  pelican still writes the URL to stderr in every case.
+- Prompts are a **set with a TTL**, not a slot: two namespaces can each open
+  a flow, and both get a card. Identical prompts fold together.
+- A prompt raised **before the browser has connected** — the likely case,
+  since credential priming runs as the volume opens — is not lost: the
+  cards are state, and `/events` carries snapshots, so the first frame a
+  stream ever receives already has them.
+- The card **never says "authorization complete"**, because the hook is
+  one-way and cannot know. It greys out on a ten-minute TTL, is dismissible
+  by hand, and carries **no token of any kind**.
+
+### `--state-dir` now covers everything, including the mount registry
+
+`--state-dir` covered a session's overlay, caches, control socket and
+signing key, but the mount-record registry was derived from
+`$XDG_STATE_HOME/pelfs` (or `~/.local/state/pelfs`) independently of the
+flag. So a run pointed entirely at a temp directory still created a
+`vol-<id>` directory in the user's home, wrote `mount.json` into it, and
+left the directory behind, empty, at exit. Measured, not theorised: the
+count went up by one per run of the browser harness, which had to export
+`XDG_STATE_HOME` to work around it.
+
+A **foreground** session — `pelfs shell`, `pelfs mount-gen`, `pelfs browse`
+— now creates nothing outside the root its own flags select. Its record
+goes under `--state-dir`, where `pelfs ctl <state-dir> <verb>` has always
+reached it; `pelfs status` and `pelfs umount` grew a `--state-dir` flag so
+they can look there too.
+
+**`pelfs mount` is the deliberate exception**, because it detaches: its
+whole contract is that a shell finds it afterwards by prefix
+(`pelfs status`, `pelfs umount <prefix>`, `pelfs ctl <prefix> publish`),
+and a reader cannot be told about a `--state-dir` it never saw. A live
+background mount that cannot be stopped by name would be a worse bug than
+the one being fixed, so that one record stays in the machine-wide registry.
+
+What is fixed for it instead: **the registry no longer accumulates**. The
+retraction at exit now removes the `vol-<id>` directory as well as the
+record when nothing else is in it, so a session that comes and goes leaves
+the state root exactly as it found it. (Directories that already hold a
+volume's state are untouched — the removal only succeeds on an empty one.)
+
 ### `fsync` now does something, and says what it did
 
 `fsync(2)` and `fsyncdir(2)` on a pelfs mount returned success

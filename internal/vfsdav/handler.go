@@ -111,7 +111,7 @@ var writeMethods = map[string]bool{
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	grant, ok := h.auth.Check(r)
 	if !ok {
-		for _, c := range h.auth.Challenge() {
+		for _, c := range challengesFor(h.auth, r) {
 			w.Header().Add("WWW-Authenticate", c)
 		}
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -234,10 +234,38 @@ func (a *bearerAuth) Check(r *http.Request) (Grant, bool) {
 	return a.verify(strings.TrimSpace(h[len(prefix):]))
 }
 
+// RequestChallenger is the optional half of Auth: a challenge that depends
+// on what the request tried. An Auth that implements it has ChallengeFor
+// called instead of Challenge on a 401.
+//
+// It exists for one specific hazard, named in docs/design-webui.md's
+// verification 2d(iii): do NOT answer an unauthorized /dav/ request with
+// `WWW-Authenticate: Basic` when a Bearer token was offered and rejected,
+// or Cyberduck may fall back into a password prompt for a profile that has
+// no password field — and the user is then staring at a dialog with nothing
+// to type in it. Challenge() takes no request and so cannot express that;
+// this can.
+type RequestChallenger interface {
+	// ChallengeFor is the WWW-Authenticate value (or values) for a 401 to
+	// this particular request.
+	ChallengeFor(r *http.Request) []string
+}
+
+// challengesFor prefers the request-aware challenge when the Auth offers
+// one, so that an Auth which does not care is unaffected.
+func challengesFor(a Auth, r *http.Request) []string {
+	if rc, ok := a.(RequestChallenger); ok {
+		return rc.ChallengeFor(r)
+	}
+	return a.Challenge()
+}
+
 // AnyOf accepts a request that any of auths accepts, and offers every
-// scheme in its 401. This is how the two client paths coexist on one
-// endpoint: AnyOf(Bearer(...), Basic(...)) is what U7 mounts, and the order
-// is the order the challenges are offered in.
+// scheme in its 401 — except that a request which TRIED a scheme is
+// challenged only with that one (see anyOf.ChallengeFor). This is how the
+// two client paths coexist on one endpoint:
+// AnyOf(Bearer(...), Basic(...)) is what U7 mounts, and the order is the
+// order the challenges are offered in.
 func AnyOf(auths ...Auth) Auth { return anyOf(auths) }
 
 type anyOf []Auth
@@ -248,6 +276,43 @@ func (a anyOf) Challenge() []string {
 		out = append(out, one.Challenge()...)
 	}
 	return out
+}
+
+// ChallengeFor narrows the 401 to the scheme the client actually tried.
+//
+// A client that offered `Authorization: Bearer …` and was refused is told
+// about Bearer and nothing else, so it retries its OAuth flow instead of
+// dropping into a password prompt (RequestChallenger says why that matters).
+// A request that offered no credential at all, or one whose scheme this
+// endpoint does not implement, gets the whole list — which is what makes a
+// first PROPFIND from any client discover both paths.
+func (a anyOf) ChallengeFor(r *http.Request) []string {
+	tried := authScheme(r.Header.Get("Authorization"))
+	if tried == "" {
+		return a.Challenge()
+	}
+	var out []string
+	for _, one := range a {
+		for _, c := range challengesFor(one, r) {
+			if strings.EqualFold(authScheme(c), tried) {
+				out = append(out, c)
+			}
+		}
+	}
+	if len(out) == 0 {
+		return a.Challenge()
+	}
+	return out
+}
+
+// authScheme is the first token of an Authorization or WWW-Authenticate
+// value: "Bearer xyz" and `Bearer realm="pelfs"` both yield "Bearer".
+func authScheme(v string) string {
+	v = strings.TrimSpace(v)
+	if i := strings.IndexAny(v, " \t"); i >= 0 {
+		return v[:i]
+	}
+	return v
 }
 
 func (a anyOf) Check(r *http.Request) (Grant, bool) {

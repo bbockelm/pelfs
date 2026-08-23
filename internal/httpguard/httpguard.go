@@ -93,7 +93,8 @@ import (
 //
 // This is the seam later milestones mount onto. U6 (WebDAV) takes
 // SurfaceExternal, U7 (the OAuth authorization server) takes
-// SurfaceNavigation, U11 (the JSON API) takes SurfaceAPI and
+// SurfaceNavigation for /oauth/authorize and SurfaceToken for
+// /oauth/token, U11 (the JSON API) takes SurfaceAPI and
 // SurfaceUpload. Adding a route means naming its surface, which means
 // naming its principal — and that is deliberately the one decision a
 // contributor cannot skip.
@@ -174,6 +175,36 @@ const (
 	// instinct of a later maintainer is to make it look like the API
 	// routes, and the consistent version does not work.
 	SurfaceNavigation
+
+	// SurfaceToken is the OAuth token endpoint — POST /oauth/token (U7) —
+	// and it exists because NO OTHER SURFACE CAN SERVE IT.
+	//
+	// docs/design-webui.md and cmd/pelfs/browse.go's route comment both
+	// pencil that route in on SurfaceExchange, "the API surface minus the
+	// session requirement". The caller, though, is not a browser and is not
+	// our page: it is Cyberduck's Apache HttpClient (or rclone, or curl)
+	// making a back-channel POST. It sends no Origin and no
+	// Sec-Fetch-Site, so SurfaceExchange's provenance requirement — which
+	// is a browser-only signal — answers 403; and its body is
+	// `application/x-www-form-urlencoded`, which RFC 6749 §4.1.3 mandates
+	// and SurfaceExchange's JSON rule answers 415. A profile pointed at a
+	// SurfaceExchange token endpoint fails every exchange.
+	//
+	// What this surface KEEPS is everything that still applies to a
+	// non-browser POST, and it is most of the list: the Host allowlist, so
+	// a rebound Host never reaches the handler; CrossOriginProtection, so a
+	// form POST from a page on another loopback port is refused (an unsafe
+	// method with `Sec-Fetch-Site: same-site` is rejected, and by F3
+	// another loopback port IS same-site); the exact-Origin match whenever
+	// an Origin is present at all; no cookie in, no Set-Cookie out; no
+	// Access-Control-Allow-*; and a security-header set that makes the
+	// response inert. What it drops is the provenance signal a non-browser
+	// cannot send and the content type the protocol forbids.
+	//
+	// The credential it checks is in its body — an authorization code plus
+	// a PKCE verifier, or a refresh token — and internal/localoauth is
+	// where that is checked.
+	SurfaceToken
 )
 
 func (s Surface) String() string {
@@ -194,6 +225,8 @@ func (s Surface) String() string {
 		return "external"
 	case SurfaceNavigation:
 		return "navigation"
+	case SurfaceToken:
+		return "token"
 	}
 	return "surface(" + strconv.Itoa(int(s)) + ")"
 }
@@ -241,10 +274,12 @@ func (s Surface) policy() policy {
 		// No content-type rule: an SSE subscription is a GET with no body.
 		return policy{provenance: true, session: true, noAuthorization: true}
 	}
-	// App, Ticket, External, Navigation: no credential of ours, so no
-	// provenance requirement either — each of the three has to answer a
-	// request the browser makes with no page of ours involved (a pasted
-	// URL, an <a href> download, a Cyberduck navigation).
+	// App, Ticket, External, Navigation, Token: no credential of ours, so
+	// no provenance requirement either — each has to answer a request made
+	// with no page of ours involved (a pasted URL, an <a href> download, a
+	// Cyberduck navigation, a back-channel POST from a Java HTTP client).
+	// Every one of them still gets the Host allowlist, the Sec-Fetch-Site
+	// check, the exact-Origin match, the cookie strip and the headers.
 	return policy{}
 }
 

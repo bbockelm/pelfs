@@ -23,6 +23,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/bbockelm/pelfs/internal/browsesession"
 )
 
 // testClock is a clock a test moves. Mutex-guarded because the sealer's
@@ -71,7 +73,14 @@ type idleFixture struct {
 func newIdleFixture(t *testing.T, interval time.Duration) *idleFixture {
 	t.Helper()
 	clk := newTestClock()
-	b := newBrowseServer("pelican://fed/pfx", browseArgs{branch: "main", rw: true}, interval, nil)
+	m, err := browsesession.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := newBrowseServer("pelican://fed/pfx", browseArgs{branch: "main", rw: true}, interval, m, 49731)
+	if err != nil {
+		t.Fatal(err)
+	}
 	b.now = clk.now
 	// A session that is open, writable, and has nothing else to say. The
 	// sealer never touches it except through the two injected functions,

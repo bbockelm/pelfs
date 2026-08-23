@@ -16,15 +16,18 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -37,6 +40,7 @@ import (
 	"github.com/bbockelm/pelfs/internal/httpguard"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/publish"
+	"github.com/bbockelm/pelfs/internal/webapi"
 )
 
 // browseFixture is a browseServer wired to a real session and served over
@@ -57,12 +61,17 @@ func newBrowseFixture(t *testing.T, rw bool, hooks bool) *browseFixture {
 		t.Fatal(err)
 	}
 	a := browseArgs{branch: g.branch, rw: rw, testHooks: hooks}
-	bs := newBrowseServer(g.prefix, a, 5*time.Minute, m)
 	srv := httptest.NewServer(nil)
 	// httptest binds 127.0.0.1 with a random port, which is what the guard
 	// wants to hear about: the allowlist and the origin are computed from
-	// the port the listener actually got.
+	// the port the listener actually got — and so is every URL in a
+	// generated WebDAV profile, which is why the server is built after the
+	// listener rather than before it.
 	port := srv.Listener.Addr().(*net.TCPAddr).Port
+	bs, err := newBrowseServer(g.prefix, a, 5*time.Minute, m, port)
+	if err != nil {
+		t.Fatal(err)
+	}
 	srv.Config.Handler = bs.routes(httpguard.New(httpguard.Config{Port: port, Sessions: m}))
 	t.Cleanup(srv.Close)
 	f := &browseFixture{t: t, bs: bs, g: g, srv: srv}
@@ -431,6 +440,13 @@ func TestPageIsOneFileWithANonceAndTheTestIDsAPlaywrightSuiteNeeds(t *testing.T)
 		"durability", "durability-legend", "glyph-staged", "glyph-sending", "glyph-published",
 		"publish-button", "publish-hint", "publish-status", "connect-another-program",
 		"stream-status", "footer-disclaimer", "noscript", "test-hooks-banner", "body",
+		// The credential surface (U7/U8). The form and the two tables are
+		// in the shipped HTML; the rows, the revoke buttons and the panel
+		// that shows a password once are built by the script, so those ids
+		// are checked in the script block below.
+		"connect-blurb", "dav-url", "add-program-form", "add-program-label",
+		"add-program-write", "add-program-write-label", "add-program-button",
+		"connect-hint", "connect-empty", "credential-new", "client-list", "grant-list",
 		// U13's card. The container is in the shipped HTML; the card,
 		// its URL, its code and its dismiss button are built by the
 		// script from the state document, so those ids live in the
@@ -450,9 +466,11 @@ func TestPageIsOneFileWithANonceAndTheTestIDsAPlaywrightSuiteNeeds(t *testing.T)
 	if staged == published {
 		t.Errorf("staged and published render the same glyph (%q)", staged)
 	}
-	// M1 has no file browsing, and the person who expected a file manager
-	// has to be told that on the page rather than in a release note.
-	if !strings.Contains(page, "cannot browse, upload or download files") {
+	// This page still has no file manager on it, and the person who
+	// expected one has to be told that on the page rather than in a release
+	// note — along with what to do instead, which is now a real answer
+	// (connect a program) rather than "use pelfs mount".
+	if !strings.Contains(page, "does not browse files") {
 		t.Error("the page does not say what it cannot do")
 	}
 	if !strings.Contains(page, "not an official Pelican Platform product") {
@@ -469,6 +487,12 @@ func TestPageIsOneFileWithANonceAndTheTestIDsAPlaywrightSuiteNeeds(t *testing.T)
 	for _, want := range []string{
 		`"sso-card"`, `"sso-url"`, `"sso-code"`, `"sso-dismiss"`, `"sso-note"`,
 		`navigator.sendBeacon`, `"/api/v1/beacon"`, `"pagehide"`, `"visibilitychange"`,
+		// The credential rows and the one panel that ever holds a secret.
+		`"client-row"`, `"client-revoke"`, `"grant-row"`, `"grant-revoke"`,
+		`"credential-label"`, `"credential-dav-url"`, `"credential-basic-user"`,
+		`"credential-basic-password"`, `"credential-notice"`,
+		`"download-profile"`, `"download-bookmark"`, `"download-basic"`,
+		`"/api/v1/credentials"`, `"/api/v1/credentials/revoke"`,
 	} {
 		if !strings.Contains(page, want) {
 			t.Errorf("the page's script does not carry %s", want)
@@ -513,21 +537,96 @@ func TestPprofIsNotOnTheWebListener(t *testing.T) {
 	}
 }
 
-// TestTicketMechanismWithoutAFileSurface: M1 registers no download
-// source, so minting says so instead of handing out a ticket that can only
-// 404. The mechanism itself is exercised in
-// internal/browsesession and in the guard's table.
-func TestTicketMechanismWithoutAFileSurface(t *testing.T) {
+// TestTicketMechanismOverTheVolume is the ticket round trip with the real
+// file surface behind it: upload through the JSON API, mint a ticket for
+// what was uploaded, and redeem it with NO credential on the request at
+// all.
+//
+// Before the wiring pass this test asserted a 503 — M1 registered no
+// Source, so minting refused rather than handing out a ticket that could
+// only 404. That refusal is gone, and this is what replaced it.
+func TestTicketMechanismOverTheVolume(t *testing.T) {
 	f := newBrowseFixture(t, true, false)
-	f.bs.setReady(f.g, context.Background())
-	res := f.do("POST", "/api/v1/download", `{"path":"/x"}`, f.tok)
-	body, _ := io.ReadAll(res.Body)
-	res.Body.Close() //nolint:errcheck
-	if res.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("mint: %d, want 503 (%s)", res.StatusCode, body)
+
+	// Minting before the volume opens still refuses: a ticket lives 30
+	// seconds, and one minted against a volume that is not there can only
+	// expire.
+	early := f.do("POST", "/api/v1/download", `{"path":"/x"}`, f.tok)
+	earlyBody, _ := io.ReadAll(early.Body)
+	early.Body.Close() //nolint:errcheck
+	if early.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("mint before the volume opens: %d, want 503 (%s)", early.StatusCode, earlyBody)
 	}
-	if !strings.Contains(string(body), "U11") {
-		t.Errorf("the refusal does not name what will provide it: %s", body)
+
+	f.bs.setReady(f.g, context.Background())
+	const want = "these bytes came out of the overlay\n"
+	f.upload(t, "/", "ticketed.txt", want)
+
+	res := f.do("POST", "/api/v1/download", `{"path":"/ticketed.txt"}`, f.tok)
+	var mint struct{ URL string }
+	_ = json.NewDecoder(res.Body).Decode(&mint)
+	res.Body.Close() //nolint:errcheck
+	if res.StatusCode != 200 || mint.URL == "" {
+		t.Fatalf("mint: %d %+v", res.StatusCode, mint)
+	}
+	bare, err := f.srv.Client().Get(f.srv.URL + mint.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := io.ReadAll(bare.Body)
+	bare.Body.Close() //nolint:errcheck
+	if bare.StatusCode != 200 || string(got) != want {
+		t.Fatalf("ticketed download: %d %q", bare.StatusCode, got)
+	}
+	if cd := bare.Header.Get("Content-Disposition"); !strings.Contains(cd, "ticketed.txt") {
+		t.Errorf("Content-Disposition = %q", cd)
+	}
+	// One use. The URL that landed in the download history is already spent
+	// by the time it was written there.
+	again, err := f.srv.Client().Get(f.srv.URL + mint.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again.Body.Close() //nolint:errcheck
+	if again.StatusCode != http.StatusNotFound {
+		t.Errorf("replayed ticket: %d, want 404", again.StatusCode)
+	}
+}
+
+// upload pushes one file through POST /api/v1/upload, which is a multipart
+// request on SurfaceUpload rather than a JSON one — a different surface
+// with a different content type, so it cannot go through do().
+func (f *browseFixture) upload(t *testing.T, dir, name, body string) {
+	t.Helper()
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	part, err := mw.CreateFormFile(webapi.UploadField, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(part, body); err != nil {
+		t.Fatal(err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest("POST",
+		f.srv.URL+"/api/v1/upload?id="+url.QueryEscape(dir), &buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("Origin", f.srv.URL)
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Header.Set(httpguard.SessionHeader, f.tok)
+	res, err := f.srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, _ := io.ReadAll(res.Body)
+	res.Body.Close() //nolint:errcheck
+	if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusCreated {
+		t.Fatalf("upload %s: %d %s", name, res.StatusCode, out)
 	}
 }
 

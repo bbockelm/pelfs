@@ -74,15 +74,22 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/go-git/go-billy/v5"
+
 	"github.com/bbockelm/pelfs/internal/browsesession"
+	"github.com/bbockelm/pelfs/internal/davprofile"
 	"github.com/bbockelm/pelfs/internal/genfs"
 	"github.com/bbockelm/pelfs/internal/httpguard"
+	"github.com/bbockelm/pelfs/internal/localoauth"
 	"github.com/bbockelm/pelfs/internal/overlay"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/refs"
 	"github.com/bbockelm/pelfs/internal/stats"
 	"github.com/bbockelm/pelfs/internal/superblock"
 	"github.com/bbockelm/pelfs/internal/ui"
+	"github.com/bbockelm/pelfs/internal/vfsbilly"
+	"github.com/bbockelm/pelfs/internal/vfsdav"
+	"github.com/bbockelm/pelfs/internal/webapi"
 )
 
 // browseAssets is the page. One file, hand-written, no bundler, no Node —
@@ -202,7 +209,11 @@ func runBrowse(o *cmdOpts, prefix string, a browseArgs) int {
 		_ = g.stats.Finalize(1, false)
 		return exitErr(err)
 	}
-	bs := newBrowseServer(prefix, a, o.snapshotInterval, sessions)
+	bs, err := newBrowseServer(prefix, a, o.snapshotInterval, sessions, port)
+	if err != nil {
+		_ = g.stats.Finalize(1, false)
+		return exitErr(err)
+	}
 	guard := httpguard.New(httpguard.Config{Port: port, Sessions: sessions})
 	srv := &http.Server{
 		Handler: bs.routes(guard),
@@ -535,6 +546,19 @@ type browseServer struct {
 	args     browseArgs
 	interval time.Duration
 	sessions *browsesession.Manager
+	// port is the port the listener actually got. Every generated
+	// connection file names it — the profile's `Default Port`, the DAV URL,
+	// the bookmark — so it is carried rather than re-derived.
+	port int
+	// api is the JSON data plane (U11) and oauth is the authorization
+	// server and credential registry (U7/U8). BOTH EXIST BEFORE THE VOLUME
+	// DOES, which is the ordering this file is built around: the api
+	// reaches the volume through b.volume, which answers webapi.ErrNotReady
+	// until setReady runs, and the oauth server never touches the volume at
+	// all. The WebDAV handler is the one piece that cannot be built here —
+	// see setReady.
+	api   *webapi.API
+	oauth *localoauth.Server
 	// prompts is the device-flow prompt registry (U13). It exists before
 	// the volume does, because that is when the first flow fires.
 	prompts *promptRegistry
@@ -550,6 +574,15 @@ type browseServer struct {
 	ctx     context.Context
 	phase   string // "connecting" | "ready" | "failed"
 	openErr string
+	// binding is the volume as billy, built ONCE at setReady rather than
+	// per request: vfsbilly's dir cache and residency bound belong to the
+	// binding, and a fresh one per request would throw both away on every
+	// listing. nil until the volume opens, which is what b.volume reports
+	// as webapi.ErrNotReady.
+	binding billy.Filesystem
+	// dav is the WebDAV surface over that binding. It is built at setReady
+	// for the reason given there, and until it exists /dav/* answers 503.
+	dav http.Handler
 	// staged* keep the last sample that was readable. pressure() answers
 	// -1 while a seal has the overlay, and reporting zero staged bytes
 	// mid-publish would be the one lie this page must not tell.
@@ -619,24 +652,67 @@ type publishJob struct {
 	Error   string    `json:"error,omitempty"`
 }
 
-func newBrowseServer(prefix string, a browseArgs, interval time.Duration, m *browsesession.Manager) *browseServer {
+// newBrowseServer builds the whole HTTP surface EXCEPT the WebDAV handler,
+// which needs a filesystem that does not exist yet (setReady).
+//
+// It returns an error because two of the three pieces can refuse to be
+// built — a negative listing cap, a read-only session that was asked for a
+// writable authorization server — and both are startup failures rather than
+// 500s on the first request.
+func newBrowseServer(prefix string, a browseArgs, interval time.Duration,
+	m *browsesession.Manager, port int) (*browseServer, error) {
 	b := &browseServer{
 		prefix:      prefix,
 		args:        a,
 		interval:    interval,
 		sessions:    m,
+		port:        port,
 		phase:       "connecting",
 		lastPublish: time.Now(),
 		streams:     map[chan struct{}]struct{}{},
 		over:        testOverrides{on: a.testHooks},
 	}
 	b.streamsIdleSince = b.lastPublish
+	var err error
+	// Cap 0 means webapi.DefaultCap (5000), which is U0's measured number
+	// and not a guess; see that package's comment for the 100k-entry
+	// measurement it comes from.
+	if b.api, err = webapi.New(webapi.Config{Volume: b.volume}); err != nil {
+		return nil, err
+	}
+	// The session's own mode is the ceiling on every credential this server
+	// will ever mint, and it is named HERE, once — a read-only `pelfs
+	// browse` cannot even register a client that could ask for
+	// pelfs.write. Sessions is the browser-session presence check (A7
+	// control 2): *browsesession.Manager satisfies it as it stands.
+	if b.oauth, err = localoauth.New(localoauth.Config{
+		Writable: a.rw,
+		Volume:   prefix,
+		Sessions: m,
+	}); err != nil {
+		return nil, err
+	}
 	// The registry's fan-out is b.nudge, and the registry calls it on its
 	// own goroutine: the device-flow hook runs on the goroutine driving the
 	// flow and BLOCKS it, so nothing it calls may wait on a mutex a slow
 	// state() sample could be holding.
 	b.prompts = newPromptRegistry(b.nowTime, b.nudge)
-	return b
+	return b, nil
+}
+
+// volume is webapi.VolumeFunc: the live binding, or webapi.ErrNotReady
+// while the volume is still opening (which the JSON surface answers 503).
+//
+// A function rather than a field for the reason webapi.VolumeFunc gives —
+// the route table is built before the volume exists — and it hands back the
+// binding CACHED at setReady rather than building one per request.
+func (b *browseServer) volume() (billy.Filesystem, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.binding == nil {
+		return nil, webapi.ErrNotReady
+	}
+	return b.binding, nil
 }
 
 // nowTime is the server's clock: time.Now unless a test injected one.
@@ -647,19 +723,28 @@ func (b *browseServer) nowTime() time.Time {
 	return time.Now()
 }
 
-// routes is THE ROUTE TABLE, and the seam the later milestones mount onto.
+// routes is THE ROUTE TABLE. Every line names a surface, and the surface
+// names the principal (internal/httpguard). Three principals reach this
+// listener and no credential minted for one is accepted at another:
 //
-// Every line names a surface, and the surface names the principal
-// (internal/httpguard). What lands here next:
+//	the page          X-Pelfs-Session, on SurfaceApp/API/Exchange/Upload/Stream
+//	an <a href>       a single-use ticket in the path, on SurfaceTicket
+//	a WebDAV client   Basic or Bearer, on SurfaceExternal, plus the two
+//	                  routes that mint it (SurfaceNavigation, SurfaceToken)
 //
-//	U6  WebDAV:  r.Handle(httpguard.SurfaceExternal, "/dav/", vfsdav.Handler(...))
-//	U7  OAuth:   r.Handle(httpguard.SurfaceNavigation, "GET /oauth/authorize", ...)
-//	             r.Handle(httpguard.SurfaceExchange,   "POST /oauth/token", ...)
-//	U11 JSON:    r.Handle(httpguard.SurfaceAPI,    "GET /api/v1/files/{path...}", ...)
-//	             r.Handle(httpguard.SurfaceUpload, "POST /api/v1/upload", ...)
+// POST /oauth/token IS ON SurfaceToken AND NOT ON SurfaceExchange, and this
+// comment said the opposite until the wiring pass. It matters: the caller
+// is Cyberduck's Apache HttpClient making a back-channel POST, so it sends
+// no Origin and no Sec-Fetch-Site (SurfaceExchange's provenance rule would
+// answer 403) and its body is application/x-www-form-urlencoded, which RFC
+// 6749 §4.1.3 mandates (SurfaceExchange's JSON rule would answer 415). A
+// profile pointed at a SurfaceExchange token endpoint fails EVERY exchange.
+// internal/httpguard.SurfaceToken exists for exactly this, and
+// internal/localoauth's TestTokenEndpointCannotLiveOnSurfaceExchange pins
+// it so nobody moves the route back for consistency's sake.
 //
-// and the one thing that does NOT land here, ever, is anything that
-// forwards to internal/control.
+// The one thing that does NOT land here, ever, is anything that forwards to
+// internal/control.
 func (b *browseServer) routes(g *httpguard.Guard) http.Handler {
 	r := g.NewRouter()
 	// The app shell. Unauthenticated because there is no secret in it: the
@@ -686,27 +771,98 @@ func (b *browseServer) routes(g *httpguard.Guard) http.Handler {
 	// and the handler checks the session token itself.
 	r.HandleFunc(httpguard.SurfaceExchange, "POST /api/v1/beacon", b.serveBeacon)
 	r.HandleFunc(httpguard.SurfaceStream, "GET /events", b.serveEvents)
-	// The ticketed download. M1 registers no Source, so a redeemed ticket
-	// 404s — the MECHANISM is what this milestone owes U11, and it is
-	// cheaper to build it with the guard than to retrofit it afterwards
-	// (see internal/browsesession.DownloadHandler for why an <a href>
-	// download cannot use the session credential).
+	// The ticketed download, over the volume (see downloadSource). An
+	// <a href> cannot carry a request header, so authority is a single-use
+	// 30-second ticket in the path and this route accepts no session
+	// credential at all — see internal/browsesession.DownloadHandler.
 	r.Handle(httpguard.SurfaceTicket, "GET /d/{"+browsesession.TicketPathValue+"}",
 		browsesession.DownloadHandler(b.sessions, b.downloadSource()))
+
+	// ---- the credential surface (U7/U8) ---------------------------------
+	//
+	// The two navigation routes and the token endpoint are what an external
+	// WebDAV client touches; the three /api/v1/credentials routes are what
+	// the PAGE touches to hand it a profile and to take it away again. A
+	// credential the user cannot see is a credential the user cannot revoke
+	// (docs/design-webui.md, A6), so the list and the revoke are as much
+	// part of this milestone as the download is.
+	//
+	// SurfaceNavigation cannot require a custom header — Cyberduck reaches
+	// /oauth/authorize by opening the user's browser at it — so its
+	// controls are elsewhere entirely: an exact-string redirect_uri
+	// allowlist, a per-download client_id, PKCE S256, and one real gesture
+	// on a consent screen that runs no script. internal/localoauth's
+	// package comment is the specification; nothing here re-decides any of
+	// it.
+	r.Handle(httpguard.SurfaceNavigation, "GET /oauth/authorize", b.oauth.AuthorizeHandler())
+	r.Handle(httpguard.SurfaceNavigation, "POST /oauth/authorize", b.oauth.AuthorizeHandler())
+	r.Handle(httpguard.SurfaceToken, "POST /oauth/token", b.oauth.TokenHandler())
+	r.HandleFunc(httpguard.SurfaceAPI, "GET /api/v1/credentials", b.serveListCredentials)
+	r.HandleFunc(httpguard.SurfaceAPI, "POST /api/v1/credentials", b.serveNewCredential)
+	r.HandleFunc(httpguard.SurfaceAPI, "POST /api/v1/credentials/revoke", b.serveRevokeCredential)
+
+	// ---- WebDAV (U6) ----------------------------------------------------
+	//
+	// The session token is REFUSED on this surface and an Authorization
+	// header is refused on the API surface: that pair is the two-principals
+	// rule, and it is a property of the route table rather than of a
+	// handler's memory.
+	r.Handle(httpguard.SurfaceExternal, davprofile.DAVPath, http.HandlerFunc(b.serveDAV))
+
+	// ---- the JSON data plane (U11) --------------------------------------
+	//
+	// Eleven patterns for eight routes, all of them webapi's own; it names
+	// its own surfaces, which is why this is one line and not eleven.
+	b.api.Register(r)
+
 	if b.args.testHooks {
 		r.HandleFunc(httpguard.SurfaceAPI, "POST /api/v1/testhook", b.serveTestHook)
 	}
 	return r
 }
 
-// downloadSource is nil in a normal build; --test-hooks supplies a
-// synthetic one so a browser driver can prove the no-credential download
-// and the single-use ticket end to end.
+// downloadSource is the file surface behind /d/<ticket>: the volume, through
+// the same vfsbilly binding and the same internal/fsperm mode check every
+// other frontend uses.
+//
+// The synthetic source stays AHEAD of it. A browser-driver run passes
+// --test-hooks precisely to reach states the volume is not in, and a driver
+// that had to create a file before it could exercise the ticket round trip
+// would be testing the upload path instead of the ticket. The flag is off in
+// every real session, so the real source is what a user ever meets.
 func (b *browseServer) downloadSource() browsesession.Source {
-	if !b.args.testHooks {
-		return nil
+	if b.args.testHooks {
+		return testDownloadSource{b}
 	}
-	return testDownloadSource{b}
+	return b.api.Source()
+}
+
+// serveDAV is the WebDAV surface, or a 503 while the volume is still
+// opening.
+//
+// A DELEGATOR rather than the handler itself, and that is the one place the
+// wiring could not take its author's line verbatim: vfsdav.New reads the
+// filesystem's write capability AT CONSTRUCTION (vfsdav.go's `writable:
+// billy.CapabilityCheck(bfs, ...)`), so it cannot be built before there is a
+// filesystem — and this route table is built before the volume opens,
+// deliberately, so that a device-flow prompt has a page to appear on. The
+// alternative was a lazy billy.Filesystem that answered the capability
+// question from browseArgs.rw, which would have put a second opinion about
+// writability next to billy's, and billy's is the one every other surface
+// asks. So the handler is built at setReady and this stands in front of it.
+//
+// 503 rather than 401: the credential is not the problem, and a WebDAV
+// client told 401 goes looking for a password it was never meant to have.
+func (b *browseServer) serveDAV(w http.ResponseWriter, r *http.Request) {
+	b.mu.Lock()
+	h := b.dav
+	b.mu.Unlock()
+	if h == nil {
+		w.Header().Set("Retry-After", "2")
+		http.Error(w, "the volume is still opening", http.StatusServiceUnavailable)
+		return
+	}
+	h.ServeHTTP(w, r)
 }
 
 type testDownloadSource struct{ b *browseServer }
@@ -789,9 +945,50 @@ type browseState struct {
 	Prompts []ssoPrompt `json:"prompts,omitempty"`
 }
 
+// setReady binds the volume to the surfaces that were registered without
+// one.
+//
+// THE BINDING IS BUILT HERE, ONCE, and not per request: vfsbilly carries a
+// directory cache and a residency bound, and a fresh binding per HTTP
+// request would discard both on every listing — which is the difference
+// between one readdir and one per navigation on a large directory.
+//
+// vfsbilly.NewFor/NewReadOnlyFor with OpenAnsweredHere, never the NFS
+// constructors. Those carry the owner override (OpenAnsweredByClient),
+// which lets a file's owner write it whatever the mode says: defensible for
+// NFSv3, where the client already answered open(2) from our ACCESS reply,
+// and indefensible for an HTTP handler, where THIS check is the open check.
+// A call-site allowlist test in internal/vfsbilly fails any caller here that
+// reaches for the other four.
 func (b *browseServer) setReady(g *genSession, ctx context.Context) {
+	var bind billy.Filesystem
+	if g.ov != nil {
+		bind = webapi.NewVolume(g.ov, vfsbilly.ProcessCred())
+	} else {
+		// A read-only session has no overlay, so the binding is over the
+		// published generation. Everything downstream is identical: billy
+		// answers "no write capability", and webapi and vfsdav both refuse
+		// a mutation from that one answer rather than from a flag of their
+		// own.
+		bind = vfsbilly.NewReadOnlyFor(g.gfs, vfsbilly.ProcessCred(), vfsbilly.OpenAnsweredHere)
+	}
+	dav, err := vfsdav.New(vfsdav.Config{
+		FS: bind, Prefix: strings.TrimSuffix(davprofile.DAVPath, "/"),
+		Auth: b.oauth.DAVAuth(davRealm),
+	})
+	if err != nil {
+		// Only a nil FS or a nil Auth can produce this, so it is a wiring
+		// bug rather than anything a session can hit. Say so and leave
+		// /dav/* answering 503; nothing else about the session is harmed.
+		ui.Warn("the WebDAV surface could not be built ({error}); /dav/ is unavailable this session",
+			"error", err)
+	}
 	b.mu.Lock()
 	b.g, b.ctx, b.phase = g, ctx, "ready"
+	b.binding = bind
+	if err == nil {
+		b.dav = dav
+	}
 	b.mu.Unlock()
 	b.nudge()
 }
@@ -989,10 +1186,17 @@ func newJobID() string {
 
 // ---- tickets -------------------------------------------------------------
 
-// serveMintTicket is the authenticated half of the download pair: it
-// checks (in U11, against the real permission model) and then mints. The
-// /d/<ticket> route does no checking at all, because it has no principal
-// to check with.
+// serveMintTicket is the authenticated half of the download pair: it mints,
+// and the /d/<ticket> route does no checking at all, because it has no
+// principal to check with.
+//
+// It deliberately does NOT pre-check readability. The permission model is
+// internal/fsperm through internal/vfsbilly and it is applied where the
+// bytes are opened (webapi's Source), which is the only place that can be
+// right — a check here would be a second opinion, evaluated at a different
+// moment, about a file another writer may have chmod'd in between. What a
+// ticket carries is a path, not an authorization: redeeming one for a file
+// the session may not read is a 403 from the layer that owns the answer.
 func (b *browseServer) serveMintTicket(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Path string `json:"path"`
@@ -1001,11 +1205,11 @@ func (b *browseServer) serveMintTicket(w http.ResponseWriter, r *http.Request) {
 		writeBrowseJSON(w, http.StatusBadRequest, map[string]string{"error": "expected a JSON body"})
 		return
 	}
-	if b.downloadSource() == nil {
-		// M1 has no file surface. Saying so beats minting a ticket that
-		// can only ever 404.
+	if _, err := b.volume(); err != nil {
+		// The volume is still opening. Saying so beats minting a ticket
+		// that expires in thirty seconds and can only ever 503.
 		writeBrowseJSON(w, http.StatusServiceUnavailable, map[string]string{
-			"error": "this build has no file surface yet: downloads arrive with the JSON API (U11)"})
+			"error": "the volume is still opening; downloads are not available yet"})
 		return
 	}
 	tk, err := b.sessions.MintTicket(req.Path)

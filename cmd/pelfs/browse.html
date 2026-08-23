@@ -95,7 +95,33 @@
   .publishrow { display: flex; gap: .8rem; align-items: center; flex-wrap: wrap; }
   #publish-hint, #publish-status { color: var(--muted); font-size: .9rem; }
   .connect h2 { font-size: 1rem; margin: 0 0 .2rem; }
-  .connect p { margin: 0; color: var(--muted); font-size: .92rem; }
+  .connect p { margin: 0 0 .6rem; color: var(--muted); font-size: .92rem; }
+  .connect form { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; margin: .8rem 0; }
+  .connect input[type="text"] {
+    font: inherit; padding: .4rem .6rem; border: 1px solid var(--rule);
+    border-radius: .35rem; background: #fff; color: var(--ink); min-width: 14rem;
+  }
+  .connect label { font-size: .92rem; color: var(--muted); }
+  .connect label input { margin-right: .3rem; }
+  .cred {
+    padding: .8rem .9rem; border-radius: .4rem; margin: 1rem 0;
+    background: var(--brand-light); border: 1px solid #a9cdf7;
+  }
+  .cred h3 { font-size: .95rem; margin: 0 0 .4rem; }
+  .cred .files { display: flex; gap: .5rem; flex-wrap: wrap; margin: .6rem 0; }
+  .cred .files button { font-size: .88rem; padding: .35rem .7rem; }
+  .cred dl { display: grid; grid-template-columns: max-content 1fr; gap: .15rem .8rem; margin: .5rem 0 0; }
+  .cred dt { color: var(--muted); font-size: .86rem; }
+  .cred dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .86rem; user-select: all; word-break: break-all; }
+  .cred .once { color: var(--staged); font-size: .86rem; margin: .5rem 0 0; }
+  table.creds { border-collapse: collapse; width: 100%; margin: .6rem 0; font-size: .9rem; }
+  table.creds th { text-align: left; color: var(--muted); font-weight: 500; font-size: .82rem; }
+  table.creds th, table.creds td { padding: .3rem .5rem .3rem 0; border-bottom: 1px solid var(--rule); }
+  table.creds button {
+    background: transparent; color: var(--muted); border: 1px solid var(--rule);
+    font-weight: 400; padding: .15rem .5rem; font-size: .84rem;
+  }
+  table.creds[hidden], .cred[hidden], #connect-empty[hidden] { display: none; }
   code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .9em; }
   footer { margin-top: 2rem; color: var(--muted); font-size: .8rem; }
   #stream-status { font-size: .8rem; color: var(--muted); }
@@ -168,13 +194,47 @@
 
   <div class="connect" data-testid="connect-another-program">
     <h2>Connect another program</h2>
-    <p>
-      Not yet built. This page cannot browse, upload or download files — it exists to
-      tell you whether your data is in the federation, and to publish it when you say so.
-      To move files today, use <code>pelfs mount</code>.
-      A WebDAV endpoint on this same port is M2; SFTP is assessed in
-      <code>docs/design-guiclients.md</code>.
+    <p data-testid="connect-blurb">
+      This page still does not browse files. What it does now is hand the job to a
+      program that is good at it: this session speaks WebDAV at
+      <code data-testid="dav-url">—</code>, and adding a program below produces a
+      Cyberduck or Mountain Duck profile that connects with one double-click and no
+      password, plus a username and password for everything else — rclone, WinSCP,
+      <code>mount_webdav</code>, curl. Everything you add here dies when
+      <code>pelfs browse</code> exits: nothing is written to disk and nothing survives
+      the process.
     </p>
+
+    <form data-testid="add-program-form" id="add-program">
+      <input type="text" id="program-label" data-testid="add-program-label"
+             placeholder="Cyberduck on this laptop" maxlength="64" autocomplete="off">
+      <label data-testid="add-program-write-label">
+        <input type="checkbox" id="program-write" data-testid="add-program-write" disabled>
+        may write
+      </label>
+      <button type="submit" id="add-program-button" data-testid="add-program-button" disabled>
+        Add a program
+      </button>
+      <span id="connect-hint" data-testid="connect-hint"></span>
+    </form>
+
+    <!-- The one panel on this page that holds a secret. It is built once,
+         from the response to the POST that minted it, and it is never
+         re-fetched: internal/localoauth keeps HMACs, so these two values
+         exist nowhere pelfs can read them back. -->
+    <div class="cred" id="credential-new" data-testid="credential-new" hidden></div>
+
+    <p id="connect-empty" data-testid="connect-empty" hidden>
+      Nothing is connected yet.
+    </p>
+    <table class="creds" id="client-list" data-testid="client-list" hidden>
+      <thead><tr><th>program</th><th>username</th><th>may write</th><th>connections</th><th></th></tr></thead>
+      <tbody id="client-rows"></tbody>
+    </table>
+    <table class="creds" id="grant-list" data-testid="grant-list" hidden>
+      <thead><tr><th>connection</th><th>scope</th><th>last used</th><th></th></tr></thead>
+      <tbody id="grant-rows"></tbody>
+    </table>
   </div>
 
   <footer>
@@ -354,6 +414,203 @@
     }).catch(() => {});
   });
 
+  // ---- the credential surface (U7/U8) -------------------------------------
+  //
+  // Three routes, all on the session-authenticated API surface: list, mint,
+  // revoke. The interesting one is mint, because its response is the only
+  // one on this listener that carries a secret — the per-client Basic
+  // password and, inside the profile, the client id — and neither can be
+  // fetched again.
+  //
+  // THE FILES ARE SAVED FROM A BLOB, not from a link to a route. A download
+  // link is an <a href>, an <a href> cannot set X-Pelfs-Session, and a
+  // credential-bearing GET authorized by anything ambient is the hole DNS
+  // rebinding exploits. So the bytes arrive in the POST's response and
+  // never touch a URL, a history entry or an access log.
+  let davURL = "", canWrite = false, connectReady = false;
+
+  function api(path, method, body) {
+    const init = { method, headers: { [SESSION_HEADER]: token } };
+    if (body !== undefined) {
+      init.headers["Content-Type"] = "application/json";
+      init.body = JSON.stringify(body);
+    }
+    return fetch(path, init);
+  }
+
+  function saveBlob(name, type, content) {
+    const url = URL.createObjectURL(new Blob([content], { type }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    // Revoked on the next turn: Safari has historically needed the URL to
+    // still be live when the click is processed.
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+  }
+
+  function when(iso) {
+    if (!iso || iso.startsWith("0001-01-01")) return "never";
+    const d = new Date(iso);
+    return isNaN(d) ? "never" : d.toLocaleTimeString();
+  }
+
+  // The one panel that holds a secret, built with textContent throughout.
+  function showNewCredential(c) {
+    const box = el("credential-new");
+    box.textContent = "";
+    box.hidden = false;
+    box.dataset.ref = c.ref;
+
+    const h = document.createElement("h3");
+    h.setAttribute("data-testid", "credential-label");
+    h.textContent = `${c.label} — added`;
+    box.appendChild(h);
+
+    const files = document.createElement("div");
+    files.className = "files";
+    const ids = ["download-profile", "download-bookmark", "download-basic"];
+    (c.files || []).forEach((f, i) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.setAttribute("data-testid", ids[i] || "download-file");
+      btn.dataset.filename = f.name;
+      btn.textContent = f.kind;
+      btn.addEventListener("click", () => saveBlob(f.name, f.content_type, f.content));
+      files.appendChild(btn);
+    });
+    box.appendChild(files);
+
+    const dl = document.createElement("dl");
+    const pair = (term, value, id) => {
+      const dt = document.createElement("dt");
+      dt.textContent = term;
+      const dd = document.createElement("dd");
+      dd.textContent = value;
+      dd.setAttribute("data-testid", id);
+      dl.appendChild(dt);
+      dl.appendChild(dd);
+    };
+    pair("WebDAV URL", c.dav_url, "credential-dav-url");
+    pair("username", c.basic_user, "credential-basic-user");
+    pair("password", c.basic_password, "credential-basic-password");
+    box.appendChild(dl);
+
+    const once = document.createElement("p");
+    once.className = "once";
+    once.setAttribute("data-testid", "credential-notice");
+    once.textContent = c.notice;
+    box.appendChild(once);
+  }
+
+  function renderCredentials(list) {
+    davURL = list.dav_url || davURL;
+    t("dav-url").textContent = davURL;
+
+    const clients = list.clients || [], grants = list.grants || [];
+    el("connect-empty").hidden = clients.length > 0;
+
+    const cbody = el("client-rows");
+    cbody.textContent = "";
+    el("client-list").hidden = clients.length === 0;
+    for (const c of clients) {
+      const tr = document.createElement("tr");
+      tr.setAttribute("data-testid", "client-row");
+      tr.dataset.ref = c.ref;
+      tr.dataset.write = String(!!c.write);
+      tr.dataset.consented = String(!!c.consented);
+      tr.dataset.grants = String(c.grants || 0);
+      for (const v of [c.label, c.basic_user, c.write ? "yes" : "no", String(c.grants || 0)]) {
+        const td = document.createElement("td");
+        td.textContent = v;
+        tr.appendChild(td);
+      }
+      const td = document.createElement("td");
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.setAttribute("data-testid", "client-revoke");
+      btn.dataset.revokeClient = c.ref;
+      btn.textContent = "Revoke";
+      td.appendChild(btn);
+      tr.appendChild(td);
+      cbody.appendChild(tr);
+    }
+
+    const gbody = el("grant-rows");
+    gbody.textContent = "";
+    el("grant-list").hidden = grants.length === 0;
+    for (const g of grants) {
+      const tr = document.createElement("tr");
+      tr.setAttribute("data-testid", "grant-row");
+      tr.dataset.ref = g.ref;
+      tr.dataset.write = String(!!g.write);
+      for (const v of [g.label, (g.scopes || []).join(" "), when(g.last_used)]) {
+        const td = document.createElement("td");
+        td.textContent = v;
+        tr.appendChild(td);
+      }
+      const td = document.createElement("td");
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.setAttribute("data-testid", "grant-revoke");
+      btn.dataset.revokeGrant = g.ref;
+      btn.textContent = "Disconnect";
+      td.appendChild(btn);
+      tr.appendChild(td);
+      gbody.appendChild(tr);
+    }
+  }
+
+  async function refreshCredentials() {
+    if (!token) return;
+    const res = await api("/api/v1/credentials", "GET");
+    if (!res.ok) return;
+    renderCredentials(await res.json());
+  }
+
+  el("add-program").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const btn = el("add-program-button"), hint = el("connect-hint");
+    btn.disabled = true;
+    hint.textContent = "";
+    try {
+      const res = await api("/api/v1/credentials", "POST", {
+        label: el("program-label").value,
+        write: el("program-write").checked,
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        hint.textContent = body.error || `refused (${res.status})`;
+        hint.setAttribute("data-testid", "connect-error");
+        return;
+      }
+      hint.setAttribute("data-testid", "connect-hint");
+      showNewCredential(body);
+      el("program-label").value = "";
+      await refreshCredentials();
+    } finally {
+      btn.disabled = !connectReady;
+    }
+  });
+
+  // One delegated listener for both revoke buttons, for the same reason the
+  // SSO cards have one: an inline onclick would need 'unsafe-inline'.
+  document.addEventListener("click", async (e) => {
+    const d = e.target && e.target.dataset;
+    if (!d || (!d.revokeClient && !d.revokeGrant)) return;
+    const body = d.revokeClient ? { client: d.revokeClient } : { grant: d.revokeGrant };
+    // A revoked client's profile is dead for good, so the panel that showed
+    // its password goes with it rather than sitting there looking usable.
+    if (d.revokeClient && el("credential-new").dataset.ref === d.revokeClient) {
+      el("credential-new").hidden = true;
+      el("credential-new").textContent = "";
+    }
+    await api("/api/v1/credentials/revoke", "POST", body).catch(() => {});
+    await refreshCredentials();
+  });
+
   function render(s) {
     document.body.dataset.phase = s.phase;
     renderPrompts(s.prompts || []);
@@ -364,6 +621,27 @@
     t("lease").textContent = `lease: ${s.lease}`;
     t("lease").dataset.leaseState = s.lease;
     t("test-hooks-banner").hidden = !s.test_hooks;
+
+    // The "Connect another program" controls. A read-only session may still
+    // hand out a credential — a WebDAV client that can only read is a
+    // perfectly good thing to want — but it may not hand out a writable
+    // one, and internal/localoauth refuses that at registration rather than
+    // trusting this checkbox. Disabling it here is the courtesy; the
+    // refusal is the control.
+    const writable = s.mode === "read-write";
+    if (writable !== canWrite) {
+      canWrite = writable;
+      el("program-write").disabled = !writable;
+      if (!writable) el("program-write").checked = false;
+      t("add-program-write-label").dataset.available = String(writable);
+    }
+    const ready = s.phase === "ready";
+    if (ready !== connectReady) {
+      connectReady = ready;
+      el("add-program-button").disabled = !ready;
+      el("connect-hint").textContent = ready ? "" : "(waiting for the volume)";
+      if (ready) refreshCredentials();
+    }
 
     const phase = t("phase-banner");
     if (s.phase === "ready") {

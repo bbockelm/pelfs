@@ -16,6 +16,8 @@ import (
 	"github.com/pelicanplatform/pelican/client"
 	"github.com/pelicanplatform/pelican/config"
 	"github.com/pelicanplatform/pelican/param"
+
+	"github.com/bbockelm/pelfs/internal/pelcred"
 )
 
 // fedStore stores objects in a Pelican federation via the Pelican client
@@ -85,7 +87,15 @@ func newFedStore(ctx context.Context, cfg Config) (*fedStore, error) {
 	opts = append(opts, client.WithAcquireToken(cfg.AcquireToken))
 
 	if cfg.AcquireToken && cfg.TokenPath == "" {
+		// Unlock the credential wallet from the macOS Keychain before
+		// priming, so the device-flow-or-prompt decision below is made
+		// with the wallet already open rather than behind a password
+		// prompt. A no-op everywhere but macOS, and a no-op there when
+		// the user has no stored password; the returned call offers to
+		// remember one they had to type. See internal/pelcred.
+		remember := pelcred.Unlock(ctx)
 		primeCredential(ctx, strings.TrimRight(cfg.PrefixURL, "/"))
+		remember()
 	}
 
 	// Transfer-only options: accept either CRC32C (the client default) or

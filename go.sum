@@ -108,8 +108,8 @@ github.com/aws/aws-sdk-go-v2/service/sts v1.41.10 h1:p8ogvvLugcR/zLBXTXrTkj0RYBU
 github.com/aws/aws-sdk-go-v2/service/sts v1.41.10/go.mod h1:60dv0eZJfeVXfbT1tFJinbHrDfSJ2GZl4Q//OSSNAVw=
 github.com/aws/smithy-go v1.24.2 h1:FzA3bu/nt/vDvmnkg+R8Xl46gmzEDam6mZ1hzmwXFng=
 github.com/aws/smithy-go v1.24.2/go.mod h1:YE2RhdIuDbA5E5bTdciG9KrW3+TiEONeUWCqxX9i1Fc=
-github.com/bbockelm/go-nfs v0.0.5-0.20260822135043-13c05601d32d h1:vP29oqInzaYeMjOpzWtPaqhi98TeUm0AvJWsvjcAbc0=
-github.com/bbockelm/go-nfs v0.0.5-0.20260822135043-13c05601d32d/go.mod h1:VhNccO67Oug787VNXcyx9JDI3ZoSpqoKMT/lWMhUIDg=
+github.com/bbockelm/go-nfs v0.0.5-0.20260823220622-d92cb75455ad h1:XUHK9qT1EJnzckWSk2rWbquJFtVvp77yrqcmuboIX74=
+github.com/bbockelm/go-nfs v0.0.5-0.20260823220622-d92cb75455ad/go.mod h1:VhNccO67Oug787VNXcyx9JDI3ZoSpqoKMT/lWMhUIDg=
 github.com/bbockelm/gosssd v0.0.1 h1:p9wJYl+GDn29W1it2ZE2RekriwUNs/1U16aUNNro5SM=
 github.com/bbockelm/gosssd v0.0.1/go.mod h1:Hz8jIcIkQnFmA/ekP2ZWpnPqmyIxftPPFsi+Y3wqRL0=
 github.com/bbockelm/pelican v0.0.0-20260823165605-e55347e5a951 h1:Sv2ZE2h5eTOkpVn8VLRO7VUAYEF+/pnjX+gnZW9DJLo=

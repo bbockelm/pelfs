@@ -141,7 +141,7 @@ require (
 // (docs/go-nfs-patches.md). Branch
 // pelfs-nfs-fixes of https://github.com/bbockelm/go-nfs, based on
 // upstream master, whose commits are written to be offered upstream.
-replace github.com/willscott/go-nfs => github.com/bbockelm/go-nfs v0.0.5-0.20260822135043-13c05601d32d
+replace github.com/willscott/go-nfs => github.com/bbockelm/go-nfs v0.0.5-0.20260823220622-d92cb75455ad
 
 // PR 3672 (PelicanPlatform/pelican, "Allow callback-based overrides of the
 // device code handler") is OPEN, and pelfs needs what it adds:

@@ -103,6 +103,12 @@ var (
 	// the client asked about -- so a drifting signature would not fail to
 	// build either; it would quietly go back to lying.
 	_ nfs.PermissionChecker = (*billyFS)(nil)
+	// COMMIT is answered through this one, and so -- less obviously -- is
+	// the stability field of every WRITE reply. A signature that drifted
+	// from it would not fail to build; it would put the frontend back to
+	// claiming FILE_SYNC for writes it has only buffered, which is a
+	// silent return of KI-10. See Commit below.
+	_ nfs.Committer = (*billyFS)(nil)
 )
 
 // New returns a billy.Filesystem over a read-write overlay FOR THE NFS
@@ -913,6 +919,59 @@ func (b *billyFS) Capabilities() billy.Capability {
 		caps |= billy.WriteCapability | billy.ReadAndWriteCapability | billy.TruncateCapability
 	}
 	return caps
+}
+
+// Committer — what fsync(2) means on an NFS mount of this filesystem.
+//
+// It is `overlay.FS.Sync`, the same body the FUSE frontend's Fsync and
+// FsyncDir call (internal/rawfuse/rw.go), and therefore the same promise:
+// when it returns, everything this session has written is recoverable by
+// remounting THIS state directory — the ring's mapping is msync'd, the
+// content journal is fsync'd, and the metadata database is fsync'd. It is
+// NOT a federation round trip; read the file comment in
+// internal/overlay/sync.go, which is the one place that distinction is
+// written out in full.
+//
+// WHY THIS IS NOT MERELY THE COMMIT HANDLER. NFSv3 has no OPEN and no
+// close, and it has no separate "make it durable" op that a client reaches
+// only from fsync: the durability contract is the stability field on every
+// WRITE reply plus COMMIT, and go-nfs used to hard-code the first to
+// FILE_SYNC. A client believes that field — Linux queues a page for
+// commit only when the reply said UNSTABLE — so it would never send a
+// COMMIT, and a commit hook alone would have been unreachable code. What
+// implementing this interface actually buys is that go-nfs now answers
+// UNSTABLE for the writes it has only buffered, which is what makes the
+// COMMIT arrive.
+//
+// THE PATH IS IGNORED, and that is the interface's own allowance (RFC
+// 1813, 3.3.21: a server may commit more of the file than it was asked
+// to). There is nothing finer to do here anyway: the durability unit is
+// the session — one ring, one journal, two databases — so a per-file sync
+// would cost exactly what a whole-session sync costs.
+//
+// THE COST, AND WHY THE COALESCING IS LOAD-BEARING HERE AND NOT MERELY
+// NICE. An NFSv3 client commits on close(2) as well as on fsync(2)
+// (nfs_file_flush -> nfs_wb_all), so this is called about once per file
+// written, not once per fsync — a tar extraction of fifty thousand files
+// is fifty thousand commits. overlay.Sync returns without touching the
+// disk when nothing has changed since the last pass, which makes the
+// second commit of an unchanged file free; it does not make the first one
+// free, and a write-heavy NFS workload pays a sync per file. That is what
+// fsync costs, and the alternative was answering it with a lie.
+//
+// A READ-ONLY BINDING HAS NOTHING OF ITS OWN TO SYNC and answers OK,
+// matching rawfuse's Fsync on the same binding. Refusing would be worse
+// than pointless: a client that opened a file read-only still commits on
+// close, and an error there surfaces as a failed close(2) on a mount that
+// was never asked to change anything.
+func (b *billyFS) Commit(path string) error {
+	if b.ov == nil {
+		return nil
+	}
+	if err := b.ov.Sync(); err != nil {
+		return pe("commit", path, err)
+	}
+	return nil
 }
 
 // Change — SETATTR support.

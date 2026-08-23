@@ -140,6 +140,94 @@ type changePermFS struct {
 
 func (f *changePermFS) Permitted(string) (nfs.Permission, error) { return f.granted, nil }
 
+// commitFS gives an in-memory filesystem the COMMIT answer go-nfs asks
+// for by type assertion, and records that it was asked.
+type commitFS struct {
+	billy.Filesystem
+	commits []string
+	fail    error
+}
+
+func (f *commitFS) Commit(path string) error {
+	f.commits = append(f.commits, path)
+	return f.fail
+}
+
+// allFS is every optional interface at once, which is the shape the real
+// filesystem (internal/vfsbilly) presents and the one the wrapper is most
+// likely to drop something from.
+type allFS struct {
+	chmodFS
+	granted nfs.Permission
+	commits []string
+}
+
+func (f *allFS) Permitted(string) (nfs.Permission, error) { return f.granted, nil }
+func (f *allFS) Link(string, string) error                { return nil }
+func (f *allFS) Commit(path string) error {
+	f.commits = append(f.commits, path)
+	return nil
+}
+
+// nfs.Committer is the fourth optional interface, and the one where
+// OVER-claiming is the expensive mistake. go-nfs reads it as "this
+// filesystem BUFFERS": it starts answering UNSTABLE to writes and defers
+// their durability to a COMMIT. A wrapper that claimed it over a
+// filesystem with nothing behind the method would leave the client waiting
+// for a commit that does nothing -- fsync(2) returning success over data
+// no layer ever made durable, which is KI-10 restored one level up.
+func TestDiagnosePreservesTheCommitInterface(t *testing.T) {
+	if _, ok := diagnose(memfs.New()).(nfs.Committer); ok {
+		t.Error("wrapper claims nfs.Committer for a filesystem that has none: go-nfs would answer " +
+			"UNSTABLE to writes and commit them nowhere")
+	}
+
+	inner := &commitFS{Filesystem: memfs.New()}
+	wrapped := diagnose(inner)
+	c, ok := wrapped.(nfs.Committer)
+	if !ok {
+		t.Fatal("wrapper dropped nfs.Committer, so COMMIT goes back to answering without asking")
+	}
+	if err := c.Commit("/a.c"); err != nil {
+		t.Fatalf("Commit through the wrapper: %v", err)
+	}
+	if len(inner.commits) != 1 || inner.commits[0] != "/a.c" {
+		t.Errorf("the wrapper recorded commits %v, want one for /a.c", inner.commits)
+	}
+	if _, ok := wrapped.(billy.Change); ok {
+		t.Error("wrapper invented billy.Change for a filesystem that only commits")
+	}
+	if _, ok := wrapped.(nfs.PermissionChecker); ok {
+		t.Error("wrapper invented nfs.PermissionChecker for a filesystem that only commits")
+	}
+
+	// A commit that fails must still fail through the wrapper: it is the
+	// only reply an application's fsync(2) is waiting on.
+	failing := diagnose(&commitFS{Filesystem: memfs.New(), fail: syscall.ENOSPC})
+	if err := failing.(nfs.Committer).Commit("/a.c"); !errors.Is(err, syscall.ENOSPC) {
+		t.Errorf("a failed commit came back as %v, want ENOSPC", err)
+	}
+
+	// And the full combination, which is the one the mount actually runs.
+	all := &allFS{chmodFS: chmodFS{Filesystem: memfs.New()}, granted: nfs.PermissionRead}
+	full := diagnose(all)
+	if _, ok := full.(billy.Change); !ok {
+		t.Error("wrapper dropped billy.Change from the four-way shape")
+	}
+	if _, ok := full.(nfs.HardLinker); !ok {
+		t.Error("wrapper dropped nfs.HardLinker from the four-way shape")
+	}
+	if _, ok := full.(nfs.PermissionChecker); !ok {
+		t.Error("wrapper dropped nfs.PermissionChecker from the four-way shape")
+	}
+	if _, ok := full.(nfs.Committer); !ok {
+		t.Error("wrapper dropped nfs.Committer from the four-way shape")
+	}
+	if err := full.(nfs.Committer).Commit("/b.c"); err != nil || len(all.commits) != 1 {
+		t.Errorf("Commit through the four-way wrapper: err=%v commits=%v", err, all.commits)
+	}
+}
+
 // The wrapper has to keep every property go-nfs tests for, or it changes
 // the server's behavior while explaining it: WriteCapability (absent, and
 // every mutating RPC is refused with ROFS), billy.Change (absent, and

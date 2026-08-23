@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Protocol</key>
+	<string>dav</string>
+	<key>Provider</key>
+	<string>org.pelicanplatform.pelfs.local.49731</string>
+	<key>Hostname</key>
+	<string>127.0.0.1</string>
+	<key>Port</key>
+	<string>49731</string>
+	<key>Path</key>
+	<string>/dav/</string>
+	<key>Nickname</key>
+	<string>Cyberduck - pelfs pelican://osg-htc.org/user/bbockelman</string>
+	<key>Comment</key>
+	<string>pelfs pelican://osg-htc.org/user/bbockelman (read-only, this session only)</string>
+</dict>
+</plist>

@@ -1,0 +1,521 @@
+package davprofile_test
+
+// Golden files pin what we MEANT to write; the checks either side of them
+// pin what Cyberduck will DO with it. A golden file alone would happily
+// freeze a profile that cannot connect, which is precisely the failure mode
+// here (docs/design-webui.md, verification 2), so every trap in that
+// verification gets an assertion of its own that does not depend on the
+// golden bytes.
+//
+// The third leg — a real Cyberduck reading a real generated profile — is
+// scripts/oauth-cyberduck-docker.sh, which runs `duck` against a live pelfs
+// authorization server. What it found is recorded in that script's header.
+
+import (
+	"encoding/xml"
+	"flag"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/bbockelm/pelfs/internal/davprofile"
+	"github.com/bbockelm/pelfs/internal/localoauth"
+)
+
+var update = flag.Bool("update", false, "rewrite the golden files")
+
+// The fixed inputs the golden files are generated from. The client id is
+// the right SHAPE (32 bytes, base64url, unpadded) and is not a secret: it
+// is a literal in a test file, which is exactly why a real one is minted
+// per download.
+const (
+	fixedPort     = 49731
+	fixedClientID = "Zm9yLXRoZS1nb2xkZW4tZmlsZS1vbmx5LTMyLWJ5dGVz"
+	fixedVolume   = "pelican://osg-htc.org/user/bbockelman"
+	fixedBasic    = "pelfs-QUJDRGVmZ2g"
+)
+
+func params(write bool) davprofile.Params {
+	return davprofile.Params{
+		Port:        fixedPort,
+		Volume:      fixedVolume,
+		ClientID:    fixedClientID,
+		RedirectURI: davprofile.RedirectURI(davprofile.DefaultCallbackPort),
+		Write:       write,
+		BasicUser:   fixedBasic,
+		Label:       "Cyberduck",
+	}
+}
+
+func golden(t *testing.T, name string, got []byte) {
+	t.Helper()
+	path := filepath.Join("testdata", name)
+	if *update {
+		if err := os.WriteFile(path, got, 0o644); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+		return
+	}
+	want, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v (run go test ./internal/davprofile -update)", path, err)
+	}
+	if string(got) != string(want) {
+		t.Errorf("%s differs from the golden file.\n--- got ---\n%s\n--- want ---\n%s",
+			name, got, want)
+	}
+}
+
+func TestGoldenFiles(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		gen  func(davprofile.Params) ([]byte, error)
+		p    davprofile.Params
+	}{
+		{"profile-ro.cyberduckprofile", davprofile.Profile, params(false)},
+		{"profile-rw.cyberduckprofile", davprofile.Profile, params(true)},
+		{"bookmark.duck", davprofile.Bookmark, params(false)},
+		{"bookmark-basic.duck", davprofile.BasicBookmark, params(false)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := tc.gen(tc.p)
+			if err != nil {
+				t.Fatalf("generate: %v", err)
+			}
+			golden(t, tc.name, got)
+		})
+	}
+}
+
+// ------------------------------------------------------------- plist shape
+
+// entry is one key/value pair of the top-level dict, in file order.
+type entry struct {
+	key  string
+	kind string // "string", "integer", "true", "false", "array"
+	val  string
+	list []string
+}
+
+// parsePlist walks the XML rather than unmarshalling into a struct, because
+// what matters here is the ORDER, the ELEMENT TYPE and the presence or
+// absence of a key — all three of which a struct would erase. It also
+// proves the file is well-formed XML, which is the first thing Cyberduck's
+// parser asks of it.
+func parsePlist(t *testing.T, b []byte) []entry {
+	t.Helper()
+	dec := xml.NewDecoder(strings.NewReader(string(b)))
+	var out []entry
+	var cur *entry
+	var wantKey bool
+	depth := 0
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("not well-formed XML: %v", err)
+		}
+		switch el := tok.(type) {
+		case xml.StartElement:
+			switch el.Name.Local {
+			case "plist":
+			case "dict":
+				depth++
+			case "key":
+				var s string
+				if err := dec.DecodeElement(&s, &el); err != nil {
+					t.Fatal(err)
+				}
+				out = append(out, entry{key: s})
+				cur = &out[len(out)-1]
+				wantKey = false
+			case "string", "integer":
+				var s string
+				if err := dec.DecodeElement(&s, &el); err != nil {
+					t.Fatal(err)
+				}
+				if cur == nil {
+					t.Fatalf("a %s with no key before it", el.Name.Local)
+				}
+				if cur.kind == "array" {
+					cur.list = append(cur.list, s)
+				} else {
+					cur.kind, cur.val = el.Name.Local, s
+				}
+			case "true", "false":
+				if cur == nil {
+					t.Fatal("a boolean with no key before it")
+				}
+				cur.kind = el.Name.Local
+				_ = dec.Skip()
+			case "array":
+				if cur == nil {
+					t.Fatal("an array with no key before it")
+				}
+				cur.kind = "array"
+			}
+		case xml.EndElement:
+			if el.Name.Local == "dict" {
+				depth--
+			}
+		}
+		_ = wantKey
+	}
+	if depth != 0 {
+		t.Fatalf("unbalanced <dict> (%d)", depth)
+	}
+	return out
+}
+
+func find(es []entry, key string) (entry, bool) {
+	for _, e := range es {
+		if e.key == key {
+			return e, true
+		}
+	}
+	return entry{}, false
+}
+
+// TestTheProfileTraps is verification 2's list, one assertion each. Every
+// one of these fails as "it just will not connect", so every one of them is
+// checked against the generated bytes rather than trusted to a comment.
+func TestTheProfileTraps(t *testing.T) {
+	b, err := davprofile.Profile(params(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	es := parsePlist(t, b)
+
+	t.Run("a non-blank OAuth Client ID is the switch", func(t *testing.T) {
+		// isOAuthConfigurable() is isNotBlank(getOAuthClientId()) and
+		// isPasswordConfigurable() is isBlank(getOAuthClientId()): one key
+		// turns OAuth on and password auth off.
+		e, ok := find(es, "OAuth Client ID")
+		if !ok || e.kind != "string" || strings.TrimSpace(e.val) == "" {
+			t.Fatalf("OAuth Client ID = %+v", e)
+		}
+		if e.val != fixedClientID {
+			t.Errorf("client id came out as %q", e.val)
+		}
+		// And a blank one is refused rather than emitted, because a blank
+		// one silently yields a password-only profile — the single public
+		// report of WebDAV+OAuth "not working" was a profile with one.
+		p := params(true)
+		p.ClientID = "   "
+		if _, err := davprofile.Profile(p); err == nil {
+			t.Error("a blank client id was accepted")
+		}
+	})
+
+	t.Run("Authorization is omitted", func(t *testing.T) {
+		// For `dav` this key is fed to FlowType.valueOf(), not the S3
+		// signature version the documentation describes, so anything but
+		// AuthorizationCode/PasswordGrant is an IllegalArgumentException
+		// inside session setup. Omitted is the only safe answer.
+		if _, ok := find(es, "Authorization"); ok {
+			t.Error("the profile carries an Authorization key")
+		}
+		if strings.Contains(string(b), "<key>Authorization</key>") {
+			t.Error("the profile writes <key>Authorization</key>")
+		}
+		// `OAuth Authorization Url` is a different key and IS required; the
+		// trap is the bare `Authorization`, whose only legal values are
+		// FlowType's two constants.
+		if _, ok := find(es, "OAuth Authorization Url"); !ok {
+			t.Error("no OAuth Authorization Url")
+		}
+	})
+
+	t.Run("OAuth PKCE is omitted so the parent's true applies", func(t *testing.T) {
+		if _, ok := find(es, "OAuth PKCE"); ok {
+			t.Error("the profile pins OAuth PKCE; the parent default (true) is what we want")
+		}
+	})
+
+	t.Run("Scopes is a plist array", func(t *testing.T) {
+		e, ok := find(es, "Scopes")
+		if !ok {
+			t.Fatal("no Scopes key")
+		}
+		if e.kind != "array" {
+			t.Fatalf("Scopes is a <%s>; getOAuthScopes() reads list(SCOPES_KEY) "+
+				"and a single string is not a one-element list", e.kind)
+		}
+		if len(e.list) != 2 || e.list[0] != "pelfs.read" || e.list[1] != "pelfs.write" {
+			t.Errorf("Scopes = %q", e.list)
+		}
+		ro, err := davprofile.Profile(params(false))
+		if err != nil {
+			t.Fatal(err)
+		}
+		e, _ = find(parsePlist(t, ro), "Scopes")
+		if len(e.list) != 1 || e.list[0] != "pelfs.read" {
+			t.Errorf("read-only Scopes = %q", e.list)
+		}
+	})
+
+	t.Run("no dollar sign anywhere", func(t *testing.T) {
+		// Every value passes through a StringSubstitutor, so a literal '$'
+		// is a value Cyberduck may rewrite before it uses it — and a
+		// rewritten redirect URL stops matching internal/localoauth's
+		// exact-string allowlist, which is A7 control 3.
+		if i := strings.IndexByte(string(b), '$'); i >= 0 {
+			t.Errorf("a '$' at byte %d", i)
+		}
+		p := params(true)
+		p.Volume = "pelican://osg-htc.org/user/${oauth.handler.scheme}"
+		if _, err := davprofile.Profile(p); err == nil {
+			t.Error("a volume containing '$' was accepted")
+		}
+		p = params(true)
+		p.ClientID = "abc$def"
+		if _, err := davprofile.Profile(p); err == nil {
+			t.Error("a client id containing '$' was accepted")
+		}
+	})
+
+	t.Run("the redirect URL has an explicit port and is loopback", func(t *testing.T) {
+		e, ok := find(es, "OAuth Redirect Url")
+		if !ok {
+			t.Fatal("no OAuth Redirect Url")
+		}
+		// The same rule the authorization server enforces, applied to the
+		// string that will be compared against it byte for byte. If these
+		// two ever disagree the flow fails on pelfs's own security check.
+		if err := localoauth.CheckRedirectURI(e.val); err != nil {
+			t.Errorf("the generated redirect URL fails the server's own rule: %v", err)
+		}
+		if !strings.Contains(e.val, ":52001/") {
+			t.Errorf("redirect URL %q has no explicit port; Cyberduck's loopback "+
+				"provider substitutes 0 and then disagrees with its own listener", e.val)
+		}
+	})
+
+	t.Run("no password field is offered", func(t *testing.T) {
+		for _, k := range []string{"Password Configurable", "Username Configurable"} {
+			e, ok := find(es, k)
+			if !ok || e.kind != "false" {
+				t.Errorf("%s = %+v, want <false/>", k, e)
+			}
+		}
+		// And there is no Password key to put a secret in, which is the
+		// fact the whole OAuth path exists for.
+		if strings.Contains(string(b), "<key>Password</key>") {
+			t.Error("the profile has a Password key, which HostDictionary has no reader for")
+		}
+	})
+
+	t.Run("the endpoints and the mount point", func(t *testing.T) {
+		for k, want := range map[string]string{
+			"Protocol":                "dav",
+			"Default Hostname":        "127.0.0.1",
+			"Default Path":            "/dav/",
+			"OAuth Authorization Url": "http://127.0.0.1:49731/oauth/authorize",
+			"OAuth Token Url":         "http://127.0.0.1:49731/oauth/token",
+			"OAuth Client Secret":     "",
+		} {
+			e, ok := find(es, k)
+			if !ok || e.val != want {
+				t.Errorf("%s = %q, want %q", k, e.val, want)
+			}
+		}
+		if e, ok := find(es, "Default Port"); !ok || e.kind != "integer" || e.val != "49731" {
+			t.Errorf("Default Port = %+v, want an <integer> 49731", e)
+		}
+		if e, ok := find(es, "OAuth Configurable"); !ok || e.kind != "true" {
+			t.Errorf("OAuth Configurable = %+v", e)
+		}
+	})
+
+	t.Run("the Vendor is unique per session", func(t *testing.T) {
+		// Profile.java uses Vendor as the profile's identity; two
+		// concurrent `pelfs browse` sessions are two different servers, and
+		// a shared identity means the second install replaces the first.
+		e, _ := find(es, "Vendor")
+		if !strings.HasPrefix(e.val, davprofile.VendorPrefix) {
+			t.Errorf("Vendor = %q", e.val)
+		}
+		p := params(true)
+		p.Port = 49732
+		other, err := davprofile.Profile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		e2, _ := find(parsePlist(t, other), "Vendor")
+		if e2.val == e.val {
+			t.Errorf("two listeners generated the same Vendor %q", e.val)
+		}
+	})
+}
+
+func TestBookmarksBindToTheProfileAndCarryNoPassword(t *testing.T) {
+	p := params(false)
+	b, err := davprofile.Bookmark(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	es := parsePlist(t, b)
+	prof := parsePlist(t, mustProfile(t, p))
+	vendor, _ := find(prof, "Vendor")
+	provider, ok := find(es, "Provider")
+	if !ok || provider.val != vendor.val {
+		t.Errorf("Provider = %q, want the profile's Vendor %q", provider.val, vendor.val)
+	}
+	if _, ok := find(es, "Username"); ok {
+		t.Error("the OAuth bookmark offers a username, but the profile sets " +
+			"Username Configurable false")
+	}
+	for _, name := range []string{"bookmark", "basic bookmark"} {
+		var raw []byte
+		if name == "bookmark" {
+			raw = b
+		} else {
+			raw, err = davprofile.BasicBookmark(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		// HostDictionary.java has no Password key: neither file can carry
+		// the secret, which is why the Basic path costs the user one paste.
+		if strings.Contains(string(raw), "<key>Password</key>") {
+			t.Errorf("the %s carries a Password key", name)
+		}
+		if strings.ContainsRune(string(raw), '$') {
+			t.Errorf("the %s contains a '$'", name)
+		}
+	}
+
+	basic, err := davprofile.BasicBookmark(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bes := parsePlist(t, basic)
+	if e, ok := find(bes, "Username"); !ok || e.val != fixedBasic {
+		t.Errorf("Username = %+v, want %q", e, fixedBasic)
+	}
+	if _, ok := find(bes, "Provider"); ok {
+		t.Error("the contingency bookmark names the profile's Provider; it must " +
+			"work whether or not the profile is installed")
+	}
+	p.BasicUser = ""
+	if _, err := davprofile.BasicBookmark(p); err == nil {
+		t.Error("a contingency bookmark with no username was generated")
+	}
+}
+
+func mustProfile(t *testing.T, p davprofile.Params) []byte {
+	t.Helper()
+	b, err := davprofile.Profile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func TestRefusals(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mut  func(*davprofile.Params)
+	}{
+		{"no port", func(p *davprofile.Params) { p.Port = 0 }},
+		{"a port that is not one", func(p *davprofile.Params) { p.Port = 70000 }},
+		{"no client id", func(p *davprofile.Params) { p.ClientID = "" }},
+		{"no redirect", func(p *davprofile.Params) { p.RedirectURI = "" }},
+		{"a newline in the volume", func(p *davprofile.Params) {
+			p.Volume = "pelican://x/y\n<key>Password</key><string>oops</string>"
+		}},
+		{"a dollar in the label", func(p *davprofile.Params) { p.Label = "$HOME" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := params(true)
+			tc.mut(&p)
+			if _, err := davprofile.Profile(p); err == nil {
+				t.Error("accepted")
+			}
+		})
+	}
+}
+
+func TestXMLEscaping(t *testing.T) {
+	// A volume name with XML metacharacters must land as text, not as
+	// markup — the injection this generator would otherwise offer is a
+	// second <key> inside a file the user double-clicks.
+	p := params(false)
+	p.Volume = `pelican://osg-htc.org/user/a&b<c>"d'`
+	b, err := davprofile.Profile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	es := parsePlist(t, b) // fails the test if it is not well-formed
+	e, _ := find(es, "Description")
+	if !strings.Contains(e.val, `a&b<c>"d'`) {
+		t.Errorf("Description = %q, want the volume verbatim after unescaping", e.val)
+	}
+	if strings.Contains(string(b), "<c>") {
+		t.Error("the raw '<c>' reached the file unescaped")
+	}
+}
+
+func TestURLHelpers(t *testing.T) {
+	if got := davprofile.RedirectURI(52001); got != "http://127.0.0.1:52001/pelfs/oauth/callback" {
+		t.Errorf("RedirectURI = %q", got)
+	}
+	if got := davprofile.DAVURL(49731); got != "http://127.0.0.1:49731/dav/" {
+		t.Errorf("DAVURL = %q", got)
+	}
+	// The literal address, never the name: `localhost` may resolve to ::1,
+	// where this tcp4 listener is not.
+	for _, u := range []string{
+		davprofile.RedirectURI(1), davprofile.DAVURL(1),
+		davprofile.AuthorizeURL(1), davprofile.TokenURL(1),
+	} {
+		if strings.Contains(u, "localhost") {
+			t.Errorf("%q names localhost", u)
+		}
+	}
+	d := params(false).Details()
+	if d.URL != davprofile.DAVURL(fixedPort) || d.Username != fixedBasic || !d.Preemptive {
+		t.Errorf("Details = %+v", d)
+	}
+	if name := davprofile.FileName(params(false), "cyberduckprofile"); name != "pelfs-49731.cyberduckprofile" {
+		t.Errorf("FileName = %q", name)
+	}
+}
+
+// TestTheGeneratorAndTheServerAgree is the seam between U8 and U7: the
+// redirect URI the profile advertises must be the exact string the
+// authorization server was registered with, because the comparison between
+// them is byte for byte and a mismatch is an unexplained failure in the
+// client's UI.
+func TestTheGeneratorAndTheServerAgree(t *testing.T) {
+	s, err := localoauth.New(localoauth.Config{Volume: fixedVolume, Sessions: onesession{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	redirect := davprofile.RedirectURI(davprofile.DefaultCallbackPort)
+	c, err := s.NewClient(localoauth.ClientRequest{Label: "Cyberduck", RedirectURI: redirect})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := params(false)
+	p.ClientID, p.RedirectURI, p.BasicUser = c.ID, c.Redirect, c.BasicUser
+	b, err := davprofile.Profile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	es := parsePlist(t, b)
+	if e, _ := find(es, "OAuth Redirect Url"); e.val != c.Redirect {
+		t.Errorf("the profile advertises %q, the server allowlisted %q", e.val, c.Redirect)
+	}
+	if e, _ := find(es, "OAuth Client ID"); e.val != c.ID {
+		t.Error("the profile's client id is not the one the server minted")
+	}
+}
+
+type onesession struct{}
+
+func (onesession) Sessions() int { return 1 }

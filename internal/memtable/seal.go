@@ -35,90 +35,12 @@ import (
 type Sealer struct {
 	s  *Store
 	pk *flushPacker
-	// recheck is set when this seal has to confirm that chunks it took
-	// from the BASE generation are still stored there — see stillStored.
-	// It is decided once, at the start, because the answer is a property
-	// of the session rather than of an inode.
-	recheck bool
-	// ourPacks are the packs this session wrote, which is how a chunk it
-	// placed itself is told from one it borrowed. Built only when recheck
-	// is set; nothing else needs it.
-	ourPacks map[string]struct{}
 }
 
 // NewSealer starts a seal. Every inode it renders may add chunks to the
 // same run of packs, so Finish must be called once at the end.
 func (s *Store) NewSealer() *Sealer {
-	sl := &Sealer{s: s, pk: s.newPacker()}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	// A base-derived chunkref is only as good as the base generation's
-	// pack list, and exactly one thing moves that list: a repack, which
-	// runs under a live writable mount (cmd/pelfs/autorepack.go) and
-	// DROPS packs. An ordinary generation only ever appends to the list,
-	// so a chunk that was stored when the flush borrowed it is still
-	// stored now and there is nothing to check.
-	if s.needsBaseRecheckLocked() {
-		sl.recheck = true
-		sl.ourPacks = make(map[string]struct{}, len(s.packs))
-		for _, sp := range s.packs {
-			sl.ourPacks[sp.Name] = struct{}{}
-		}
-	}
-	return sl
-}
-
-// stillStored reports whether a chunk this seal is about to name as a
-// WHOLE chunk is still stored where the store thinks it is.
-//
-// It is the one guard on the dangerous direction of cross-generation
-// dedup. Reusing an existing entry writes a row whose bytes live in
-// somebody else's pack, and that is sound because reachability is over
-// identities: the sweep credits every pack holding a reached identity, so
-// the new row keeps the old pack alive, and gc cannot touch a pack a live
-// generation lists because its liveness is set arithmetic over the lists.
-//
-// A repack is the exception, and the only one. It computes what is
-// reachable, carries that out of the packs it condemns, and drops the
-// rest — so a chunk that was PRESENT in a listed pack but REFERENCED by
-// no live generation (the ordinary residue of a rewrite) can stop being
-// stored, in the middle of a session, between the flush that borrowed it
-// and the seal that names it. Without this check that seal publishes a row
-// resolving in no listed pack: a generation that mounts, passes its own
-// signature, and fails to read one file.
-//
-// So a borrowed chunk the base no longer stores is not whole any more, and
-// the seal's existing repair takes it from there — the span is re-chunked
-// and re-uploaded out of the bytes themselves, which the condemned pack
-// still holds for the length of the grace window. That is the same repair
-// a rewrite gets, reached by a different route.
-func (sl *Sealer) stillStored(ctx context.Context, id chunkid.Identity) bool {
-	if !sl.recheck {
-		return true
-	}
-	s := sl.s
-	s.mu.Lock()
-	loc, known := s.chunkLoc[id.Hex()]
-	s.mu.Unlock()
-	if !known {
-		// An adopted extent, which resolves through the base's own records
-		// and was checked against its pack list when it was adopted.
-		return true
-	}
-	if _, ours := sl.ourPacks[loc.Pack]; ours {
-		return true
-	}
-	if _, still := s.placer.Placed(ctx, id); still {
-		return true
-	}
-	// Not stored there any more. The span goes down the re-chunk path, and
-	// the packer has to be told to ignore the stale location on the way —
-	// see flushPacker.avoid.
-	if sl.pk.avoid == nil {
-		sl.pk.avoid = make(map[string]struct{})
-	}
-	sl.pk.avoid[id.Hex()] = struct{}{}
-	return false
+	return &Sealer{s: s, pk: s.newPacker()}
 }
 
 // Inode renders one inode's live content as catalog rows.
@@ -183,7 +105,7 @@ func (sl *Sealer) inodeFrom(ctx context.Context, view *Frozen, c *content, ino u
 	var covered int64
 	for _, g := range groupPieces(ps) {
 		broken(covered, g.at) // the gap this group starts after, if any
-		if g.whole() && sl.stillStored(ctx, g.id) {
+		if g.whole() {
 			segs = append(segs, segment{g: g, whole: true})
 		} else {
 			broken(g.at, g.end())
@@ -297,38 +219,16 @@ func (sl *Sealer) Finish(ctx context.Context) error {
 	for k, v := range sl.pk.locs {
 		s.chunkLoc[k] = v
 	}
-	// Chunks a re-chunk found the base generation already holding. Their
-	// locations belong in the map for the same reason the written ones do:
-	// a read of those file bytes has to resolve, and the seal has just
-	// written rows that name them.
-	for k, v := range sl.pk.baseLocs {
-		s.chunkLoc[k] = v
-	}
 	s.packs = append(s.packs, sl.pk.sealed...)
 	s.stats.UploadedBytes += sl.pk.bytes
 	s.stats.UploadedChunks += sl.pk.count
 	s.stats.DedupedChunks += sl.pk.skipped
-	s.stats.BaseDedupedChunks += sl.pk.baseChunks
-	s.stats.BaseDedupedBytes += sl.pk.baseBytes
-	if sl.pk.baseChunks > 0 {
-		s.noteBaseHitLocked(sl.pk.baseGen)
-	}
 	s.stats.Packs += int64(len(sl.pk.sealed))
 	if s.journal != nil {
 		// The re-chunk's own chunks and packs. A seal that published rows
 		// naming them without recording where they are would leave the
 		// next session unable to read what this one just wrote.
-		chunks := sl.pk.locs
-		if len(sl.pk.baseLocs) > 0 {
-			chunks = make(map[string]PackLoc, len(sl.pk.locs)+len(sl.pk.baseLocs))
-			for k, v := range sl.pk.locs {
-				chunks[k] = v
-			}
-			for k, v := range sl.pk.baseLocs {
-				chunks[k] = v
-			}
-		}
-		return s.journal.Located(Location{Chunks: chunks, Packs: sl.pk.sealed})
+		return s.journal.Located(Location{Chunks: sl.pk.locs, Packs: sl.pk.sealed})
 	}
 	return nil
 }

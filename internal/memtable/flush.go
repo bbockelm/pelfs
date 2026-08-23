@@ -11,7 +11,6 @@ import (
 
 	"github.com/bbockelm/pelfs/internal/chunkid"
 	"github.com/bbockelm/pelfs/internal/entrycodec"
-	"github.com/bbockelm/pelfs/internal/mpi"
 	"github.com/bbockelm/pelfs/internal/packstore"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 )
@@ -32,9 +31,6 @@ type flushResult struct {
 	uploadedBytes  int64
 	uploadedChunks int64
 	dedupedChunks  int64
-	baseChunks     int64
-	baseBytes      int64
-	baseGen        uint64
 	deadExtents    int64
 	deadBytes      int64
 	uploaded       *sync.WaitGroup
@@ -133,17 +129,6 @@ func (s *Store) chunkAndPack(ctx context.Context, b *batch, plan []inodePlan, re
 	res.uploadedBytes = pk.bytes
 	res.uploadedChunks = pk.count
 	res.dedupedChunks = pk.skipped
-	res.baseChunks = pk.baseChunks
-	res.baseBytes = pk.baseBytes
-	res.baseGen = pk.baseGen
-	// The locations of chunks this run did NOT write, because an earlier
-	// generation already had them. They go into the same map for the same
-	// reason the ones it did write do: a read of those file bytes has to
-	// resolve, and the pack holding them is a pack the base generation
-	// lists.
-	for k, v := range pk.baseLocs {
-		res.chunkLoc[k] = v
-	}
 	return nil
 }
 
@@ -239,11 +224,6 @@ func (s *Store) publish(b *batch, res *flushResult) {
 	s.stats.UploadedBytes += res.uploadedBytes
 	s.stats.UploadedChunks += res.uploadedChunks
 	s.stats.DedupedChunks += res.dedupedChunks
-	s.stats.BaseDedupedChunks += res.baseChunks
-	s.stats.BaseDedupedBytes += res.baseBytes
-	if res.baseChunks > 0 {
-		s.noteBaseHitLocked(res.baseGen)
-	}
 	s.stats.Packs += int64(len(res.packs))
 	s.stats.DeadExtents += res.deadExtents
 	s.stats.DeadBytes += res.deadBytes
@@ -331,42 +311,10 @@ type flushPacker struct {
 	pending map[string]pendingLoc
 	locs    map[string]PackLoc
 
-	// placed asks the store where a chunk already is — the dedup that
-	// reaches back past this run, within this SESSION. Nil for a packer
-	// with no store behind it, which is what the measurement harness
-	// builds.
+	// placed asks the store where a chunk already is — the only dedup that
+	// reaches back past this run. Nil for a packer with no store behind
+	// it, which is what the measurement harness builds.
 	placed func(key string) (PackLoc, bool)
-
-	// base asks the generation this session is building ON, which is the
-	// dedup that reaches back past the session. Nil when there is no base,
-	// or when the base cannot answer (Placer).
-	base Placer
-	// baseLocs is where the base already stores the chunks this run
-	// skipped because of it. Separate from locs because locs means "this
-	// run placed it" and drives the pack accounting; these were placed by
-	// a generation that is already published.
-	baseLocs   map[string]PackLoc
-	baseChunks int64
-	baseBytes  int64
-	// baseGen is the generation the answers came from, taken once. A seal
-	// needs it to know whether a repack has moved the base out from under
-	// the rows it is about to write (Sealer.stillStored).
-	baseGen uint64
-
-	// avoid names chunks this run must STORE however many maps already
-	// claim to know where they are. There is exactly one caller: a seal
-	// that found a borrowed chunk the base generation no longer holds
-	// (Sealer.stillStored). Without it the repair is not a repair — the
-	// session's own location map still holds the stale location, so the
-	// re-chunk would skip the upload on the strength of it and write the
-	// same dangling row by a longer route.
-	//
-	// The stale location is left in place rather than deleted, because the
-	// bytes have to be READ through it: the pack a repack condemned still
-	// exists for the length of the grace window, and reading it is how the
-	// re-chunk gets the content. cut() overwrites the entry when the new
-	// pack lands.
-	avoid map[string]struct{}
 
 	sealed  []packstore.SealedPack
 	bytes   int64
@@ -392,9 +340,8 @@ func newFlushPacker(obj pelicanobj.Store, dir string, target int64, cache *packC
 	return &flushPacker{
 		obj: obj, dir: dir, target: target, cache: cache, dek: dek, keyID: keyID,
 		onUpload: onUpload, uploads: uploads,
-		pending:  make(map[string]pendingLoc),
-		locs:     make(map[string]PackLoc),
-		baseLocs: make(map[string]PackLoc),
+		pending: make(map[string]pendingLoc),
+		locs:    make(map[string]PackLoc),
 	}
 }
 
@@ -403,7 +350,6 @@ func newFlushPacker(obj pelicanobj.Store, dir string, target int64, cache *packC
 func (s *Store) newPacker() *flushPacker {
 	p := newFlushPacker(s.obj, s.dir, s.packTarget, s.cache, s.dek, s.keyID, s.onUpload, s.uploads)
 	p.placed = s.placedChunk
-	p.base = s.placer
 	return p
 }
 
@@ -460,34 +406,12 @@ func (p *flushPacker) add(ctx context.Context, id chunkid.Identity, data []byte)
 	// The chunk is deliberately NOT recorded in p.locs: this run did not
 	// place it, and a caller that copies p.locs into the store's map must
 	// not overwrite the location that already answers for it.
-	if _, no := p.avoid[key]; no {
-		return p.store(ctx, key, data)
-	}
 	if p.placed != nil {
 		if loc, ok := p.placed(key); ok {
 			p.skipped++
 			return loc.Stored, loc.Alg, loc.KeyID, nil
 		}
 	}
-	// And neither of those reaches past the SESSION, which is what made a
-	// byte-identical file written into a later generation cost full price
-	// — the whole of docs/design-apptainer.md's W2. The generation this
-	// session builds on is asked last, because it is the only one of the
-	// three that can cost a request.
-	if loc, ok := p.reuse(ctx, id, data); ok {
-		p.skipped++
-		p.baseChunks++
-		p.baseBytes += loc.Logical
-		p.baseLocs[key] = loc
-		return loc.Stored, loc.Alg, loc.KeyID, nil
-	}
-	return p.store(ctx, key, data)
-}
-
-// store encodes one chunk and writes it into the open pack, cutting first
-// if it will not fit. It is the second half of add, reachable directly for
-// the caller that must not consult any of add's dedup maps (avoid).
-func (p *flushPacker) store(ctx context.Context, key string, data []byte) (stored int64, alg uint8, keyID int64, err error) {
 	if p.w != nil && p.w.Size() > 0 && p.w.Size()+int64(len(data)) > p.target {
 		if err := p.cut(ctx); err != nil {
 			return 0, 0, 0, err
@@ -517,68 +441,6 @@ func (p *flushPacker) store(ctx context.Context, key string, data []byte) (store
 	p.bytes += int64(len(enc))
 	p.count++
 	return pl.stored, pl.alg, p.keyID, nil
-}
-
-// minReuseBytes is the smallest chunk worth asking the base generation
-// about, and it is derived from what the question COSTS rather than
-// chosen: mpi.LookupBytes is the one windowed range request a lookup makes
-// against a large index. A chunk smaller than the window it would move is
-// not worth the window — deduping 4 KiB by transferring 64 KiB is a loss
-// of bandwidth that calls itself a saving — and a chunk larger than it
-// wins by the ratio.
-//
-// At the shipped chunker (1 MiB minimum) every chunk of a file clears this
-// by a factor of sixteen, so in practice it excludes exactly one thing:
-// the short trailing chunk of a small file, where a re-publish is already
-// covered by catalog reuse and anything at or under the inline threshold
-// never becomes a chunk at all. It is not a tuning knob; if the stride
-// moves, this moves with it.
-//
-// A var only so that a test can exercise the threshold, and the dedup
-// behind it, against fixtures cut with test-sized chunker parameters.
-// Nothing in the tree writes it.
-var minReuseBytes int64 = mpi.LookupBytes
-
-// reuse asks the base generation whether these exact bytes are already
-// stored, and returns the location to name if they are.
-//
-// Three things have to be true before a row may claim an existing entry,
-// and the third is the one that is not obvious:
-//
-//   - the entry is in a pack the base generation LISTS, confirmed against
-//     that pack's own signed-for trailer. Placed's contract, and the
-//     reason a stale index cannot produce a dangling row.
-//   - the stored LENGTH is the trailer's, not a length this writer
-//     computed. It is what a reader range-reads.
-//   - the ALG is derived from the plaintext in hand and CHECKED against
-//     that length (entrycodec.AlgOfStored). A trailer does not record a
-//     codec, so this is the only sound way to fill the column in, and a
-//     derivation that does not match the length means the entry is not one
-//     this writer may claim — it stores the bytes itself instead.
-//
-// The key id is this store's own, which is sound because a volume has one
-// data-encryption key for its lifetime; genfs.Placed refuses to answer at
-// all on a volume whose key table says otherwise, so the assumption is
-// checked rather than assumed.
-func (p *flushPacker) reuse(ctx context.Context, id chunkid.Identity, data []byte) (PackLoc, bool) {
-	if p.base == nil || int64(len(data)) < minReuseBytes {
-		return PackLoc{}, false
-	}
-	pl, ok := p.base.Placed(ctx, id)
-	if !ok {
-		return PackLoc{}, false
-	}
-	alg, ok := entrycodec.AlgOfStored(data, p.dek, pl.Length)
-	if !ok {
-		return PackLoc{}, false
-	}
-	if p.baseGen == 0 {
-		p.baseGen = p.base.Generation()
-	}
-	return PackLoc{
-		Pack: pl.Pack, Off: pl.Off,
-		Stored: pl.Length, Logical: int64(len(data)), Alg: alg, KeyID: p.keyID,
-	}, true
 }
 
 // cut seals the open pack and uploads it. The upload is synchronous: a

@@ -35,63 +35,6 @@ const KeySize = 32
 // nonceSize is the GCM nonce length prepended to every encrypted entry.
 const nonceSize = 12
 
-// gcmTagSize is the AEAD tag GCM appends. It is stated rather than read
-// from the cipher because SealedLen has to answer before any key is in
-// hand, and it is pinned against the real one by
-// TestSealedLenStatesTheRealTagSize — a drift here would make every
-// encrypted volume quietly stop deduplicating.
-const gcmTagSize = 16
-
-// AlgOfStored recovers the algorithm an entry of exactly clen stored bytes
-// must have been encoded with, given the plaintext it holds — or reports
-// that no encoding of that plaintext under that key is clen bytes long.
-//
-// It exists because a pack TRAILER records an entry's extent and not its
-// codec: the codec lives in the chunkref that names the chunk. A writer
-// that wants to reuse an entry another generation already stored therefore
-// has to supply an alg it cannot read anywhere, and the only sound way to
-// supply one is to derive it from the plaintext it holds and CHECK the
-// derivation against the length the trailer states. A mismatch means the
-// writer must store the bytes itself rather than write a row claiming an
-// entry is something it is not.
-//
-// The check is exact rather than probable: the two encodings cannot
-// collide on length. Encode stores verbatim unless zstd came out strictly
-// smaller, so an AlgNone entry is exactly SealedLen(len(data)) bytes and
-// every AlgZstd entry is strictly shorter.
-func AlgOfStored(data, key []byte, clen int64) (uint8, bool) {
-	raw := SealedLen(len(data), key)
-	if clen == raw {
-		// Only AlgNone can be exactly this long. Encode picks AlgZstd only
-		// when the compressed payload is STRICTLY smaller than the
-		// plaintext, so every zstd entry is shorter than this — which makes
-		// the common case for already-compressed content (a container
-		// image, a video, an encrypted archive) free: no compressor runs.
-		return AlgNone, true
-	}
-	if clen > raw || clen <= 0 {
-		// Longer than storing the bytes verbatim, so no encoding this
-		// package produces is this long. Whatever wrote that entry, this
-		// caller may not claim it.
-		return 0, false
-	}
-	if SealedLen(len(zEnc.EncodeAll(data, nil)), key) != clen {
-		return 0, false
-	}
-	return AlgZstd, true
-}
-
-// SealedLen is how many bytes Encode produces for a payload of n bytes
-// under key — n itself in the clear, n plus the nonce and the tag when a
-// volume has a key. It answers before any key is in hand and without
-// encoding anything.
-func SealedLen(n int, key []byte) int64 {
-	if len(key) == 0 {
-		return int64(n)
-	}
-	return int64(n + nonceSize + gcmTagSize)
-}
-
 // Shared codecs: EncodeAll/DecodeAll are stateless and safe for concurrent
 // use (same pattern as the packstore trailer codec).
 //

@@ -68,15 +68,6 @@ const (
 	Dir = "mpi"
 )
 
-// LookupBytes is what ONE windowed lookup transfers: a stride of entries,
-// which is the extent Header.Window returns and the smallest thing a range
-// request against a large index can usefully ask for.
-//
-// It is here so that a caller deciding whether a lookup is worth making
-// can compare against the cost rather than against a number somebody
-// picked. 64 KiB at the shipped stride.
-const LookupBytes = packidx.DefaultStride * (KeyLen + recordLen)
-
 // ErrFormat reports bytes that are not an index this build understands.
 var ErrFormat = fmt.Errorf("mpi: unrecognized index")
 

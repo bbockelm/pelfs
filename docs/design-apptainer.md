@@ -504,48 +504,29 @@ also the floor: adding **one small file** to a squashfs still costs 4.7 MiB,
 because mksquashfs re-lays out what follows. "Costs nothing" is not on the
 table; "costs 7% instead of 100%" is.
 
-### The write path realizes it — since W2, on the default path too
+### The write path throws all of it away — unless you pass `--no-memtable`
 
 Measured end to end against a real volume, one generation per
 `mount-gen --rw` session (section 8b of the harness; `uploaded` is
 `put.bytes` from the stats file, `origin` is the fakeorigin's directory
 size after that generation):
 
-| generation | default BEFORE W2 | default AFTER W2 | `--no-memtable` |
-|---|---|---|---|
-| gen1 `el9.sif` (68,497,408 bytes) | 68,200,190 | 68,200,190 | 68,199,809 |
-| gen2 `+` **one small file** added | 68,202,172 | **4,895,856** | **4,894,763** |
-| gen3 `+` a 3 MB payload (derived) | 71,204,714 | **10,982,211** | **10,980,738** |
-| gen4 `+` `el10.sif` (base moved) | 65,150,940 | 65,148,852 | 65,148,468 |
-| **the volume at the end** | **272,755,301** | **149,224,395** | **149,221,054** |
+| generation | default: uploaded | `--no-memtable`: uploaded |
+|---|---|---|
+| gen1 `el9.sif` (68,497,408 bytes) | 68,200,190 | 68,199,809 |
+| gen2 `+` **one small file** added | 68,202,172 | **4,894,763** |
+| gen3 `+` a 3 MB payload (derived) | 71,204,714 | **10,980,738** |
+| gen4 `+` `el10.sif` (base moved) | 65,150,940 | 65,148,468 |
+| **the volume at the end** | **272,755,301** | **149,221,054** |
 
-Four related images cost **149 MB either way now, and 273 MB before W2**.
-The default path is within **3,341 bytes** of the seal path over the whole
-volume — 0.002%, which is a few catalog rows and not a mechanism. gen2's
-4,895,856 bytes against the chunker's predicted 4.70 MiB is the same
-number: both paths realise the full potential, and gen4 confirms the
+Four related images cost **149 MB with `--no-memtable` and 273 MB
+without** — the same four images, the same volume, one flag. gen2's
+4,894,763 bytes against the chunker's predicted 4.70 MiB is the same
+number: the seal path realises the full potential, and gen4 confirms the
 mechanism is content and not luck (a rebuilt base dedups against nothing,
-in every mode).
+in both modes).
 
-**What changed.** The default path now asks the generation it is building
-ON whether it already stores a chunk, through the same windowed pack index
-the read path uses (`genfs.Placed` over `internal/packidx` /
-`internal/mpi`) — so there is no new structure, no sidecar to load, and no
-search: a hit is a pack the base generation's SIGNED pack list names, with
-the identity confirmed against that pack's own trailer. It is asked only
-about chunks at least as large as the 64 KiB window one lookup transfers,
-which at the shipped 1 MiB chunker minimum is every chunk of a file, and
-the answers cost nothing measurable here — the whole index of a
-four-generation volume is one object, fetched once.
-
-The two mechanisms that were there before are unchanged and still first in
-line, because both are free: this session's own location map, then the open
-pack's entries. The base generation is asked last, because it is the only
-one of the three that can cost a request.
-
-Three more hand-run data points, from the same shape. All three are
-BEFORE W2, and the first two are the ones W2 did **not** fix — they are
-one session, not one generation, which is the batch limitation below:
+Three more hand-run data points, from the same shape:
 
 | what | uploaded | verdict |
 |---|---|---|
@@ -553,38 +534,29 @@ one session, not one generation, which is the batch limitation below:
 | **default**, four SIFs (two ~93% identical) in one session | 273,007,591 of 273,846,272 logical | **no dedup at all** |
 | `--no-memtable`, a byte-identical copy of el9 in a later generation | **7,101** | essentially free |
 
-The cause had been structural, not a bug. The default path packs and
-uploads **during** the session through `internal/memtable`, whose only
-dedup was `Store.chunkLoc` — an in-memory map, per session. The
+The cause is structural, not a bug. The default path packs and uploads
+**during** the session through `internal/memtable`, whose only dedup is
+`Store.chunkLoc` — an in-memory map, per session — and whose chunker runs
+over **one flush batch's** extents (`internal/memtable/flush.go:175`), so
+boundaries depend on where the ring flushed, not only on content. The
 `--no-memtable` path stages writes and chunks everything at the seal
 through `internal/publish`, which loads the SQLite **dedup sidecar**
 (`internal/publish/dedup.go`) keyed by chunk identity across generations.
-One path had cross-generation dedup; the other had none.
+One path has cross-generation dedup; the other has none.
 
-Three things fall out, two of them fixed with it:
+Two smaller things fall out of this:
 
-- `write.deduped_chunks` reported **0 for every one of the BEFORE rows**,
-  including the one that deduped 92.8%, because it is incremented only on
-  the memtable path. There are now three counters and each says something
-  different: `write.base_deduped_chunks` / `base_deduped_bytes` are the
-  cross-generation case, `write.deduped_chunks` is that plus the
-  within-session repeats, and `sealed_deduped_chunks` is publish's own —
-  which is the one `--no-memtable` moves, and which had no field anywhere
-  (the `write` section is not even emitted when there is no memtable).
-- **The residual gap is the flush BATCH, not the index.** The chunker runs
-  over one batch of the ring at a time (`internal/memtable/flush.go`), so
-  a session whose writes exceed the ring is cut partly where the ring
-  flushed rather than where the content says. One file per generation —
-  which is what publishing an image is, and what the table above measures
-  — fits and is unaffected. Several large files in ONE session do not:
-  measured, 17 of 87 chunks and 28% of bytes content-determined over a
-  four-file 274 MB session. See `docs/known-issues.md` KL-9.
+- `write.deduped_chunks` in the stats file reported **0 for every one of the
+  rows above**, including the row that deduped 92.8%. The counter is
+  incremented only on the memtable path (`internal/memtable/seal.go:225`),
+  so the path that actually dedups is invisible in the statistics.
 - `--no-memtable` is not free: it stages the whole write locally before
   chunking it, so pushing a 68 MB image needs 68 MB of local scratch and
-  the upload does not overlap the write. Which is now a reason not to use
-  it, since the default path gets the same bytes.
+  the upload does not overlap the write.
 
-**So the distribution claim holds, and it no longer needs a flag.**
+**So the distribution claim holds, and today it is spelled
+`--no-memtable`.** For anyone publishing images into a pelfs volume that is
+the flag, and nothing in the documentation says so.
 
 ---
 
@@ -649,8 +621,7 @@ bug:
 | | change | buys | effort | unblocks |
 |---|---|---|---|---|
 | ~~**W1**~~ | **DONE (2026-08-23).** `rawfuse.PassedFD` gates the mkdir, the unmount, the `/dev/fuse` probe, the backend choice and the permission check; `internal/fsperm` + `internal/rawfuse/perm.go` apply the mode bits where the kernel does not; `scripts/pelfs-fusemount.sh` is the driver wrapper. | `--fusemount`: a job mounts a pelfs volume **inside its own container**, no host-side pelfs, nothing for a site to install | took an afternoon: the plumbing was an hour and the permission model was the rest | was the only FAILS row in the matrix |
-| ~~**W2**~~ | **DONE (2026-08-23).** The default write path asks the base generation's own windowed pack index (`genfs.Placed` over `internal/packidx` / `internal/mpi`) before storing a chunk, above the 64 KiB a lookup transfers; the seal rechecks what it borrowed if a repack moved the base under it. Three counters replace the one that read 0. **Measured 149,224,395 against `--no-memtable`'s 149,221,054.** | 149 MB instead of 273 MB for four related images, on the DEFAULT path; 93% off a derived image, ~100% off a re-push | an afternoon, and the reachability half was most of it | pelfs as an image distribution channel |
-| **W2b** | Chunk an inode's stream across flush BATCHES rather than within one, so a session larger than the ring still cuts on content | the remaining gap: 28% of bytes content-determined over a four-file 274 MB session, against 100% for one file per generation | real — a batch would have to defer its trailing partial chunk, which touches backpressure | several large files published in ONE session |
+| **W2** | Cross-generation dedup on the **default** write path — or, far cheaper, document `--no-memtable` as the flag for publishing images and count the seal path's dedup in `write.deduped_chunks` | 149 MB instead of 273 MB for four related images; 92.8% off a derived image, ~100% off a re-push | documenting + the counter: hours. Making the memtable path dedup: real work — its chunker cuts per flush batch and its index is per session | pelfs as an image distribution channel |
 | **W3** | A path argument to `genfs.Prefetch` / `--prefetch <path>` | prefetch one image out of a volume of twenty, instead of the whole generation | moderate | "prefetch or stage" on a slow link |
 | **W4** | Set `MaxWrite`/`MaxReadAhead` in `rawfuse.mount`'s `MountOptions` (both unset today, so reads cap at 128 KiB against a 4 MiB chunk) | fewer FUSE round trips per decoded chunk on the nested-FUSE path | two fields | nothing blocked; a constant-factor win |
 | **W5** | A `pelfs get <prefix> <path> <dest>` verb | staging one file at the measured 1.04x without standing up a mount — the fallback for setuid-apptainer sites (constraint 2) | small | the setuid-site path, if constraint 2 turns out badly |
@@ -687,21 +658,14 @@ staging the image would, and on a node that has run the image before it
 moves none. The two conditions are site policy and stated above:
 unprivileged user namespaces, and a usable `/dev/fuse`.
 
-**For publishing images into the volume, no flag either** — this is what
-W2 changed, and it is the only thing that has changed about how the owner
-would use it:
+**For publishing images into the volume, add one flag** — this is the only
+thing worth changing about how the owner would use it today:
 
 ```
-pelfs mount-gen --rw <prefix> ~/publish -- cp mypipeline.sif ~/publish/
+pelfs mount-gen --rw --no-memtable <prefix> ~/publish -- cp mypipeline.sif ~/publish/
 ```
 
-A derived image costs 4.9 MB rather than 68 MB, on the default path.
-`--no-memtable` reaches the same number and stages the whole file locally
-to get there, so there is no longer a reason to pass it. One caveat, and
-it is the batch limitation above: publish **one image per generation**. Two
-large files in one `mount-gen` session are cut partly at the ring's flush
-points rather than on content, and dedup against a later generation
-degrades accordingly (`docs/known-issues.md` KL-9).
+Without it a derived image costs 68 MB; with it, 4.9 MB.
 
 **And for a job that would rather not mount anything on the host at all**,
 W1 is now in, so this works:

@@ -2,56 +2,6 @@
 
 ## Unreleased
 
-### Cross-generation dedup on the default write path
-
-Writing a file whose content the volume already holds now costs the
-metadata and nothing else, on the **default** write path. Before this, only
-`--no-memtable` deduplicated across generations; the default path packed
-and uploaded during the session against an in-memory, per-session map and
-re-sent every byte.
-
-Measured on four related container images, one per generation, against a
-real origin (`scripts/apptainer-docker.sh` section 8b):
-
-| | uploaded, default | uploaded, `--no-memtable` |
-|---|---|---|
-| before | 272,755,301 | 149,221,054 |
-| after | **149,224,395** | 149,221,054 |
-
-A derived image costs 4.9 MB instead of 68 MB, and a re-push of an
-unchanged one costs essentially nothing. **`--no-memtable` is no longer
-worth passing to publish images**: it reaches the same number and stages
-the whole file to local disk to get there.
-
-There is no new index, no sidecar, and no new resident structure. The write
-path asks the generation it is building on, through the same windowed pack
-index the read path already uses — one ~64 KiB range read per lookup at
-worst, usually nothing at all because a small index is one object — and it
-only asks about chunks at least as large as that window, which at the
-shipped 1 MiB chunker minimum is every chunk of a file.
-
-**One caveat, and it is a real one: publish one image per generation.** The
-flush chunks one batch of the write ring at a time, so a session whose
-writes exceed the ring cuts some chunks where the ring flushed rather than
-where the content says, and those chunks cannot dedup against anything.
-One large file per generation is unaffected (100% of bytes cut on content);
-four in one session measured 28%. `docs/known-issues.md` KL-9 has the
-numbers and why the fix is not local.
-
-### The statistics file can now show dedup working
-
-`write.deduped_chunks` reported **0 on every path that was actually
-deduplicating**, because it was incremented only on the memtable path,
-which had nothing to count. Three fields now, each answering a different
-question:
-
-- `write.base_deduped_chunks` / `write.base_deduped_bytes` — content the
-  BASE GENERATION already held. This is the cross-generation claim.
-- `write.deduped_chunks` — that, plus repeats within the session.
-- `sealed_deduped_chunks` — `internal/publish`'s own, which is what
-  `--no-memtable` moves. It had no field anywhere: the `write` section is
-  not written at all when there is no memtable.
-
 ### Windows builds (`GOOS=windows`), and the port that made them possible
 
 `CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build ./...` now succeeds, a CI

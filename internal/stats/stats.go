@@ -192,16 +192,9 @@ type Summary struct {
 	Seals            int64  `json:"seals,omitempty"`
 	SealedGeneration uint64 `json:"sealed_generation,omitempty"`
 	SealedChunks     int64  `json:"sealed_chunks,omitempty"`
-	// SealedDedupedChunks is chunks the seal did NOT store because the
-	// volume already held them. It exists because the seal path is the one
-	// that dedups on `--no-memtable`, and until this field the statistics
-	// file reported zero for it — the write section is not even written
-	// when there is no memtable, so the path that saved 45% of a volume's
-	// bytes had no counter anywhere.
-	SealedDedupedChunks int64 `json:"sealed_deduped_chunks,omitempty"`
-	SealedCatalogs      int64 `json:"sealed_catalogs,omitempty"`
-	SealedPacks         int64 `json:"sealed_packs,omitempty"`
-	SealOK              *bool `json:"seal_ok,omitempty"`
+	SealedCatalogs   int64  `json:"sealed_catalogs,omitempty"`
+	SealedPacks      int64  `json:"sealed_packs,omitempty"`
+	SealOK           *bool  `json:"seal_ok,omitempty"`
 
 	// Maintenance is what the background repack and sweep have done in this
 	// session. Nil on a mount that runs neither.
@@ -273,15 +266,6 @@ type WriteStats struct {
 	// was neither encoded nor sent — the part of the write that cost
 	// nothing.
 	DedupedChunks int64 `json:"deduped_chunks,omitempty"`
-	// BaseDedupedChunks and BaseDedupedBytes are the part of DedupedChunks
-	// the GENERATION being built on already held, rather than an earlier
-	// flush of this session. They are what says a volume is deduplicating
-	// across generations — the bytes a related image did not cost — and
-	// they were invisible before: the counter above cannot distinguish
-	// "this session wrote the same bytes twice" from "the volume already
-	// had them", and only the second one is the interesting claim.
-	BaseDedupedChunks int64 `json:"base_deduped_chunks,omitempty"`
-	BaseDedupedBytes  int64 `json:"base_deduped_bytes,omitempty"`
 }
 
 // CacheStats is the local generation cache, per directory, against its

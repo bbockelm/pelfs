@@ -10,7 +10,6 @@ import (
 
 	"lukechampine.com/blake3"
 
-	"github.com/bbockelm/pelfs/internal/chunkid"
 	"github.com/bbockelm/pelfs/internal/mpi"
 	"github.com/bbockelm/pelfs/internal/packstore"
 	"github.com/bbockelm/pelfs/internal/superblock"
@@ -369,115 +368,6 @@ func (x *packIndex) locate(ctx context.Context, key string) (packLoc, error) {
 		return packLoc{}, failed
 	}
 	return packLoc{}, fmt.Errorf("genfs: %s not present in any listed pack", key)
-}
-
-// locatePlaced is locate with the two expensive steps removed: the
-// backwards walk of the pack list and the sweep of every trailer.
-//
-// It exists for the caller that is asking a DIFFERENT question. locate
-// asks "where are the bytes I am about to read", and for that question a
-// wrong answer is a failed read, so it is worth any number of round trips
-// to be sure — including the sweep, which is the only step entitled to say
-// "present in no listed pack". This asks "would storing these bytes again
-// be a waste", and for THAT question a miss costs one duplicate upload and
-// nothing else. Paying a trailer fetch per pack to avoid one is the wrong
-// trade by orders of magnitude, and at the hundred-million-object target it
-// is the difference between a lookup and a whole-generation sweep.
-//
-// So the answer is three-valued and only two of the values are returned: a
-// location, or "not cheaply". It never means "absent", and no caller may
-// read it that way.
-func (x *packIndex) locatePlaced(ctx context.Context, key string) (packLoc, bool) {
-	if loc, ok := x.lookup(key); ok {
-		return loc, true
-	}
-	x.loadMu.Lock()
-	defer x.loadMu.Unlock()
-	if loc, ok := x.lookup(key); ok {
-		return loc, true
-	}
-	// Trailers already on disk, which cost no requests. For a session
-	// publishing into a volume it has read or written before this is the
-	// whole answer: the packs of the generation being built on are in the
-	// local pack cache, so the identities of everything they hold are one
-	// local read away and the index is never consulted at all.
-	if loc, ok := x.mergeLocal(key); ok {
-		return loc, true
-	}
-	return x.probeHints(ctx, key)
-}
-
-// Placement is where a chunk this generation already holds is stored: the
-// pack, the extent inside it, and nothing about how to decode it. Alg and
-// key id are not here because a pack trailer does not record them — they
-// live in the chunkref that names the chunk, and a writer reusing an entry
-// has to supply them itself (see memtable's reuse, and dedupSound below).
-type Placement struct {
-	Pack   string
-	Off    int64
-	Length int64 // the STORED length: what a reader will range-read
-}
-
-// Placed reports where a chunk this generation already holds is stored,
-// and nothing about a chunk it does not.
-//
-// It is the cross-generation dedup lookup, and every property that makes
-// it safe comes from machinery the read path already has. The name a
-// multi-pack index produces is held against the SIGNED pack list
-// (packIndex.entry), so a stale or hostile index cannot name a pack this
-// generation does not list; the full 32-byte identity is then confirmed
-// against that pack's own trailer, whose hash the pack list signs, so a
-// truncated-key collision cannot produce a hit. A hit therefore means
-// exactly: this identity is stored, in a pack THIS generation lists, and
-// the pack's own signed-for trailer says so.
-//
-// The stored length is the trailer's, which is the authority: it is what a
-// reader will range-read, and a chunkref claiming any other number sends a
-// reader to read an extent that is not the one that is there.
-//
-// A miss is never "absent". See locatePlaced.
-func (fs *FS) Placed(ctx context.Context, id chunkid.Identity) (Placement, bool) {
-	fs.swapMu.RLock()
-	defer fs.swapMu.RUnlock()
-	if !fs.dedupSound() {
-		return Placement{}, false
-	}
-	loc, ok := fs.packIndex.locatePlaced(ctx, id.Hex())
-	if !ok || loc.length <= 0 || loc.pack == "" {
-		return Placement{}, false
-	}
-	return Placement{Pack: loc.pack, Off: loc.off, Length: loc.length}, true
-}
-
-// dedupSound reports whether reusing an entry this generation already
-// stores is sound for a WRITER, which is a stronger question than whether
-// reading it is.
-//
-// A reader takes a chunkref's alg and key id from the row it is following.
-// A writer reusing an existing entry has to SUPPLY those, and the only
-// key id it can supply is the one it is itself writing under. That is
-// correct because a volume has exactly one data-encryption key for its
-// lifetime — `pelfs volume create` mints it (cmd/pelfs/volume.go) and every
-// generation carries the key table forward verbatim; nothing in the tree
-// adds a second DEK. Rather than trust that from a distance, this checks
-// it: a key table naming more than one DEK is a volume where an entry's
-// key id is not derivable from the writer's own, and on such a volume
-// there is no cross-generation dedup rather than a wrong row.
-//
-// Confidentiality is not at issue. Identity is keyed BLAKE3 over the
-// PLAINTEXT on an encrypted volume (chunkid), so a hit means the writer
-// already holds the identity key and the plaintext; it learns nothing it
-// did not bring. Nor is the nonce: reusing an entry reuses the ciphertext
-// and the nonce TOGETHER, which is not nonce reuse — nothing is encrypted
-// a second time.
-func (fs *FS) dedupSound() bool {
-	deks := 0
-	for _, ke := range fs.sb.KeyTable {
-		if ke.Kind == superblock.KeyKindDEK {
-			deks++
-		}
-	}
-	return deks <= 1
 }
 
 // loadHints attaches the indexes a generation lists. It must be called

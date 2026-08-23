@@ -1,15 +1,24 @@
 package main
 
-// `pelfs browse` is M1 of docs/design-webui.md: a loopback HTTP listener,
-// one hand-written page, and the two things a file manager cannot give —
-// a publish button and an honest answer to "is my data in the federation
-// yet".
+// `pelfs browse` is docs/design-webui.md's whole plan: a loopback HTTP
+// listener, and on it TWO pages with two addresses.
 //
-// It deliberately does NOT browse files. docs/design-guiclients.md
-// identified the trap this milestone exists to close: a modest
-// drag-and-drop finishes, the user closes the client, and nothing has been
-// published for up to five minutes. Neither half of that is a
-// file-manager feature, and both are on the page below.
+//	GET /          the file manager (internal/webui's committed bundle)
+//	GET /connect   the connection page (browse.html, hand-written)
+//
+// The file manager is at `/` because that is what the verb promises, and the
+// connection page is where the credential desk, the SSO cards and the
+// generated Cyberduck profile live. BOTH render the durability panel, from
+// the same `/events` snapshot and in the same words — see
+// internal/webui/durability_test.go, which fails if the two ever drift —
+// because that panel is the two things a file manager cannot give: a publish
+// button and an honest answer to "is my data in the federation yet".
+//
+// docs/design-guiclients.md identified the trap this verb exists to close: a
+// modest drag-and-drop finishes, the user closes the client, and nothing has
+// been published for up to five minutes. Neither half of that is a
+// file-manager feature, which is why the panel is above the grid rather than
+// behind a tab, and on both pages rather than on one.
 //
 // # What this verb is, in one paragraph
 //
@@ -90,11 +99,14 @@ import (
 	"github.com/bbockelm/pelfs/internal/vfsbilly"
 	"github.com/bbockelm/pelfs/internal/vfsdav"
 	"github.com/bbockelm/pelfs/internal/webapi"
+	"github.com/bbockelm/pelfs/internal/webui"
 )
 
-// browseAssets is the page. One file, hand-written, no bundler, no Node —
-// and no third-party JavaScript, which is why the CSP below can be strict
-// enough to make a stored-XSS finding harmless.
+// browseAssets is the CONNECTION page, served at /connect. One file,
+// hand-written, no bundler, no Node — and no third-party JavaScript, which is
+// why the CSP below can be strict enough to make a stored-XSS finding
+// harmless. The file manager at / is internal/webui's bundle; see
+// appHandler.
 //
 //go:embed browse.html
 var browseAssets embed.FS
@@ -747,10 +759,38 @@ func (b *browseServer) nowTime() time.Time {
 // internal/control.
 func (b *browseServer) routes(g *httpguard.Guard) http.Handler {
 	r := g.NewRouter()
-	// The app shell. Unauthenticated because there is no secret in it: the
-	// page ships no state at all and asks for everything over the API,
-	// which is also what lets its CSP have no data in it to smuggle.
-	r.HandleFunc(httpguard.SurfaceApp, "GET /{$}", b.servePage)
+	// ---- the two surfaces, and their addresses --------------------------
+	//
+	// `/` IS THE FILE MANAGER. The verb's pitch is "browse and upload
+	// files", so the address the terminal prints has to be the thing that
+	// does it; a user who lands on a credential desk and has to find a link
+	// to the files has been given the tool's plumbing as its front door.
+	//
+	// `/connect` IS THE CONNECTION PAGE — M1's hand-written file: the
+	// credential desk (U7/U8), the SSO cards (U13), and its own copy of the
+	// durability panel. It keeps that panel rather than losing it, because
+	// the panel is what this whole design exists for and a page a user may
+	// sit on for the length of a Cyberduck setup must not be the one page
+	// that cannot say whether the data is published.
+	//
+	// Neither page is a fallback for the other and neither is authenticated
+	// at the transport: both ship no state and ask for everything over the
+	// API, which is also what lets both CSPs have nothing in them to
+	// smuggle. What links them is one anchor each way — see
+	// webui/frontend/src/ui/Durability.tsx and browse.html's nav.
+	//
+	// No catch-all. The bundle's own handler falls back to index.html for
+	// an unknown path so a client-side route survives a reload, but this app
+	// HAS no client-side routes (there is no router in it: the open
+	// directory is component state, not the URL), so a catch-all would only
+	// turn a mistyped `/api/v1/fil` into an HTML page pretending to be an
+	// answer. Four exact patterns instead, and a 404 is a 404.
+	app := appHandler()
+	r.Handle(httpguard.SurfaceApp, "GET /{$}", app)
+	r.Handle(httpguard.SurfaceApp, "GET /assets/{file}", app)
+	r.Handle(httpguard.SurfaceApp, "GET /brand/{file}", app)
+	r.Handle(httpguard.SurfaceApp, "GET /third_party.txt", app)
+	r.HandleFunc(httpguard.SurfaceApp, "GET /connect", b.servePage)
 	// The bootstrap-for-session exchange: the one route that cannot
 	// require the session header, because it mints it.
 	r.Handle(httpguard.SurfaceExchange, "POST /api/v1/session",
@@ -1476,7 +1516,32 @@ func (b *browseServer) closeStreams() {
 
 // ---- the page ------------------------------------------------------------
 
-// servePage renders the one HTML file.
+// appHandler is the file manager: internal/webui's committed bundle, on the
+// route table.
+//
+// internal/webui owns the bundle's own two behaviours (immutable caching for
+// the hashed assets, no-store for index.html) and deliberately owns none of
+// the security work, so the one thing added here is the policy — webui.CSP,
+// which is the bundle's own statement of what it loads.
+//
+// WHY THE HEADER HAS TO BE SET AT ALL, since the guard already sets one:
+// internal/httpguard puts `default-src 'none'` on every response
+// (securityHeaders), which is exactly right for a JSON answer and leaves the
+// app a BLANK PAGE — index.html arrives and its own <script src> is refused.
+// That is what happened the first time this route existed; it is one of the
+// two things that only broke once the app was reachable. webui.CSP is the
+// same shape with the bundle's own sources named. It is `'self'` and not a
+// nonce because every byte of the bundle's script and style is a hashed file:
+// see webui.CSP for why 'unsafe-inline' must never join it.
+func appHandler() http.Handler {
+	bundle := webui.Handler()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Security-Policy", webui.CSP)
+		bundle.ServeHTTP(w, r)
+	})
+}
+
+// servePage renders the connection page: one HTML file, at /connect.
 //
 // The CSP carries a per-response nonce rather than 'unsafe-inline'. The
 // page is one file with one inline <script> and one inline <style>, which

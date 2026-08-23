@@ -29,6 +29,21 @@ import { join } from "node:path";
  */
 
 export const MODE = process.env.PELFS_WEBUI_MODE ?? "embed";
+
+/**
+ * The two addresses, since the wiring pass gave each surface one.
+ *
+ *   `/`         the file manager (internal/webui's bundle). BOTH modes serve
+ *               it here, which is why most of the specs below no longer fork
+ *               on MODE for the page they open.
+ *   `/connect`  the connection page (cmd/pelfs/browse.html): the credential
+ *               desk, the SSO cards, and its own durability panel. Only
+ *               `pelfs browse` has it -- internal/webui's test server serves
+ *               the bundle and a mock API and nothing hand-written -- so the
+ *               specs that drive it skip in embed mode and say so.
+ */
+export const APP = "/";
+export const CONNECT = "/connect";
 export const BASE = process.env.PELFS_WEBUI_URL ?? "";
 export const ORIGIN = BASE ? new URL(BASE).origin : "";
 export const SESSION_KEY = "pelfs.session";
@@ -155,7 +170,7 @@ export { expect };
  * the exchange -- which is what a second load of a real session does, because
  * the launch link is spent by then.
  */
-export async function openPelfs(page: Page, session: string, path = "/") {
+export async function openPelfs(page: Page, session: string, path: string = APP) {
   await page.addInitScript(
     ([key, value]) => {
       try {
@@ -167,6 +182,11 @@ export async function openPelfs(page: Page, session: string, path = "/") {
     [SESSION_KEY, session] as [string, string],
   );
   await page.goto(path);
+}
+
+/** Opens the connection page at /connect, with a session already in this tab. */
+export async function openConnect(page: Page, session: string) {
+  await openPelfs(page, session, CONNECT);
 }
 
 /** Drives M1's `--test-hooks` route. Off by default; the harness passes it. */

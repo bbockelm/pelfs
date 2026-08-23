@@ -20,11 +20,26 @@ import (
 //
 // scripts/webui-playwright.sh prefers `pelfs browse` -- the real binary, a
 // real volume, a real federation stub -- because that is the gate worth
-// having. But `pelfs browse` is work item U3 and does not exist yet, and a
-// harness that cannot run until someone else's milestone lands is a harness
-// nobody has proven. So this is the fallback: the embedded bundle, served by
-// Go, on an ephemeral loopback port, with the URL printed for the script to
-// pick up.
+// having, and since the wiring pass it serves this same bundle at `/`. This is
+// the OTHER mode, and it is kept rather than retired because it is the only
+// one that can drive the file manager against a volume whose contents the test
+// chooses: a 6,000-entry directory for the listing cap, a path that refuses a
+// rename, a listing with a known name in it. A real fresh volume has none of
+// those and arranging them through the UI would be testing the upload path.
+//
+// WHAT THIS SERVER MUST KEEP IN COMMON WITH `pelfs browse`, or the suite
+// proves the app under rules the product does not use:
+//
+//   - the same four EXACT routes, so an unregistered path is a 404 in both
+//     modes rather than an index.html in one of them;
+//   - webui.CSP on the app's responses, which is what the real listener sets
+//     (cmd/pelfs/browse.go, appHandler) and what caught the app rendering
+//     blank the first time it was mounted for real;
+//   - the real internal/browsesession, so the credential flow is not stubbed.
+//
+// What it deliberately does NOT have is internal/httpguard. The guard's own
+// table test owns the threat model, and the cross-origin specs skip in this
+// mode and say so.
 //
 // It is skipped unless PELFS_WEBUI_SERVE=1, so `go test ./...` never starts a
 // server. It is a test and not a `main` package so that no shipped binary
@@ -53,7 +68,17 @@ func TestServeEmbeddedForBrowserSuite(t *testing.T) {
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle("/", Handler())
+	// The same four patterns cmd/pelfs's route table uses, and the same
+	// policy, so "it worked in embed mode" means something about browse mode.
+	bundle := Handler()
+	app := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Security-Policy", CSP)
+		bundle.ServeHTTP(w, r)
+	})
+	mux.Handle("GET /{$}", app)
+	mux.Handle("GET /assets/{file}", app)
+	mux.Handle("GET /brand/{file}", app)
+	mux.Handle("GET /third_party.txt", app)
 	// The JSON API, mocked (mockapi_test.go). Work item U11 owns the real
 	// one; without a stand-in the app in webui/frontend has nothing to talk
 	// to, and the browser suite could only assert that a shell renders.

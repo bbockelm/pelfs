@@ -9,11 +9,23 @@ import (
 
 // ONE DURABILITY VOCABULARY, ON TWO SURFACES.
 //
-// `pelfs browse` serves M1's hand-written connection page
-// (cmd/pelfs/browse.html) and, when the wiring pass lands, this bundle's file
-// manager. Both answer the same question -- "is my data in the federation
-// yet" -- from the same `/events` snapshot, and they must answer it in the
-// same words and with the same glyphs.
+// `pelfs browse` serves this bundle's file manager at `/` and M1's
+// hand-written connection page (cmd/pelfs/browse.html) at `/connect`. Both
+// answer the same question -- "is my data in the federation yet" -- from the
+// same `/events` snapshot, and they must answer it in the same words and with
+// the same glyphs.
+//
+// THIS TEST IS THE RECONCILIATION, and it is worth saying what it is not.
+// Neither panel is the other's source: both are CLIENTS of the server's
+// snapshot, so there is one answer with two renderings rather than two
+// answers that have to be kept in agreement. What could still drift is the
+// WORDING -- and a reviewer reading a diff of one file cannot see that it now
+// disagrees with the other. Hence a test that reads both.
+//
+// The alternative was to have one panel link to the other and delete the
+// second rendering. It was rejected: the whole trap this design closes is a
+// finished drag-and-drop nobody publishes, and a user who has to follow a
+// link to read the sentence is a user who does not read it.
 //
 // The failure this prevents is not cosmetic. docs/design-webui.md names the
 // one ambiguity that must never reach the screen: "a file that looks uploaded
@@ -66,6 +78,11 @@ func TestTheTwoSurfacesShareOneDurabilityVocabulary(t *testing.T) {
 		"in the federation",
 		"nothing staged",
 		"next automatic publish in",
+		// The idle clause. It is the promise that closing the tab publishes
+		// rather than abandons, and it was on the connection page only until
+		// the wiring pass -- so the surface that can actually stage files was
+		// the one that did not make the promise.
+		"after this tab closes",
 		"(nothing to publish)",
 		"(read-only session — restart with --rw to publish)",
 	} {

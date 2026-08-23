@@ -56,9 +56,12 @@ a defensible number: it renders in under half a second. Search is
 **client-side over what is already loaded**, so a capped listing is also a
 partial search, and the UI has to say so.
 
-## Two defects in the shipped provider, and the three-line fix
+## Three defects in the shipped provider
 
-Recorded in `recording.json`'s last step:
+Two of them are in `recording.json`'s last step; the third is not on the wire
+at all and was found by reading the method afterwards. This heading said
+**two** for four commits, which is worth recording because the one it left out
+is the only one that can cost a user their belief about the volume.
 
 - `RestDataProvider.send()` overrides the base `Rest.send()` and spreads only
   its `customHeaders` argument — it never reads `this._customHeaders`. So
@@ -70,9 +73,25 @@ Recorded in `recording.json`'s last step:
   a string body. `text/plain` is one of the three types an HTML form can
   send, so the threat model's "mutating route with `text/plain` → 415" row
   would reject every write the file manager makes.
+- **It swallows every failure.** The shipped `send` attaches its `.catch`
+  AFTER its own `!res.ok` throw, so the throw it just made is caught by it: a
+  401, a 415, a 500 or a torn connection all resolve to `undefined` and the
+  promise never rejects. A wire trace cannot show this — the request and the
+  response are both correct — which is why it took reading the method.
 
-`PelfsDataProvider` in `../src/api/provider.ts` overrides `send()` and fixes
-both. The recording shows the difference on the wire.
+`PelfsDataProvider` in `../src/api/provider.ts` fixes all three: `send()` is a
+full override doing its own fetch, so the happy path is identical and a failure
+is a rejected promise. The recording shows the difference on the wire for the
+first two.
+
+There is a fourth thing, and it is NOT a defect in the provider — it is what
+the third one hides. The store applies every mutation optimistically, and a
+rejected promise rolls none of it back, so `send()` rejecting is necessary and
+not sufficient: without more, a refused rename gave an error banner beside a
+row that kept the new name. `PelfsDataProvider.getHandlers` closes it by
+re-listing from the server; see that method, and
+`../tests/filemanager.spec.ts`'s refused-rename test, which is the assertion
+that fails if any of this regresses.
 
 ## And it phones home unless told not to
 

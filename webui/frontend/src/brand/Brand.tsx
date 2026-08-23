@@ -26,22 +26,19 @@ export function Brand({ subtitle }: { subtitle?: string }) {
   );
 }
 
-/**
- * The line that keeps a borrowed mark from becoming a claim. It costs
- * nothing and prevents the one misunderstanding a borrowed mark can cause,
- * so it is part of the brand component rather than something a page can
- * forget to include.
+/*
+ * THERE IS NO FOOTER, and its absence is a decision rather than an omission.
+ *
+ * This page used to carry a disclaimer -- "an independent tool for Pelican
+ * federations; not an official Pelican Platform product" -- under the
+ * borrowed mark. The Pelican Project's PI, who is the person whose mark it
+ * is, asked for it off the page: not important to state, and it cost every
+ * viewer a line. The attribution it was standing in for did not go anywhere:
+ * it is in public/brand/NOTICE.txt, which ships beside the asset it is about
+ * and is served at /brand/NOTICE.txt (internal/webui/webui_test.go asserts
+ * both), and in the repository's own NOTICE.
+ *
+ * The MIT notices for the bundled packages are the OTHER obligation and it is
+ * separate: they are embedded, served at /third_party.txt, and linked from
+ * the status line at the bottom of App.tsx.
  */
-export function BrandFooter() {
-  return (
-    <footer className="pelfs-footer" data-testid="pelfs-disclaimer">
-      <span>
-        pelfs is an independent tool for Pelican federations — <strong>not</strong> an official
-        Pelican Platform product. The Pelican mark is used with permission of the Pelican Project.
-      </span>
-      <a href="./third_party.txt" data-testid="pelfs-notices-link">
-        third-party notices
-      </a>
-    </footer>
-  );
-}

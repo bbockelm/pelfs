@@ -95,13 +95,22 @@ export function UploadNotice({ text }: { text: string }) {
 }
 
 /**
- * A failed operation, said out loud.
+ * A failed operation, said out loud -- beside a listing that has already been
+ * put back.
  *
- * The store applies every change optimistically and the shipped provider
- * swallows every failure (see api/provider.ts, finding 3), so without this
- * banner a refused rename shows as a successful one. It offers a reload
- * rather than pretending to undo: the store has no rollback, and inventing
- * one would be a second, wrong model of what the volume holds.
+ * The store applies every change optimistically, so a refused rename used to
+ * leave the new name on the screen with this banner underneath it: two
+ * answers, and the screen is the one a user believes. The provider now
+ * re-lists the directories a failed mutation touched and hands the server's
+ * answer back to the store (api/provider.ts, `getHandlers`), so by the time
+ * this appears the row is the volume's row again and the banner says only what
+ * did not happen.
+ *
+ * The reload button stays, for the case the repair cannot cover: a server that
+ * is not answering at all fails the re-listing too, and then a full reload is
+ * the only thing left. It is offered rather than performed, because a page
+ * that reloads itself on an error is a page that can lose an unsent rename in
+ * another folder.
  */
 export function ErrorBanner({ text, onReload }: { text: string; onReload: () => void }) {
   if (!text) return null;
@@ -112,8 +121,9 @@ export function ErrorBanner({ text, onReload }: { text: string; onReload: () => 
         Reload the listing
       </button>
       <div className="pelfs-muted">
-        What you see may no longer match the volume: this page applies a change as soon as you ask
-        for it, and the server refused this one.
+        The listing above has been read back from the volume, so what you see is what the volume
+        holds — the change you asked for is not in it. If this folder still looks wrong, the
+        server did not answer the re-read either, and a reload is the way to be sure.
       </div>
     </div>
   );

@@ -931,6 +931,12 @@ func (b *browseServer) routes(g *httpguard.Guard) http.Handler {
 	// its own surfaces, which is why this is one line and not eleven.
 	b.api.Register(r)
 
+	// ---- the branch picker (cmd/pelfs/browsebranch.go) ------------------
+	//
+	// On the page's surface and nowhere else: a WebDAV client's credential
+	// cannot move the session it is connected to.
+	b.registerBranchRoutes(r)
+
 	if b.args.testHooks {
 		r.HandleFunc(httpguard.SurfaceAPI, "POST /api/v1/testhook", b.serveTestHook)
 	}
@@ -1137,10 +1143,15 @@ func (b *browseServer) state() browseState {
 	b.mu.Unlock()
 
 	st := browseState{
-		Phase:     phase,
-		Error:     openErr,
-		Volume:    b.prefix,
-		Mode:      "read-only",
+		Phase:  phase,
+		Error:  openErr,
+		Volume: b.prefix,
+		Mode:   "read-only",
+		// The branch the flags asked for until the volume is open, and the
+		// one the SESSION is on after that. They differ the moment the
+		// branch picker is used, and a durability panel still naming the
+		// branch a switch moved off is the stale binding this route was
+		// most at risk of.
 		Branch:    b.args.branch,
 		Lease:     "none",
 		Publish:   job,
@@ -1162,6 +1173,7 @@ func (b *browseServer) state() browseState {
 	if g == nil {
 		return st
 	}
+	st.Branch = g.currentBranch()
 	st.Generation = g.gfs.Generation()
 	if g.lease != nil {
 		ls := g.lease.State()

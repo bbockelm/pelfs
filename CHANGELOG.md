@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+**The branch pill is a control.** `GET /api/v1/branches` lists the volume's
+branches with the generation, head and staged flag the picker needs, and
+`POST /api/v1/branch` switches — 202 with progress on `/events` like a
+publish job, because reopening a volume at another generation is not
+instant. A switch reuses the generation swap a checkpoint already uses
+(`genfs.Swap`), so the WebDAV handler, the JSON data plane and the
+durability panel follow it rather than being kept in sync. A session with
+unpublished work answers **409, "publish or discard first"** — nothing is
+discarded to make a switch possible — and a read-only session is **not**
+refused: it has no overlay to strand and no lease to move, which makes it
+the safest form of the operation.
+
 **`pelfs browse` listens on 8443 when it can.** The port is the first free
 one at or above 8443, probed a hundred ports up before falling back to an
 OS-chosen one — replacing a hash of the volume URL, which gave every volume

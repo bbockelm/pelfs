@@ -153,6 +153,24 @@ type genSession struct {
 	sb      *superblock.Superblock
 	prevRaw []byte
 
+	// branchMu guards branch, which was immutable until `pelfs browse`
+	// grew a branch picker (cmd/pelfs/browsebranch.go). It is its own
+	// mutex and not g.mu because the readers that are NOT on the seal path
+	// — the control socket's status, the page's state sample — must keep
+	// answering while a seal or a switch holds g.mu for minutes.
+	//
+	// The switch writes it holding BOTH: g.mu, so no seal can be running,
+	// and this one, so an unlocked reader sees one branch or the other and
+	// never a torn string.
+	branchMu sync.RWMutex
+
+	// leaseFor takes the advisory lease on ANOTHER branch of this volume,
+	// with the same options this session's own lease was taken with. Set
+	// by acquireLease and therefore nil in a session that holds no lease
+	// (read-only, or --no-lease), which is exactly the set of sessions
+	// that need no lease to switch branches.
+	leaseFor func(ctx context.Context, branch string) (*lease.Lease, error)
+
 	// ovMu guards overlay LIVENESS only, never a seal in progress: the
 	// statistics sampler must keep answering while a checkpoint runs, and
 	// overlay.FS serializes its own operations anyway.
@@ -1011,6 +1029,25 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 // hide a live holder or resurrect a dead one. It never goes through the
 // statistics wrapper's sibling encryption layers either — a client with
 // the wrong volume key must still see that the branch is busy.
+// currentBranch is the branch this session is on RIGHT NOW, which stopped
+// being a constant when `pelfs browse` grew a branch picker. Every reader
+// outside the seal lock must go through here.
+func (g *genSession) currentBranch() string {
+	g.branchMu.RLock()
+	defer g.branchMu.RUnlock()
+	return g.branch
+}
+
+// setBranch moves the session onto another branch. The caller holds g.mu —
+// which is what makes this safe rather than merely atomic: the branch and
+// the generation it names have to move together, and g.mu is what no seal
+// can be running across.
+func (g *genSession) setBranch(name string) {
+	g.branchMu.Lock()
+	g.branch = name
+	g.branchMu.Unlock()
+}
+
 func (g *genSession) acquireLease(ctx context.Context, o *cmdOpts, prefix string) (*lease.Lease, error) {
 	metaStore, err := pelicanobj.New(ctx, pelicanobj.Config{
 		PrefixURL:    prefix,
@@ -1022,33 +1059,49 @@ func (g *genSession) acquireLease(ctx context.Context, o *cmdOpts, prefix string
 	if err != nil {
 		return nil, err
 	}
-	l, err := lease.Acquire(ctx, lease.Options{
-		Store:             metaStore,
-		Session:           g.sessionID,
-		Branch:            g.branch,
-		Steal:             o.stealLease,
-		IgnoreVolumeLease: o.ignoreVolumeLease,
-		OnConflict: func(holder *lease.Info) {
-			g.stats.Update(func(sum *stats.Summary) { sum.LeaseConflictObserved = true })
-			// STOP CHECKPOINTING. Every seal from here on is refused by
-			// fenceSeal, and a periodic checkpointer that keeps ticking
-			// would freeze the overlay, walk the dirty set and upload packs
-			// on its interval, forever, to be told each time what it was
-			// told the first time. The work is not lost by stopping — it
-			// stays in the overlay, which is where a refused seal leaves it
-			// anyway.
-			g.haltCheckpointer()
-			// "this branch", not "this prefix": another writer on another
-			// branch is now ordinary, and only a writer on OURS is the
-			// emergency this warning is for.
-			ui.Warn("another client took over branch {branch}: {holder}\n"+
-				"concurrent writers on one branch WILL corrupt each other; stop one of them.\n"+
-				"this session keeps serving but will no longer PUBLISH: checkpointing is stopped and\n"+
-				"the seal at unmount will be REFUSED, keeping this session's work in its overlay.\n"+
-				"remount to take a fresh lease and reseal on top of whatever that client published.",
-				"branch", g.branch, "holder", holder.Describe())
-		},
-	})
+	// take is the acquisition with the branch as a PARAMETER, so the same
+	// options can be used again for another branch: `pelfs browse`'s
+	// picker moves a writable session between branches, and the lease is
+	// per branch (internal/lease), so it has to move with it. Recorded on
+	// the session as leaseFor rather than rebuilt there, because the
+	// options include the store, the steal flag and the conflict handler,
+	// and a second opinion about any of them would be a second lease
+	// policy.
+	take := func(ctx context.Context, branch string) (*lease.Lease, error) {
+		return lease.Acquire(ctx, lease.Options{
+			Store:             metaStore,
+			Session:           g.sessionID,
+			Branch:            branch,
+			Steal:             o.stealLease,
+			IgnoreVolumeLease: o.ignoreVolumeLease,
+			OnConflict: func(holder *lease.Info) {
+				g.stats.Update(func(sum *stats.Summary) { sum.LeaseConflictObserved = true })
+				// STOP CHECKPOINTING. Every seal from here on is refused by
+				// fenceSeal, and a periodic checkpointer that keeps ticking
+				// would freeze the overlay, walk the dirty set and upload
+				// packs on its interval, forever, to be told each time what
+				// it was told the first time. The work is not lost by
+				// stopping — it stays in the overlay, which is where a
+				// refused seal leaves it anyway.
+				g.haltCheckpointer()
+				// "this branch", not "this prefix": another writer on
+				// another branch is now ordinary, and only a writer on
+				// OURS is the emergency this warning is for. It is the
+				// branch this lease was taken for, not the session's
+				// current one, because a browse session can move between
+				// them and a warning naming the wrong one is worse than no
+				// warning.
+				ui.Warn("another client took over branch {branch}: {holder}\n"+
+					"concurrent writers on one branch WILL corrupt each other; stop one of them.\n"+
+					"this session keeps serving but will no longer PUBLISH: checkpointing is stopped and\n"+
+					"the seal at unmount will be REFUSED, keeping this session's work in its overlay.\n"+
+					"remount to take a fresh lease and reseal on top of whatever that client published.",
+					"branch", branch, "holder", holder.Describe())
+			},
+		})
+	}
+	g.leaseFor = take
+	l, err := take(ctx, g.currentBranch())
 	if err != nil {
 		return nil, err
 	}
@@ -2502,7 +2555,7 @@ func (g *genSession) controlHooks() control.Hooks {
 			if g.tag != "" {
 				st["tag"] = g.tag
 			} else {
-				st["branch"] = g.branch
+				st["branch"] = g.currentBranch()
 			}
 			// When this volume last collected, and what it got back. The
 			// status socket is where someone looks when they suspect a mount

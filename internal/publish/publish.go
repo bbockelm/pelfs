@@ -192,8 +192,21 @@ type Options struct {
 	SpoolDir string
 	// Branch is the ref name; default "main".
 	Branch string
-	// SigningKey signs the superblock.
+	// SigningKey signs the superblock. Nil only when the generation is
+	// unsigned — either because Unsigned was asked for (generation 0) or
+	// because Prev carries no signature (every generation after it).
 	SigningKey ed25519.PrivateKey
+	// Unsigned creates a volume with NO signing key at all, and it is
+	// consulted ONLY for generation 0 (Prev == nil). A throwaway volume
+	// under a prefix only one person can write does not need a key, and
+	// this is how it says so — explicitly, because an unsigned volume must
+	// be REQUESTED and never inferred from a key that happened to be nil.
+	//
+	// For every later generation the answer comes from Prev instead
+	// (superblock.SignAs): how a volume is authenticated is a property of
+	// the volume, and a seal, a checkpoint, a repack or a merge must not be
+	// able to change it. Only `pelfs rotate` does that.
+	Unsigned bool
 	// IdentityKey selects keyed BLAKE3 chunk identity (encrypted volumes);
 	// nil hashes unkeyed. Must be nil or 32 bytes.
 	IdentityKey []byte
@@ -544,6 +557,21 @@ func openSource(o Options) (Source, string, func(), error) {
 	return &overlaySource{fs: view}, formatVolumeID(o.Prev.VolumeID), view.ReleaseSeal, nil
 }
 
+// unsigned reports how this publish will authenticate the generation it is
+// building: inherited from the parent when there is one, and taken from
+// Options.Unsigned only for generation 0.
+//
+// ONE FUNCTION, because the whole safety of the feature is that a publish
+// cannot MOVE a volume between the two modes: two places that computed
+// this could disagree, and the disagreement would be a volume that silently
+// grew — or lost — an integrity root at a seal.
+func (o Options) unsigned() bool {
+	if o.Prev != nil {
+		return o.Prev.IsUnsigned()
+	}
+	return o.Unsigned
+}
+
 func applyDefaults(o *Options) error {
 	switch {
 	case o.emptySource:
@@ -575,7 +603,15 @@ func applyDefaults(o *Options) error {
 			"the sweep safe against a concurrent writer with no coordination, so a volume under it can "+
 			"have its next gc delete a pack a live writer is about to reference", o.Grace, MinGrace)
 	}
-	if len(o.SigningKey) != ed25519.PrivateKeySize {
+	if o.Unsigned && o.Prev != nil && !o.Prev.IsUnsigned() {
+		return errors.New("publish: Unsigned is for generation 0; a successor is authenticated the way " +
+			"its parent is, and only `pelfs rotate --to-unsigned` changes that")
+	}
+	switch {
+	case o.unsigned() && len(o.SigningKey) != 0:
+		return fmt.Errorf("publish: %w: this volume is unsigned but a signing key was supplied",
+			superblock.ErrSigningChange)
+	case !o.unsigned() && len(o.SigningKey) != ed25519.PrivateKeySize:
 		return fmt.Errorf("publish: signing key is %d bytes, want %d", len(o.SigningKey), ed25519.PrivateKeySize)
 	}
 	if len(o.IdentityKey) != 0 && len(o.IdentityKey) != chunkid.IdentitySize {
@@ -1636,7 +1672,13 @@ func (p *pipeline) buildSuperblock(packList []superblock.PackEntry, shards []sup
 			"instead of carrying unchanged subtrees forward",
 			"gen", sb.Generation, "bytes", n, "budget", int64(superblock.CatalogBudgetBytes))
 	}
-	if err := sb.Sign(p.o.SigningKey); err != nil {
+	// A generation is authenticated the way the volume is (Options.unsigned):
+	// the key for a signed volume, nothing at all for an unsigned one. The
+	// options check has already refused every combination that would MOVE a
+	// volume between the two, so this is a branch and not a decision.
+	if p.o.unsigned() {
+		sb.Unsign()
+	} else if err := sb.Sign(p.o.SigningKey); err != nil {
 		return nil, nil, fmt.Errorf("publish: %w", err)
 	}
 	raw, err := sb.Encode()

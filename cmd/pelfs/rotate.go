@@ -45,7 +45,14 @@ func cmdRotate(args []string) int {
 	var branchList branches
 	var pubkeyHex string
 	var apply, abort, breakSiblings, announceOnly bool
+	var toUnsigned, toSigned bool
 	o, pos, err := parseArgs("rotate", args, 1, 1, func(fs *flag.FlagSet, o *cmdOpts) {
+		fs.BoolVar(&toUnsigned, "to-unsigned", false, "stop signing this volume: publish one unsigned "+
+			"generation per branch and archive the key. EVERY OTHER READER REFUSES the volume afterwards "+
+			"until a human clears its pin — no chain step carries a downgrade")
+		fs.BoolVar(&toSigned, "to-signed", false, "give an unsigned volume a signing key: one signed "+
+			"generation per branch. It attests to what the volume holds NOW, including anything an "+
+			"attacker put there while it was unsigned")
 		fs.BoolVar(&apply, "apply", false, "publish the rotation (default: report what it would do and what it would break)")
 		fs.BoolVar(&announceOnly, "announce-only", false, "publish only the ANNOUNCING generation and stop, so polling readers can record it before the key changes; re-run with --apply to finish")
 		fs.BoolVar(&abort, "abort", false, "retract a rotation that announced a successor but has not used it, and delete the pending key")
@@ -81,6 +88,24 @@ func cmdRotate(args []string) int {
 		return exitErr(err)
 	}
 	left := notIn(all, targets)
+
+	// A MODE CHANGE IS ITS OWN OPERATION and it leaves before the key
+	// rotation's machinery is touched: it mints no pending key, publishes
+	// one generation per branch rather than two, and has no announcement to
+	// abort. Sharing the plumbing would mean sharing the two-generation
+	// dance that exists only to carry a pin across a key change, and a mode
+	// change carries no pin anywhere by design.
+	if toUnsigned || toSigned {
+		if toUnsigned && toSigned {
+			return exitErr(errors.New("--to-unsigned and --to-signed are opposites; pick one"))
+		}
+		if abort || announceOnly {
+			return exitErr(errors.New("--abort and --announce-only belong to a KEY rotation: a mode change " +
+				"is one generation per branch and announces nothing, so there is no window to abort"))
+		}
+		return runModeChange(ctx, o, prefix, stateDir, rstore, targets, left, tags, toUnsigned, apply, breakSiblings)
+	}
+
 	forks := pendingForkTags(ctx, rstore, all)
 
 	// BEFORE ANYTHING. The warnings come first even on a dry run, because

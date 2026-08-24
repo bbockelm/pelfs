@@ -317,6 +317,13 @@ func cmdGraft(args []string) int {
 		Base: base, Prev: head.Superblock, Graft: gsrc, Source: source,
 		Mount: mountPath, Replace: replace, Refresh: refresh,
 	})
+
+	// Re-checked against the RE-READ head, not redeclared: the preflight
+	// above already loaded this key, but the walk took hours and the head
+	// moved under it. A graft publishes a successor, so it must sign the way
+	// the head does NOW — and on an unsigned volume it must not MINT a key,
+	// which is what a nil predecessor would have it do.
+	signingKey, err = loadOrCreateSigningKey(signingKeyFileIn(stateDir, ""), head.Superblock)
 	if err != nil {
 		return exitErr(err)
 	}

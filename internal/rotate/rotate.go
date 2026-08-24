@@ -395,7 +395,14 @@ func Successor(prev *superblock.Superblock, prevRaw []byte, branch string, now i
 	sb.Branch = branch
 	sb.NextPub = nextPub
 	sb.Signature = [64]byte{}
-	if err := sb.Sign(signer); err != nil {
+	// A NIL SIGNER IS THE DOWNGRADE, and this is the only place in the tree
+	// where it means anything: everywhere else a nil key with a signed
+	// parent is an error (superblock.SignAs), because a writer that lost
+	// track of its key must not quietly publish a volume with no integrity
+	// root. Here it is what `pelfs rotate --to-unsigned` asked for.
+	if signer == nil {
+		sb.Unsign()
+	} else if err := sb.Sign(signer); err != nil {
 		return nil, nil, err
 	}
 	raw, err := sb.Encode()

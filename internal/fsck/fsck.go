@@ -95,6 +95,10 @@ const (
 // without parsing prose; Detail holds the human half. Every kind below is
 // damage — see Severity and warningKinds for the other half of the axis.
 const (
+	// KindUnsigned: the generation carries no signature at all
+	// (superblock.IsUnsigned). The one kind here that is NOT damage — see
+	// warningKinds — and the reason the severity axis exists.
+	KindUnsigned = "unsigned"
 	// KindMissingPack: a pack in the signed pack list is not in the
 	// federation (or cannot be stat'd).
 	KindMissingPack = "missing-pack"
@@ -193,17 +197,18 @@ func (s Severity) String() string {
 // can never disagree. This set is therefore the whole of the axis, and
 // adding a kind to it is the whole of making that kind a warning.
 //
-// It is EMPTY, and that is a statement rather than an omission. Every
-// failure this package can report is a generation contradicting itself —
-// an object the signed pack list names and the federation does not have,
-// bytes that do not hash to the identity referencing them, a dirent with
-// no inode. None of that is "worth knowing"; all of it is damage, and
-// nothing was reclassified to give the new axis something to carry. The
-// two warnings it exists for arrive with the features that produce them:
-// a graft whose external source has changed (which is what a graft is
-// FOR, so it cannot be a failure), and a reference whose pinned source
-// cannot be checked from this volume's objects alone.
-var warningKinds = map[string]struct{}{}
+// It holds exactly one kind, and the shape of that kind is the argument
+// for the axis. Every OTHER failure this package reports is a generation
+// contradicting itself — an object the signed pack list names and the
+// federation does not have, bytes that do not hash to the identity
+// referencing them, a dirent with no inode — and all of that is damage.
+// KindUnsigned is not: the volume is exactly as its owner made it, every
+// invariant holds, and the check still has to say so out loud because a
+// person who inherits the volume must not have to read a superblock to
+// find out it has no integrity root.
+var warningKinds = map[string]struct{}{
+	KindUnsigned: {},
+}
 
 // SeverityOf reports how a Kind is classified. A kind this build has never
 // heard of is an error: fsck must never quietly downgrade a finding it
@@ -424,6 +429,16 @@ func Check(ctx context.Context, o Options) (*Report, error) {
 		shards:   make(map[string]catalog.Reader),
 	}
 	defer c.closeShards()
+
+	// FIRST, because it frames every finding below it. On a signed volume
+	// "the pack list says X" is a statement the volume's owner made; on an
+	// unsigned one it is a statement whoever last wrote the prefix made,
+	// and every check that follows is checking that document against
+	// itself. Reported as a WARNING and not damage: the volume is exactly
+	// as its owner made it and every invariant holds.
+	if o.SB.IsUnsigned() {
+		c.problem(KindUnsigned, "/", "this generation carries no signature; nothing below it is authenticated")
+	}
 
 	if err := c.checkPacks(ctx); err != nil {
 		c.sortProblems()

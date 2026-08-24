@@ -124,8 +124,32 @@ hdr=$(curl -sS -D - -o /dev/null -H 'Sec-Fetch-Site: none' -H 'Sec-Fetch-Mode: n
   | tr -d '\r')
 echo "$hdr" | grep -qi '^referrer-policy: same-origin'
 ck $? "hdr:referrer-policy    the consent page does not send no-referrer (which nulls the Origin)"
-echo "$hdr" | grep -qi "^content-security-policy:.*form-action 'self' $PELFS_REDIRECT"
-ck $? "hdr:form-action        the CSP names the client's callback, so the 303 is not blocked"
+# THE CALLBACK MOVED DIRECTIVES, and both halves are checked because getting
+# either one wrong is the same silent failure. The consent POST no longer
+# redirects at all -- it answers a success page and the authorization is
+# delivered from a hidden frame on it -- so `form-action` is 'self' alone,
+# and the URL the flow actually ends at has to be named by `frame-src` on
+# THAT page.
+echo "$hdr" | grep -qi "^content-security-policy:.*form-action 'self';"
+ck $? "hdr:form-action        the consent form may post to its own origin"
+if echo "$hdr" | grep -qi "^content-security-policy:.*$PELFS_REDIRECT"; then r=1; else r=0; fi
+ck $r "hdr:no-stale-source    the consent CSP no longer names a callback nothing goes to"
+
+# The success page's own policy. Driving a whole consent by hand here would
+# duplicate the browser leg above, so this asks the server for one screen and
+# answers it, which is all the header needs.
+curl -sS -o /work/hdr-consent.html -H 'Sec-Fetch-Site: none' -H 'Sec-Fetch-Mode: navigate' \
+  "$ORIGIN/oauth/authorize?response_type=code&client_id=$PELFS_CLIENT_ID&redirect_uri=$PELFS_REDIRECT&scope=pelfs.read&code_challenge=$challenge&code_challenge_method=S256" >/dev/null
+tkt=$(grep -o 'name="consent_ticket" value="[^"]*"' /work/hdr-consent.html \
+      | head -1 | sed 's/.*value="//; s/"$//')
+shdr=$(curl -sS -o /work/hdr-connected.html -D - \
+  -H "Origin: $ORIGIN" -H 'Sec-Fetch-Site: same-origin' -H 'Sec-Fetch-Mode: navigate' \
+  --data-urlencode "consent_ticket=$tkt" --data-urlencode "decision=allow" \
+  "$ORIGIN/oauth/authorize" | tr -d '\r')
+echo "$shdr" | grep -qi "^content-security-policy:.*frame-src $PELFS_REDIRECT"
+ck $? "hdr:frame-src          the success page's CSP names the callback, so the delivery is not blocked"
+grep -q '<iframe class="deliver"' /work/hdr-connected.html
+ck $? "hdr:success-is-a-page  the consent POST answers a page with the delivery on it"
 
 # ---------------------------------------------------------------- counters
 kill -TERM "$srv" 2>/dev/null
@@ -136,6 +160,13 @@ grep -q 'consented=true' /work/server.log
 ck $? "server:consent-recorded a human's click in a real browser minted the grant"
 grep -qE 'counts .*replays=0 ' /work/server.log
 ck $? "server:no-replays      no code was exchanged twice"
+# A second press of one screen is a usability event, not a security one. The
+# browser leg above makes one per connection it drives, and every one of them
+# must have been counted as a repeat and NOT as a refused ticket -- which is
+# the whole distinction: a spent ticket we minted is a person pressing a
+# button, an unknown one is a forgery.
+grep -qE 'counts .*ticket-refused=0 consent-repeats=[1-9]' /work/server.log
+ck $? "server:press-is-a-press a second Authorize was counted as a repeat, not a forgery"
 
 echo
 echo "== the authorization URL Cyberduck built =="

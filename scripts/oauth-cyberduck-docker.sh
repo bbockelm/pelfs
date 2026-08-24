@@ -45,7 +45,8 @@
 #   ok   refuse:redirect-uri     a callback off by one port answers 400
 #   ok   refuse:client-id        an unknown client_id answers 400
 #   ok   refuse:no-pkce          an authorization with no S256 challenge answers 400
-#   ok   duck:basic-contingency  the built-in dav protocol, the Basic credential
+#   ok   dav:bearer-only         one challenge, and it is Bearer -- there is no
+#                                password path left to fall back to
 #   ok   server:consent-recorded a human's click minted every grant
 #   ok   server:counters         the three refusals were counted, no replays
 #
@@ -162,14 +163,21 @@ echo
 #     line below types the correct Origin in by hand, so this gate never
 #     saw it.
 #   * Chromium enforces `form-action` on the REDIRECTS of a form
-#     submission, so the 303 that hands the code to Cyberduck was blocked
-#     by the consent page's own CSP. curl has no CSP at all.
+#     submission, so the 303 that used to hand the code to Cyberduck was
+#     blocked by the consent page's own CSP. curl has no CSP at all.
 #
 # scripts/oauth-browser-docker.sh is the gate that drives this navigation
 # in a real Chromium with real duck as the client, and it is the one to
 # extend when the question is about what a BROWSER does. This gate's job
 # is the protocol and the server's own refusals, which it does in a
 # fraction of the time.
+#
+# ONE THING CHANGED SHAPE. The consent POST used to answer 303 straight to
+# Cyberduck's loopback listener -- which answers by closing the connection, so
+# a real user's tab died at the moment the flow succeeded. It answers a
+# SUCCESS PAGE now, and the authorization is delivered from one hidden frame
+# on it. So the delivery URL is read out of the page, and `&amp;` is
+# unescaped because it lives in an HTML attribute.
 consent() {
   url="$1"
   curl -sS -o /work/consent.html -w '%{http_code}' \
@@ -177,14 +185,17 @@ consent() {
   ticket=$(grep -o 'name="consent_ticket" value="[^"]*"' /work/consent.html \
            | head -1 | sed 's/.*value="//; s/"$//')
   [ -n "$ticket" ] || { echo "no consent ticket in the page"; return 1; }
-  loc=$(curl -sS -o /work/consent2.html -D - \
+  curl -sS -o /work/connected.html \
     -H "Origin: $ORIGIN" -H 'Sec-Fetch-Site: same-origin' -H 'Sec-Fetch-Mode: navigate' \
     --data-urlencode "consent_ticket=$ticket" --data-urlencode "decision=allow" \
-    "$ORIGIN/oauth/authorize" | grep -i '^location:' | tr -d '\r' | sed 's/^[Ll]ocation: *//')
-  [ -n "$loc" ] || { echo "the consent POST did not redirect"; return 1; }
+    "$ORIGIN/oauth/authorize" >/dev/null
+  loc=$(sed -n 's/.*<iframe class="deliver" src="\([^"]*\)".*/\1/p' /work/connected.html \
+        | head -1 | sed 's/&amp;/\&/g')
+  [ -n "$loc" ] || { echo "no delivery frame on the page the consent POST answered"; return 1; }
   # Cyberduck's loopback HttpServer takes it from here. It answers by
   # closing the connection rather than by writing a response, so curl's
-  # "empty reply" is the expected outcome and not an error.
+  # "empty reply" is the expected outcome and not an error. In a real browser
+  # this request is the hidden frame's.
   curl -s -o /dev/null "$loc" || true
 }
 
@@ -327,15 +338,18 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Sec-Fetch-Site: none' \
 [ "$code" = 400 ]
 ck $? "refuse:no-pkce         an authorization with no S256 challenge answers $code"
 
-# 8. THE CONTINGENCY: the built-in WebDAV protocol, the per-client Basic
-#    credential, one paste. This is the path WinSCP, rclone and
-#    mount_webdav take, and Cyberduck's own fallback if the flow will not
-#    run. NO --profile here, deliberately: it must work without one.
-timeout 60 duck --username "$PELFS_BASIC_USER" --password "$PELFS_BASIC_PASS" \
-  --assumeyes --quiet --list "dav://127.0.0.1:$PORT/dav/" < /dev/null \
-  2>/dev/null | grep -v 'plaintext\|^$' > /work/basic.txt
-grep -qx hello.txt /work/basic.txt
-ck $? "duck:basic-contingency $(tr '\n' ' ' < /work/basic.txt)"
+# 8. THERE IS NO CONTINGENCY ANY MORE, and that is the check.
+#    This step used to run `duck --username --password` against the built-in
+#    WebDAV protocol, with no --profile, as the path for a client that
+#    cannot do OAuth. The per-client Basic credential is gone: /dav/* accepts
+#    a Bearer token and nothing else. So the assertion inverted -- an
+#    anonymous request must be offered ONE challenge, Bearer, because a Basic
+#    challenge is what talks a client into a password prompt for a profile
+#    with no password field (verification 2d(iii)).
+hdr=$(curl -sS -o /dev/null -D - -X PROPFIND -H 'Depth: 0' "$ORIGIN/dav/" | tr -d '\r')
+n=$(echo "$hdr" | grep -ci '^www-authenticate:')
+if [ "$n" = 1 ] && echo "$hdr" | grep -qi '^www-authenticate: *bearer'; then r=0; else r=1; fi
+ck $r "dav:bearer-only        one challenge on an anonymous PROPFIND, and it is Bearer"
 
 # 9. AND THE COUNTERS, which are the server's own account of what happened.
 kill -TERM "$srv" 2>/dev/null
@@ -344,7 +358,7 @@ echo
 grep -E '^(counts|grant|client) ' /work/server.log
 grep -q 'consented=true' /work/server.log
 ck $? "server:consent-recorded a human's click is what minted every grant"
-grep -qE 'counts .*replays=0 redirect-mismatch=1 unknown-client=1 missing-pkce=1' /work/server.log
+grep -qE 'counts .*replays=0 retries=0 redirect-mismatch=1 unknown-client=1 missing-pkce=1' /work/server.log
 ck $? "server:counters        the three refusals above were counted, no replays"
 
 echo

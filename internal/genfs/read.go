@@ -156,19 +156,22 @@ type Content struct {
 // before it is handed out, so a caller carrying these records into a new
 // generation can only carry records some listed pack actually holds.
 //
-// That check is why this is one of the few callers that asks for the WHOLE
-// location map. A read only ever needs to find the pack it is about to
-// fetch, so the map fills in lazily; a check for ABSENCE needs every pack
-// indexed, or it would report content missing that has merely not been
-// probed for — and the caller's response to "missing" is to re-upload a
-// file it already has, or to refuse the seal. The map is built once per
-// mount and the trailers are cached across mounts, so a seal pays it once.
+// That check asks PRESENCE, not location, and asking it as location is
+// what made a metadata-only seal cost the volume. This used to build the
+// whole location map up front — one trailer fetch per pack in the
+// generation — on the reasoning that only a fully indexed map may report
+// an absence. True, and it is still true: packIndex.holds falls through to
+// exactly that sweep when nothing cheaper can confirm an identity, because
+// the caller's response to "missing" is to re-upload a file it already has
+// or to refuse the seal. What changed is that a YES no longer needs it.
+// The generation's own multi-pack index names the pack an identity went
+// into, and holding that name against the signed pack list settles
+// presence without opening the pack — so a healthy volume answers every
+// ref out of one index and the sweep survives only for the volumes that
+// have no index to answer from. See packIndex.holds for the full argument.
 func (fs *FS) ContentOf(ctx context.Context, ino uint64) (Content, error) {
 	fs.swapMu.RLock()
 	defer fs.swapMu.RUnlock()
-	if err := fs.packIndex.all(ctx); err != nil {
-		return Content{}, err
-	}
 	e, err := fs.extentsOf(ctx, ino)
 	if err != nil {
 		return Content{}, err
@@ -206,7 +209,9 @@ func (fs *FS) ContentOf(ctx context.Context, ino uint64) (Content, error) {
 			}
 			if held {
 				out.External = true
-			} else if _, ok := fs.packIndex.lookup(idHex); !ok {
+			} else if packed, err := fs.packIndex.holds(ctx, idHex); err != nil {
+				return Content{}, fmt.Errorf("genfs: inode %d references chunk %s: %w", ino, idHex, err)
+			} else if !packed {
 				return Content{}, fmt.Errorf("genfs: inode %d references chunk %s, present in no listed pack", ino, idHex)
 			}
 			r.Identity = append([]byte(nil), r.Identity...)

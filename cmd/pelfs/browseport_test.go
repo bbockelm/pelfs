@@ -7,94 +7,121 @@ import (
 	"testing"
 )
 
-// TestBrowsePortIsStableAndPerVolume is the whole contract of the derivation,
-// and every assertion in it is a property a saved Cyberduck bookmark depends
-// on. The report that prompted it: "can we try to have a stable port so the
-// CyberDuck bookmark is not one-time-use?"
-func TestBrowsePortIsStableAndPerVolume(t *testing.T) {
-	const a = "pelican://osg-htc.org/user/bbockelman"
-	const b = "pelican://osg-htc.org/user/bbockelman/other"
-
-	// 1. STABLE. The same prefix, twice, is the same port — this is the
-	// property the bookmark rests on, and the one an OS-chosen port did not
-	// have.
-	if browsePort(a) != browsePort(a) {
-		t.Fatal("browsePort is not deterministic")
-	}
-
-	// 2. PER VOLUME. Two volumes must not collide, or the second `pelfs
-	// browse` a user starts silently takes the first one's port and its
-	// profile's Vendor with it.
-	if browsePort(a) == browsePort(b) {
-		t.Errorf("two volumes derive the same port %d", browsePort(a))
-	}
-
-	// 3. IN THE WINDOW, for every input rather than for the two above. The
-	// range is the point (see the file comment on why 61000-65535), and a
-	// modulo that could land below the base or above 65535 would produce a
-	// port the OS hands out to outbound connections or no port at all.
-	for i := 0; i < 20000; i++ {
-		prefix := fmt.Sprintf("pelican://example.org/vol/%d", i)
-		p := browsePort(prefix)
-		if p < portBase || p > 65535 {
-			t.Fatalf("browsePort(%q) = %d, outside %d-65535", prefix, p, portBase)
-		}
-	}
-
-	// 4. PINNED. A change to the salt or the hash input moves every user's
-	// port and breaks every bookmark they saved, so it has to be a change
-	// somebody makes on purpose and not a side effect. If this fails and you
-	// meant it, bump portSalt and say so in the CHANGELOG.
-	if got, want := browsePort(a), 61767; got != want {
-		t.Errorf("browsePort(%q) = %d, want %d — the derivation moved, and with "+
-			"it every saved Cyberduck bookmark. Bump portSalt deliberately or "+
-			"put the input back.", a, got, want)
-	}
-}
-
-// TestBrowseListen covers the three ways a port gets chosen and, for each,
-// what happens when it is already taken — which is the case the report calls
-// "a stale session, or another tool" and the one that has to say something
-// useful rather than fail obscurely.
-func TestBrowseListen(t *testing.T) {
-	const prefix = "pelican://example.org/user/someone"
-
-	t.Run("stablePortWhenFree", func(t *testing.T) {
-		ln, taken, err := browseListen(prefix, 0)
+// TestBrowseListenProbesUpwardFrom8443 is the whole contract of the port,
+// and it is the owner's sentence turned into assertions: "try probing
+// starting at 8443 and going up. If not found in 100 ports, use the kernel
+// localhost:0 binding."
+//
+// Every subtest here sits on ports itself rather than mocking the bind,
+// because "is this port free" is a question only the kernel answers and a
+// probe that agreed with a fake would tell us nothing.
+func TestBrowseListenProbesUpwardFrom8443(t *testing.T) {
+	t.Run("prefersTheWellKnownPort", func(t *testing.T) {
+		ln, probed, err := browseListen(0)
 		if err != nil {
-			t.Skipf("cannot bind this volume's stable port on this host: %v", err)
+			t.Fatalf("browseListen: %v", err)
 		}
 		defer ln.Close() //nolint:errcheck
-		if taken != 0 {
-			t.Errorf("fell back from port %d on a free port", taken)
+		if !probed {
+			t.Fatal("the probe reported that it did not get a port from its window")
 		}
-		if got := ln.Addr().(*net.TCPAddr).Port; got != browsePort(prefix) {
-			t.Errorf("bound %d, want the derived %d", got, browsePort(prefix))
+		got := ln.Addr().(*net.TCPAddr).Port
+		// Not asserted as exactly 8443: this test runs on developer
+		// machines and CI hosts where something may legitimately have it,
+		// which is the ordinary case the probe exists for. What IS asserted
+		// is that it is in the window and that the probe says so.
+		if got < browsePortFirst || got >= browsePortFirst+browsePortProbe {
+			t.Errorf("bound %d, outside the probe window %d-%d",
+				got, browsePortFirst, browsePortFirst+browsePortProbe-1)
 		}
 	})
 
-	t.Run("fallsBackAndSaysSoWhenTheStablePortIsTaken", func(t *testing.T) {
-		// Sit on it, which is exactly what a stale `pelfs browse` does.
-		squatter, err := listenLoopback(browsePort(prefix))
-		if err != nil {
-			t.Skipf("cannot bind this volume's stable port on this host: %v", err)
+	t.Run("stepsOverWhatIsTaken", func(t *testing.T) {
+		// Sit on the first two, which is exactly what two other browse
+		// sessions do, and the third must be what comes back.
+		var held []net.Listener
+		defer func() {
+			for _, l := range held {
+				l.Close() //nolint:errcheck
+			}
+		}()
+		for p := browsePortFirst; p < browsePortFirst+2; p++ {
+			l, err := listenLoopback(p)
+			if err != nil {
+				t.Skipf("cannot hold port %d on this host: %v", p, err)
+			}
+			held = append(held, l)
 		}
-		defer squatter.Close() //nolint:errcheck
+		ln, probed, err := browseListen(0)
+		if err != nil {
+			t.Fatalf("browseListen: %v", err)
+		}
+		defer ln.Close() //nolint:errcheck
+		if !probed {
+			t.Fatal("fell out of the probe window with ports still free in it")
+		}
+		if got := ln.Addr().(*net.TCPAddr).Port; got < browsePortFirst+2 {
+			t.Errorf("bound %d, which is one of the ports being held", got)
+		}
+	})
 
-		ln, taken, err := browseListen(prefix, 0)
+	t.Run("theWindowIsAHundredPortsAndTheyAreAllNavigable", func(t *testing.T) {
+		if browsePortProbe != 100 {
+			t.Errorf("the probe window is %d ports, and the request was 100", browsePortProbe)
+		}
+		if browsePortFirst != 8443 {
+			t.Errorf("the probe starts at %d, and the request was 8443", browsePortFirst)
+		}
+		// Chromium refuses to navigate to a list of ports, and a browse
+		// session on one would be unusable with no error anybody could act
+		// on. None of these is on it; the two that come closest are 6000
+		// (X11) and 10080, both outside the window.
+		last := browsePortFirst + browsePortProbe - 1
+		for _, blocked := range []int{6000, 6665, 6666, 6667, 6668, 6669, 6697, 10080} {
+			if blocked >= browsePortFirst && blocked <= last {
+				t.Errorf("port %d is on Chromium's blocked list and inside the window", blocked)
+			}
+		}
+	})
+
+	t.Run("fallsBackToTheKernelWhenTheWholeWindowIsGone", func(t *testing.T) {
+		// A hundred binds is a slow way to say this and the only honest
+		// one: the fallback has to be reachable, and the only way in is an
+		// exhausted window.
+		var held []net.Listener
+		defer func() {
+			for _, l := range held {
+				l.Close() //nolint:errcheck
+			}
+		}()
+		for p := browsePortFirst; p < browsePortFirst+browsePortProbe; p++ {
+			l, err := listenLoopback(p)
+			if err != nil {
+				// Something else on this host has one of them. That IS the
+				// exhausted case as far as the probe is concerned, so the
+				// test simply keeps going: what matters is that no port in
+				// the window is left free.
+				continue
+			}
+			held = append(held, l)
+		}
+		if len(held) == 0 {
+			t.Skip("cannot hold any port in the probe window on this host")
+		}
+		ln, probed, err := browseListen(0)
 		if err != nil {
 			t.Fatalf("browseListen refused to start at all: %v", err)
 		}
 		defer ln.Close() //nolint:errcheck
-		// FALLING BACK rather than refusing: a `pelfs browse` that will not
-		// start is worse than one whose bookmark needs regenerating. The
-		// caller is what warns, and `taken` is how it knows to.
-		if taken != browsePort(prefix) {
-			t.Errorf("taken = %d, want %d — the caller has nothing to warn about",
-				taken, browsePort(prefix))
+		got := ln.Addr().(*net.TCPAddr).Port
+		if got >= browsePortFirst && got < browsePortFirst+browsePortProbe {
+			t.Fatalf("bound %d, which is inside a window this test is holding", got)
 		}
-		if got := ln.Addr().(*net.TCPAddr).Port; got == browsePort(prefix) {
-			t.Errorf("bound the taken port %d", got)
+		// FALLING BACK rather than refusing, and SAYING SO: the caller
+		// warns off `probed`, because a session on an unexpected port hands
+		// out connection files nobody's bookmark will match.
+		if probed {
+			t.Error("probed = true on a kernel-chosen port; the caller has nothing to warn about")
 		}
 	})
 
@@ -109,29 +136,25 @@ func TestBrowseListen(t *testing.T) {
 		busy := probe.Addr().(*net.TCPAddr).Port
 		defer probe.Close() //nolint:errcheck
 
-		if _, _, err := browseListen(prefix, busy); err == nil {
+		if _, _, err := browseListen(busy); err == nil {
 			t.Error("--port on a taken port started anyway")
-		} else if !strings.Contains(err.Error(), fmt.Sprint(browsePort(prefix))) {
-			t.Errorf("the error does not offer the volume's own stable port: %v", err)
+		} else if !strings.Contains(err.Error(), fmt.Sprint(browsePortFirst)) {
+			t.Errorf("the error does not point at the default probe: %v", err)
 		}
-		if _, _, err := browseListen(prefix, 70000); err == nil {
+		if _, _, err := browseListen(70000); err == nil {
 			t.Error("--port 70000 was accepted")
 		}
 	})
 
 	t.Run("negativeMeansEphemeral", func(t *testing.T) {
-		// The opt-out, for somebody who wants the old behaviour: no derived
-		// port, nothing to report.
-		ln, taken, err := browseListen(prefix, -1)
+		// The opt-out, for somebody who wants no preference at all.
+		ln, probed, err := browseListen(-1)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer ln.Close() //nolint:errcheck
-		if taken != 0 {
-			t.Errorf("taken = %d on an explicitly ephemeral bind", taken)
-		}
-		if got := ln.Addr().(*net.TCPAddr).Port; got == browsePort(prefix) {
-			t.Errorf("--port -1 bound the derived port %d anyway", got)
+		if probed {
+			t.Error("probed = true on an explicitly ephemeral bind")
 		}
 	})
 }

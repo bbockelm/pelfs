@@ -661,9 +661,15 @@ Filed at `c01d35c` by oauthfix-agent, with the stable-port change, and
 recorded because the change is what makes it stateable rather than because
 it is new.
 
-The port is now derived from the volume, so any local process can compute
-it and bind it first. A user's saved bookmark would then reach the squatter
-instead of pelfs.
+The port is now PUBLISHED — `pelfs browse` takes the first free port at or
+above 8443 — so any local process can bind it first without computing
+anything. A user's saved bookmark would then reach the squatter instead of
+pelfs.
+
+**Updated at the probe (browseback-agent):** this used to say "derived from
+the volume, so any local process can compute it". The change from
+*computable* to *published* is a change in degree and not in kind, and the
+paragraph below was written for the computable case and applies unaltered.
 
 **Why this is accepted rather than fixed.** It is not a new capability: a
 process running as the user can already read the volume, the state
@@ -674,14 +680,53 @@ session says on the terminal that it is on a different port and that a
 saved bookmark will not match. The whole of `docs/design-webui.md`'s
 threat model already refuses to rely on the port being unguessable ("a
 random port is not a secret … nothing in this design may rely on it"), and
-that claim was audited control by control before the stable port landed;
-see the "A stable port is not a weaker port" note there.
+that claim was audited control by control — first for a derived port and
+again for a well-known one; see the "A WELL-KNOWN port is not a weaker
+port" note there.
 
-**Pinned by an executable test: PARTLY.** That a taken port produces a
-fallback and a report rather than a silent bind is pinned
-(`cmd/pelfs/browseport_test.go`'s
-`fallsBackAndSaysSoWhenTheStablePortIsTaken`). The squat itself is not a
-behaviour to assert.
+**Pinned by an executable test: PARTLY.** That a taken port is stepped over
+rather than silently bound, and that an exhausted window falls back and
+says so, are pinned (`cmd/pelfs/browseport_test.go`'s `stepsOverWhatIsTaken`
+and `fallsBackToTheKernelWhenTheWholeWindowIsGone`). The squat itself is
+not a behaviour to assert.
+
+### KL-20. A `pelfs browse` port no longer identifies a volume, so a profile is only good while its volume keeps its port
+
+Filed with the 8443 probe (browseback-agent).
+
+`pelfs browse` takes the first free port at or above 8443, so two volumes
+land on 8443 and 8444 **in whatever order they happened to start**. The
+port a bookmark names is therefore not a promise about which volume answers
+it, and it used to be: the port before this was a hash of the volume's
+prefix URL, so one volume meant one port for as long as the salt held.
+
+**What does NOT happen** is the outcome that would matter — a bookmark
+quietly opening another volume's files. The profile's `Vendor` is keyed on
+the volume (`davprofile.VolumeTag`), not on the port, so volume A's
+bookmark keeps resolving to volume A's profile and keeps presenting volume
+A's `client_id`. That names no client in a session serving volume B, so
+`/oauth/authorize` refuses — and the refusal page NAMES THE VOLUME THAT
+LISTENER IS SERVING, because "you have reached the wrong session" and "your
+profile is corrupt" are otherwise the same page.
+
+**What does happen, and is the accepted cost:** a profile whose volume did
+not get its usual port has to be downloaded again, because the profile
+carries `Default Port` and both OAuth URLs. The user is told: the session
+says on the terminal which port it got and, when it is not 8443, that a
+profile from an earlier session will not reach it.
+
+**Why accepted.** The alternative is the hash this replaced, and the owner
+asked for the probe by name: "I asked you to preferentially bind to a known
+port, such as 8443 … try probing starting at 8443 and going up." A port a
+human can predict and type is worth more than a port that never moves, and
+the cost of the move is one download rather than a wrong answer.
+
+**Pinned by an executable test: YES.** That the `Vendor` is keyed on the
+volume and not the port (`internal/davprofile/davprofile_test.go`, "the
+Vendor is the volume, not the port") and that another volume's client is
+refused by a page naming this session's volume
+(`internal/localoauth/localoauth_test.go`,
+`TestABookmarkFromAnotherVolumeIsRefusedByName`).
 
 ### KL-19. `pelfs browse`'s search covers loaded rows only, and the page no longer says so
 

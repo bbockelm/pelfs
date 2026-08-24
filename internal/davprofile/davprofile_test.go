@@ -18,6 +18,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -332,23 +333,51 @@ func TestTheProfileTraps(t *testing.T) {
 		}
 	})
 
-	t.Run("the Vendor is unique per session", func(t *testing.T) {
-		// Profile.java uses Vendor as the profile's identity; two
-		// concurrent `pelfs browse` sessions are two different servers, and
-		// a shared identity means the second install replaces the first.
+	t.Run("the Vendor is the volume, not the port", func(t *testing.T) {
+		// Profile.java uses Vendor as the profile's identity, and a
+		// bookmark's Provider names it. Two VOLUMES must therefore be two
+		// Vendors — or the second install replaces the first and a
+		// bookmark saved for one volume resolves to the other's profile,
+		// carrying the other's OAuth client.
+		//
+		// And two PORTS for one volume must be ONE Vendor, which is the
+		// half that changed: `pelfs browse` probes upward from 8443, so a
+		// volume's port moves whenever something else got there first, and
+		// a Vendor that moved with it would make every such session a
+		// different profile identity for the same volume.
 		e, _ := find(es, "Vendor")
 		if !strings.HasPrefix(e.val, davprofile.VendorPrefix) {
 			t.Errorf("Vendor = %q", e.val)
 		}
-		p := params(true)
-		p.Port = 49732
-		other, err := davprofile.Profile(p)
+		if !strings.Contains(e.val, davprofile.VolumeTag(fixedVolume)) {
+			t.Errorf("Vendor = %q, which does not name the volume", e.val)
+		}
+		if strings.Contains(e.val, strconv.Itoa(fixedPort)) {
+			t.Errorf("Vendor = %q still carries the port", e.val)
+		}
+
+		samePort := params(true)
+		samePort.Port = 49732
+		other, err := davprofile.Profile(samePort)
 		if err != nil {
 			t.Fatal(err)
 		}
 		e2, _ := find(parsePlist(t, other), "Vendor")
-		if e2.val == e.val {
-			t.Errorf("two listeners generated the same Vendor %q", e.val)
+		if e2.val != e.val {
+			t.Errorf("the same volume on another port is a different profile identity: %q vs %q",
+				e2.val, e.val)
+		}
+
+		otherVol := params(true)
+		otherVol.Volume = fixedVolume + "/second"
+		third, err := davprofile.Profile(otherVol)
+		if err != nil {
+			t.Fatal(err)
+		}
+		e3, _ := find(parsePlist(t, third), "Vendor")
+		if e3.val == e.val {
+			t.Errorf("two volumes generated the same Vendor %q — one profile would "+
+				"replace the other, and a bookmark would follow it to the wrong volume", e.val)
 		}
 	})
 }

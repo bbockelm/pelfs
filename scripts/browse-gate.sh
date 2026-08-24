@@ -32,7 +32,8 @@
 #      those files out of the federation, byte for byte
 #   8. A SECOND `pelfs browse` OVER THE SAME STATE DIRECTORY, and the
 #      profile from step 4 -- NOT REGENERATED, the same bytes on disk --
-#      still connects: same stable port, same client id, one consent click.
+#      still connects: the probe lands on the same port, same client id,
+#      one consent click.
 #      A regenerated profile is byte-identical, and a different volume gets
 #      a different identity.                                          (U7/U8)
 #   9. a READ-ONLY `pelfs browse` cannot mint a writable DAV credential,
@@ -577,8 +578,12 @@ fi
 ORIGIN="${LAUNCH%%/#bt=*}"
 BOOTSTRAP="${LAUNCH##*#bt=}"
 PORT="${ORIGIN##*:}"
+# The probe's first port, twice: the earlier session has exited, so 8443
+# (or whatever the probe reached past what this host already had) is free
+# again and the restart lands on it. That is what makes an installed
+# profile -- which carries Default Port and both OAuth URLs -- still good.
 [ "$PORT" = "$FIRSTPORT" ]
-ck $? "restart:same-port      $PORT, the volume's stable port, twice"
+ck $? "restart:same-port      $PORT twice: the probe lands where it landed before"
 
 curl -sS -o "$WORK/again-session.json" -X POST \
   -H 'Content-Type: application/json' -H "Origin: $ORIGIN" \
@@ -683,8 +688,15 @@ for _ in $(seq 300); do
   sleep 0.1
 done
 OTHERORIGIN="${OTHERLAUNCH%%/#bt=*}"
+# A CONCURRENT second volume steps to the next port, because the probe is
+# first-come-first-served and the first session still holds its own. Note
+# what this does NOT assert any more: the port does not identify the
+# volume. Which volume is on which port depends on start order, and what
+# keeps a bookmark off the wrong volume is the profile's Vendor (keyed on
+# the volume) plus a client_id that names nothing in the other session --
+# see docs/known-issues.md KL-20.
 [ -n "$OTHERORIGIN" ] && [ "$OTHERORIGIN" != "$ORIGIN" ]
-ck $? "volumes:own-port       the second volume is on its own stable port"
+ck $? "volumes:own-port       a concurrent second volume steps to the next port"
 curl -sS -o "$WORK/other-session.json" -X POST \
   -H 'Content-Type: application/json' -H "Origin: $OTHERORIGIN" \
   -H 'Sec-Fetch-Site: same-origin' \

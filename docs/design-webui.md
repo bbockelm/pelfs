@@ -1519,15 +1519,22 @@ this design may rely on it — which is exactly why A1's and A2's controls
 have to hold on their own. The `Host` allowlist and the `Origin` check are
 what make a found port useless.
 
-##### A stable port is not a weaker port, and here is the audit
+##### A WELL-KNOWN port is not a weaker port, and here is the audit
 
-The port is no longer random. `pelfs browse` derives it from the volume
-(`cmd/pelfs/browseport.go`), because the port is written into every
-connection file the session hands out — the profile's `Default Port`, its
-`Vendor`, the `.duck`'s `Port`, both OAuth URLs — so a fresh port per
-session made every generated profile and saved bookmark single-use. The
-paragraph above is the licence for that, and it was checked against the
-code rather than taken on its word:
+The port is no longer random, and as of the probe it is no longer merely
+guessable: **`pelfs browse` takes the first free port at or above 8443**,
+trying a hundred of them before falling back to the kernel's `:0`
+(`cmd/pelfs/browseport.go`). The port is written into every connection file
+the session hands out — the profile's `Default Port`, the `.duck`'s `Port`,
+both OAuth URLs — so a fresh port per session made every generated profile
+and saved bookmark single-use.
+
+The audit below was first run when the port became *derivable* from the
+volume. It has been re-run for a port that is **published in this document
+and in `--help`**, which is a strictly stronger assumption than
+"guessable", and every row still holds — because not one control is
+computed from the port's unpredictability. Nothing hashes, seeds or salts
+anything with it:
 
 | control | computed from | weaker for a guessable port? |
 |---|---|---|
@@ -1541,12 +1548,32 @@ code rather than taken on its word:
 | OAuth `client_id` | `crypto/rand` per download | no |
 | cookies | none, stripped on the way in | unchanged — a cookie on 127.0.0.1 was never port-isolated (F4) |
 
-Nothing hashes, seeds or salts anything with the port. Two consequences DO
-change and are recorded as accepted limitations rather than glossed:
-`docs/known-issues.md` KL-18 (a local process can squat a predictable port
-before pelfs starts — not a new capability for a process running as the
-user, and the bind failure is reported rather than hidden) and KL-17 (the
-bookmark now survives a restart; the profile's credential still does not).
+Three consequences DO change and are recorded as accepted limitations
+rather than glossed:
+
+- **Squatting** (`docs/known-issues.md` KL-18). A local process can take
+  8443 before pelfs starts, and a saved bookmark would then reach it. This
+  is a change in degree and not in kind — the derived port was already
+  guessable, and a process running as the user can already read the volume,
+  the state directory and the tokens. pelfs does not cooperate silently:
+  the bind fails, the probe moves on, and the session reports which port it
+  got.
+- **The port no longer identifies the volume** (KL-20). Two volumes take
+  8443 and 8444 in whatever order they started, so a bookmark — which names
+  a port — can reach a session serving a *different* volume. It cannot
+  succeed there: the profile's `Vendor` is keyed on the volume
+  (`davprofile.VolumeTag`), so the bookmark still resolves to its own
+  profile and presents its own `client_id`, which names no client in that
+  session. `/oauth/authorize` refuses, **naming the volume the listener is
+  actually serving**, because otherwise a wrong-volume bookmark is
+  indistinguishable from a corrupt profile.
+- **A profile is only good while its volume keeps its port** (KL-20). Start
+  the other volume first tomorrow and the profile has to be downloaded
+  again. That is the price of a port a human can predict, and it is paid by
+  a download rather than by silence.
+
+KL-17 is unchanged: the bookmark survives a restart; the profile's
+credential still does not.
 
 #### A5. The stored-XSS problem: serving the user's own files
 

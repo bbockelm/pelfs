@@ -124,9 +124,9 @@ type browseArgs struct {
 	rw        bool
 	open      bool
 	testHooks bool
-	// port is --port: 0 means "the stable port for this volume", -1 means
-	// "an OS-chosen ephemeral one", anything else is an exact request. See
-	// browsePort.
+	// port is --port: 0 means "the first free port at or above 8443", -1
+	// means "an OS-chosen ephemeral one", anything else is an exact
+	// request. See browseListen.
 	port int
 }
 
@@ -209,29 +209,18 @@ func runBrowse(o *cmdOpts, prefix string, a browseArgs) int {
 	})
 
 	// ---- 1. The listener, the guard and the page, before anything that
-	// can touch the network. The port is DERIVED FROM THE VOLUME rather
+	// can touch the network. The port is PROBED FROM 8443 UPWARD rather
 	// than taken from the OS, because it is baked into every connection
-	// file this session hands out and a fresh one per session made every
-	// generated profile and saved bookmark single-use; the bind, the range
-	// and the security reasoning are all in cmd/pelfs/browseport.go.
-	ln, taken, err := browseListen(prefix, a.port)
+	// file this session hands out and an OS-chosen one made every generated
+	// profile and saved bookmark single-use; the probe, the window and the
+	// security reasoning are all in cmd/pelfs/browseport.go.
+	ln, probed, err := browseListen(a.port)
 	if err != nil {
 		_ = g.stats.Finalize(1, false)
 		return exitErr(err)
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
-	if taken != 0 {
-		// The stable port was busy and this session is on an OS-chosen one
-		// instead. Said loudly, because the CONSEQUENCE is invisible
-		// otherwise: every connection file this session generates names
-		// this port, so a Cyberduck bookmark kept from an earlier session
-		// will not resolve to it.
-		ui.Warn("port {stable} is this volume's stable browse port and something else "+
-			"has it, so this session is on {actual} instead — a Cyberduck bookmark or "+
-			"profile kept from an earlier session will not match. If that was a stale "+
-			"`pelfs browse`, stop it and run this again; otherwise pass --port to pick "+
-			"one yourself.", "stable", taken, "actual", port)
-	}
+	sayBrowsePort(port, a.port, probed)
 	sessions, err := browsesession.New()
 	if err != nil {
 		_ = g.stats.Finalize(1, false)

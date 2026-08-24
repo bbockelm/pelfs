@@ -65,6 +65,8 @@ package davprofile
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/xml"
 	"fmt"
 	"strconv"
@@ -93,10 +95,27 @@ const CallbackPath = "/pelfs/oauth/callback"
 // Path` wants the trailing slash.
 const DAVPath = "/dav/"
 
-// VendorPrefix is the profile identity's stem. The full Vendor includes the
-// listener's port (see Params.vendor) because the profile's Vendor must be
-// unique and two concurrent `pelfs browse` sessions are two different
-// servers.
+// VendorPrefix is the profile identity's stem. The full Vendor names the
+// VOLUME (see Params.vendor), because that is what a profile is a profile
+// for and it is no longer implied by anything else in the file.
+//
+// It used to name the listener's PORT, which worked only while the port
+// identified the volume: the port was derived from the prefix URL by a
+// hash, so one volume meant one port meant one Vendor. `pelfs browse` now
+// probes upward from 8443 (cmd/pelfs/browseport.go), so two volumes take
+// 8443 and 8444 in whatever order they happened to start, and tomorrow's
+// 8443 may be a different volume from today's. A port-keyed Vendor under
+// that rule is a COLLISION: installing volume B's profile would replace
+// volume A's, and volume A's saved bookmark — which resolves to a profile
+// by this string — would carry volume B's OAuth client into whatever is
+// on the port. That is "a bookmark quietly opening another volume's
+// files", which must not be reachable by accident.
+//
+// Keyed on the volume it cannot happen: two volumes are two profiles, A's
+// bookmark keeps resolving to A's profile and therefore keeps presenting
+// A's client_id, and a session serving another volume answers
+// internal/localoauth's refusal page — which names the volume it IS
+// serving, so the user can see what happened.
 const VendorPrefix = "org.pelicanplatform.pelfs.local"
 
 // Params is one generated download: one client, one session, one set of
@@ -178,7 +197,32 @@ func (p Params) Scopes() []string {
 }
 
 func (p Params) vendor() string {
-	return VendorPrefix + "." + strconv.Itoa(p.Port)
+	return VendorPrefix + "." + VolumeTag(p.Volume)
+}
+
+// VolumeTag is a volume's identity inside a profile identifier: a short,
+// stable, filename-safe digest of the volume URL.
+//
+// SHA-256 truncated to six bytes, which is a collision every 2^24 volumes
+// by the birthday bound and is not a security boundary in either
+// direction: it decides which PROFILE a bookmark resolves to, and every
+// credential behind that profile is checked by internal/localoauth against
+// the client roster of the session actually answering. Two volumes that
+// collided here would produce one profile identity, which is exactly the
+// behaviour of the port-keyed Vendor this replaced — no worse, and
+// vanishingly rarer.
+//
+// The leading "v" is so the component is not a bare number: this string
+// goes into a reverse-DNS-shaped identifier, and a segment starting with a
+// digit is the kind of thing a parser somewhere decides to have an opinion
+// about.
+//
+// DETERMINISM IS LOAD-BEARING, as everywhere in this package: a profile a
+// user installed once has to keep matching the one pelfs would generate
+// today, byte for byte.
+func VolumeTag(volume string) string {
+	sum := sha256.Sum256([]byte(volume))
+	return "v" + hex.EncodeToString(sum[:6])
 }
 
 func (p Params) description() string {

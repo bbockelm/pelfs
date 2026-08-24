@@ -1171,3 +1171,59 @@ func TestRedirectMismatchPageNamesBothPorts(t *testing.T) {
 		t.Error("the refusal page echoes an unparseable port back to the user")
 	}
 }
+
+// TestABookmarkFromAnotherVolumeIsRefusedByName is the case a shared port
+// range creates, and the reason the refusal page names the volume.
+//
+// `pelfs browse` probes upward from 8443, so port 8443 is whichever volume
+// started first. A Cyberduck bookmark names a PORT — so tomorrow it can
+// reach a session serving somebody else's volume. What must NOT happen is
+// that it works: the bookmark carries its own profile's client_id (the
+// profile's Vendor is keyed on the volume, davprofile.VolumeTag, so it
+// resolves to its own profile whatever the port), that client_id names
+// nothing here, and the request is refused.
+//
+// What must ALSO not happen is that the refusal is illegible. "The client
+// identifier does not name a client this pelfs session knows" is, on its
+// own, indistinguishable from a corrupt profile — and sends the user off to
+// re-download the one file that was never wrong.
+func TestABookmarkFromAnotherVolumeIsRefusedByName(t *testing.T) {
+	h := newHarness(t, false)
+
+	// The other volume's session, and the client id its profile carries.
+	other, err := New(Config{
+		Writable: false,
+		Volume:   "pelican://osg-htc.org/user/someone-else",
+		Sessions: fakeSessions(1),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	theirs, err := other.NewClient(ClientRequest{
+		Label:       "Cyberduck",
+		RedirectURI: davprofile.RedirectURI(davprofile.DefaultCallbackPort),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	q := h.query()
+	q.Set("client_id", theirs.ID)
+	w := h.get(q)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("another volume's client was accepted: %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "pelican://osg-htc.org/user/bbockelman") {
+		t.Error("the refusal does not name the volume this listener is serving, so a user " +
+			"cannot tell a wrong-volume bookmark from a corrupt profile")
+	}
+	// And it still says nothing about the request: the volume is this
+	// process's own configuration, and the client id is the caller's.
+	if strings.Contains(body, theirs.ID) {
+		t.Error("the refusal echoes the client_id it was sent")
+	}
+	if strings.Contains(body, "someone-else") {
+		t.Error("the refusal names the OTHER volume, which this session cannot know")
+	}
+}

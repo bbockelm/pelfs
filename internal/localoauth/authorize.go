@@ -111,13 +111,28 @@ func (s *Server) authorizeGET(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 		// No echo of the client_id, and the same page whether it was
 		// absent, malformed or simply wrong.
+		//
+		// IT NAMES THE VOLUME THIS LISTENER IS SERVING, and that is not
+		// decoration: `pelfs browse` probes upward from 8443
+		// (cmd/pelfs/browseport.go), so the port no longer identifies the
+		// volume, and the ordinary way an honest user reaches this page is
+		// now a saved bookmark for volume A meeting a session serving
+		// volume B on the port A had yesterday. Without the volume on the
+		// page that is indistinguishable from a corrupt profile, and the
+		// user's next move is to re-download the profile that was never
+		// wrong. The volume is this process's own configuration, not a
+		// string from the request, so echoing it tells an attacker nothing
+		// they did not have to know to send the request.
 		s.page(w, r, http.StatusBadRequest, pageData{
 			Heading: "This is not an authorization request pelfs issued",
 			Detail: "The client identifier does not name a client this pelfs session " +
 				"knows. A client identifier only exists inside a connection profile " +
-				"that this page generated and you downloaded.",
-			Hint: "If you meant to connect a WebDAV client, download a fresh profile " +
-				"from the pelfs page and open that.",
+				"that this page generated and you downloaded. This listener is serving " +
+				volumeName(s.cfg.Volume) + ".",
+			Hint: "If this profile was made for a different volume, that is the whole " +
+				"problem: pelfs sessions share a small range of ports, so a saved " +
+				"bookmark can reach the wrong one. Open the pelfs page for the volume " +
+				"you want and download a fresh profile from it.",
 		})
 		return
 	}
@@ -740,4 +755,14 @@ this volume's files only: it can never publish, and it dies when
 func s256(verifier string) string {
 	sum := sha256.Sum256([]byte(verifier))
 	return base64.RawURLEncoding.EncodeToString(sum[:])
+}
+
+// volumeName is the volume as a page says it, and "this session's volume"
+// when there is none to name — a browse server built without one (the
+// tests, and nothing a user runs) must not render an empty sentence.
+func volumeName(v string) string {
+	if v == "" {
+		return "this session's volume"
+	}
+	return v
 }

@@ -5,7 +5,7 @@
 	<key>Protocol</key>
 	<string>dav</string>
 	<key>Vendor</key>
-	<string>org.pelicanplatform.pelfs.local.49731</string>
+	<string>org.pelicanplatform.pelfs.local.v23a4a9699c14</string>
 	<key>Name</key>
 	<string>pelfs osg-htc.org/user/bbockelman</string>
 	<key>Description</key>

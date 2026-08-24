@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+**`pelfs browse` listens on 8443 when it can.** The port is the first free
+one at or above 8443, probed a hundred ports up before falling back to an
+OS-chosen one — replacing a hash of the volume URL, which gave every volume
+its own port in the 61000s and no user a port they could predict. The
+session says which port it got and, when it is not 8443, that a profile from
+an earlier session names a different one. Because the port no longer
+identifies the volume, a generated profile's `Vendor` now does: two volumes
+install as two profiles, and a bookmark that reaches a session serving
+another volume is refused by a page naming the volume that listener IS
+serving, rather than opening the wrong files. `docs/known-issues.md` KL-20
+has the cost; `docs/design-webui.md`'s threat-model audit is re-run for a
+port that is published rather than merely guessable.
+
 **`pelfs browse` no longer disappears behind its own page.** A volume that
 refuses to open — most often a killed session's branch lease, which outlives
 its holder by a TTL — used to end the process inside the second the browser

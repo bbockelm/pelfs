@@ -36,7 +36,6 @@ const (
 	fixedPort     = 49731
 	fixedClientID = "Zm9yLXRoZS1nb2xkZW4tZmlsZS1vbmx5LTMyLWJ5dGVz"
 	fixedVolume   = "pelican://osg-htc.org/user/bbockelman"
-	fixedBasic    = "pelfs-QUJDRGVmZ2g"
 )
 
 func params(write bool) davprofile.Params {
@@ -46,7 +45,6 @@ func params(write bool) davprofile.Params {
 		ClientID:    fixedClientID,
 		RedirectURI: davprofile.RedirectURI(davprofile.DefaultCallbackPort),
 		Write:       write,
-		BasicUser:   fixedBasic,
 		Label:       "Cyberduck",
 	}
 }
@@ -79,7 +77,6 @@ func TestGoldenFiles(t *testing.T) {
 		{"profile-ro.cyberduckprofile", davprofile.Profile, params(false)},
 		{"profile-rw.cyberduckprofile", davprofile.Profile, params(true)},
 		{"bookmark.duck", davprofile.Bookmark, params(false)},
-		{"bookmark-basic.duck", davprofile.BasicBookmark, params(false)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := tc.gen(tc.p)
@@ -399,41 +396,14 @@ func TestBookmarksBindToTheProfileAndCarryNoPassword(t *testing.T) {
 		t.Error("the OAuth bookmark offers a username, but the profile sets " +
 			"Username Configurable false")
 	}
-	for _, name := range []string{"bookmark", "basic bookmark"} {
-		var raw []byte
-		if name == "bookmark" {
-			raw = b
-		} else {
-			raw, err = davprofile.BasicBookmark(p)
-			if err != nil {
-				t.Fatal(err)
-			}
-		}
-		// HostDictionary.java has no Password key: neither file can carry
-		// the secret, which is why the Basic path costs the user one paste.
-		if strings.Contains(string(raw), "<key>Password</key>") {
-			t.Errorf("the %s carries a Password key", name)
-		}
-		if strings.ContainsRune(string(raw), '$') {
-			t.Errorf("the %s contains a '$'", name)
-		}
+	// HostDictionary.java has no Password key, so a bookmark cannot carry a
+	// secret at all — which is why OAuth is the only way a downloaded file
+	// becomes a working connection with nothing for the user to type.
+	if strings.Contains(string(b), "<key>Password</key>") {
+		t.Error("the bookmark carries a Password key")
 	}
-
-	basic, err := davprofile.BasicBookmark(p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	bes := parsePlist(t, basic)
-	if e, ok := find(bes, "Username"); !ok || e.val != fixedBasic {
-		t.Errorf("Username = %+v, want %q", e, fixedBasic)
-	}
-	if _, ok := find(bes, "Provider"); ok {
-		t.Error("the contingency bookmark names the profile's Provider; it must " +
-			"work whether or not the profile is installed")
-	}
-	p.BasicUser = ""
-	if _, err := davprofile.BasicBookmark(p); err == nil {
-		t.Error("a contingency bookmark with no username was generated")
+	if strings.ContainsRune(string(b), '$') {
+		t.Error("the bookmark contains a '$'")
 	}
 }
 
@@ -507,9 +477,14 @@ func TestURLHelpers(t *testing.T) {
 			t.Errorf("%q names localhost", u)
 		}
 	}
-	d := params(false).Details()
-	if d.URL != davprofile.DAVURL(fixedPort) || d.Username != fixedBasic || !d.Preemptive {
+	// Details is what a client with no profile format at all is pointed at:
+	// the DAV URL and whether this session will accept writes.
+	d := params(true).Details()
+	if d.URL != davprofile.DAVURL(fixedPort) || !d.Writable {
 		t.Errorf("Details = %+v", d)
+	}
+	if ro := params(false).Details(); ro.Writable {
+		t.Errorf("a read-only session's Details = %+v", ro)
 	}
 	if name := davprofile.FileName(params(false), "cyberduckprofile"); name != "pelfs-49731.cyberduckprofile" {
 		t.Errorf("FileName = %q", name)
@@ -532,7 +507,7 @@ func TestTheGeneratorAndTheServerAgree(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := params(false)
-	p.ClientID, p.RedirectURI, p.BasicUser = c.ID, c.Redirect, c.BasicUser
+	p.ClientID, p.RedirectURI = c.ID, c.Redirect
 	b, err := davprofile.Profile(p)
 	if err != nil {
 		t.Fatal(err)
@@ -570,11 +545,6 @@ func TestNamesTheUserReads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	basic, err := davprofile.BasicBookmark(p)
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	// 1. The PROFILE carries `Default Nickname` — the key
 	// BookmarkNameProvider consults for a bookmark with no nickname of its
 	// own, which is every bookmark a user creates from the installed profile
@@ -603,40 +573,25 @@ func TestNamesTheUserReads(t *testing.T) {
 	for _, tc := range []struct {
 		what string
 		b    []byte
-	}{{"the profile", prof}, {"the .duck", book}, {"the basic .duck", basic}} {
+	}{{"the profile", prof}, {"the .duck", book}} {
 		for _, want := range []string{"pelfs", "osg-htc.org/user/bbockelman", "Cyberduck"} {
 			if !bytes.Contains(tc.b, []byte(want)) {
 				t.Errorf("%s's name does not contain %q", tc.what, want)
 			}
 		}
 	}
-	// Both bookmarks carry their own `Nickname`, which wins over everything
-	// above — and the two must not be the SAME name: one needs a pasted
-	// password and the other does not, which is the single most useful thing
-	// to know before clicking.
-	oauthName, basicName := nicknameOf(t, book), nicknameOf(t, basic)
-	if string(oauthName) == string(basicName) {
-		t.Errorf("the OAuth and password bookmarks share the name %q", oauthName)
-	}
-	if !bytes.Contains(basicName, []byte("password")) {
-		t.Errorf("the contingency bookmark's name (%q) does not say it needs one", basicName)
+	// The bookmark carries its own `Nickname`, precedence (1) above, which
+	// wins over the profile's `Default Nickname` and the fallback both.
+	if !bytes.Contains(book, []byte("<key>Nickname</key>")) {
+		t.Error("the .duck has no `Nickname` of its own, so its name comes from " +
+			"the profile rather than from the bookmark the user opened")
 	}
 	// No en dash, no smart quotes: the same rule description() states, and
 	// for the same reason — a plist read by a Java StringSubstitutor and an
 	// XML parser is one place fewer to be clever.
-	for _, b := range [][]byte{prof, book, basic} {
+	for _, b := range [][]byte{prof, book} {
 		if bytes.ContainsRune(b, '–') || bytes.ContainsRune(b, '—') {
 			t.Error("a generated name contains an en or em dash")
 		}
 	}
-}
-
-func nicknameOf(t *testing.T, plist []byte) []byte {
-	t.Helper()
-	_, rest, ok := bytes.Cut(plist, []byte("<key>Nickname</key>\n\t<string>"))
-	if !ok {
-		t.Fatal("no Nickname in the plist")
-	}
-	v, _, _ := bytes.Cut(rest, []byte("</string>"))
-	return v
 }

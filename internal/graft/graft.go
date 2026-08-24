@@ -198,6 +198,11 @@ func NewWriter(spoolDir string, blockBase int64) (*Writer, error) {
 // runs of equal keys at encode time, so the same bytes in two places
 // still cost one record in the finished table — and filtering here would
 // need the identity set the whole design just stopped holding.
+//
+// The ORDER of the calls does not reach the encoded object: Encode sorts
+// the string table and picks the surviving location by rule, so a walk
+// that finished its spans in a different order still writes the same
+// bytes.
 func (w *Writer) Add(bs []Block) error {
 	if len(bs) == 0 {
 		return nil
@@ -246,10 +251,41 @@ func (w *Writer) Close() error { return w.sorter.Close() }
 //
 // Nothing larger than one record is held: the sort streams, the stream
 // writer spools, and the string table is bounded by the object count.
+//
+// The bytes it writes are a FUNCTION OF THE SOURCE AND THE POLICY, and
+// nothing else — see the canonical ordering below. A hash-named object
+// that varied run to run would make `--refresh` of an unchanged tree
+// upload a new index and rewrite the superblock entry every time.
 func (w *Writer) Encode(out io.Writer) (blocks int, err error) {
 	w.mu.Lock()
 	keys := append([]string(nil), w.keys...)
 	w.mu.Unlock()
+
+	// CANONICAL ORDER FOR THE STRING TABLE.
+	//
+	// A record names its object by an index into this table, and the
+	// table was built in the order Add happened to be called — which is
+	// the order concurrent spider workers finished their spans in
+	// (spider.go), and is therefore different on every walk of the same
+	// tree. That leaked the scheduler into the encoded object: two walks
+	// of an unchanged source produced two differently-hashed indexes.
+	//
+	// Sorting it here and remapping the records through the permutation
+	// is the fix, and this is the only place that sees the whole table.
+	// The permutation costs one uint32 per OBJECT, which is the bound the
+	// string table itself already carries — never the block count.
+	order := make([]uint32, len(keys))
+	for i := range order {
+		order[i] = uint32(i)
+	}
+	sort.Slice(order, func(a, b int) bool { return keys[order[a]] < keys[order[b]] })
+	remap := make([]uint32, len(keys))
+	canon := make([]string, len(keys))
+	for newID, oldID := range order {
+		remap[oldID] = uint32(newID)
+		canon[newID] = keys[oldID]
+	}
+	keys = canon
 
 	var strs []byte
 	for _, k := range keys {
@@ -288,28 +324,61 @@ func (w *Writer) Encode(out io.Writer) (blocks int, err error) {
 	defer merged.Close() //nolint:errcheck
 
 	sw := packidx.NewStreamWriter(spool, keyLen, recordLen, Stride)
-	var last []byte
+	var (
+		cur  [keyLen]byte
+		best [recordLen]byte
+		have bool
+	)
 	n := 0
+	emit := func() error {
+		if !have {
+			return nil
+		}
+		if err := sw.Add(cur[:], best[:]); err != nil {
+			return fmt.Errorf("graft: encode index: %w", err)
+		}
+		n++
+		return nil
+	}
 	for {
 		rec, ok := merged.Next()
 		if !ok {
 			break
 		}
+		var val [recordLen]byte
+		copy(val[:], rec[keyLen:])
+		oi := binary.LittleEndian.Uint32(val[0:])
+		if int(oi) >= len(remap) {
+			return 0, fmt.Errorf("graft: an index record names source object %d of %d", oi, len(remap))
+		}
+		binary.LittleEndian.PutUint32(val[0:], remap[oi])
 		// A streaming table cannot reorder and will not accept a repeat,
-		// so runs of equal identities collapse HERE — the same bytes in
-		// two objects keep the first location the sort put in front, and
-		// which one that is is arbitrary and correct either way.
-		if last != nil && string(rec[:keyLen]) == string(last) {
+		// so runs of equal identities — the same bytes in two places —
+		// collapse HERE. The survivor is the LOWEST location rather than
+		// whichever the sort happened to put in front, for the same
+		// reason the string table is sorted: the sort's order among equal
+		// keys follows the order Add was called in, which is the walk's
+		// schedule. Either location serves the same bytes, so the only
+		// thing at stake is that the choice be a property of the tree.
+		// One record is held, never a run: a tree of identical blocks
+		// must not be able to make this allocate.
+		if have && string(rec[:keyLen]) == string(cur[:]) {
+			if lowerLoc(val, best) {
+				best = val
+			}
 			continue
 		}
-		if err := sw.Add(rec[:keyLen], rec[keyLen:]); err != nil {
-			return 0, fmt.Errorf("graft: encode index: %w", err)
+		if err := emit(); err != nil {
+			return 0, err
 		}
-		last = append(last[:0], rec[:keyLen]...)
-		n++
+		copy(cur[:], rec[:keyLen])
+		best, have = val, true
 	}
 	if err := merged.Err(); err != nil {
 		return 0, fmt.Errorf("graft: sort index: %w", err)
+	}
+	if err := emit(); err != nil {
+		return 0, err
 	}
 	if _, err := sw.Finish(out); err != nil {
 		return 0, fmt.Errorf("graft: encode index: %w", err)
@@ -460,6 +529,24 @@ func splitKeys(b []byte) []string {
 		parts = parts[:n-1]
 	}
 	return parts
+}
+
+// lowerLoc orders two encoded records by the location they name: which
+// object in the (already canonical) string table, then where in it. The
+// fields are little-endian, so this compares them rather than the bytes.
+// Any total order would make the encode deterministic; this one makes the
+// surviving location the one in the alphabetically first source object,
+// which is also the one a person reading the index would expect.
+func lowerLoc(a, b [recordLen]byte) bool {
+	ao, bo := binary.LittleEndian.Uint32(a[0:]), binary.LittleEndian.Uint32(b[0:])
+	if ao != bo {
+		return ao < bo
+	}
+	af, bf := binary.LittleEndian.Uint64(a[4:]), binary.LittleEndian.Uint64(b[4:])
+	if af != bf {
+		return af < bf
+	}
+	return binary.LittleEndian.Uint32(a[12:]) < binary.LittleEndian.Uint32(b[12:])
 }
 
 // decodeRecord turns a table value into a Loc.

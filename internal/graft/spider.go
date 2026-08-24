@@ -337,6 +337,14 @@ func Spider(ctx context.Context, o SpiderOptions) (*Result, error) {
 			}
 		}
 		obj.ids = make([]chunkid.Identity, n)
+		if obj.size > 0 && obj.size <= InlineKeep {
+			// Allocated up front for the same reason ids is: an object
+			// small enough to inline can still be cut into more than one
+			// span (a small --block with a small --span), and its spans
+			// run on different workers. Appending would be both a data
+			// race and an inline body assembled in completion order.
+			obj.body = make([]byte, obj.size)
+		}
 		obj.todo = true
 		todo = append(todo, obj)
 	}
@@ -544,8 +552,11 @@ func hashSpan(ctx context.Context, o SpiderOptions, s span) (int64, int, error) 
 				"(the source changed while it was being spidered): %v", obj.key, i, want, n, rerr)
 		}
 		obj.ids[i] = o.Hasher.Sum(buf[:want])
-		if obj.size <= InlineKeep {
-			obj.body = append(obj.body, buf[:want]...)
+		if obj.body != nil {
+			// Written at the block's own offset, so two spans of the same
+			// small object touch disjoint ranges of a slice neither of
+			// them grows. Same shape as obj.ids just above it.
+			copy(obj.body[int64(i)*obj.block:], buf[:want])
 		}
 		read += want
 		nb++

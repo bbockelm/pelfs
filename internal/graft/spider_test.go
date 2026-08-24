@@ -313,3 +313,97 @@ func TestProgressReportsSomethingBeforeTheEnd(t *testing.T) {
 		t.Fatal("a walk that ran for many ticks reported no progress at all")
 	}
 }
+
+// TestTheSameSourceAlwaysEncodesTheSameIndex is the guarantee the
+// checkpoint's resume rests on, stated without the checkpoint.
+//
+// The index object is hash-named and the superblock entry names it by
+// hash, so a walk whose output depended on the order its workers happened
+// to finish in would make `--refresh` of a tree that had not moved upload
+// a new index and rewrite the entry every single time — which is the one
+// operation the whole resume design exists to make free. It regressed
+// exactly this way: the string table was built in Add order, and Add was
+// called from the span workers.
+//
+// The tree deliberately holds two objects with IDENTICAL contents, so the
+// collapse of a repeated identity is under test too: the surviving
+// location has to be chosen by rule, not by which walk won the race.
+func TestTheSameSourceAlwaysEncodesTheSameIndex(t *testing.T) {
+	m := newMemStore()
+	tree(t, m)
+	twin := make([]byte, 120000)
+	rand.New(rand.NewSource(11)).Read(twin)
+	m.put("data/zz-twin-b.bin", twin, time.Unix(1700000000, 0))
+	m.put("data/aa-twin-a.bin", twin, time.Unix(1700000000, 0))
+
+	var want []byte
+	// Enough walks that a completion order other than the sorted one is
+	// overwhelmingly likely to occur at least once.
+	for i := 0; i < 12; i++ {
+		_, raw := spiderInto(t, m, SpiderOptions{
+			Policy: smallPolicy(), Concurrency: 8, SpanBytes: 16384,
+		})
+		if want == nil {
+			want = raw
+			continue
+		}
+		if !bytes.Equal(want, raw) {
+			t.Fatalf("walk %d of an unchanged source encoded a different index object "+
+				"(%d bytes vs %d): a refresh would republish it every time", i, len(raw), len(want))
+		}
+	}
+	// And the repeated identity kept the alphabetically first location,
+	// which is the rule rather than the accident.
+	ix, err := Open(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := chunkid.NewHasher(nil).Sum(twin[:smallPolicy().For(int64(len(twin)))])
+	loc, ok := ix.Lookup(id[:])
+	if !ok || loc.Key != "data/aa-twin-a.bin" {
+		t.Fatalf("the shared block resolves to %+v (found=%v), want data/aa-twin-a.bin", loc, ok)
+	}
+}
+
+// TestASmallObjectSpreadOverManySpansInlinesInOrder: an object under
+// InlineKeep is kept whole for the catalog, and a small --block with a
+// small --span cuts even a small object into several spans that run on
+// different workers. The body has to be assembled by OFFSET; assembling
+// it in completion order was both a data race and a corrupt inline file.
+func TestASmallObjectSpreadOverManySpansInlinesInOrder(t *testing.T) {
+	m := newMemStore()
+	// A flat policy, so the ladder does not coarsen the block out from
+	// under the point of the test.
+	flat := BlockPolicy{Block: 4096, Max: 4096, PerObject: 1 << 20}
+	bodies := map[string][]byte{}
+	rnd := rand.New(rand.NewSource(23))
+	for i := 0; i < 6; i++ {
+		b := make([]byte, 40000) // under InlineKeep, ten blocks, ten spans
+		rnd.Read(b)
+		k := fmt.Sprintf("small%02d.bin", i)
+		m.put(k, b, time.Unix(1700000000, 0))
+		bodies[k] = b
+	}
+	m.delay = time.Millisecond
+	res, _ := spiderInto(t, m, SpiderOptions{Policy: flat, Concurrency: 8, SpanBytes: 4096})
+	if res.Inlined != len(bodies) {
+		t.Fatalf("inlined %d of %d small objects", res.Inlined, len(bodies))
+	}
+	for _, f := range res.Files {
+		want := bodies[strings.TrimPrefix(f.Path, "/")]
+		if !bytes.Equal(f.Body, want) {
+			t.Fatalf("%s: the inlined body is not the source's bytes (%d of %d bytes match)",
+				f.Path, matching(f.Body, want), len(want))
+		}
+	}
+}
+
+// matching counts the leading bytes two slices agree on, so a failure can
+// say WHERE an out-of-order body diverged.
+func matching(a, b []byte) int {
+	n := 0
+	for n < len(a) && n < len(b) && a[n] == b[n] {
+		n++
+	}
+	return n
+}

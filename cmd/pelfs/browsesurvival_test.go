@@ -474,7 +474,7 @@ func TestTheFailedPageDoesNotWaitForever(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := newBrowseServer("pelican://example.org/vol", browseArgs{}, time.Minute, m, 1, nil)
+	b, err := newBrowseServer("pelican://example.org/vol", browseArgs{}, time.Minute, m, 1, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

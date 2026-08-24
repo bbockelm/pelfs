@@ -68,7 +68,7 @@ func newBrowseFixture(t *testing.T, rw bool, hooks bool) *browseFixture {
 	// generated WebDAV profile, which is why the server is built after the
 	// listener rather than before it.
 	port := srv.Listener.Addr().(*net.TCPAddr).Port
-	bs, err := newBrowseServer(g.prefix, a, 5*time.Minute, m, port, nil)
+	bs, err := newBrowseServer(g.prefix, a, 5*time.Minute, m, port, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -513,7 +513,13 @@ func TestPageIsOneFileWithANonceAndTheTestIDsAPlaywrightSuiteNeeds(t *testing.T)
 	for _, want := range []string{
 		`"sso-card"`, `"sso-url"`, `"sso-code"`, `"sso-dismiss"`, `"sso-note"`,
 		`navigator.sendBeacon`, `"/api/v1/beacon"`, `"pagehide"`, `"visibilitychange"`,
-		// The credential rows and the panel the POST's response builds.
+		// The credential rows. FOUR HOOKS CAME OUT OF THIS LIST with the
+		// password path -- `credential-basic-user`,
+		// `credential-basic-password`, `download-basic` and
+		// `credential-notice` -- because the server no longer has the data
+		// behind any of them: there is no Basic credential, no third
+		// download, and no one-time password notice to render. A hook
+		// asserted here that nothing can fill is a contract with nobody.
 		`"client-row"`, `"client-revoke"`, `"grant-row"`, `"grant-revoke"`,
 		`"credential-label"`, `"credential-dav-url"`,
 		`"download-profile"`, `"download-bookmark"`,

@@ -13,9 +13,19 @@ package localoauth
 //	the FIRST one generated, and regenerating that profile produces the same
 //	bytes.
 //
-// Everything else here is the fence around that: what must NOT survive
-// (tokens, grants, the Basic password, consent), what a read-only session
-// must still refuse, and what revoking one of these now means.
+// Everything else here is the fence around that: what must NOT survive on
+// an IDENTITY ALONE, what a read-only session must still refuse, and what
+// revoking one of these now means.
+//
+// READ THAT FENCE CAREFULLY, because half of it moved. `session` below builds
+// a server with an Identity and NO GrantStore, which is the configuration
+// this file is about, and under it nothing but the identity survives: no
+// access token, no grant, no consent. A `pelfs browse` also passes a
+// GrantStore, and then the ISSUED GRANT survives too, on purpose — grants.go
+// says why that is a different thing from persisting consent, and
+// grants_test.go asserts it. What is true in BOTH configurations, and is the
+// line that must never move, is the last subtest here: consent is never
+// remembered at /oauth/authorize.
 //
 // White box, in the package, for the reason localoauth_test.go gives: the
 // read-only-session checks and the derivation's own domain separation have
@@ -24,6 +34,8 @@ package localoauth
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -83,7 +95,7 @@ func install(t *testing.T, h *harness, label string, write bool) (*Client, []byt
 		// the second one.
 		Port: 61234, Volume: "pelican://osg-htc.org/user/bbockelman",
 		ClientID: c.ID, RedirectURI: c.Redirect, Write: c.Write,
-		BasicUser: c.BasicUser, Label: label,
+		Label: label,
 	})
 	if err != nil {
 		t.Fatalf("davprofile.Profile: %v", err)
@@ -145,12 +157,21 @@ func TestAnInstalledProfileSurvivesARestart(t *testing.T) {
 	})
 
 	t.Run("the CREDENTIALS from the first session are dead", func(t *testing.T) {
+		// An ACCESS token never survives a process, in any configuration:
+		// Server.key is crypto/rand at New, so the table it would be looked
+		// up in is keyed under a key this process invented. That is true
+		// even with a grant store, where the REFRESH token does survive —
+		// which is why an adopted grant serves nothing at /dav/* until the
+		// client refreshes it (grants_test.go).
 		if _, ok := second.s.Verify(tok.AccessToken); ok {
-			t.Error("an access token survived the process: persistence is for the "+
-				"client identity, not for issued credentials", tok.AccessToken[:8])
+			t.Error("an access token survived the process", tok.AccessToken[:8])
 		}
-		if _, ok := second.s.verifyBasic(c1.BasicUser, c1.BasicPassword); ok {
-			t.Error("the first session's Basic password still authenticates")
+		// And with no grant store, neither does the refresh token.
+		if w, _ := second.postToken(url.Values{
+			"grant_type": {"refresh_token"}, "refresh_token": {tok.RefreshToken},
+			"client_id": {c1.ID},
+		}); w.Code != http.StatusBadRequest {
+			t.Errorf("a refresh token survived a process with no grant store: %d", w.Code)
 		}
 	})
 
@@ -198,8 +219,8 @@ func TestTheIdentityIsPerStateDirectory(t *testing.T) {
 
 // TestTheSameProgramIsOneClient pins the idempotence the derivation forces:
 // (label, redirect, write) is the identity, so asking twice is one client
-// with one revoke button — and a new Basic password, which is the one thing
-// that cannot be handed back twice.
+// with one revoke button and one profile — and now that there is no password
+// to roll, asking twice re-issues NOTHING at all.
 func TestTheSameProgramIsOneClient(t *testing.T) {
 	dir := t.TempDir()
 	h := session(t, dir, true)
@@ -213,15 +234,6 @@ func TestTheSameProgramIsOneClient(t *testing.T) {
 	}
 	if len(h.s.Clients()) != 1 {
 		t.Errorf("the credential list has %d rows for one program", len(h.s.Clients()))
-	}
-	if first.BasicPassword == second.BasicPassword {
-		t.Error("the Basic password was handed back twice; it is issued once")
-	}
-	if _, ok := h.s.verifyBasic(first.BasicUser, first.BasicPassword); ok {
-		t.Error("the retired Basic password still authenticates")
-	}
-	if _, ok := h.s.verifyBasic(second.BasicUser, second.BasicPassword); !ok {
-		t.Error("the re-issued Basic password does not authenticate")
 	}
 	// A different label, or a different write flag, is a different program
 	// and therefore a different identity.
@@ -309,9 +321,12 @@ func TestRevokeSaysSoWhenItCouldNotReachTheDisk(t *testing.T) {
 	if !strings.Contains(err.Error(), "still on disk") {
 		t.Errorf("the error does not say what is still true: %v", err)
 	}
-	// The in-memory half is done regardless, which is what the error claims.
-	if _, ok := h.s.verifyBasic(c.BasicUser, c.BasicPassword); ok {
-		t.Error("the credential still works in this session")
+	// The in-memory half is done regardless, which is what the error claims:
+	// the client id names nothing here any more, so its /authorize is
+	// refused even though the file still holds the identity.
+	h.client = c
+	if w := h.get(h.query()); w.Code != http.StatusBadRequest {
+		t.Errorf("the revoked client is still known in this session: %d", w.Code)
 	}
 }
 
@@ -377,8 +392,7 @@ func TestTheIdentityFileIsLazyAndPrivate(t *testing.T) {
 	// here at all — which is what makes this file weaker than the signing
 	// key sitting beside it.
 	for what, secret := range map[string]string{
-		"the client id":      c.ID,
-		"the Basic password": c.BasicPassword,
+		"the client id": c.ID,
 	} {
 		if strings.Contains(string(body), secret) {
 			t.Errorf("%s is written into the identity file", what)

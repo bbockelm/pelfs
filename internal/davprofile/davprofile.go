@@ -53,14 +53,20 @@
 // A PASSWORD. `HostDictionary.java`'s key set has `Protocol`, `Provider`,
 // `Hostname`, `Port`, `Path`, `Username`, `Nickname` and friends, and no
 // `Password` key at all — so neither a `.cyberduckprofile` nor a `.duck`
-// bookmark can carry the HTTP Basic secret. That is exactly why the OAuth
-// path is worth building (it is the only way a downloaded file becomes a
-// working connection with no typing) and why the Basic credential is
-// nonetheless generated for every client: it is the contingency if the
-// OAuth flow will not run, and it is the path every non-Cyberduck client
-// uses — WinSCP, rclone, macOS `mount_webdav`, the Windows redirector. The
-// contingency costs the user one paste, and BasicBookmark is what makes it
-// only one.
+// bookmark can carry a secret a user would otherwise have to type. That is
+// exactly why the OAuth path is worth building: it is the only way a
+// downloaded file becomes a working connection with no typing at all.
+//
+// THERE IS NO PASSWORD CONTINGENCY ANY MORE. This package used to generate
+// one — a `BasicBookmark` carrying a per-client HTTP Basic username, with
+// the password pasted in by hand — and it is gone, with
+// internal/localoauth's Basic credential. A second credential that
+// authenticates at /dav/* in one hop, with no gesture in front of it and no
+// expiry behind it, was the weakest thing on the listener, and its only job
+// was to cover a flow that now works in a real browser with real Cyberduck
+// on every gate this repo runs. A client that cannot do OAuth is a client
+// that does not connect to `pelfs browse`; that is the deliberate answer
+// rather than an oversight.
 package davprofile
 
 import (
@@ -153,11 +159,6 @@ type Params struct {
 	// A read-only browse session must not set it (internal/localoauth
 	// refuses the client registration, which is where that is enforced).
 	Write bool
-
-	// BasicUser is the per-client HTTP Basic username, used by
-	// BasicBookmark and by Details. Optional for Profile, which offers no
-	// password field at all.
-	BasicUser string
 
 	// Label names the client in a bookmark's nickname: "Cyberduck". Falls
 	// back to "pelfs".
@@ -305,21 +306,6 @@ func (p Params) nickname() string {
 	return "pelfs: " + v + " (" + label + ")"
 }
 
-// basicNickname distinguishes the contingency bookmark from the OAuth one
-// in the same list, and says which one needs the paste. Both end up in the
-// user's bookmarks and "no clue which each is" applies to two of ours as
-// much as to two of anybody's.
-func (p Params) basicNickname() string {
-	label := p.Label
-	if label == "" {
-		label = "pelfs"
-	}
-	if v := shortVolume(p.Volume); v != "" {
-		return "pelfs: " + v + " (" + label + ", password)"
-	}
-	return "pelfs (" + label + ", password)"
-}
-
 // protocolName is the profile's `Name`: what Cyberduck shows wherever it
 // names the PROTOCOL rather than the bookmark — the New Bookmark dropdown,
 // and the tail of the fallback in nickname's quotation. Without it that is
@@ -445,60 +431,29 @@ func Bookmark(p Params) ([]byte, error) {
 	return w.bytes()
 }
 
-// BasicBookmark is the contingency, and the path every client that is not
-// Cyberduck or Mountain Duck takes: the built-in WebDAV protocol, this
-// listener, and the per-client Basic username filled in. The PASSWORD IS
-// NOT IN IT and cannot be — HostDictionary has no such key — so this costs
-// the user exactly one paste, which is the price docs/design-webui.md's
-// verification 2g quotes.
-//
-// It deliberately does NOT name the profile's Provider: this bookmark must
-// work whether or not the profile is installed, because its whole reason to
-// exist is the case where the OAuth path is not working.
-func BasicBookmark(p Params) ([]byte, error) {
-	if err := p.check(); err != nil {
-		return nil, err
-	}
-	if p.BasicUser == "" {
-		return nil, fmt.Errorf("davprofile: BasicBookmark needs the per-client Basic username")
-	}
-	w := newPlist()
-	w.str("Protocol", "dav")
-	w.str("Hostname", "127.0.0.1")
-	w.str("Port", strconv.Itoa(p.Port))
-	w.str("Path", DAVPath)
-	w.str("Username", p.BasicUser)
-	w.str("Nickname", p.basicNickname())
-	w.str("Comment", p.description()+" - paste the password pelfs showed you")
-	return w.bytes()
-}
-
-// FileName is the download's filename, with no `/` and no space, for one of
-// "cyberduckprofile", "duck" or "basic.duck".
+// FileName is the download's filename, with no `/` and no space, for
+// "cyberduckprofile" or "duck".
 func FileName(p Params, ext string) string {
 	base := "pelfs-" + strconv.Itoa(p.Port)
 	return base + "." + ext
 }
 
 // Details is the plain connection information for a client with no profile
-// format at all: rclone, WinSCP, `mount_webdav`, curl. It is what the UI
-// shows beside the download buttons.
+// format at all. It is what the UI shows beside the download buttons.
+//
+// It has no username and no `preemptive` flag any more: there is no password
+// credential to send, preemptively or otherwise. What a non-Cyberduck client
+// needs from this listener is the URL and an OAuth Bearer token it obtained
+// through the same authorization-code flow — rclone's
+// `--webdav-bearer-token` is the shape of it.
 type Details struct {
 	URL      string
-	Username string
 	Writable bool
-	// Preemptive says the Basic credential must be sent without waiting for
-	// a challenge, which is what Cyberduck does
-	// (`webdav.basic.preemptive=true`, docs/design-guiclients.md) and what
-	// rclone and curl do by default.
-	Preemptive bool
 }
 
-// Details returns the plain connection information. The password is not in
-// it: the caller has it once, from internal/localoauth, and shows it once.
+// Details returns the plain connection information.
 func (p Params) Details() Details {
-	return Details{URL: DAVURL(p.Port), Username: p.BasicUser,
-		Writable: p.Write, Preemptive: true}
+	return Details{URL: DAVURL(p.Port), Writable: p.Write}
 }
 
 // check is trap 4 plus the ordinary sanity: no `$` anywhere, no control
@@ -507,7 +462,7 @@ func (p Params) check() error {
 	if p.Port <= 0 || p.Port > 65535 {
 		return fmt.Errorf("davprofile: port %d is not a port", p.Port)
 	}
-	for _, v := range []string{p.Volume, p.ClientID, p.RedirectURI, p.BasicUser, p.Label} {
+	for _, v := range []string{p.Volume, p.ClientID, p.RedirectURI, p.Label} {
 		if err := checkValue(v); err != nil {
 			return err
 		}

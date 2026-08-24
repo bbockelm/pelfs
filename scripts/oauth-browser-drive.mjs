@@ -110,13 +110,24 @@ async function consent(url) {
   const ticketed = await page.locator('input[name="consent_ticket"]').count();
   ck(ticketed === 1, `browser:consent-rendered a consent form with a ticket`);
 
+  // WHAT THE SCREEN SAYS, which is three facts and two buttons. The callback
+  // row and the paragraph of reassurance under them were deleted -- "useless
+  // over-explanation", and a loopback URL with a port in it is not something
+  // a person can act on -- so their absence is asserted here rather than
+  // trusted to stay absent.
+  const consentText = await page.locator("body").innerText();
+  ck(!/sends the authorization to/i.test(consentText) && !/one thing standing/i.test(consentText),
+    `page:consent-is-terse    no callback row and no essay on the consent screen`);
+  ck(/Cyberduck/.test(consentText) && /pelican:\/\//.test(consentText) && /read/i.test(consentText),
+    `page:consent-names-ask   the screen names the program, the volume and the scope`);
+
   // 2. THE CLICK. Playwright's click dispatches a trusted input event, so
   //    this is the "one real user gesture" internal/localoauth's consent
   //    page is built around -- not form.submit(), which `script-src 'none'`
   //    makes impossible anyway.
   await page.locator("button.go").click();
-  await page.waitForURL(/\/pelfs\/oauth\/callback\?/, { timeout: 30_000 }).catch(() => {});
-  await page.waitForTimeout(500);
+  await page.waitForLoadState("load").catch(() => {});
+  await page.waitForTimeout(1000);
 
   const post = lastOf(seen.requests, (r) => r.method === "POST");
   const postRes = lastOf(seen.responses, (r) => r.url.endsWith("/oauth/authorize"));
@@ -130,7 +141,20 @@ async function consent(url) {
     `browser:sec-fetch-post   sec-fetch-site=${post?.headers["sec-fetch-site"]} on the form POST`);
   ck(post?.headers["content-type"]?.startsWith("application/x-www-form-urlencoded"),
     `browser:form-encoded     ${post?.headers["content-type"]}`);
-  ck(postRes?.status === 303, `browser:consent-303      the POST answered ${postRes?.status}, not a refusal`);
+  ck(postRes?.status === 200, `browser:consent-200      the POST answered ${postRes?.status}, not a refusal`);
+
+  // BUG 3, AND THE ONE A USER REPORTED IN THEIR OWN WORDS: "when I click
+  // Authorize, nothing happens in the browser. I'd expect a 'success' type
+  // page." The POST used to 303 to Cyberduck's loopback listener, which
+  // answers by closing the connection -- so the browser's last act in the
+  // flow was to land on ERR_EMPTY_RESPONSE at the moment everything worked.
+  // The tab must now be sitting on a pelfs page that says so.
+  const landed = page.url();
+  const success = await page.locator("body").innerText();
+  ck(landed.startsWith(origin),
+    `browser:lands-on-pelfs  the tab ended on ${landed.slice(0, 60)}, not a dead callback`);
+  ck(/Connected/i.test(success) && /close this tab/i.test(success),
+    `browser:success-page     the page tells the user the program is connected`);
 
   // BUG 1b. The redirect a `form-action 'self'` policy blocked. A CSP
   // violation is reported to the console and NOWHERE ELSE -- no status code,
@@ -152,6 +176,13 @@ async function consent(url) {
   const cb = lastOf(seen.requests, (r) => /\/pelfs\/oauth\/callback\?/.test(r.url));
   const hasCode = /[?&]code=[A-Za-z0-9._~-]+/.test(cb?.url ?? "");
   ck(hasCode, `browser:code-delivered  the authorization reached the client's callback`);
+  // AND IT GOT THERE FROM A FRAME, not from a navigation the user was
+  // dumped on. That is the mechanism the success page above depends on: if
+  // `frame-src` stops naming the callback, this request never happens and
+  // Cyberduck waits forever on a callback that a CSP silently blocked --
+  // which is precisely the failure mode this whole gate exists for.
+  ck(cb?.type === "document" && landed.startsWith(origin),
+    `browser:frame-delivered  the code was delivered from the page, not by leaving it`);
 
   // And it reached it with NO Referer, which is the property
   // `Referrer-Policy: same-origin` keeps that plain `no-referrer` was chosen
@@ -166,6 +197,42 @@ async function consent(url) {
   //    which is hand-written HTML with `default-src 'none'` over it.
   ck(seen.offLoopback.length === 0,
     `browser:no-beacon        ${seen.offLoopback.length ? seen.offLoopback[0].url : "zero requests left 127.0.0.1"}`);
+
+  // 5. PRESSING IT TWICE. "If I click it twice, I get an error" was the
+  //    second half of the report, and reproducing it faithfully in a browser
+  //    means being precise about which "twice" it was.
+  //
+  //    A RELOAD of the success page is the one that hurts: the browser
+  //    re-POSTs the SAME consent ticket. That used to be indistinguishable
+  //    from a forged POST and got the forged POST's page -- "this
+  //    authorization screen is no longer live" -- shown to somebody who had
+  //    just successfully connected. It must now say what the first press
+  //    already did, and it must NOT re-deliver the code, because a code
+  //    presented twice is what revokes the grant.
+  const callbacksBefore = seen.requests.filter((r) => /\/pelfs\/oauth\/callback\?/.test(r.url)).length;
+  await page.reload({ waitUntil: "load" }).catch(() => {});
+  await page.waitForTimeout(500);
+  const twice = await page.locator("body").innerText();
+  const twiceRes = lastOf(seen.responses, (r) => r.url.endsWith("/oauth/authorize"));
+  const twicePost = lastOf(seen.requests, (r) => r.method === "POST" && r.url.endsWith("/oauth/authorize"));
+  ck(twicePost !== undefined, `browser:resubmits        the reload re-POSTed the consent form`);
+  ck(twiceRes?.status === 200 && /Already connected/i.test(twice),
+    `browser:second-press     re-submitting answered ${twiceRes?.status} ` +
+    `${JSON.stringify(twice.split("\n")[0])}`);
+  const callbacksAfter = seen.requests.filter((r) => /\/pelfs\/oauth\/callback\?/.test(r.url)).length;
+  ck(callbacksAfter === callbacksBefore,
+    `browser:no-redelivery    the second press sent nothing to the client (${callbacksBefore} -> ${callbacksAfter})`);
+
+  //    AND THE OTHER "twice", which is Back and press again. That is a NEW
+  //    screen with a new ticket, and it must be -- consent is never
+  //    remembered at /authorize, so a client asking a second time asks a
+  //    second human. What it must not be is an error.
+  await page.goBack({ waitUntil: "load" }).catch(() => {});
+  await page.waitForTimeout(300);
+  const backText = await page.locator("body").innerText();
+  const backForm = await page.locator('input[name="consent_ticket"]').count();
+  ck(backForm === 1 && !/no longer live/i.test(backText),
+    `browser:back-is-a-screen going back offers a fresh consent screen, not a refusal`);
 
   await browser.close();
   return cb?.url ?? "";

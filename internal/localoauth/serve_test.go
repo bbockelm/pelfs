@@ -24,6 +24,11 @@ package localoauth_test
 //	PELFS_OAUTH_RW        if non-empty, the session is writable
 //	PELFS_OAUTH_TTL       exit after this duration (default 10m)
 //
+// It writes NO PASSWORD, because there is none: /dav/* accepts an OAuth
+// Bearer token and nothing else. creds.env carries the client id, the origin
+// and the callback URL, which is everything the probe needs to drive the
+// flow.
+//
 // It writes the generated files, prints one `ready` line, and serves until
 // SIGTERM, SIGINT or the TTL — at which point it prints the refusal
 // counters and the credential list, which is what the probe reads to say
@@ -120,12 +125,11 @@ func TestServeForCyberduckGate(t *testing.T) {
 	p := davprofile.Params{
 		Port: port, Volume: "pelican://osg-htc.org/user/bbockelman",
 		ClientID: client.ID, RedirectURI: client.Redirect, Write: writable,
-		BasicUser: client.BasicUser, Label: "Cyberduck",
+		Label: "Cyberduck",
 	}
 	for name, gen := range map[string]func(davprofile.Params) ([]byte, error){
 		"pelfs.cyberduckprofile": davprofile.Profile,
 		"pelfs.duck":             davprofile.Bookmark,
-		"pelfs-basic.duck":       davprofile.BasicBookmark,
 	} {
 		b, err := gen(p)
 		if err != nil {
@@ -138,9 +142,8 @@ func TestServeForCyberduckGate(t *testing.T) {
 	// The secrets the probe needs, in a file rather than on the command
 	// line: this is a throwaway container, but a credential in argv is a
 	// habit worth not having.
-	creds := fmt.Sprintf("PELFS_CLIENT_ID=%s\nPELFS_BASIC_USER=%s\nPELFS_BASIC_PASS=%s\n"+
-		"PELFS_ORIGIN=%s\nPELFS_REDIRECT=%s\n",
-		client.ID, client.BasicUser, client.BasicPassword, guard.Origin(), client.Redirect)
+	creds := fmt.Sprintf("PELFS_CLIENT_ID=%s\nPELFS_ORIGIN=%s\nPELFS_REDIRECT=%s\n",
+		client.ID, guard.Origin(), client.Redirect)
 	if err := os.WriteFile(filepath.Join(dir, "creds.env"), []byte(creds), 0o600); err != nil {
 		t.Fatalf("write creds.env: %v", err)
 	}
@@ -163,12 +166,12 @@ func TestServeForCyberduckGate(t *testing.T) {
 	// What the client actually did, which is the whole point of running a
 	// real one.
 	c := oauth.Counts()
-	fmt.Printf("counts replays=%d redirect-mismatch=%d unknown-client=%d "+
+	fmt.Printf("counts replays=%d retries=%d redirect-mismatch=%d unknown-client=%d "+
 		"missing-pkce=%d verifier-mismatch=%d consent-denied=%d ticket-refused=%d "+
-		"no-session=%d clamped=%d\n",
-		c.CodeReplays, c.RedirectMismatches, c.UnknownClients, c.MissingPKCE,
+		"consent-repeats=%d no-session=%d clamped=%d\n",
+		c.CodeReplays, c.CodeRetries, c.RedirectMismatches, c.UnknownClients, c.MissingPKCE,
 		c.VerifierMismatches, c.ConsentDenied, c.ConsentTicketsRefused,
-		c.NoSession, c.ScopeClamped)
+		c.ConsentRepeats, c.NoSession, c.ScopeClamped)
 	for _, g := range oauth.Grants() {
 		fmt.Printf("grant %s client=%s scopes=%s write=%v last-used=%s\n",
 			g.Ref, g.Label, strings.Join(g.Scopes, "+"), g.Write,

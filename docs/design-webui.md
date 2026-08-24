@@ -564,7 +564,7 @@ a profile that has no password field.
 **(iv) An authorization-code store.** Single-use, 60-second TTL, bound to
 the `client_id`, the exact `redirect_uri`, and the PKCE challenge.
 
-#### 2e. Consent: one gesture, on every authorization
+#### 2e. Consent: one gesture, to CREATE a grant — and not to keep one
 
 **Same-session does *not* imply consent — require exactly one click, on
 every `/authorize`.** This section originally said "and remember it per
@@ -577,8 +577,25 @@ required every time, and the property the "remember it" clause was
 reaching for is delivered where the client actually needs it: **the
 refresh token.** Cyberduck's `OAuth2RequestInterceptor` refreshes before
 each request goes out and never revisits `/authorize` while a refresh
-works, so a reconnect within the session does not re-prompt anyway. The
-user-visible friction is identical and the endpoint keeps its property.
+works, so a reconnect does not re-prompt anyway.
+
+**And the refresh token now persists, which is a change to this document
+rather than a detail of it.** The report was "I feel like we shouldn't need
+to redo the OAuth2 connection each time we start a browse session"; the
+first answer given was that consent-per-session had to stay, and that answer
+conflated two different things. Separating them is the whole argument:
+
+| | reaches `/authorize`? | can a page the user visits drive it? |
+|---|---|---|
+| persisting **consent** | yes — it *is* `/authorize` approving without a human | **yes.** This is the attack. Refused, permanently. |
+| persisting the **grant** | no. A client holding a refresh token POSTs to `/oauth/token` | no. There is no authorization request in the exchange to drive, and the credential renewed is one a human already approved on a screen naming the volume, the program and the scope. |
+
+So the grant is written to `<state-dir>/browse-grants.key` and consent is
+not remembered anywhere. A saved Cyberduck bookmark reconnects across a
+restart of `pelfs browse` **with no click at all**; only a client that has
+never been authorized, or one whose grant was revoked or expired, meets the
+screen. `internal/localoauth/grants.go` carries the threat model and the
+trade; it is summarised under A7 below.
 
 The argument for "no consent screen" is real: the user just downloaded this
 profile from this page, double-clicked it, and is watching. Asking again is
@@ -592,9 +609,28 @@ navigate the user's browser to it. A single click is the difference between
 click Authorize on a screen that says what is being authorized". So:
 
 - a consent screen naming the client (`Cyberduck`), the scope
-  (`read` / `read+write`), the volume, and the redirect target;
+  (`read` / `read+write`) and the volume — **and not the redirect target.**
+  This list used to include it and the screen used to show it, as a row
+  reading "sends the authorization to
+  `http://127.0.0.1:52001/pelfs/oauth/callback`". It is deleted: a loopback
+  URL with a port in it is not something a person can act on, it tells them
+  nothing about whether to press the button, and the control it looks like
+  it is performing is performed unconditionally in the handler — the URL is
+  compared byte for byte against the one pelfs itself wrote into that
+  client's profile (control 3) whatever the screen says. Three facts and two
+  buttons; no paragraph of reassurance under them either;
 - one click, requiring a real user gesture on the page;
 - **required on every authorization**, never remembered at `/authorize`;
+- and the click **lands the user on a success page** on pelfs's own origin,
+  which is not decoration. The `POST` used to answer `303` straight to
+  Cyberduck's loopback listener, and that listener answers by closing the
+  connection — so the browser's last act in the flow was to land on a dead
+  tab at the exact moment everything had worked ("when I click Authorize,
+  nothing happens in the browser"). The authorization now reaches the client
+  from **one hidden frame** on that page, which is byte for byte the request
+  the `303` used to cause, named by `frame-src` in the page's own CSP. A
+  second press of the same screen answers "already connected" rather than a
+  refusal, mints nothing, and re-delivers nothing;
 - and, as shipped, the gesture is **structural rather than advisory**:
   `GET /oauth/authorize` has no code path that writes a `Location` header
   at all, the `POST` requires a 32-byte consent ticket that exists only in
@@ -686,17 +722,41 @@ appeared [W9], on a profile with a **blank** `OAuth Client ID` — which by
 a hypothesis about somebody else's configuration, and it is consistent with
 everything above.
 
-**Contingency, one paragraph.** If the flow cannot be made to work, the
-`/dav/*` endpoint keeps its HTTP Basic path — a per-client credential
-minted in the UI, 32 random characters, presented preemptively (Cyberduck's
-`webdav.basic.preemptive=true`, per `docs/design-guiclients.md`). A profile
-**cannot** carry the password and neither can a `.duck` bookmark:
-`HostDictionary.java`'s key set has `Protocol`, `Hostname`, `Port`, `Path`,
-`Username`, `Nickname` and friends and **no `Password`** [W16], so the
-contingency costs the user one paste. It is also the path every *other*
-WebDAV client needs — WinSCP, rclone, macOS `mount_webdav` — so it gets
-built either way; the OAuth flow is what makes Cyberduck and Mountain Duck
-one double-click instead of one double-click plus one paste.
+**The contingency was built, and then removed.** This paragraph used to
+say: if the flow cannot be made to work, `/dav/*` keeps an HTTP Basic path
+— a per-client credential minted in the UI, 32 random characters, presented
+preemptively (Cyberduck's `webdav.basic.preemptive=true`, per
+`docs/design-guiclients.md`) — costing the user one paste, because a
+profile **cannot** carry a password and neither can a `.duck` bookmark
+(`HostDictionary.java` has `Protocol`, `Hostname`, `Port`, `Path`,
+`Username`, `Nickname` and friends and **no `Password`** [W16]).
+
+It is gone, and the reason is that the premise expired. The flow *does*
+work: `scripts/oauth-browser-docker.sh` drives it in a real Chromium with
+real `duck` as the client, and `scripts/browse-gate.sh` drives it against
+the shipped binary end to end. What the contingency was left doing was
+standing on `/dav/*` as a **second, weaker door on the same room** — a
+credential that authenticates in one hop, preemptively, with no gesture in
+front of it, no expiry behind it, and one live value per client that rolled
+silently on every re-download. The owner's verdict was the short version:
+*"if we're going to use OAuth2, we don't need to show the password-based
+bookmarking. Passwords are bad."*
+
+So there is one scheme at `/dav/*` — **Bearer** — and an anonymous request
+is offered exactly one challenge, which closes verification 2d(iii) by
+construction rather than by narrowing. A client that cannot do OAuth does
+not connect to `pelfs browse`; that is the deliberate answer. In practice
+the clients named above do not need one: rclone takes
+`--webdav-bearer-token`, and anything that can run an authorization-code
+flow with PKCE — `curl` and twenty lines of shell can, and
+`scripts/browse-gate.sh` does exactly that for its read-only checks — gets
+a token the same way Cyberduck does.
+
+`internal/vfsdav.Basic` still exists as a library primitive and is used by
+`internal/vfsdav`'s own client-gate server
+(`scripts/webdav-clients-docker.sh`, which exercises the adapter with
+`rclone`, `curl` and `duck` against a fixed credential). Nothing a user runs
+offers it, and `internal/localoauth` no longer mints one.
 
 One note for the record: **Cyberduck is GPLv3** (`LICENSE.txt`). Irrelevant
 here — nothing of Cyberduck is linked or distributed by pelfs, only its
@@ -1631,25 +1691,23 @@ browser session, and the design keeps them apart everywhere:
 | | browser session | WebDAV client |
 |---|---|---|
 | **minted** | by exchanging the single-use bootstrap token | by an authenticated `POST /api/v1/dav-credentials` from the UI, one per client |
-| **carried as** | `X-Pelfs-Session` request header, from `sessionStorage` | `Authorization: Bearer` after the OAuth flow, or HTTP Basic preemptively (Cyberduck's `webdav.basic.preemptive=true`, per `docs/design-guiclients.md`) |
+| **carried as** | `X-Pelfs-Session` request header, from `sessionStorage` | `Authorization: Bearer` after the OAuth flow, and **nothing else** — the HTTP Basic path this row used to offer is removed (2g) |
 | **scope** | the whole app: browse, upload, publish, mint DAV credentials, read status | the filesystem only, at a fixed mode (`ro`/`rw`), and optionally a subtree |
 | **may it publish?** | yes | **no** — a WebDAV client cannot trigger a checkpoint, which keeps the publish decision with the person, not with a background sync |
-| **revoked** | by exiting; by a "sign out" that rotates the session secret | individually, from the UI, immediately; and collectively at process exit |
+| **revoked** | by exiting; by a "sign out" that rotates the session secret | individually, from the UI, immediately **and durably** — the grant's row is deleted from the state directory before the call reports success, so a revoked grant is dead after a restart. Exiting is no longer a collective revocation: see A7's "the grant is persistent" |
 | **listed** | n/a | in the UI with a label, creation time and last-used time, because a credential you cannot see is a credential you cannot revoke |
 | **accepted at** | `/`, `/assets/*`, `/api/v1/*`, `/events` | `/dav/*` only |
 
 Two rules make that table enforceable rather than aspirational: a session
-token at `/dav/*` is a **401**, and a Basic credential at `/api/v1/*` is a
-**401**. Both are rows in U1's test table.
+token at `/dav/*` is a **401**, and an `Authorization` header at
+`/api/v1/*` is a **401**. Both are rows in U1's test table.
 
-**What Basic over loopback gives up**, stated as plainly as
-`docs/design-guiclients.md` states it: the credential crosses the loopback
-socket in base64, readable by anything that can capture loopback traffic on
-that machine — root, or the owner's own uid. That is weaker than Digest and
-enormously stronger than the loopback NFS export shipping today, which
-advertises `AUTH_NULL` and, in `internal/vfsbilly/perm.go`'s own words,
-means *"Any local process can dial the loopback port and claim any uid it
-likes."*
+This section used to carry a paragraph on what HTTP Basic over loopback
+gives up — the credential crosses the loopback socket in base64, readable by
+anything that can capture loopback traffic on that machine. It is moot: there
+is no Basic credential. What crosses that socket is a Bearer token with a
+one-hour life, and the same capture concession applies to it, which is A8's
+first bullet and not a new one.
 
 #### A7. The OAuth authorization endpoint, which is the juiciest target here
 
@@ -1764,13 +1822,41 @@ with the process:
   a previous session does not validate against a new one even if the port
   is reused;
 - **individual revocation from the UI**: the credential list shows each
-  issued grant with its client label, scope, issue time and last-used time,
-  with a Revoke button, exactly as the Basic credentials do (A6). A
-  credential the user cannot see is a credential the user cannot revoke.
+  issued grant with its client label, scope, issue time, last-used time and
+  whether it is *persistent* — i.e. whether the program holding it will
+  reconnect after a restart with no consent screen — with a Revoke button
+  beside it. A credential the user cannot see is a credential the user
+  cannot revoke, and the one that outlives the process is the one that most
+  needs seeing.
 - **authorization codes are single-use with a 60-second TTL**, bound to
-  `client_id`, exact `redirect_uri` and the PKCE challenge; a replayed code
-  is a hard failure and is counted, because a replay is either a bug or an
-  attack and both deserve a number.
+  `client_id`, exact `redirect_uri` and the PKCE challenge. A code presented
+  twice is refused either way — single use does not bend — but the two
+  reasons it happens are **not the same event** and are no longer treated as
+  one:
+
+  - the caller presents the used code **with a `code_verifier` that hashes
+    to the challenge it was bound to** (and the right `client_id` and
+    `redirect_uri`). The verifier never leaves the client: it is not in the
+    authorization request, not in the redirect, not in the callback URL, not
+    in any log. A caller holding it *is* the client the code was issued to,
+    retrying a POST whose response was lost. Counted as a retry; nothing is
+    revoked. Destroying a working connection because a packet dropped is
+    punishing the user for the network.
+  - the caller presents the used code **without** it. That is exactly the
+    attacker RFC 6819 §5.2.1.1 describes — somebody who scraped the code and
+    has nothing else — so the grant the first exchange bought is revoked and
+    the replay is counted. Nothing is conceded by the distinction: an
+    attacker who *also* held the verifier could simply have made the first
+    exchange.
+
+  The same distinction, one layer up, is what makes a second press of the
+  consent screen say "already connected" instead of showing an error to
+  somebody who just successfully connected. A consent ticket is 32 bytes of
+  `crypto/rand` that existed in exactly one place — the body of a page this
+  server rendered into the user's own browser — so a caller who can produce a
+  *spent* one was shown that page. The re-press mints nothing, re-delivers
+  nothing, and is counted as a repeat rather than as a forgery; a ticket
+  that matches nothing still gets the refusal it always did.
 
 ##### The client identity is persistent, and it is not a credential
 
@@ -1805,12 +1891,15 @@ repeat on every surface:
   `Revoke` on a client now means something durable — the identity is
   deleted, the installed profile is dead for good, and the call reports an
   error rather than success if that could not be written;
-- **does not buy, on purpose**: no token, no refresh token and no Basic
-  password is written anywhere (those still die with the process); and
+- **does not buy, on purpose**: no *access* token is written anywhere, and
   **consent is still required on every `/authorize`** — control 6 stands
-  exactly as written, this document's "do not reinstate that" included. The
-  user clicks Authorize once per `pelfs browse` session, and every surface
-  that describes this must say so rather than implying the click went away.
+  exactly as written, this document's "do not reinstate that" included.
+
+  This bullet used to also say "no refresh token and no Basic password".
+  Both halves changed, in opposite directions: the Basic password no longer
+  exists at all (2g), and the refresh token is now persisted deliberately.
+  The next section is that argument, and it is the one place in this
+  document where something got *weaker* on purpose.
 
 **Threat model for the file.** An attacker who reads it can derive the
 client ids of the clients listed in it, and so can name a valid client at
@@ -1829,6 +1918,90 @@ not encrypted: the key that wrapped it would have to be readable by a
 non-interactive `pelfs browse`, in the same directory, and the ceremony
 would protect nothing that the signing key beside it does not already
 concede.
+
+##### The GRANT is persistent too, and that one is a real credential
+
+The report was *"I feel like we shouldn't need to redo the OAuth2 connection
+each time we start a browse session. Why not persist?"*, and it was answered
+once with "consent-per-session must stay, because persisting consent would
+reinstate the attack the gesture exists to stop". That answer was correct
+about consent and wrong about the question. Two different things were being
+held together by one word:
+
+- **Persisting consent** means `/oauth/authorize` approving a request with
+  no human in the loop. That is the attack in one step: a page the user
+  merely visits can navigate their browser to that endpoint. It is refused,
+  permanently, and no configuration turns it on. Control 6 is unchanged.
+- **Persisting the issued grant** does not touch `/oauth/authorize` at all.
+  A client holding a refresh token POSTs to `/oauth/token` with the token
+  and its `client_id`. There is no authorization request in that exchange
+  for anything to drive silently, and the credential being renewed is one a
+  human already approved on a screen naming the volume, the program and the
+  scope.
+
+So `<state-dir>/browse-grants.key` holds one row per issued grant, beside
+`browse-identity.key` and under the same discipline: mode 0600, created
+lazily, written atomically with an `fsync` before the rename.
+
+**What is in a row:** the client's identity tuple (the same
+`(label, redirect, write)` `browse-identity.key` uses — two files that name
+a client two ways is two files that can disagree), the grant's non-secret
+ref, its scope, when it was issued, when it was last used, when it expires,
+and `HMAC-SHA256(file key, refresh token)`. **Not the refresh token.** No
+access token either: those stay per-process under a `crypto/rand` key, which
+is why an adopted grant authenticates nothing at `/dav/*` until the client
+refreshes it.
+
+**State the trade, because it is real.** Before this file, exiting
+`pelfs browse` was a complete revocation of every credential it had ever
+issued. It is not any more. A refresh token stolen from the client's own
+credential store keeps working across restarts, for up to 30 days, until the
+user revokes that row. "Reconnect with no click" and "a restart revokes
+everything" are the same statement with opposite signs, and the first one is
+what was asked for twice.
+
+What bounds it:
+
+- the scope is unchanged — this volume's `/dav/*`, clamped at every request
+  to the session's own mode, and **never publish** (no DAV grant has ever
+  carried a publish scope, and `/api/v1/publish` refuses an `Authorization`
+  header a layer up);
+- a hard 30-day ceiling, recorded per row and enforced both when the file is
+  read and when a token is presented;
+- every row is **individually listed** on the connection page (with its
+  scope, age, last-used time and the fact that it is persistent) and
+  **individually revocable**, and `RevokeGrant` deletes the row *before* it
+  reports success — so a revoked grant is dead after a restart. That is the
+  property that makes persisting one defensible at all, and
+  `scripts/browse-gate.sh` runs three `pelfs browse` processes in sequence to
+  prove it;
+- a grant is worth nothing without the `client_id`, which is in the
+  installed profile.
+
+**Against its two neighbours,** since a file in the state directory is
+judged against what is already there:
+
+- `v2-signing.key`, unencrypted, in the same directory: the volume's Ed25519
+  signing key, which can publish a generation every reader in the federation
+  will accept. `browse-grants.key` cannot write a byte, and *reading it
+  yields no credential at all* — it is a verifier. Strictly weaker than its
+  neighbour, and A8 already declines to defend against the only attacker who
+  can read either.
+- **the Basic password we just removed**, which we had refused to persist
+  for exactly the reason this file has to answer. It is a different
+  proposition, and here is the difference rather than an assertion of it. A
+  password authenticated at `/dav/*` **directly, in one hop, preemptively**,
+  with no expiry, no recorded scope beyond the client's, no issue time, no
+  last-used time, and one live value per client that rolled silently
+  whenever the user re-downloaded — so it was neither individually visible
+  nor individually revocable in any useful sense. A refresh token
+  authenticates **nothing** on its own: it must be exchanged at
+  `/oauth/token`, against a `client_id` only the installed profile carries,
+  for an access token that dies in an hour — and the grant behind it is one
+  row a user can see, date and kill, with a revoke that reaches the disk.
+  Scoped, bounded, individually listed, durably revocable: that is the
+  difference, and it is why the answer here is yes where the answer for a
+  password was no.
 
 **And one thing to keep off this surface entirely:** the federation bearer
 token. pelfs's OAuth server issues *its own* tokens for *its own* WebDAV

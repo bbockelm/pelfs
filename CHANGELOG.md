@@ -52,6 +52,34 @@ of the tree the session has browsed and not at all by how much changed; the
 line after a checkpoint now reports that resident count beside the inodes
 returned to clean, so an eight-second swap on a three-inode seal is a number
 rather than a mystery.
+**A saved Cyberduck bookmark reconnects with no click.** `pelfs browse` now
+records the OAuth grants a human authorized in
+`<state-dir>/browse-grants.key`, so a program that has been authorized once
+reconnects across a restart without a consent screen. Consent itself is still
+never remembered at `/oauth/authorize` — that is the control that stops a page
+you happened to visit from driving the endpoint — and the two are different
+things: a client holding a refresh token talks to `/oauth/token` and never
+reaches `/authorize` at all. The file holds an HMAC of each refresh token and
+never the token, carries a 30-day ceiling, and every row is listed on the
+connection page with its own revoke button that deletes it from disk before
+reporting success.
+
+**Pressing Authorize lands you on a success page, and pressing it twice does
+not error.** The consent POST used to redirect straight to the WebDAV client's
+loopback listener, which answers by closing the connection — so the browser
+died on a blank tab at the moment the flow had worked. It now answers a page
+that says which program reached which volume, with the authorization delivered
+from one hidden frame. A second press answers "already connected" instead of a
+replay refusal; it mints nothing and re-sends nothing. At the token endpoint, a
+used code presented again *with* its PKCE verifier is the client retrying and
+costs it nothing, while one presented without the verifier still revokes the
+grant the first exchange bought.
+
+**Password authentication is gone from `pelfs browse`.** No per-client HTTP
+Basic credential is minted, no password bookmark is generated, and none is in
+the credential response; `/dav/*` accepts an OAuth Bearer token and offers
+exactly one challenge. The consent screen lost its callback-URL row and its
+paragraph of reassurance — it names the program, the volume and the scope.
 
 **A hostile pack can no longer panic a reader.** The stored-trailer length in
 a pack footer is eight bytes an origin chooses, and the bound check on it

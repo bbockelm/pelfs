@@ -238,7 +238,23 @@ func runBrowse(o *cmdOpts, prefix string, a browseArgs) int {
 		_ = g.stats.Finalize(1, false)
 		return exitErr(err)
 	}
-	bs, err := newBrowseServer(prefix, a, o.snapshotInterval, sessions, port, identity)
+	// And the grants a human already authorized, beside it and under the
+	// same rules — 0600, lazily created, atomically written. This is what
+	// makes a saved Cyberduck bookmark reconnect across a restart with NO
+	// CLICK: the refresh token the client is holding is recognised because
+	// this file remembers an HMAC of it. Consent is unchanged and is still
+	// required to CREATE a grant; internal/localoauth/grants.go is the
+	// argument for why those are different things.
+	//
+	// Unreadable is a startup failure for the same reason the identity is:
+	// the alternative is silently forgetting every connection, which looks
+	// to the user exactly like the bug this file exists to fix.
+	grants, err := localoauth.OpenGrants(stateDir)
+	if err != nil {
+		_ = g.stats.Finalize(1, false)
+		return exitErr(err)
+	}
+	bs, err := newBrowseServer(prefix, a, o.snapshotInterval, sessions, port, identity, grants)
 	if err != nil {
 		_ = g.stats.Finalize(1, false)
 		return exitErr(err)
@@ -742,12 +758,16 @@ type publishJob struct {
 //
 // `id` is the persistent client identity (internal/localoauth's
 // identity.go): the per-volume key that makes a generated
-// .cyberduckprofile byte-identical across restarts. nil is the ephemeral
-// server this verb started with — every client id crypto/rand, every
-// installed profile dead at exit — which is what the tests that are not
-// about persistence pass.
+// .cyberduckprofile byte-identical across restarts. `grants` is the
+// persistent grant roster (grants.go): what makes a program that has been
+// authorized once reconnect after a restart with no consent screen. nil for
+// either is the ephemeral server this verb started with — every client id
+// crypto/rand, every credential dead at exit — which is what the tests that
+// are not about persistence pass. `grants` without `id` is refused by
+// localoauth.New, because a grant is bound to a persistent identity.
 func newBrowseServer(prefix string, a browseArgs, interval time.Duration,
-	m *browsesession.Manager, port int, id *localoauth.Identity) (*browseServer, error) {
+	m *browsesession.Manager, port int, id *localoauth.Identity,
+	grants *localoauth.GrantStore) (*browseServer, error) {
 	b := &browseServer{
 		prefix:      prefix,
 		args:        a,
@@ -773,15 +793,18 @@ func newBrowseServer(prefix string, a browseArgs, interval time.Duration,
 	// pelfs.write. Sessions is the browser-session presence check (A7
 	// control 2): *browsesession.Manager satisfies it as it stands.
 	//
-	// Identity is what makes the CLIENT identity outlive the process, and
-	// nothing else about the credential model changes: no token and no
-	// password reaches the disk, and consent is still required on every
-	// /oauth/authorize.
+	// Identity is what makes the CLIENT identity outlive the process;
+	// Grants is what makes the CONNECTION outlive it. Between them a saved
+	// bookmark works next session with no download, no reinstall and no
+	// click. What does NOT change is the gesture that creates a grant in the
+	// first place: consent is required on every /oauth/authorize, never
+	// remembered there, and there is no password on this listener at all.
 	if b.oauth, err = localoauth.New(localoauth.Config{
 		Writable: a.rw,
 		Volume:   prefix,
 		Sessions: m,
 		Identity: id,
+		Grants:   grants,
 	}); err != nil {
 		return nil, err
 	}

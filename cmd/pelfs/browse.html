@@ -308,9 +308,15 @@
       <code data-testid="dav-url">—</code>, and adding a program below produces a
       Cyberduck or Mountain Duck profile that connects with one double-click and no
       password, plus a username and password for everything else — rclone, WinSCP,
-      <code>mount_webdav</code>, curl. Everything you add here dies when
-      <code>pelfs browse</code> exits: nothing is written to disk and nothing survives
-      the process.
+      <code>mount_webdav</code>, curl. The Cyberduck profile is the same file every
+      session: install it once, and the bookmark you save keeps working after
+      <code>pelfs browse</code> restarts. What does not carry over is the
+      authorization &mdash; you will click <strong>Authorize</strong> once per session,
+      on a screen that names the volume and exactly what is being granted &mdash; nor
+      the password below, which is issued once and replaced if you add this program
+      again. Nothing handed out here can publish, and no access token is ever written
+      to disk; what is on disk is one file in this volume&rsquo;s state directory
+      listing which programs you have set up.
     </p>
 
     <form data-testid="add-program-form" id="add-program">
@@ -712,7 +718,26 @@
       el("credential-new").hidden = true;
       el("credential-new").textContent = "";
     }
-    await api("/api/v1/credentials/revoke", "POST", body).catch(() => {});
+    // fetch RESOLVES on a 500, so .catch alone would drop the one failure that
+    // matters here: revoking a persistent client deletes its identity from the
+    // state directory, and if the in-memory half succeeded while the disk half
+    // did not, the installed profile is still alive after a restart. The server
+    // reports that as a 500 with a reason; say so rather than letting the row
+    // vanish from the refreshed list and imply it worked.
+    try {
+      const res = await api("/api/v1/credentials/revoke", "POST", body);
+      if (!res.ok) {
+        let why = "";
+        try { why = (await res.json()).error || ""; } catch (_) { /* no body */ }
+        const hint = el("connect-hint");
+        hint.textContent = why || `pelfs could not finish revoking that program (${res.status}); it may still work after a restart`;
+        hint.setAttribute("data-testid", "connect-error");
+      }
+    } catch (e) {
+      const hint = el("connect-hint");
+      hint.textContent = "pelfs could not reach the session to revoke that program";
+      hint.setAttribute("data-testid", "connect-error");
+    }
     await refreshCredentials();
   });
 

@@ -123,12 +123,19 @@ atomic load and allocates nothing) and hands it to the session on a
 goroutine of its own — calling a socket inline from a FUSE handler would
 turn "the mount reported an error" into "the mount hung".
 
-`vfsbilly` additionally asks whether the error is one it *chose*: a bare
-`syscall.Errno` handed to `pe` is a deliberate answer (`EACCES`,
-`EINVAL`, `ELOOP`…) and does not latch, and neither does `ENOSPC`, which
-go-nfs maps to `NFS3ERR_NOSPC` rather than to `IO`. The FUSE side needs
-no such test — `errStatus` translates its deliberate answers before the
-fall-through.
+The line is *answering* versus *failing*, not *named* versus *unnamed*.
+`vfsbilly` asks whether the error is one it chose: a bare `syscall.Errno`
+handed to `pe` is a deliberate answer (`EACCES`, `EINVAL`, `ELOOP`…) and
+does not latch, and neither does `ENOSPC`, which go-nfs maps to
+`NFS3ERR_NOSPC` rather than to `IO`. On the FUSE side `errStatus`
+translates its deliberate answers before the fall-through — with one
+exception: a **graft-integrity failure** has a status of its own
+(`EBADMSG`) and still latches, because it means the mount could not
+deliver bytes it had promised, and no more code checks `read(2)` for
+`EBADMSG` than checks it for `EIO`. The NFS frontend has no case for
+that sentinel and latches it by falling through, so latching it
+explicitly on the FUSE side is what keeps the two frontends agreeing
+about the same event.
 
 ## `--on-mount-error`: report, hold, or ignore
 

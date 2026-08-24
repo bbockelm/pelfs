@@ -294,6 +294,19 @@ func errStatus(err error) fuse.Status {
 		// logged, and with MORE care than an unrecognized error, because
 		// the message is the only place a user learns which graft and
 		// which object changed under them.
+		//
+		// It is nevertheless reported to the mount-error latch, which the
+		// other named statuses above are not. The line that separates
+		// them is not whether we have a name for the failure, it is
+		// whether the filesystem is ANSWERING or FAILING: ENOENT and
+		// EISDIR are answers a program asked for, while EBADMSG here
+		// means the mount could not deliver bytes it had promised, and
+		// no more code checks read(2) for EBADMSG than checks it for
+		// EIO. A job whose input changed under it is exactly the case
+		// this reporting exists for (internal/mounterr,
+		// internal/chirp) — and the NFS frontend, which has no case for
+		// this sentinel, already latches it by falling through.
+		mounterr.Fail(mounterr.FrontendFUSE, err)
 		logGraftIntegrity(err)
 		return errGraftIntegrity
 	}

@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -48,6 +49,28 @@ func TestOnlyUntranslatableErrorsLatch(t *testing.T) {
 			}
 		})
 	}
+
+	// The exception, and the reason the rule is "answering versus
+	// failing" rather than "named versus unnamed": a graft-integrity
+	// failure has a status of its own and is still the mount failing to
+	// deliver bytes it promised. The NFS frontend latches it by falling
+	// through, so the FUSE one has to as well or the two disagree about
+	// the same event.
+	t.Run("graft integrity", func(t *testing.T) {
+		mounterr.Rearm()
+		t.Cleanup(mounterr.Rearm)
+		var out bytes.Buffer
+		defer ui.SetOutput(&out, ui.Plain)()
+		graftReportedAt.Store(0)
+
+		err := fmt.Errorf("graft upstream: %w", genfs.ErrGraftIntegrity)
+		if got := errStatus(err); got != errGraftIntegrity {
+			t.Fatalf("errStatus = %v, want the graft-integrity status", got)
+		}
+		if _, ok := mounterr.Fired(); !ok {
+			t.Fatal("a graft-integrity failure did not latch")
+		}
+	})
 
 	t.Run("untranslatable", func(t *testing.T) {
 		mounterr.Rearm()

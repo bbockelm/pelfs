@@ -1,6 +1,7 @@
 # Grafts: serving a foreign Pelican tree as part of a pelfs volume
 
-Status: **spiked, then built out for scale.** A grafted tree is spidered
+Status: **spiked, built out for scale, then made usable on a volume that
+already has content in it.** A grafted tree is spidered
 in parallel, block-digested, published into a signed generation, and read
 back byte-for-byte through a real Linux kernel mount, with no copy of the
 data under the volume's own prefix — and when the source changes
@@ -13,6 +14,18 @@ into a local cache** — proven by killing the graft source and reading the
 tree anyway. The end-to-end is
 `scripts/graft-spike-docker.sh`, and the transcript is in "The spike"
 below.
+
+**The writer's own limit is now gone**, which was ranked item 1 and the one
+thing between this and a usable feature: a graft is SPLICED into the
+previous generation at one path. The volume's other content keeps its
+inodes, its attributes and its published content records; the catalogs
+outside the graft path are carried forward rather than rebuilt; there is a
+verdict per collision case at the path with every refusal ending in what to
+do instead; both nesting cases are refused by name; the advisory lease and
+a re-read of the head bracket the flip; and `--remove` fell out of the same
+source. Decision 14. A graft-integrity failure is also its own error class
+now, so "the source changed" is distinguishable from "the network blinked"
+by a caller and by an errno (Decision 15).
 
 The design content is the decisions, the interaction inventory, and the
 ranked work.
@@ -60,9 +73,15 @@ are fixable; neither is a reason not to do this.
 | `internal/genfs/graftcache.go` | the local disk tier: self-describing blobs under `packs/`, resident identity→(blob, offset) map, verified on every read |
 | `internal/genfs/gencache.go` | two-pass eviction: prefetched graft blobs go last, and the loss is counted |
 | `internal/publish/graftsource.go` | `GraftSource`: a `publish.Source` + `ContentProvider` over a spider result |
-| `cmd/pelfs/graft.go` | `pelfs graft`, `--refresh`, `--list`, the block/concurrency knobs, the scheme allowlist, the mount's `GraftOpener` |
+| `internal/publish/graftsplice.go` | `GraftSpliceSource`: the splice into a POPULATED volume, plus `GraftPreflight` and the collision matrix (Decision 14) |
+| `internal/genfs/grafterr.go` | the graft-integrity error class: `ErrGraftIntegrity`, `*GraftIntegrityError` (Decision 15) |
+| `cmd/pelfs/graft.go` | `pelfs graft`, `--refresh`, `--replace`, `--remove`, `--list`, the block/concurrency knobs, the scheme allowlist, the mount's `GraftOpener` |
+| `cmd/pelfs/graftsplice.go` | the command's side of the splice: the preflight, what it reports, and `--remove` |
 | `cmd/pelfs/mountgen.go` | `--prefetch all｜packs｜background` and what each promises |
 | `internal/genfs/graft_test.go` | the whole read path in the ORDINARY lane: good read, straddling read, fail-closed, no-opener refusal, prefetch arithmetic, a windowed index, and **offline reads after a prefetch** |
+| `internal/genfs/graftintegrity_test.go` | the error class: a changed source, a truncated one, and — the half that makes it worth having — an UNREACHABLE source that must not be classified as changed data |
+| `internal/publish/graftsplice_test.go` | the splice in the ORDINARY lane: the whole collision matrix, both nesting refusals, two grafts side by side, catalog reuse across a nested boundary, idempotence, `--remove`, and interruption safety against a dying store |
+| `internal/rawfuse/graftstatus_internal_test.go` | `EBADMSG` for an integrity failure, `EIO` for a transport one, and the separate log budget |
 | `internal/genfs/graftcache_internal_test.go` | the storage shape (one file per blob, not per block), reopen, torn blobs, both eviction passes |
 | `scripts/graft-spike-{test,docker}.sh` | the mount-backed end-to-end, now including resume and the prefetch modes |
 
@@ -1283,6 +1302,232 @@ eviction passes.
 
 ---
 
+## Decision 14 — Grafting into a POPULATED volume: the splice, and what happens at the path
+
+**Decision: a `publish.Source` that splices the spidered tree over the
+previous generation at exactly one path, on `mergeSource`'s pattern; and a
+verdict per collision case, with every refusal ending in what to do
+instead.**
+
+This was ranked item 1 and it was the thing between the feature and being
+usable: everything before it was `pelfs init` then `pelfs graft`, which
+nobody wants. `internal/publish/graftsplice.go`.
+
+### The shape, and why it is cheap
+
+`mergeSource` was the right model and the analogy is exact in one respect
+and narrower in another: like a merge, the tree publish walks is assembled
+from two sides that already have their content records; unlike a merge, the
+two sides meet at **one path** rather than everywhere, so what has to be
+held is proportional to the depth of the graft path and not to the
+divergence.
+
+Three optional `Source` capabilities carry the whole design, and each
+answers for one half of the tree:
+
+| capability | answers for | what it buys |
+|---|---|---|
+| `ContentReuser` | BASE files | their chunkrefs are the ones the previous generation published, in packs `buildSuperblock` carries forward verbatim. **No byte of the volume is re-read or re-chunked.** |
+| `ContentProvider` | GRAFTED files | external chunkrefs located by the `GraftEntry`, exactly as `GraftSource` does on a fresh volume |
+| `CatalogReuser` | the whole tree | `DirtyInodes`/`DirtyScope` are **the spine and nothing else**, so the walk stops at every catalog root outside the graft path |
+
+The third is the one that makes size irrelevant. A graft into a 10M-inode
+volume rewrites the catalogs from the graft to the root and does not *look
+at* the rest — the git property. `TestGraftAcrossANestedCatalogBoundary`
+measures it: a volume with a real catalog tree, a graft inside one of the
+nested catalogs, and assertions that `CatalogsReused > 0` **and**
+`SubtreesPruned > 0`. A graft path crossing a nested-catalog boundary
+therefore needs no special handling at all and is not refused: catalog
+boundaries are recomputed from weights every publish, and a pruned subtree
+stands in for itself with its recorded weight (`buildDirNode`, `Pinned`).
+
+The completeness argument for that tiny dirty set is worth writing down,
+because `CatalogReuser`'s contract says a missing inode is a lost change.
+Grafted inodes are numbered **above the base generation's allocator mark**,
+so no entry in the previous generation's catalog list can be keyed by one
+of them, and the carry-forward test needs a matching inode *and* a matching
+path. A grafted inode cannot be mistaken for an unchanged one. Everything
+the base published is either on the spine (dirty, rebuilt) or untouched.
+
+A spine directory the volume already has **keeps its inode and its
+attributes** — mode, owner, times, xattrs, and its other entries. That is
+the whole of why an existing volume survives a graft, and
+`TestGraftKeepsAnExistingDirectorysIdentity` pins it.
+
+### The collision matrix
+
+What is at the graft path decides what happens to it. Silently replacing a
+populated directory is the worst outcome this feature had available, so it
+is a refusal; and because a refusal that leaves somebody guessing is worse
+than the operation it prevented, each one ends in a way forward.
+
+| at the graft path | what happens | why |
+|---|---|---|
+| nothing | **graft** | the ordinary case |
+| nothing, and intermediate directories missing | **graft**, synthesizing them (0555, the grafting user) | and it says which ones it will create, so a mistyped path is visible now rather than as empty directories somebody finds later |
+| an intermediate component is a file/symlink/device | **REFUSE** (`ErrGraftPathNotDir`), naming the component | there is nowhere to put the tree. `--replace` does NOT force this: replacing a file with a directory tree the user did not describe is a different operation |
+| an EMPTY directory | **graft into it** | nothing is lost, so nothing is asked. This is the shape a user who prepared a mount point leaves behind, and refusing it would be pedantry |
+| a POPULATED directory | **REFUSE** (`ErrGraftPathNotEmpty`) — with the entry count and two of the names — unless `--replace` | a graft REPLACES the directory it lands on rather than merging into it. Merging was considered and rejected: the hybrid tree it produces has no defensible answer for what the next `--refresh` does to the local half |
+| a file, symlink, or device | **REFUSE** (`ErrGraftPathOccupied`), naming what it is and its size, unless `--replace` | same reason, smaller blast radius |
+| a graft from the SAME source | **REFUSE** (`ErrGraftSameSource`) and say it is a refresh | re-grafting the same source IS `--refresh`, which re-reads only what changed AND keeps the block rule the graft was cut with. A different rule moves every identity in it, so this is not a stylistic preference |
+| a graft from a DIFFERENT source | **REPLACE**, loudly | a graft's bytes were never in this volume, so nothing local is lost — but it changes who every reader of this volume fetches from, so the report names both sources at `WARN` |
+| a whiteout from an earlier deletion | **there is no such case** | whiteouts are an overlay concept (`internal/overlay`); a published generation records a deleted path as simple absence, so this is the "nothing" row. A live writable mount's whiteout over the same path is a concurrent-writer question, answered by the lease and the CAS flip below |
+
+`--replace` covers only the two rows that name it. It is not a
+force-everything flag, and in particular it does not override the nesting
+refusals or the same-source refusal, both of which have specific and
+better answers.
+
+### Nesting: both directions refused, by name
+
+- **A graft INSIDE an existing graft** (`ErrGraftNested`). The directory
+  that would hold it is synthesized from the outer graft's spider result,
+  so the outer graft's next `--refresh` rebuilds that subtree from its
+  source and the inner graft simply stops being in the namespace — a
+  signed generation quietly missing a tree somebody grafted. There is no
+  mechanism here that could keep it, so it is refused rather than
+  half-supported. The message names the outer graft and its source, and
+  offers `--remove`.
+- **A graft CONTAINING an existing graft** (`ErrGraftSwallows`). The new
+  tree covers the inner graft's mount point, so the inner graft's files
+  leave the namespace while its `GraftEntry` stays in the superblock: a
+  volume that names a third party it no longer reads. `--remove` the inner
+  one first and the outer is an ordinary graft.
+- **Two grafts side by side** is the case that must NOT be refused, and
+  `TestTwoGraftsSideBySide` exists to make sure the checks are about
+  nesting rather than about there being a graft at all.
+
+### The generation is a write, so it is a write
+
+`pelfs graft` now does everything a publish does, and the order is the
+interesting part:
+
+1. **Everything that can fail cheaply fails first.** The signing key is
+   loaded and checked against the head, and `publish.GraftPreflight` runs
+   the whole collision matrix — one directory listing per component of the
+   path — *before* a byte of the source is read. A graft streams the whole
+   source once, which at TB scale is hours; "there is a populated
+   directory at that path" is news that has to arrive in the first second.
+2. **The walk.** No lease. It reads a third party's storage and touches
+   nothing of this volume, and holding the branch for the hours it takes
+   would stop a mount from checkpointing for no reason.
+3. **The lease**, taken between the walk and the flip, which is the window
+   that actually needs protecting (`maintenanceLease`, the same one
+   `repack` and `merge` take, on the same per-branch key).
+4. **The head is RE-READ**, and the preflight runs again against it.
+   Splicing against the generation the command started from would publish
+   a tree that never existed: every write a mount checkpointed while the
+   spider ran would be silently reverted. If the branch moved, it says so
+   and splices into what is there now.
+5. **The publish**, whose flip is CAS-guarded against `PrevRaw` and then
+   read back (`publish.flip`).
+
+**Interruption safety** is therefore the pipeline's own, not something
+added: nothing mutable changes until the flip, so a killed `pelfs graft`
+leaves the branch exactly where it was and its uploaded packs as
+unreferenced orphans for GC.
+`TestAFailedGraftLeavesThePreviousGeneration` proves it with a store that
+stops accepting writes partway through — the shape a `kill -9`, a full
+disk or an expired token has from in here — and then asserts the branch
+still holds the old generation, that it still reads through a **cold
+cache**, and that `/ext` is not in its namespace.
+`TestAGraftAgainstAMovedBranchIsRefused` drives the other half: a
+concurrent writer advances the branch mid-walk, the loser's publish is
+refused naming the skew, and the winner's generation is intact.
+
+### `--remove` came along, and it was cheap
+
+Ranked item 5's other half. With the splice in place a removal is the same
+source with the spliced entry **dropped and not re-stated**: the previous
+generation's tree minus one subtree, and the superblock's graft list stated
+without that entry (a non-nil empty slice, since nil carries the parent's
+list forward). It reads nothing, so there is no walk to interrupt and no
+checkpoint to keep — which is what makes it the answer the nesting
+refusals are able to offer.
+
+Two things it deliberately does not do. It does not remove the
+directories the original graft had to CREATE on its way to the mount path
+— removing them would mean guessing which of them the volume's owner also
+wanted, and a graft does not record that — and it is not an undo: the
+generation that served the graft stays readable until it ages out of the
+retention window, so the way back is to re-graft, and the report says so.
+
+### What this leaves for later, stated rather than discovered
+
+- **A refresh RENUMBERS the grafted subtree.** Inodes are numbered from
+  the base generation's allocator mark upward, which makes routing an
+  inode to its side arithmetic rather than a lookup — and means the mark
+  has moved on by the next refresh. Correct but not free: every catalog
+  under the graft rebuilds even where nothing changed, and the allocator
+  advances by the size of the graft each time. Preserving the numbers
+  means walking the old subtree for its path→inode map. Ranked below.
+- **An out-of-band publish strands a leftover write overlay**, and this
+  is where people will meet it. An overlay records the generation it
+  shadows, so a head that moves underneath it makes it unsealable and
+  `pelfs mount --rw` refuses with `overlay.ErrGeneration`. Not new and not
+  graft-specific — `pelfs repack`, `pelfs merge` and a second writer have
+  always done it — but grafting into a *populated* volume means the state
+  directory has usually just had a writable mount in it. `pelfs graft`
+  now WARNS about it up front, where it costs nothing to act on. The real
+  fix is for `overlay.Open` to retire a mismatched overlay that has
+  nothing unsealed in it, and that is a change to the write path's
+  contract rather than to this feature. Ranked below.
+- **A source truncated below a block's START** comes back as a transport
+  error (HTTP 416) and is classified as one rather than as a
+  graft-integrity failure. Distinguishing "the object shrank" from any
+  other range refusal would mean parsing the transport's status here or
+  spending a HEAD on every failure. The read fails closed either way; only
+  the label is less precise. `TestATruncatedSourceIsAlsoAnIntegrityError`
+  truncates *inside* the block being read, which is the case the
+  classification does catch.
+
+---
+
+## Decision 15 — Graft-integrity failure is its own error class
+
+**Decision: `genfs.ErrGraftIntegrity`, a `*genfs.GraftIntegrityError`
+carrying the evidence, and `EBADMSG` at the FUSE boundary. The message is
+unchanged.**
+
+Ranked item 12, and the log line that named it —
+`Read: returning EIO for an unrecognized error` — was the whole
+complaint: the one failure in this system that is neither damage nor a bug
+was arriving as the sentence we print when we do not understand our own
+failure.
+
+The distinction that makes the class worth having is **operational, not
+aesthetic**. A grafted read fails in two ways that mean opposite things:
+
+| what happened | retry? | class | errno |
+|---|---|---|---|
+| the source was unreachable — a GET failed, a token expired, a federation was down | **yes**, probably in a second | ordinary I/O error | `EIO` |
+| the source ANSWERED and the bytes were not the published bytes | **never** — the next read of the same range returns the same wrong bytes, because the source really has changed | `ErrGraftIntegrity` | `EBADMSG` |
+
+A job that retries on `EIO` spins forever on the second, and from one
+errno it cannot tell them apart. `EBADMSG` ("Bad message") is also the
+honest sentence for it — the message that arrived is not the message that
+was asked for — and it is what a user sees out of `cp`, `tar` or `dd`,
+distinctive enough to search for where "Input/output error" is the generic
+muddle.
+
+Three consequences:
+
+- **Go callers ask once.** `errors.Is(err, genfs.ErrGraftIntegrity)`
+  covers both kinds; `errors.As` into `*GraftIntegrityError` gets the
+  graft, the source, the object key, the range, and both hashes, so an
+  fsck finding or a report never has to parse the message.
+- **The log line is its own**, on its own suppression budget rather than
+  the EIO explainer's, so a mount drowning in unrelated EIOs cannot
+  silence the one message that names a changed source. It keeps the whole
+  original sentence, which already named the graft, the object, the range,
+  both hashes, what changed, and the fix.
+- **`GraftStats.Mismatch` now counts both kinds** — a hash mismatch and a
+  short object are both "the source changed" — so `Failures` with
+  `Mismatch` at zero means a network, and a non-zero `Mismatch` is never
+  zero for a benign reason.
+
+---
+
 ## The spike
 
 `scripts/graft-spike-docker.sh` → `scripts/graft-spike-test.sh`. Docker,
@@ -1335,10 +1580,10 @@ about the namespace looks wrong.
 PASS: the other grafted files are unaffected
 
 -- the mutated block must FAIL, not return wrong bytes --
-dd: error reading '…/mnt/ext/data/multiblock.bin': Input/output error
+dd: error reading '…/mnt/ext/data/multiblock.bin': Bad message
 0 bytes copied
 
-ERROR pelfs: Read: returning EIO for an unrecognized error: genfs: graft /ext:
+ERROR pelfs: graft integrity failure, returning EBADMSG ("Bad message"): genfs: graft /ext:
 http://127.0.0.1:18997/ext/data/multiblock.bin [1048576,+1048576) hashes to
 8a7b79e18a96b98ac30a6287c32eb8ec9405514f03e11b3f82d4c76d20a52a78, the generation
 says 5dfc71717d9f562de745c6870a9af3ce870a2614ca366c0814f3591939f7ed63 — the graft
@@ -1349,11 +1594,12 @@ PASS: failed closed, naming the graft, the source, the object and the fix
 PASS: the unchanged blocks of the SAME file still read (per-block granularity)
 ```
 
-Note `Read: returning EIO for an unrecognized error`. That is the raw-FUSE
-binding saying it has no errno for this, and it is **a finding, not
-noise**: a graft-integrity failure deserves its own error class rather than
-falling through the catch-all. The user-visible `EIO` is right; the log line
-admitting it is unrecognized is not.
+That log line used to read `Read: returning EIO for an unrecognized
+error` — the raw-FUSE binding saying it had no errno for this — and it was
+**a finding, not noise**. It is fixed: Decision 15 gave the failure its own
+error class, its own errno, and its own log budget, and `dd` now says `Bad
+message` instead of `Input/output error`, which is both more accurate and
+distinguishable from the transport failure that IS worth retrying.
 
 ### Ungraft on write
 
@@ -1437,13 +1683,12 @@ graft is not damage.
 
 Said plainly:
 
-- **It grafts over an empty root.** `pelfs init` then `pelfs graft`.
-  Grafting into a volume that already has content needs the source to
-  merge the previous generation's tree with the spidered one — the job
-  `mergeSource` already does over two generations. **Nothing in the read
-  path or the format changes**; the writer is what is unfinished. Ranked
-  item 1, and it is now the largest remaining gap between this and a
-  feature.
+- ~~It grafts over an empty root.~~ **Done, Decision 14** — and the
+  transcript above is section 9 of the spike: a volume written through a
+  real writable mount and sealed, then grafted into, with every
+  pre-existing file compared byte for byte afterwards, a seal over the
+  grafted volume, and a cold remount that agrees with all of it. Nothing
+  in the read path or the format changed, as predicted.
 - **`fsck` still reports every grafted file as damaged** and exits 1. It
   needs a severity axis first, which is a contract change and is
   deliberately NOT touched here — see the boundary note under Decision 4.
@@ -1451,9 +1696,9 @@ Said plainly:
   multi-block read is one request per block, plus one index lookup per
   block on a windowed index. The speculation trick in Decision 9 makes
   both nearly free and is not built.
-- **No `--remove`**, no `merge` support, no `grafts/` retention key space,
-  no `GraftStats` in the stats JSON (the PREFETCH graft counters are
-  there; the read-path ones are not yet).
+- No `merge` support, no `grafts/` retention key space, no `GraftStats` in
+  the stats JSON (the PREFETCH graft counters are there; the read-path ones
+  are not yet). **`--remove` is built** (Decision 14).
 - **No `pelfs cache` awareness of graft blobs as a category.** They are
   counted — they live under `packs/`, which is the point — but a user
   reading the breakdown sees them as pack bytes. A `graft` line in
@@ -1464,8 +1709,9 @@ Said plainly:
   (Decision 13). Pass 2 of the sweep can take it back if the cache goes
   over its cap, and `PinnedEvicted` records that. Nothing yet SURFACES
   that number to the user mid-session.
-- **No test of concurrent readers of one graft block**, of a source that
-  fails mid-read, or of a graft across a nested-catalog boundary.
+- **No test of concurrent readers of one graft block**, or of a source that
+  fails mid-read. A graft across a nested-catalog boundary IS tested now
+  (`TestGraftAcrossANestedCatalogBoundary`).
 - **The resume is tested against process exit, not against a kill in the
   middle of a span.** The unit of durability is the object, so a killed
   span costs that object; that is argued, and it is not yet asserted by a
@@ -1480,26 +1726,31 @@ items are done** in this round.
 
 | # | Work | Why it is here | Effort |
 |---|---|---|---|
-| 1 | **Graft into a populated volume** — a `Source` that splices a spidered tree over the previous generation, on `mergeSource`'s pattern | without it the feature is `init`-then-`graft` only, which is not the use case | 3–4 d |
+| 1 | ~~**Graft into a populated volume**~~ | **done** — Decision 14; `publish.GraftSpliceSource`, the collision matrix, both nesting refusals, the lease and the re-read, and interruption safety proven against a dying store | — |
 | 2 | **`fsck`: a `Severity` axis, then graft awareness** | `fsck` reports every grafted file as damaged and exits 1. The severity change must land first and is a contract change — see the boundary note in Decision 4 | 2 d + 2 d |
 | 3 | ~~`--prefetch`: FETCH grafted blocks into a local cache tier~~ | **done** — Decision 13; blobs under `packs/`, verified on the way in, offline reads proven, two-pass eviction, budget refusal with both numbers | — |
 | 4 | ~~Ranged-window index lookup~~ | **done** — Decision 9; `graft.Reader`, whole under 4 MiB, windowed above | — |
-| 5 | ~~`pelfs graft --refresh`~~ / **`--remove`** | refresh is done and costs only what changed (Decision 11). `--remove` is still named in no error message and unbuilt | 0.5 d |
+| 5 | ~~`pelfs graft --refresh`~~ / ~~**`--remove`**~~ | **done** — refresh costs only what changed (Decision 11); `--remove` fell out of the splice (Decision 14) and is what the nesting refusals now offer | — |
 | 6 | **`grafts/` in the retention key space** | index objects leak forever today, and they are now large | 0.5 d |
 | 7 | **Coalesce adjacent graft blocks, and SPECULATE the next block's location** | one request per block, plus one index lookup per block on a windowed index. The identity check makes a wrong guess free (Decision 9) | 1–2 d |
 | 8 | **`merge`: `ProvidedGrafts`, and make `sameRef` location-aware** | merge on a grafted volume fails loudly now; making it work needs both | 2–3 d |
 | 9 | **Publish `GraftStats` into the stats JSON; wrap the graft store in `stats.WrapStorage`** | third-party traffic is invisible in the summary | 1 d |
 | 10 | ~~Spider: parallelism, and `extsort` instead of an in-memory identity set~~ | **done** — Decision 11; plus the checkpoint, the progress ticker, and the two-listing consistency check, none of which were on this list and all of which the size demanded | — |
 | 11 | **`--no-graft` and `--graft-allow` mount flags** | the reader's veto is all-or-nothing today | 1 d |
-| 12 | **A distinct errno/error class for graft-integrity failure** | `returning EIO for an unrecognized error` in the log, still | 0.5 d |
+| 12 | ~~**A distinct errno/error class for graft-integrity failure**~~ | **done** — Decision 15; `genfs.ErrGraftIntegrity`, `*GraftIntegrityError`, `EBADMSG`, its own log budget | — |
 | 13 | **Re-derive `GraftEntry.Path` at report time, or record the root inode** | renaming a grafted directory makes `--list` lie | 0.5 d |
 | 14 | **`pelfs graft --materialize`** | permanently ungraft a subtree (Decision 13) — distinct from prefetch, which is now built; reuses `adoptByReading` and `publish`, needs the lease and a resumable driver | 3–4 d |
 | 17 | **Report graft blobs as their own line in `pelfs cache`, and surface `PinnedEvicted`** | a prefetched graft that got evicted is invisible to the user today | 0.5 d |
 | 15 | **Use the source's advertised object digest** in `fsck --check-grafts` and to gate `--refresh` | strictly stronger than the size+mtime gate, and it is the thing to build instead of TOFU (Decision 12) | 1–2 d |
 | 16 | **Arena sizing for graft-heavy mounts** | the arena is tuned against decode cost, and a graft trades in round trips | investigation |
+| 18 | **Preserve grafted inode numbers across a `--refresh`** | a refresh renumbers the whole grafted subtree, so every catalog under it rebuilds even where nothing changed, and the allocator advances by the size of the graft each time. Needs a walk of the old subtree for its path→inode map (Decision 14) | 1–2 d |
+| 19 | **`overlay.Open` should retire a mismatched overlay that has nothing unsealed** | an out-of-band publish — graft, repack, merge, a second writer — strands a clean leftover overlay and `mount --rw` refuses it. `pelfs graft` warns now; the fix belongs to the write path (Decision 14) | 1 d |
 
-Item 1 is now the only thing between this and a usable feature; item 2 is
-the only thing between it and a volume `fsck` can be run on.
+Item 1 is done, so the feature is usable on a volume that already has
+content in it. **Item 2 is now the only thing between it and a volume
+`fsck` can be run on** — `fsck` reports every grafted file as
+`missing-chunk` and exits 1, which the graft spike's own last section
+prints and then explains rather than failing on.
 
 ---
 

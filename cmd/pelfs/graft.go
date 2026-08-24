@@ -25,10 +25,14 @@ import (
 // of it, and publishes a generation that serves the tree at <path> with
 // no copy of the data under the volume's own prefix.
 //
-// What is proven and what is not is in docs/design-graft.md. The limit a
-// user would hit first: the graft REPLACES the tree rather than being
-// spliced into it, so this is `pelfs init` then `pelfs graft`, not a
-// graft into a populated volume.
+// The tree is SPLICED into the volume: everything the volume already
+// serves stays exactly as the previous generation published it, and only
+// the catalogs from the graft path to the root are rewritten
+// (internal/publish/graftsplice.go). What happens when something is
+// already at the graft path is a decision per case, and every refusal ends
+// in what to do instead — the table is in docs/design-graft.md.
+//
+// What is proven and what is not is in docs/design-graft.md.
 
 func cmdGraft(args []string) int {
 	var (
@@ -42,6 +46,8 @@ func cmdGraft(args []string) int {
 		conc      int
 		span      int64
 		restart   bool
+		replace   bool
+		remove    bool
 	)
 	o, pos, err := parseArgs("graft", args, 1, 3, func(fs *flag.FlagSet, o *cmdOpts) {
 		fs.StringVar(&pubkeyHex, "volume-pubkey", "", "hex Ed25519 volume key to trust (default: pin on first use)")
@@ -54,6 +60,8 @@ func cmdGraft(args []string) int {
 		fs.IntVar(&conc, "concurrency", 0, "ranged reads of the source in flight (default: the transfer pool)")
 		fs.Int64Var(&span, "span", graft.DefaultSpanBytes, "most bytes one ranged read of the source covers")
 		fs.BoolVar(&restart, "restart", false, "discard the checkpoint and re-read the whole source")
+		fs.BoolVar(&replace, "replace", false, "permit the graft to displace a populated directory, or a file, already at <path>")
+		fs.BoolVar(&remove, "remove", false, "drop the graft at <path> and publish a generation without it")
 	})
 	if err != nil {
 		return exitErr(err)
@@ -88,9 +96,23 @@ func cmdGraft(args []string) int {
 		return 0
 	}
 
+	if refresh && remove {
+		return exitErr(fmt.Errorf("--refresh re-reads a graft and --remove deletes one; " +
+			"pass one of them"))
+	}
 	policy := graft.BlockPolicy{Block: block, Max: blockMax, PerObject: perObject}
 	var mountPath, source string
 	switch {
+	case remove:
+		// A removal reads nothing: it publishes the previous generation's
+		// tree with one subtree taken out and the superblock's graft entry
+		// dropped. The path is the only argument, and the source comes
+		// from the recorded entry so that the report can say what stopped
+		// being depended on.
+		if len(pos) != 2 {
+			return exitErr(fmt.Errorf("usage: pelfs graft --remove <volume> <path>"))
+		}
+		mountPath = cleanGraftPath(pos[1])
 	case refresh:
 		// A refresh must cut IDENTICALLY or every identity moves and it is
 		// a new graft rather than a refresh, so the source and the rule
@@ -122,6 +144,16 @@ func cmdGraft(args []string) int {
 		return exitErr(err)
 	}
 
+	if head.Superblock.CatalogKeyID != 0 {
+		// Refused at the writer too, so an encrypted volume never carries
+		// a graft that its own readers would then refuse to mount. The
+		// reason is in genfs.openGrafts: nothing there can verify a
+		// grafted block on a keyed-identity volume.
+		return exitErr(fmt.Errorf("volume %s is encrypted; a graft's blocks carry no AEAD tag and "+
+			"its identities are keyed, so no reader could verify them "+
+			"(docs/design-graft.md, \"Encryption\")", pos[0]))
+	}
+
 	// THE SECURITY DECISION, enforced at the writer as well as the reader.
 	//
 	// A graft makes OTHER PEOPLE's clients fetch a URL this volume's
@@ -137,8 +169,34 @@ func cmdGraft(args []string) int {
 	// reader has an independent veto in genfs (Options.GraftOpener), and
 	// that is the one that actually protects a reader — this check only
 	// stops an author publishing something no reader should accept.
-	if err := checkGraftSource(source); err != nil {
+	if !remove {
+		if err := checkGraftSource(source); err != nil {
+			return exitErr(err)
+		}
+	}
+
+	// EVERYTHING THAT CAN FAIL CHEAPLY FAILS HERE, before a byte of
+	// somebody else's storage has been read. A graft streams the whole
+	// source once, which at TB scale is hours, so "there is a populated
+	// directory at that path" and "this state directory does not hold this
+	// volume's signing key" are both news that has to arrive in the first
+	// second rather than the last.
+	signingKey, err := loadOrCreateSigningKey(signingKeyFileIn(stateDir, ""), head.Superblock)
+	if err != nil {
 		return exitErr(err)
+	}
+	plan, err := graftPreflight(ctx, o, inner, stateDir, head.Superblock, mountPath, source, replace, refresh, remove)
+	if err != nil {
+		return exitErr(err)
+	}
+	reportGraftPlan(plan, mountPath, source, remove)
+	warnAboutLeftoverOverlay(stateDir)
+
+	if remove {
+		return graftRemove(ctx, graftPublishArgs{
+			o: o, inner: inner, refs: rstore, stateDir: stateDir, prefix: pos[0],
+			branch: branch, head: head, key: signingKey, mount: mountPath,
+		})
 	}
 
 	src, err := pelicanobj.New(ctx, pelicanobj.Config{
@@ -147,16 +205,6 @@ func cmdGraft(args []string) int {
 	})
 	if err != nil {
 		return exitErr(fmt.Errorf("open graft source %s: %w", source, err))
-	}
-
-	if head.Superblock.CatalogKeyID != 0 {
-		// Refused at the writer too, so an encrypted volume never carries
-		// a graft that its own readers would then refuse to mount. The
-		// reason is in genfs.openGrafts: nothing there can verify a
-		// grafted block on a keyed-identity volume.
-		return exitErr(fmt.Errorf("volume %s is encrypted; a graft's blocks carry no AEAD tag and "+
-			"its identities are keyed, so no reader could verify them "+
-			"(docs/design-graft.md, \"Encryption\")", pos[0]))
 	}
 
 	// THE CHECKPOINT. A graft reads every byte of the source once, which
@@ -232,26 +280,52 @@ func cmdGraft(args []string) int {
 	if err != nil {
 		return exitErr(err)
 	}
-	signingKey, err := loadOrCreateSigningKey(signingKeyFileIn(stateDir, ""), nil)
+
+	// THE LEASE, taken HERE and not before the walk. The walk touches
+	// nothing of this volume — it reads a third party's storage — and
+	// holding the branch for the hours that takes would stop a mount from
+	// checkpointing for no reason at all. What needs protecting is the
+	// window from "read the head" to "flip the ref", which is what
+	// everything below is.
+	lease, err := maintenanceLease(ctx, o, pos[0], branch, "graft-"+newSessionID())
+	if err != nil {
+		return exitErr(err)
+	}
+	defer releaseLease(ctx, lease)
+
+	// AND THE HEAD IS RE-READ, because the walk took as long as it took.
+	// Splicing against the generation this command started from would
+	// publish a tree that never existed: every write a mount checkpointed
+	// while the spider ran would be silently reverted. The preflight runs
+	// again for the same reason — a directory may have appeared at the
+	// graft path in the meantime — and it is cheap enough to pay twice.
+	head, err = rstore.Fetch(ctx, branch)
+	if err != nil {
+		return exitErr(fmt.Errorf("re-read %s/%s after the walk: %w", refs.RefDirKey, branch, err))
+	}
+	if head.Superblock.Generation != plan.generation {
+		ui.Warn("the branch moved from generation {was} to {now} while the source was being read; "+
+			"the graft is spliced into {now}, and the preflight is being re-run against it",
+			"was", plan.generation, "now", head.Superblock.Generation)
+	}
+	base, err := openGraftBase(ctx, o, inner, stateDir, head.Superblock)
+	if err != nil {
+		return exitErr(err)
+	}
+	defer base.Close() //nolint:errcheck
+	splice, err := publish.NewGraftSpliceSource(ctx, publish.GraftSpliceOptions{
+		Base: base, Prev: head.Superblock, Graft: gsrc, Source: source,
+		Mount: mountPath, Replace: replace, Refresh: refresh,
+	})
 	if err != nil {
 		return exitErr(err)
 	}
 	// The parent's grafts plus this one. Options.Grafts REPLACES the list,
 	// so it has to be stated whole — carrying the parent's forward is what
 	// keeps a second graft from deleting the first.
-	grafts := append([]superblock.GraftEntry(nil), head.Superblock.Grafts...)
-	replaced := false
-	for i := range grafts {
-		if grafts[i].Path == entry.Path {
-			grafts[i] = entry
-			replaced = true
-		}
-	}
-	if !replaced {
-		grafts = append(grafts, entry)
-	}
-	if _, err := publish.Publish(ctx, publish.Options{
-		Source:     gsrc,
+	grafts := graftListWith(head.Superblock.Grafts, entry)
+	pub, err := publish.Publish(ctx, publish.Options{
+		Source:     splice,
 		Inner:      inner,
 		SpoolDir:   stateDir,
 		Branch:     branch,
@@ -259,7 +333,8 @@ func cmdGraft(args []string) int {
 		Prev:       head.Superblock,
 		PrevRaw:    head.Raw,
 		Grafts:     grafts,
-	}); err != nil {
+	})
+	if err != nil {
 		return exitErr(err)
 	}
 	ui.Info("grafted {files} files ({bytes} bytes) at {path} from {source}",
@@ -284,6 +359,16 @@ func cmdGraft(args []string) int {
 		"rather than serving wrong bytes", "source", source, "path", entry.Path)
 	ui.Info("the checkpoint at {path} is kept: `pelfs graft --refresh {volume} {mount}` will "+
 		"re-read only what changed", "path", ckptPath, "volume", pos[0], "mount", entry.Path)
+	// What a person grafting into a volume they care about most wants to
+	// hear: the rest of it was not rewritten. The carried count is the
+	// measure — those catalogs are the previous generation's bytes,
+	// referenced rather than rebuilt.
+	ui.Info("generation {gen} is the previous tree with {path} spliced in: {carried} catalogs "+
+		"carried forward unchanged, {wrote} rewritten, {reused} files' content records reused "+
+		"as published",
+		"gen", pub.Superblock.Generation, "path", entry.Path,
+		"carried", pub.Stats.CatalogsReused, "wrote", pub.Stats.Catalogs,
+		"reused", pub.Stats.ReusedFiles)
 	return 0
 }
 
@@ -339,8 +424,25 @@ func cleanGraftPath(p string) string {
 	return p
 }
 
-// checkGraftSource applies the writer-side scheme allowlist.
+// checkGraftSource applies the writer-side scheme allowlist, and says out
+// loud when a source is allowed only because tests need it to be.
 func checkGraftSource(source string) error {
+	return checkGraftSourceScheme(source, true)
+}
+
+// checkGraftSourceQuiet is the same check with the advisory line
+// suppressed, for the paths that apply it more than once in a run.
+//
+// `pelfs graft` opens the generation it is splicing into twice (once for
+// the preflight, once for the publish) and each open builds a transport
+// per graft the volume already serves, so the loud form would repeat the
+// same sentence four or six times about a source the command has already
+// named. The CHECK still runs every time; only the narration is dropped.
+func checkGraftSourceQuiet(source string) error {
+	return checkGraftSourceScheme(source, false)
+}
+
+func checkGraftSourceScheme(source string, loud bool) error {
 	u, err := url.Parse(source)
 	if err != nil {
 		return fmt.Errorf("graft source %q is not a URL: %w", source, err)
@@ -353,9 +455,11 @@ func checkGraftSource(source string) error {
 		// because the volume prefix itself may be one, so refusing it
 		// would make a graft untestable without a federation — but it is
 		// the case a reader-side veto exists for, and the writer says so.
-		ui.Warn("graft source {source} is a direct HTTP prefix, not a federated one: "+
-			"no director, no failover, and every reader of this volume will fetch that host "+
-			"directly", "source", source)
+		if loud {
+			ui.Warn("graft source {source} is a direct HTTP prefix, not a federated one: "+
+				"no director, no failover, and every reader of this volume will fetch that host "+
+				"directly", "source", source)
+		}
 		return nil
 	case "file", "":
 		// Refused absolutely, and not as a policy preference. A graft is
@@ -390,11 +494,29 @@ func checkGraftSource(source string) error {
 // of federations — is argued in docs/design-graft.md and is not
 // implemented.
 func graftOpener(o *cmdOpts) func(context.Context, string) (pelicanobj.Store, error) {
+	return graftOpenerLoud(o, true)
+}
+
+// graftOpenerQuiet is the same veto without the per-source narration, for
+// a command that opens a generation only to WRITE the next one and has
+// already said which third parties are involved (see
+// checkGraftSourceQuiet).
+func graftOpenerQuiet(o *cmdOpts) func(context.Context, string) (pelicanobj.Store, error) {
+	return graftOpenerLoud(o, false)
+}
+
+func graftOpenerLoud(o *cmdOpts, loud bool) func(context.Context, string) (pelicanobj.Store, error) {
 	return func(ctx context.Context, source string) (pelicanobj.Store, error) {
-		if err := checkGraftSource(source); err != nil {
+		check := checkGraftSourceQuiet
+		if loud {
+			check = checkGraftSource
+		}
+		if err := check(source); err != nil {
 			return nil, err
 		}
-		ui.Info("graft source: reads under a grafted path will fetch {source}", "source", source)
+		if loud {
+			ui.Info("graft source: reads under a grafted path will fetch {source}", "source", source)
+		}
 		return pelicanobj.New(ctx, pelicanobj.Config{
 			PrefixURL: source, TokenPath: o.token, Insecure: o.insecure,
 			AcquireToken: !o.noAcquireToken,

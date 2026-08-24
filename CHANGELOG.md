@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+**A volume that will not open says why, on the page.** Both surfaces rendered
+every phase that was not `ready` as "reading the overlay…", so a session
+refused by a leftover branch lease looked exactly like one that was about to
+open. A failed open now renders the server's whole sentence — what refused,
+this session's state directory, and what to do next — as a stopped state
+rather than a progress message, and no publish control beside it.
+
+**A branch switch no longer reads as a publish.** `POST /api/v1/branch`
+reports progress in the publish job slot with `reason: "branch"`; the page
+reads the reason and says the session is switching branches, which is what is
+happening — nothing is being written to the federation.
+
 **The branch pill is a control.** `GET /api/v1/branches` lists the volume's
 branches with the generation, head and staged flag the picker needs, and
 `POST /api/v1/branch` switches — 202 with progress on `/events` like a

@@ -83,6 +83,15 @@ export type SsoPrompt = {
 export type PublishJob = {
   id: string;
   state: "running" | "done" | "failed" | "idle";
+  /**
+   * WHO ASKED, and it is not always a publish at all: "user" is the button,
+   * "idle" is the seal that runs when the last tab has been gone a while, and
+   * "branch" is `POST /api/v1/branch` -- a switch, reported in this slot
+   * because a switch and a seal both hold the session lock end to end. The
+   * page reads it: "publishing…" over a branch switch would say the user's
+   * bytes are going to the federation when they are not.
+   */
+  reason?: string;
   started: string;
   ended?: string;
   summary?: string;

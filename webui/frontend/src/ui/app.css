@@ -146,6 +146,17 @@
   border-left-color: var(--pelfs-federated);
 }
 
+/* A FAILED OPEN IS A STOPPED STATE, NOT A LOADING ONE. This is the one place
+   the panel is allowed to be loud: there is no volume, the reader's next
+   action is inside the sentence, and a quiet line here is what left people
+   watching "reading the overlay…" forever. */
+.pelfs-panel--status[data-durability="failed"] {
+  border-left-color: #c0392b;
+  background: var(--pelfs-bad-wash);
+  border-color: var(--pelfs-bad-rule);
+  color: var(--pelfs-bad-ink);
+}
+
 /* THE FILE PANEL: a frame around the component, and the component fills it.
    `overflow: hidden` is what makes the radius real at the corners of the
    vendor's own toolbar. */
@@ -204,6 +215,14 @@
   font-size: 0.95rem;
 }
 
+/* pre-wrap because the server's failure sentence is MULTI-LINE -- what
+   refused, where this session's state directory is, what to do next -- and
+   flowing those three into one paragraph is how a path stops being
+   copy-pasteable. */
+.pelfs-status__line--failed {
+  white-space: pre-wrap;
+}
+
 .pelfs-status__aside {
   display: flex;
   align-items: center;
@@ -227,6 +246,10 @@
 
 .pelfs-glyph--published {
   color: var(--pelfs-federated);
+}
+
+.pelfs-glyph--failed {
+  color: #c0392b;
 }
 
 .pelfs-status__note {

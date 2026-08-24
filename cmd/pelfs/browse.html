@@ -121,6 +121,13 @@
   section.panel.status { border-left: 3px solid var(--rule); }
   section.panel.status[data-durability="staged"] { border-left-color: var(--staged); }
   section.panel.status[data-durability="published"] { border-left-color: var(--published); }
+  /* A FAILED OPEN IS A STOPPED STATE, NOT A LOADING ONE, and it is the one
+     place this panel is allowed to be loud: there is no volume, and the
+     reader's next action is inside the sentence. */
+  section.panel.status[data-durability="failed"] {
+    border-left-color: #c0392b; background: var(--bad-wash);
+    border-color: var(--bad-rule); color: var(--bad-ink);
+  }
   h1 { font-size: 1.15rem; font-weight: 650; margin: 0; letter-spacing: -.01em;
        display: flex; align-items: center; gap: .45rem; min-width: 0; }
   /* THE WORDMARK IS THE WAY HOME, which is what every other web page has
@@ -167,10 +174,16 @@
   .banner.bad { background: var(--bad-wash); border-color: var(--bad-rule); border-left-color: #c0392b; color: var(--bad-ink); }
   .banner[hidden] { display: none; }
   #durability { font-size: .95rem; margin: 0; }
+  /* pre-wrap because the server's failure sentence is MULTI-LINE -- what
+     refused, where this session's state directory is, what to do next -- and
+     flowing those into one paragraph is how a path stops being
+     copy-pasteable. */
+  #durability[data-durability="failed"] { white-space: pre-wrap; }
   .glyph { font-weight: 700; margin-right: .35rem; }
   .glyph.staged { color: var(--staged); }
   .glyph.published { color: var(--published); }
   .glyph.sending { color: var(--brand); }
+  .glyph.failed { color: #c0392b; }
   /* The SSO card. Brand-light rather than a warning colour: being asked to
      log in is normal, not a fault. */
   .sso {
@@ -820,18 +833,20 @@
     if (ready !== connectReady) {
       connectReady = ready;
       el("add-program-button").disabled = !ready;
-      el("connect-hint").textContent = ready ? "" : "(waiting for the volume)";
       if (ready) refreshCredentials();
     }
+    // "(waiting for the volume)" is a progress message, and a failed open is
+    // not progress: nothing is coming, and the panel above says why.
+    el("connect-hint").textContent =
+      ready || s.phase === "failed" ? "" : "(waiting for the volume)";
 
+    // The banner is the CONNECTING sentence and nothing else now. A failed
+    // open used to be said here AND left the durability panel below saying
+    // "reading the overlay…", which is two answers to one question with the
+    // wrong one underneath. The failure belongs in the panel, which is the
+    // surface the app at `/` renders too (webui/frontend/src/durability.ts).
     const phase = t("phase-banner");
-    if (s.phase === "ready") {
-      phase.hidden = true;
-    } else if (s.phase === "failed") {
-      phase.className = "banner bad";
-      phase.textContent = `pelfs could not open this volume: ${s.error}`;
-      phase.hidden = false;
-    }
+    if (s.phase !== "connecting") phase.hidden = true;
 
     // A lease this session no longer holds means everything the user does
     // from here is going to fail at the seal, so it is a banner the moment
@@ -859,7 +874,26 @@
     // collaborator the data is there.
     dirty = s.staged_files;
     const d = t("durability");
-    if (s.phase !== "ready") {
+    if (s.phase === "failed") {
+      // A FAILED OPEN IS NOT A SLOW ONE. Every phase that was not "ready"
+      // used to render as "Reading the overlay…", so a volume that refused
+      // to open -- a branch lease left behind by a --rw session that did not
+      // exit cleanly is the ordinary way in -- looked exactly like one that
+      // was about to open. cmd/pelfs/browsefail.go now SERVES the reason,
+      // and `error` is a whole sentence: what refused, where this session's
+      // state directory is, and what to do next. It is rendered unedited.
+      //
+      // createElement and textContent, never innerHTML: the sentence carries
+      // an error from off this machine.
+      d.textContent = "";
+      const g = document.createElement("span");
+      g.className = "glyph failed";
+      g.textContent = "✗";
+      d.append(g, s.error
+        ? `pelfs could not open this volume.\n${s.error}`
+        : "pelfs could not open this volume.");
+      d.dataset.durability = "failed";
+    } else if (s.phase !== "ready") {
       d.textContent = "Reading the overlay…";
       d.dataset.durability = "unknown";
     } else if (s.mode === "read-only" || (s.staged_files === 0 && s.dirty_nodes === 0)) {
@@ -895,12 +929,22 @@
     const btn = el("publish"), hint = el("publish-hint");
     const job = s.publish;
     let state = "ready";
-    if (s.phase !== "ready") state = "connecting";
+    if (s.phase === "failed") state = "failed";
+    else if (s.phase !== "ready") state = "connecting";
     else if (s.mode === "read-only") state = "read-only";
-    else if (job && job.state === "running") state = "running";
-    else if (s.staged_files === 0 && s.dirty_nodes === 0) state = "nothing";
+    else if (job && job.state === "running") {
+      // The SAME job slot, and not the same event: `POST /api/v1/branch`
+      // reports itself here with reason "branch". Calling that "publishing"
+      // would say the user's bytes are going to the federation while the
+      // session is reopening an overlay on another head.
+      state = job.reason === "branch" ? "switching" : "running";
+    } else if (s.staged_files === 0 && s.dirty_nodes === 0) state = "nothing";
     if (btn) {
-      if (state === "read-only") {
+      if (state === "failed") {
+        // No volume, so nothing to press and nothing to explain: the line
+        // above is the whole answer, and it is the server's.
+        btn.hidden = true;
+      } else if (state === "read-only") {
         // One-way: `mode` is fixed for the life of the process (it is --rw at
         // startup), so a session that reports read-only once will never
         // report anything else, and the hint below is the whole answer.
@@ -914,8 +958,10 @@
     hint.textContent = {
       ready: "",
       connecting: "(waiting for the volume)",
+      failed: "",
       "read-only": "(read-only session — restart with --rw to publish)",
       running: "(publishing — this holds the overlay, so writes wait)",
+      switching: "(switching branches — this holds the overlay, so writes wait)",
       nothing: "(nothing to publish)",
     }[state];
 
@@ -926,11 +972,16 @@
     } else {
       st.dataset.jobState = job.state;
       st.dataset.jobId = job.id;
+      const switching = job.reason === "branch";
       if (job.state === "running") {
         const s0 = Math.round((Date.now() - Date.parse(job.started)) / 1000);
-        st.textContent = `publishing… (${s0}s) — the seal freezes the overlay, so uploads resume in a moment`;
+        st.textContent = switching
+          ? `switching branches… (${s0}s) — the overlay is reopened on the new head, so writes wait`
+          : `publishing… (${s0}s) — the seal freezes the overlay, so uploads resume in a moment`;
       } else if (job.state === "failed") {
-        st.textContent = `publish failed: ${job.error}`;
+        st.textContent = switching ? `branch switch failed: ${job.error}` : `publish failed: ${job.error}`;
+      } else if (switching) {
+        st.textContent = `switched: ${job.summary}`;
       } else if (job.reason === "idle") {
         // A generation nobody clicked for. Saying so is the difference
         // between a reassuring line and a confusing one.

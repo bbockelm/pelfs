@@ -119,6 +119,14 @@ type Boot =
   | { kind: "loading" }
   | { kind: "no-session"; why: string }
   | { kind: "connecting"; token: string }
+  /**
+   * The volume itself refused to open. NOT the same state as `no-api`, and
+   * conflating the two put "The volume is open but the JSON data plane did
+   * not answer" above a message that says the volume never opened. The panel
+   * carries the server's reason; this state's whole job is to stop waiting
+   * and to render no grid.
+   */
+  | { kind: "no-volume"; token: string }
   | { kind: "no-api"; token: string; why: string }
   | { kind: "ready"; token: string; info: DriveInfo; root: Entry[]; meta: ListingMeta };
 
@@ -202,12 +210,12 @@ export function App() {
       // the stream, and asking the data plane would only turn a real reason
       // into "503, the volume is still opening" — which is false and sends the
       // user off to wait for something that is not coming.
+      //
+      // The reason is NOT repeated here: the durability panel renders
+      // `state.error` whole, and a second copy under a different lead-in is
+      // how a page ends up disagreeing with itself about what went wrong.
       bootedRef.current = true;
-      setBoot({
-        kind: "no-api",
-        token: boot.token,
-        why: live.error || "the volume could not be opened",
-      });
+      setBoot({ kind: "no-volume", token: boot.token });
       return;
     }
     const provider = providerRef.current;
@@ -294,9 +302,16 @@ export function App() {
     return () => window.removeEventListener("beforeunload", warn);
   }, [staged]);
 
-  const publishing = publishState(state) === "running";
-  const publishingRef = useRef(publishing);
-  publishingRef.current = publishing;
+  // A SWITCH HOLDS THE OVERLAY THE WAY A SEAL DOES, so it blocks writes the
+  // same way and the interception below has to cover both. It is not called
+  // "publishing" here for the reason durability.ts gives: a branch switch
+  // writes nothing to the federation.
+  const jobState = publishState(state);
+  const holdsOverlay = jobState === "running" || jobState === "switching";
+  const holdsOverlayRef = useRef(holdsOverlay);
+  holdsOverlayRef.current = holdsOverlay;
+  const switchingRef = useRef(jobState === "switching");
+  switchingRef.current = jobState === "switching";
 
   // `drive` MUST be referentially stable: the component re-initialises its
   // WHOLE STORE whenever this prop's identity changes (Filemanager.jsx's
@@ -339,16 +354,21 @@ export function App() {
         );
       });
 
-      // A seal freezes the overlay, so a write during a publish blocks. The
-      // design's instruction is to disable the write and say so rather than
-      // let a drop fail with an opaque error; `intercept` returning false is
-      // how the store's own action is cancelled before it is applied.
+      // A seal freezes the overlay, so a write during a publish blocks -- and
+      // so does a branch switch, which retires the overlay and opens a new one
+      // on the incoming head. The design's instruction is to disable the write
+      // and say so rather than let a drop fail with an opaque error;
+      // `intercept` returning false is how the store's own action is cancelled
+      // before it is applied.
       for (const action of ["create-file", "rename-file", "move-files", "copy-files", "delete-files"]) {
         api.intercept(action, () => {
-          if (!publishingRef.current) return;
+          if (!holdsOverlayRef.current) return;
           setError(
-            "publishing — the seal holds the overlay, so writes wait. Nothing was changed; " +
-              "try again when the publish finishes (a moment, or minutes for a large one).",
+            switchingRef.current
+              ? "switching branches — the overlay is reopened on the new head, so writes wait. " +
+                  "Nothing was changed; try again when the switch finishes."
+              : "publishing — the seal holds the overlay, so writes wait. Nothing was changed; " +
+                  "try again when the publish finishes (a moment, or minutes for a large one).",
           );
           return false;
         });

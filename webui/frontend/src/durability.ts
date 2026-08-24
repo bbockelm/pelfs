@@ -31,9 +31,20 @@ export const GLYPH = {
   staged: "●", // ● filled dot: on this machine only
   sending: "◔", // ◔ moving arc: packs in flight
   published: "✓", // ✓ check: named by a generation in the federation
+  failed: "✗", // ✗ cross: the volume never opened, so none of the above is known
 } as const;
 
-export type Durability = "unknown" | "staged" | "published";
+export type Durability = "unknown" | "staged" | "published" | "failed";
+
+/**
+ * The lead-in on a failed open, and the ONLY words this file adds to one.
+ *
+ * Everything after it is the server's own sentence, verbatim: it names the
+ * state directory and the next step (wait out the branch lease, or point at
+ * another state dir), and a page that paraphrased or truncated it would take
+ * away the one thing the reader can act on.
+ */
+export const OPEN_FAILED = "pelfs could not open this volume.";
 
 export function bytes(n: number): string {
   if (!n) return "0 B";
@@ -79,6 +90,26 @@ export type DurabilityLine = {
  * that erodes.
  */
 export function describe(s: BrowseState | null): DurabilityLine {
+  // A FAILED OPEN IS NOT A SLOW ONE, and this line is where the difference
+  // used to be lost. Every phase that was not "ready" rendered as "Reading
+  // the overlay…", so the volume refusing to open -- a branch lease left
+  // behind by a `--rw` session that did not exit cleanly is the ordinary way
+  // in -- looked exactly like a volume that was about to open. That is the
+  // report: "whenever I start read-write, I just get a page that says
+  // 'reading the overlay…'. Never seems to progress."
+  //
+  // The server now SERVES the reason rather than racing the browser with it
+  // (cmd/pelfs/browsefail.go): the listener stays up, and `error` carries a
+  // whole sentence -- what refused, where this session's state directory is,
+  // and what to do next. So this renders that sentence, unedited, and stops
+  // claiming progress.
+  if (s && s.phase === "failed") {
+    return {
+      state: "failed",
+      glyph: GLYPH.failed,
+      text: s.error ? `${OPEN_FAILED}\n${s.error}` : OPEN_FAILED,
+    };
+  }
   if (!s || s.phase !== "ready") {
     return { state: "unknown", glyph: "", text: "Reading the overlay…" };
   }
@@ -110,12 +141,34 @@ export function describe(s: BrowseState | null): DurabilityLine {
   };
 }
 
-export type PublishState = "ready" | "connecting" | "read-only" | "running" | "nothing";
+export type PublishState =
+  | "ready"
+  | "connecting"
+  | "failed"
+  | "read-only"
+  | "running"
+  | "switching"
+  | "nothing";
 
+/**
+ * `switching` and `running` are the SAME job slot and not the same event.
+ *
+ * `POST /api/v1/branch` reports its progress as a publish job with
+ * `reason: "branch"` (cmd/pelfs/browsebranch.go), because a switch and a seal
+ * both hold the session lock for their whole duration and a second slot would
+ * only be a second name for the same queue. Rendering it as "publishing…"
+ * would tell the user their bytes are being written to the federation while
+ * the session is reopening an overlay on another branch head, which is the
+ * one thing this panel exists not to do.
+ */
 export function publishState(s: BrowseState | null): PublishState {
-  if (!s || s.phase !== "ready") return "connecting";
+  if (!s) return "connecting";
+  if (s.phase === "failed") return "failed";
+  if (s.phase !== "ready") return "connecting";
   if (s.mode === "read-only") return "read-only";
-  if (s.publish && s.publish.state === "running") return "running";
+  if (s.publish && s.publish.state === "running") {
+    return s.publish.reason === "branch" ? "switching" : "running";
+  }
   if (s.staged_files === 0 && s.dirty_nodes === 0) return "nothing";
   return "ready";
 }
@@ -123,8 +176,11 @@ export function publishState(s: BrowseState | null): PublishState {
 export const PUBLISH_HINT: Record<PublishState, string> = {
   ready: "",
   connecting: "(waiting for the volume)",
+  // Nothing: the line above is the whole answer, and it is the server's.
+  failed: "",
   "read-only": "(read-only session — restart with --rw to publish)",
   running: "(publishing — this holds the overlay, so writes wait)",
+  switching: "(switching branches — this holds the overlay, so writes wait)",
   nothing: "(nothing to publish)",
 };
 

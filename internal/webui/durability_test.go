@@ -45,13 +45,19 @@ func TestTheTwoSurfacesShareOneDurabilityVocabulary(t *testing.T) {
 	page := readRepoFile(t, "cmd", "pelfs", "browse.html")
 	app := readRepoFile(t, "webui", "frontend", "src", "durability.ts")
 
-	// The three glyphs, as literal characters. They are three DIFFERENT
-	// characters on purpose: colour alone would fail roughly one man in
-	// twelve, so the shape carries the meaning.
+	// The glyphs, as literal characters. They are all DIFFERENT characters
+	// on purpose: colour alone would fail roughly one man in twelve, so the
+	// shape carries the meaning.
 	glyphs := map[string]string{
 		"staged":    "●",
 		"sending":   "◔",
 		"published": "✓",
+		// The fourth is the volume that never opened. It is here for the
+		// same reason as the other three: a failed open is a state a reader
+		// must be able to tell from the others at a glance, and it acquired
+		// a glyph when both surfaces stopped rendering it as "reading the
+		// overlay…".
+		"failed": "✗",
 	}
 	seen := map[string]string{}
 	for name, glyph := range glyphs {
@@ -60,7 +66,7 @@ func TestTheTwoSurfacesShareOneDurabilityVocabulary(t *testing.T) {
 		}
 		if !strings.Contains(app, glyph) {
 			t.Errorf("webui/frontend/src/durability.ts no longer contains the %q glyph %q\n"+
-				"The two surfaces must render the same three characters; see this test's comment.",
+				"The two surfaces must render the same characters; see this test's comment.",
 				name, glyph)
 		}
 		if other, clash := seen[glyph]; clash {
@@ -98,6 +104,19 @@ func TestTheTwoSurfacesShareOneDurabilityVocabulary(t *testing.T) {
 		"after this tab closes",
 		"(nothing to publish)",
 		"(read-only session — restart with --rw to publish)",
+		// THE FAILED OPEN. The server serves a whole sentence in
+		// `state.error` -- what refused, where this session's state
+		// directory is, what to do next (cmd/pelfs/browsefail.go) -- and
+		// both surfaces render it VERBATIM under this one fixed lead-in.
+		// The lead-in is the only wording either page adds, so it is the
+		// only part of that state there is anything to keep in step.
+		"pelfs could not open this volume.",
+		// A BRANCH SWITCH IS NOT A PUBLISH. It is reported in the publish
+		// job slot with reason "branch" (cmd/pelfs/browsebranch.go), and a
+		// surface that rendered it as "publishing" would tell the user
+		// their bytes were going to the federation while the session
+		// reopened an overlay on another head.
+		"(switching branches — this holds the overlay, so writes wait)",
 	} {
 		if !strings.Contains(page, phrase) {
 			t.Errorf("cmd/pelfs/browse.html no longer says %q", phrase)
@@ -108,9 +127,9 @@ func TestTheTwoSurfacesShareOneDurabilityVocabulary(t *testing.T) {
 		}
 	}
 
-	// The three values of data-durability, which are the suite's handle on
+	// The values of data-durability, which are the suite's handle on
 	// all of the above (webui/frontend/tests/durability.spec.ts).
-	for _, state := range []string{"unknown", "staged", "published"} {
+	for _, state := range []string{"unknown", "staged", "published", "failed"} {
 		if !strings.Contains(page, `"`+state+`"`) {
 			t.Errorf("cmd/pelfs/browse.html no longer produces data-durability=%q", state)
 		}

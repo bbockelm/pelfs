@@ -275,15 +275,18 @@ test.describe("the page reads as a file manager", () => {
 });
 
 /**
- * THE BRANCH PILL AS A CONTROL, in whichever of its two forms this server can
- * support -- which is the point.
+ * THE BRANCH PILL IS A CONTROL, IN BOTH MODES, and that is new here.
  *
- * `GET /api/v1/branches` is a sibling's work in progress. This spec runs in
- * BOTH modes and asserts the invariant that holds either way: the pill names
- * the branch the durability stream says the session is on, and if it is a real
- * dropdown then that branch is the SELECTED option. What it must never be is a
- * control that shows a branch the session is not on -- the failure mode of
- * treating a 202 as a switch -- or a dropdown rendered against a 404.
+ * `GET /api/v1/branches` answers in both now -- cmd/pelfs/browsebranch.go for
+ * `pelfs browse`, and internal/webui/mockapi_test.go for the embed server,
+ * which had no such route and so exercised only the picker's degraded form.
+ * So this asserts the settled shape: a real select, whose selected option is
+ * the branch the durability stream says this session is on. What it must
+ * never be is a control showing a branch the session is not on -- the failure
+ * mode of treating a 202 as a switch.
+ *
+ * What the picker does across a switch, and what it does when one is refused,
+ * is branch.spec.ts; this is the invariant that holds in every session.
  */
 test.describe("the branch pill", () => {
   test("names the session's branch, and is a real control when the server has one", async ({
@@ -294,16 +297,14 @@ test.describe("the branch pill", () => {
     const pill = page.getByTestId("branch");
     await expect(pill).toBeVisible();
 
-    const form = await pill.getAttribute("data-branch-control");
-    expect(["static", "select"], `unknown branch control form ${form}`).toContain(form);
-
-    if (form === "static") {
-      // The degraded form: the fact, as text, exactly as the app bar carried
-      // it before there was a route to ask. Not a dead <select>.
-      await expect(pill.locator("select")).toHaveCount(0);
-      await expect(pill).toContainText("branch");
-      return;
-    }
+    // THE PILL STARTS STATIC IN EVERY SESSION, and that is not the degraded
+    // form: the picker asks for the list only once the volume is open, so a
+    // browse-mode session renders the plain fact for as long as the open
+    // takes. Reading `data-branch-control` once, without waiting, is how this
+    // spec read "static" off a page that was two frames from being a
+    // dropdown. Both servers in this suite answer GET /api/v1/branches, so
+    // the settled form is the control, and this waits for it.
+    await expect(pill).toHaveAttribute("data-branch-control", "select");
 
     const select = page.getByTestId("branch-select");
     await expect(select).toBeVisible();

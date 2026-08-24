@@ -27,6 +27,12 @@ import { LEASE_WORDS, PUBLISH_HINT, describe, publishState } from "../durability
  * like published (webui/frontend/tests/durability.spec.ts reads the glyph the
  * panel actually renders in each state and compares them).
  *
+ * A FAILED OPEN RENDERS NO CONTROL EITHER, and the line becomes the server's
+ * sentence rather than a progress message. There is no volume, so a publish
+ * button is a lever attached to nothing and "(waiting for the volume)" is a
+ * promise nobody is keeping. What the reader needs is in `state.error` and
+ * nowhere else on this page.
+ *
  * A READ-ONLY SESSION RENDERS NO PUBLISH CONTROL AT ALL. It used to render a
  * disabled one with "(read-only session — restart with --rw to publish)"
  * beside it, at the top of the page: a button you cannot press, under a line
@@ -71,13 +77,22 @@ export function Durability({
 
   // The job's own state wins over the click's, because it is the truth: the
   // click only says the request was accepted.
+  //
+  // A BRANCH SWITCH TAKES THIS SLOT TOO (reason "branch"; see ../durability.ts
+  // and cmd/pelfs/browsebranch.go), and it is not a publish: nothing is being
+  // written to the federation, the session is reopening on another head. Every
+  // one of the three lines below therefore forks on the reason rather than
+  // calling all of it publishing.
+  const switching = job?.reason === "branch";
   let jobText = status;
   if (job && job.state === "running") {
-    jobText = "publishing… — the seal freezes the overlay, so uploads resume in a moment";
+    jobText = switching
+      ? "switching branches… — the overlay is reopened on the new head, so writes wait"
+      : "publishing… — the seal freezes the overlay, so uploads resume in a moment";
   } else if (job && job.state === "failed") {
-    jobText = `publish failed: ${job.error}`;
+    jobText = switching ? `branch switch failed: ${job.error}` : `publish failed: ${job.error}`;
   } else if (job && job.state === "done" && !status) {
-    jobText = `published: ${job.summary}`;
+    jobText = switching ? `switched: ${job.summary}` : `published: ${job.summary}`;
   }
 
   return (
@@ -105,7 +120,7 @@ export function Durability({
         </p>
 
         <div className="pelfs-status__aside">
-          {pstate === "read-only" ? (
+          {pstate === "failed" ? null : pstate === "read-only" ? (
             // No control, one sentence: this session cannot publish and the
             // way to change that is a flag on the command that started it.
             <span data-testid="publish-hint" className="pelfs-muted">

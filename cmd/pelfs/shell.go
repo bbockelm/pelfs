@@ -90,7 +90,14 @@ func mountEnv(prefix, mountPoint string) []string {
 // interactive subshell (exit to unmount); with one — the trailing `-- ...`
 // form — it is exactly that command, so scripts can branch on the status
 // pelfs exits with.
-func runInMount(o *cmdOpts, prefix, mountPoint string, command []string) int {
+//
+// takeDown is how `--on-mount-error=hold` reaches the payload: a reason
+// arriving on it means the mount has handed this process an I/O error it
+// could not explain, and the payload is to be stopped rather than left
+// to produce plausible garbage. Nil in every other mode, and nil is the
+// ordinary case — see mountErrorPolicy for why the aggressive behaviour
+// is opt-in.
+func runInMount(o *cmdOpts, prefix, mountPoint string, command []string, takeDown <-chan string) int {
 	argv := command
 	if len(argv) == 0 {
 		shellPath := o.shellPath
@@ -148,11 +155,44 @@ func runInMount(o *cmdOpts, prefix, mountPoint string, command []string) int {
 		return 1
 	}
 	done := make(chan struct{})
+	// stopped is closed by the signal goroutine as it returns, and this
+	// function JOINS on it. Without that join the goroutine can still be
+	// inside a Signal call after Wait has reaped the child -- which is
+	// how a stale pid gets signalled once the operating system has handed
+	// it to somebody else.
+	stopped := make(chan struct{})
 	go func() {
+		defer close(stopped)
+		// The grace timer for a take-down lives in this select rather
+		// than in a time.AfterFunc callback, so that EVERY path that can
+		// signal the child is this one goroutine: once it has returned,
+		// nothing can signal a reaped pid at all.
+		var grace *time.Timer
+		var killAt <-chan time.Time
+		defer func() {
+			if grace != nil {
+				grace.Stop()
+			}
+		}()
 		for {
 			select {
 			case <-done:
 				return
+			case reason := <-takeDown:
+				ui.Error("stopping the payload: {reason} (--on-mount-error=hold)", "reason", reason)
+				if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+					ui.Warn("could not signal the payload: {error}", "error", err)
+					continue
+				}
+				// A grace period rather than an immediate kill: a payload
+				// that flushes on SIGTERM should get to, and the mount is
+				// still serving everything that has not failed.
+				grace = time.NewTimer(takeDownGrace)
+				killAt = grace.C
+			case <-killAt:
+				killAt = nil
+				ui.Warn("the payload did not stop within {grace}; killing it", "grace", takeDownGrace)
+				_ = cmd.Process.Kill()
 			case s := <-sigs:
 				switch s {
 				case syscall.SIGINT, syscall.SIGQUIT:
@@ -165,6 +205,7 @@ func runInMount(o *cmdOpts, prefix, mountPoint string, command []string) int {
 	}()
 	err := cmd.Wait()
 	close(done)
+	<-stopped
 	return waitStatus(err)
 }
 

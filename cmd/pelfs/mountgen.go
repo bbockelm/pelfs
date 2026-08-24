@@ -20,11 +20,13 @@ import (
 
 	"github.com/go-git/go-billy/v5"
 
+	"github.com/bbockelm/pelfs/internal/chirp"
 	"github.com/bbockelm/pelfs/internal/chunkid"
 	"github.com/bbockelm/pelfs/internal/control"
 	"github.com/bbockelm/pelfs/internal/genfs"
 	"github.com/bbockelm/pelfs/internal/lease"
 	"github.com/bbockelm/pelfs/internal/memtable"
+	"github.com/bbockelm/pelfs/internal/mounterr"
 	"github.com/bbockelm/pelfs/internal/nfsmount"
 	"github.com/bbockelm/pelfs/internal/overlay"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
@@ -141,6 +143,18 @@ type genSession struct {
 	stats     *stats.Collector
 	statsPath string
 	lease     *lease.Lease // held for writable sessions unless --no-lease
+
+	// chirp reports this mount's health to the HTCondor job it is
+	// serving, live (cmd/pelfs/jobreport.go). Inert -- and it is the
+	// usual case -- when pelfs is not running inside a job.
+	chirp        *chirp.Reporter
+	onMountError mountErrorPolicy
+	// takeDown carries the reason the payload is being terminated, from
+	// the mount-error latch to the goroutine that owns the child process.
+	// Buffered by one because the latch fires at most once and the
+	// sender must never block a reporting goroutine on a payload that
+	// has already exited.
+	takeDown chan string
 
 	dek            []byte
 	identityKey    []byte
@@ -536,7 +550,13 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		overlayDir:     filepath.Join(stateDir, "overlay"),
 		signingKeyPath: signingKeyPath,
 		down:           &phaseClock{},
+		takeDown:       make(chan string, 1),
 	}
+	// Take the process-wide mount-error latch before anything can serve.
+	// A mount that is starting has not failed yet, whatever an earlier
+	// mount in this process concluded -- and in a test binary there have
+	// been many.
+	mounterr.Rearm()
 	// Deferred FIRST so it runs LAST: every other deferred teardown step
 	// must have marked itself before the breakdown is printed.
 	defer g.reportTeardown()
@@ -853,6 +873,12 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	// Nothing in the write path calls back, so overlay pressure and the
 	// served generation are sampled on the same cadence.
 	go g.sample(sessionCtx, statsInterval)
+	// Live reporting to the HTCondor job, if there is one. Started here,
+	// beside the other samplers, because it reads the same counters --
+	// and after the mount is serving, so a failure during startup is
+	// reported by the ordinary error path rather than through a job ad.
+	g.startJobReporting(sessionCtx, o, subshell)
+	defer func() { _ = g.chirp.Close() }()
 
 	if ctl := g.startControl(); ctl != nil {
 		defer g.down.timed("control", func() { ctl.Close() }) //nolint:errcheck
@@ -918,7 +944,7 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		// seal (with --rw) happens on the way out just as it does for a
 		// signalled mount — a failing command still gets its teardown, and
 		// still carries its status out.
-		code = runInMount(o, prefix, mountpoint, command)
+		code = runInMount(o, prefix, mountpoint, command, g.takeDown)
 		// Everything from here on is teardown: the user has stopped
 		// working and is now waiting on us.
 		g.beginTeardown()
@@ -1008,6 +1034,11 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		}
 	}
 	g.refresh()
+	// Applied here rather than beside the payload's own exit so that
+	// EVERY way out of a session carries the verdict: a `pelfs mount-gen`
+	// serving an apptainer descriptor has no payload to take down, but
+	// its exit status is still the only thing a wrapper can test.
+	code = g.mountErrorExit(code)
 	if err := g.stats.Finalize(code, unmountErr == nil && sealErr == nil); err != nil {
 		ui.Warn("write stats file: {error}", "error", err)
 	}

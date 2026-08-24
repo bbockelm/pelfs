@@ -220,6 +220,21 @@ type Summary struct {
 	// session. Nil on a mount that runs neither.
 	Maintenance *MaintenanceStats `json:"maintenance,omitempty"`
 
+	// MountError records that the mount answered the PAYLOAD with an I/O
+	// error it could not explain -- an EIO on the FUSE frontend, an
+	// NFS3ERR_IO on the NFS one (internal/mounterr). It is latched at
+	// the first occurrence and never cleared.
+	//
+	// It is deliberately not folded into object_errors_total. That
+	// counter includes attempts a lower layer retried successfully, so
+	// it is routinely nonzero on a session that served every byte
+	// correctly; this field is nonzero only when a process reading the
+	// mount was handed a failure. They answer different questions and a
+	// supervisor acts on them differently.
+	MountError       bool      `json:"mount_error,omitempty"`
+	MountErrorReason string    `json:"mount_error_reason,omitempty"`
+	MountErrorAt     time.Time `json:"mount_error_at,omitempty"`
+
 	// Overall verdict for supervisors: true only when unmount, flush/drain,
 	// and the final snapshot all succeeded.
 	CleanShutdown bool `json:"clean_shutdown"`

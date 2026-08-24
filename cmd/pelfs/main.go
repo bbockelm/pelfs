@@ -175,6 +175,9 @@ type cmdOpts struct {
 	cacheSize         string
 	noAutoRepack      bool
 	noAutoGC          bool
+	// onMountError is what happens the first time the mount answers the
+	// payload with an unexplained I/O error; see cmd/pelfs/jobreport.go.
+	onMountError mountErrorPolicy
 }
 
 func registerFlags(fs *flag.FlagSet, o *cmdOpts) {
@@ -229,6 +232,26 @@ func registerFlags(fs *flag.FlagSet, o *cmdOpts) {
 	// repack was involved in -- an aborted publish, a deleted tag's closure
 	// -- is still collectable.)
 	fs.BoolVar(&o.noAutoGC, "no-auto-gc", false, "do not collect unreferenced objects in the background when the mount is idle (the sweep is `pelfs gc --delete`, with the same grace and retain-K windows and the same fail-closed rule)")
+	// Default `report`, and the aggressive option has to be typed: the
+	// reasoning for that choice is written out at mountErrorPolicy, and
+	// it is the one decision in this feature a user is entitled to
+	// disagree with.
+	o.onMountError = onMountErrorReport
+	// The backquoted word is flag's placeholder syntax, so it must be the
+	// value list and nothing else -- a stray pair of backquotes further
+	// into the sentence renames the argument to whatever they enclose.
+	fs.Func("on-mount-error", "what to do the first time the mount hands an HTCondor job an I/O error "+
+		"it cannot explain, one of `report|hold|ignore`: report (the default) writes the job's user "+
+		"log and sets ChirpPelfsMountError in the job ad for a periodic_hold expression to act on, "+
+		"leaving the payload running; hold does that and then stops the payload and exits "+
+		strconv.Itoa(exitMountError)+", for on_exit_hold; ignore says nothing to the job", func(v string) error {
+		p, err := parseMountErrorPolicy(v)
+		if err != nil {
+			return err
+		}
+		o.onMountError = p
+		return nil
+	})
 }
 
 func parseArgs(name string, args []string, minPos, maxPos int, extra func(*flag.FlagSet, *cmdOpts)) (*cmdOpts, []string, error) {

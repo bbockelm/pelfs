@@ -32,19 +32,19 @@ func TestRunInMountCommand(t *testing.T) {
 	dir := t.TempDir()
 	o := &cmdOpts{}
 
-	if code := runInMount(o, "pelican://fed/pfx", dir, []string{"/bin/sh", "-c", "exit 7"}); code != 7 {
+	if code := runInMount(o, "pelican://fed/pfx", dir, []string{"/bin/sh", "-c", "exit 7"}, nil); code != 7 {
 		t.Errorf("exit status = %d, want 7", code)
 	}
-	if code := runInMount(o, "pelican://fed/pfx", dir, []string{"/bin/sh", "-c", "true"}); code != 0 {
+	if code := runInMount(o, "pelican://fed/pfx", dir, []string{"/bin/sh", "-c", "true"}, nil); code != 0 {
 		t.Errorf("exit status = %d, want 0", code)
 	}
-	if code := runInMount(o, "pelican://fed/pfx", dir, []string{"/nonexistent/pelfs-no-such-command"}); code != 127 {
+	if code := runInMount(o, "pelican://fed/pfx", dir, []string{"/nonexistent/pelfs-no-such-command"}, nil); code != 127 {
 		t.Errorf("missing command status = %d, want 127", code)
 	}
 
 	// The command runs IN the mount, with the session environment.
 	script := `pwd > where; printf '%s\n%s\n%s\n' "$PELFS_MOUNT" "$PELFS_PREFIX" "$PWD" > env`
-	if code := runInMount(o, "pelican://fed/pfx", dir, []string{"/bin/sh", "-c", script}); code != 0 {
+	if code := runInMount(o, "pelican://fed/pfx", dir, []string{"/bin/sh", "-c", script}, nil); code != 0 {
 		t.Fatalf("environment probe exited %d", code)
 	}
 	where, err := os.ReadFile(filepath.Join(dir, "where"))
@@ -202,7 +202,7 @@ func TestRunInMountHelper(t *testing.T) {
 	// leaving an orphaned sleep behind. Cores are off because one of the
 	// signals under test is SIGQUIT.
 	code := runInMount(&cmdOpts{}, "pelican://fed/pfx", t.TempDir(),
-		[]string{"/bin/sh", "-c", "ulimit -c 0; echo HELPER-READY; exec sleep 30"})
+		[]string{"/bin/sh", "-c", "ulimit -c 0; echo HELPER-READY; exec sleep 30"}, nil)
 	// Reaching this point at all is the assertion: pelfs was not killed by
 	// the signal that the terminal also delivered to it, so a real session
 	// would go on to unmount and seal.

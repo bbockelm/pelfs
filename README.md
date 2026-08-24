@@ -203,6 +203,58 @@ pelfs shell --prefetch background --stats-file $_CONDOR_SCRATCH_DIR/pelfs-stats.
   lower layer retried successfully, so nonzero errors with
   `clean_shutdown: true` means "transient trouble, but all data made it".
 
+### Telling the job how the mount is doing (Chirp)
+
+The statistics file above is read *after* the job. Inside an HTCondor job
+pelfs also reports **live**, over the Chirp protocol the `condor_starter`
+already offers, and — the point of the exercise — it says so the moment
+the mount hands your program an I/O error it cannot explain, so the job
+can be **held** instead of quietly producing wrong output.
+
+Nothing needs to be turned on for the periodic half: a starter enables
+delayed job-ad updates by default. Add one line for the error path, and
+one expression to act on it:
+
+```
++WantIOProxy = true
+
+periodic_hold         = (ChirpPelfsMountError =?= true)
+periodic_hold_reason  = strcat("pelfs mount error: ", \
+                               ifThenElse(ChirpPelfsMountErrorReason =?= undefined, \
+                                          "unexplained I/O error", \
+                                          ChirpPelfsMountErrorReason))
+periodic_hold_subcode = 1
+```
+
+The job then goes on hold with a reason like `pelfs mount error: fuse
+mount: read chunk 91af…: pack 3 trailer is truncated`, rather than
+running to completion on a file it only partly read.
+
+Nine attributes are published, all in the `ChirpPelfs` namespace (the
+`Chirp` prefix is required by the starter's default
+`CHIRP_DELAYED_UPDATE_PREFIX`, not a stylistic choice):
+`ChirpPelfsSession`, `ChirpPelfsGeneration`, `ChirpPelfsHeartbeat`,
+`ChirpPelfsBytesDown`, `ChirpPelfsBytesUp`, `ChirpPelfsUploadBacklog`,
+`ChirpPelfsObjectErrors`, and on failure `ChirpPelfsMountError` /
+`ChirpPelfsMountErrorReason`. The first seven refresh every minute
+through the starter's *batched* update channel, so they cost the schedd
+nothing; only the error latch takes the synchronous path, and only once.
+
+`--on-mount-error` chooses what happens on that failure:
+
+- `report` (**default**) — user log, job ad, and pelfs's own stderr. The
+  payload keeps running; your `periodic_hold` decides its fate.
+- `hold` — the above, and then pelfs stops the payload it owns under
+  `pelfs shell -- cmd` and exits `75`, so `on_exit_hold = ExitCode =?= 75`
+  fires at once. Opt-in on purpose: a transient error killing a ten-hour
+  job is its own failure mode, and pelfs owns no payload at all under
+  apptainer or `pelfs mount-gen`.
+- `ignore` — say nothing to the job, for a workload that handles I/O
+  errors itself.
+
+`docs/design-chirp.md` has the attribute table, the cadence argument, and
+the wire-format details.
+
 ### Inside a container: apptainer `--fusemount`
 
 A job that runs its payload in a container can mount the volume **inside
@@ -249,8 +301,10 @@ volume's data keys — the same key must be supplied on every later mount;
 (where the overlay, caches, trust pin, and signing key live), `--poll`
 (read-only mounts follow the branch head live), `--no-seal`,
 `--volume-pubkey`, `--ignore-volume-lease` (proceed past a pelfs v0.1.0
-volume-wide lease — see *Caveats*), and the two maintenance switches
-`--no-auto-repack` / `--no-auto-gc`.
+volume-wide lease — see *Caveats*), the two maintenance switches
+`--no-auto-repack` / `--no-auto-gc`, and `--on-mount-error`
+(`report` / `hold` / `ignore`; see *Telling the job how the mount is
+doing*).
 
 ## Messages
 

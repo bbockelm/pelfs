@@ -2,6 +2,54 @@
 
 ## Unreleased
 
+**`pelfs graft` splices into a volume that already has content in it.** Until
+now grafting a foreign Pelican tree replaced the volume's namespace, so the
+only usable sequence was `pelfs init` then `pelfs graft` — which is not what
+anybody wants a graft for. A graft is now spliced in at one path: everything
+else keeps its inodes, its attributes and the content records the previous
+generation published, and the catalogs outside the graft path are carried
+forward rather than rebuilt, so a graft into a large volume rewrites the path
+and does not read the rest. `docs/design-graft.md`, Decision 14.
+
+**What is at the graft path is decided per case, and nothing is replaced
+silently.** A populated directory is refused — with its entry count and two of
+its names — unless you pass `--replace`; so is a file. An *empty* directory is
+adopted, because nothing is lost. Re-grafting the same source at the same path
+is refused and told to use `--refresh`, which is what it is; a graft from a
+*different* source replaces the old one and says whose storage this volume
+will start fetching from instead. A graft inside an existing graft, or one
+that would swallow one, is refused by name. Every refusal ends in what to do
+instead.
+
+**`pelfs graft --remove`** drops a graft and publishes a generation that does
+not serve it and does not name its source. It reads nothing. It is also the
+way out that the nesting refusals now offer.
+
+**A graft is a write, so it behaves like one.** The signing key and the whole
+path check happen *before* the walk, which at TB scale is hours; the advisory
+branch lease is taken after the walk and before the flip, so a graft no longer
+blocks a mount from checkpointing while it reads somebody else's storage; and
+the branch head is re-read afterwards, so a graft cannot silently revert writes
+a mount sealed while the spider ran. A killed `pelfs graft` leaves the volume
+on its previous generation.
+
+**A graft-integrity failure is its own error class.** When a graft source has
+been republished under a signed generation, the read still fails closed with
+the same message — naming the graft, the object, the range, both hashes, what
+changed and the fix — but it is now `genfs.ErrGraftIntegrity`, carries the
+evidence on a typed error, and maps to **`EBADMSG` ("Bad message")** instead of
+`EIO`. The distinction is operational: an unreachable source is worth
+retrying, and a changed one never will be until somebody runs `pelfs graft
+--refresh`, and one errno could not say which. The log line no longer reads
+"returning EIO for an unrecognized error", and it has its own budget so a mount
+full of unrelated errors cannot suppress the one message that names a changed
+source.
+
+*Known limitation, and it is not new:* an out-of-band publish — a graft, a
+repack, a merge, a second writer — strands an unsealed write overlay left in
+the same state directory, and `pelfs mount --rw` then refuses it. `pelfs
+graft` now warns about this before it starts.
+
 **`pelfs browse` opens the file manager.** `GET /` is now the React file
 manager — `internal/webui`'s committed bundle, on the route table — and the
 hand-written connection page moved to **`GET /connect`**, where the credential

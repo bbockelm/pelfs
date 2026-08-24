@@ -6,9 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/bbockelm/pelfs/internal/catalog"
+	"github.com/bbockelm/pelfs/internal/graft"
+	"github.com/bbockelm/pelfs/internal/superblock"
 )
 
 // Prefetch makes a whole generation LOCAL.
@@ -61,6 +64,52 @@ type PrefetchReport struct {
 	// Skipped counts refs with nothing to fetch: holes, and files stored
 	// inline in a catalog.
 	Skipped int
+	// Grafted counts chunk references this pass CANNOT make local, and
+	// GraftedBytes their logical size, because they live at a foreign
+	// prefix rather than in a pack (graft.go).
+	//
+	// They are counted rather than failed, and the distinction is the
+	// whole of the prefetch/graft question. A pack that will not download
+	// is DAMAGE or an outage; a grafted block is working exactly as
+	// designed and simply cannot be moved by a pass that moves packs —
+	// there is no pack to cache. Reporting it as a failure (which is what
+	// this pass used to do, and it refused the mount) said the volume was
+	// broken when it was not.
+	//
+	// What a caller may NOT do is treat a report with Grafted > 0 as
+	// "everything is local". Making those bytes local means WRITING them
+	// into local packs, which is a materialization — a new generation,
+	// the lease, and the publish path — not a prefetch.
+	Grafted      int
+	GraftedBytes int64
+	// GraftLocal is how many of those chunks are on this machine's disk
+	// when the pass returns, and GraftLocalBytes what they weigh.
+	// GraftFetched is what this pass moved to get there — zero on a
+	// re-run over a warm cache.
+	GraftLocal      int
+	GraftLocalBytes int64
+	GraftFetched    int64
+	// GraftRoots names the grafts those chunks belong to, so a refusal or
+	// a warning can name what it is talking about instead of printing a
+	// list of hashes.
+	GraftRoots []superblock.GraftEntry
+}
+
+// FullyLocal reports whether the generation was entirely on this machine
+// when the pass returned. It is deliberately the ONLY way to ask, so that
+// no caller can conclude "local" from a zero failure count while grafted
+// bytes are still one federation away.
+//
+// WHEN, not forever, and the distinction is real rather than pedantic. A
+// cached graft block is evictable — it has to be, or a graft larger than
+// the disk could wedge the cache — so this is a statement about the
+// moment, exactly as it already was for packs. What makes it a useful
+// statement anyway is that eviction PREFERS everything else first
+// (gencache.go), and that when it does take a prefetched blob it records
+// the fact (GraftCacheStats.PinnedEvicted) instead of letting the earlier
+// report quietly become a lie.
+func (r *PrefetchReport) FullyLocal() bool {
+	return r.Failed == 0 && r.GraftLocal == r.Grafted
 }
 
 // PrefetchBudgetError is the refusal a generation too large for the local
@@ -68,15 +117,40 @@ type PrefetchReport struct {
 // things from it: strict mode fails the mount with the numbers, background
 // mode logs them and serves anyway from the federation.
 type PrefetchBudgetError struct {
-	Need   int64 // bytes of the referenced pack set
+	Need   int64 // bytes of the referenced pack set PLUS the grafted content
 	Budget int64 // bytes the cache may hold
 	Packs  int
+	// GraftBytes is how much of Need is grafted content, and GraftRoots
+	// which grafts it belongs to. A refusal that says "10 TB does not fit
+	// in 100 GB" is actionable; one that says "grafts cannot be
+	// prefetched" is not, and is also untrue.
+	GraftBytes int64
+	GraftRoots []superblock.GraftEntry
 }
 
 func (e *PrefetchBudgetError) Error() string {
-	return fmt.Sprintf("genfs: the generation is %d bytes in %d packs, the local cache budget is %d bytes; "+
-		"it cannot be made local (raise --cache-size above %d, or drop --prefetch all)",
-		e.Need, e.Packs, e.Budget, e.Need)
+	if e.GraftBytes == 0 {
+		return fmt.Sprintf("genfs: the generation is %d bytes in %d packs, the local cache budget is %d bytes; "+
+			"it cannot be made local (raise --cache-size above %d, or drop --prefetch all)",
+			e.Need, e.Packs, e.Budget, e.Need)
+	}
+	var names []string
+	for _, g := range e.GraftRoots {
+		names = append(names, fmt.Sprintf("%s <- %s (%d bytes)", g.Path, g.Source, g.Bytes))
+	}
+	// The pack clause is omitted when the graft alone already blows the
+	// budget, because that check runs off the signed superblock BEFORE
+	// anything is walked — "0 bytes in 0 packs" there would be a fact
+	// about the walk that never happened rather than about the volume.
+	packs := ""
+	if e.Packs > 0 {
+		packs = fmt.Sprintf("%d bytes in %d packs and ", e.Need-e.GraftBytes, e.Packs)
+	}
+	return fmt.Sprintf("genfs: making this generation local needs %d bytes — %s%d bytes grafted from %s — "+
+		"and the local cache budget is %d bytes (raise --cache-size above %d, or use "+
+		"--prefetch packs to make the packed content local and read the grafted content "+
+		"from its source)",
+		e.Need, packs, e.GraftBytes, strings.Join(names, ", "), e.Budget, e.Need)
 }
 
 // ErrPrefetchNeedsPackCache is the refusal when whole-pack caching is off.
@@ -84,18 +158,54 @@ func (e *PrefetchBudgetError) Error() string {
 // would be a lie rather than a slow success.
 var ErrPrefetchNeedsPackCache = errors.New("genfs: --prefetch needs the whole-pack cache, which this mount has turned off")
 
-// Prefetch downloads the generation's referenced pack set using workers
-// concurrent transfers. It stops early and returns the error only when ctx
-// is cancelled or the set cannot fit; per-pack failures are counted so a
+// PrefetchOptions configures a warm-up pass.
+type PrefetchOptions struct {
+	// Workers bounds concurrent transfers; zero takes 8.
+	Workers int
+	// Grafts asks the pass to fetch GRAFTED blocks into the local cache
+	// too, so that later reads under a graft do not touch the source.
+	//
+	// It is a separate flag from the pack work because the two make
+	// different promises and one of them can be kept when the other
+	// cannot: a volume whose grafted content does not fit the cache can
+	// still have every pack made local. It is NOT a materialization —
+	// nothing is written to the volume, no generation is produced, and the
+	// files stay grafted (graftcache.go).
+	Grafts bool
+}
+
+// Prefetch downloads the generation's referenced pack set, and — when
+// Options.Grafts is set — its grafted blocks, using Workers concurrent
+// transfers. It stops early and returns the error only when ctx is
+// cancelled or the set cannot fit; per-pack failures are counted so a
 // caller can decide whether "mostly local" is good enough (background
 // mode) or not (strict mode).
-func (fs *FS) Prefetch(ctx context.Context, workers int) (*PrefetchReport, error) {
+func (fs *FS) Prefetch(ctx context.Context, o PrefetchOptions) (*PrefetchReport, error) {
+	workers := o.Workers
 	if workers <= 0 {
 		workers = 8
 	}
 	rep := &PrefetchReport{}
 	if fs.packCacheCap <= 0 {
 		return rep, ErrPrefetchNeedsPackCache
+	}
+	// THE CHEAP REFUSAL, before anything is walked. The signed superblock
+	// already says how large each graft is (GraftEntry.Bytes, recorded for
+	// exactly this), so the 10-TB-graft-into-a-100-GB-cache case is
+	// answered without touching a catalog. The exact combined check
+	// happens below, once the pack set is known.
+	if o.Grafts {
+		var graftBytes int64
+		roots := fs.Grafts()
+		for _, g := range roots {
+			graftBytes += g.Bytes
+		}
+		if limit := fs.prefetchBudget(); limit > 0 && graftBytes > limit {
+			return rep, &PrefetchBudgetError{
+				Need: graftBytes, Budget: limit,
+				GraftBytes: graftBytes, GraftRoots: roots,
+			}
+		}
 	}
 	// Prefetch is one of the callers that must ask for the WHOLE location
 	// map. A read fills it in as it goes, one pack at a time; a pass that
@@ -112,7 +222,7 @@ func (fs *FS) Prefetch(ctx context.Context, workers int) (*PrefetchReport, error
 		return rep, err
 	}
 
-	packs, err := fs.referencedPacks(ctx, rep)
+	packs, wantGrafts, err := fs.referencedPacks(ctx, rep, o.Grafts)
 	if err != nil {
 		return rep, err
 	}
@@ -140,8 +250,20 @@ func (fs *FS) Prefetch(ctx context.Context, workers int) (*PrefetchReport, error
 		fit = append(fit, name)
 	}
 	names = fit
-	if limit := fs.prefetchBudget(); limit > 0 && need > limit {
-		return rep, &PrefetchBudgetError{Need: need, Budget: limit, Packs: len(names)}
+	// Grafted bytes count against the budget only when this pass intends
+	// to FETCH them. A packs-only prefetch on a volume whose graft is far
+	// larger than the cache is a perfectly reasonable thing to do, and
+	// refusing it because of bytes nobody asked for would leave that
+	// volume with no working prefetch mode at all.
+	graftNeed := int64(0)
+	if o.Grafts {
+		graftNeed = rep.GraftedBytes
+	}
+	if limit := fs.prefetchBudget(); limit > 0 && need+graftNeed > limit {
+		return rep, &PrefetchBudgetError{
+			Need: need + graftNeed, Budget: limit, Packs: len(names),
+			GraftBytes: graftNeed, GraftRoots: rep.GraftRoots,
+		}
 	}
 
 	// What is already here, counted BEFORE anything is fetched, or the
@@ -192,7 +314,66 @@ func (fs *FS) Prefetch(ctx context.Context, workers int) (*PrefetchReport, error
 	if err := ctx.Err(); err != nil {
 		return rep, err
 	}
+	if err := fs.prefetchGrafts(ctx, rep, wantGrafts, workers); err != nil {
+		return rep, err
+	}
 	return rep, nil
+}
+
+// graftWant is one grafted block a prefetch has to make local.
+type graftWant struct {
+	e     *graftEntry
+	loc   graft.Loc
+	idHex string
+}
+
+// prefetchGrafts fetches, verifies and caches the grafted blocks.
+//
+// It is deliberately the SAME code the read path uses — readGraftChunk,
+// with the pin flag set — so a prefetched block is verified against the
+// identity the signed catalog names before it is written, and there is no
+// second path on which an unverified byte could reach the disk. What ends
+// up cached is what a read would have accepted.
+//
+// A failure is counted rather than fatal, exactly as a pack failure is.
+// The bytes are re-fetchable, so a graft block that would not come down is
+// a slower mount and not a broken one; what it is NOT is fully local, and
+// the report says so through GraftLocal.
+func (fs *FS) prefetchGrafts(ctx context.Context, rep *PrefetchReport, want []graftWant, workers int) error {
+	if len(want) == 0 {
+		return nil
+	}
+	var (
+		mu    sync.Mutex
+		tasks = make([]func(), 0, len(want))
+	)
+	for _, w := range want {
+		w := w
+		tasks = append(tasks, func() {
+			if fs.graftCache.holds(w.idHex) {
+				mu.Lock()
+				rep.GraftLocal++
+				rep.GraftLocalBytes += w.loc.Length
+				mu.Unlock()
+				return
+			}
+			_, err := fs.readGraftChunk(ctx, w.e, w.loc, w.idHex, true)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				fs.noteFailure(rep, err.Error())
+				return
+			}
+			rep.GraftLocal++
+			rep.GraftLocalBytes += w.loc.Length
+			rep.GraftFetched += w.loc.Length
+		})
+	}
+	runBounded(ctx, tasks, workers)
+	// Finalize the open blob, or the bytes this pass just paid for are an
+	// abandoned temp file the moment the process exits.
+	fs.graftCache.flush()
+	return ctx.Err()
 }
 
 // prefetchBudget is the byte ceiling a prefetched pack set is held to: the
@@ -241,8 +422,9 @@ func (fs *FS) noteFailure(rep *PrefetchReport, msg string) {
 // collected a deduplicated set of every identity in the generation before
 // it fetched anything — tens of millions of 32-byte keys on a large volume,
 // resident at once, to derive a few hundred pack names.
-func (fs *FS) referencedPacks(ctx context.Context, rep *PrefetchReport) (map[string]struct{}, error) {
+func (fs *FS) referencedPacks(ctx context.Context, rep *PrefetchReport, collectGrafts bool) (map[string]struct{}, []graftWant, error) {
 	packs := make(map[string]struct{})
+	var wantGrafts []graftWant
 	// locateInto resolves one entry identity to its pack. The whole
 	// location map is loaded by the time this runs, so a miss is a genuine
 	// absence and the caller's problem to report.
@@ -252,6 +434,47 @@ func (fs *FS) referencedPacks(ctx context.Context, rep *PrefetchReport) (map[str
 			return
 		}
 		fs.noteFailure(rep, fmt.Sprintf("%s %s: present in no listed pack", what, idHex[:min(16, len(idHex))]))
+	}
+	// Grafted refs are counted, not failed. The graft table is asked
+	// FIRST for the same reason the read path asks it first: a grafted
+	// identity is in no pack by construction, and packIndex.lookup would
+	// answer "absent" — the sentence that means damage everywhere else.
+	seenGraft := make(map[string]struct{})
+	graftedRef := func(ctx context.Context, r *catalog.ChunkRef) (bool, error) {
+		if fs.grafts == nil {
+			return false, nil
+		}
+		e, loc, ok, err := fs.grafts.locate(ctx, r.Identity)
+		if err != nil {
+			return false, err
+		}
+		if !ok {
+			return false, nil
+		}
+		idHex := hex.EncodeToString(r.Identity)
+		if _, dup := seenGraft[idHex]; dup {
+			// Counted once. Two files sharing a block — which a graft
+			// dedups within itself — is one thing to fetch, not two, and
+			// double-counting would make the budget refuse a set that
+			// fits.
+			return true, nil
+		}
+		seenGraft[idHex] = struct{}{}
+		rep.Grafted++
+		rep.GraftedBytes += r.LLen
+		if collectGrafts {
+			wantGrafts = append(wantGrafts, graftWant{e: e, loc: loc, idHex: idHex})
+		}
+		named := false
+		for _, g := range rep.GraftRoots {
+			if g.Path == e.sb.Path {
+				named = true
+			}
+		}
+		if !named {
+			rep.GraftRoots = append(rep.GraftRoots, e.sb)
+		}
+		return true, nil
 	}
 	locateInto(fs.cats.rootHex, "root catalog")
 
@@ -305,6 +528,13 @@ func (fs *FS) referencedPacks(ctx context.Context, rep *PrefetchReport) (map[str
 						rep.Skipped++ // hole or inline: nothing to fetch
 						continue
 					}
+					grafted, err := graftedRef(ctx, r)
+					if err != nil {
+						return fmt.Errorf("prefetch: %q: %w", e.Name, err)
+					}
+					if grafted {
+						continue
+					}
 					locateInto(hex.EncodeToString(r.Identity), "chunk")
 				}
 			}
@@ -312,7 +542,7 @@ func (fs *FS) referencedPacks(ctx context.Context, rep *PrefetchReport) (map[str
 		return nil
 	}
 	if err := walk(RootInode); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return packs, nil
+	return packs, wantGrafts, nil
 }

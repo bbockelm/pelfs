@@ -924,7 +924,7 @@ func TestPrefetchWarmsCache(t *testing.T) {
 
 	cache := t.TempDir()
 	fs := openFS(t, inner, res.Superblock, genfs.Options{CacheDir: cache})
-	rep, err := fs.Prefetch(ctx, 4)
+	rep, err := fs.Prefetch(ctx, genfs.PrefetchOptions{Workers: 4})
 	if err != nil {
 		t.Fatalf("Prefetch: %v", err)
 	}
@@ -979,7 +979,7 @@ func TestPrefetchWarmsCache(t *testing.T) {
 	}
 
 	// A second pass finds everything cached and transfers nothing.
-	rep2, err := fs.Prefetch(ctx, 4)
+	rep2, err := fs.Prefetch(ctx, genfs.PrefetchOptions{Workers: 4})
 	if err != nil {
 		t.Fatalf("second Prefetch: %v", err)
 	}

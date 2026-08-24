@@ -889,6 +889,35 @@ back in key order to a `packidx.StreamWriter`, which keeps only the
 samples. Memory is the extsort budget plus the string table, both
 independent of the block count.
 
+### The encoded index is a function of the source, not of the schedule
+
+An index object is **hash-named** and the superblock entry names it by
+hash, so two walks of an unchanged tree under an unchanged policy must
+write **byte-identical** objects. That is what makes `--refresh` of a
+quiet source cost a listing: the encode reproduces the same object, the
+upload is idempotent on a key that already exists, and the entry does not
+move. If the bytes varied, a refresh that read zero bytes of source data
+would still upload a fresh index and rewrite the entry every time.
+
+Two things had to be pinned for that to hold, because the walk is
+concurrent and both of them were taking their order from it:
+
+- **The object-key string table is sorted at encode time**, and the
+  records are remapped through the permutation. It used to be built in
+  `Writer.Add` order -- which is the order the span workers finished in --
+  so every record's object index depended on the schedule. The
+  permutation costs one `uint32` per OBJECT, the bound the string table
+  already carries.
+- **A repeated identity collapses to the lowest location**, not to
+  whichever the sort happened to put in front (the sort compares keys
+  only, so its order among equal keys is the input order, which is again
+  the schedule). Either location serves the same bytes; what matters is
+  that the choice be a property of the tree. One record is held, never a
+  run, so a tree of identical blocks cannot make the encode allocate.
+
+Pinned by `TestTheSameSourceAlwaysEncodesTheSameIndex`, which walks a tree
+holding two identical objects twelve times and compares the bytes.
+
 One resident cost remains and is stated rather than hidden: a spider
 result carries 32 bytes per block for the identities (336 MB at 10 TB),
 because `publish` pulls one file's records at a time and something must

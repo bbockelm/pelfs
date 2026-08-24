@@ -252,22 +252,23 @@ func (r *Reporter) Publish(m Mount) error {
 		AttrUploadBacklog: Int(m.UploadBacklog),
 		AttrObjectErrors:  Int(m.ObjectErrors),
 	}
-	var firstErr error
 	for _, name := range PeriodicAttrs {
 		v := vals[name]
+		// Skipping what the ad already holds is what keeps an idle
+		// mount's cycle down to the one attribute that moves on its own.
 		if v == "" || r.last[name] == v {
 			continue
 		}
 		if err := r.c.SetJobAttrDelayed(name, v); err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
+			// Stop at the first failure rather than sending the rest into
+			// the same broken socket. Nothing is recorded in r.last, so
+			// the next cycle sends the whole set again.
 			r.faultLocked(err)
-			return firstErr
+			return err
 		}
 		r.last[name] = v
 	}
-	return firstErr
+	return nil
 }
 
 // Fail reports, exactly once, that the mount has answered the payload

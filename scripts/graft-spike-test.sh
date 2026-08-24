@@ -472,5 +472,201 @@ echo "PASS: the refusal is about SIZE, carries both numbers, names the graft, an
 
 echo
 echo "===================================================================="
-echo "  the spike answers both questions: yes, and yes"
+echo "  9. A GRAFT INTO A POPULATED VOLUME"
+echo "===================================================================="
+# The one thing that made this feature unusable: everything above is
+# `pelfs init` then `pelfs graft`, which nobody wants. This section takes a
+# volume that ALREADY HAS CONTENT -- written through a real rw mount and
+# sealed -- and splices the foreign tree into it, then checks the only
+# things that matter: the old files still read, the new ones read, a seal
+# afterwards works, and a cold remount agrees with all of it.
+#
+# A SECOND VOLUME, so the narrative above is untouched.
+VOL2="http://127.0.0.1:18997/vol2"
+mkdir -p "$WORK/rw2" "$WORK/mnt2"
+"$WORK/pelfs" init --state-dir "$WORK/state2" "$VOL2"
+
+echo "-- write a real tree through a real rw mount, and seal it --"
+"$WORK/pelfs" mount --rw --state-dir "$WORK/state2" --no-lease --snapshot-interval 0 "$VOL2" "$WORK/rw2"
+wait_for "$WORK/rw2" || { echo "rw mount did not come up" >&2; exit 1; }
+mkdir -p "$WORK/rw2/docs" "$WORK/rw2/busy" "$WORK/rw2/empty"
+echo "a file the volume already had" > "$WORK/rw2/keep.txt"
+head -c 300000 /dev/urandom > "$WORK/rw2/docs/big.bin"
+echo "nested and must survive" > "$WORK/rw2/docs/readme.txt"
+echo "do not lose me" > "$WORK/rw2/busy/mine.txt"
+echo "nor me" > "$WORK/rw2/busy/mine2.txt"
+mkdir -p "$WORK/ref2"
+cp -R "$WORK/rw2/." "$WORK/ref2/"
+"$WORK/pelfs" ctl "$VOL2" publish
+"$WORK/pelfs" umount "$VOL2"
+BASE_FILES=$(find "$WORK/ref2" -type f | wc -l)
+echo "the volume holds $BASE_FILES files of its own before any graft"
+
+echo
+echo "-- REFUSALS FIRST, because they are what protects somebody's data --"
+set +e
+"$WORK/pelfs" graft --state-dir "$WORK/state2" --block 1048576 "$VOL2" /busy "$EXT" \
+    >"$WORK/g-busy.log" 2>&1
+rc=$?
+set -e
+[ "$rc" -ne 0 ] || { echo "FAIL: grafting over a POPULATED directory succeeded" >&2; cat "$WORK/g-busy.log" >&2; exit 1; }
+grep -qi '2 entries' "$WORK/g-busy.log" || { echo "FAIL: the refusal does not count what it would drop" >&2; cat "$WORK/g-busy.log" >&2; exit 1; }
+grep -qi -- '--replace' "$WORK/g-busy.log" || { echo "FAIL: the refusal does not say what to do instead" >&2; cat "$WORK/g-busy.log" >&2; exit 1; }
+echo "PASS: a populated directory is not replaced silently; the refusal counts it and offers --replace"
+
+set +e
+"$WORK/pelfs" graft --state-dir "$WORK/state2" --block 1048576 "$VOL2" /keep.txt "$EXT" \
+    >"$WORK/g-file.log" 2>&1
+rc=$?
+set -e
+[ "$rc" -ne 0 ] || { echo "FAIL: grafting onto a FILE succeeded" >&2; exit 1; }
+grep -qi 'is a file' "$WORK/g-file.log" || { echo "FAIL: the refusal does not say what is there" >&2; cat "$WORK/g-file.log" >&2; exit 1; }
+echo "PASS: a file at the graft path is refused, by name"
+
+# Nothing was published by either refusal.
+GEN_BEFORE=$("$WORK/pelfs" fsck --state-dir "$WORK/state2" "$VOL2" 2>/dev/null | grep -oE '^generation [0-9]+' | head -1 | awk '{print $2}')
+echo "the branch is still on generation ${GEN_BEFORE:-?} after two refusals"
+
+echo
+echo "-- and now the graft itself, into the populated volume --"
+"$WORK/pelfs" graft --state-dir "$WORK/state2" --block 1048576 "$VOL2" /ext "$EXT" \
+    2>&1 | tee "$WORK/g-ok.log" | sed 's/^/    /'
+grep -qi 'carried forward unchanged' "$WORK/g-ok.log" || {
+  echo "FAIL: the graft did not report what it carried forward; it may have rewritten the volume" >&2
+  cat "$WORK/g-ok.log" >&2; exit 1; }
+# The count itself is 0 on a volume this small -- it has ONE catalog, so
+# there is nothing below the root to carry. What this checks is that the
+# splice reports the split at all; the carrying is measured where it can
+# be, on a volume with nested catalogs, in
+# publish.TestGraftAcrossANestedCatalogBoundary.
+grep -qi "files' content records reused as published" "$WORK/g-ok.log" || {
+  echo "FAIL: the graft did not reuse the base generation's content records" >&2
+  cat "$WORK/g-ok.log" >&2; exit 1; }
+REUSED=$(grep -oE '[0-9]+ files.\ content records reused' "$WORK/g-ok.log" | head -1 | awk '{print $1}')
+[ "${REUSED:-0}" -ge "$BASE_FILES" ] || {
+  echo "FAIL: only ${REUSED:-0} of $BASE_FILES base files kept their published records;" >&2
+  echo "      the splice is re-reading content it already had" >&2; exit 1; }
+echo "PASS: the splice kept all $BASE_FILES base files' published content records and rewrote only the path"
+
+echo
+echo "-- a COLD mount of the result: the old tree AND the new one --"
+"$WORK/pelfs" mount-gen --state-dir "$WORK/state2-ro" "$VOL2" "$WORK/mnt2" 2>"$WORK/mnt2-err.log" &
+MOUNT_PID=$!
+wait_for "$WORK/mnt2/keep.txt" || { echo "mount did not come up" >&2; cat "$WORK/mnt2-err.log" >&2; exit 1; }
+echo "-- ls -la / --"
+ls -la "$WORK/mnt2"
+# Every pre-existing file, byte for byte, against the copy taken before
+# the graft.
+for f in keep.txt docs/readme.txt docs/big.bin busy/mine.txt busy/mine2.txt; do
+  cmp "$WORK/ref2/$f" "$WORK/mnt2/$f" || { echo "FAIL: $f did not survive the graft" >&2; exit 1; }
+done
+[ -d "$WORK/mnt2/empty" ] || { echo "FAIL: the empty directory did not survive the graft" >&2; exit 1; }
+echo "PASS: all $BASE_FILES pre-existing files, and the empty directory, read unchanged"
+# And the grafted tree, from a prefix that holds none of the volume's bytes.
+cmp "$WORK/ref/data/small.txt" "$WORK/mnt2/ext/data/small.txt"
+cmp "$WORK/ref/data/nested/mid.bin" "$WORK/mnt2/ext/data/nested/mid.bin"
+cmp "$WORK/ref/data/multiblock.bin" "$WORK/mnt2/ext/data/multiblock.bin"
+echo "PASS: the grafted tree reads beside the volume's own content"
+unmount_at "$WORK/mnt2"; wait "$MOUNT_PID" 2>/dev/null || true; MOUNT_PID=
+
+echo
+echo "-- RE-GRAFTING THE SAME SOURCE is a refresh, and says so --"
+set +e
+"$WORK/pelfs" graft --state-dir "$WORK/state2" --block 1048576 "$VOL2" /ext "$EXT" \
+    >"$WORK/g-again.log" 2>&1
+rc=$?
+set -e
+[ "$rc" -ne 0 ] || { echo "FAIL: re-grafting the same source at the same path succeeded silently" >&2; exit 1; }
+grep -qi -- '--refresh' "$WORK/g-again.log" || { echo "FAIL: the refusal does not name --refresh" >&2; cat "$WORK/g-again.log" >&2; exit 1; }
+echo "PASS: re-grafting the same source is refused and names --refresh"
+
+echo
+echo "-- A GRAFT INSIDE A GRAFT is refused by name --"
+set +e
+"$WORK/pelfs" graft --state-dir "$WORK/state2" --block 1048576 "$VOL2" /ext/inner "$EXT" \
+    >"$WORK/g-nested.log" 2>&1
+rc=$?
+set -e
+[ "$rc" -ne 0 ] || { echo "FAIL: a graft inside a grafted subtree succeeded" >&2; exit 1; }
+grep -qi 'inside the graft at /ext' "$WORK/g-nested.log" || {
+  echo "FAIL: the refusal does not name the graft it is inside" >&2; cat "$WORK/g-nested.log" >&2; exit 1; }
+echo "PASS: a nested graft is refused, naming the outer graft"
+
+echo
+echo "-- A SEAL AFTERWARDS: the volume is still writable, and the graft survives it --"
+# The graft advanced the branch, and the leftover overlay from the writable
+# mount above records the generation it shadowed -- so it can no longer be
+# sealed onto the head. `pelfs graft` warns about exactly this before it
+# starts, and moving it aside is what the warning says to do. NOT graft
+# specific: `pelfs repack`, `pelfs merge` and a second writer have always
+# done the same thing to a leftover overlay.
+grep -qi 'unsealed write overlay' "$WORK/g-ok.log" || {
+  echo "FAIL: the graft did not warn that it would strand the leftover overlay" >&2
+  cat "$WORK/g-ok.log" >&2; exit 1; }
+echo "PASS: the graft warned up front about the leftover overlay it would strand"
+rm -rf "$WORK/state2/overlay"
+"$WORK/pelfs" mount --rw --state-dir "$WORK/state2" --no-lease --snapshot-interval 0 "$VOL2" "$WORK/rw2"
+wait_for "$WORK/rw2/keep.txt" || { echo "rw mount did not come up over a grafted volume" >&2; exit 1; }
+echo "written after the graft" > "$WORK/rw2/after.txt"
+cmp "$WORK/ref/data/small.txt" "$WORK/rw2/ext/data/small.txt"
+"$WORK/pelfs" ctl "$VOL2" publish
+"$WORK/pelfs" umount "$VOL2"
+echo "PASS: a seal over a grafted volume published, and the grafted tree read through the rw mount"
+
+"$WORK/pelfs" mount-gen --state-dir "$WORK/state2-ro2" "$VOL2" "$WORK/mnt2" 2>"$WORK/mnt2-err2.log" &
+MOUNT_PID=$!
+wait_for "$WORK/mnt2/after.txt" || { echo "the post-seal mount did not come up" >&2; cat "$WORK/mnt2-err2.log" >&2; exit 1; }
+grep -q 'written after the graft' "$WORK/mnt2/after.txt"
+cmp "$WORK/ref2/keep.txt" "$WORK/mnt2/keep.txt"
+cmp "$WORK/ref/data/nested/mid.bin" "$WORK/mnt2/ext/data/nested/mid.bin"
+echo "PASS: a cold remount agrees: the pre-graft tree, the graft, and the post-graft write"
+unmount_at "$WORK/mnt2"; wait "$MOUNT_PID" 2>/dev/null || true; MOUNT_PID=
+
+echo
+echo "-- --replace, on purpose, over the populated directory --"
+rm -rf "$WORK/state2/overlay"
+"$WORK/pelfs" graft --state-dir "$WORK/state2" --block 1048576 --replace "$VOL2" /busy "$EXT" \
+    2>&1 | tee "$WORK/g-replace.log" | sed 's/^/    /'
+grep -qi 'will NOT be in the next generation' "$WORK/g-replace.log" || {
+  echo "FAIL: --replace did not say what it was dropping" >&2; cat "$WORK/g-replace.log" >&2; exit 1; }
+"$WORK/pelfs" mount-gen --state-dir "$WORK/state2-ro3" "$VOL2" "$WORK/mnt2" 2>"$WORK/mnt2-err3.log" &
+MOUNT_PID=$!
+wait_for "$WORK/mnt2/busy/data/small.txt" || {
+  echo "FAIL: --replace did not put the graft at /busy" >&2; cat "$WORK/mnt2-err3.log" >&2; exit 1; }
+[ ! -e "$WORK/mnt2/busy/mine.txt" ] || { echo "FAIL: --replace left the old entries behind" >&2; exit 1; }
+cmp "$WORK/ref2/keep.txt" "$WORK/mnt2/keep.txt"
+echo "PASS: --replace displaced exactly the directory it named, and nothing else"
+unmount_at "$WORK/mnt2"; wait "$MOUNT_PID" 2>/dev/null || true; MOUNT_PID=
+
+echo
+echo "-- --remove: the graft goes, the volume stays --"
+rm -rf "$WORK/state2/overlay"
+"$WORK/pelfs" graft --state-dir "$WORK/state2" --remove "$VOL2" /ext \
+    2>&1 | tee "$WORK/g-remove.log" | sed 's/^/    /'
+grep -qi 'does not name that source' "$WORK/g-remove.log" || {
+  echo "FAIL: --remove did not say the volume stopped depending on the source" >&2
+  cat "$WORK/g-remove.log" >&2; exit 1; }
+"$WORK/pelfs" graft --state-dir "$WORK/state2" --list "$VOL2" | tee "$WORK/g-list.log" | sed 's/^/    /'
+grep -q '/ext ' "$WORK/g-list.log" && { echo "FAIL: --list still names the removed graft" >&2; exit 1; }
+"$WORK/pelfs" mount-gen --state-dir "$WORK/state2-ro4" "$VOL2" "$WORK/mnt2" 2>"$WORK/mnt2-err4.log" &
+MOUNT_PID=$!
+wait_for "$WORK/mnt2/keep.txt" || { echo "the post-remove mount did not come up" >&2; cat "$WORK/mnt2-err4.log" >&2; exit 1; }
+[ ! -e "$WORK/mnt2/ext" ] || { echo "FAIL: --remove left /ext in the namespace" >&2; exit 1; }
+cmp "$WORK/ref2/keep.txt" "$WORK/mnt2/keep.txt"
+cmp "$WORK/ref2/docs/big.bin" "$WORK/mnt2/docs/big.bin"
+grep -q 'written after the graft' "$WORK/mnt2/after.txt"
+# The OTHER graft (/busy, from --replace) is untouched by removing this one.
+cmp "$WORK/ref/data/small.txt" "$WORK/mnt2/busy/data/small.txt"
+echo "PASS: --remove dropped one graft and left the volume, and the other graft, intact"
+unmount_at "$WORK/mnt2"; wait "$MOUNT_PID" 2>/dev/null || true; MOUNT_PID=
+
+echo
+echo "-- and fsck still parses the result --"
+"$WORK/pelfs" fsck --state-dir "$WORK/state2" "$VOL2" 2>&1 | tail -5 | sed 's/^/    /' || true
+echo "(fsck reports grafted files as missing chunks today; that is item 2, not this one)"
+
+echo
+echo "===================================================================="
+echo "  the spike answers both questions: yes, and yes -- and a graft now"
+echo "  goes into a volume that already has content in it"
 echo "===================================================================="

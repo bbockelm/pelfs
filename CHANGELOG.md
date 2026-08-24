@@ -46,6 +46,14 @@ tested `DirtyEdges`), which is why this cost a prompt rather than the data.
 `unpublished` boolean computed from the same predicate the seal uses, and the
 idle sealer counts a rename as both a change and something to publish.
 
+**And now the page shows it.** Both surfaces key off that `unpublished`
+boolean instead of re-deriving it from the byte counters, so a rename -- or a
+delete, a mkdir, a hardlink -- moves the durability panel into the staged
+state and enables *Publish now*, on `/` and on `/connect` alike. A change that
+stages no bytes gets its own sentence, "Changes on this machine only.", rather
+than the counted one reporting the size of the change as zero. The leave-site
+hint moved to the same predicate.
+
 **A seal says how much of itself was the mount following it.** The swap phase
 re-descends every inode the KERNEL is holding, so its cost is set by how much
 of the tree the session has browsed and not at all by how much changed; the

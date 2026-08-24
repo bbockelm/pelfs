@@ -46,7 +46,7 @@ const consentBodyLimit = 64 << 10
 // is a new tab. There is no header to check and no place to check it.
 //
 // The controls that carry the weight instead, all in this file: a client_id
-// that is a per-download secret (findClient, constant time); a redirect_uri
+// that only a profile download carries (findClient, constant time); a redirect_uri
 // matched byte for byte against the one URL pelfs itself wrote into that
 // client's profile; PKCE S256 required rather than accepted; and one real
 // user gesture on a consent screen that cannot be framed and on which no

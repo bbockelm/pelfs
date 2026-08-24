@@ -654,8 +654,8 @@ func TestRevocation(t *testing.T) {
 		_, tok := h.exchange(h.code(), testVerifier)
 		page := h.get(h.query()) // a live consent page, too
 		ticket := h.ticket(page)
-		if !h.s.Revoke(h.client.Ref) {
-			t.Fatal("Revoke reported nothing to revoke")
+		if ok, err := h.s.Revoke(h.client.Ref); !ok || err != nil {
+			t.Fatalf("Revoke reported nothing to revoke: %v %v", ok, err)
 		}
 		if _, ok := h.s.Verify(tok.AccessToken); ok {
 			t.Error("a revoked client's OAuth token still verifies")
@@ -669,8 +669,8 @@ func TestRevocation(t *testing.T) {
 		if w := h.get(h.query()); w.Code != http.StatusBadRequest {
 			t.Errorf("a revoked client_id is still known: %d", w.Code)
 		}
-		if h.s.Revoke(h.client.Ref) {
-			t.Error("Revoke succeeded twice")
+		if ok, err := h.s.Revoke(h.client.Ref); ok || err != nil {
+			t.Errorf("Revoke succeeded twice: %v %v", ok, err)
 		}
 	})
 
@@ -729,7 +729,9 @@ func TestBasicCredentialIsPerClientAndRevocable(t *testing.T) {
 	if second.BasicUser == h.client.BasicUser || second.BasicPassword == h.client.BasicPassword {
 		t.Error("two clients share a credential")
 	}
-	h.s.Revoke(h.client.Ref)
+	if _, err := h.s.Revoke(h.client.Ref); err != nil {
+		t.Fatalf("Revoke: %v", err)
+	}
 	if _, ok := h.s.verifyBasic(second.BasicUser, second.BasicPassword); !ok {
 		t.Error("revoking one client's credential killed another's")
 	}
@@ -810,7 +812,7 @@ func TestA7Controls(t *testing.T) {
 		}
 	})
 
-	t.Run("4 client_id is a per-download secret", func(t *testing.T) {
+	t.Run("4 client_id is a secret only a profile download carries", func(t *testing.T) {
 		h := newHarness(t, false)
 		if len(h.client.ID) < 40 {
 			t.Errorf("client_id is %d characters; it should be 32 random bytes", len(h.client.ID))

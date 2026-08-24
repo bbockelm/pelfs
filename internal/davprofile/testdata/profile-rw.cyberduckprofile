@@ -9,7 +9,7 @@
 	<key>Name</key>
 	<string>pelfs osg-htc.org/user/bbockelman</string>
 	<key>Description</key>
-	<string>pelfs pelican://osg-htc.org/user/bbockelman (read-write, this session only)</string>
+	<string>pelfs pelican://osg-htc.org/user/bbockelman (read-write; install once, authorize once per session)</string>
 	<key>Default Nickname</key>
 	<string>pelfs: osg-htc.org/user/bbockelman (Cyberduck)</string>
 	<key>Default Hostname</key>

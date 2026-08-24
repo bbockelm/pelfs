@@ -28,8 +28,12 @@ mount-gate:
 # `pelfs browse` end to end: the shipped binary against a fakeorigin, curl
 # as the browser, REAL Cyberduck (`duck`) as the WebDAV client, and a
 # SECOND, FRESH pelfs mounting the published generation from an empty state
-# directory to prove the bytes reached the federation. ~90s after the
-# image build; the run itself is --network none.
+# directory to prove the bytes reached the federation. Step 8 then RESTARTS
+# `pelfs browse` over the same state directory and reconnects real duck with
+# the profile the first session generated -- not regenerated, not
+# reinstalled -- which is the check that an installed Cyberduck profile is
+# not single-use. ~2min after the image build; the run itself is
+# --network none.
 browse-gate:
 	./scripts/browse-gate-docker.sh
 

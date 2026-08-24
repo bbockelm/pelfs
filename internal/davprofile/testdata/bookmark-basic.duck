@@ -15,6 +15,6 @@
 	<key>Nickname</key>
 	<string>pelfs: osg-htc.org/user/bbockelman (Cyberduck, password)</string>
 	<key>Comment</key>
-	<string>pelfs pelican://osg-htc.org/user/bbockelman (read-only, this session only) - paste the password pelfs showed you</string>
+	<string>pelfs pelican://osg-htc.org/user/bbockelman (read-only; install once, authorize once per session) - paste the password pelfs showed you</string>
 </dict>
 </plist>

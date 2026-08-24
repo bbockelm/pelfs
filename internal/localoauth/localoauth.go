@@ -42,8 +42,10 @@
 //  3. exact-string redirect_uri          Client.RedirectURI, one entry, one
 //     byte-for-byte comparison, and no
 //     redirect of any kind on failure
-//  4. client_id is a per-download secret 32 bytes of crypto/rand, stored as
-//     an HMAC, compared in constant time
+//  4. client_id comes only from a        32 bytes, stored as an HMAC and
+//     profile pelfs generated             compared in constant time:
+//     crypto/rand, or derived from the state directory's key when one is
+//     configured (identity.go)
 //  5. PKCE S256 REQUIRED                 not accepted-if-offered: an
 //     /authorize with no S256 challenge
 //     is refused (and `plain` with it)
@@ -92,16 +94,28 @@
 // never revisits /authorize while a refresh works). The user-visible
 // friction is the same and the endpoint keeps its property.
 //
-// # Nothing persists, and that is the revocation story
+// # No CREDENTIAL persists, and that is the revocation story
 //
-// No file, no state-directory entry, nothing in the volume. Every secret is
-// crypto/rand into memory, and the tables hold HMACs of secrets rather than
-// the secrets — the key is per-process, so a token from a previous `pelfs
-// browse` does not validate against a new one even on the same port, and a
-// heap profile of this process (internal/control exposes one over its unix
-// socket) contains no usable DAV credential. Exiting `pelfs browse` is a
-// complete revocation of every credential it ever minted; Revoke and
-// RevokeGrant are the individual ones.
+// Every secret this package issues is crypto/rand into memory, and the
+// tables hold HMACs of secrets rather than the secrets — Server.key is
+// per-process, so a token from a previous `pelfs browse` does not validate
+// against a new one even on the same port, and a heap profile of this
+// process (internal/control exposes one over its unix socket) contains no
+// usable DAV credential. Exiting `pelfs browse` is a complete revocation of
+// every credential it ever minted; Revoke and RevokeGrant are the
+// individual ones.
+//
+// EXACTLY ONE THING NOW SURVIVES THE PROCESS, and it is not a credential:
+// the client IDENTITY, when Config.Identity is set. identity.go is the
+// whole of it, including its threat model; the one-line version is that a
+// client_id is DERIVED from a per-volume key in the state directory rather
+// than minted per download, so the `.cyberduckprofile` a user installed
+// last week is still a profile this session recognises. What did NOT change:
+// no token and no password is written anywhere, and CONSENT IS STILL
+// REQUIRED ON EVERY /authorize — so the bookmark stops being one-time-use
+// and the click does not go away. Say it that way wherever it is described;
+// a page that implies otherwise is describing a control this package
+// refuses to build.
 package localoauth
 
 import (
@@ -242,6 +256,19 @@ type Config struct {
 	// Now is time.Now except in tests, which drive the clock rather than
 	// sleeping on it.
 	Now func() time.Time
+
+	// Identity makes the CLIENT IDENTITY persistent: client ids are derived
+	// from a per-volume key in the state directory instead of minted per
+	// download, so a generated profile is byte-identical across restarts and
+	// the one a user installed keeps working. See identity.go for the whole
+	// of what that does and does not persist — no token, no password, and
+	// not consent.
+	//
+	// nil is the ephemeral server this package started as: every client id
+	// is crypto/rand and dies with the process. That is what every test
+	// that does not care about persistence gets, and it is still the right
+	// answer for a caller with no state directory.
+	Identity *Identity
 }
 
 // Server is one process's authorization server and credential registry.
@@ -296,6 +323,12 @@ type Counts struct {
 
 // New builds a server. It fails rather than defaulting when something
 // security-relevant is missing.
+//
+// When Config.Identity is set it ADOPTS the clients already on disk, before
+// serving anything. That is what makes a saved bookmark work with no
+// interaction: the user's Cyberduck reconnects to a client this process has
+// never issued a profile for, and the registry has to know the name already
+// or the flow ends on "This is not an authorization request pelfs issued".
 func New(cfg Config) (*Server, error) {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
@@ -304,7 +337,54 @@ func New(cfg Config) (*Server, error) {
 	if _, err := rand.Read(s.key[:]); err != nil {
 		return nil, fmt.Errorf("localoauth: per-process key: %w", err)
 	}
+	if err := s.adoptPersistentClients(); err != nil {
+		return nil, err
+	}
 	return s, nil
+}
+
+// adoptPersistentClients registers the identities the state directory
+// already holds. Called once, from New, before the server can serve.
+//
+// TWO THINGS IT DELIBERATELY DOES NOT DO:
+//
+//   - It does not resurrect a Basic password. There is none on disk (see
+//     identity.go), so each adopted client gets a macBasic over a secret
+//     that is minted and immediately thrown away — nobody, pelfs included,
+//     can present it. The password path for an adopted client comes back
+//     when the user generates the download again, which is also the only
+//     way they could have the password to paste.
+//   - It does not drop or downgrade a write:true identity on a read-only
+//     session. Keeping it is what turns Cyberduck's reconnect into "That
+//     scope is wider than this profile … restart it with --rw", which is
+//     the true answer, instead of "this is not an authorization request
+//     pelfs issued", which is not. NewClient still refuses to CREATE a
+//     writable client on a read-only session, and parseScopes still refuses
+//     to grant the scope; adoption is not creation.
+func (s *Server) adoptPersistentClients() error {
+	if s.cfg.Identity == nil {
+		return nil
+	}
+	for _, e := range s.cfg.Identity.clients() {
+		id, err := s.cfg.Identity.derive(e)
+		if err != nil {
+			return err
+		}
+		ref, err := mintRef()
+		if err != nil {
+			return err
+		}
+		unknowable, err := mint()
+		if err != nil {
+			return err
+		}
+		s.clients = append(s.clients, &client{
+			ref: ref, label: e.Label, macID: s.mac(id), redirect: e.Redirect,
+			basicUser: "pelfs-" + ref, macBasic: s.mac(unknowable),
+			write: e.Write, created: e.Created, persistent: true,
+		})
+	}
+	return nil
 }
 
 // Writable reports the session's mode: the ceiling on every grant.
@@ -343,6 +423,10 @@ type client struct {
 	// decide anything, because a remembered consent at /authorize is the
 	// primitive control 6 removes. See the package comment.
 	consented bool
+	// persistent says this client's IDENTITY is in the state directory, so
+	// the profile the user installed survives a restart and revoking it has
+	// to reach the disk. Also for the UI's list, and also not a permission.
+	persistent bool
 }
 
 // ClientRequest registers one external client — in practice, one profile
@@ -396,6 +480,16 @@ type Client struct {
 }
 
 // NewClient registers a client and mints its credentials.
+//
+// WITH Config.Identity SET IT IS IDEMPOTENT ON (label, redirect, write), and
+// that is forced by the derivation rather than chosen for convenience: the
+// client id is HMAC(key, tuple), so a second registration of the same tuple
+// cannot produce a different id, and a second ROW for it would be one
+// profile with two revoke buttons. So the same tuple is the same client,
+// re-generating its download hands back a byte-identical profile, and the
+// only thing that is re-issued is the Basic password — which the previous
+// download's holder loses, because there is exactly one live password per
+// client and the response says the password is shown once.
 func (s *Server) NewClient(req ClientRequest) (*Client, error) {
 	label := strings.TrimSpace(req.Label)
 	if label == "" {
@@ -413,7 +507,21 @@ func (s *Server) NewClient(req ClientRequest) (*Client, error) {
 	if err := CheckRedirectURI(req.RedirectURI); err != nil {
 		return nil, err
 	}
-	id, err := mint()
+	now := s.cfg.Now()
+	// The identity: derived and recorded when there is a state directory to
+	// record it in, 32 fresh random bytes otherwise. This is the whole of
+	// the difference between a profile that survives a restart and one that
+	// does not.
+	var (
+		id      string
+		created = now
+		err     error
+	)
+	if s.cfg.Identity != nil {
+		id, created, err = s.cfg.Identity.register(label, req.RedirectURI, req.Write, now)
+	} else {
+		id, err = mint()
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -425,24 +533,39 @@ func (s *Server) NewClient(req ClientRequest) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	now := s.cfg.Now()
-	c := &client{
-		ref:       ref,
-		label:     label,
-		macID:     s.mac(id),
-		redirect:  req.RedirectURI,
-		basicUser: "pelfs-" + ref,
-		macBasic:  s.mac(pass),
-		write:     req.Write,
-		created:   now,
-	}
+	// ONE critical section for find-or-append, not two: two concurrent
+	// downloads of the same label would otherwise both miss and both append,
+	// and one derived id on two rows is one profile with two revoke buttons.
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Re-registering an identity this process already knows — either adopted
+	// from disk at startup or downloaded earlier in this session — reuses
+	// the ROW, so the ref the UI lists and the Basic username stay put and
+	// the password is the only thing that rolls.
+	if c := s.findClient(id); c != nil {
+		c.macBasic = s.mac(pass)
+		return &Client{
+			ID: id, BasicUser: c.basicUser, BasicPassword: pass,
+			Ref: c.ref, Label: c.label, Redirect: c.redirect,
+			Write: c.write, Created: c.created,
+		}, nil
+	}
+	c := &client{
+		ref:        ref,
+		label:      label,
+		macID:      s.mac(id),
+		redirect:   req.RedirectURI,
+		basicUser:  "pelfs-" + ref,
+		macBasic:   s.mac(pass),
+		write:      req.Write,
+		created:    created,
+		persistent: s.cfg.Identity != nil,
+	}
 	s.clients = append(s.clients, c)
-	s.mu.Unlock()
 	return &Client{
 		ID: id, BasicUser: c.basicUser, BasicPassword: pass,
 		Ref: ref, Label: label, Redirect: req.RedirectURI,
-		Write: req.Write, Created: now,
+		Write: req.Write, Created: created,
 	}, nil
 }
 
@@ -532,6 +655,12 @@ type ClientInfo struct {
 	// Consented is whether a human has authorized this client on a consent
 	// screen at least once.
 	Consented bool
+	// Persistent is whether this client's IDENTITY is in the state
+	// directory. It is what distinguishes "this profile still works next
+	// session" from "this profile dies with this process", and it is what
+	// makes Revoke's promise different between the two: revoking a
+	// persistent client kills the installed profile for good.
+	Persistent bool
 	// Grants is how many live OAuth grants this client holds.
 	Grants int
 	// LastUsed is the most recent time any of this client's credentials
@@ -549,6 +678,7 @@ func (s *Server) Clients() []ClientInfo {
 			Ref: c.ref, Label: c.label, BasicUser: c.basicUser,
 			Redirect: c.redirect, Write: c.write, Created: c.created,
 			Consented: c.consented, LastUsed: c.lastUsed,
+			Persistent: c.persistent,
 		}
 		for _, g := range s.grants {
 			if g.clientRef == c.ref {
@@ -561,28 +691,58 @@ func (s *Server) Clients() []ClientInfo {
 }
 
 // Revoke drops one client: its Basic credential, every grant it holds, and
-// every code and consent page outstanding for it. Immediate, and the return
-// says whether there was anything to revoke.
-func (s *Server) Revoke(ref string) bool {
+// every code and consent page outstanding for it. Immediate, and the first
+// return says whether there was anything to revoke.
+//
+// WHAT IT MEANS FOR A PERSISTENT CLIENT, which is the whole reason this
+// returns an error. With Config.Identity set, revoking a client also DELETES
+// ITS IDENTITY FROM THE STATE DIRECTORY, so the derived client_id names
+// nothing in this session and in every session after it: the profile the
+// user installed in Cyberduck is permanently dead and they have to download
+// a new one. That is the honest meaning of the button, and it is stronger
+// than the old one, which outlived nothing.
+//
+// It is therefore the one revocation that can FAIL. If the file cannot be
+// rewritten, the credential is dead in this session and alive in the next,
+// and a caller that reported plain success would be lying about the only
+// part of it that is durable. The in-memory half is done either way — the
+// error says the durable half is not — so a caller must surface it rather
+// than retrying on the user's behalf.
+//
+// The key is not rotated: see Identity.forget for why revoking one profile
+// must not kill the others.
+func (s *Server) Revoke(ref string) (bool, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	found := false
+	var gone *client
 	kept := s.clients[:0]
 	for _, c := range s.clients {
 		if c.ref == ref {
-			found = true
+			found, gone = true, c
 			continue
 		}
 		kept = append(kept, c)
 	}
 	s.clients = kept
-	if !found {
-		return false
+	if found {
+		s.grants = filterGrants(s.grants, func(g *grant) bool { return g.clientRef != ref })
+		s.codes = filterCodes(s.codes, func(c *code) bool { return c.clientRef != ref })
+		s.pending = filterPending(s.pending, func(p *pending) bool { return p.clientRef != ref })
 	}
-	s.grants = filterGrants(s.grants, func(g *grant) bool { return g.clientRef != ref })
-	s.codes = filterCodes(s.codes, func(c *code) bool { return c.clientRef != ref })
-	s.pending = filterPending(s.pending, func(p *pending) bool { return p.clientRef != ref })
-	return true
+	s.mu.Unlock()
+	if !found {
+		return false, nil
+	}
+	// Outside the lock: this writes a file, and no /dav/* request may wait
+	// on a disk to answer.
+	if s.cfg.Identity != nil && gone.persistent {
+		if _, err := s.cfg.Identity.forget(gone.label, gone.redirect, gone.write); err != nil {
+			return true, fmt.Errorf("localoauth: %q is revoked in this session but its identity "+
+				"is still on disk, so the profile would work again after a restart: %w",
+				gone.label, err)
+		}
+	}
+	return true, nil
 }
 
 // RevokeGrant drops one issued grant — one client connection's access and

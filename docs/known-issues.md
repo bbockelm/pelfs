@@ -36,6 +36,17 @@ two rows were added to the table at the bottom, and the KI/KL entries that
 predate it were not re-checked (they were current at `0c2baf0` and nothing
 in `pelfs browse` touches them).
 
+**KL-17 was closed** by durableprofile-agent, one commit after it was
+filed. It said the next thing to fix on that path was "a client id derived
+from a per-volume key in the state directory so that a regenerated profile
+is byte-identical to the one the user already installed", and that is what
+landed: `internal/localoauth/identity.go`. Its row is in the table at the
+bottom, including the one thing the entry did NOT predict — that a pure
+function of the identity tuple lets a revoked profile be re-armed by
+re-adding the same label, which is why the derivation carries a per-entry
+epoch. **KL-18 stays open and is still true**: the port is derivable by any
+local process and can be squatted, and nothing in that work changes it.
+
 **KI-11 was closed at `b16784d`** by mount-app-agent, the pass that put the
 file manager on the route table — the same pass that made the defect
 reachable by a user at all, since until then nothing served the app. Its row
@@ -640,46 +651,6 @@ would mean asserting a wall-clock ratio. The BEHAVIOUR is pinned:
 `scripts/mount-gate-test.sh`, which asserts against a real kernel NFS
 client that a COMMIT is SENT.
 
-### KL-17. A stable browse port makes the BOOKMARK survive a restart; the CREDENTIAL in the profile still does not
-
-Filed at `c01d35c` by oauthfix-agent, with the stable-port change.
-
-`pelfs browse` now listens on a port derived from the volume
-(`cmd/pelfs/browseport.go`), so the `.duck` bookmark a user saved keeps
-resolving: `Hostname`, `Port` and the `Provider`/`Vendor` string
-(`org.pelicanplatform.pelfs.local.<port>`) are all the same next session.
-That was the whole of the report — "can we try to have a stable port so the
-CyberDuck bookmark is not one-time-use?" — and it is what shipped.
-
-**What did NOT become durable is the credential, and a user will meet this
-on the second session.** The `.cyberduckprofile`'s `OAuth Client ID` is a
-per-download secret minted by `internal/localoauth` and held in memory
-only; a new `pelfs browse` process has a new HMAC key and no client
-registry, so the old profile's client id names nothing. Opening the saved
-bookmark therefore reaches the right port and then fails at
-`/oauth/authorize` with "This is not an authorization request pelfs
-issued". **The profile has to be regenerated and reinstalled every
-session.** So the honest summary is: the bookmark survives, the profile
-does not, and the user's per-session work went from "download a profile,
-install it, make a bookmark" to "download a profile, install it" — better,
-and not yet "it just works".
-
-That is deliberate today, not an oversight: the design's credential rule is
-that exit revokes everything (`docs/design-webui.md`, A7), and the
-alternative is a durable secret on disk in the state directory. It is
-nonetheless **the next thing to fix on this path**, and the shape it would
-take is a client id derived from a per-volume key in the state directory so
-that a regenerated profile is byte-identical to the one the user already
-installed — at which point the bookmark AND the profile both survive, and
-the credential is exactly as durable as the state directory.
-
-**Pinned by an executable test: PARTLY.** The stable port and its fallback
-are pinned (`cmd/pelfs/browseport_test.go`); that a client id does not
-survive a process is pinned by `internal/localoauth`'s revocation tests
-(`TestRevocation`), but nothing asserts the user-visible consequence,
-because no gate runs two `pelfs browse` processes in sequence against one
-saved profile.
-
 ### KL-18. A predictable browse port can be squatted before pelfs starts
 
 Filed at `c01d35c` by oauthfix-agent, with the stable-port change, and
@@ -762,6 +733,7 @@ pass does not re-file them.
 | **A crash between a flush's publish and its location record loses that batch** (was KL-10) | **FIXED** by durability-agent: `publish` no longer reclaims the ring region a batch came from. It queues the region (`Store.locating`) and `journalLocated` releases it, so until the `Located` record binding handles to packs is durable the ring is still where recovery finds those extents — and a crash in the window loses nothing rather than one flush batch (2 MiB at the shipped pack target). Only a PREFIX is released, because that is all a ring can release: four upload workers finish out of order, so a batch is marked done and the tail advances over however many done batches sit at the front. `Flush` waits for the queue to drain, which is what makes "a flush means recorded" true as well as "a flush means uploaded". Pinned by `memtable.TestACrashBeforeTheLocatedRecordLosesNothing` and `memtable.TestTheRingIsNotReclaimedUntilTheLocatedRecordIsDurable` (`internal/memtable/losswindow_test.go`) — one through `Store.Durable`/`Recover`, one at the ring itself, neither killing anything. The cost was the reason it was deferred and it was MEASURED rather than argued (`memtable.TestMeasureRingHoldBackpressure`, `PELFS_RINGHOLD_MEASURE=1`): holding the ring moves the uplink's cost from the seal into the write phase and leaves end-to-end throughput alone. |
 | **`fsync` over NFS makes nothing durable** (was KI-10) | **FIXED** by commit-agent, and NOT where this file said the fix was. The COMMIT no-op was real but unreachable: `onWrite` wrote the constant FILE_SYNC into the stability field of every WRITE reply, and a Linux client queues a page for commit only when the reply said UNSTABLE — so it never sent a COMMIT. Measured before the fix on this repo's own mount-gate container: `dd conv=fsync` produced 2 WRITEs and **0** COMMITs; after, 1 COMMIT. The fork (`d92cb75`, pinned in `go.mod`) now exports `nfs.Committer`, which both `onWrite` and `onCommit` consult; `internal/vfsbilly` implements it with `overlay.FS.Sync`, the same body the FUSE frontend's `Fsync` calls. Pinned by `internal/vfsbilly/commit_test.go` (a commit syncs, a repeat commit is free), `internal/nfsmount/diag_internal_test.go` (the wrapper must not over-claim the interface), the fork's own `nfs_oncommit_test.go`, and `commit_gate` in `scripts/mount-gate-test.sh`, which asserts against a real kernel NFS client that a COMMIT is SENT. |
 | **A refused mutation in the file manager resolved to `undefined`, so a failed rename looked successful** (was KI-11) | **FIXED** by mount-app-agent, and the mechanism was not the one this file named. The entry said `PelfsDataProvider` "calls `super.send()`", so upstream's swallowed rejection reached the app: it does not — `send()` is a full override that does its own fetch and REJECTS on `!res.ok`, which was true when the entry was written. What actually kept the lie on the screen is a step further on: the STORE applies every mutation optimistically (`@svar-ui/filemanager-store`'s `rename-file` renames the node and re-parents its children before the provider is reached), and a rejection rolls none of that back — so the banner said "that did not happen" beside a row showing that it had. Of the three options this file offered, the second was taken: `PelfsDataProvider.getHandlers` (`webui/frontend/src/api/provider.ts`) wraps each of the five mutating handlers, and on a rejection RE-LISTS the directories the event touched and hands the answer to the store as `provide-data`, which replaces that directory outright. Deliberately not an inverse operation: undoing a rename in the store means keeping a second model of the volume, and the first case that model gets wrong is a batch whose fourth id failed. No copy of upstream's promise chain, so no re-read on every component upgrade. **Pinned by two executable tests**, which the entry said were the missing thing: `A REFUSED RENAME DOES NOT STAY ON THE SCREEN` and `a refused delete leaves the file where it was` (`webui/frontend/tests/filemanager.spec.ts`), driving a real 403 from a read-only path in the mock volume (`mockEntry.ro`, `internal/webui/mockapi_test.go`) and asserting BOTH halves — that the user is told, with the server's reason, and that the row is back under its original name. |
+| **KL-17.** A stable browse port made the BOOKMARK survive a restart; the CREDENTIAL in the generated profile did not, so the profile had to be reinstalled every session | **FIXED** by durableprofile-agent, with the shape KL-17 itself named: the `.cyberduckprofile`'s `OAuth Client ID` is now `HMAC-SHA256(key, label ‖ redirect ‖ write ‖ epoch)` under a 32-byte key in the state directory (`internal/localoauth/identity.go`; `browse-identity.key`, mode 0600, created lazily on the first download), so the generated profile is byte-identical across restarts and the one the user installed keeps working. What the entry did not foresee: a derivation over the tuple ALONE lets a revoked profile come back the moment the user re-adds the same label, so every entry carries a random epoch and `Revoke` destroys it — which is also what makes `Revoke` durable, and why it now returns an error (a revocation that did not reach the disk must not be reported as one). Unchanged on purpose, and said in the code, the docs and the page: no token and no Basic password is persisted, and **consent is still required on every `/authorize`** — the bookmark stops being one-time-use, the click per session does not. **Pinned by executable tests**, which is what the entry said was missing: `internal/localoauth/identity_test.go` (including that the first session's token and password are dead in the second, that a read-only session adopts a writable identity and refuses the SCOPE rather than disowning the client, and that a re-added label is a different client), `cmd/pelfs/browseidentity_test.go` (the page's own JSON across a restart on one port), and `scripts/browse-gate.sh` step 8 — two `pelfs browse` processes in sequence, REAL duck, the profile from the first session neither regenerated nor reinstalled, and its stale refresh token left in place on purpose. |
 | **C2**, the "fsck lifts the cap" claim | **STALE** in that detail — `internal/fsck` does not touch `packIndex`. The rest of C2 survives as KI-8. |
 | **F11** dead/unwired inventory; **G4**, **G6** doc-staleness sweeps | Real work, but hygiene and prose rather than defects or limitations. They stay in `docs/TODO.md`, which is what a punchlist is for. |
 | **`golang.org/x/net` is in `go.mod` as `// indirect`** while `internal/vfsdav` imports `webdav` directly (reported by the WebDAV pass, and predicted to be "promoted by the next `go mod tidy`") | **STALE — the promotion already happened.** `go.mod`'s direct `require` block carries `golang.org/x/net v0.56.0` with **no** `// indirect` marker, at the same version it was pinned at as an indirect. `docs/design-windows.md`'s "The Go half is already compliant" was updated to say so. Nothing to file. |

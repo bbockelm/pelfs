@@ -23,14 +23,25 @@ package main
 // Blob and an <a download>. The secret never touches a URL, never enters
 // the browser's history, and never reaches an access log.
 //
-// # What is returned once and never again
+// # What is returned once, and what is returned again
 //
-// The client id and the Basic password. internal/localoauth keeps HMACs of
-// both, so a page that loses them has to register a new client — which is
-// the correct outcome and is why the response says so. The client id is
-// inside the generated profile (that is what makes possessing the profile
-// the whole of what identifies the client, A7 control 4), so it is NOT
-// echoed as a field of its own: one carrier is enough.
+// The BASIC PASSWORD is once. internal/localoauth keeps an HMAC of it, so a
+// page that loses it has to ask for the program again — which re-issues the
+// password and invalidates the one before it, and is why the response says
+// so in one sentence the page must show.
+//
+// THE PROFILE IS NOT ONCE ANY MORE, and that is the point of this session's
+// work. With a persistent identity (internal/localoauth's identity.go) the
+// client id is derived from a per-volume key in the state directory rather
+// than minted per download, so asking for the same program again hands back
+// a BYTE-IDENTICAL .cyberduckprofile: the user installs it once, and their
+// saved Cyberduck bookmark keeps working next session without a
+// reinstall. What has NOT changed is the consent gesture — a human clicks
+// Authorize on every /oauth/authorize, once per session — and no surface
+// here may imply otherwise.
+//
+// The client id is still never echoed as a field of its own: it is inside
+// the generated profile, and one carrier is enough (A7 control 4).
 
 import (
 	"encoding/json"
@@ -111,6 +122,12 @@ type clientRow struct {
 	Consented bool      `json:"consented"`
 	Grants    int       `json:"grants"`
 	LastUsed  time.Time `json:"last_used,omitzero"`
+	// Persistent is whether this program's identity is in the state
+	// directory — i.e. whether the profile the user installed will still
+	// work after `pelfs browse` restarts, and therefore whether revoking
+	// this row kills an installed profile for good or only for this
+	// session. The two answers deserve different words on the page.
+	Persistent bool `json:"persistent"`
 }
 
 // grantRow is one live connection: an access and refresh token pair.
@@ -132,8 +149,10 @@ type grantRow struct {
 // profile download, each with its Basic credential) and the grants (one per
 // connection a client has actually made). They revoke differently and the
 // difference is user-visible — revoking a grant makes Cyberduck ask for
-// consent again, revoking a client makes its profile permanently dead — so
-// the page shows them separately rather than merging them into one row.
+// consent again, revoking a client makes its profile permanently dead, in
+// this session AND every later one, because the identity is deleted from
+// the state directory — so the page shows them separately rather than
+// merging them into one row.
 func (b *browseServer) serveListCredentials(w http.ResponseWriter, _ *http.Request) {
 	// Never nil: the page iterates these, and a JSON null would be one more
 	// case for it to carry.
@@ -147,7 +166,7 @@ func (b *browseServer) serveListCredentials(w http.ResponseWriter, _ *http.Reque
 		out.Clients = append(out.Clients, clientRow{
 			Ref: c.Ref, Label: c.Label, BasicUser: c.BasicUser, Write: c.Write,
 			Created: c.Created, Consented: c.Consented, Grants: c.Grants,
-			LastUsed: c.LastUsed,
+			LastUsed: c.LastUsed, Persistent: c.Persistent,
 		})
 	}
 	for _, g := range b.oauth.Grants() {
@@ -179,6 +198,12 @@ func (b *browseServer) serveNewCredential(w http.ResponseWriter, r *http.Request
 		return
 	}
 	redirect := davprofile.RedirectURI(davprofile.DefaultCallbackPort)
+	// Before the registration, so that a generation failure below can tell
+	// a client this request CREATED from one it merely re-derived. See the
+	// rollback comment there: with a persistent identity those are the
+	// difference between cleaning up after ourselves and deleting a profile
+	// the user has installed and is using.
+	start := b.nowTime()
 	c, err := b.oauth.NewClient(localoauth.ClientRequest{
 		Label: req.Label, RedirectURI: redirect, Write: req.Write,
 	})
@@ -211,12 +236,27 @@ func (b *browseServer) serveNewCredential(w http.ResponseWriter, r *http.Request
 	} {
 		body, err := gen.fn(p)
 		if err != nil {
-			// The client is already registered, so it is revoked rather
-			// than left behind as a credential nobody was handed. A
-			// generation failure here is davprofile refusing a value it
+			// A generation failure here is davprofile refusing a value it
 			// would have to mangle (a `$` in the volume name, say), which
 			// is a refusal worth showing verbatim.
-			b.oauth.Revoke(c.Ref)
+			//
+			// THE ROLLBACK IS CONDITIONAL, and the condition is load-bearing
+			// now that an identity is durable. A client this request created
+			// is revoked, so a credential nobody was handed is not left
+			// behind. A client that ALREADY EXISTED — the user asking again
+			// for a program whose profile is installed and working — is left
+			// exactly where it was, because revoking it would delete that
+			// profile's identity from the state directory and kill a
+			// connection the user did not ask us to touch. `Created` is the
+			// FIRST registration time, from the state directory, so it is
+			// the fact that tells the two apart.
+			if !c.Created.Before(start) {
+				// Best effort, and the error is deliberately dropped: the
+				// caller is already being told the generation failed, and a
+				// second failure to un-register a client nobody was handed
+				// is not a second thing for them to act on.
+				_, _ = b.oauth.Revoke(c.Ref)
+			}
 			writeBrowseJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
 		}
@@ -231,8 +271,11 @@ func (b *browseServer) serveNewCredential(w http.ResponseWriter, r *http.Request
 		DAVURL: d.URL, RedirectURI: c.Redirect,
 		BasicUser: c.BasicUser, BasicPassword: c.BasicPassword,
 		Preemptive: d.Preemptive, Files: files,
-		Notice: "this password is shown once and is not stored anywhere " +
-			"pelfs can read it back; if you lose it, add another program",
+		Notice: "this password is shown once and is not stored anywhere pelfs can " +
+			"read it back; asking for this program again issues a new one and " +
+			"retires this. The Cyberduck profile beside it is the same file every " +
+			"time, so install it once — you will still click Authorize once per " +
+			"pelfs browse session.",
 	})
 }
 
@@ -244,6 +287,13 @@ func (b *browseServer) serveNewCredential(w http.ResponseWriter, r *http.Request
 // itself and everything it ever held. internal/localoauth's Revoke and
 // RevokeGrant are both immediate — a token stops working mid-connection,
 // which internal/localoauth's own suite asserts end to end.
+//
+// AND ONE OF THEM IS NOW DURABLE. Revoking a client deletes its identity
+// from the state directory, so the .cyberduckprofile the user installed
+// stops naming a client this volume knows — for good, not for this process.
+// That is the only revocation on this listener that can half-succeed, and
+// the 500 below is what says so rather than reporting a durable act that
+// did not happen.
 func (b *browseServer) serveRevokeCredential(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Client string `json:"client"`
@@ -258,7 +308,20 @@ func (b *browseServer) serveRevokeCredential(w http.ResponseWriter, r *http.Requ
 		writeBrowseJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "name a client or a grant, not both"})
 	case req.Client != "":
-		writeBrowseJSON(w, http.StatusOK, map[string]bool{"revoked": b.oauth.Revoke(req.Client)})
+		// The one revocation that can half-succeed. With a persistent
+		// identity, revoking a client deletes it from the state directory so
+		// the profile the user installed is dead for good — and if that
+		// write fails, the credential is gone from this session and would
+		// come back in the next one. Reporting that as `{"revoked":true}`
+		// would be the page telling the user something durable happened when
+		// it did not, so it is a 500 with the reason.
+		revoked, err := b.oauth.Revoke(req.Client)
+		if err != nil {
+			writeBrowseJSON(w, http.StatusInternalServerError, map[string]any{
+				"revoked": revoked, "error": err.Error()})
+			return
+		}
+		writeBrowseJSON(w, http.StatusOK, map[string]bool{"revoked": revoked})
 	case req.Grant != "":
 		writeBrowseJSON(w, http.StatusOK, map[string]bool{"revoked": b.oauth.RevokeGrant(req.Grant)})
 	default:

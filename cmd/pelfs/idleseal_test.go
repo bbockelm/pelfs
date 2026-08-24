@@ -77,7 +77,7 @@ func newIdleFixture(t *testing.T, interval time.Duration) *idleFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := newBrowseServer("pelican://fed/pfx", browseArgs{branch: "main", rw: true}, interval, m, 49731)
+	b, err := newBrowseServer("pelican://fed/pfx", browseArgs{branch: "main", rw: true}, interval, m, 49731, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

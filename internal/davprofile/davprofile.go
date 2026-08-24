@@ -112,9 +112,16 @@ type Params struct {
 	// a list of bookmarks, so it is the volume rather than a UUID.
 	Volume string
 
-	// ClientID is the OAuth client_id from internal/localoauth: a
-	// per-download secret, and the key that turns OAuth on. A blank one is
-	// an error rather than a default, per trap 1.
+	// ClientID is the OAuth client_id from internal/localoauth: a secret
+	// only a profile download carries, and the key that turns OAuth on. A
+	// blank one is an error rather than a default, per trap 1.
+	//
+	// IT IS USUALLY THE SAME STRING EVERY SESSION — internal/localoauth
+	// derives it from a per-volume key in the state directory — which is what
+	// makes this package's determinism load-bearing rather than tidy: a
+	// profile a user installed once has to keep matching the one pelfs would
+	// generate today, byte for byte. Nothing here may grow a timestamp, a
+	// nonce or a map iteration.
 	ClientID string
 
 	// RedirectURI is the loopback callback, with an explicit port. Build it
@@ -186,7 +193,16 @@ func (p Params) description() string {
 	// No em dash, no smart quotes: this string lands in a plist that a Java
 	// StringSubstitutor and an XML parser both read, and plain ASCII is one
 	// fewer thing to go wrong.
-	return "pelfs " + v + " (" + mode + ", this session only)"
+	//
+	// IT USED TO SAY "this session only", which was true of the profile when
+	// the client id was minted per download and is not true now: the id is
+	// derived from a per-volume key in the state directory, so this file is
+	// the same file next session and installing it again is unnecessary
+	// (internal/localoauth's identity.go). What IS still per session is the
+	// authorization — a human clicks Authorize on every /oauth/authorize, and
+	// this string is one of the few places a user reads about the profile
+	// with no page in front of them, so it says both halves.
+	return "pelfs " + v + " (" + mode + "; install once, authorize once per session)"
 }
 
 // nickname is the ONE STRING A USER READS IN A LIST OF BOOKMARKS, and
@@ -313,7 +329,7 @@ func shortVolume(volume string) string {
 //	                 REQUIRED by internal/localoauth, not merely accepted
 //	Password         impossible — no such key exists (see the package
 //	                 comment)
-//	any secret but the client id, which is minted per download, so
+//	any secret but the client id, which only a profile download carries, so
 //	possessing the profile is the whole of what identifies the client
 func Profile(p Params) ([]byte, error) {
 	if err := p.check(); err != nil {

@@ -39,9 +39,19 @@ page's `form-action` names the client's exact callback. New gate:
 **The browse port is stable per volume**, derived from the prefix
 (61000–65535), so a saved Cyberduck bookmark is no longer single-use;
 `--port` overrides it and a taken port falls back with a warning naming both.
-The port was never a secret and the audit is in `docs/design-webui.md`. The
-bookmark survives a restart; **the profile's credential still does not** and
-has to be regenerated each session — `docs/known-issues.md` KL-17.
+The port was never a secret and the audit is in `docs/design-webui.md`.
+
+**And the generated Cyberduck profile survives a restart too, so install it
+once.** Its `OAuth Client ID` is derived from a per-volume key in the state
+directory (`browse-identity.key`, mode 0600, written on the first download)
+instead of minted per download, so the file comes out byte-identical every
+time and the copy already installed keeps working. No token and no password
+is persisted, and **consent is still required on every authorization** — the
+bookmark and the profile stop being one-time-use; the one Authorize click per
+session does not go away. Revoking a program now deletes its identity, so its
+profile is dead for good rather than until the next restart, and the API says
+so with a 500 if that could not be written. Closes KL-17; KL-18 (a local
+process can squat a predictable port) stands.
 
 **Generated bookmarks have names.** Cyberduck read `Default Nickname` and
 `Name` from the profile, neither of which pelfs set, so every bookmark showed

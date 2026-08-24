@@ -237,7 +237,19 @@ func runBrowse(o *cmdOpts, prefix string, a browseArgs) int {
 		_ = g.stats.Finalize(1, false)
 		return exitErr(err)
 	}
-	bs, err := newBrowseServer(prefix, a, o.snapshotInterval, sessions, port)
+	// The persistent client identity lives in the state directory, beside
+	// the volume signing key and under the same 0700 — and it is created
+	// LAZILY, so a session that never generates a connection profile leaves
+	// no new secret behind. Opening it can fail (a file from a future pelfs,
+	// a corrupt one), and that is a startup failure rather than a surprise
+	// at the first download: a session that cannot agree with the profiles
+	// this volume has already handed out should not be serving one.
+	identity, err := localoauth.OpenIdentity(stateDir)
+	if err != nil {
+		_ = g.stats.Finalize(1, false)
+		return exitErr(err)
+	}
+	bs, err := newBrowseServer(prefix, a, o.snapshotInterval, sessions, port, identity)
 	if err != nil {
 		_ = g.stats.Finalize(1, false)
 		return exitErr(err)
@@ -686,9 +698,20 @@ type publishJob struct {
 // It returns an error because two of the three pieces can refuse to be
 // built — a negative listing cap, a read-only session that was asked for a
 // writable authorization server — and both are startup failures rather than
-// 500s on the first request.
+// 500s on the first request. A third refusal joined them with the
+// persistent client identity: an identity file in the state directory that
+// cannot be read is a startup failure too, because the alternative is
+// serving a session whose generated profiles disagree with the ones the
+// user has installed.
+//
+// `id` is the persistent client identity (internal/localoauth's
+// identity.go): the per-volume key that makes a generated
+// .cyberduckprofile byte-identical across restarts. nil is the ephemeral
+// server this verb started with — every client id crypto/rand, every
+// installed profile dead at exit — which is what the tests that are not
+// about persistence pass.
 func newBrowseServer(prefix string, a browseArgs, interval time.Duration,
-	m *browsesession.Manager, port int) (*browseServer, error) {
+	m *browsesession.Manager, port int, id *localoauth.Identity) (*browseServer, error) {
 	b := &browseServer{
 		prefix:      prefix,
 		args:        a,
@@ -713,10 +736,16 @@ func newBrowseServer(prefix string, a browseArgs, interval time.Duration,
 	// browse` cannot even register a client that could ask for
 	// pelfs.write. Sessions is the browser-session presence check (A7
 	// control 2): *browsesession.Manager satisfies it as it stands.
+	//
+	// Identity is what makes the CLIENT identity outlive the process, and
+	// nothing else about the credential model changes: no token and no
+	// password reaches the disk, and consent is still required on every
+	// /oauth/authorize.
 	if b.oauth, err = localoauth.New(localoauth.Config{
 		Writable: a.rw,
 		Volume:   prefix,
 		Sessions: m,
+		Identity: id,
 	}); err != nil {
 		return nil, err
 	}

@@ -476,9 +476,12 @@ func TestReadOnlyBrowseCannotMintAWritableCredentialOrPublish(t *testing.T) {
 }
 
 // clientIDOf digs the client_id out of a generated profile. The id is a
-// per-download secret and this is the only place a test may look at one: it
-// is here so that the "no secret in the inventory" check above can name the
-// value it is looking for rather than trusting a field name.
+// secret only a profile download carries, and this is the only place a test
+// in this file may look at one: it is here so that the "no secret in the
+// inventory" check above can name the value it is looking for rather than
+// trusting a field name. (cmd/pelfs/browseidentity_test.go has its own,
+// because it asserts something different: that the id is the SAME one after
+// a restart.)
 func clientIDOf(t *testing.T, profile string) string {
 	t.Helper()
 	const key = "<key>OAuth Client ID</key>"

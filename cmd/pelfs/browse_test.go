@@ -68,7 +68,7 @@ func newBrowseFixture(t *testing.T, rw bool, hooks bool) *browseFixture {
 	// generated WebDAV profile, which is why the server is built after the
 	// listener rather than before it.
 	port := srv.Listener.Addr().(*net.TCPAddr).Port
-	bs, err := newBrowseServer(g.prefix, a, 5*time.Minute, m, port)
+	bs, err := newBrowseServer(g.prefix, a, 5*time.Minute, m, port, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

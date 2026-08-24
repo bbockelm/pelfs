@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/bbockelm/pelfs/internal/webapi"
@@ -309,6 +310,10 @@ func TestConcurrentIdenticalListingsCostOneReadDir(t *testing.T) {
 	// this the eight goroutines can run to completion one after another --
 	// each finishing before the next begins -- and singleflight has nothing
 	// to merge. That passed on a busy laptop and failed on an idle runner.
+	var joins atomic.Int64
+	webapi.SetFlightJoined(func() { joins.Add(1) })
+	t.Cleanup(func() { webapi.SetFlightJoined(nil) })
+
 	gate := make(chan struct{})
 	held := map[string]chan struct{}{"/dir-0": gate}
 	f.cnt.hold.Store(&held)
@@ -324,9 +329,11 @@ func TestConcurrentIdenticalListingsCostOneReadDir(t *testing.T) {
 			bodies[i] = f.list("/dir-0").want(http.StatusOK)
 		}(i)
 	}
-	// One caller is inside ReadDir; the rest must be queued behind the guard
-	// rather than entering it. Wait for the leader, then let everyone go.
-	for f.cnt.arrived.Load() == 0 {
+	// Hold the leader inside ReadDir until every follower has JOINED the
+	// guard -- not merely started. Waiting on "the leader arrived" was not
+	// enough: the followers had not reached flight.do yet, so they each took
+	// their own readdir and the assertion failed on an idle runner.
+	for joins.Load() < n-1 {
 		runtime.Gosched()
 	}
 	f.cnt.hold.Store(nil)

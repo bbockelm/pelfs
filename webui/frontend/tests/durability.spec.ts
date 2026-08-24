@@ -115,6 +115,45 @@ test.describe("durability", () => {
     await request.dispose();
   });
 
+  test("a namespace-only change is staged, and it does not say '0 files'", async ({
+    page,
+    session,
+    playwright,
+  }) => {
+    // THE RENAME. A rename -- and a delete, a mkdir, a hardlink -- writes no
+    // bytes and no inode row, only namespace edges, so a panel keyed on the
+    // staged-file and dirty-inode counts told a user who had just renamed a
+    // file that there was nothing to publish, over a disabled button that
+    // agreed. The server answers `unpublished` from the same predicate the
+    // seal uses; this is the page keying off it.
+    //
+    // TWO ASSERTIONS, AND THE SECOND IS NOT COSMETIC. The staged sentence is
+    // byte-shaped, so a panel that merely started rendering it would say "0
+    // files (0 B) on this machine only" -- the size of the change reported as
+    // zero while the line claims there is one, which is the same ambiguity
+    // this panel exists to prevent, moved.
+    const request = await playwright.request.newContext();
+    await openPelfs(page, session);
+    const line = page.getByTestId("durability");
+    await expect(line).toHaveAttribute("data-durability", "published");
+
+    // Edges and NOTHING else: no staged files, no staged bytes.
+    await testHook(request, session, { dirty_edges: 2 });
+
+    await expect(line).toHaveAttribute("data-durability", "staged");
+    await expect(line).toContainText("Changes on this machine only.");
+    await expect(line).not.toContainText("0 files");
+    await expect(line).not.toContainText("0 B");
+    await expect(line).not.toContainText("Everything here is in the federation");
+
+    // And the control the user has to be able to press.
+    const button = page.getByTestId("publish-button");
+    await expect(button).toHaveAttribute("data-publish-state", "ready");
+    await expect(button).toHaveText("Publish now");
+    await expect(button).toBeEnabled();
+    await request.dispose();
+  });
+
   test("an upload backlog says 'sending', which is neither of the other two", async ({
     page,
     session,

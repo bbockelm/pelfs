@@ -200,6 +200,41 @@ test.describe("the file manager", () => {
     await expect(line).toContainText("in the federation");
   });
 
+  test("a rename stages no bytes and is still unpublished work", async ({ page, session }) => {
+    // THE GESTURE ITSELF, not a hook that describes it. The mock's rename
+    // leaves exactly what overlay.Rename leaves -- a whiteout for the old name
+    // and an edge for the new one, no staged file and no staged byte
+    // (internal/webui/mockapi_test.go, stageEdges) -- which is why the panel
+    // used to say "Everything here is in the federation." over a button
+    // reading "Nothing to publish" the moment a user renamed something.
+    //
+    // The sentence is the other half: it is byte-shaped, and a panel that
+    // merely started rendering it here would report the size of the change as
+    // zero while claiming there is one.
+    await openPelfs(page, session);
+    const line = page.getByTestId("durability");
+    await expect(line).toHaveAttribute("data-durability", "published");
+
+    const before = card(page, "/README.txt");
+    await expect(before).toBeVisible();
+    await before.click({ button: "right" });
+    await page.getByText("Rename", { exact: true }).first().click();
+    const input = page.locator(".wx-modal input, .wx-item input").first();
+    await input.fill("MEASUREMENTS.txt");
+    await input.press("Enter");
+    await expect(card(page, "/MEASUREMENTS.txt")).toBeVisible();
+
+    await expect(line).toHaveAttribute("data-durability", "staged");
+    await expect(line).toContainText("Changes on this machine only.");
+    await expect(line).not.toContainText("0 files");
+    await expect(line).not.toContainText("0 B");
+
+    const button = page.getByTestId("publish-button");
+    await expect(button).toHaveAttribute("data-publish-state", "ready");
+    await expect(button).toHaveText("Publish now");
+    await expect(button).toBeEnabled();
+  });
+
   test("A REFUSED RENAME DOES NOT STAY ON THE SCREEN", async ({ page, session }) => {
     // THE TEST THAT PINS KI-11, and the reason it is worth a browser.
     //

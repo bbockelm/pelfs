@@ -442,7 +442,7 @@
     return m > 0 ? `${m}m${String(r).padStart(2, "0")}s` : `${r}s`;
   };
 
-  let token = null, dirty = 0;
+  let token = null, dirty = false;
 
   // The bootstrap token arrives in the FRAGMENT, is exchanged once, and is
   // wiped out of the address bar before anything else runs. A fragment is
@@ -875,7 +875,11 @@
     // not in the federation is the worst ambiguity this page could carry,
     // because the user's next action is to close the laptop and tell a
     // collaborator the data is there.
-    dirty = s.staged_files;
+    // The leave-site hint's trigger is the server's `unpublished`
+    // predicate, not the staged file count: a session whose only
+    // unpublished work is a rename has no staged files and plenty to
+    // lose.
+    dirty = s.unpublished;
     const d = t("durability");
     if (s.phase === "failed") {
       // A FAILED OPEN IS NOT A SLOW ONE. Every phase that was not "ready"
@@ -899,12 +903,20 @@
     } else if (s.phase !== "ready") {
       d.textContent = "Reading the overlay…";
       d.dataset.durability = "unknown";
-    } else if (s.mode === "read-only" || (s.staged_files === 0 && s.dirty_nodes === 0)) {
+    } else if (s.mode === "read-only" || !s.unpublished) {
       // A read-only session and a writable one with nothing staged are the
       // same answer to the only question this line asks. The mode is a chip
       // in the bar above and the generation is beside the branch, so saying
       // either of them here was a repeat -- which is what the owner called
       // it. See webui/frontend/src/durability.ts, which now says this.
+      //
+      // `unpublished` AND NOT THE COUNTERS. The test used to be the
+      // staged-file and dirty-inode counts against zero, a re-derivation of
+      // the seal's predicate that got it wrong: a rename writes no bytes and
+      // no inode row, only namespace edges, so a user who had just renamed a
+      // file was told everything was in the federation while the seal knew
+      // otherwise. The server answers the predicate itself now
+      // (cmd/pelfs/browse.go), so there is one definition of it.
       d.innerHTML = `<span class="glyph published">✓</span>` +
         `Everything here is in the federation.`;
       d.dataset.durability = "published";
@@ -919,10 +931,18 @@
       const when = s.publish && s.publish.state === "running" && s.publish.reason !== "branch"
         ? "Publishing now."
         : `Next publish in ${secs(s.next_publish_s)}.`;
+      // WHAT IS UNPUBLISHED IS NOT ALWAYS BYTES. A rename, a delete, a
+      // mkdir, a hardlink stage namespace and nothing else, so the
+      // counted sentence would read "0 files (0 B) on this machine only"
+      // -- the size of the change reported as zero while the line claims
+      // there is one. Same two sentences as the app's
+      // (webui/frontend/src/durability.ts).
+      const what = s.staged_files > 0
+        ? `${s.staged_files} file${s.staged_files === 1 ? "" : "s"} ` +
+          `(${bytes(s.staged_bytes)}) on this machine only.`
+        : `Changes on this machine only.`;
       d.innerHTML = `<span class="glyph staged">●</span>` +
-        `${s.staged_files} file${s.staged_files === 1 ? "" : "s"} ` +
-        `(${bytes(s.staged_bytes)}) on this machine only.` +
-        ` ${when}${sending}`;
+        `${what} ${when}${sending}`;
       d.dataset.durability = "staged";
     }
     // The panel's left edge carries the same state as colour, the way the
@@ -942,7 +962,10 @@
       // would say the user's bytes are going to the federation while the
       // session is reopening an overlay on another head.
       state = job.reason === "branch" ? "switching" : "running";
-    } else if (s.staged_files === 0 && s.dirty_nodes === 0) state = "nothing";
+    // The SAME predicate the line above uses, and the server's rather
+    // than this page's: a button reading "Nothing to publish" over a
+    // session that would publish a rename is the bug it exists to end.
+    } else if (!s.unpublished) state = "nothing";
     // ONE CONTROL, WEARING ITS OWN STATE. A disabled "Publish now" with
     // "(nothing to publish)" printed beside it was one fact twice, so the
     // label IS the state and nothing stands next to it. Same map, same words,
@@ -1058,7 +1081,7 @@
   // suppress it without prior interaction, so it is a hint and never the
   // durability mechanism: the session seals at exit either way.
   window.addEventListener("beforeunload", (e) => {
-    if (dirty > 0) e.preventDefault();
+    if (dirty) e.preventDefault();
   });
 
   // The idle-seal HINT (U10), and it is only ever a hint: sendBeacon is

@@ -46,6 +46,26 @@ tested `DirtyEdges`), which is why this cost a prompt rather than the data.
 `unpublished` boolean computed from the same predicate the seal uses, and the
 idle sealer counts a rename as both a change and something to publish.
 
+**And now the page shows it.** Both surfaces key off that `unpublished`
+boolean instead of re-deriving it from the byte counters, so a rename -- or a
+delete, a mkdir, a hardlink -- moves the durability panel into the staged
+state and enables *Publish now*, on `/` and on `/connect` alike. A change that
+stages no bytes gets its own sentence, "Changes on this machine only.", rather
+than the counted one reporting the size of the change as zero. The leave-site
+hint moved to the same predicate.
+
+**`make` cannot embed a stale web UI in silence.** `go build` embeds the
+committed `internal/webui/dist` and never runs `go generate` -- which is what
+lets a contributor with no Node build a working UI, and is also why a frontend
+edit that had not been rebuilt looked exactly like a change that did not
+happen. `make build`, `make test`, `make linux` and the two browser gates now
+compare webui/frontend against `internal/webui/bundle.inputs`, by CONTENT
+rather than by timestamp (a fresh clone writes the sources after the bundle, so
+every clean checkout would look stale), and either regenerate it or fail with
+the command to run. An unmodified checkout with no Node is untouched: the check
+costs ~30ms and says nothing. `make ui` regenerates deliberately and `make
+help` lists the targets.
+
 **A seal says how much of itself was the mount following it.** The swap phase
 re-descends every inode the KERNEL is holding, so its cost is set by how much
 of the tree the session has browsed and not at all by how much changed; the

@@ -354,8 +354,8 @@ type countingFS struct {
 	noWrite  bool
 	readDirs atomic.Int64
 	// hold gates ReadDir per path; arrived counts callers parked in it.
-	hold    atomic.Pointer[map[string]chan struct{}]
-	arrived atomic.Int64
+	hold     atomic.Pointer[map[string]chan struct{}]
+	arrived  atomic.Int64
 	written  atomic.Int64
 	maxWrite atomic.Int64
 	opens    atomic.Int64

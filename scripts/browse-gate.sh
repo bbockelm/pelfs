@@ -469,6 +469,31 @@ print("   generation %d, %s" % (s["generation"], s["publish"]["summary"]))
 PY
 ck $? "publish:generation     the page reports the new generation and nothing staged"
 
+# A PUBLISH IS NOT AN EXIT, and until this block the gate could not tell.
+# The three assertions above are all about the publish, and the very next
+# line used to be `kill -TERM` -- so a session that ended on its own between
+# the 202 and the signal was indistinguishable from one the gate stopped.
+# That is exactly the report ("after the first publish the pelfs browse
+# server shuts down automatically") this gate was green through.
+#
+# Three things, in the order a user meets them: the process is up, the data
+# plane still reaches the volume, and the event stream that was open across
+# the publish is still delivering.
+kill -0 "$BROWSE_PID" 2>/dev/null
+ck $? "publish:still-running  the session is still up after publishing"
+code=$(api GET /api/v1/files)
+[ "$code" = 200 ]
+ck $? "publish:still-serving  the volume still lists after publishing ($code)"
+# `timeout` returns 124 when it cuts the stream off, which is the PASS here:
+# a stream that is still open is one that has to be killed. A stream the
+# server closed returns 0 with `event: bye` in it.
+timeout 3 curl -sS -N -H 'Sec-Fetch-Site: same-origin' \
+  "$ORIGIN/events?s=$SESSION" > "$WORK/post-publish.sse" 2>/dev/null
+[ $? = 124 ] && ! grep -q '^event: bye' "$WORK/post-publish.sse"
+ck $? "publish:stream-open    the event stream survives the publish"
+grep -q '"phase": *"ready"' "$WORK/post-publish.sse" || grep -q '"phase":"ready"' "$WORK/post-publish.sse"
+ck $? "publish:still-ready    a stream opened after the publish reports ready"
+
 # Stop the session the way Ctrl-C does, so the lease is released and the
 # seal at exit runs, before anything else opens the branch.
 kill -TERM "$BROWSE_PID" 2>/dev/null

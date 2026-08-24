@@ -306,12 +306,47 @@ func runBrowse(o *cmdOpts, prefix string, a browseArgs) int {
 
 	// ---- 3. Now the volume. This is where a device-flow prompt fires,
 	// and by construction the page is already loadable when it does.
+	//
+	// A FAILURE HERE DOES NOT END THE PROCESS AT ONCE, and that is the fix
+	// for the report this comment is written under: "whenever I start
+	// read-write, I just get a page that says 'reading the overlay…'. Never
+	// seems to progress." The page had already been printed, opened and
+	// loaded by the time the open failed — a killed session's branch lease
+	// is the ordinary way in, since it outlives its holder by a TTL — and
+	// the process then exited inside the second it took the browser to
+	// attach. What the user was left looking at was a tab whose event
+	// stream had died against a closed port, and a page that renders every
+	// phase that is not "ready" with the same "reading the overlay…" line.
+	// Nothing about it said the volume had refused to open, or why.
+	//
+	// So the failure is now SERVED rather than raced: the reason goes on
+	// the page, the listener stays up long enough for a browser to attach
+	// and show it, and the exit is an orderly Shutdown, which sends every
+	// stream `event: bye` — the difference between a page that says "pelfs
+	// browse is exiting" and a page that says nothing at all. The exit code
+	// is unchanged, and so is the terminal's error line: a script sees what
+	// it always saw, a few seconds later.
 	fail := func(err error) int {
+		err = browseOpenFailure(err, stateDir, prefix)
+		// setFailed FIRST, so the frame is already queued for any stream
+		// that is attached by the time the terminal line is written.
 		bs.setFailed(err)
-		_ = g.stats.Finalize(1, false)
-		// The page's stream carries the failure, but the terminal is still
-		// where a pelfs error belongs: the tab may never have been opened.
-		return exitErr(err)
+		// The terminal is still where a pelfs error belongs — the tab may
+		// never have been opened at all — it is simply no longer the only
+		// place the reason exists.
+		code := exitErr(err)
+		bs.lingerAfterFailedOpen(guard.Origin())
+		// The orderly close, in the teardown's order and for its reasons:
+		// the streams are told the process is leaving, and Shutdown can
+		// then return instead of waiting on a response that is open by
+		// design. There is no volume to seal and no lease to release —
+		// nothing below this line in the happy path has run.
+		bs.closeStreams()
+		shutCtx, cancelShut := context.WithTimeout(ctx, 5*time.Second)
+		_ = srv.Shutdown(shutCtx)
+		cancelShut()
+		_ = g.stats.Finalize(code, false)
+		return code
 	}
 	raw, err := pelicanobj.New(ctx, pelicanobj.Config{
 		PrefixURL:    prefix,
@@ -478,8 +513,15 @@ func runBrowse(o *cmdOpts, prefix string, a browseArgs) int {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
 	code := 0
+	// WHICH DOOR THE SESSION LEFT BY IS SAID OUT LOUD. There are three, they
+	// mean entirely different things — the user asked, a test asked, the
+	// listener died — and until this line the teardown that follows looked
+	// identical for all three. "The browse server shut down on its own" is a
+	// report that cannot be diagnosed from a log that does not say whether a
+	// signal arrived, so the log now says.
 	select {
-	case <-sigs:
+	case sig := <-sigs:
+		ui.Info("{signal} received; stopping this browse session", "signal", sig)
 	case <-browseStop:
 	case err := <-serveErr:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {

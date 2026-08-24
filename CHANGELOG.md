@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+**`pelfs browse` no longer disappears behind its own page.** A volume that
+refuses to open — most often a killed session's branch lease, which outlives
+its holder by a TTL — used to end the process inside the second the browser
+took to attach, leaving a tab retrying against a closed port and a durability
+panel stuck on "reading the overlay…". The failure is now served: the reason,
+the holder and this session's state directory go on the page, the listener
+stays up for a browser to attach and show them, and the exit is orderly (every
+stream gets `event: bye`). It is bounded in both directions — 15s with nobody
+watching, 60s after the last tab closes, and Ctrl-C at any time — and the exit
+code is unchanged. A session's exit now says which door it left by.
+
+**A publish leaves the session running, and something finally asserts it.**
+Nothing changed in the publish path; what changed is that
+`scripts/browse-gate.sh` used to `kill -TERM` the session on the line after
+the 202, so a session that ended on its own after publishing was green
+everywhere. The gate now checks the process, the data plane and the event
+stream after the publish, and two new tests drive the real verb through both
+triggers — the button and the automatic seal, which no gate had ever run.
+
 **The browse UI says less.** The status line's whole-file-upload caveat and the
 search-scope caveat are **deleted**, not shortened or hidden behind a
 disclosure; both facts live in `docs/known-issues.md` (KL-15, KL-19) and an

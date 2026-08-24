@@ -353,13 +353,28 @@ type countingFS struct {
 	billy.Filesystem
 	noWrite  bool
 	readDirs atomic.Int64
+	// hold gates ReadDir per path; arrived counts callers parked in it.
+	hold    atomic.Pointer[map[string]chan struct{}]
+	arrived atomic.Int64
 	written  atomic.Int64
 	maxWrite atomic.Int64
 	opens    atomic.Int64
 }
 
+// hold, when set, blocks inside ReadDir until it is closed. It exists so a
+// test can prove the in-flight guard COLLAPSES rather than merely observing
+// that it sometimes does: singleflight only merges callers that overlap, and
+// on a fast machine eight goroutines can each finish a 50-entry ReadDir
+// before the next one starts. Without a barrier the assertion is a race that
+// passes on a loaded laptop and fails on an idle CI runner.
 func (c *countingFS) ReadDir(p string) ([]os.FileInfo, error) {
 	c.readDirs.Add(1)
+	if h := c.hold.Load(); h != nil {
+		if ch, ok := (*h)[p]; ok {
+			c.arrived.Add(1)
+			<-ch
+		}
+	}
 	return c.Filesystem.ReadDir(p)
 }
 

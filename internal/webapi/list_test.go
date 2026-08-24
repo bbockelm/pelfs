@@ -3,6 +3,7 @@ package webapi_test
 import (
 	"fmt"
 	"net/http"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -303,6 +304,15 @@ func TestConcurrentIdenticalListingsCostOneReadDir(t *testing.T) {
 	// serialize the whole surface.
 	f.dir(rootIno, "other")
 
+	// Park the first ReadDir until every caller has arrived, so "they
+	// collapsed" is a fact rather than a race the scheduler decides. Without
+	// this the eight goroutines can run to completion one after another --
+	// each finishing before the next begins -- and singleflight has nothing
+	// to merge. That passed on a busy laptop and failed on an idle runner.
+	gate := make(chan struct{})
+	held := map[string]chan struct{}{"/dir-0": gate}
+	f.cnt.hold.Store(&held)
+
 	before := f.cnt.readDirs.Load()
 	const n = 8
 	var wg sync.WaitGroup
@@ -314,14 +324,21 @@ func TestConcurrentIdenticalListingsCostOneReadDir(t *testing.T) {
 			bodies[i] = f.list("/dir-0").want(http.StatusOK)
 		}(i)
 	}
+	// One caller is inside ReadDir; the rest must be queued behind the guard
+	// rather than entering it. Wait for the leader, then let everyone go.
+	for f.cnt.arrived.Load() == 0 {
+		runtime.Gosched()
+	}
+	f.cnt.hold.Store(nil)
+	close(gate)
 	wg.Wait()
 	reads := f.cnt.readDirs.Load() - before
 	if reads < 1 {
 		t.Fatalf("%d concurrent listings made %d readdirs", n, reads)
 	}
-	if reads == n {
-		t.Fatalf("%d concurrent listings of the same directory made %d readdirs: the in-flight "+
-			"guard is not collapsing them, and one navigation costs two full listings", n, reads)
+	if reads > 1 {
+		t.Fatalf("%d concurrent listings of the same directory made %d readdirs, want 1: the "+
+			"in-flight guard is not collapsing them, and one navigation costs two full listings", n, reads)
 	}
 	for i := 1; i < n; i++ {
 		if bodies[i] != bodies[0] {

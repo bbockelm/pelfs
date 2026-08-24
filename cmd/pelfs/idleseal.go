@@ -122,10 +122,11 @@ func idleQuietWindow(interval time.Duration) time.Duration {
 // lock-free rather than lucky.
 type idleSealer struct {
 	b *browseServer
-	// pressure is genSession.pressure: staged bytes and dirty inodes, or
-	// (-1, -1) while the overlay is being sealed or is gone. Injected so
-	// the tests can drive the decision without a volume.
-	pressure func() (int64, int)
+	// pressure is genSession.pressure: staged bytes, dirty inodes and
+	// dirty namespace edges, or all -1 while the overlay is being sealed
+	// or is gone. Injected so the tests can drive the decision without a
+	// volume.
+	pressure func() (int64, int, int)
 	// seal is genSession.checkpoint. Same reason.
 	seal func(context.Context) (string, error)
 	// now is the clock. Injected for the tests, which move it in whole
@@ -141,25 +142,30 @@ type idleSealer struct {
 
 	// ---- loop-local state ----
 
-	// sampled is whether lastBytes/lastNodes hold a real reading yet. The
-	// FIRST sample is a baseline and not a write: without this flag every
-	// session's first sample would differ from the zero value and restart
+	// sampled is whether lastBytes/lastNodes/lastEdges hold a real reading
+	// yet. The FIRST sample is a baseline and not a write: without this
+	// flag every session's first sample would differ from the zero value
+	// and restart
 	// the quiet window, which is a bug that hides itself -- it makes idle
 	// sealing look like it works and simply never fires on a session that
 	// staged its work before the first sample.
 	sampled bool
-	// lastBytes/lastNodes are the previous readable sample, and lastChange
-	// is when it last differed. That difference is the "no write on any
-	// surface" half of the trigger, and it is measured from the overlay
+	// lastBytes/lastNodes/lastEdges are the previous readable sample, and
+	// lastChange is when it last differed. That difference is the "no write
+	// on any surface" half of the trigger, and it is measured from the
+	// overlay
 	// rather than from a hook on each surface for two reasons: it is the
 	// same number the checkpoint policy already trusts, and it covers
 	// surfaces that do not exist yet (U6's WebDAV writes through the same
 	// overlay, so a WebDAV upload postpones an idle seal without U6
 	// touching this file). A write that changes neither counter would be
 	// missed, and the consequence of missing one is a seal that runs
-	// sooner — the safe direction.
+	// sooner — the safe direction. Edges were the counter that WAS missing:
+	// a rename changes neither bytes nor inodes, and the consequence was
+	// not a seal that ran sooner but one that never ran at all.
 	lastBytes  int64
 	lastNodes  int
+	lastEdges  int
 	lastChange time.Time
 	// backoff and retryAfter are the pressure path's, in the same shape.
 	backoff    time.Duration
@@ -258,8 +264,14 @@ func (s *idleSealer) due() bool {
 	if streams > 0 || idleSince.IsZero() {
 		return false
 	}
-	staged, nodes := s.pressure()
-	if staged < 0 || nodes < 0 {
+	// Edges count here for both jobs this does — noticing a change, and
+	// deciding there is something to publish. A rename writes a whiteout
+	// and an edge and nothing else, so without them a session whose only
+	// change was a rename neither reset its quiet window nor ever sealed
+	// on idle: it waited for a tab to close and then decided there was
+	// nothing to seal.
+	staged, nodes, edges := s.pressure()
+	if staged < 0 || nodes < 0 || edges < 0 {
 		// The overlay is mid-seal or gone. Not idle, not dirty, not ours:
 		// and the sample is NOT recorded, so a seal in progress cannot be
 		// mistaken for a write.
@@ -268,11 +280,11 @@ func (s *idleSealer) due() bool {
 	now := s.now()
 	switch {
 	case !s.sampled:
-		s.sampled, s.lastBytes, s.lastNodes = true, staged, nodes
-	case staged != s.lastBytes || nodes != s.lastNodes:
-		s.lastBytes, s.lastNodes, s.lastChange = staged, nodes, now
+		s.sampled, s.lastBytes, s.lastNodes, s.lastEdges = true, staged, nodes, edges
+	case staged != s.lastBytes || nodes != s.lastNodes || edges != s.lastEdges:
+		s.lastBytes, s.lastNodes, s.lastEdges, s.lastChange = staged, nodes, edges, now
 	}
-	if staged == 0 && nodes == 0 {
+	if staged == 0 && nodes == 0 && edges == 0 {
 		// Nothing to publish. checkpoint would fast-path this too, but it
 		// would take g.mu to find out, and this runs every second.
 		return false

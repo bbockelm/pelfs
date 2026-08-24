@@ -659,6 +659,7 @@ type browseServer struct {
 	// mid-publish would be the one lie this page must not tell.
 	stagedBytes int64
 	stagedNodes int
+	stagedEdges int
 	// publishing state, and the last job's outcome.
 	job *publishJob
 	// lastPublish anchors "next automatic publish in ...". The periodic
@@ -698,10 +699,14 @@ type browseServer struct {
 // testOverrides is what --test-hooks lets the browser-driver suite set.
 // Every field is inert unless the flag was passed.
 type testOverrides struct {
-	on            bool
-	lease         string
-	stagedFiles   int
-	stagedBytes   int64
+	on          bool
+	lease       string
+	stagedFiles int
+	stagedBytes int64
+	// dirtyEdges stages an unpublished NAMESPACE change — a rename — which
+	// is the one kind of staged work the other overrides cannot express,
+	// because it moves no bytes and touches no inode row.
+	dirtyEdges    int
 	uploadBacklog int64
 	publishStall  time.Duration
 	// downloadBody, when set, registers a synthetic download source so the
@@ -1038,12 +1043,26 @@ type browseState struct {
 	Lease    string  `json:"lease"`
 	LeaseAge float64 `json:"lease_age_s,omitempty"`
 
-	// Durability. Two counters, never one: what is on this machine and
+	// Durability. Several counters, never one: what is on this machine and
 	// what is in the federation are different facts and the page must
 	// never merge them into a single checkmark.
-	StagedFiles   int   `json:"staged_files"`
-	StagedBytes   int64 `json:"staged_bytes"`
-	DirtyNodes    int   `json:"dirty_nodes"`
+	StagedFiles int   `json:"staged_files"`
+	StagedBytes int64 `json:"staged_bytes"`
+	DirtyNodes  int   `json:"dirty_nodes"`
+	// DirtyEdges is unpublished NAMESPACE: names added, removed, or moved.
+	// It is here because a rename moves no bytes and writes no inode row,
+	// so a panel keyed on the two counters above told a user who had just
+	// renamed a file that there was nothing to publish.
+	DirtyEdges int `json:"dirty_edges"`
+	// Unpublished is the PREDICATE, computed here rather than left to the
+	// page to assemble out of the counters — which is how the panel came
+	// to disagree with the seal in the first place. It is the same
+	// expression checkpoint and sealAtExit use to decide whether a seal
+	// has anything to do, so "the page says there is something to publish"
+	// and "publishing would write a generation" cannot drift apart again.
+	// The counters stay for the page to SHOW; this is what it should key
+	// off.
+	Unpublished   bool  `json:"unpublished"`
 	UploadBacklog int64 `json:"upload_backlog"`
 	// NextPublishS is a floor, not a promise: write pressure can fire a
 	// checkpoint sooner, and the page says so.
@@ -1179,15 +1198,16 @@ func (b *browseServer) state() browseState {
 		ls := g.lease.State()
 		st.Lease, st.LeaseAge = ls.Name(), ls.Age.Seconds()
 	}
-	bytes, nodes := g.pressure()
+	bytes, nodes, edges := g.pressure()
 	b.mu.Lock()
 	if bytes >= 0 {
 		// A readable sample replaces the remembered one. A -1 means the
 		// overlay is mid-seal, and the last known numbers are the truth
 		// about what the seal is publishing — not zero.
-		b.stagedBytes, b.stagedNodes = bytes, nodes
+		b.stagedBytes, b.stagedNodes, b.stagedEdges = bytes, nodes, edges
 	}
 	st.StagedBytes, st.DirtyNodes = b.stagedBytes, b.stagedNodes
+	st.DirtyEdges = b.stagedEdges
 	b.mu.Unlock()
 	// StagedFiles is the file count behind those bytes; overlay.Stats has
 	// it, and pressure() (shared with the checkpoint policy) does not
@@ -1218,10 +1238,17 @@ func (b *browseServer) state() browseState {
 			st.StagedBytes = over.stagedBytes
 			st.DirtyNodes = over.stagedFiles
 		}
+		if over.dirtyEdges != 0 {
+			st.DirtyEdges = over.dirtyEdges
+		}
 		if over.uploadBacklog != 0 {
 			st.UploadBacklog = over.uploadBacklog
 		}
 	}
+	// Last, so it is the truth about the state actually being reported —
+	// overrides included, since a driver test that stages an edge must see
+	// the page behave as it would for a real one.
+	st.Unpublished = st.DirtyNodes != 0 || st.DirtyEdges != 0
 	if b.args.rw && b.interval > 0 {
 		left := b.interval - time.Since(last)
 		if left < 0 {
@@ -1689,6 +1716,7 @@ func (b *browseServer) serveTestHook(w http.ResponseWriter, r *http.Request) {
 		Lease          string `json:"lease"`
 		StagedFiles    int    `json:"staged_files"`
 		StagedBytes    int64  `json:"staged_bytes"`
+		DirtyEdges     int    `json:"dirty_edges"`
 		UploadBacklog  int64  `json:"upload_backlog"`
 		PublishStallMS int    `json:"publish_stall_ms"`
 		DownloadBody   string `json:"download_body"`
@@ -1705,6 +1733,7 @@ func (b *browseServer) serveTestHook(w http.ResponseWriter, r *http.Request) {
 		b.over.lease = req.Lease
 		b.over.stagedFiles = req.StagedFiles
 		b.over.stagedBytes = req.StagedBytes
+		b.over.dirtyEdges = req.DirtyEdges
 		b.over.uploadBacklog = req.UploadBacklog
 		b.over.publishStall = time.Duration(req.PublishStallMS) * time.Millisecond
 		b.over.downloadBody = req.DownloadBody

@@ -24,6 +24,17 @@ are deterministic where wall clock is not — and
 `TestContentOfStillReportsASweptPackAsAbsent` pins the half that must not be
 traded away.
 
+**A rename is unpublished work, and the page is told so now.** The durability
+panel is fed from `genSession.pressure()`, which reported staged bytes and
+dirty inodes — and a rename writes neither, only namespace edges. So renaming
+a file in the browser left the page saying there was nothing to publish, and
+the idle sealer agreed with it and never sealed when the last tab closed. The
+seal itself never had the hole (`checkpoint` and `sealAtExit` have always
+tested `DirtyEdges`), which is why this cost a prompt rather than the data.
+`pressure()` now reports edges too, `/api/v1/info` carries `dirty_edges` and an
+`unpublished` boolean computed from the same predicate the seal uses, and the
+idle sealer counts a rename as both a change and something to publish.
+
 **A seal says how much of itself was the mount following it.** The swap phase
 re-descends every inode the KERNEL is holding, so its cost is set by how much
 of the tree the session has browsed and not at all by how much changed; the

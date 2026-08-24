@@ -21,11 +21,18 @@
  * file are the exceptions, and each one says why.
  */
 
+/* A COLUMN THAT FILLS THE VIEWPORT, which is what keeps the status line on the
+   bottom edge rather than wherever the content happens to stop ("the footer is
+   not at the bottom of the browser"). `height` and `min-height` together
+   because the two failure modes are opposite: without the first a short page
+   (the no-session shell) leaves the bar floating mid-screen, and without the
+   second a viewport shorter than the app bar plus the bar clips instead of
+   scrolling. The workspace between them is the part that scrolls. */
 .pelfs-app {
   display: flex;
   flex-direction: column;
   height: 100%;
-  min-height: 0;
+  min-height: 100%;
   background: var(--pelfs-ground);
 }
 
@@ -299,83 +306,73 @@
   border-radius: 3px;
 }
 
-/* ---- the quiet caveats, and what makes them discoverable ------------- */
+/* ---- the one count on the pane's bar --------------------------------- */
 
 /*
- * A DISCLOSURE, NOT A PARAGRAPH, and this is the second complaint about the
- * first version answered: it printed "Search below is partial by design: it
- * matches only what this tab has already loaded and never asks the server. For
- * a whole-volume search, use pelfs mount and your own tools." in a full-width
- * strip above the grid, which is an implementation confession standing between
- * a person and their files.
- *
- * The FACT is not optional -- the component's search filters loaded rows and
- * fires no request (measured), so "no results" does not mean "not in your
- * volume", and a UI that lets a user conclude otherwise is lying by omission.
- * What was wrong was the volume of it. So: a short chip beside the pane whose
- * search box it is about, and the whole sentence one click away in a <details>
- * that no CSP rule and no JavaScript is needed for.
+ * WHAT USED TO BE HERE: eight rules for a <details> disclosure -- a dashed
+ * pill, a "?" affordance, an absolutely positioned popover -- built so the
+ * search caveat and the cap explanation could be on the screen without being
+ * a paragraph. The owner asked for the search caveat gone twice, and the
+ * second ask was specifically about the disclosure that hid it. So the
+ * mechanism is deleted with the text: what is left is a folder's entry count,
+ * which is a fact rather than a caveat, and a count needs no popover.
  */
-.pelfs-caveat {
-  position: relative;
+.pelfs-count {
   font-size: 0.75rem;
   color: var(--pelfs-ink-muted);
-  max-width: 100%;
-}
-
-.pelfs-caveat > summary {
-  cursor: help;
-  list-style: none;
-  display: inline-flex;
-  align-items: center;
-  gap: 0.3rem;
   padding: 0.1rem 0.45rem;
-  border: 1px dashed var(--pelfs-rule);
+  border: 1px solid var(--pelfs-rule);
   border-radius: 999px;
   white-space: nowrap;
 }
 
-.pelfs-caveat > summary::-webkit-details-marker {
-  display: none;
+/* ---- the branch control ---------------------------------------------- */
+
+/*
+ * A <select> in the app bar, dressed as the chip it replaced (ui/BranchPicker
+ * .tsx). It has to read as something you can open -- that is the whole
+ * request -- so it keeps the native disclosure arrow and gets the surface and
+ * border a control has, rather than being restyled into looking like the text
+ * it used to be.
+ */
+.pelfs-branch {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
 }
 
-.pelfs-caveat > summary:hover {
+.pelfs-branch__label {
+  color: var(--pelfs-ink-muted);
+}
+
+.pelfs-branch__select {
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 600;
   color: var(--pelfs-ink);
+  background: var(--pelfs-surface-alt);
+  border: 1px solid var(--pelfs-rule);
+  border-radius: var(--pelfs-radius-sm);
+  padding: 0.1rem 0.3rem;
+  max-width: 14rem;
+  cursor: pointer;
+}
+
+.pelfs-branch__select:hover:not(:disabled) {
   border-color: var(--pelfs-ink-muted);
 }
 
-/* The "more" affordance: a character, not an icon font -- this page loads no
-   font off the network, and the icon layer is not this file's business. */
-.pelfs-caveat > summary::after {
-  content: "?";
-  font-weight: 700;
-  color: var(--pelfs-primary-ink);
+.pelfs-branch__select:disabled {
+  cursor: progress;
+  color: var(--pelfs-ink-muted);
 }
 
-.pelfs-caveat[open] > summary::after {
-  content: "\00d7";
-}
-
-.pelfs-caveat__body {
-  position: absolute;
-  right: 0;
-  z-index: 6;
-  width: min(26rem, 80vw);
-  margin-top: 0.35rem;
-  padding: 0.6rem 0.7rem;
-  background: var(--pelfs-surface);
-  color: var(--pelfs-ink);
-  border: 1px solid var(--pelfs-rule);
-  border-radius: var(--pelfs-radius-sm);
-  box-shadow: var(--pelfs-shadow);
-  font-size: 0.78rem;
-  line-height: 1.45;
-}
-
-.pelfs-caveat--cap > summary {
-  border-style: solid;
-  border-color: var(--pelfs-local-only);
-  color: var(--pelfs-ink);
+/* A switch this tab asked for and the server has not confirmed, or a refusal.
+   Beside the control, never in place of the branch it still shows. */
+.pelfs-branch__note {
+  color: var(--pelfs-local-only);
+  font-size: 0.72rem;
+  white-space: normal;
 }
 
 /* ---- notices, banners, the status line ------------------------------- */

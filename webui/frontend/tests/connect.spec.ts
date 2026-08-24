@@ -89,14 +89,85 @@ test.describe("the two addresses", () => {
     await expect(page.getByTestId("durability-legend")).toHaveCount(0);
   });
 
-  test("the connection page says where the file manager is", async ({ page, session }) => {
+  test("the connection page says where the file manager is, in one short line", async ({
+    page,
+    session,
+  }) => {
     // M1's page carried one honest sentence about its own limits: "this page
     // does not browse files". That was the whole answer when nothing did. Now
     // something does, and half an answer is worse than the old whole one --
     // so the sentence has to name the address.
+    //
+    // AND IT HAS TO BE SHORT. This lede grew into a 180-word paragraph that
+    // explained WebDAV, the profile's stability, the per-session
+    // authorization, the password's lifetime and what is written to disk --
+    // "The connect page text is HORRIBLE. It overly explains, a wall of text
+    // for a page that can just configure CyberDuck." A word budget is a crude
+    // assertion and it is the only one that catches the thing that actually
+    // went wrong, which is length.
     await openConnect(page, session);
     const blurb = page.getByTestId("connect-blurb");
     await expect(blurb).toContainText("does not browse files");
     await expect(blurb.locator('a[href="/"]')).toHaveCount(1);
+    const words = ((await blurb.textContent()) ?? "").trim().split(/\s+/).length;
+    expect(words, "the lede is a line, not an essay").toBeLessThan(55);
+
+    // The concrete thing, named and linked. A user who has never heard the
+    // word "Cyberduck" cannot act on "connect another program"; a link can be
+    // clicked. It is an ordinary anchor -- tests/loopback.spec.ts is what
+    // proves the page still FETCHES nothing off this machine.
+    const duck = page.getByTestId("cyberduck-link");
+    await expect(duck).toHaveAttribute("href", "https://cyberduck.io/");
+    await expect(duck).toHaveAttribute("rel", /noopener/);
+
+    // And the whole page's prose is now beside its controls rather than above
+    // them: the paragraph that began "The Cyberduck profile is the same file
+    // every session" is gone, and nothing on the page says it.
+    const main = page.locator("main");
+    await expect(main).not.toContainText("the same file every session");
+    await expect(main).not.toContainText("Nothing handed out here can publish");
+  });
+
+  test("the footer is at the bottom of the viewport, on a short page", async ({
+    page,
+    session,
+  }) => {
+    // "The footer is not at the bottom of the browser on /connect." This page
+    // is three panels on a good day and one on a read-only session, so normal
+    // flow left the status line halfway up the viewport with grey ground under
+    // it. Geometry, not a class name: how it is pinned is a design choice and
+    // where it lands is not.
+    await openConnect(page, session);
+    await expect(page.getByTestId("connect-another-program")).toBeVisible();
+    const footer = page.locator("footer");
+    const box = (await footer.boundingBox())!;
+    const viewport = page.viewportSize()!;
+    expect(
+      viewport.height - (box.y + box.height),
+      "the footer's bottom edge is the viewport's",
+    ).toBeLessThan(2);
+    // And the page is not scrolled to get there: a footer that is only at the
+    // bottom because the document is taller than the window is the bug.
+    expect(await page.evaluate(() => window.scrollY)).toBe(0);
+  });
+
+  test("the wordmark goes home", async ({ page, session }) => {
+    // "I feel like I should be able to click the 'pelfs' / Pelican logo at the
+    // upper-left to go back to 'home'." Every web page in the world has taught
+    // that gesture, and this one did not answer it.
+    await openConnect(page, session);
+    const home = page.getByTestId("brand-home");
+    await expect(home).toHaveAttribute("href", "/");
+    // It has to LOOK clickable where it navigates, and the cheapest honest
+    // check of that is the cursor the browser resolves for it.
+    expect(await home.evaluate((el) => getComputedStyle(el).cursor)).toBe("pointer");
+    // The mark and the word are both inside the anchor, which is what makes
+    // the target the size a person aims at.
+    await expect(home.locator("img")).toHaveCount(1);
+    await expect(home).toContainText("pelfs");
+
+    await home.click();
+    await expect(page.getByTestId("pelfs-shell")).toBeVisible();
+    await expect(page.getByTestId("session-error")).toHaveCount(0);
   });
 });

@@ -61,41 +61,52 @@ export type DurabilityLine = {
   text: string;
 };
 
-/** The one-line answer to "is my data in the federation yet". */
+/**
+ * The one-line answer to "is my data in the federation yet", AND NOTHING ELSE.
+ *
+ * It used to open lowercase, mid-sentence, and it repeated two facts the app
+ * bar already carries: the session's mode ("read-only.", which is a chip three
+ * inches to the right) and the generation ("(generation 5)", which is beside
+ * the branch). The owner's verdict was "strangely capitalized and repeats
+ * things elsewhere in the UI", and both halves were true. So: a capitalised
+ * sentence, no mode, no generation. Where the volume stands is the app bar's
+ * job; whether the user's bytes are safe is this line's, and it is the only
+ * line on either surface that answers it.
+ *
+ * What did NOT get shortened away is the distinction. Three glyphs, three
+ * characters, and "on this machine only" never wearing the check --
+ * internal/webui/durability_test.go and tests/durability.spec.ts both fail if
+ * that erodes.
+ */
 export function describe(s: BrowseState | null): DurabilityLine {
   if (!s || s.phase !== "ready") {
-    return { state: "unknown", glyph: "", text: "reading the overlay…" };
+    return { state: "unknown", glyph: "", text: "Reading the overlay…" };
   }
-  if (s.mode === "read-only") {
+  // A read-only session and a writable one with nothing staged are the same
+  // answer to the only question this line asks, so they are the same sentence.
+  // The difference between them is a mode chip and a publish control, both of
+  // which are elsewhere and neither of which is durability.
+  if (s.mode === "read-only" || (s.staged_files === 0 && s.dirty_nodes === 0)) {
     return {
       state: "published",
       glyph: GLYPH.published,
-      text: `read-only. everything here is in the federation (generation ${s.generation}).`,
-    };
-  }
-  if (s.staged_files === 0 && s.dirty_nodes === 0) {
-    return {
-      state: "published",
-      glyph: GLYPH.published,
-      text: `nothing staged. everything here is in the federation (generation ${s.generation}).`,
+      text: "Everything here is in the federation.",
     };
   }
   const sending =
-    s.upload_backlog > 0 ? ` ${GLYPH.sending} sending ${bytes(s.upload_backlog)}.` : "";
+    s.upload_backlog > 0 ? ` ${GLYPH.sending} Sending ${bytes(s.upload_backlog)}.` : "";
   // The idle clause is not decoration: it is the promise that closing this
   // tab publishes rather than abandoning. Said only when the server says
   // idle sealing is on for this session, and in cmd/pelfs/browse.html's
   // words, because the two surfaces have one vocabulary.
-  const idle = s.idle_seal_s && s.idle_seal_s > 0
-    ? `, or ${secs(s.idle_seal_s)} after this tab closes`
-    : "";
+  const idle =
+    s.idle_seal_s && s.idle_seal_s > 0 ? `, or ${secs(s.idle_seal_s)} after this tab closes` : "";
   return {
     state: "staged",
     glyph: GLYPH.staged,
     text:
       `${s.staged_files} file${s.staged_files === 1 ? "" : "s"} (${bytes(s.staged_bytes)}) ` +
-      `on this machine only — next automatic publish in ${secs(s.next_publish_s)}` +
-      `${idle} (sooner under write pressure).${sending}`,
+      `on this machine only. Next publish in ${secs(s.next_publish_s)}${idle}.${sending}`,
   };
 }
 

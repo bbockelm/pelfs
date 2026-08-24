@@ -70,7 +70,7 @@ test.describe("durability", () => {
     // The third one is inside the sentence, next to the word it qualifies --
     // which is the whole reason the legend was redundant. Read it from there.
     const line = ((await page.getByTestId("durability").textContent()) ?? "").trim();
-    const sending = (/(\S+)\s+sending/.exec(line) ?? ["", ""])[1];
+    const sending = (/(\S+)\s+[Ss]ending/.exec(line) ?? ["", ""])[1];
 
     expect(staged, "the staged glyph must exist").not.toBe("");
     expect(published, "the published glyph must exist").not.toBe("");
@@ -106,7 +106,9 @@ test.describe("durability", () => {
     await expect(line).toContainText("3 files");
     await expect(line).toContainText("on this machine only");
     // The count of what is NOT published must not be reported as published.
-    await expect(line).not.toContainText("everything here is in the federation");
+    // (Case as the line now renders it: the sentence was recapitalised when it
+    // stopped repeating the mode and the generation.)
+    await expect(line).not.toContainText("Everything here is in the federation");
 
     await testHook(request, session, { reset: true });
     await expect(line).toHaveAttribute("data-durability", "published");
@@ -130,7 +132,7 @@ test.describe("durability", () => {
     // Still staged -- packs in flight are not packs landed -- and the arc
     // says the difference.
     await expect(line).toHaveAttribute("data-durability", "staged");
-    await expect(line).toContainText("sending");
+    await expect(line).toContainText("Sending");
     await request.dispose();
   });
 

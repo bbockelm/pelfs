@@ -618,6 +618,10 @@ and the shared durability vocabulary are pinned
 (`internal/webapi/upload_test.go`, `internal/webui/durability_test.go`).
 The absence of resume is pinned by nothing, being an absence.
 
+**Updated at `7bcce06` (uitext-agent):** the browse UI used to state this in
+its status line on every screen and no longer does — see KL-19 for the
+instruction and for the two sibling limits that left the chrome with it.
+
 ### KL-16. An NFS mount commits once per small file created, whether or not anything called `fsync`
 
 Filed at `b16784d` with the v0.2.1 release pass.
@@ -678,6 +682,53 @@ fallback and a report rather than a silent bind is pinned
 (`cmd/pelfs/browseport_test.go`'s
 `fallsBackAndSaysSoWhenTheStablePortIsTaken`). The squat itself is not a
 behaviour to assert.
+
+### KL-19. `pelfs browse`'s search covers loaded rows only, and the page no longer says so
+
+Filed at `7bcce06` by uitext-agent, and filed HERE because it was deleted
+from the screen.
+
+The file manager's search box is client-side: typing in it fires no request
+at all (measured, `internal/webui/testdata/svar-contract/recording.json`,
+step `search`) and the store filters the rows that tab has already loaded.
+A listing is also capped, because the component does not virtualize
+(100,000 entries produced 703 MB of heap). So **"no results" in that box
+means "not in what this tab has loaded", not "not in your volume"** — for a
+whole-volume search, use `pelfs mount`, a WebDAV client, or a narrower
+path.
+
+Two other limits of the same shape belong with it, since they were all in
+ambient chrome and are all now off it: **an upload is whole-file** (KL-15
+has the detail — a dropped connection restarts it and nothing can draw a
+progress bar until the request finishes), and **a capped folder shows the
+first N entries**. The pane still prints the count when it differs
+(`showing 5,000 of 6,000`), because that is a fact about the user's data
+rather than a caveat about ours.
+
+**Why the UI does not state them.** The owner asked twice, in writing, for
+both standing caveats off the page: *"'whole-file upload only: a dropped
+connection restarts it, and there is no progress bar…' which is the exact
+over-explaining crap I asked you to remove. NOTHING is valuable there for
+an inexperienced user"*, and *"SAME PROBLEM WITH SEARCH ('search covers
+loaded rows'). I ASKED YOU TO DO THAT LAST ROUND."* The earlier passes had
+each answered the complaint by making the sentence smaller and hiding it
+behind a disclosure, which is relocation rather than deletion. This entry
+is where the facts live instead. `webapi.PartialSearchNotice` still carries
+the search one on the wire (`GET /api/v1/info/{id}`), so a different client
+may render it; nothing in this repository has to.
+
+Where a limit actually bites, the user is still told AT THAT MOMENT — a
+failed upload reports its failure, and the app's own `UploadNotice` says
+what a *finished* upload does and does not mean. That is the distinction
+being drawn: an event, not ambient chrome.
+
+**Pinned by an executable test: PARTLY.** That the search is client-side is
+pinned by the recording (`internal/webui/contract_test.go` replays it, and
+a search step that grew a request would fail it). That the caveats stay OFF
+the screen is pinned by `webui/frontend/tests/chrome.spec.ts` ("no legend,
+no search caveat, no upload caveat -- the chrome states nothing"), which
+counts them at zero. The partial-search behaviour itself is an absence and
+is pinned by nothing.
 
 ---
 

@@ -89,8 +89,18 @@
     }
   }
   * { box-sizing: border-box; }
+  /* A STICKY FOOTER, because this page is SHORT and the footer used to float
+     wherever the content stopped -- reported as "the footer is not at the
+     bottom of the browser on /connect". The page is three panels on a good
+     day and one on a read-only session, so normal flow put the status line
+     halfway up the viewport with grey ground underneath it. A flex column
+     with `main` taking the slack pins it to the bottom without positioning
+     it, so a long page still scrolls the footer off the way it should. */
+  html { height: 100%; }
   body {
     margin: 0; padding: 0;
+    min-height: 100%;
+    display: flex; flex-direction: column;
     background: var(--ground); color: var(--ink);
     font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
   }
@@ -100,8 +110,9 @@
     padding: .5rem 1rem; background: var(--surface);
     border-bottom: 1px solid var(--rule);
     box-shadow: inset 0 -3px 0 -1px var(--brand);
+    flex: none;
   }
-  main { max-width: 52rem; margin: 0 auto; padding: .9rem 1rem 2rem; }
+  main { max-width: 52rem; width: 100%; margin: 0 auto; padding: .9rem 1rem 2rem; flex: 1 0 auto; }
   section.panel {
     background: var(--surface); border: 1px solid var(--rule);
     border-radius: var(--radius); box-shadow: var(--shadow);
@@ -112,6 +123,17 @@
   section.panel.status[data-durability="published"] { border-left-color: var(--published); }
   h1 { font-size: 1.15rem; font-weight: 650; margin: 0; letter-spacing: -.01em;
        display: flex; align-items: center; gap: .45rem; min-width: 0; }
+  /* THE WORDMARK IS THE WAY HOME, which is what every other web page has
+     taught people to expect ("I feel like I should be able to click the
+     'pelfs' / Pelican logo at the upper-left"). The mark and the word are one
+     anchor; the volume name beside them is not, because it is a label and not
+     a destination. It has to LOOK clickable, so: inherit the colours, take
+     the pointer, and underline the word on hover. */
+  h1 .home {
+    display: flex; align-items: center; gap: .45rem;
+    color: inherit; text-decoration: none; border-radius: var(--radius-sm);
+  }
+  h1 .home:hover .fs, h1 .home:hover .pel { text-decoration: underline; }
   h1 .mark { height: 26px; width: auto; display: block; flex: none; }
   h1 .pel { color: var(--ink); }
   h1 .fs { color: var(--brand-ink); }
@@ -190,6 +212,10 @@
   .connect input[type="text"]:focus { border-color: var(--brand); outline: 2px solid var(--brand); outline-offset: -1px; }
   .connect label { font-size: .88rem; color: var(--muted); }
   .connect label input { margin-right: .3rem; }
+  /* A fact beside its control, which is the shape this page has instead of a
+     preamble. Same size as the blurb, one line, never a paragraph. */
+  .connect p.note { margin: 0; color: var(--muted); font-size: .82rem; }
+  .cred p.sub { margin: .1rem 0 0; color: var(--muted); font-size: .82rem; white-space: normal; }
   .cred {
     padding: .8rem .9rem; border-radius: var(--radius-sm); margin: .75rem 0;
     background: var(--brand-light); border: 1px solid var(--rule);
@@ -214,6 +240,7 @@
     display: flex; gap: .9rem; align-items: center;
     padding: .35rem 1rem; background: var(--surface); border-top: 1px solid var(--rule);
     font-size: .75rem; color: var(--muted);
+    flex: none;
   }
   #stream-status::before { content: "\25cf"; margin-right: .35rem; color: var(--published); }
   #stream-status[data-stream="connecting"]::before,
@@ -240,8 +267,9 @@
        bundle's, served at /brand/{file} (cmd/pelfs/browse.go's route table),
        and the CSP on this page allows `img-src 'self'`. Nothing is drawn on
        top of the mark -- see webui/frontend/src/brand/Brand.tsx. -->
-  <h1><img class="mark" src="/brand/PelicanPlatformLogo_Icon.png" width="26" height="26"
-        alt="Pelican Platform mark"><span class="pel">pel</span><span class="fs">fs</span>
+  <h1><a class="home" href="/" data-testid="brand-home"
+        ><img class="mark" src="/brand/PelicanPlatformLogo_Icon.png" width="26" height="26"
+        alt="Pelican Platform mark"><span class="pel">pel</span><span class="fs">fs</span></a>
     <span class="vol" data-testid="volume">{{.Volume}}</span></h1>
   <div class="facts">
     <span class="sub" data-testid="branch-generation">branch —, generation —</span>
@@ -281,7 +309,7 @@
        sentence, so a legend was a second copy of the text. -->
   <section class="panel status" id="status-panel" data-testid="pelfs-durability-panel">
     <div class="statusrow">
-      <p id="durability" data-testid="durability">reading the overlay…</p>
+      <p id="durability" data-testid="durability">Reading the overlay…</p>
       <span id="publish-hint" data-testid="publish-hint"></span>
       <!-- HIDDEN until a frame says this session is writable, and REMOVED for
            good if it says read-only: `pelfs browse` is read-only by default, and
@@ -297,26 +325,32 @@
     <div class="banner bad" data-testid="lease-banner" hidden></div>
   </section>
 
+  <!-- THE ACTION PAGE. It used to open with a 180-word paragraph that
+       explained WebDAV, the profile's stability, the per-session
+       authorization, the password's lifetime and what is on disk, before the
+       reader reached a single control. The owner's verdict: "The connect page
+       text is HORRIBLE. It overly explains, a wall of text for a page that
+       can just configure CyberDuck."
+
+       So this is a page with a verb on it. Cyberduck is named, and linked,
+       because "connect another program" told nobody what to do and most
+       people have never heard the word: the link is what turns the name into
+       something a person can act on, and it is an ordinary anchor a user
+       clicks -- nothing on this page FETCHES anything off this machine
+       (tests/loopback.spec.ts).
+
+       Every remaining fact sits beside the control it is about rather than in
+       a preamble above all of them: the WebDAV address under the form, the
+       profile's one-install-per-machine promise next to the download buttons,
+       the password's one-time nature next to the password. -->
   <section class="panel connect" data-testid="connect-another-program">
-    <h2>Connect another program</h2>
+    <h2>Connect with Cyberduck</h2>
     <p data-testid="connect-blurb">
-      This page does not browse files — <a href="/">the file manager</a>
-      does, on this session's main page. What this page does is hand the job to a
-      program that is better at it than any browser: one that can copy a whole
-      directory, resume after a dropped connection, and keep going while you do
-      something else. This session speaks WebDAV at
-      <code data-testid="dav-url">—</code>, and adding a program below produces a
-      Cyberduck or Mountain Duck profile that connects with one double-click and no
-      password, plus a username and password for everything else — rclone, WinSCP,
-      <code>mount_webdav</code>, curl. The Cyberduck profile is the same file every
-      session: install it once, and the bookmark you save keeps working after
-      <code>pelfs browse</code> restarts. What does not carry over is the
-      authorization &mdash; you will click <strong>Authorize</strong> once per session,
-      on a screen that names the volume and exactly what is being granted &mdash; nor
-      the password below, which is issued once and replaced if you add this program
-      again. Nothing handed out here can publish, and no access token is ever written
-      to disk; what is on disk is one file in this volume&rsquo;s state directory
-      listing which programs you have set up.
+      <a href="https://cyberduck.io/" target="_blank" rel="noopener noreferrer"
+         data-testid="cyberduck-link">Cyberduck</a>
+      is a free file browser for Mac and Windows that copies whole folders and keeps
+      going in the background. This page does not browse files &mdash;
+      <a href="/">the file manager</a> does &mdash; it sets Cyberduck up.
     </p>
 
     <form data-testid="add-program-form" id="add-program">
@@ -327,10 +361,15 @@
         may write
       </label>
       <button type="submit" id="add-program-button" data-testid="add-program-button" disabled>
-        Add a program
+        Set up
       </button>
       <span id="connect-hint" data-testid="connect-hint"></span>
     </form>
+
+    <p class="note">
+      Anything that speaks WebDAV works too &mdash; rclone, WinSCP,
+      <code>mount_webdav</code> &mdash; at <code data-testid="dav-url">&mdash;</code>
+    </p>
 
     <!-- The one panel on this page that holds a secret. It is built once,
          from the response to the POST that minted it, and it is never
@@ -594,6 +633,18 @@
     });
     box.appendChild(files);
 
+    // THE ONE LINE that replaced a paragraph. Install-once and
+    // authorize-per-session are the two things a person needs at the moment
+    // they click a download, and they belong here rather than above
+    // everything: the profile is stable across restarts
+    // (internal/localoauth/identity.go) and consent deliberately is not.
+    const how = document.createElement("p");
+    how.className = "sub";
+    how.setAttribute("data-testid", "credential-how");
+    how.textContent = "Install the profile once — the bookmark keeps working after a " +
+      "restart. Each new session asks you to approve it.";
+    box.appendChild(how);
+
     const dl = document.createElement("dl");
     const pair = (term, value, id) => {
       const dt = document.createElement("dt");
@@ -809,19 +860,20 @@
     dirty = s.staged_files;
     const d = t("durability");
     if (s.phase !== "ready") {
-      d.textContent = "reading the overlay…";
+      d.textContent = "Reading the overlay…";
       d.dataset.durability = "unknown";
-    } else if (s.mode === "read-only") {
+    } else if (s.mode === "read-only" || (s.staged_files === 0 && s.dirty_nodes === 0)) {
+      // A read-only session and a writable one with nothing staged are the
+      // same answer to the only question this line asks. The mode is a chip
+      // in the bar above and the generation is beside the branch, so saying
+      // either of them here was a repeat -- which is what the owner called
+      // it. See webui/frontend/src/durability.ts, which now says this.
       d.innerHTML = `<span class="glyph published">✓</span>` +
-        `read-only. everything here is in the federation (generation ${s.generation}).`;
-      d.dataset.durability = "published";
-    } else if (s.staged_files === 0 && s.dirty_nodes === 0) {
-      d.innerHTML = `<span class="glyph published">✓</span>` +
-        `nothing staged. everything here is in the federation (generation ${s.generation}).`;
+        `Everything here is in the federation.`;
       d.dataset.durability = "published";
     } else {
       const sending = s.upload_backlog > 0
-        ? ` <span class="glyph sending">◔</span> sending ${bytes(s.upload_backlog)}.`
+        ? ` <span class="glyph sending">◔</span> Sending ${bytes(s.upload_backlog)}.`
         : "";
       // The idle clause is not decoration: it is the promise that closing
       // this tab publishes rather than abandoning. Said only when the
@@ -831,9 +883,8 @@
         : "";
       d.innerHTML = `<span class="glyph staged">●</span>` +
         `${s.staged_files} file${s.staged_files === 1 ? "" : "s"} ` +
-        `(${bytes(s.staged_bytes)}) on this machine only` +
-        ` — next automatic publish in ${secs(s.next_publish_s)}` +
-        `${idle} (sooner under write pressure).${sending}`;
+        `(${bytes(s.staged_bytes)}) on this machine only.` +
+        ` Next publish in ${secs(s.next_publish_s)}${idle}.${sending}`;
       d.dataset.durability = "staged";
     }
     // The panel's left edge carries the same state as colour, the way the

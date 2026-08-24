@@ -9,7 +9,8 @@ import { subscribeState, type StreamStatus } from "./api/events";
 import { downloadFile } from "./api/control";
 import type { BrowseState, DriveInfo, Entry, ListingMeta } from "./api/types";
 import { Durability } from "./ui/Durability";
-import { CapCaveat, ErrorBanner, SearchCaveat, UploadNotice } from "./ui/Notices";
+import { CapCaveat, ErrorBanner, UploadNotice } from "./ui/Notices";
+import { BranchPicker } from "./ui/BranchPicker";
 import { publishState } from "./durability";
 import { CONNECT } from "./routes";
 
@@ -36,12 +37,22 @@ import { CONNECT } from "./routes";
  *
  *   - It does not resume an upload. The component posts one whole multipart
  *     request through fetch [U0 recording, step "upload"], so a dropped
- *     connection at 90% of a 68 MB SIF starts over and there is no progress
- *     bar to watch on the way. Resumable upload is `tus` + `uppy` at
- *     `api.intercept("upload-file")`, deferred by decision (U15). The page
- *     says so rather than letting somebody find out at 80%.
+ *     connection at 90% of a 68 MB SIF starts over. Resumable upload is `tus`
+ *     + `uppy` at `api.intercept("upload-file")`, deferred by decision (U15).
  *
- *   - It does not search the volume. See ui/Notices.tsx.
+ *   - It does not search the volume: the component's search box filters the
+ *     rows this tab has loaded and asks the server nothing.
+ *
+ * NEITHER OF THOSE TWO IS ON THE SCREEN ANY MORE, and that is an instruction
+ * rather than an oversight. Both were stated in ambient chrome -- a caveat in
+ * the status line, a disclosure chip beside the search box -- and the owner
+ * asked for both gone, twice: "NOTHING is valuable there for an inexperienced
+ * user", "SAME PROBLEM WITH SEARCH … I ASKED YOU TO DO THAT LAST ROUND." They
+ * are recorded in docs/known-issues.md (KL-15, KL-19), which is tracked and
+ * linked from the README, and where a limit actually bites the user is told
+ * AT THAT MOMENT: a failed upload reports its failure, and `UploadNotice`
+ * still says what a finished one does and does not mean. What is gone is the
+ * standing confession, and it does not come back as a tooltip.
  */
 
 const API_BASE = "/api/v1";
@@ -117,7 +128,6 @@ export function App() {
   const [stream, setStream] = useState<StreamStatus>("connecting");
   const [error, setError] = useState("");
   const [upload, setUpload] = useState("");
-  const [search, setSearch] = useState("");
   const [path, setPath] = useState("/");
   const [listings, setListings] = useState<Record<string, ListingMeta>>({});
   const dark = usePrefersDark();
@@ -317,7 +327,6 @@ export function App() {
       // Which directory the user is looking at, so the cap notice is about
       // THIS folder and not the one they opened first.
       api.on("set-path", (ev: { id: string }) => setPath(ev.id));
-      api.on("filter-files", (ev: { text: string }) => setSearch(ev.text || ""));
 
       // The download. `download-file` has no handler in the store at all, so
       // nothing happens unless this is here -- and what happens has to be the
@@ -413,9 +422,18 @@ export function App() {
           <Brand subtitle={state?.volume ?? ""} />
         </div>
         <div className="pelfs-appbar__facts">
-          <span className="pelfs-fact" data-testid="branch-generation">
-            branch <b>{state?.branch ?? "—"}</b>, generation{" "}
-            <b>{state && state.phase === "ready" ? state.generation : "—"}</b>
+          {/* The branch is a CONTROL now (ui/BranchPicker.tsx) and the
+              generation stays the fact beside it. They were one span; they
+              are two because only one of them is something a user can
+              change, and because the generation is the number the durability
+              line stopped repeating. */}
+          <BranchPicker
+            token={token}
+            current={state?.branch ?? ""}
+            ready={state?.phase === "ready"}
+          />
+          <span className="pelfs-fact" data-testid="generation">
+            generation <b>{state && state.phase === "ready" ? state.generation : "—"}</b>
           </span>
           <span className="pelfs-fact" data-testid="lease" data-lease-state={state?.lease ?? "—"}>
             lease <b>{state?.lease ?? "—"}</b>
@@ -499,9 +517,10 @@ export function App() {
 
         {ready ? (
           <section className="pelfs-panel pelfs-panel--files" data-testid="pelfs-files-panel">
-            {/* The pane's own accessory row, directly above the component's
-                toolbar -- whose search box is at its left, which is the
-                reason the search caveat is here and not in a footer. */}
+            {/* The pane's own accessory row: the path, and the entry count
+                when this folder holds more than the page is showing. It used
+                to carry the search caveat as well; see ui/Notices.tsx for why
+                that is deleted rather than moved again. */}
             <div className="pelfs-panel__bar">
               {/* The folder this pane is showing, as a PATH. The component's
                   breadcrumb above shows the same place in names; a path is
@@ -511,7 +530,6 @@ export function App() {
                 {path || "/"}
               </span>
               <span className="pelfs-panel__bar-spacer" />
-              <SearchCaveat meta={meta} search={search} />
               <CapCaveat meta={meta} />
             </div>
             <div className="pelfs-panel__body pelfs-fm">
@@ -543,10 +561,14 @@ export function App() {
                 ? "pelfs browse has exited — this page is now a snapshot"
                 : "connecting…"}
         </span>
-        <span>
-          whole-file upload only: a dropped connection restarts it, and there is no progress bar.
-          For a large set of files use <code>pelfs mount</code> or a WebDAV client.
-        </span>
+        {/* NOTHING ELSE LIVES HERE. This slot held "whole-file upload only: a
+            dropped connection restarts it, and there is no progress bar. For a
+            large set of files use pelfs mount or a WebDAV client." -- on every
+            screen, before anything had gone wrong, to a reader who has no use
+            for it: "NOTHING is valuable there for an inexperienced user." It
+            is deleted, not shortened and not hidden behind a hover. The fact
+            is KL-15 in docs/known-issues.md, and an upload that actually dies
+            says so when it dies. */}
         <span className="pelfs-statusline__spacer" />
         {/* The MIT notices for the bundled packages. The distribution is a Go
             binary with the bundle inside it, so a person who has nothing but

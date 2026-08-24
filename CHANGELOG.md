@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+**The browse UI says less.** The status line's whole-file-upload caveat and the
+search-scope caveat are **deleted**, not shortened or hidden behind a
+disclosure; both facts live in `docs/known-issues.md` (KL-15, KL-19) and an
+upload that fails still says so when it fails. The durability sentence no
+longer repeats the mode chip or the generation — published reads
+"Everything here is in the federation." on both surfaces. `/connect` is an
+action page: **Connect with Cyberduck**, with a link to cyberduck.io and each
+remaining fact beside the control it describes, in place of a 180-word
+preamble. The footer is pinned to the bottom of the viewport on both pages,
+the wordmark on `/connect` links home, and the branch pill is a real picker
+where the server offers `GET /api/v1/branches` (and today's static pill where
+it does not).
+
 **The file manager looks like a file manager.** The app shipped one of the eight
 stylesheets the component needs (`style.css`, not `all.css`), so thirteen base
 theme tokens were undefined and the menu, the modal, the segmented view switch

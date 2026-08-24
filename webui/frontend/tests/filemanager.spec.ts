@@ -100,50 +100,28 @@ test.describe("the file manager", () => {
     await expect(cap).toBeVisible();
     await expect(cap).toHaveAttribute("data-listing-total", "6000");
     await expect(cap).toHaveAttribute("data-listing-returned", "5000");
-    // The summary carries the two numbers, which is the whole of what a user
-    // needs to know that the folder is bigger than the screen.
+    // The two numbers, which is the whole of what a user needs to know that
+    // the folder is bigger than the screen.
     await expect(cap).toContainText("5,000");
     await expect(cap).toContainText("6,000");
-    // Opened, it says why and what to do instead, rather than leaving the
-    // user stuck.
-    await cap.locator("summary").click();
-    await expect(cap.locator(".pelfs-caveat__body")).toContainText("not virtualized");
-    await expect(cap).toContainText("pelfs mount");
+    // AND NOTHING ELSE. The disclosure that used to open to a paragraph about
+    // virtualization and heap size is deleted: a count is a fact, and the
+    // explanation of why the cap exists is not something a person standing in
+    // a folder needs. It is not a <details> any more, so there is nothing to
+    // open and no hidden body to assert.
+    await expect(cap.locator("summary")).toHaveCount(0);
   });
 
-  test("the partial search is admitted, beside the search box, and says how much", async ({
-    page,
-    session,
-  }) => {
-    // Typing in the toolbar's search box fires NO request (recording.json,
-    // step "search"): the store filters what it has. Combined with the cap,
-    // "no results" means "not in what this tab loaded", which is a different
-    // statement from "not in your volume".
-    //
-    // WHAT CHANGED HERE, and it was a defect and not a preference: this used
-    // to be a full-width paragraph above the grid, reading "Search below is
-    // partial by design: it matches only what this tab has already loaded and
-    // never asks the server..." before anybody had typed anything. The fact is
-    // still on the screen, still beside the pane whose search box it is about,
-    // and still without a tooltip -- a tooltip does not exist on a touch
-    // screen -- but it is a summary you can open rather than a confession you
-    // must read. The long form is asserted in tests/chrome.spec.ts.
-    await openPelfs(page, session);
-    const notice = page.getByTestId("search-scope");
-    await expect(notice).toBeVisible();
-    await expect(notice).toHaveAttribute("data-searching", "no");
-    await expect(notice).toContainText("loaded rows");
-
-    const box = page.getByPlaceholder("Search");
-    await box.fill("sample");
-    // While a search is running the summary says HOW MUCH was searched, which
-    // is the number a user needs to judge "no results" -- and it is a fact the
-    // old paragraph did not carry until you read to the end of it.
-    await expect(notice).toHaveAttribute("data-searching", "yes");
-    await expect(notice).toContainText("searching");
-    await expect(page.getByTestId("search-scope-count")).not.toBeEmpty();
-  });
-
+  /*
+   * DELETED: "the partial search is admitted, beside the search box, and says
+   * how much". It drove the <details> chip and the "searching N loaded rows"
+   * summary, and both are gone from the UI on the owner's instruction, given
+   * twice -- so the spec goes with them rather than being weakened into
+   * asserting a smaller version of something he asked to have removed. The
+   * fact it was defending is KL-19 in docs/known-issues.md; that the chip
+   * STAYS gone is asserted in tests/chrome.spec.ts, which is the file that
+   * owns "what is on the screen".
+   */
   test("create a folder: the mutation is application/json, or the guard 415s it", async ({
     page,
     session,

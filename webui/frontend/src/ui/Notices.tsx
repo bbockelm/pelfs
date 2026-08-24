@@ -1,104 +1,42 @@
 import type { ListingMeta } from "../api/types";
 
 /**
- * THE TWO LIMITS THIS UI OWES THE USER, SAID QUIETLY.
+ * THE ONE COUNT THIS PANE STILL SHOWS, AND THE TWO CAVEATS THAT ARE GONE.
  *
- * MEASURED (internal/webui/testdata/svar-contract/u0-measurements.json):
+ * DELETED, on the owner's instruction, twice given: the search caveat. It was
+ * a paragraph above the grid ("Search below is partial by design…"), then a
+ * <details> chip beside the search box that opened to the same paragraph. The
+ * second was the wrong fix for the first -- "SAME PROBLEM WITH SEARCH ('search
+ * covers loaded rows'). I ASKED YOU TO DO THAT LAST ROUND." -- because moving
+ * an implementation confession into a disclosure keeps it on the screen. A
+ * tooltip would be the same move again, so there is no title attribute here
+ * either.
  *
- *   - The component does not virtualize. 100,000 entries produced 100,000 card
- *     elements, 1,000,067 DOM nodes and 703 MB of JS heap, and 17.7 s to open
- *     in cards mode / 33.3 s in table mode. So the API caps a listing -- the
- *     cap is the design, not a fallback -- and a capped listing that the UI
- *     does not admit to is a UI that says a directory has 5,000 entries when
- *     it has two million.
+ * The FACT is unchanged and it is not hidden: the component's search filters
+ * loaded rows and fires no request (measured, recording.json step "search"),
+ * so "no results" is not "not in your volume". It lives in
+ * docs/known-issues.md, where it is findable, dated and cross-referenced, and
+ * webapi.PartialSearchNotice still carries it on the wire for a client that
+ * wants to render it. This UI does not.
  *
- *   - Search is CLIENT-SIDE over loaded data only. Typing in the toolbar's
- *     search box fires no request at all (recording.json, step "search"); the
- *     store filters the subtree it happens to have. Combined with the cap, "no
- *     results" therefore means "not in what this tab has loaded", which is a
- *     different statement from "not in your volume" -- and the user cannot
- *     tell the two apart unless the UI says so.
- *
- * BOTH FACTS STAY. WHAT CHANGED IS THE VOLUME OF THEM, and it was a defect
- * rather than a preference. The first version printed, full width, above the
- * grid, before anyone had typed anything: "Search below is partial by design:
- * it matches only what this tab has already loaded and never asks the server.
- * For a whole-volume search, use pelfs mount and your own tools." That is an
- * implementation confession standing between a person and their files, and the
- * owner's verdict on it was "a BIZARRE thing to say".
- *
- * So each limit is now a chip in the file pane's accessory row -- beside the
- * pane whose search box it is about -- and the whole sentence is one click
- * away inside it. A <details>, deliberately: it needs no JavaScript and no
- * inline style, so it survives `script-src 'self'` and `style-src 'self'`; it
- * is keyboard-reachable and it exists on a touch screen, which a tooltip does
- * not. Nothing is hidden that a person cannot open, and nothing is shouted.
- */
-export function SearchCaveat({ meta, search }: { meta: ListingMeta | null; search: string }) {
-  const loaded = meta?.returned;
-  return (
-    <details
-      className="pelfs-caveat"
-      // One `name` for both caveats makes them an exclusive accordion in the
-      // browser itself: opening one closes the other, so two popovers cannot
-      // overlap. No JavaScript, and a browser that does not know the attribute
-      // simply opens both.
-      name="pelfs-caveat"
-      data-testid="search-scope"
-      data-searching={search ? "yes" : "no"}
-    >
-      <summary>
-        {search ? (
-          <>
-            searching{" "}
-            <strong data-testid="search-scope-count">{(loaded ?? 0).toLocaleString()}</strong> loaded
-            rows
-          </>
-        ) : (
-          <>search covers loaded rows</>
-        )}
-      </summary>
-      <p className="pelfs-caveat__body">
-        The search box filters the rows this tab has already loaded and asks the server nothing, so
-        a file that exists but has not been listed here will not appear. For a whole-volume search,
-        use <code>pelfs mount</code> or a WebDAV client.
-      </p>
-    </details>
-  );
-}
-
-/**
- * The other half: this folder is bigger than what is on the screen.
- *
- * The server's own sentence for this is webapi.PartialSearchNotice, which says
- * the same two things in the same order -- how much is shown, and that the
- * search box is therefore searching only that much. It is served on
- * `GET /api/v1/info/{id}`; this page learns the numbers from the listing's
- * response headers instead (api/types.ts, ListingMeta) because the listing
- * body has to stay a bare JSON array. Same facts, one wording per surface.
+ * WHAT STAYS is the COUNT, because it is not a caveat: a folder that holds two
+ * million entries and shows five thousand has to say five thousand of two
+ * million, or the pane is reporting a number that is not the directory's. That
+ * is a fact about the user's data, said in six words, with no disclosure and
+ * no explanation attached -- and it appears only when the numbers differ, so a
+ * normal folder shows nothing at all.
  */
 export function CapCaveat({ meta }: { meta: ListingMeta | null }) {
   if (!meta || meta.total === undefined || meta.total <= meta.returned) return null;
   return (
-    <details
-      className="pelfs-caveat pelfs-caveat--cap"
-      name="pelfs-caveat"
+    <span
+      className="pelfs-count"
       data-testid="listing-cap"
       data-listing-total={meta.total}
       data-listing-returned={meta.returned}
     >
-      <summary>
-        showing {meta.returned.toLocaleString()} of {meta.total.toLocaleString()}
-      </summary>
-      <p className="pelfs-caveat__body">
-        This folder holds <strong>{meta.total.toLocaleString()}</strong> entries and this page is
-        showing the first <strong>{meta.returned.toLocaleString()}</strong>
-        {meta.cap ? ` (the server's cap is ${meta.cap.toLocaleString()})` : ""}. The browser cannot
-        render the rest — the file list is not virtualized, and a directory this size costs hundreds
-        of megabytes of memory and tens of seconds. Use <code>pelfs mount</code>, a WebDAV client,
-        or a narrower path.
-      </p>
-    </details>
+      showing {meta.returned.toLocaleString()} of {meta.total.toLocaleString()}
+    </span>
   );
 }
 

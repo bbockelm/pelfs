@@ -73,11 +73,24 @@ func TestTheTwoSurfacesShareOneDurabilityVocabulary(t *testing.T) {
 	// The sentences a user reads. Not the whole prose -- these are the
 	// phrases that carry the distinction, and rewording one surface's copy of
 	// them without the other is the drift this test catches.
+	//
+	// THE LIST GOT SHORTER ON PURPOSE, and this is the one place the reason is
+	// worth recording. The published sentence used to read "read-only.
+	// everything here is in the federation (generation 5)." on one surface and
+	// "nothing staged. everything here is …" on the other -- lowercase,
+	// mid-sentence, and repeating two facts the app bar already carries (the
+	// mode chip and the generation). The owner's verdict was "strangely
+	// capitalized and repeats things elsewhere in the UI", so both surfaces now
+	// say "Everything here is in the federation." for every published state and
+	// neither says the mode or the generation. "nothing staged" and "sooner
+	// under write pressure" left the vocabulary with that edit; "next automatic
+	// publish in" became "Next publish in". What did NOT change is the thing
+	// this test exists for: the two surfaces still say it in the same words, so
+	// a later edit to one of them still fails here.
 	for _, phrase := range []string{
 		"on this machine only",
-		"in the federation",
-		"nothing staged",
-		"next automatic publish in",
+		"Everything here is in the federation.",
+		"Next publish in",
 		// The idle clause. It is the promise that closing the tab publishes
 		// rather than abandons, and it was on the connection page only until
 		// the wiring pass -- so the surface that can actually stage files was

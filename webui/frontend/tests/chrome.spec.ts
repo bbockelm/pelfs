@@ -15,6 +15,17 @@ import { MODE, card, expect, openPelfs, resetHooks, test, testHook } from "./pel
  *    the actual text"
  *   "having the 'Publish now' box so prominent and up top is weird, especially
  *    since it's already labeled as read-only"
+ *   "the status bar … is strangely capitalized and repeats things elsewhere in
+ *    the UI"
+ *   "'whole-file upload only: a dropped connection restarts it…' which is the
+ *    exact over-explaining crap I asked you to remove"
+ *   "SAME PROBLEM WITH SEARCH ('search covers loaded rows'). I ASKED YOU TO DO
+ *    THAT LAST ROUND."
+ *
+ * The last three are DELETIONS, and a deletion needs a test more than an
+ * addition does: nothing about a missing sentence fails on its own, so the
+ * only thing standing between "gone" and "back next round, smaller" is an
+ * assertion that counts it at zero.
  *
  * A layout is not fully assertable and this file does not pretend otherwise --
  * it pins the four properties that were wrong and that a rewrite could undo
@@ -117,7 +128,7 @@ test.describe("the page reads as a file manager", () => {
     ).toBeGreaterThan(0);
   });
 
-  test("there is no glyph legend, and the caveats are a disclosure rather than a wall", async ({
+  test("no legend, no search caveat, no upload caveat -- the chrome states nothing", async ({
     page,
     session,
   }) => {
@@ -130,26 +141,63 @@ test.describe("the page reads as a file manager", () => {
     // is asserted in durability.spec.ts against what the panel renders.
     await expect(page.getByTestId("durability-legend")).toHaveCount(0);
 
-    // The search caveat is TRUE and it is QUIET: a short summary on the file
-    // pane's own bar, with the whole sentence one click away. What it must not
-    // be again is a paragraph of implementation detail across the top of the
-    // page before anyone has typed anything.
-    const caveat = page.getByTestId("search-scope");
-    await expect(caveat).toBeVisible();
-    await expect(caveat).toHaveAttribute("data-searching", "no");
-    const summary = caveat.locator("summary");
-    const words = ((await summary.textContent()) ?? "").trim();
-    expect(words.length, "the caveat's summary is a phrase, not a paragraph").toBeLessThan(60);
-    // Closed, the long form is not on the screen.
-    await expect(caveat.locator(".pelfs-caveat__body")).toBeHidden();
+    // THE SEARCH CAVEAT IS GONE, and this assertion is the whole point of
+    // this test now. It was a paragraph above the grid; it was then made a
+    // <details> chip with the same paragraph inside it, which is relocation
+    // and not deletion, and the owner said so in as many words: "SAME PROBLEM
+    // WITH SEARCH ('search covers loaded rows'). I ASKED YOU TO DO THAT LAST
+    // ROUND." So: no chip, no summary, no popover body, and -- because a
+    // tooltip is the same move a third time -- no title attribute on the
+    // search box either.
+    await expect(page.getByTestId("search-scope")).toHaveCount(0);
+    await expect(page.getByTestId("search-scope-count")).toHaveCount(0);
+    await expect(page.locator(".pelfs-caveat")).toHaveCount(0);
+    const box = page.getByTestId("pelfs-files-panel").locator("input[type=text]").first();
+    await expect(box).not.toHaveAttribute("title", /./);
 
-    // Opened, the fact is there in full -- including the half a user cannot
-    // guess: that the search never reaches the server.
-    await summary.click();
-    const body = caveat.locator(".pelfs-caveat__body");
-    await expect(body).toBeVisible();
-    await expect(body).toContainText("asks the server nothing");
-    await expect(body).toContainText("pelfs mount");
+    // THE UPLOAD CAVEAT IS GONE FROM THE STATUS LINE, for the same reason:
+    // "whole-file upload only: a dropped connection restarts it, and there is
+    // no progress bar" stood on every screen before anything had gone wrong.
+    // What is left in that bar is the stream light and the third-party notices
+    // link, which is a licence obligation rather than a statement.
+    const statusline = page.locator(".pelfs-statusline");
+    await expect(statusline).not.toContainText("whole-file");
+    await expect(statusline).not.toContainText("progress bar");
+    await expect(statusline).not.toContainText("dropped connection");
+    await expect(page.getByTestId("pelfs-notices-link")).toBeVisible();
+  });
+
+  test("the durability line answers one question and repeats nothing", async ({
+    page,
+    session,
+    playwright,
+  }) => {
+    // "The status bar ('✓read-only. everything here is in the federation
+    // (generation 5).') is strangely capitalized and repeats things elsewhere
+    // in the UI." Both halves, as assertions: it starts with a capital, and
+    // the two facts the app bar owns -- the mode chip and the generation --
+    // are not said a second time here.
+    const request = await playwright.request.newContext();
+    await testHook(request, session, { mode: "read-only" });
+    await openPelfs(page, session);
+
+    const line = page.getByTestId("durability");
+    await expect(line).toHaveAttribute("data-durability", "published");
+    // The app bar still owns both facts, which is why the line does not.
+    await expect(page.getByTestId("mode")).toHaveText("read-only");
+    await expect(page.getByTestId("generation")).toContainText("generation");
+
+    const words = ((await line.textContent()) ?? "").replace(/^[^A-Za-z]*/, "");
+    expect(words[0], "the sentence starts with a capital letter").toBe(words[0].toUpperCase());
+    expect(words.toLowerCase(), "the line must not repeat the mode chip").not.toContain(
+      "read-only",
+    );
+    expect(words.toLowerCase(), "the line must not repeat the generation").not.toContain(
+      "generation",
+    );
+    // It still answers the only question it is for.
+    await expect(line).toContainText("in the federation");
+    await request.dispose();
   });
 
   test("a read-only session renders no publish control at all", async ({
@@ -166,8 +214,9 @@ test.describe("the page reads as a file manager", () => {
     await testHook(request, session, { mode: "read-only" });
 
     await openPelfs(page, session);
-    const line = page.getByTestId("durability");
-    await expect(line).toContainText("read-only");
+    // The mode is the app bar's chip, not the durability line's -- see "the
+    // durability line answers one question and repeats nothing" above.
+    await expect(page.getByTestId("mode")).toHaveText("read-only");
     await expect(
       page.getByTestId("publish-button"),
       "a session that cannot publish must not render a publish button",
@@ -204,5 +253,71 @@ test.describe("the page reads as a file manager", () => {
     // Publish it, so the next spec's "nothing is staged yet" holds.
     await button.click();
     await expect(page.getByTestId("publish-status")).toHaveAttribute("data-job-state", "done");
+  });
+
+  test("the status line is at the bottom of the viewport", async ({ page, session }) => {
+    // "The footer is not at the bottom of the browser on /connect" -- the same
+    // property, asserted on this surface too, because the two pages are one
+    // product and a footer that floats on either reads as a broken page. The
+    // assertion is GEOMETRY rather than a class or a `position` value: whether
+    // it is flex, grid or sticky is a design choice, and where it ends up is
+    // not.
+    await openPelfs(page, session);
+    await expect(card(page, "/README.txt")).toBeVisible();
+    const bar = page.locator(".pelfs-statusline");
+    const box = (await bar.boundingBox())!;
+    const viewport = page.viewportSize()!;
+    expect(
+      viewport.height - (box.y + box.height),
+      "the status line's bottom edge is the viewport's",
+    ).toBeLessThan(2);
+  });
+});
+
+/**
+ * THE BRANCH PILL AS A CONTROL, in whichever of its two forms this server can
+ * support -- which is the point.
+ *
+ * `GET /api/v1/branches` is a sibling's work in progress. This spec runs in
+ * BOTH modes and asserts the invariant that holds either way: the pill names
+ * the branch the durability stream says the session is on, and if it is a real
+ * dropdown then that branch is the SELECTED option. What it must never be is a
+ * control that shows a branch the session is not on -- the failure mode of
+ * treating a 202 as a switch -- or a dropdown rendered against a 404.
+ */
+test.describe("the branch pill", () => {
+  test("names the session's branch, and is a real control when the server has one", async ({
+    page,
+    session,
+  }) => {
+    await openPelfs(page, session);
+    const pill = page.getByTestId("branch");
+    await expect(pill).toBeVisible();
+
+    const form = await pill.getAttribute("data-branch-control");
+    expect(["static", "select"], `unknown branch control form ${form}`).toContain(form);
+
+    if (form === "static") {
+      // The degraded form: the fact, as text, exactly as the app bar carried
+      // it before there was a route to ask. Not a dead <select>.
+      await expect(pill.locator("select")).toHaveCount(0);
+      await expect(pill).toContainText("branch");
+      return;
+    }
+
+    const select = page.getByTestId("branch-select");
+    await expect(select).toBeVisible();
+    await expect(select).toBeEnabled();
+    // The selected option is the session's branch, and there is exactly one
+    // option bearing that name.
+    const current = await select.inputValue();
+    expect(current, "the picker must have a branch selected").not.toBe("");
+    expect(
+      await select.locator("option").evaluateAll(
+        (opts, want) => opts.filter((o) => (o as HTMLOptionElement).value === want).length,
+        current,
+      ),
+      "the current branch appears once in the list",
+    ).toBe(1);
   });
 });

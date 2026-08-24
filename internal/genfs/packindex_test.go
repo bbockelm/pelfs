@@ -424,7 +424,7 @@ func TestPackIndexFallsBackOnCorruptCachedTrailer(t *testing.T) {
 	fs := openFS(t, inner, res.Superblock, genfs.Options{CacheDir: cache})
 	// Prefetch asks for the whole location map, so every pack's trailer is
 	// on disk to be corrupted.
-	if _, err := fs.Prefetch(ctx, 2); err != nil {
+	if _, err := fs.Prefetch(ctx, genfs.PrefetchOptions{Workers: 2}); err != nil {
 		t.Fatalf("Prefetch: %v", err)
 	}
 	_ = fs.Close()
@@ -443,7 +443,7 @@ func TestPackIndexFallsBackOnCorruptCachedTrailer(t *testing.T) {
 	if _, err := fs2.LookupPath(ctx, "one.bin"); err != nil {
 		t.Fatalf("mount over corrupt cached trailers: %v", err)
 	}
-	if _, err := fs2.Prefetch(ctx, 2); err != nil {
+	if _, err := fs2.Prefetch(ctx, genfs.PrefetchOptions{Workers: 2}); err != nil {
 		t.Fatalf("Prefetch over corrupt cached trailers: %v", err)
 	}
 	// And the bad copies are gone, not re-read forever.
@@ -473,7 +473,7 @@ func TestTrailerFromCachedPackIsVerified(t *testing.T) {
 
 	cache := t.TempDir()
 	fs := openFS(t, inner, res.Superblock, genfs.Options{CacheDir: cache})
-	if _, err := fs.Prefetch(ctx, 2); err != nil {
+	if _, err := fs.Prefetch(ctx, genfs.PrefetchOptions{Workers: 2}); err != nil {
 		t.Fatalf("Prefetch: %v", err)
 	}
 	_ = fs.Close()

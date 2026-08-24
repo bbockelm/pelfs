@@ -155,6 +155,19 @@ type Summary struct {
 	PrefetchPacks        int64 `json:"prefetch_packs,omitempty"`
 	PrefetchBytes        int64 `json:"prefetch_bytes,omitempty"`
 	PrefetchFetchedBytes int64 `json:"prefetch_fetched_bytes,omitempty"`
+	// PrefetchGraftedChunks and PrefetchGraftedBytes are what the pass
+	// could NOT make local because it lives at a graft source rather than
+	// in a pack. They are not failures — there is no pack to cache — but
+	// they are the exact amount by which "prefetched" falls short of
+	// "local", and prefetch_complete is false whenever they are non-zero.
+	PrefetchGraftedChunks int64 `json:"prefetch_grafted_chunks,omitempty"`
+	PrefetchGraftedBytes  int64 `json:"prefetch_grafted_bytes,omitempty"`
+	// PrefetchGraftLocalBytes is how much of that is on THIS machine's
+	// disk, verified, when the pass finished. Equal to
+	// PrefetchGraftedBytes after a successful `--prefetch all`; smaller
+	// after `--prefetch packs`, which does not fetch grafted content.
+	// prefetch_complete is false whenever they differ.
+	PrefetchGraftLocalBytes int64 `json:"prefetch_graft_local_bytes,omitempty"`
 
 	// ResidentInodes is how many inodes the mount is holding resolved, and
 	// ResidencyEvicted how many a residency cap has dropped. The second is

@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 // Handler serves the origin namespace from root.
@@ -21,8 +22,22 @@ func Handler(root string) http.Handler {
 	return &origin{root: root}
 }
 
+// HandlerWithDelay serves the same namespace with a fixed delay in front
+// of every request, standing in for a round trip.
+//
+// It exists for one measurement and says so: without a latency term, a
+// loopback origin answers before a second request can be issued, so any
+// concurrency table taken against it measures the hashing rate and
+// nothing else. A graft's cost against a real federation is
+// latency-dominated, and the number of workers that saturates it is a
+// function of the RTT. Test tool only.
+func HandlerWithDelay(root string, d time.Duration) http.Handler {
+	return &origin{root: root, delay: d}
+}
+
 type origin struct {
-	root string
+	root  string
+	delay time.Duration
 }
 
 // etagFor derives a strong ETag from a file's size and mtime, mimicking the
@@ -41,6 +56,9 @@ func (o *origin) fsPath(urlPath string) (string, bool) {
 }
 
 func (o *origin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if o.delay > 0 {
+		time.Sleep(o.delay)
+	}
 	p, ok := o.fsPath(r.URL.Path)
 	if !ok {
 		http.Error(w, "bad path", http.StatusBadRequest)

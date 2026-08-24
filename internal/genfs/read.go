@@ -130,6 +130,20 @@ type Content struct {
 	// Refs is a chunked file's list, in logical order. A nil Identity is
 	// a hole. Nil for an inline file.
 	Refs []catalog.ChunkRef
+	// External reports that at least one of Refs resolves through a GRAFT
+	// rather than through this volume's packs (graft.go).
+	//
+	// It is one bool for the whole file rather than one per ref, because
+	// both consumers act on the file: a copy-up materializes the file, and
+	// the dedup set admits or refuses the file's identities. Neither has a
+	// use for "the third extent is external".
+	//
+	// Every caller that carries these records forward MUST look at it. The
+	// records are valid only in a generation that also states the graft
+	// locating them, and their identities must never enter a dedup set —
+	// see publish's reuseContent and memtable.Adopt for the two things
+	// that go wrong otherwise.
+	External bool
 }
 
 // ContentOf returns ino's content records WITHOUT reading a byte of file
@@ -174,7 +188,25 @@ func (fs *FS) ContentOf(ctx context.Context, ino uint64) (Content, error) {
 		r := e.refs[i]
 		if r.Identity != nil {
 			idHex := hex.EncodeToString(r.Identity)
-			if _, ok := fs.packIndex.lookup(idHex); !ok {
+			// A graft holds it, or a pack does. The graft is asked first
+			// for the same reason the read path asks it first (graft.go),
+			// and asking at all is what keeps a copy-up of a grafted file
+			// from being reported as damage: memtable.Adopt calls this,
+			// and "present in no listed pack" would abort every seal over
+			// a grafted subtree.
+			//
+			// A caller carrying these records forward must therefore also
+			// carry the GRAFT that locates them — see publish's Grafts
+			// option. Records whose location the next generation does not
+			// state are exactly the hazard this check exists to prevent;
+			// grafts move the boundary of "listed", they do not remove it.
+			held, err := fs.graftHolds(ctx, r.Identity)
+			if err != nil {
+				return Content{}, fmt.Errorf("genfs: inode %d references chunk %s: %w", ino, idHex, err)
+			}
+			if held {
+				out.External = true
+			} else if _, ok := fs.packIndex.lookup(idHex); !ok {
 				return Content{}, fmt.Errorf("genfs: inode %d references chunk %s, present in no listed pack", ino, idHex)
 			}
 			r.Identity = append([]byte(nil), r.Identity...)
@@ -303,6 +335,23 @@ func (fs *FS) readChunkAt(ctx context.Context, r *catalog.ChunkRef, chunkOff int
 		}
 	}
 	fs.chunkStats.misses.Add(1)
+	// The graft table first (graft.go): it is an in-memory lookup, and
+	// packIndex.locate is only entitled to say "absent" after indexing
+	// every pack — so the other order would sweep a whole generation's
+	// trailers before every grafted read.
+	if fs.grafts != nil {
+		e, gl, ok, err := fs.grafts.locate(ctx, r.Identity)
+		if err != nil {
+			// NOT a fall-through to the pack index. A graft that could
+			// not be consulted is a graft whose bytes cannot be found,
+			// and reporting "present in no listed pack" for it would
+			// name the volume as damaged for a third party's outage.
+			return fmt.Errorf("genfs: chunk %s: %w", idHex, err)
+		}
+		if ok {
+			return fs.graftChunkAt(ctx, e, gl, idHex, chunkOff, window)
+		}
+	}
 	loc, err := fs.packIndex.locate(ctx, idHex)
 	if err != nil {
 		return fmt.Errorf("genfs: chunk %s: %w", idHex, err)

@@ -63,6 +63,7 @@ import (
 	"github.com/bbockelm/pelfs/internal/catalog"
 	"github.com/bbockelm/pelfs/internal/chunkid"
 	"github.com/bbockelm/pelfs/internal/entrycodec"
+	"github.com/bbockelm/pelfs/internal/genfs"
 	"github.com/bbockelm/pelfs/internal/overlay"
 	"github.com/bbockelm/pelfs/internal/packstore"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
@@ -266,6 +267,21 @@ type Options struct {
 	// one tree at 1 and at N and compare the bytes.
 	CatalogConcurrency int
 
+	// Grafts REPLACES the graft list this generation states; nil CARRIES
+	// THE PARENT'S FORWARD (internal/graft, docs/design-graft.md).
+	//
+	// Carrying forward is the default, and it is not a convenience — it is
+	// the difference between a working volume and a signed unreadable one.
+	// A writable mount checkpoints on a timer, and a checkpoint that
+	// restated the graft list as empty would publish chunkrefs whose only
+	// location statement it had just deleted: a generation that mounts,
+	// passes its own signature, and fails every read under the graft. The
+	// same argument PackList's carry-forward rests on, with a sharper
+	// edge, because a graft has no trailer anyone could fall back to.
+	//
+	// So only `pelfs graft` and `pelfs graft --remove` state this. To
+	// remove the LAST graft, state a non-nil empty slice.
+	Grafts []superblock.GraftEntry
 	// emptySource selects the empty-root source (InitVolume).
 	emptySource bool
 }
@@ -912,7 +928,7 @@ func (p *pipeline) reuseContent(ctx context.Context, cr ContentReuser, r *rec) (
 		p.stats.InlineFiles++
 	case c.Refs != nil && !inlineNow:
 		r.chunks = c.Refs
-		p.rememberReusedChunks(c.Refs)
+		p.rememberExcept(c)
 		p.stats.ChunkedFiles++
 		p.stats.ReusedChunks += len(c.Refs)
 	default:
@@ -962,7 +978,7 @@ func (p *pipeline) provideContent(ctx context.Context, cp ContentProvider, r *re
 				"records for a %d-byte file", r.n.Inode, covered, r.n.Length)
 		}
 		r.chunks = c.Refs
-		p.rememberReusedChunks(c.Refs)
+		p.rememberExcept(c)
 		p.stats.ChunkedFiles++
 		p.stats.ProvidedChunks += len(c.Refs)
 	default:
@@ -970,6 +986,29 @@ func (p *pipeline) provideContent(ctx context.Context, cp ContentProvider, r *re
 	}
 	p.stats.ProvidedFiles++
 	return true, nil
+}
+
+// rememberExcept folds a file's identities into the dedup set unless the
+// file is GRAFTED, in which case none of them may go in.
+//
+// The exclusion is a data-loss guard, not tidiness. The dedup set means
+// "a pack this generation lists holds these bytes", and a graft block is
+// exactly not that. Admit one and chunkFile will later elide the upload
+// of a LOCALLY WRITTEN chunk because a third party happens to hold the
+// same block — leaving a file this volume created dependent on a URL it
+// does not control, with no graft record naming it, in a generation that
+// signs and mounts cleanly.
+//
+// And it is not a remote coincidence. A graft block is the WHOLE FILE
+// whenever the source file is under the block size, and FastCDC cuts a
+// file under its minimum into exactly one chunk of the same bytes — so
+// every small file present in both a graft and a local write collides by
+// construction.
+func (p *pipeline) rememberExcept(c genfs.Content) {
+	if c.External {
+		return
+	}
+	p.rememberReusedChunks(c.Refs)
 }
 
 // rememberReusedChunks folds carried-forward identities into the
@@ -1541,6 +1580,20 @@ func (p *pipeline) buildSuperblock(packList []superblock.PackEntry, shards []sup
 	if p.o.Prev != nil && p.o.Prev.Fork != nil {
 		f := *p.o.Prev.Fork
 		sb.Fork = &f
+	}
+	// The graft list: what the caller states, or the parent's untouched.
+	// See Options.Grafts for why the default must be to carry rather than
+	// to restate — a checkpoint that dropped it would sign a generation
+	// whose grafted files have no location anywhere.
+	if p.o.Grafts != nil {
+		sb.Grafts = p.o.Grafts
+	} else if p.o.Prev != nil && len(p.o.Prev.Grafts) > 0 {
+		sb.Grafts = append([]superblock.GraftEntry(nil), p.o.Prev.Grafts...)
+	}
+	if n := superblock.EncodedLen(sb.Grafts); n > superblock.GraftBudgetBytes {
+		return nil, nil, fmt.Errorf("publish: the graft list is %d bytes over the %d-byte budget "+
+			"(%d grafts); remove one before adding another",
+			n-superblock.GraftBudgetBytes, superblock.GraftBudgetBytes, len(sb.Grafts))
 	}
 	// The condemned ledgers for the derived key spaces: what this seal
 	// stopped listing, plus the parent's entries still inside the grace

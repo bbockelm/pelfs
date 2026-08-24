@@ -206,7 +206,7 @@ func runArm(t *testing.T, c *benchCorpus, o genfs.Options, encrypted bool) ([]ph
 	// Packs local first, in both arms: the question is decode cost, not
 	// transfer cost, and a prefetch is exactly how a batch job asks for
 	// that state.
-	if _, err := fs.Prefetch(ctx, 8); err != nil {
+	if _, err := fs.Prefetch(ctx, genfs.PrefetchOptions{Workers: 8}); err != nil {
 		t.Fatalf("Prefetch: %v", err)
 	}
 

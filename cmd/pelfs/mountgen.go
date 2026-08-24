@@ -672,6 +672,13 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		// deliberately, because packs are immutable and content-addressed —
 		// remounting a volume must not re-fetch what the last mount already
 		// pulled down.
+		//
+		// GraftOpener is the reader's veto over the external sources this
+		// generation names (graft.go, genfs/graft.go). Supplying one is
+		// what makes a grafted volume mountable at all; supplying nil
+		// would refuse every graft, which is the right default for a
+		// caller that has not thought about it.
+		GraftOpener: graftOpener(o),
 	})
 	if err != nil {
 		return fail(err)
@@ -1160,64 +1167,189 @@ func (g *genSession) releaseLease() {
 	g.down.mark("lease release")
 }
 
-// runPrefetch honors the shared --prefetch flag's three modes.
+// runPrefetch honors the shared --prefetch flag's modes.
 //
-// What a prefetch moves is PACKS, not decoded chunks (genfs/prefetch.go):
-// a pack is the unit of transfer and everything a read needs comes out of
-// one, so "the data is local" and "the packs are local" are the same
-// statement, and the second costs no decode.
+// What a prefetch moves is PACKS — a pack is the unit of transfer and
+// everything a read needs comes out of one, so "the data is local" and
+// "the packs are local" are the same statement (genfs/prefetch.go) — plus,
+// on a grafted volume, the GRAFTED BLOCKS, which are not in any pack and
+// have a local tier of their own (genfs/graftcache.go).
+//
+// # Prefetching a graft is not materializing it
+//
+// The two were conflated once, and the difference decides what this
+// function is allowed to do:
+//
+//	MATERIALIZE writes grafted bytes into PUBLISHED packs — the write
+//	lease, a new generation, and the file is not grafted any more. It
+//	changes the volume, so it is `pelfs graft --materialize`, not
+//	something a mount does on the way up.
+//
+//	PREFETCH puts the bytes in the LOCAL CACHE. No lease, no publish, no
+//	generation, nothing ungrafted. The volume is untouched and the file is
+//	still grafted; this machine simply already has the bytes, verified
+//	against the identity the signed catalog names.
+//
+// So `--prefetch all` fetches grafted blocks, because that is exactly what
+// the person who typed it asked for. What it does NOT do is pretend the
+// dependency is gone: the volume still names the source, another reader
+// still fetches from it, and `pelfs graft --list` still says so.
+//
+// # The three modes
+//
+//	all      Make everything local: every pack, and every grafted block.
+//	         Refuse to mount if anything could not be made local — or if
+//	         it does not FIT, which is the honest refusal and carries both
+//	         numbers.
+//	packs    Packs only. Grafted bytes stay remote and are WARNED about,
+//	         by graft and by source. The mount comes up. This is the mode
+//	         for a cache too small for the graft.
+//	background   `all`, asynchronously and at half the transfer pool, with
+//	         every refusal downgraded to a warning.
 func (g *genSession) runPrefetch(ctx context.Context, mode string) error {
-	record := func(rep *genfs.PrefetchReport, complete bool) {
+	record := func(rep *genfs.PrefetchReport) {
 		g.stats.Update(func(sum *stats.Summary) {
 			sum.PrefetchPacks = int64(rep.Packs + rep.Cached)
 			sum.PrefetchBytes = rep.Bytes
 			sum.PrefetchFetchedBytes = rep.Fetched
 			sum.PrefetchFailed = int64(rep.Failed)
-			sum.PrefetchComplete = complete
+			sum.PrefetchGraftedChunks = int64(rep.Grafted)
+			sum.PrefetchGraftedBytes = rep.GraftedBytes
+			sum.PrefetchGraftLocalBytes = rep.GraftLocalBytes
+			// FullyLocal, never `Failed == 0`: a report with grafted bytes
+			// still at their source is not a local volume, and this field
+			// is what a batch system reads to decide whether it is.
+			sum.PrefetchComplete = rep.FullyLocal()
 		})
 		_ = g.stats.Flush()
 	}
+	// warnRemoteGrafts is the sentence a packs-only prefetch owes the
+	// user. It names the graft and its source, because "some bytes are
+	// remote" is not actionable and "reads under /sw still fetch from X"
+	// is.
+	warnRemoteGrafts := func(rep *genfs.PrefetchReport) {
+		for _, gr := range rep.GraftRoots {
+			ui.Warn("prefetch: {path} is GRAFTED from {source} and this mode does not fetch it — "+
+				"reads under it will go to {source} ({bytes} of grafted content in this "+
+				"generation). `--prefetch all` fetches and verifies it into the local cache",
+				"path", gr.Path, "source", gr.Source, "bytes", ui.ByteCount(rep.GraftedBytes))
+		}
+		ui.Warn("prefetch: this volume is NOT fully local: {chunks} chunks ({bytes}) live at a "+
+			"graft source", "chunks", rep.Grafted-rep.GraftLocal,
+			"bytes", ui.ByteCount(rep.GraftedBytes-rep.GraftLocalBytes))
+	}
+	// budgetMessage is the refusal that actually helps: both numbers, and
+	// which graft is the large one.
+	budgetMessage := func(b *genfs.PrefetchBudgetError) error {
+		if b.GraftBytes > 0 {
+			var names []string
+			for _, gr := range b.GraftRoots {
+				names = append(names, fmt.Sprintf("%s <- %s (%s)", gr.Path, gr.Source, ui.ByteCount(gr.Bytes)))
+			}
+			// The pack clause is omitted when the graft alone already
+			// blows the budget: that check runs off the signed superblock
+			// BEFORE anything is walked, so "0 B in 0 packs" there would
+			// describe a walk that never happened rather than the volume.
+			packs := ""
+			if b.Packs > 0 {
+				packs = fmt.Sprintf("%s in %d packs and ", ui.ByteCount(b.Need-b.GraftBytes), b.Packs)
+			}
+			return fmt.Errorf("prefetch: refusing to mount: making this generation local needs %s — "+
+				"%s%s grafted from %s — and the local cache budget is %s. "+
+				"Raise --cache-size above %s, or use `--prefetch packs` to make the packed content "+
+				"local and read the grafted content from its source",
+				ui.ByteCount(b.Need), packs,
+				ui.ByteCount(b.GraftBytes), strings.Join(names, ", "),
+				ui.ByteCount(b.Budget), ui.ByteCount(b.Need))
+		}
+		return fmt.Errorf("prefetch: refusing to mount: the generation is %s in %d packs and the local cache budget is %s; "+
+			"raise --cache-size, or use --prefetch none and read from the federation",
+			ui.ByteCount(b.Need), b.Packs, ui.ByteCount(b.Budget))
+	}
+	report := func(rep *genfs.PrefetchReport) {
+		ui.Info("prefetched {packs} packs ({cached} already cached) across {files} files, "+
+			"{bytes} local ({fetched} transferred); fully local: {complete}",
+			"packs", rep.Packs, "cached", rep.Cached, "files", rep.Files,
+			"bytes", ui.ByteCount(rep.Bytes), "fetched", ui.ByteCount(rep.Fetched),
+			"complete", rep.FullyLocal())
+		if rep.GraftLocal > 0 {
+			ui.Info("prefetched {local} of {total} grafted blocks ({bytes} local, {fetched} "+
+				"transferred from the graft source); the files are still grafted and the volume "+
+				"is unchanged — this is a local copy, not a materialization",
+				"local", rep.GraftLocal, "total", rep.Grafted,
+				"bytes", ui.ByteCount(rep.GraftLocalBytes), "fetched", ui.ByteCount(rep.GraftFetched))
+		}
+	}
 	switch mode {
 	case "", "none":
-	case "all":
-		ui.Info("prefetching the generation's packs into the local cache...")
-		rep, err := g.gfs.Prefetch(ctx, pelicanobj.TransferWorkers())
+	case "all", "packs":
+		strict := mode == "all"
+		if strict {
+			ui.Info("prefetching the generation's packs, and any grafted blocks, into the local cache...")
+		} else {
+			ui.Info("prefetching the generation's packs into the local cache...")
+		}
+		rep, err := g.gfs.Prefetch(ctx, genfs.PrefetchOptions{
+			Workers: pelicanobj.TransferWorkers(), Grafts: strict,
+		})
 		if err != nil {
 			// A generation larger than the cache budget is the one refusal
 			// worth spelling out: nothing is wrong with the volume or with
 			// the federation, the disk is simply too small for what was
-			// asked, and the two numbers say so.
+			// asked, and the numbers say so.
 			var budget *genfs.PrefetchBudgetError
 			if errors.As(err, &budget) {
-				return fmt.Errorf("prefetch: refusing to mount: the generation is %s in %d packs and the local cache budget is %s; "+
-					"raise --cache-size, or use --prefetch none and read from the federation",
-					ui.ByteCount(budget.Need), budget.Packs, ui.ByteCount(budget.Budget))
+				return budgetMessage(budget)
 			}
 			return fmt.Errorf("prefetch: %w", err)
 		}
-		record(rep, rep.Failed == 0)
+		record(rep)
 		if rep.Failed > 0 {
-			return fmt.Errorf("prefetch: %d pack(s) could not be made local (%v); refusing to mount",
-				rep.Failed, rep.Sample)
+			if strict {
+				return fmt.Errorf("prefetch: %d item(s) could not be made local (%v); refusing to mount",
+					rep.Failed, rep.Sample)
+			}
+			ui.Warn("prefetch: {failed} item(s) could not be made local ({sample})",
+				"failed", rep.Failed, "sample", rep.Sample)
 		}
-		ui.Info("prefetched {packs} packs ({cached} already cached) across {files} files, {bytes} local ({fetched} transferred)",
-			"packs", rep.Packs, "cached", rep.Cached, "files", rep.Files,
-			"bytes", ui.ByteCount(rep.Bytes), "fetched", ui.ByteCount(rep.Fetched))
+		if !strict && rep.Grafted > rep.GraftLocal {
+			warnRemoteGrafts(rep)
+		}
+		if strict && !rep.FullyLocal() {
+			// Belt and braces over the Failed check above: whatever the
+			// reason, `--prefetch all` may not come up claiming a volume
+			// is local when it is not.
+			return fmt.Errorf("prefetch: refusing to mount: %d of %d grafted blocks could not be "+
+				"made local", rep.Grafted-rep.GraftLocal, rep.Grafted)
+		}
+		report(rep)
 	case "background":
 		go func() {
 			// Half the transfer pool, so warming never starves the
 			// interactive I/O the mount is serving.
-			rep, err := g.gfs.Prefetch(ctx, max(1, pelicanobj.TransferWorkers()/2))
+			rep, err := g.gfs.Prefetch(ctx, genfs.PrefetchOptions{
+				Workers: max(1, pelicanobj.TransferWorkers()/2), Grafts: true,
+			})
 			if err != nil {
+				var budget *genfs.PrefetchBudgetError
+				if errors.As(err, &budget) {
+					ui.Warn("background prefetch: {error}", "error", budgetMessage(budget))
+					return
+				}
 				ui.Warn("background prefetch: {error}", "error", err)
 				return
 			}
-			record(rep, rep.Failed == 0)
-			ui.Info("background prefetch done: {packs} packs, {failed} failed, {fetched} transferred",
-				"packs", rep.Packs, "failed", rep.Failed, "fetched", ui.ByteCount(rep.Fetched))
+			record(rep)
+			if rep.Grafted > rep.GraftLocal {
+				warnRemoteGrafts(rep)
+			}
+			ui.Info("background prefetch done: {packs} packs, {grafted} grafted blocks, {failed} failed, "+
+				"{fetched} transferred; fully local: {complete}",
+				"packs", rep.Packs, "grafted", rep.GraftLocal, "failed", rep.Failed,
+				"fetched", ui.ByteCount(rep.Fetched+rep.GraftFetched), "complete", rep.FullyLocal())
 		}()
 	default:
-		return fmt.Errorf("unknown --prefetch %q (want none, all, or background)", mode)
+		return fmt.Errorf("unknown --prefetch %q (want none, all, packs, or background)", mode)
 	}
 	return nil
 }

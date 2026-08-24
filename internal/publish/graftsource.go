@@ -35,12 +35,13 @@ import (
 // returns nothing and is not a stub — it is the honest answer, and the
 // location is stated somewhere else.
 //
-// SPIKE LIMIT, and it is the first ranked work item: this publishes the
-// graft tree over an EMPTY root. Grafting into a volume that already has
-// content needs the source to merge the previous generation's tree with
-// the spidered one, which is the same job merge's mergeSource does over
-// two generations. Nothing in the read path or the format changes; it is
-// the writer that is unfinished.
+// ON ITS OWN it publishes the graft tree over an EMPTY root, which is only
+// ever what `pelfs init` then `pelfs graft` wants. Grafting into a volume
+// that already has content goes through GraftSpliceSource
+// (graftsplice.go), which uses this for the SUBTREE and takes everything
+// above it from the previous generation. This type stays the thing that
+// turns a spider result into a publishable tree, and knows nothing about
+// what it is being spliced into.
 type GraftSource struct {
 	// mount is the path the tree is grafted at, cleaned and absolute.
 	mount string
@@ -58,6 +59,16 @@ type GraftSource struct {
 	next    uint64
 	uid     uint32
 	gid     uint32
+	// spine is the inode of each directory ON the mount path, the volume
+	// root excluded: spine[0] is the first component, spine[len-1] is the
+	// graft root itself.
+	//
+	// A SPLICE needs them (graftsplice.go). Grafting into a populated
+	// volume keeps the inode and the attributes of every directory on the
+	// path that the volume ALREADY has, and creates only the ones it does
+	// not — so the splice takes the directories it needs from here and
+	// ignores the rest, rather than this source deciding.
+	spine []uint64
 }
 
 type node struct {
@@ -143,6 +154,15 @@ func NewGraftSource(o GraftSourceOptions) (*GraftSource, error) {
 	if _, err := s.mkdirAll(dirs, mount); err != nil {
 		return nil, err
 	}
+	comps := splitGraftPath(mount)
+	for d := range comps {
+		dir := "/" + strings.Join(comps[:d+1], "/")
+		ino, ok := dirs[dir]
+		if !ok {
+			return nil, fmt.Errorf("graft: %s was not created on the mount path", dir)
+		}
+		s.spine = append(s.spine, ino)
+	}
 	for i := range o.Result.Files {
 		f := &o.Result.Files[i]
 		full := path.Join(mount, strings.TrimPrefix(f.Path, "/"))
@@ -217,6 +237,35 @@ func (s *GraftSource) mkdir(dirs map[string]uint64, parent uint64, p string) (ui
 
 // Mount is where the tree lands.
 func (s *GraftSource) Mount() string { return s.mount }
+
+// MountInode is the inode of the grafted tree's ROOT directory — the one
+// that lands at Mount(). A splice publishes this subtree and nothing above
+// it (graftsplice.go).
+func (s *GraftSource) MountInode() uint64 {
+	if len(s.spine) == 0 {
+		return 0
+	}
+	return s.spine[len(s.spine)-1]
+}
+
+// SpineInode is the inode this source minted for the directory at depth d
+// of the mount path (d == 0 is the first component). A splice uses it only
+// for a directory the volume does not already have.
+func (s *GraftSource) SpineInode(d int) uint64 {
+	if d < 0 || d >= len(s.spine) {
+		return 0
+	}
+	return s.spine[d]
+}
+
+// splitGraftPath is the mount path's components, root excluded.
+func splitGraftPath(mount string) []string {
+	t := strings.Trim(mount, "/")
+	if t == "" {
+		return nil
+	}
+	return strings.Split(t, "/")
+}
 
 // Files is how many grafted files the tree holds.
 func (s *GraftSource) Files() int { return len(s.content) }

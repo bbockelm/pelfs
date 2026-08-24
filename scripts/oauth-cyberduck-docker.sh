@@ -150,6 +150,26 @@ echo
 # consent() plays the browser: fetch the authorization screen, take the
 # ticket out of it, press Authorize with the headers a browser sends for a
 # same-origin form POST, and hand the 303 to Cyberduck's own listener.
+#
+# WHAT THIS GATE CANNOT SEE, and it is not a small list. curl is not a
+# browser: it implements neither the Fetch standard's Origin rules nor
+# Content Security Policy. Two bugs that broke EVERY Cyberduck connection
+# lived exactly there and passed here green --
+#
+#   * a real browser sends `Origin: null` on this form POST, because
+#     `Referrer-Policy: no-referrer` makes it (Fetch, "append a request
+#     `Origin` header"), and the guard answered `403 origin refused`. The
+#     line below types the correct Origin in by hand, so this gate never
+#     saw it.
+#   * Chromium enforces `form-action` on the REDIRECTS of a form
+#     submission, so the 303 that hands the code to Cyberduck was blocked
+#     by the consent page's own CSP. curl has no CSP at all.
+#
+# scripts/oauth-browser-docker.sh is the gate that drives this navigation
+# in a real Chromium with real duck as the client, and it is the one to
+# extend when the question is about what a BROWSER does. This gate's job
+# is the protocol and the server's own refusals, which it does in a
+# fraction of the time.
 consent() {
   url="$1"
   curl -sS -o /work/consent.html -w '%{http_code}' \

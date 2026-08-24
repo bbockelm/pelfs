@@ -70,6 +70,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // DefaultCallbackPort is the loopback port pelfs writes into a generated
@@ -188,12 +189,115 @@ func (p Params) description() string {
 	return "pelfs " + v + " (" + mode + ", this session only)"
 }
 
+// nickname is the ONE STRING A USER READS IN A LIST OF BOOKMARKS, and
+// getting it wrong is what "each time I click on it, it just says
+// '127.0.0.1 - WebDAV (HTTP)'; no clue which each is" was.
+//
+// That string is Cyberduck's own fallback, and it is worth writing out
+// where it comes from because it names the two keys this package has to
+// set and the two it must not confuse them with. BookmarkNameProvider.java:
+//
+//	if(StringUtils.isEmpty(bookmark.getNickname())) {
+//	    if(StringUtils.isNotBlank(bookmark.getProtocol().getDefaultNickname())) {
+//	        return bookmark.getProtocol().getDefaultNickname();
+//	    }
+//	    final String hostname = toHostname(bookmark, username);
+//	    ...
+//	    return hostname + StringUtils.SPACE + '\u2013' + StringUtils.SPACE
+//	        + bookmark.getProtocol().getName();
+//	}
+//	return bookmark.getNickname();
+//
+// So there are exactly three places a name can come from, in order:
+//
+//  1. the BOOKMARK's `Nickname` — HostDictionary.java reads that key
+//     (`bookmark.setNickname(...)`), so it belongs in the `.duck`;
+//  2. the PROTOCOL's `Default Nickname` — Profile.java's
+//     DEFAULT_NICKNAME_KEY, so it belongs in the `.cyberduckprofile`, and
+//     it is the one that names every bookmark a user creates from the
+//     profile HIMSELF rather than by opening our `.duck`;
+//  3. hostname + en dash + the PROTOCOL's `Name` — Profile.java's
+//     NAME_KEY, which falls through to `parent.getName()` when absent, and
+//     the built-in `dav` parent's name is the literal string "WebDAV
+//     (HTTP)".
+//
+// The old code set (1) and neither (2) nor (3), which is why a bookmark the
+// user made from the installed profile — and any UI that shows the protocol
+// name rather than the bookmark name — read "127.0.0.1 – WebDAV (HTTP)".
+// Note also that `Description` is NOT in that list at all: it is
+// DESCRIPTION_KEY and it shows in the profile chooser, never in the
+// bookmark list. Setting it was not setting a name.
+//
+// The shape is "pelfs: <volume> (<label>)": the volume first, because it is
+// what distinguishes two of these from each other, and the label — what
+// the user typed on the connection page when generating the download — in
+// parentheses, because it is what distinguishes two clients on the same
+// volume.
 func (p Params) nickname() string {
 	label := p.Label
 	if label == "" {
 		label = "pelfs"
 	}
-	return label + " - pelfs " + p.Volume
+	v := shortVolume(p.Volume)
+	if v == "" {
+		return "pelfs (" + label + ")"
+	}
+	return "pelfs: " + v + " (" + label + ")"
+}
+
+// basicNickname distinguishes the contingency bookmark from the OAuth one
+// in the same list, and says which one needs the paste. Both end up in the
+// user's bookmarks and "no clue which each is" applies to two of ours as
+// much as to two of anybody's.
+func (p Params) basicNickname() string {
+	label := p.Label
+	if label == "" {
+		label = "pelfs"
+	}
+	if v := shortVolume(p.Volume); v != "" {
+		return "pelfs: " + v + " (" + label + ", password)"
+	}
+	return "pelfs (" + label + ", password)"
+}
+
+// protocolName is the profile's `Name`: what Cyberduck shows wherever it
+// names the PROTOCOL rather than the bookmark — the New Bookmark dropdown,
+// and the tail of the fallback in nickname's quotation. Without it that is
+// "WebDAV (HTTP)" for every pelfs profile a user has installed, which is
+// true and useless.
+func (p Params) protocolName() string {
+	if v := shortVolume(p.Volume); v != "" {
+		return "pelfs " + v
+	}
+	return "pelfs"
+}
+
+// shortVolume is the volume as a person recognises it: the scheme dropped,
+// because every pelfs volume has the same one and it is the widest column
+// in the name.
+//
+// "pelican://osg-htc.org/user/bbockelman" becomes
+// "osg-htc.org/user/bbockelman". A long one is truncated from the FRONT,
+// keeping the tail, because the tail is the part that differs between two
+// volumes in the same federation and the head is the part that does not.
+func shortVolume(volume string) string {
+	v := strings.TrimSpace(volume)
+	if i := strings.Index(v, "://"); i >= 0 {
+		v = v[i+len("://"):]
+	}
+	v = strings.Trim(v, "/")
+	const max = 48
+	if len(v) > max {
+		// A rune boundary rather than a byte one: a truncated multi-byte
+		// character in a plist string is a parse error in the client, not
+		// a cosmetic problem.
+		cut := v[len(v)-max:]
+		for len(cut) > 0 && !utf8.ValidString(cut) {
+			cut = cut[1:]
+		}
+		v = "..." + cut
+	}
+	return v
 }
 
 // Profile is the `.cyberduckprofile`: a plist that installs by double-click
@@ -227,7 +331,13 @@ func Profile(p Params) ([]byte, error) {
 	// `dav` is plain HTTP; `davs` would be TLS, and this listener has none.
 	w.str("Protocol", "dav")
 	w.str("Vendor", p.vendor())
+	w.str("Name", p.protocolName())
 	w.str("Description", p.description())
+	// `Default Nickname` (Profile.java's DEFAULT_NICKNAME_KEY), not
+	// `Nickname`: a Profile has no such key, and BookmarkNameProvider
+	// consults this one for any bookmark whose own Nickname is empty. See
+	// Params.nickname for the three-way precedence this is the middle of.
+	w.str("Default Nickname", p.nickname())
 	w.str("Default Hostname", "127.0.0.1")
 	w.integer("Default Port", p.Port)
 	w.str("Default Path", DAVPath)
@@ -298,7 +408,7 @@ func BasicBookmark(p Params) ([]byte, error) {
 	w.str("Port", strconv.Itoa(p.Port))
 	w.str("Path", DAVPath)
 	w.str("Username", p.BasicUser)
-	w.str("Nickname", p.nickname()+" (password)")
+	w.str("Nickname", p.basicNickname())
 	w.str("Comment", p.description()+" - paste the password pelfs showed you")
 	return w.bytes()
 }

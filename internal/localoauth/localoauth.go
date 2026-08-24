@@ -504,6 +504,18 @@ func CheckRedirectURI(raw string) error {
 		return fmt.Errorf("%w: redirect_uri needs a path, which is what "+
 			"Cyberduck registers its listener's context at: %q", ErrConfig, raw)
 	}
+	// AND IT HAS TO BE SAFE TO PUT IN A HEADER, because it goes in one: the
+	// consent page's `form-action` names this exact URL (see consentCSP for
+	// why it must). A space, a `;`, a `,` or a quote in it would either
+	// truncate the policy or split the header, and a mangled CSP is a
+	// silently weaker one. Checked here rather than at the header, so a
+	// redirect URI that could do it never becomes a registered client.
+	for _, r := range raw {
+		if r <= ' ' || r > '~' || r == ';' || r == ',' || r == '\'' || r == '"' {
+			return fmt.Errorf("%w: redirect_uri may only use printable "+
+				"URL characters (no space, `;`, `,` or quote): %q", ErrConfig, raw)
+		}
+	}
 	return nil
 }
 

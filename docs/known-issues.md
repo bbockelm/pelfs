@@ -640,6 +640,74 @@ would mean asserting a wall-clock ratio. The BEHAVIOUR is pinned:
 `scripts/mount-gate-test.sh`, which asserts against a real kernel NFS
 client that a COMMIT is SENT.
 
+### KL-17. A stable browse port makes the BOOKMARK survive a restart; the CREDENTIAL in the profile still does not
+
+Filed at `c01d35c` by oauthfix-agent, with the stable-port change.
+
+`pelfs browse` now listens on a port derived from the volume
+(`cmd/pelfs/browseport.go`), so the `.duck` bookmark a user saved keeps
+resolving: `Hostname`, `Port` and the `Provider`/`Vendor` string
+(`org.pelicanplatform.pelfs.local.<port>`) are all the same next session.
+That was the whole of the report — "can we try to have a stable port so the
+CyberDuck bookmark is not one-time-use?" — and it is what shipped.
+
+**What did NOT become durable is the credential, and a user will meet this
+on the second session.** The `.cyberduckprofile`'s `OAuth Client ID` is a
+per-download secret minted by `internal/localoauth` and held in memory
+only; a new `pelfs browse` process has a new HMAC key and no client
+registry, so the old profile's client id names nothing. Opening the saved
+bookmark therefore reaches the right port and then fails at
+`/oauth/authorize` with "This is not an authorization request pelfs
+issued". **The profile has to be regenerated and reinstalled every
+session.** So the honest summary is: the bookmark survives, the profile
+does not, and the user's per-session work went from "download a profile,
+install it, make a bookmark" to "download a profile, install it" — better,
+and not yet "it just works".
+
+That is deliberate today, not an oversight: the design's credential rule is
+that exit revokes everything (`docs/design-webui.md`, A7), and the
+alternative is a durable secret on disk in the state directory. It is
+nonetheless **the next thing to fix on this path**, and the shape it would
+take is a client id derived from a per-volume key in the state directory so
+that a regenerated profile is byte-identical to the one the user already
+installed — at which point the bookmark AND the profile both survive, and
+the credential is exactly as durable as the state directory.
+
+**Pinned by an executable test: PARTLY.** The stable port and its fallback
+are pinned (`cmd/pelfs/browseport_test.go`); that a client id does not
+survive a process is pinned by `internal/localoauth`'s revocation tests
+(`TestRevocation`), but nothing asserts the user-visible consequence,
+because no gate runs two `pelfs browse` processes in sequence against one
+saved profile.
+
+### KL-18. A predictable browse port can be squatted before pelfs starts
+
+Filed at `c01d35c` by oauthfix-agent, with the stable-port change, and
+recorded because the change is what makes it stateable rather than because
+it is new.
+
+The port is now derived from the volume, so any local process can compute
+it and bind it first. A user's saved bookmark would then reach the squatter
+instead of pelfs.
+
+**Why this is accepted rather than fixed.** It is not a new capability: a
+process running as the user can already read the volume, the state
+directory and the federation tokens, so it does not need to impersonate a
+listener to do anything the listener could do. And pelfs does not
+cooperate quietly — the bind fails, `browseListen` reports it, and the
+session says on the terminal that it is on a different port and that a
+saved bookmark will not match. The whole of `docs/design-webui.md`'s
+threat model already refuses to rely on the port being unguessable ("a
+random port is not a secret … nothing in this design may rely on it"), and
+that claim was audited control by control before the stable port landed;
+see the "A stable port is not a weaker port" note there.
+
+**Pinned by an executable test: PARTLY.** That a taken port produces a
+fallback and a report rather than a silent bind is pinned
+(`cmd/pelfs/browseport_test.go`'s
+`fallsBackAndSaysSoWhenTheStablePortIsTaken`). The squat itself is not a
+behaviour to assert.
+
 ---
 
 ## `CHANGELOG.md` v0.1.0 *Known limitations*: status on main

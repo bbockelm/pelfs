@@ -80,6 +80,7 @@ package httpguard
 import (
 	"crypto/subtle"
 	"fmt"
+	"html/template"
 	"net/http"
 	"strconv"
 	"strings"
@@ -362,7 +363,7 @@ func New(cfg Config) *Guard {
 		g.origins = append(g.origins, "http://"+h)
 	}
 	g.cop.SetDenyHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		deny(w, http.StatusForbidden, "cross-origin request refused")
+		denyCrossOrigin(w, r)
 	}))
 	return g
 }
@@ -406,6 +407,91 @@ func originOK(r *http.Request) bool {
 	return o == "http://"+r.Host
 }
 
+// nullOriginOK is the one place `Origin: null` is not a refusal, and it
+// exists because the alternative was a feature that could not work in any
+// browser.
+//
+// THE BUG IT FIXES, with the bytes. `Referrer-Policy: no-referrer` is set
+// on every response by securityHeaders. The Fetch standard's "append a
+// request `Origin` header" step says that for a request whose mode is not
+// "cors" and whose method is neither GET nor HEAD — which is exactly a form
+// submission, mode "navigate" — a referrer policy of `no-referrer` makes
+// the serialized origin `null`. So EVERY consent-form POST from a real
+// browser arrived as:
+//
+//	POST /oauth/authorize
+//	host: 127.0.0.1:64592
+//	origin: null
+//	sec-fetch-site: same-origin
+//	sec-fetch-mode: navigate
+//	sec-fetch-user: ?1
+//
+// and step 4 answered `403 origin refused`. Every Cyberduck connection
+// failed at the click, and no test caught it because the gates hand-set an
+// `Origin` header with curl (scripts/oauth-cyberduck-docker.sh's consent(),
+// scripts/browse-gate.sh's) — a browser's ROLE played by a client that
+// satisfies the check by construction. The real fix is at the source:
+// SurfaceNavigation now serves `Referrer-Policy: same-origin`, so the
+// browser sends its real origin. This is the belt to that brace, for the
+// user whose browser or extension forces `no-referrer` globally
+// (Firefox's network.http.referer.defaultPolicy=0 does exactly that) and
+// for whom the source fix is overridden.
+//
+// WHY IT IS SAFE, and it is not a smaller check than the one it replaces:
+//
+//   - It is SurfaceNavigation only. That surface carries no credential of
+//     ours (policy.provenance and policy.session are both false on it), so
+//     there is no ambient authority for a forged POST to borrow. Its real
+//     controls are elsewhere and unaffected: a per-download client_id, an
+//     exact-string redirect_uri, PKCE S256, and a single-use consent
+//     ticket that existed only in the body of a page this origin rendered.
+//   - `Sec-Fetch-Site: same-origin` is required, and a page cannot set it.
+//     It is a browser-attached header, on the forbidden-header list, so it
+//     is stronger evidence of provenance than an `Origin` a fetch could
+//     choose — the reason requireProvenance already accepts it alone.
+//   - A cross-site or same-site page's form POST reads `cross-site` or
+//     `same-site` and never reaches here: step 3 (CrossOriginProtection)
+//     rejects both on an unsafe method.
+//   - DNS rebinding is unaffected. A rebound request IS same-origin to the
+//     browser, which is the whole point of A2 — and step 1 has already
+//     refused it on the Host, before this line runs.
+//
+// A sandboxed frame also sends `Origin: null`, and would now be accepted
+// here — with `Sec-Fetch-Site: same-origin`, which a sandboxed frame of
+// OUR OWN document is, and which frame-ancestors 'none' plus
+// X-Frame-Options: DENY stop anybody else from creating.
+//
+// # WHY SurfaceApp IS IN THE SET, WHICH IS NOT AN ACCIDENT
+//
+// Because otherwise this function is DEAD CODE and the exception it grants
+// is unreachable. Router.top wraps the whole mux as `g.Handler(SurfaceApp,
+// r.mux)`, so EVERY request runs check with SurfaceApp BEFORE the mux
+// dispatches it to the route that names its real surface (see Router.top on
+// why the checks run twice). A per-surface relaxation that names only the
+// inner surface is refused by the outer pass and never reaches the inner
+// one. Measured: the first version of this named SurfaceNavigation alone and
+// answered 403 through the router while passing when the handler was wrapped
+// directly.
+//
+// Naming SurfaceApp costs nothing, and it is worth being precise about why.
+// It is the top wrapper's surface and the static bundle's, and neither
+// carries a credential of ours: policy() gives both the empty policy. What
+// the outer pass lets through, the route's OWN wrapper then checks again
+// with its real surface — so a credentialed surface still refuses
+// `Origin: null` (TestNullOriginIsStillRefusedOnCredentialedSurfaces), and
+// the widening on SurfaceApp itself reaches only GET-only routes and
+// net/http's 404, both of which have nothing to authorize.
+//
+// Anyone adding a surface: if you relax something per-surface in check, ask
+// whether Router.top's SurfaceApp pass will refuse it first.
+func nullOriginOK(r *http.Request, s Surface) bool {
+	switch s {
+	case SurfaceNavigation, SurfaceApp:
+		return r.Header.Get("Sec-Fetch-Site") == "same-origin"
+	}
+	return false
+}
+
 // check runs the whole chain for one request and reports whether the
 // handler should run. Everything it refuses, it has already answered.
 func (g *Guard) check(w http.ResponseWriter, r *http.Request, s Surface) bool {
@@ -425,12 +511,20 @@ func (g *Guard) check(w http.ResponseWriter, r *http.Request, s Surface) bool {
 	// 3. The standard library's Sec-Fetch-Site check, which is what
 	// rejects a page on another loopback port (`same-site`).
 	if err := g.cop.Check(r); err != nil {
-		deny(w, http.StatusForbidden, "cross-origin request refused")
+		denyCrossOrigin(w, r)
 		return false
 	}
 	// 4. Exact Origin, when present.
-	if r.Header.Get("Origin") != "" && !originOK(r) {
-		deny(w, http.StatusForbidden, "origin refused")
+	//
+	// `Origin: null` IS A REFUSAL EVERYWHERE EXCEPT ON A NAVIGATION, and
+	// that exception is a BUG FIX, not a relaxation. See nullOriginOK.
+	if o := r.Header.Get("Origin"); o != "" && !originOK(r) &&
+		!(o == "null" && nullOriginOK(r, s)) {
+		denyNav(w, r, http.StatusForbidden, "origin refused",
+			"The browser said this request came from a page pelfs did not serve.",
+			"If you reached this from a WebDAV client, ask it to connect again. "+
+				"If it keeps happening, `pelfs browse` is printing the only URL "+
+				"this listener answers to — use that one.")
 		return false
 	}
 	p := s.policy()
@@ -526,7 +620,7 @@ func hasContentType(r *http.Request, want string) bool {
 func (g *Guard) Handler(s Surface, h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w = noCookies(w)
-		securityHeaders(w.Header())
+		securityHeaders(w.Header(), s)
 		switch s {
 		case SurfaceExternal:
 			// The browser session is refused here rather than ignored. An
@@ -629,7 +723,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 // handler replaces it with the app's own policy, which is the same shape
 // plus a nonce for its one inline script and its one inline style — see
 // cmd/pelfs/browse.go.
-func securityHeaders(h http.Header) {
+func securityHeaders(h http.Header, s Surface) {
 	h.Set("Content-Security-Policy",
 		"default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
 	h.Set("X-Content-Type-Options", "nosniff")
@@ -637,7 +731,26 @@ func securityHeaders(h http.Header) {
 	// fragment and a fragment must never travel. The default policy would
 	// already cover the cross-origin case; this covers the same-origin one
 	// too, at no cost.
-	h.Set("Referrer-Policy", "no-referrer")
+	//
+	// EXCEPT ON A NAVIGATION, where "at no cost" was false and the cost was
+	// the whole feature. `no-referrer` makes a browser send `Origin: null`
+	// on a form submission (Fetch, "append a request `Origin` header"), and
+	// `Origin: null` is a refusal at check step 4 — so the consent form on
+	// /oauth/authorize could not be submitted by any browser. See
+	// nullOriginOK for the bytes.
+	//
+	// `same-origin` is the narrowest policy that does not null the origin:
+	// a full-URL Referer to THIS origin (our own handler, no access log)
+	// and NO Referer at all to anywhere else. The 303 that ends the flow
+	// goes to the client's own loopback port, which is a different origin,
+	// so it still travels with no Referer — the property no-referrer was
+	// chosen for. And no page on this surface has a fragment token: the
+	// bootstrap token lives on SurfaceApp, which keeps no-referrer.
+	rp := "no-referrer"
+	if s == SurfaceNavigation {
+		rp = "same-origin"
+	}
+	h.Set("Referrer-Policy", rp)
 	h.Set("X-Frame-Options", "DENY")
 	h.Set("Cross-Origin-Opener-Policy", "same-origin")
 	h.Set("Cross-Origin-Resource-Policy", "same-origin")
@@ -656,6 +769,65 @@ func deny(w http.ResponseWriter, code int, why string) {
 	w.WriteHeader(code)
 	fmt.Fprintln(w, why)
 }
+
+// denyNav is deny for a refusal a PERSON may be looking at.
+//
+// A refusal on the navigation surface lands in a browser window, and three
+// words of text/plain is what the user who reported this bug was left with:
+// "origin refused", no status, no next step, and a WebDAV client still
+// spinning on its callback listener behind it. So a request that a browser
+// made as a top-level document gets a page instead — same words, plus what
+// it means and what to do — and everything else keeps the terse text/plain
+// body a script or a CLI wants.
+//
+// EVERY STRING IT RENDERS IS A CONSTANT FROM THIS PACKAGE OR ITS CALLER.
+// Nothing from the request reaches the page: not the Host, not the Origin,
+// not the path. That is the same rule internal/localoauth's pages follow,
+// and for the same reason — a page that repeats an attacker's string back
+// to the user is a page that can be made to say anything.
+func denyNav(w http.ResponseWriter, r *http.Request, code int, why, detail, hint string) {
+	if !wantsHTML(r) {
+		deny(w, code, why)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(code)
+	if r.Method == http.MethodHead {
+		return
+	}
+	_ = denyTmpl.Execute(w, struct{ Why, Detail, Hint string }{why, detail, hint})
+}
+
+// wantsHTML reports whether this request is a browser fetching a document.
+// `Sec-Fetch-Dest: document` is the precise signal and a page cannot forge
+// it; the Accept sniff is the fallback for a browser that does not send
+// Fetch metadata (Safari, at the time of writing), and it is deliberately
+// narrow — `Accept: */*`, which is what curl and every Java HTTP client
+// send, is not a document request.
+func wantsHTML(r *http.Request) bool {
+	if r.Header.Get("Sec-Fetch-Dest") == "document" {
+		return true
+	}
+	return strings.Contains(r.Header.Get("Accept"), "text/html")
+}
+
+// denyTmpl is the refusal page. No script, no image, no external anything,
+// so it renders identically under the CSP securityHeaders already set
+// (`default-src 'none'`) — which is also why the style is an attribute
+// rather than a <style> block: this response has no nonce.
+var denyTmpl = template.Must(template.New("deny").Parse(`<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Why}} — pelfs</title></head>
+<body style="font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, sans-serif;
+ max-width: 40rem; margin: 3rem auto; padding: 0 1.25rem; color: #1a1a1a">
+<h1 style="font-size: 1.35rem; margin: 0 0 .75rem">pelfs refused this request</h1>
+<p><strong>{{.Why}}</strong></p>
+<p>{{.Detail}}</p>
+{{if .Hint}}<p style="color: #555; font-size: .92rem; border-top: 1px solid #e3e3e3;
+ margin-top: 1.75rem; padding-top: .9rem">{{.Hint}}</p>{{end}}
+</body></html>
+`))
 
 // noCookies is the belt to the braces: a ResponseWriter that drops any
 // Set-Cookie a handler sets.
@@ -711,4 +883,16 @@ func ConstantTimeEqual(a, b string) bool {
 	// Length is not secret (every token this program mints is the same
 	// length), and ConstantTimeCompare already returns 0 for a mismatch.
 	return len(a) == len(b) && subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+// denyCrossOrigin answers a request CrossOriginProtection refused. Same text
+// as before on the wire for a script; a page for a person, because this is
+// the refusal a mis-typed launch URL and a mixed-up second `pelfs browse`
+// session both land on.
+func denyCrossOrigin(w http.ResponseWriter, r *http.Request) {
+	denyNav(w, r, http.StatusForbidden, "cross-origin request refused",
+		"This request came from a page on a different origin. pelfs's loopback "+
+			"listener answers requests from its own page only.",
+		"Two `pelfs browse` sessions on two ports are two different origins to a "+
+			"browser. Use the URL the terminal printed for the session you mean.")
 }

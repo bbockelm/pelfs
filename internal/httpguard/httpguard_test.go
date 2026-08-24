@@ -59,6 +59,7 @@ type fixture struct {
 	// but also did nothing.
 	publishes int
 	davHits   int
+	consents  int
 }
 
 // source is the M1 stand-in for U11's file surface: one readable path, one
@@ -114,6 +115,14 @@ func newFixtureAt(t *testing.T, now func() time.Time) *fixture {
 	})
 	r.HandleFunc(httpguard.SurfaceNavigation, "GET /oauth/authorize", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, "consent screen")
+	})
+	// The POST half. It has to be here, and its absence is part of why the
+	// consent-form bug survived: the table drove a GET of /oauth/authorize
+	// and nothing at all drove the CLICK, which is the request that carries
+	// a body, an Origin and a form content type.
+	r.HandleFunc(httpguard.SurfaceNavigation, "POST /oauth/authorize", func(w http.ResponseWriter, _ *http.Request) {
+		f.consents++
+		_, _ = io.WriteString(w, "authorized")
 	})
 	f.router = r
 	return f
@@ -719,5 +728,215 @@ func decodeJSON(t *testing.T, b []byte, v any) {
 	t.Helper()
 	if err := json.Unmarshal(b, v); err != nil {
 		t.Fatalf("decode %q: %v", b, err)
+	}
+}
+
+// ------------------------------------------- the consent form, as a browser
+//                                              actually submits it
+
+// consentPost is the consent form's POST exactly as Chromium sends it,
+// measured (scripts/oauth-browser-docker.sh prints the header block). The
+// difference from pageRequest is the whole subject of the two tests below:
+// no JSON content type, a form one; and an `Origin` this test's callers set
+// rather than one it assumes.
+func (f *fixture) consentPost(t *testing.T, origin, fetchSite string) *http.Request {
+	t.Helper()
+	r := httptest.NewRequest("POST", "/oauth/authorize",
+		strings.NewReader("consent_ticket=x&decision=allow"))
+	r.Host = goodHost
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if origin != "" {
+		r.Header.Set("Origin", origin)
+	}
+	if fetchSite != "" {
+		r.Header.Set("Sec-Fetch-Site", fetchSite)
+	}
+	r.Header.Set("Sec-Fetch-Mode", "navigate")
+	r.Header.Set("Sec-Fetch-Dest", "document")
+	r.Header.Set("Sec-Fetch-User", "?1")
+	return r
+}
+
+// TestConsentFormPostWithNullOrigin is the regression test for the bug that
+// made `pelfs browse` unusable with Cyberduck: EVERY authorization failed at
+// the click with `403 origin refused`.
+//
+// The mechanism, which is worth having in a test comment because it is not
+// guessable from the code: `Referrer-Policy: no-referrer` was set on every
+// response, and the Fetch standard's "append a request `Origin` header" step
+// says that for a request whose mode is not "cors" and whose method is
+// neither GET nor HEAD — a form submission, mode "navigate" — a referrer
+// policy of `no-referrer` makes the serialized origin `null`. So every real
+// browser's consent POST arrived with `Origin: null`, and check step 4
+// refused it.
+//
+// WHY NO TEST CAUGHT IT, which is the more useful half. The table above
+// drove a GET of /oauth/authorize and never the POST; and both shell gates
+// (scripts/oauth-cyberduck-docker.sh, scripts/browse-gate.sh) played the
+// browser with curl and typed `-H "Origin: $ORIGIN"` in by hand, satisfying
+// the check by construction. The fix is two-sided and both sides are here:
+// the source fix (SurfaceNavigation serves `Referrer-Policy: same-origin`,
+// TestReferrerPolicyIsPerSurface) and the belt (nullOriginOK).
+func TestConsentFormPostWithNullOrigin(t *testing.T) {
+	tests := []struct {
+		name      string
+		origin    string
+		fetchSite string
+		want      int
+	}{{
+		// The real browser's request, before the fix. It must now be served.
+		name:   "nullOriginWithSameOriginFetchSiteIsServed",
+		origin: "null", fetchSite: "same-origin", want: 200,
+	}, {
+		// The real browser's request, after the fix: a genuine Origin.
+		name:   "realOriginIsServed",
+		origin: goodOrigin, fetchSite: "same-origin", want: 200,
+	}, {
+		// `Origin: null` with NO fetch metadata is still refused, and by
+		// CrossOriginProtection rather than by step 4: with Sec-Fetch-Site
+		// absent the standard library compares the Origin to the Host and
+		// `url.Parse("null")` has no host. This is the case a browser that
+		// sends no fetch metadata AND has no-referrer forced on it lands in,
+		// and it is why the source fix (not nullOriginOK) is the real one.
+		name:   "nullOriginWithNoFetchMetadataIsRefused",
+		origin: "null", fetchSite: "", want: 403,
+	}, {
+		// A page on another loopback port, submitting a form at us. By F3
+		// that is same-SITE, and an unsafe method from same-site is what
+		// CrossOriginProtection exists to reject. This is the row that says
+		// nullOriginOK did not open a hole.
+		name:   "sameSiteFormPostIsRefused",
+		origin: "null", fetchSite: "same-site", want: 403,
+	}, {
+		name:   "crossSiteFormPostIsRefused",
+		origin: "null", fetchSite: "cross-site", want: 403,
+	}, {
+		// An Origin that is neither ours nor `null` is refused whatever the
+		// fetch metadata says: step 4 is an exact match and a rebound
+		// request is same-origin to the browser.
+		name:   "anotherLoopbackPortsOriginIsRefused",
+		origin: otherOrigin, fetchSite: "same-origin", want: 403,
+	}}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			rec := f.do(t, f.consentPost(t, tc.origin, tc.fetchSite))
+			if rec.Code != tc.want {
+				t.Fatalf("got %d, want %d (%s)", rec.Code, tc.want, rec.Body.String())
+			}
+			// A refused consent must not have RUN, which is the property a
+			// status code alone does not give: the handler mints the code.
+			wantRan := 0
+			if tc.want == 200 {
+				wantRan = 1
+			}
+			if f.consents != wantRan {
+				t.Errorf("the consent handler ran %d times, want %d", f.consents, wantRan)
+			}
+		})
+	}
+}
+
+// TestNullOriginIsStillRefusedOnCredentialedSurfaces is the other half of
+// nullOriginOK's contract: the relaxation is SurfaceNavigation's alone.
+//
+// On a surface that carries a credential of ours, `Origin: null` stays a
+// refusal even with `Sec-Fetch-Site: same-origin`, because there it would be
+// an opt-out of the origin check on a route with ambient-looking authority.
+// The navigation surface has no credential of ours to borrow — that is the
+// difference, and it is the entire justification.
+func TestNullOriginIsStillRefusedOnCredentialedSurfaces(t *testing.T) {
+	f := newFixture(t)
+	tok := f.session(t)
+	for _, tc := range []struct{ method, target, body string }{
+		{"POST", "/api/v1/publish", "{}"},
+		{"GET", "/api/v1/info", ""},
+		// The upload and stream surfaces too, because "every surface that
+		// carries a credential of ours" is the rule and a list of two is not
+		// a rule.
+		{"GET", "/events?s=" + tok, ""},
+	} {
+		r := f.pageRequest(t, tc.method, tc.target, tc.body)
+		r.Header.Set("Origin", "null")
+		r.Header.Set(httpguard.SessionHeader, tok)
+		if rec := f.do(t, r); rec.Code != http.StatusForbidden {
+			t.Errorf("%s %s with Origin: null got %d, want 403",
+				tc.method, tc.target, rec.Code)
+		}
+	}
+	if f.publishes != 0 {
+		t.Errorf("a refused publish still ran %d times", f.publishes)
+	}
+}
+
+// TestReferrerPolicyIsPerSurface pins the SOURCE fix for the bug above, and
+// pins that it is scoped.
+//
+// `no-referrer` everywhere was chosen because the bootstrap token rides in a
+// URL fragment. It is still right everywhere the app is, and it is wrong on
+// the one surface that has a form on it, for the reason
+// TestConsentFormPostWithNullOrigin sets out. `same-origin` is the narrowest
+// policy that does not null the origin: a full-URL Referer to this origin
+// only, and none at all to the client's loopback callback, which is a
+// different origin and the only cross-origin destination this flow has.
+func TestReferrerPolicyIsPerSurface(t *testing.T) {
+	f := newFixture(t)
+	tok := f.session(t)
+	for _, tc := range []struct {
+		what, method, target, want string
+	}{
+		{"the app page", "GET", "/", "no-referrer"},
+		{"the JSON API", "GET", "/api/v1/info", "no-referrer"},
+		{"the authorize navigation", "GET", "/oauth/authorize", "same-origin"},
+	} {
+		r := f.pageRequest(t, tc.method, tc.target, "")
+		r.Header.Set(httpguard.SessionHeader, tok)
+		rec := f.do(t, r)
+		if got := rec.Header().Get("Referrer-Policy"); got != tc.want {
+			t.Errorf("%s: Referrer-Policy = %q, want %q", tc.what, got, tc.want)
+		}
+	}
+}
+
+// TestNavigationRefusalRendersAPage is the third thing the bug report asked
+// for: "whatever the cause, a refusal at /oauth/authorize must explain itself
+// on the page in terms a user can act on". The reporter got the three words
+// "origin refused" in a browser window, with a WebDAV client still spinning
+// on its callback listener behind it and no next step.
+//
+// So: a request a BROWSER made as a document gets a page; anything else keeps
+// the terse text/plain body a script or a CLI wants. And the page still
+// echoes nothing from the request — that rule does not bend for readability.
+func TestNavigationRefusalRendersAPage(t *testing.T) {
+	f := newFixture(t)
+
+	// A document navigation, refused. `Sec-Fetch-Dest: document` is the
+	// signal, and a page cannot forge it.
+	rec := f.do(t, f.consentPost(t, otherOrigin, "same-origin"))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("got %d, want 403", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Errorf("a refused document navigation answered %q, want text/html", ct)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "<h1") || len(body) < 300 {
+		t.Errorf("the refusal is not a page: %q", body)
+	}
+	if strings.Contains(body, otherOrigin) {
+		t.Errorf("the refusal page echoes the request's Origin: %q", body)
+	}
+
+	// The same refusal to something that is not a browser fetching a
+	// document. `Accept: */*` is what curl and every Java HTTP client send.
+	r := f.consentPost(t, otherOrigin, "same-origin")
+	r.Header.Del("Sec-Fetch-Dest")
+	r.Header.Set("Accept", "*/*")
+	rec = f.do(t, r)
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+		t.Errorf("a refused non-document request answered %q, want text/plain", ct)
+	}
+	if got := strings.TrimSpace(rec.Body.String()); strings.Contains(got, "<") {
+		t.Errorf("a non-document refusal got markup: %q", got)
 	}
 }

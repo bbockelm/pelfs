@@ -2,6 +2,54 @@
 
 ## Unreleased
 
+**The file manager looks like a file manager.** The app shipped one of the eight
+stylesheets the component needs (`style.css`, not `all.css`), so thirteen base
+theme tokens were undefined and the menu, the modal, the segmented view switch
+and the uploader's hidden file input had no rules at all: cards were
+transparent, the search box's border computed to `0px none`, the "Add New" menu
+rendered as bare text over the folder tree, and a native "Choose Files" widget
+sat in the middle of the file pane. The complete stylesheet is now imported,
+with its six cdn.svar.dev `@font-face` rules dropped at build time — nothing
+loads off loopback, and the suite still proves it for a whole session. Dark
+mode used to leave the component on its light theme, rendering white file names
+on white cards; both themes now follow the platform and share one palette.
+Cost: +13 KB gzipped.
+
+**The page is laid out as a tool**: an app bar, and two panels — what is
+published, and the files — with borders and space between them instead of
+full-bleed strips of prose. The glyph legend is gone (each glyph already sits
+beside its own words; the three-distinct-characters contract is asserted
+against what the panel renders). The "search is partial" paragraph is a quiet
+chip on the file pane's own bar that opens to the full sentence. A **read-only
+session renders no publish control at all** — it says so once, where the button
+would have been — and "Connect a program" moved to the app bar, off the
+publish line.
+
+**`pelfs browse` connects Cyberduck again.** Two bugs made every real-browser
+authorization fail, and neither was visible to the curl-driven gates. A
+browser sends `Origin: null` on a form POST when the page carries
+`Referrer-Policy: no-referrer`, so every consent click was answered
+`403 origin refused`; and Chromium enforces `form-action` on the redirects of
+a form submission, so the 303 that hands the code to the client was blocked
+by the consent page's own CSP, reported to the console and nowhere else. The
+navigation surface now serves `Referrer-Policy: same-origin` and the consent
+page's `form-action` names the client's exact callback. New gate:
+`make oauth-browser` — a real Chromium and real `duck` on one flow.
+
+**The browse port is stable per volume**, derived from the prefix
+(61000–65535), so a saved Cyberduck bookmark is no longer single-use;
+`--port` overrides it and a taken port falls back with a warning naming both.
+The port was never a secret and the audit is in `docs/design-webui.md`. The
+bookmark survives a restart; **the profile's credential still does not** and
+has to be regenerated each session — `docs/known-issues.md` KL-17.
+
+**Generated bookmarks have names.** Cyberduck read `Default Nickname` and
+`Name` from the profile, neither of which pelfs set, so every bookmark showed
+`127.0.0.1 - WebDAV (HTTP)`. They now read `pelfs: <volume> (<label>)`.
+
+**A refusal at `/oauth/authorize` explains itself on the page** instead of
+three words of `text/plain`, and a callback-port mismatch names both ports.
+
 **`pelfs browse` opens the file manager.** `GET /` is now the React file
 manager — `internal/webui`'s committed bundle, on the route table — and the
 hand-written connection page moved to **`GET /connect`**, where the credential

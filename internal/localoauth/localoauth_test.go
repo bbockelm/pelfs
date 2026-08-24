@@ -995,6 +995,12 @@ func TestCheckRedirectURI(t *testing.T) {
 	}
 	bad := []string{
 		"", "not a url", "://x",
+		"http://127.0.0.1:52001/c b",              // a space would truncate the CSP header
+		"http://127.0.0.1:52001/c;b",              // a `;` would end the form-action directive
+		"http://127.0.0.1:52001/c,b",              // a `,` would split the header
+		"http://127.0.0.1:52001/c'b",              // a quote in a CSP source expression
+		"http://127.0.0.1:52001/c\"b",             // ditto
+		"http://127.0.0.1:52001/c\tb",             // a control character
 		"https://127.0.0.1:52001/cb",              // no TLS on this listener
 		"http://127.0.0.1/pelfs/oauth/callback",   // NO PORT — the trap
 		"http://127.0.0.1:0/pelfs/oauth/callback", // port 0, ditto
@@ -1054,5 +1060,112 @@ func TestS256MatchesRFC7636AppendixB(t *testing.T) {
 	}
 	if !validChallenge(want) {
 		t.Error("the RFC's own challenge is rejected")
+	}
+}
+
+// --------------------------------------- the consent page's own CSP, which is
+//                                          load-bearing and was wrong
+
+// TestConsentCSPNamesTheClientsCallback is the regression test for the SECOND
+// of the two bugs that made every real-browser Cyberduck connection fail.
+//
+// `form-action` is enforced by Chromium on the REDIRECTS of a form
+// submission, not only on the submission's first hop. The one thing a
+// successful authorization does is 303 the consent POST to the client's own
+// loopback listener, which is a different origin — so `form-action 'self'`
+// blocked the last step of the flow with:
+//
+//	Sending form data to 'http://127.0.0.1:PORT/oauth/authorize' violates
+//	the following Content Security Policy directive: "form-action 'self'".
+//	The request has been blocked.
+//
+// and NOTHING ELSE. The server had already minted the code and recorded the
+// consent; the browser sat on the consent page; Cyberduck waited on a
+// callback that never came. A CSP violation is reported to the browser
+// console and to no status code, which is precisely why every server-side
+// test passed and why the two shell gates that drive this with curl could
+// never have seen it: curl does not implement CSP.
+//
+// scripts/oauth-browser-docker.sh is the gate that watches the console. This
+// is the cheap Go pin under it.
+func TestConsentCSPNamesTheClientsCallback(t *testing.T) {
+	h := newHarness(t, false)
+	page := h.get(h.query())
+	if page.Code != http.StatusOK {
+		t.Fatalf("consent page: %d", page.Code)
+	}
+	csp := page.Header().Get("Content-Security-Policy")
+	if !strings.Contains(csp, "form-action 'self' "+h.client.Redirect+";") {
+		t.Errorf("the consent page's CSP does not name the client's callback in\n"+
+			"form-action, so the 303 that ends the flow is blocked by our own\n"+
+			"policy:\n  %s", csp)
+	}
+	// The clauses that are the structural half of "one real user gesture"
+	// and of "the ticket cannot be exfiltrated" have to survive the change
+	// that widened form-action.
+	for _, want := range []string{
+		"script-src 'none'", "default-src 'none'", "frame-ancestors 'none'",
+		"base-uri 'none'", "'self'",
+	} {
+		if !strings.Contains(csp, want) {
+			t.Errorf("the consent CSP lost %q: %s", want, csp)
+		}
+	}
+
+	// A page with NO form gets `form-action 'none'` and names no callback:
+	// there is nothing on a refusal page to submit, and a refusal page must
+	// not carry a URL from the request into a header either.
+	q := h.query()
+	q.Set("client_id", "not-a-client")
+	refusal := h.get(q)
+	rcsp := refusal.Header().Get("Content-Security-Policy")
+	if !strings.Contains(rcsp, "form-action 'none'") {
+		t.Errorf("a refusal page's CSP allows a form action: %s", rcsp)
+	}
+	if strings.Contains(rcsp, "127.0.0.1:") {
+		t.Errorf("a refusal page's CSP names a callback: %s", rcsp)
+	}
+}
+
+// TestRedirectMismatchPageNamesBothPorts is the third thing the bug report
+// asked for and the reason loopbackPort exists: "a refusal at
+// /oauth/authorize must explain itself on the page in terms a user can act on
+// ('this profile expects a callback on port X; Cyberduck asked for port Y')
+// without echoing attacker-controlled strings".
+//
+// The two numbers are safe where the two strings are not: each has been
+// through strconv.Atoi and back, so what reaches the page can only be an
+// integer in 1..65535.
+func TestRedirectMismatchPageNamesBothPorts(t *testing.T) {
+	h := newHarness(t, false)
+	q := h.query()
+	q.Set("redirect_uri", "http://127.0.0.1:61033/pelfs/oauth/callback")
+	w := h.get(q)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400", w.Code)
+	}
+	body := w.Body.String()
+	for _, want := range []string{"52001", "61033"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the refusal page does not name port %s:\n%s", want, body)
+		}
+	}
+	// And still no echo. The sent URL, the client id and the path are all
+	// strings a caller chose.
+	for _, forbidden := range []string{q.Get("redirect_uri"), h.client.ID} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("the refusal page echoes %q back to the user", forbidden)
+		}
+	}
+
+	// A redirect_uri whose port cannot be read as an integer falls back to
+	// saying less rather than to guessing — and to echoing nothing.
+	q.Set("redirect_uri", "http://127.0.0.1:notaport/cb")
+	w2 := h.get(q)
+	if w2.Code != http.StatusBadRequest {
+		t.Errorf("status %d, want 400", w2.Code)
+	}
+	if strings.Contains(w2.Body.String(), "notaport") {
+		t.Error("the refusal page echoes an unparseable port back to the user")
 	}
 }

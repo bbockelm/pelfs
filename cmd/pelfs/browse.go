@@ -124,6 +124,10 @@ type browseArgs struct {
 	rw        bool
 	open      bool
 	testHooks bool
+	// port is --port: 0 means "the stable port for this volume", -1 means
+	// "an OS-chosen ephemeral one", anything else is an exact request. See
+	// browsePort.
+	port int
 }
 
 // cmdBrowse implements `pelfs browse [flags] <prefix>`.
@@ -140,6 +144,7 @@ func cmdBrowse(args []string) int {
 		// somebody runs.
 		fs.BoolVar(&a.rw, "rw", false, "open read-write: a local overlay, a branch lease, and a seal at exit (default: read-only)")
 		fs.BoolVar(&a.open, "open", false, "launch the platform's browser at the URL (the URL is printed either way)")
+		fs.IntVar(&a.port, "port", 0, browsePortUsage)
 		fs.BoolVar(&a.testHooks, "test-hooks", false, browseTestHooksUsage)
 	})
 	if err != nil {
@@ -204,18 +209,29 @@ func runBrowse(o *cmdOpts, prefix string, a browseArgs) int {
 	})
 
 	// ---- 1. The listener, the guard and the page, before anything that
-	// can touch the network. tcp4 explicitly, and 127.0.0.1 rather than
-	// 0.0.0.0: internal/nfsmount.Serve's comment applies word for word
-	// ("a hostname like 'localhost' can resolve to ::1 where nothing
-	// listens"), and binding the wildcard address would put this UI on the
-	// machine's LAN address — a mistake that turns a local threat model
-	// into a network one.
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	// can touch the network. The port is DERIVED FROM THE VOLUME rather
+	// than taken from the OS, because it is baked into every connection
+	// file this session hands out and a fresh one per session made every
+	// generated profile and saved bookmark single-use; the bind, the range
+	// and the security reasoning are all in cmd/pelfs/browseport.go.
+	ln, taken, err := browseListen(prefix, a.port)
 	if err != nil {
 		_ = g.stats.Finalize(1, false)
-		return exitErr(fmt.Errorf("browse listen: %w", err))
+		return exitErr(err)
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
+	if taken != 0 {
+		// The stable port was busy and this session is on an OS-chosen one
+		// instead. Said loudly, because the CONSEQUENCE is invisible
+		// otherwise: every connection file this session generates names
+		// this port, so a Cyberduck bookmark kept from an earlier session
+		// will not resolve to it.
+		ui.Warn("port {stable} is this volume's stable browse port and something else "+
+			"has it, so this session is on {actual} instead — a Cyberduck bookmark or "+
+			"profile kept from an earlier session will not match. If that was a stale "+
+			"`pelfs browse`, stop it and run this again; otherwise pass --port to pick "+
+			"one yourself.", "stable", taken, "actual", port)
+	}
 	sessions, err := browsesession.New()
 	if err != nil {
 		_ = g.stats.Finalize(1, false)

@@ -1,6 +1,6 @@
 ARCH  := $(shell go env GOARCH)
 
-.PHONY: all build linux test e2e integration mount-gate browse-gate opfuzz hostile hostile-long hostile-encrypted hostile-retro unprivileged crash big-tree vet clean
+.PHONY: all build linux test e2e integration mount-gate browse-gate oauth-browser opfuzz hostile hostile-long hostile-encrypted hostile-retro unprivileged crash big-tree vet clean
 
 all: build
 
@@ -32,6 +32,18 @@ mount-gate:
 # image build; the run itself is --network none.
 browse-gate:
 	./scripts/browse-gate-docker.sh
+
+# The one gate with a REAL BROWSER and REAL Cyberduck on the same flow.
+#
+# It exists because everything else on this path plays the browser's role
+# with curl -- their own words -- and two bugs that broke every single
+# Cyberduck connection lived in that gap: `Referrer-Policy: no-referrer`
+# nulling the Origin on the consent form POST, and `form-action 'self'`
+# blocking the 303 that hands the authorization to the client. Neither is
+# visible to a client that does not implement the Fetch standard and CSP.
+# ~40s after the image build; the run itself is --network none.
+oauth-browser:
+	./scripts/oauth-browser-docker.sh
 
 integration:
 	./scripts/integration-pelican.sh

@@ -1442,9 +1442,28 @@ on Linux is `/proc/<pid>/cmdline` and readable by other local users unless
 - **in the fragment**, `#bt=…`, not the query. A fragment is never sent in
   a request line, so it is in no access log; and it is never in a `Referer`
   under any policy;
-- `Referrer-Policy: no-referrer` on every response as well [B31] — though
-  it is worth recording that the *default* policy already suffices for the
-  query-string case: `strict-origin-when-cross-origin` sends *"only the
+- `Referrer-Policy: no-referrer` on every response **except the navigation
+  surface**, which serves `same-origin` [B31]. The exception is not a
+  relaxation, it is the fix for a bug that made the whole OAuth path
+  unusable: `no-referrer` makes a browser send `Origin: null` on a form
+  submission (the interaction this document already flagged three sections
+  up), and `Origin: null` was refused at the `Origin` check — so the consent
+  form on `/oauth/authorize` could not be submitted by ANY browser, in any
+  version, while both shell gates passed because they set the `Origin`
+  header by hand with curl. `same-origin` is the narrowest policy that does
+  not null the origin: a full-URL `Referer` to this origin only, and none at
+  all to the client's loopback callback, which is a different origin and the
+  only cross-origin destination the flow has. See
+  `internal/httpguard.nullOriginOK` for the measured header block and
+  `scripts/oauth-browser-docker.sh` for the gate that now drives it in a
+  real Chromium. The second bug in the same path is `form-action 'self'`:
+  Chromium enforces it on the REDIRECTS of a form submission, so the 303
+  that ends the flow was blocked by our own policy, silently, with the
+  console as the only report — the consent page's CSP now names the
+  client's exact callback URL (`internal/localoauth`'s `consentCSP`).
+- `no-referrer` was chosen for the app surface because a fragment must never
+  travel [B31] — though it is worth recording that the *default* policy
+  already suffices for the query-string case: `strict-origin-when-cross-origin` sends *"only the
   ASCII serialization of the origin"* cross-origin, and from a
   potentially-trustworthy page to a non-trustworthy one *"a `Referer` HTTP
   header will not be sent"* at all [B31][B32];
@@ -1496,6 +1515,35 @@ seconds. So the random port is *friction*, not a control, and nothing in
 this design may rely on it — which is exactly why A1's and A2's controls
 have to hold on their own. The `Host` allowlist and the `Origin` check are
 what make a found port useless.
+
+##### A stable port is not a weaker port, and here is the audit
+
+The port is no longer random. `pelfs browse` derives it from the volume
+(`cmd/pelfs/browseport.go`), because the port is written into every
+connection file the session hands out — the profile's `Default Port`, its
+`Vendor`, the `.duck`'s `Port`, both OAuth URLs — so a fresh port per
+session made every generated profile and saved bookmark single-use. The
+paragraph above is the licence for that, and it was checked against the
+code rather than taken on its word:
+
+| control | computed from | weaker for a guessable port? |
+|---|---|---|
+| `Host` allowlist (A2) | the port the listener ACTUALLY got | no — an exact-string match, and a rebinding `Host` names the attacker's own name whatever the port is |
+| `CrossOriginProtection` | `Sec-Fetch-Site` | no — no port anywhere in it |
+| exact-`Origin` match | `"http://" + r.Host` | no |
+| provenance rule | `Origin` or `Sec-Fetch-Site` | no |
+| session token | `crypto/rand` per process, in a request header from `sessionStorage` | no — and `sessionStorage` is port-scoped, so a stable port does not widen it; a token from a previous process is refused by `ValidSession` because the HMAC key is new |
+| bootstrap token | `crypto/rand`, single-use, 120 s, in the fragment | no |
+| download tickets | `crypto/rand` per process, single use | no |
+| OAuth `client_id` | `crypto/rand` per download | no |
+| cookies | none, stripped on the way in | unchanged — a cookie on 127.0.0.1 was never port-isolated (F4) |
+
+Nothing hashes, seeds or salts anything with the port. Two consequences DO
+change and are recorded as accepted limitations rather than glossed:
+`docs/known-issues.md` KL-18 (a local process can squat a predictable port
+before pelfs starts — not a new capability for a process running as the
+user, and the bind failure is reported rather than hidden) and KL-17 (the
+bookmark now survives a restart; the profile's credential still does not).
 
 #### A5. The stored-XSS problem: serving the user's own files
 
@@ -2122,13 +2170,24 @@ The failure mode this table exists to prevent is a green check for the
 first row. A file that looks uploaded and is not in the federation is the
 worst possible ambiguity for this audience, because the user's next action
 is to close the laptop and tell a collaborator the data is there. Two
-distinct glyphs, a legend that is always visible, and a global line that
-is unambiguous:
+distinct glyphs and a global line that is unambiguous:
 
 ```
   14 files (412 MB) on this machine only — next automatic publish in 3m41s
   [ Publish now ]                                 branch: main   gen 87
 ```
+
+**The legend this section used to require is gone** (redesign-agent). It was
+built and shipped -- a row reading "● on this machine only / ◔ sending / ✓ in
+the federation" under the line -- and the owner's verdict on it in use was
+"bizarre, not needed, duplicate of the actual text". He is right: each glyph
+already appears immediately before the words it stands for, in the sentence
+that names its state, so the legend was a second copy of the text with nothing
+in it the sentence did not have. The REQUIREMENT is unchanged and is what is
+actually tested: three states, three different characters, staged never
+looking like published (`cmd/pelfs/browse_test.go` reads the glyph out of each
+of the page's own sentences; `webui/frontend/tests/durability.spec.ts` reads it
+out of the rendered panel in each state).
 
 **Where the numbers come from.** `overlay.FS.Stats()` already returns
 `StagedBytes`, `DirtyNodes` and `DirtyEdges` — `checkpoint` reads exactly
@@ -2819,6 +2878,17 @@ and the page shows:
   Connect another program
     (not yet built: WebDAV — M2; SFTP — docs/design-guiclients.md)
 ```
+
+**Two corrections to that sketch** (redesign-agent). The `[ Publish now ]` in
+it is drawn for a READ-ONLY session, which is the default, and that is exactly
+the shape the owner objected to in use: "why have a box you can't click when
+you said 'read-only' already and explain 'read-only' later?" A read-only
+session now renders **no publish control at all** on either surface -- the
+sentence `(read-only session — restart with --rw to publish)` takes its place,
+said once -- and the button appears only where pressing it can do something.
+And "Connect another program" is no longer on the same line as publishing:
+publishing is a durability action and the credential desk is a different page,
+so the link to it lives in the app bar.
 
 **That last line is now stale, and pleasantly so:** "Connect another
 program" is real. The page adds a program, hands back a

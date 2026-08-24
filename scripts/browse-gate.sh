@@ -307,6 +307,26 @@ ck $? "profile:client-id      the per-download secret is in the file"
 # same-origin form POST, and hand the 303 to Cyberduck's own loopback
 # listener. Every byte on the wire is the real client's and the real
 # server's; what curl replaces is a human's click, not a protocol.
+#
+# WHAT THIS GATE CANNOT SEE, and it is not a small list. curl is not a
+# browser: it implements neither the Fetch standard's Origin rules nor
+# Content Security Policy. Two bugs that broke EVERY Cyberduck connection
+# lived exactly there and passed here green --
+#
+#   * a real browser sends `Origin: null` on this form POST, because
+#     `Referrer-Policy: no-referrer` makes it (Fetch, "append a request
+#     `Origin` header"), and the guard answered `403 origin refused`. The
+#     line below types the correct Origin in by hand, so this gate never
+#     saw it.
+#   * Chromium enforces `form-action` on the REDIRECTS of a form
+#     submission, so the 303 that hands the code to Cyberduck was blocked
+#     by the consent page's own CSP. curl has no CSP at all.
+#
+# scripts/oauth-browser-docker.sh is the gate that drives this navigation
+# in a real Chromium with real duck as the client, and it is the one to
+# extend when the question is about what a BROWSER does. This gate's job
+# is the protocol and the server's own refusals, which it does in a
+# fraction of the time.
 consent() {
   url="$1"
   curl -sS -o "$WORK/consent.html" \
@@ -572,10 +592,34 @@ echo "== duck's own account of the connection =="
 # It also saves and restores the cursor with ESC 7 / ESC 8 around each
 # redraw, so the ESC has to go with the digit after it or the log grows a
 # "78" in front of every line.
-sed -e 's/\x1b[78]//g' -e 's/\x1b\[[0-9;?]*[a-zA-Z]//g' "$WORK/duck.out" 2>/dev/null \
-  | tr '\010\015' '\n\n' \
+clean_duck() {
+  sed -e 's/\x1b[78]//g' -e 's/\x1b\[[0-9;?]*[a-zA-Z]//g' "$WORK/duck.out" 2>/dev/null \
+    | tr '\010\015' '\n\n'
+}
+clean_duck \
   | grep -E 'Authenticating as|Login successful|Open web browser|connection opened|Upload complete' \
   | head -6
+
+# ------------------------------------------------- 9. the name a user reads
+#
+# THE ONE CHECK IN THIS FILE THAT ONLY REAL CYBERDUCK CAN MAKE. A golden
+# file proves pelfs wrote a `Name` and a `Default Nickname`; only Cyberduck's
+# own plist reader and its own BookmarkNameProvider prove it READS them.
+#
+# The reported bug: "each time I click on it, it just says '127.0.0.1 -
+# WebDAV (HTTP)'; no clue which each is". That string is Cyberduck's
+# fallback, `toHostname(bookmark) + " – " + protocol.getName()`, and
+# `getName()` fell through to the built-in `dav` parent because the profile
+# set no `Name` at all. So the assertion is exactly that: whatever duck
+# calls this connection, it must be a name pelfs chose and NOT the built-in
+# protocol's.
+displayed=$(clean_duck | grep -m1 'connection opened' | sed 's/ connection opened.*//')
+case "$displayed" in
+  *"WebDAV (HTTP)"*) r=1 ;;
+  pelfs*) r=0 ;;
+  *) r=1 ;;
+esac
+ck $r "profile:name-displayed real duck calls this connection ${displayed:-<nothing>}"
 
 echo
 echo "== summary: $fails failing check(s) =="

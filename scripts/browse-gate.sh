@@ -18,7 +18,7 @@
 # empty state directory reading the bytes back out of the federation is the
 # fact. Everything before it can pass with a broken seal.
 #
-# The eight things it proves, in order:
+# The ten things it proves, in order:
 #
 #   1. the bootstrap token in the launch URL's fragment buys a session
 #   2. GET /api/v1/files lists, POST /api/v1/upload writes  (U11)
@@ -30,8 +30,14 @@
 #   6. POST /api/v1/publish reaches `done`
 #   7. a fresh `pelfs shell --ro`, new state directory, reads every one of
 #      those files out of the federation, byte for byte
-#   8. a READ-ONLY `pelfs browse` cannot mint a writable DAV credential,
+#   8. A SECOND `pelfs browse` OVER THE SAME STATE DIRECTORY, and the
+#      profile from step 4 -- NOT REGENERATED, the same bytes on disk --
+#      still connects: same stable port, same client id, one consent click.
+#      A regenerated profile is byte-identical, and a different volume gets
+#      a different identity.                                          (U7/U8)
+#   9. a READ-ONLY `pelfs browse` cannot mint a writable DAV credential,
 #      cannot publish, and its credential answers 403 (not 401) on a PUT
+#  10. whatever duck CALLS the connection is a name pelfs chose
 #
 # It mounts a real filesystem in step 7, so it is Linux-only and refuses to
 # run on a host that has not said it is expendable. Run it through
@@ -71,6 +77,8 @@ FAKEORIGIN="${PELFS_PREBUILT:-/stage}/fakeorigin"
 
 cleanup() {
   [ -n "${BROWSE_PID:-}" ] && kill "$BROWSE_PID" 2>/dev/null
+  [ -n "${AGAIN_PID:-}" ] && kill "$AGAIN_PID" 2>/dev/null
+  [ -n "${OTHER_PID:-}" ] && kill "$OTHER_PID" 2>/dev/null
   [ -n "${ROBROWSE_PID:-}" ] && kill "$ROBROWSE_PID" 2>/dev/null
   [ -n "${ORIGIN_PID:-}" ] && kill "$ORIGIN_PID" 2>/dev/null
   return 0
@@ -120,6 +128,7 @@ fi
 ORIGIN="${LAUNCH%%/#bt=*}"
 BOOTSTRAP="${LAUNCH##*#bt=}"
 PORT="${ORIGIN##*:}"
+FIRSTPORT="$PORT"
 echo "   listening on $ORIGIN"
 
 # BOTH PAGES must be servable BEFORE the volume is open — that is the whole
@@ -298,7 +307,13 @@ print(m.group(1) if m else "")
 PY
 )
 [ -n "$CLIENT_ID" ]
-ck $? "profile:client-id      the per-download secret is in the file"
+ck $? "profile:client-id      the client id is in the file"
+
+# THE COPY STEP 8 REINSTALLS NOTHING FROM. Kept byte for byte, because the
+# whole claim under test later is that a user does not have to download this
+# file again -- and a claim about "the file the user already has" needs the
+# file the user already had.
+cp "$WORK/pelfs.cyberduckprofile" "$WORK/installed.cyberduckprofile"
 
 # ---------------------------------------------------------------- 5. real duck
 #
@@ -307,6 +322,26 @@ ck $? "profile:client-id      the per-download secret is in the file"
 # same-origin form POST, and hand the 303 to Cyberduck's own loopback
 # listener. Every byte on the wire is the real client's and the real
 # server's; what curl replaces is a human's click, not a protocol.
+#
+# WHAT THIS GATE CANNOT SEE, and it is not a small list. curl is not a
+# browser: it implements neither the Fetch standard's Origin rules nor
+# Content Security Policy. Two bugs that broke EVERY Cyberduck connection
+# lived exactly there and passed here green --
+#
+#   * a real browser sends `Origin: null` on this form POST, because
+#     `Referrer-Policy: no-referrer` makes it (Fetch, "append a request
+#     `Origin` header"), and the guard answered `403 origin refused`. The
+#     line below types the correct Origin in by hand, so this gate never
+#     saw it.
+#   * Chromium enforces `form-action` on the REDIRECTS of a form
+#     submission, so the 303 that hands the code to Cyberduck was blocked
+#     by the consent page's own CSP. curl has no CSP at all.
+#
+# scripts/oauth-browser-docker.sh is the gate that drives this navigation
+# in a real Chromium with real duck as the client, and it is the one to
+# extend when the question is about what a BROWSER does. This gate's job
+# is the protocol and the server's own refusals, which it does in a
+# fraction of the time.
 consent() {
   url="$1"
   curl -sS -o "$WORK/consent.html" \
@@ -475,7 +510,191 @@ ck $? "federation:dav-upload  the file CYBERDUCK uploaded is in the federation"
 grep -qx "$sha_want" "$WORK/verify.log"
 ck $? "federation:bytes-exact 256 KiB of random data, sha256 identical"
 
-# ---------------------------------------------------------------- 8. read-only
+# ---------------------------------------------------------------- 8. THE RESTART
+#
+# THE CHECK THIS FEATURE EXISTS FOR, and the one docs/known-issues.md said
+# nothing could make ("no gate runs two `pelfs browse` processes in sequence
+# against one saved profile"). This one does.
+#
+# A SECOND `pelfs browse` over the SAME state directory, and then real duck
+# pointed at $WORK/installed.cyberduckprofile -- the copy taken in step 4,
+# before this session existed, and not touched since. Nothing is regenerated
+# and nothing is reinstalled first: if the client id in that file does not
+# name a client this new process knows, duck's flow ends on "This is not an
+# authorization request pelfs issued" and this section goes red.
+#
+# DUCK'S OWN TOKEN CACHE IS LEFT EXACTLY WHERE THE FIRST SESSION PUT IT, and
+# that was a deliberate choice between two versions of this check. The access
+# and refresh tokens die with the process on purpose (in memory, under a
+# per-process key), so a second session always meets a client holding a stale
+# refresh token -- which is the real user's situation, and clearing ~/.duck
+# first would have been the gate quietly arranging the easier one. Measured
+# both ways on this gate: with the cache intact, duck's refresh fails, duck
+# re-runs the authorization flow against the SAME client id out of the same
+# installed profile, and the download succeeds. So the assertion below covers
+# both halves of what a user does -- the profile is still good, and one
+# consent click is all it costs.
+echo
+echo "== a SECOND pelfs browse, and the profile the user already installed =="
+"$PELFS" browse --rw --state-dir "$WORK/state" --snapshot-interval 0 \
+  "$PREFIX" > "$WORK/again.log" 2>&1 &
+AGAIN_PID=$!
+LAUNCH=""
+for _ in $(seq 300); do
+  LAUNCH=$(grep -o 'http://127\.0\.0\.1:[0-9]*/#bt=[A-Za-z0-9_-]*' "$WORK/again.log" 2>/dev/null | head -1)
+  [ -n "$LAUNCH" ] && break
+  kill -0 $AGAIN_PID 2>/dev/null || break
+  sleep 0.1
+done
+if [ -z "$LAUNCH" ]; then
+  echo "the second session never printed a launch URL:"; cat "$WORK/again.log"; exit 1
+fi
+ORIGIN="${LAUNCH%%/#bt=*}"
+BOOTSTRAP="${LAUNCH##*#bt=}"
+PORT="${ORIGIN##*:}"
+[ "$PORT" = "$FIRSTPORT" ]
+ck $? "restart:same-port      $PORT, the volume's stable port, twice"
+
+curl -sS -o "$WORK/again-session.json" -X POST \
+  -H 'Content-Type: application/json' -H "Origin: $ORIGIN" \
+  -H 'Sec-Fetch-Site: same-origin' \
+  --data-binary "{\"bootstrap\":\"$BOOTSTRAP\"}" "$ORIGIN/api/v1/session" >/dev/null
+SESSION=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("session",""))' "$WORK/again-session.json")
+[ -n "$SESSION" ]
+ck $? "restart:session        the new session token"
+for _ in $(seq 600); do
+  api GET /api/v1/info > /dev/null
+  phase=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("phase",""))' "$WORK/out.json" 2>/dev/null)
+  [ "$phase" = ready ] && break
+  [ "$phase" = failed ] && { echo "the second session failed to open:"; cat "$WORK/out.json"; break; }
+  sleep 0.1
+done
+[ "$phase" = ready ]
+ck $? "restart:ready          the same state directory reopened, phase=$phase"
+
+# BEFORE anything asks for a profile: the credential the user installed is
+# already in the inventory, adopted from the state directory, with no grant
+# and no consent carried across the process.
+api GET /api/v1/credentials > /dev/null
+python3 - "$WORK/out.json" <<'PY'
+import json, sys
+s = json.load(open(sys.argv[1]))
+assert len(s["clients"]) == 1, s["clients"]
+c = s["clients"][0]
+assert c["label"] == "Cyberduck", c
+assert c["persistent"] is True, c
+assert c["write"] is True, c
+# What must NOT have survived: the grant and the consent are per process.
+assert c["grants"] == 0, c
+assert c["consented"] is False, c
+assert s["grants"] == [], s["grants"]
+PY
+ck $? "restart:adopted        the installed profile is listed, with no grant and no consent"
+
+# The identity file, where it is and what it is not. A secret in the state
+# directory is fine (the signing key is there and is stronger); a secret
+# anywhere else is not.
+[ -f "$WORK/state/browse-identity.key" ]
+ck $? "restart:identity-file  the key is in the state directory"
+mode=$(stat -c '%a' "$WORK/state/browse-identity.key" 2>/dev/null)
+[ "$mode" = 600 ]
+ck $? "restart:identity-mode  mode $mode"
+if grep -q "$CLIENT_ID" "$WORK/state/browse-identity.key"; then r=1; else r=0; fi
+ck $r "restart:no-id-on-disk  the client id is derived, not stored"
+if [ -n "$PELFS_BASIC_PASS" ] && grep -q "$PELFS_BASIC_PASS" "$WORK/state/browse-identity.key"; then r=1; else r=0; fi
+ck $r "restart:no-password    no DAV password is on disk"
+
+# ---- and now the actual thing: REAL duck, the OLD profile, no reinstall.
+cp "$WORK/installed.cyberduckprofile" "$WORK/pelfs.cyberduckprofile"
+# The stale URL from the first session goes, or the client-id check below
+# would pass on evidence from the process this section is about surviving.
+rm -f "$WORK/reconnect.txt" "$WORK/authorize.url"
+run_duck --download "dav://127.0.0.1:$PORT/dav/hello.txt" "$WORK/reconnect.txt"
+rc=$?
+cmp -s "$WORK/hello.txt" "$WORK/reconnect.txt"
+r=$?; [ "$rc" = 0 ] || r=1
+ck $r "restart:reconnected    the profile installed LAST session downloaded a file THIS session"
+
+# One consent, this session: the click does not go away and must not.
+# authorize.url was rewritten by the run above, so its client_id is the one
+# duck read out of the file the user installed.
+case "$(cat "$WORK/authorize.url" 2>/dev/null)" in
+  *"client_id=$CLIENT_ID"*) r=0 ;;
+  *) r=1 ;;
+esac
+ck $r "restart:same-client-id duck sent the client id from the old profile, verbatim"
+if grep -q 'Login successful' "$WORK/duck.out"; then r=0; else r=1; fi
+ck $r "restart:one-consent    one click on the consent screen was all it took"
+
+# The regenerated profile is the same FILE, which is why reinstalling is
+# unnecessary rather than merely tolerable.
+api POST /api/v1/credentials '{"label":"Cyberduck","write":true}' > /dev/null
+python3 - "$WORK/out.json" "$WORK/regenerated.cyberduckprofile" <<'PY'
+import json, sys
+c = json.load(open(sys.argv[1]))
+for f in c["files"]:
+    if f["name"].endswith(".cyberduckprofile"):
+        open(sys.argv[2], "w").write(f["content"])
+        break
+else:
+    raise SystemExit("no profile in the response")
+PY
+cmp -s "$WORK/installed.cyberduckprofile" "$WORK/regenerated.cyberduckprofile"
+ck $? "restart:byte-identical the regenerated profile is the installed one, byte for byte"
+
+# A DIFFERENT VOLUME IS A DIFFERENT IDENTITY. Same label, same write flag,
+# same machine, its own state directory: the client id must not be the same
+# string, or one volume's profile would open another's files.
+"$PELFS" init --state-dir "$WORK/state2" "$PREFIX-two" > "$WORK/init2.log" 2>&1
+[ $? = 0 ] || { echo "second init failed:"; cat "$WORK/init2.log"; }
+"$PELFS" browse --rw --state-dir "$WORK/state2" --snapshot-interval 0 \
+  "$PREFIX-two" > "$WORK/other.log" 2>&1 &
+OTHER_PID=$!
+OTHERLAUNCH=""
+for _ in $(seq 300); do
+  OTHERLAUNCH=$(grep -o 'http://127\.0\.0\.1:[0-9]*/#bt=[A-Za-z0-9_-]*' "$WORK/other.log" 2>/dev/null | head -1)
+  [ -n "$OTHERLAUNCH" ] && break
+  kill -0 $OTHER_PID 2>/dev/null || break
+  sleep 0.1
+done
+OTHERORIGIN="${OTHERLAUNCH%%/#bt=*}"
+[ -n "$OTHERORIGIN" ] && [ "$OTHERORIGIN" != "$ORIGIN" ]
+ck $? "volumes:own-port       the second volume is on its own stable port"
+curl -sS -o "$WORK/other-session.json" -X POST \
+  -H 'Content-Type: application/json' -H "Origin: $OTHERORIGIN" \
+  -H 'Sec-Fetch-Site: same-origin' \
+  --data-binary "{\"bootstrap\":\"${OTHERLAUNCH##*#bt=}\"}" \
+  "$OTHERORIGIN/api/v1/session" >/dev/null
+OTHERSESSION=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("session",""))' "$WORK/other-session.json")
+curl -sS -o "$WORK/other-creds.json" -X POST \
+  -H "X-Pelfs-Session: $OTHERSESSION" -H 'Sec-Fetch-Site: same-origin' \
+  -H "Origin: $OTHERORIGIN" -H 'Content-Type: application/json' \
+  --data-binary '{"label":"Cyberduck","write":true}' \
+  "$OTHERORIGIN/api/v1/credentials" >/dev/null
+OTHER_ID=$(python3 - "$WORK/other-creds.json" <<'PY'
+import json, re, sys
+c = json.load(open(sys.argv[1]))
+for f in c.get("files", []):
+    if f["name"].endswith(".cyberduckprofile"):
+        m = re.search(r"<key>OAuth Client ID</key>\s*<string>([^<]*)</string>", f["content"])
+        print(m.group(1) if m else "")
+        break
+PY
+)
+[ -n "$OTHER_ID" ] && [ "$OTHER_ID" != "$CLIENT_ID" ]
+ck $? "volumes:own-identity   the same label on another volume is another client"
+kill -TERM "$OTHER_PID" 2>/dev/null
+wait "$OTHER_PID" 2>/dev/null
+OTHER_PID=""
+
+kill -TERM "$AGAIN_PID" 2>/dev/null
+wait "$AGAIN_PID" 2>/dev/null
+AGAIN_RC=$?
+AGAIN_PID=""
+[ "$AGAIN_RC" = 0 ]
+ck $? "restart:clean-exit     the second session exited $AGAIN_RC"
+
+# ---------------------------------------------------------------- 9. read-only
 echo
 echo "== a read-only pelfs browse over the same published generation =="
 "$PELFS" browse --state-dir "$WORK/rostate" "$PREFIX" > "$WORK/robrowse.log" 2>&1 &
@@ -572,10 +791,34 @@ echo "== duck's own account of the connection =="
 # It also saves and restores the cursor with ESC 7 / ESC 8 around each
 # redraw, so the ESC has to go with the digit after it or the log grows a
 # "78" in front of every line.
-sed -e 's/\x1b[78]//g' -e 's/\x1b\[[0-9;?]*[a-zA-Z]//g' "$WORK/duck.out" 2>/dev/null \
-  | tr '\010\015' '\n\n' \
+clean_duck() {
+  sed -e 's/\x1b[78]//g' -e 's/\x1b\[[0-9;?]*[a-zA-Z]//g' "$WORK/duck.out" 2>/dev/null \
+    | tr '\010\015' '\n\n'
+}
+clean_duck \
   | grep -E 'Authenticating as|Login successful|Open web browser|connection opened|Upload complete' \
   | head -6
+
+# ------------------------------------------------ 10. the name a user reads
+#
+# THE ONE CHECK IN THIS FILE THAT ONLY REAL CYBERDUCK CAN MAKE. A golden
+# file proves pelfs wrote a `Name` and a `Default Nickname`; only Cyberduck's
+# own plist reader and its own BookmarkNameProvider prove it READS them.
+#
+# The reported bug: "each time I click on it, it just says '127.0.0.1 -
+# WebDAV (HTTP)'; no clue which each is". That string is Cyberduck's
+# fallback, `toHostname(bookmark) + " – " + protocol.getName()`, and
+# `getName()` fell through to the built-in `dav` parent because the profile
+# set no `Name` at all. So the assertion is exactly that: whatever duck
+# calls this connection, it must be a name pelfs chose and NOT the built-in
+# protocol's.
+displayed=$(clean_duck | grep -m1 'connection opened' | sed 's/ connection opened.*//')
+case "$displayed" in
+  *"WebDAV (HTTP)"*) r=1 ;;
+  pelfs*) r=0 ;;
+  *) r=1 ;;
+esac
+ck $r "profile:name-displayed real duck calls this connection ${displayed:-<nothing>}"
 
 echo
 echo "== summary: $fails failing check(s) =="

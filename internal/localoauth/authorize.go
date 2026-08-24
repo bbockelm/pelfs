@@ -7,6 +7,7 @@ import (
 	"html/template"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -45,7 +46,7 @@ const consentBodyLimit = 64 << 10
 // is a new tab. There is no header to check and no place to check it.
 //
 // The controls that carry the weight instead, all in this file: a client_id
-// that is a per-download secret (findClient, constant time); a redirect_uri
+// that only a profile download carries (findClient, constant time); a redirect_uri
 // matched byte for byte against the one URL pelfs itself wrote into that
 // client's profile; PKCE S256 required rather than accepted; and one real
 // user gesture on a consent screen that cannot be framed and on which no
@@ -126,19 +127,42 @@ func (s *Server) authorizeGET(w http.ResponseWriter, r *http.Request) {
 	redirect := q.Get("redirect_uri")
 	if subtle.ConstantTimeCompare([]byte(redirect), []byte(c.redirect)) != 1 {
 		s.counts.RedirectMismatches++
+		want := c.redirect
 		s.mu.Unlock()
-		// Nothing about the request is echoed — not the redirect_uri that
-		// was sent, and not the one that was expected. A page that repeats
-		// an attacker's string back to the user is a page that can be made
-		// to say anything.
+		// THE DETAIL IS TWO PORT NUMBERS AND NOTHING ELSE.
+		//
+		// No string from the request is echoed — a page that repeats an
+		// attacker's string back to the user is a page that can be made to
+		// say anything — but a user who is told only "that address is not
+		// the one in this profile" has no next step, which is what the
+		// person who reported this was left with. So: the port pelfs wrote
+		// into the profile (ours, a constant of this process) and the port
+		// the request asked for, PARSED TO AN INTEGER AND REFORMATTED. An
+		// int that survived strconv.Atoi is not a string an attacker
+		// controls the shape of; it can only be 1..65535.
+		detail := "pelfs will only send an authorization back to the exact address " +
+			"it wrote into the profile it generated, and this request named a " +
+			"different one. Nothing has been authorized and nothing was sent " +
+			"anywhere."
+		if wantPort, ok := loopbackPort(want); ok {
+			if gotPort, ok := loopbackPort(redirect); ok && gotPort != wantPort {
+				detail = "This profile expects the client's callback on port " +
+					strconv.Itoa(wantPort) + "; the client asked for port " +
+					strconv.Itoa(gotPort) + " instead. That usually means port " +
+					strconv.Itoa(wantPort) + " was already in use on this machine, so " +
+					"the client took one of its own. Nothing has been authorized and " +
+					"nothing was sent anywhere."
+			} else {
+				detail += " The profile's callback is on port " + strconv.Itoa(wantPort) + "."
+			}
+		}
 		s.page(w, r, http.StatusBadRequest, pageData{
 			Heading: "That callback address is not the one in this profile",
-			Detail: "pelfs will only send an authorization back to the exact address " +
-				"it wrote into the profile it generated, and this request named a " +
-				"different one. Nothing has been authorized and nothing was sent " +
-				"anywhere.",
-			Hint: "If your client picked its own port, generate a new profile: the " +
-				"pelfs page can regenerate one with a different callback port.",
+			Detail:  detail,
+			Hint: "Close the client, then generate a fresh profile from the pelfs " +
+				"connection page: it will pick a callback port that is free right now " +
+				"and write it into both the profile and this allowlist. Nobody has to " +
+				"edit a plist.",
 		})
 		return
 	}
@@ -344,6 +368,26 @@ func (s *Server) parseScopes(raw string, c *client) (scopes []string, write, ok 
 	return scopes, write, true
 }
 
+// loopbackPort is the port of a loopback callback URL, as an INTEGER.
+//
+// It exists so that a refusal page can say "port 52001, not 61033" without
+// echoing one byte of a caller's string: the only thing that escapes here is
+// a number that survived strconv.Atoi and is in range, and the caller
+// reformats it with strconv.Itoa rather than passing the original text
+// through. It reports false for anything it cannot read that way, and the
+// page then says less rather than guessing.
+func loopbackPort(raw string) (int, bool) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return 0, false
+	}
+	n, err := strconv.Atoi(u.Port())
+	if err != nil || n < 1 || n > 65535 {
+		return 0, false
+	}
+	return n, true
+}
+
 // validChallenge is the S256 challenge's shape: base64url, no padding, of a
 // SHA-256 digest, which is exactly 43 characters. Checking the shape here
 // means the comparison at exchange time is against something well-formed.
@@ -521,9 +565,10 @@ type consentData struct {
 
 // consentCSP is the consent page's own policy, and it REPLACES
 // internal/httpguard's default (which sets `form-action 'none'`, so the
-// form would not submit under it).
+// form would not submit under it). `%s` is the style nonce and `%r` is the
+// client's callback URL; both are substituted by cspFor.
 //
-// The two clauses that are load-bearing rather than tidy:
+// The three clauses that are load-bearing rather than tidy:
 //
 //   - `script-src 'none'`: this is the structural half of "one real user
 //     gesture". No script may execute on this document, so no script can
@@ -531,15 +576,57 @@ type consentData struct {
 //     form is a person activating the button. The page contains no script
 //     either, but the header is what makes it impossible rather than merely
 //     absent.
-//   - `form-action 'self'`: the form may post to this origin and nowhere
-//     else, so an injected form cannot exfiltrate the ticket even in a
-//     world where injection were possible on a page with no script.
+//
+//   - `form-action 'self'`: the form may post to this origin, so an
+//     injected form cannot exfiltrate the ticket even in a world where
+//     injection were possible on a page with no script.
+//
+//   - AND THE CLIENT'S CALLBACK URL, EXACTLY, WITHOUT WHICH THE FLOW
+//     CANNOT COMPLETE IN CHROMIUM. `form-action` is enforced on the
+//     REDIRECTS of a form submission, not only on its first hop, and the
+//     one thing a successful authorization does is 303 the POST to the
+//     client's own loopback listener — a different origin. So `'self'`
+//     alone blocked the last step of every real-browser flow:
+//
+//     Sending form data to 'http://127.0.0.1:PORT/oauth/authorize'
+//     violates the following Content Security Policy directive:
+//     "form-action 'self'". The request has been blocked.
+//
+//     with the code minted, the consent recorded, the browser sitting on
+//     the consent page, and Cyberduck waiting on a callback that never
+//     arrives. No curl-driven gate could see it: curl does not implement
+//     CSP. See scripts/oauth-browser-docker.sh, which does.
+//
+//     The value is safe because it is not a value from the request: it is
+//     the URL pelfs itself wrote into this client's profile, which control
+//     3 has just compared byte for byte, and which CheckRedirectURI has
+//     already confined to a loopback literal with an explicit port and no
+//     character that could break a header. CSP source matching ignores the
+//     query, so the `?code=…&state=…` the redirect appends is covered by
+//     naming the path alone — and naming the path rather than the origin
+//     means a form on this page could not be redirected to any OTHER
+//     resource on the client's port either.
 //
 // The style nonce is there so the page can have a stylesheet without
 // 'unsafe-inline' anywhere on this listener.
 const consentCSP = "default-src 'none'; script-src 'none'; style-src 'nonce-%s'; " +
-	"img-src 'none'; connect-src 'none'; form-action 'self'; base-uri 'none'; " +
+	"img-src 'none'; connect-src 'none'; form-action 'self' %r; base-uri 'none'; " +
 	"frame-ancestors 'none'"
+
+// pageCSP is consentCSP for a page with NO form: every refusal and every
+// acknowledgement this package serves. `form-action 'none'` rather than
+// 'self' because none of these pages has anything to submit, and a page
+// that cannot submit anywhere is one fewer thing to reason about.
+const pageCSP = "default-src 'none'; script-src 'none'; style-src 'nonce-%s'; " +
+	"img-src 'none'; connect-src 'none'; form-action 'none'; base-uri 'none'; " +
+	"frame-ancestors 'none'"
+
+// cspFor substitutes the nonce and, for the consent page, the one callback
+// URL the form may be redirected to.
+func cspFor(policy, nonce, redirect string) string {
+	p := strings.Replace(policy, "%s", nonce, 1)
+	return strings.Replace(p, "%r", redirect, 1)
+}
 
 func (s *Server) consentPage(w http.ResponseWriter, r *http.Request, req authorizeRequest, ticket string) {
 	nonce, err := mintRef()
@@ -560,7 +647,7 @@ func (s *Server) consentPage(w http.ResponseWriter, r *http.Request, req authori
 		Action: r.URL.EscapedPath(), Nonce: nonce,
 		Field: ConsentTicketField, Decision: ConsentDecisionField,
 	}
-	w.Header().Set("Content-Security-Policy", strings.Replace(consentCSP, "%s", nonce, 1))
+	w.Header().Set("Content-Security-Policy", cspFor(consentCSP, nonce, req.redirect))
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	if r.Method == http.MethodHead {
@@ -570,14 +657,14 @@ func (s *Server) consentPage(w http.ResponseWriter, r *http.Request, req authori
 }
 
 // page serves one of this package's own refusals or acknowledgements. Same
-// strict CSP as the consent screen, minus the form.
+// strict CSP as the consent screen, minus the form (pageCSP).
 func (s *Server) page(w http.ResponseWriter, r *http.Request, status int, data pageData) {
 	nonce, err := mintRef()
 	if err != nil {
 		http.Error(w, data.Heading, status)
 		return
 	}
-	w.Header().Set("Content-Security-Policy", strings.Replace(consentCSP, "%s", nonce, 1))
+	w.Header().Set("Content-Security-Policy", cspFor(pageCSP, nonce, ""))
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
 	if r.Method == http.MethodHead {

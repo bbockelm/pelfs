@@ -12,6 +12,7 @@ package davprofile_test
 // authorization server. What it found is recorded in that script's header.
 
 import (
+	"bytes"
 	"encoding/xml"
 	"flag"
 	"io"
@@ -519,3 +520,94 @@ func TestTheGeneratorAndTheServerAgree(t *testing.T) {
 type onesession struct{}
 
 func (onesession) Sessions() int { return 1 }
+
+// TestNamesTheUserReads is the regression test for "each time I click on it,
+// it just says '127.0.0.1 - WebDAV (HTTP)'; no clue which each is".
+//
+// The golden files already pin the bytes. What they cannot say is WHICH KEY
+// Cyberduck reads to produce that name, and getting that wrong is how the
+// bug happened: the old code set the `.duck`'s `Nickname` — correctly, it is
+// the key HostDictionary.java reads — and nothing at all on the profile,
+// where the key is `Default Nickname` and where `Name` is the string the
+// "127.0.0.1 – …" fallback ends in. davprofile.Params.nickname quotes
+// BookmarkNameProvider.java's three-way precedence in full.
+func TestNamesTheUserReads(t *testing.T) {
+	p := params(false)
+	prof, err := davprofile.Profile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	book, err := davprofile.Bookmark(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	basic, err := davprofile.BasicBookmark(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. The PROFILE carries `Default Nickname` — the key
+	// BookmarkNameProvider consults for a bookmark with no nickname of its
+	// own, which is every bookmark a user creates from the installed profile
+	// himself.
+	if !bytes.Contains(prof, []byte("<key>Default Nickname</key>")) {
+		t.Error("the profile has no `Default Nickname`, so any bookmark the user " +
+			"makes from it falls through to \"127.0.0.1 – <protocol name>\"")
+	}
+	// And NOT `Nickname`, which a Profile has no key for at all: writing it
+	// would look right in a diff and do nothing.
+	if bytes.Contains(prof, []byte("<key>Nickname</key>")) {
+		t.Error("the profile writes `Nickname`, which Profile.java does not read")
+	}
+	// 2. `Name`, which is the tail of that fallback. Absent, Profile.java
+	// returns parent.getName() — and the built-in dav parent's name is the
+	// literal "WebDAV (HTTP)" the report quoted.
+	if !bytes.Contains(prof, []byte("<key>Name</key>")) {
+		t.Error("the profile has no `Name`, so Cyberduck calls this protocol " +
+			"\"WebDAV (HTTP)\" like every other WebDAV bookmark")
+	}
+
+	// 3. THE NAMES THEMSELVES NAME THE VOLUME AND THE PROGRAM, which is what
+	// "no clue which each is" was asking for. Two of these in a list have to
+	// be distinguishable, and the two things that distinguish them are the
+	// volume and the label the user typed.
+	for _, tc := range []struct {
+		what string
+		b    []byte
+	}{{"the profile", prof}, {"the .duck", book}, {"the basic .duck", basic}} {
+		for _, want := range []string{"pelfs", "osg-htc.org/user/bbockelman", "Cyberduck"} {
+			if !bytes.Contains(tc.b, []byte(want)) {
+				t.Errorf("%s's name does not contain %q", tc.what, want)
+			}
+		}
+	}
+	// Both bookmarks carry their own `Nickname`, which wins over everything
+	// above — and the two must not be the SAME name: one needs a pasted
+	// password and the other does not, which is the single most useful thing
+	// to know before clicking.
+	oauthName, basicName := nicknameOf(t, book), nicknameOf(t, basic)
+	if string(oauthName) == string(basicName) {
+		t.Errorf("the OAuth and password bookmarks share the name %q", oauthName)
+	}
+	if !bytes.Contains(basicName, []byte("password")) {
+		t.Errorf("the contingency bookmark's name (%q) does not say it needs one", basicName)
+	}
+	// No en dash, no smart quotes: the same rule description() states, and
+	// for the same reason — a plist read by a Java StringSubstitutor and an
+	// XML parser is one place fewer to be clever.
+	for _, b := range [][]byte{prof, book, basic} {
+		if bytes.ContainsRune(b, '–') || bytes.ContainsRune(b, '—') {
+			t.Error("a generated name contains an en or em dash")
+		}
+	}
+}
+
+func nicknameOf(t *testing.T, plist []byte) []byte {
+	t.Helper()
+	_, rest, ok := bytes.Cut(plist, []byte("<key>Nickname</key>\n\t<string>"))
+	if !ok {
+		t.Fatal("no Nickname in the plist")
+	}
+	v, _, _ := bytes.Cut(rest, []byte("</string>"))
+	return v
+}

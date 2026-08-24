@@ -638,8 +638,11 @@ built-in `dav`.
 
 Note what is **not** there: `Authorization` (omitted deliberately, 2b),
 `OAuth PKCE` (omitted so the parent's `true` applies), and any secret other
-than the `client_id` — which is itself minted per download, so possessing
-the profile is the only thing that identifies the client.
+than the `client_id` — which only a profile download carries, so possessing
+the profile is the only thing that identifies the client. (It is *derived*
+rather than minted where there is a state directory to derive from, so the
+file is byte-identical across restarts; see A7's "The client identity is
+persistent".)
 
 Installation is by double-click, or *Preferences → Profiles*; the same
 mechanism and the same core serve **Mountain Duck**, whose only difference
@@ -1442,9 +1445,28 @@ on Linux is `/proc/<pid>/cmdline` and readable by other local users unless
 - **in the fragment**, `#bt=…`, not the query. A fragment is never sent in
   a request line, so it is in no access log; and it is never in a `Referer`
   under any policy;
-- `Referrer-Policy: no-referrer` on every response as well [B31] — though
-  it is worth recording that the *default* policy already suffices for the
-  query-string case: `strict-origin-when-cross-origin` sends *"only the
+- `Referrer-Policy: no-referrer` on every response **except the navigation
+  surface**, which serves `same-origin` [B31]. The exception is not a
+  relaxation, it is the fix for a bug that made the whole OAuth path
+  unusable: `no-referrer` makes a browser send `Origin: null` on a form
+  submission (the interaction this document already flagged three sections
+  up), and `Origin: null` was refused at the `Origin` check — so the consent
+  form on `/oauth/authorize` could not be submitted by ANY browser, in any
+  version, while both shell gates passed because they set the `Origin`
+  header by hand with curl. `same-origin` is the narrowest policy that does
+  not null the origin: a full-URL `Referer` to this origin only, and none at
+  all to the client's loopback callback, which is a different origin and the
+  only cross-origin destination the flow has. See
+  `internal/httpguard.nullOriginOK` for the measured header block and
+  `scripts/oauth-browser-docker.sh` for the gate that now drives it in a
+  real Chromium. The second bug in the same path is `form-action 'self'`:
+  Chromium enforces it on the REDIRECTS of a form submission, so the 303
+  that ends the flow was blocked by our own policy, silently, with the
+  console as the only report — the consent page's CSP now names the
+  client's exact callback URL (`internal/localoauth`'s `consentCSP`).
+- `no-referrer` was chosen for the app surface because a fragment must never
+  travel [B31] — though it is worth recording that the *default* policy
+  already suffices for the query-string case: `strict-origin-when-cross-origin` sends *"only the
   ASCII serialization of the origin"* cross-origin, and from a
   potentially-trustworthy page to a non-trustworthy one *"a `Referer` HTTP
   header will not be sent"* at all [B31][B32];
@@ -1496,6 +1518,35 @@ seconds. So the random port is *friction*, not a control, and nothing in
 this design may rely on it — which is exactly why A1's and A2's controls
 have to hold on their own. The `Host` allowlist and the `Origin` check are
 what make a found port useless.
+
+##### A stable port is not a weaker port, and here is the audit
+
+The port is no longer random. `pelfs browse` derives it from the volume
+(`cmd/pelfs/browseport.go`), because the port is written into every
+connection file the session hands out — the profile's `Default Port`, its
+`Vendor`, the `.duck`'s `Port`, both OAuth URLs — so a fresh port per
+session made every generated profile and saved bookmark single-use. The
+paragraph above is the licence for that, and it was checked against the
+code rather than taken on its word:
+
+| control | computed from | weaker for a guessable port? |
+|---|---|---|
+| `Host` allowlist (A2) | the port the listener ACTUALLY got | no — an exact-string match, and a rebinding `Host` names the attacker's own name whatever the port is |
+| `CrossOriginProtection` | `Sec-Fetch-Site` | no — no port anywhere in it |
+| exact-`Origin` match | `"http://" + r.Host` | no |
+| provenance rule | `Origin` or `Sec-Fetch-Site` | no |
+| session token | `crypto/rand` per process, in a request header from `sessionStorage` | no — and `sessionStorage` is port-scoped, so a stable port does not widen it; a token from a previous process is refused by `ValidSession` because the HMAC key is new |
+| bootstrap token | `crypto/rand`, single-use, 120 s, in the fragment | no |
+| download tickets | `crypto/rand` per process, single use | no |
+| OAuth `client_id` | `crypto/rand` per download | no |
+| cookies | none, stripped on the way in | unchanged — a cookie on 127.0.0.1 was never port-isolated (F4) |
+
+Nothing hashes, seeds or salts anything with the port. Two consequences DO
+change and are recorded as accepted limitations rather than glossed:
+`docs/known-issues.md` KL-18 (a local process can squat a predictable port
+before pelfs starts — not a new capability for a process running as the
+user, and the bind failure is reported rather than hidden) and KL-17 (the
+bookmark now survives a restart; the profile's credential still does not).
 
 #### A5. The stored-XSS problem: serving the user's own files
 
@@ -1623,10 +1674,13 @@ top-level navigation is the one thing LNA does **not** gate in Chromium.
    not "is it loopback". An unmatched `redirect_uri` renders an error
    **on pelfs's own page** and does not redirect anywhere, because
    redirecting to an unvalidated URI is the vulnerability.
-4. **`client_id` is a secret, minted per profile download**, 32 bytes from
-   `crypto/rand`, compared in constant time. Possessing the profile is what
-   identifies the client, so an attacker who has not been handed a profile
-   cannot even name a valid client.
+4. **`client_id` is a secret only a profile download carries**, 32 bytes,
+   compared in constant time. Possessing the profile is what identifies the
+   client, so an attacker who has not been handed a profile cannot even name
+   a valid client. It is **derived** rather than minted where `pelfs browse`
+   has a state directory to derive from — see "The client identity is
+   persistent" below — which changes nothing an attacker can do and
+   everything a user has to do.
 5. **PKCE `S256` is required**, not merely accepted. Cyberduck sends it by
    default (`isOAuthPKCE()` → `true` [W13]), so requiring it costs nothing
    and means a stolen code is useless without the verifier.
@@ -1669,14 +1723,16 @@ never grant a writable one. That check is at grant time *and* at request
 time, because the session's mode cannot change mid-life but a future
 version might let it.
 
-**Revocation, which is the part that is easy to get wrong.** Everything the
-authorization server issues lives **only in memory** and dies with the
-process:
+**Revocation, which is the part that is easy to get wrong.** Every
+CREDENTIAL the authorization server issues lives **only in memory** and dies
+with the process:
 
-- **no persistence at all** — no tokens in the state directory, no refresh
-  tokens on disk, nothing in the volume. `pelfs browse` exiting is a
-  complete revocation of every credential it ever minted, and that property
-  is worth more than the convenience of surviving a restart;
+- **no credential is persisted** — no access or refresh token in the state
+  directory, no HTTP Basic password on disk, nothing in the volume. `pelfs
+  browse` exiting is a complete revocation of every credential it ever
+  minted, and that property is worth more than the convenience of surviving
+  a restart. (The one thing that IS persisted is the client IDENTITY, which
+  is not a credential; the next subsection is the whole of it.);
 - the signing/lookup material is a per-process random key, so a token from
   a previous session does not validate against a new one even if the port
   is reused;
@@ -1688,6 +1744,64 @@ process:
   `client_id`, exact `redirect_uri` and the PKCE challenge; a replayed code
   is a hard failure and is counted, because a replay is either a bug or an
   attack and both deserve a number.
+
+##### The client identity is persistent, and it is not a credential
+
+This document originally said "no persistence at all", and that was right
+about credentials and wrong about the user. The stable browse port made a
+saved `.duck` bookmark resolve next session; the profile's `client_id` did
+not, because it was minted per download, so the bookmark reached the right
+port and failed on pelfs's own first control. The profile had to be
+reinstalled every session, which is the one-time-use problem moved one step
+later (it was filed as KL-17 in `docs/known-issues.md`).
+
+So the client id is derived from a per-volume key in the state directory:
+
+    client_id = base64url( HMAC-SHA256(key, "pelfs-browse-client-v1\0"
+                              || label || redirect || write || epoch) )
+
+`key` is 32 bytes of `crypto/rand` in `<state-dir>/browse-identity.key`,
+mode 0600, **created lazily** — a session that hands out no profile writes
+no new secret. `epoch` is 8 more, recorded beside the tuple the first time
+it is registered, and it is what makes revocation final: without it the
+derivation would be a pure function of the label, so revoking "Cyberduck"
+and later re-adding "Cyberduck" would re-derive the id that was revoked.
+`internal/localoauth/identity.go` is the implementation and carries the
+argument.
+
+What this buys and what it does not, and the second list is the one to
+repeat on every surface:
+
+- **buys**: the generated profile for a given (volume, program label, write
+  flag) is byte-identical across restarts, so the installed one keeps
+  working and the credential is exactly as durable as the state directory;
+  `Revoke` on a client now means something durable — the identity is
+  deleted, the installed profile is dead for good, and the call reports an
+  error rather than success if that could not be written;
+- **does not buy, on purpose**: no token, no refresh token and no Basic
+  password is written anywhere (those still die with the process); and
+  **consent is still required on every `/authorize`** — control 6 stands
+  exactly as written, this document's "do not reinstate that" included. The
+  user clicks Authorize once per `pelfs browse` session, and every surface
+  that describes this must say so rather than implying the click went away.
+
+**Threat model for the file.** An attacker who reads it can derive the
+client ids of the clients listed in it, and so can name a valid client at
+`/oauth/authorize`. That is the whole of it: to get a credential they must
+also have a `pelfs browse` running, get the user to click Authorize on a
+consent screen naming the volume, the client and the scope, and be
+listening on the client's loopback callback to catch the code — i.e. be
+running as the user on this machine already, which is A8's first bullet.
+They cannot read the volume with it, cannot publish with it (no DAV grant
+has ever carried a publish scope), and cannot use it against another volume
+(the key is per state directory, which is per volume in every default
+configuration). It sits in the same directory as `v2-signing.key`, which
+can publish a generation every reader in the federation will accept, so
+this file is **strictly weaker than its neighbour** — which is why it is
+not encrypted: the key that wrapped it would have to be readable by a
+non-interactive `pelfs browse`, in the same directory, and the ceremony
+would protect nothing that the signing key beside it does not already
+concede.
 
 **And one thing to keep off this surface entirely:** the federation bearer
 token. pelfs's OAuth server issues *its own* tokens for *its own* WebDAV
@@ -2122,13 +2236,24 @@ The failure mode this table exists to prevent is a green check for the
 first row. A file that looks uploaded and is not in the federation is the
 worst possible ambiguity for this audience, because the user's next action
 is to close the laptop and tell a collaborator the data is there. Two
-distinct glyphs, a legend that is always visible, and a global line that
-is unambiguous:
+distinct glyphs and a global line that is unambiguous:
 
 ```
   14 files (412 MB) on this machine only — next automatic publish in 3m41s
   [ Publish now ]                                 branch: main   gen 87
 ```
+
+**The legend this section used to require is gone** (redesign-agent). It was
+built and shipped -- a row reading "● on this machine only / ◔ sending / ✓ in
+the federation" under the line -- and the owner's verdict on it in use was
+"bizarre, not needed, duplicate of the actual text". He is right: each glyph
+already appears immediately before the words it stands for, in the sentence
+that names its state, so the legend was a second copy of the text with nothing
+in it the sentence did not have. The REQUIREMENT is unchanged and is what is
+actually tested: three states, three different characters, staged never
+looking like published (`cmd/pelfs/browse_test.go` reads the glyph out of each
+of the page's own sentences; `webui/frontend/tests/durability.spec.ts` reads it
+out of the rendered panel in each state).
 
 **Where the numbers come from.** `overlay.FS.Stats()` already returns
 `StagedBytes`, `DirtyNodes` and `DirtyEdges` — `checkpoint` reads exactly
@@ -2819,6 +2944,17 @@ and the page shows:
   Connect another program
     (not yet built: WebDAV — M2; SFTP — docs/design-guiclients.md)
 ```
+
+**Two corrections to that sketch** (redesign-agent). The `[ Publish now ]` in
+it is drawn for a READ-ONLY session, which is the default, and that is exactly
+the shape the owner objected to in use: "why have a box you can't click when
+you said 'read-only' already and explain 'read-only' later?" A read-only
+session now renders **no publish control at all** on either surface -- the
+sentence `(read-only session — restart with --rw to publish)` takes its place,
+said once -- and the button appears only where pressing it can do something.
+And "Connect another program" is no longer on the same line as publishing:
+publishing is a durability action and the credential desk is a different page,
+so the link to it lives in the app bar.
 
 **That last line is now stale, and pleasantly so:** "Connect another
 program" is real. The page adds a program, hands back a

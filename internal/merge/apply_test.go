@@ -87,7 +87,7 @@ func TestApplyMergesTwoBranchesIntoOneTree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fsck: %v", err)
 	}
-	if !rep.OK() {
+	if !rep.Clean() {
 		for _, p := range rep.Problems {
 			t.Errorf("fsck: %s %s: %s", p.Kind, p.Path, p.Detail)
 		}
@@ -328,7 +328,7 @@ func TestApplyCanKeepBothSidesOfAConflict(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !rep.OK() {
+	if !rep.Clean() {
 		for _, p := range rep.Problems {
 			t.Errorf("fsck: %s %s: %s", p.Kind, p.Path, p.Detail)
 		}

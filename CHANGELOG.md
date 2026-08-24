@@ -2,6 +2,64 @@
 
 ## Unreleased
 
+**The file manager looks like a file manager.** The app shipped one of the eight
+stylesheets the component needs (`style.css`, not `all.css`), so thirteen base
+theme tokens were undefined and the menu, the modal, the segmented view switch
+and the uploader's hidden file input had no rules at all: cards were
+transparent, the search box's border computed to `0px none`, the "Add New" menu
+rendered as bare text over the folder tree, and a native "Choose Files" widget
+sat in the middle of the file pane. The complete stylesheet is now imported,
+with its six cdn.svar.dev `@font-face` rules dropped at build time — nothing
+loads off loopback, and the suite still proves it for a whole session. Dark
+mode used to leave the component on its light theme, rendering white file names
+on white cards; both themes now follow the platform and share one palette.
+Cost: +13 KB gzipped.
+
+**The page is laid out as a tool**: an app bar, and two panels — what is
+published, and the files — with borders and space between them instead of
+full-bleed strips of prose. The glyph legend is gone (each glyph already sits
+beside its own words; the three-distinct-characters contract is asserted
+against what the panel renders). The "search is partial" paragraph is a quiet
+chip on the file pane's own bar that opens to the full sentence. A **read-only
+session renders no publish control at all** — it says so once, where the button
+would have been — and "Connect a program" moved to the app bar, off the
+publish line.
+
+**`pelfs browse` connects Cyberduck again.** Two bugs made every real-browser
+authorization fail, and neither was visible to the curl-driven gates. A
+browser sends `Origin: null` on a form POST when the page carries
+`Referrer-Policy: no-referrer`, so every consent click was answered
+`403 origin refused`; and Chromium enforces `form-action` on the redirects of
+a form submission, so the 303 that hands the code to the client was blocked
+by the consent page's own CSP, reported to the console and nowhere else. The
+navigation surface now serves `Referrer-Policy: same-origin` and the consent
+page's `form-action` names the client's exact callback. New gate:
+`make oauth-browser` — a real Chromium and real `duck` on one flow.
+
+**The browse port is stable per volume**, derived from the prefix
+(61000–65535), so a saved Cyberduck bookmark is no longer single-use;
+`--port` overrides it and a taken port falls back with a warning naming both.
+The port was never a secret and the audit is in `docs/design-webui.md`.
+
+**And the generated Cyberduck profile survives a restart too, so install it
+once.** Its `OAuth Client ID` is derived from a per-volume key in the state
+directory (`browse-identity.key`, mode 0600, written on the first download)
+instead of minted per download, so the file comes out byte-identical every
+time and the copy already installed keeps working. No token and no password
+is persisted, and **consent is still required on every authorization** — the
+bookmark and the profile stop being one-time-use; the one Authorize click per
+session does not go away. Revoking a program now deletes its identity, so its
+profile is dead for good rather than until the next restart, and the API says
+so with a 500 if that could not be written. Closes KL-17; KL-18 (a local
+process can squat a predictable port) stands.
+
+**Generated bookmarks have names.** Cyberduck read `Default Nickname` and
+`Name` from the profile, neither of which pelfs set, so every bookmark showed
+`127.0.0.1 - WebDAV (HTTP)`. They now read `pelfs: <volume> (<label>)`.
+
+**A refusal at `/oauth/authorize` explains itself on the page** instead of
+three words of `text/plain`, and a callback-port mismatch names both ports.
+
 **`pelfs graft` splices into a volume that already has content in it.** Until
 now grafting a foreign Pelican tree replaced the volume's namespace, so the
 only usable sequence was `pelfs init` then `pelfs graft` — which is not what
@@ -91,6 +149,46 @@ page a user lands on:**
   a manual reload. The page now takes its readiness from the same event stream
   the durability panel reads, and shows the panel and the connection banner
   while it waits.
+
+### `pelfs fsck` findings now have a severity, and a warning does not fail a run
+
+`fsck` had one verdict: anything it found was damage, and any finding exited
+1. That is right for everything it checks today and wrong for two checks
+arriving next, where the thing being reported is normal rather than broken —
+an external source a volume points at having been republished, or a pinned
+source that cannot be verified from this volume's objects alone. Under the
+old model those would exit 1 on a perfectly healthy volume, and an operator
+who learns that `fsck` cries wolf stops running `fsck`.
+
+What changes for an operator:
+
+- **Nothing was reclassified.** Every check `fsck` ships still reports
+  damage, still exits 1, and reports it in the same words. Nothing produces
+  a warning yet; this release is the tier, not a user of it.
+- **Exit status is unchanged for damage and for a healthy volume**: 0 when
+  nothing was found, 1 when the generation is damaged or the check could not
+  run, 2 for a usage error. Warnings alone will exit **0** — a script that
+  reads "nonzero means broken" will not start failing on a volume that is
+  fine.
+- **`--strict`** fails on warnings too, for a cron job that wants any
+  finding to be an alert. It exits 1, like damage: the flag means "a warning
+  is an error".
+- **Every finding line now leads with its severity** — `error: missing-chunk:
+  /path: ...` — so a line lifted out of the report by a grep still says
+  whether it is damage. The kind, path and detail behind it are unchanged.
+- **The summary line names the warnings it is standing next to.** A run with
+  warnings and no damage says `generation is consistent, with 2 warnings to
+  read above (not damage)`, so "consistent" is never the whole story when it
+  is not. The words `generation is consistent` still appear whenever the
+  generation is consistent, which is what existing greps match.
+
+For anyone using `internal/fsck` directly: `Problem` carries a `Severity`
+(`SeverityError` is the zero value, so an unstated severity is damage),
+`Report` gained `Errors()`, `Warnings()`, `Damaged()` and `Clean()`, and
+`Report.OK()` is **gone**. It used to mean "no findings at all"; with two
+severities every caller has to say which question it is asking — "is this
+volume sound" (`Damaged`) or "is there anything to show a human" (`Clean`) —
+and removing it is how each one got asked.
 
 ### Fixed
 

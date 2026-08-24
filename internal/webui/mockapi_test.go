@@ -584,9 +584,34 @@ func (a *mockAPI) state() map[string]any {
 	return st
 }
 
-func (a *mockAPI) resetHook(w http.ResponseWriter, _ *http.Request) {
+// resetHook is the driver hook, and it does two things.
+//
+// `{"reset": true}` (or an empty body) puts the volume back the way it started
+// -- see seed for why a browser suite has to be order-independent.
+//
+// `{"mode": "read-only"}` is the second, and it exists for one assertion the
+// browser suite cannot otherwise make: `pelfs browse` is READ-ONLY BY DEFAULT,
+// and the whole point of the shipped design is that such a session renders no
+// publish control at all rather than a disabled one explaining itself. The
+// harness runs `pelfs browse --rw` (it has to: the publish path is the other
+// thing under test), so read-only is not reachable there, and this mock is the
+// only server in the suite that can report it.
+func (a *mockAPI) resetHook(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Reset bool   `json:"reset"`
+		Mode  string `json:"mode"`
+	}
+	// A body is optional and a malformed one is not worth a 400 here: the
+	// zero value is "reset", which is what every caller but one wants.
+	_ = json.NewDecoder(r.Body).Decode(&req)
 	a.mu.Lock()
-	a.seed()
+	switch req.Mode {
+	case "read-only", "read-write":
+		a.mode = req.Mode
+	default:
+		a.seed()
+		a.mode = "read-write"
+	}
 	a.mu.Unlock()
 	writeMockJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }

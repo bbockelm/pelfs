@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { Filemanager, Willow } from "@svar-ui/react-filemanager";
+import { Filemanager, Willow, WillowDark } from "@svar-ui/react-filemanager";
 import type { IApi } from "@svar-ui/react-filemanager";
 import { Brand } from "./brand/Brand";
 import { PelfsDataProvider, wireLazyLoading, type StoreBus } from "./api/provider";
@@ -9,7 +9,7 @@ import { subscribeState, type StreamStatus } from "./api/events";
 import { downloadFile } from "./api/control";
 import type { BrowseState, DriveInfo, Entry, ListingMeta } from "./api/types";
 import { Durability } from "./ui/Durability";
-import { ErrorBanner, ListingNotices, UploadNotice } from "./ui/Notices";
+import { CapCaveat, ErrorBanner, SearchCaveat, UploadNotice } from "./ui/Notices";
 import { publishState } from "./durability";
 import { CONNECT } from "./routes";
 
@@ -45,6 +45,40 @@ import { CONNECT } from "./routes";
  */
 
 const API_BASE = "/api/v1";
+
+/**
+ * WHICH OF THE COMPONENT'S TWO THEMES TO RENDER, and why this is a hook rather
+ * than a stylesheet.
+ *
+ * The app's own chrome has followed `prefers-color-scheme` since it was
+ * written; the component has a light theme and a dark theme and no automatic
+ * relationship to either. That combination shipped, and in dark mode it was
+ * unusable rather than merely inconsistent: the chrome went dark, the file
+ * manager stayed on Willow's white cards, and the file names inherited the
+ * app's near-white body colour -- white text on white cards.
+ *
+ * So the media query is READ here and the matching theme is rendered. Both
+ * theme components appear below as literal JSX tags, each with fonts={false}:
+ * vite.config.ts's offlineAssets plugin scans the SOURCE for a theme element
+ * that leaves fonts on (which injects a stylesheet link to cdn.svar.dev), and
+ * it can only see a literal tag -- an aliased component, `const Theme = dark ?
+ * WillowDark : Willow`, would have silently taken the page out from under that
+ * guard. (The plugin reads comments too, so this one names no tags.)
+ */
+function usePrefersDark(): boolean {
+  const query = "(prefers-color-scheme: dark)";
+  const [dark, setDark] = useState(
+    () => typeof matchMedia === "function" && matchMedia(query).matches,
+  );
+  useEffect(() => {
+    if (typeof matchMedia !== "function") return;
+    const mq = matchMedia(query);
+    const onChange = () => setDark(mq.matches);
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, []);
+  return dark;
+}
 
 /**
  * THE VOLUME OPENS AFTER THE LISTENER, which is why `connecting` is a state of
@@ -86,6 +120,7 @@ export function App() {
   const [search, setSearch] = useState("");
   const [path, setPath] = useState("/");
   const [listings, setListings] = useState<Record<string, ListingMeta>>({});
+  const dark = usePrefersDark();
 
   const providerRef = useRef<PelfsDataProvider | null>(null);
   // The session token, for the two routes that are not the provider's
@@ -335,132 +370,171 @@ export function App() {
   if (boot.kind === "no-session") {
     return (
       <Shell>
-        <div className="pelfs-banner pelfs-banner--bad" data-testid="session-error">
+        <p className="pelfs-note pelfs-note--bad" data-testid="session-error">
           {boot.why}
-        </div>
+        </p>
       </Shell>
     );
   }
 
   const meta = listings[path] ?? null;
   const ready = boot.kind === "ready" ? boot : null;
+  const mode = state?.mode ?? ready?.info.mode ?? "";
+
+  // The grid, built once and rendered inside whichever of the component's two
+  // themes matches the platform. See usePrefersDark for why both theme tags
+  // are literal.
+  const grid = ready ? (
+    <Filemanager
+      icons="simple"
+      // The cast is the provider's parseDates: the wire carries `date` as an
+      // ISO string and RestDataProvider.loadFiles rewrites each one into a
+      // Date in place before this array is ever rendered, so the runtime value
+      // matches IEntity even though the wire type does not.
+      data={ready.root as unknown as Parameters<typeof Filemanager>[0]["data"]}
+      drive={drive}
+      // A read-only session cannot lose anything, which is `pelfs browse`'s
+      // default. Telling the component makes the menus match the truth
+      // instead of offering a rename that will 403.
+      readonly={mode === "read-only"}
+      init={init}
+    />
+  ) : null;
 
   return (
     <div className="pelfs-app" data-testid="pelfs-shell" data-phase={state?.phase ?? "unknown"}>
-      <header className="pelfs-header">
-        <Brand subtitle={state?.volume ?? ""} />
-        <div className="pelfs-header__right">
-          <span className="pelfs-sub" data-testid="branch-generation">
-            branch {state?.branch ?? "—"}, generation{" "}
-            {state && state.phase === "ready" ? state.generation : "—"}
+      {/* THE APP BAR: who this is, what volume it is serving, the session's
+          facts, and the one link off this page. The link is here and not in
+          the status panel because it is navigation and not a durability
+          action -- it used to sit on the same line as "Publish now", which
+          made an unrelated page look like a step in publishing. */}
+      <header className="pelfs-appbar">
+        <div className="pelfs-appbar__id">
+          <Brand subtitle={state?.volume ?? ""} />
+        </div>
+        <div className="pelfs-appbar__facts">
+          <span className="pelfs-fact" data-testid="branch-generation">
+            branch <b>{state?.branch ?? "—"}</b>, generation{" "}
+            <b>{state && state.phase === "ready" ? state.generation : "—"}</b>
           </span>
-          <span className="pelfs-sub" data-testid="lease" data-lease-state={state?.lease ?? "—"}>
-            lease: {state?.lease ?? "—"}
+          <span className="pelfs-fact" data-testid="lease" data-lease-state={state?.lease ?? "—"}>
+            lease <b>{state?.lease ?? "—"}</b>
           </span>
-          <span className="pelfs-badge" data-testid="mode">
-            {state?.mode ?? "—"}
+          <span className="pelfs-chip" data-testid="mode" data-mode={mode}>
+            {mode || "—"}
           </span>
+          <a className="pelfs-navlink" href={CONNECT} data-testid="connect-link">
+            Connect a program →
+          </a>
         </div>
       </header>
 
-      {state?.test_hooks ? (
-        <div className="pelfs-banner pelfs-banner--warn" data-testid="test-hooks-banner">
-          <strong>--test-hooks is on.</strong> This session accepts a route that overrides what this
-          page reports, so what you see may not be what the volume holds. It exists for the
-          browser-driver test suite. Never use it on real data.
-        </div>
-      ) : null}
+      <div className="pelfs-workspace">
+        <Durability state={state} token={token} onNotice={setUpload} />
 
-      {/* A FEDERATION LOGIN WAITING ON THE USER (U13), which is the one state
-          where this page cannot do its job and the reason is not on it.
-          Without this line a user whose institution is asking for a device
-          login sits at `/` watching a listing that never arrives.
+        {state?.test_hooks ? (
+          <p className="pelfs-note pelfs-note--warn" data-testid="test-hooks-banner">
+            <strong>--test-hooks is on.</strong> This session accepts a route that overrides what
+            this page reports, so what you see may not be what the volume holds. It exists for the
+            browser-driver test suite. Never use it on real data.
+          </p>
+        ) : null}
 
-          It is a POINTER, not a second copy of the card. The card owns a URL,
-          a code the user must type, an expiry and a dismiss control; a second
-          implementation of it here would be a second place for the code to be
-          rendered wrongly, and the dismiss is one-way (nothing tells us the
-          flow finished), so two dismiss buttons for one prompt is worse than
-          one. /connect renders the cards; this says they are there. */}
-      {state?.prompts?.length ? (
-        <div className="pelfs-banner pelfs-banner--warn" data-testid="sso-waiting">
-          <strong>
-            {state.prompts.length === 1
-              ? "Your institution is asking you to log in."
-              : `${state.prompts.length} federation logins are waiting for you.`}
-          </strong>{" "}
-          Until that is done this page cannot read the volume.{" "}
-          <a className="pelfs-link" href={CONNECT} data-testid="sso-waiting-link">
-            Open the login prompt
-          </a>{" "}
-          — it carries the address and the code. The same prompt is in the terminal running{" "}
-          <code>pelfs browse</code>.
-        </div>
-      ) : null}
+        {/* A FEDERATION LOGIN WAITING ON THE USER (U13), which is the one
+            state where this page cannot do its job and the reason is not on
+            it. Without this line a user whose institution is asking for a
+            device login sits at `/` watching a listing that never arrives.
 
-      <Durability state={state} token={token} onNotice={setUpload} />
-
-      <ErrorBanner text={error} onReload={() => location.reload()} />
-      <UploadNotice text={upload} />
-      {ready ? <ListingNotices meta={meta} search={search} /> : null}
-
-      {boot.kind === "connecting" ? (
-        // The same sentence M1's page carries, for the same reason: this is
-        // where an institution may ask for a device login, and a user watching
-        // an empty page needs to know that the wait is expected and where the
-        // prompt will appear.
-        <div className="pelfs-banner" data-testid="phase-banner">
-          connecting to the federation — this is where your institution may ask you to approve
-          access. The terminal shows the same prompt, and the panel above is live already.
-        </div>
-      ) : null}
-
-      {boot.kind === "no-api" ? (
-        <div className="pelfs-banner pelfs-banner--bad" data-testid="pelfs-status">
-          The volume is open but the JSON data plane did not answer: <code>{boot.why}</code>
-          <div className="pelfs-muted">
-            The durability panel above is still live, so what it says about publishing is true.{" "}
-            <code>pelfs browse</code> is still running in your terminal, and Ctrl-C there stops it
-            (sealing, if you started it with <code>--rw</code>). To move files meanwhile, use{" "}
-            <a className="pelfs-link" href={CONNECT}>
-              a WebDAV client
+            It is a POINTER, not a second copy of the card. The card owns a
+            URL, a code the user must type, an expiry and a dismiss control; a
+            second implementation of it here would be a second place for the
+            code to be rendered wrongly, and the dismiss is one-way (nothing
+            tells us the flow finished), so two dismiss buttons for one prompt
+            is worse than one. /connect renders the cards; this says they are
+            there. */}
+        {state?.prompts?.length ? (
+          <p className="pelfs-note pelfs-note--warn" data-testid="sso-waiting">
+            <strong>
+              {state.prompts.length === 1
+                ? "Your institution is asking you to log in."
+                : `${state.prompts.length} federation logins are waiting for you.`}
+            </strong>{" "}
+            Until that is done this page cannot read the volume.{" "}
+            <a className="pelfs-link" href={CONNECT} data-testid="sso-waiting-link">
+              Open the login prompt
             </a>{" "}
-            or <code>pelfs mount</code>.
-          </div>
-        </div>
-      ) : null}
+            — it carries the address and the code. The same prompt is in the terminal running{" "}
+            <code>pelfs browse</code>.
+          </p>
+        ) : null}
 
-      {ready ? (
-        <main className="pelfs-main">
-          {/* fonts={false}: the theme otherwise injects
-              <link rel=stylesheet href=https://cdn.svar.dev/fonts/wxi/wx-icons.css>
-              and a preconnect to the same host. icons="simple": the default icon
-              callback builds https://cdn.svar.dev/icons/... URLs per file
-              extension. Both were caught on the wire by the U0 probe; with both
-              off the page makes ZERO requests off loopback, which vite.config.ts's
-              no-remote-assets plugin and a Playwright assertion then keep true. */}
-          <Willow fonts={false}>
-            <Filemanager
-              icons="simple"
-              // The cast is the provider's parseDates: the wire carries `date`
-              // as an ISO string and RestDataProvider.loadFiles rewrites each
-              // one into a Date in place before this array is ever rendered, so
-              // the runtime value matches IEntity even though the wire type
-              // does not.
-              data={ready.root as unknown as Parameters<typeof Filemanager>[0]["data"]}
-              drive={drive}
-              // A read-only session cannot lose anything, which is `pelfs
-              // browse`'s default. Telling the component makes the menus match
-              // the truth instead of offering a rename that will 403.
-              readonly={(state?.mode ?? ready.info.mode) === "read-only"}
-              init={init}
-            />
-          </Willow>
-        </main>
-      ) : null}
+        <ErrorBanner text={error} onReload={() => location.reload()} />
+        <UploadNotice text={upload} />
+
+        {boot.kind === "connecting" ? (
+          // The same sentence M1's page carries, for the same reason: this is
+          // where an institution may ask for a device login, and a user
+          // watching an empty page needs to know that the wait is expected
+          // and where the prompt will appear.
+          <p className="pelfs-note" data-testid="phase-banner">
+            connecting to the federation — this is where your institution may ask you to approve
+            access. The terminal shows the same prompt, and the panel above is live already.
+          </p>
+        ) : null}
+
+        {boot.kind === "no-api" ? (
+          <p className="pelfs-note pelfs-note--bad" data-testid="pelfs-status">
+            The volume is open but the JSON data plane did not answer: <code>{boot.why}</code>
+            <span className="pelfs-note__more">
+              The durability panel above is still live, so what it says about publishing is true.{" "}
+              <code>pelfs browse</code> is still running in your terminal, and Ctrl-C there stops it
+              (sealing, if you started it with <code>--rw</code>). To move files meanwhile, use{" "}
+              <a className="pelfs-link" href={CONNECT}>
+                a WebDAV client
+              </a>{" "}
+              or <code>pelfs mount</code>.
+            </span>
+          </p>
+        ) : null}
+
+        {ready ? (
+          <section className="pelfs-panel pelfs-panel--files" data-testid="pelfs-files-panel">
+            {/* The pane's own accessory row, directly above the component's
+                toolbar -- whose search box is at its left, which is the
+                reason the search caveat is here and not in a footer. */}
+            <div className="pelfs-panel__bar">
+              {/* The folder this pane is showing, as a PATH. The component's
+                  breadcrumb above shows the same place in names; a path is
+                  what a person retypes into `pelfs mount` or a WebDAV
+                  client, which is the thing this page keeps recommending. */}
+              <span className="pelfs-path" data-testid="pelfs-path">
+                {path || "/"}
+              </span>
+              <span className="pelfs-panel__bar-spacer" />
+              <SearchCaveat meta={meta} search={search} />
+              <CapCaveat meta={meta} />
+            </div>
+            <div className="pelfs-panel__body pelfs-fm">
+              {/* fonts={false}: the theme otherwise injects
+                  <link rel=stylesheet href=https://cdn.svar.dev/fonts/wxi/wx-icons.css>
+                  and a preconnect to the same host. icons="simple": the
+                  default icon callback builds https://cdn.svar.dev/icons/...
+                  URLs per file extension. Both were caught on the wire by the
+                  U0 probe; with both off the page makes ZERO requests off
+                  loopback, which vite.config.ts's no-remote-assets plugin and
+                  a Playwright assertion then keep true. */}
+              {dark ? (
+                <WillowDark fonts={false}>{grid}</WillowDark>
+              ) : (
+                <Willow fonts={false}>{grid}</Willow>
+              )}
+            </div>
+          </section>
+        ) : null}
+      </div>
 
       <div className="pelfs-statusline">
-        <span data-testid="stream-status" data-stream={stream}>
+        <span className="pelfs-stream" data-testid="stream-status" data-stream={stream}>
           {stream === "open"
             ? "live"
             : stream === "reconnecting"
@@ -469,10 +543,11 @@ export function App() {
                 ? "pelfs browse has exited — this page is now a snapshot"
                 : "connecting…"}
         </span>
-        <span className="pelfs-muted">
+        <span>
           whole-file upload only: a dropped connection restarts it, and there is no progress bar.
           For a large set of files use <code>pelfs mount</code> or a WebDAV client.
         </span>
+        <span className="pelfs-statusline__spacer" />
         {/* The MIT notices for the bundled packages. The distribution is a Go
             binary with the bundle inside it, so a person who has nothing but
             the binary has to be able to reach them from what it serves. This
@@ -487,21 +562,24 @@ export function App() {
 }
 
 /**
- * The header, for the two states with no credential and so nothing to render:
- * the first paint, and a session that could not be established.
+ * The app bar alone, for the two states with no credential and so nothing to
+ * render: the first paint, and a session that could not be established.
  */
 function Shell({ children }: { children: ReactNode }) {
   return (
     <div className="pelfs-app" data-testid="pelfs-shell">
-      <header className="pelfs-header">
-        <Brand />
+      <header className="pelfs-appbar">
+        <div className="pelfs-appbar__id">
+          <Brand />
+        </div>
       </header>
-      <main className="pelfs-main pelfs-main--prose">{children}</main>
+      <div className="pelfs-workspace pelfs-workspace--prose">{children}</div>
       {/* The notices link is here as well as in the full status line, because
           the MIT obligation does not depend on the app being able to start:
           a page that failed to get a session still ships the bundle whose
           licences these are. */}
       <div className="pelfs-statusline">
+        <span className="pelfs-statusline__spacer" />
         <a className="pelfs-link" href="./third_party.txt" data-testid="pelfs-notices-link">
           third-party notices
         </a>
@@ -509,4 +587,3 @@ function Shell({ children }: { children: ReactNode }) {
     </div>
   );
 }
-

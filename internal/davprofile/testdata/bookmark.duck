@@ -13,8 +13,8 @@
 	<key>Path</key>
 	<string>/dav/</string>
 	<key>Nickname</key>
-	<string>Cyberduck - pelfs pelican://osg-htc.org/user/bbockelman</string>
+	<string>pelfs: osg-htc.org/user/bbockelman (Cyberduck)</string>
 	<key>Comment</key>
-	<string>pelfs pelican://osg-htc.org/user/bbockelman (read-only, this session only)</string>
+	<string>pelfs pelican://osg-htc.org/user/bbockelman (read-only; install once, authorize once per session)</string>
 </dict>
 </plist>

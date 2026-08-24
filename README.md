@@ -270,6 +270,36 @@ have to ask for: one object per line, with the message TEMPLATE as a
 constant `msg` you can group by and the values as typed fields (a size is
 a count of bytes, a duration a count of nanoseconds).
 
+## `pelfs fsck`: what it reports, and what it exits
+
+Every finding carries a severity, and the exit status follows from it:
+
+```
+0   nothing found, or warnings only
+1   the generation is damaged (or fsck could not run at all)
+2   usage error -- a bad flag, -h
+```
+
+An **error** means the generation is damaged: something it states about
+itself is not true of the objects behind it, and a reader will get wrong
+bytes or an error where the generation promised data. Every check fsck
+ships today reports errors and nothing else.
+
+A **warning** means something worth knowing that is *not* damage. Nothing
+produces one yet; the tier exists for the checks arriving next, where the
+thing being reported is normal (an external source a volume points at has
+been republished, say). Those must not fail a healthy volume, because an
+fsck that cries wolf is one people stop running.
+
+So warnings alone exit **0**, and every finding is printed with its
+severity in front of it (`warning: ...`), with the count repeated in the
+last line -- `generation is consistent, with 2 warnings to read above` --
+so "consistent" is never the whole story when it is not.
+
+Add `--strict` to fail on warnings too, for a cron job that wants any
+finding to be an alert. It exits 1, the same as damage: the flag means "a
+warning is an error".
+
 ## Disaster: losing the refs, and replacing the key
 
 Two commands for the two things that can go wrong with the only mutable part

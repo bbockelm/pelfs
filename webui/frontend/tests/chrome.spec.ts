@@ -165,6 +165,19 @@ test.describe("the page reads as a file manager", () => {
     await expect(statusline).not.toContainText("progress bar");
     await expect(statusline).not.toContainText("dropped connection");
     await expect(page.getByTestId("pelfs-notices-link")).toBeVisible();
+
+    // THE HINT BESIDE THE PUBLISH BUTTON IS GONE. A disabled control reading
+    // "Publish now" with "(nothing to publish)" printed next to it is one fact
+    // rendered twice, which is what the owner called duplicate info; the
+    // button wears the state instead. (The read-only session is the one that
+    // still renders a hint, and it renders no button -- see below.)
+    const button = page.getByTestId("publish-button");
+    await expect(button).toHaveText("Nothing to publish");
+    await expect(page.getByTestId("publish-hint")).toHaveCount(0);
+    // AND THE IDLE-SEAL CLAUSE IS GONE FROM THE DURABILITY LINE. ", or 30s
+    // after this tab closes" was true and was not worth the width; the seal
+    // still happens.
+    await expect(page.getByTestId("durability")).not.toContainText("after this tab closes");
   });
 
   test("the durability line answers one question and repeats nothing", async ({
@@ -244,6 +257,8 @@ test.describe("the page reads as a file manager", () => {
     const button = page.getByTestId("publish-button");
     await expect(button).toBeEnabled();
     await expect(button).toHaveAttribute("data-publish-state", "ready");
+    // The middle of the three states, and the only one that is a live control.
+    await expect(button).toHaveText("Publish now");
     // In the status panel, not floating in the header.
     expect(
       await page

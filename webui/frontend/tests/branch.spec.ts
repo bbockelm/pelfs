@@ -70,13 +70,17 @@ test.describe("the branch picker", () => {
 
     const status = page.getByTestId("publish-status");
     await expect(status).toHaveAttribute("data-job-state", "running");
-    await expect(status).toContainText("switching branches");
+    // WHAT A RUNNING JOB SAYS IS ON THE BUTTON NOW, and nowhere else: the
+    // hint beside the control and the paragraph under it were both deleted as
+    // duplicate info, so the label is the single place this can be got wrong.
+    const button = page.getByTestId("publish-button");
+    await expect(button).toHaveText("Switching branches");
     // THE WHOLE POINT. Nothing is going to the federation.
-    await expect(status).not.toContainText("publishing");
-    await expect(page.getByTestId("publish-hint")).toContainText("switching branches");
+    await expect(button).not.toContainText("Publish");
+    await expect(page.getByTestId("durability")).not.toContainText("Publishing");
     // The overlay is held either way, so the control that would write to it
     // is disabled while this runs.
-    await expect(page.getByTestId("publish-button")).toBeDisabled();
+    await expect(button).toBeDisabled();
 
     // The select shows the SERVER's branch, not the click: a 202 is not a
     // switch, and a control that jumped ahead would be showing a branch this

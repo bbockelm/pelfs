@@ -164,10 +164,9 @@ export function App() {
       provider.onError = (err) => setError(err.message);
       provider.onSettled = ({ url, method }) => {
         if (method === "POST" && url.startsWith("upload?")) {
+          // The owner's own words, and they replace four sentences of ours.
           setUpload(
-            "Upload finished. The bytes are on THIS MACHINE, in the local overlay — durable " +
-              "against a crash, invisible to the federation until a publish. The line above says " +
-              "when that happens; “Publish now” makes it happen immediately.",
+            'File uploaded to local machine; click "Publish now" to push it to the federation',
           );
         }
       };

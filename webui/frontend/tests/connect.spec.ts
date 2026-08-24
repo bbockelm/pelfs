@@ -89,28 +89,26 @@ test.describe("the two addresses", () => {
     await expect(page.getByTestId("durability-legend")).toHaveCount(0);
   });
 
-  test("the connection page says where the file manager is, in one short line", async ({
+  test("the lede names Cyberduck, links its download, and explains nothing", async ({
     page,
     session,
   }) => {
-    // M1's page carried one honest sentence about its own limits: "this page
-    // does not browse files". That was the whole answer when nothing did. Now
-    // something does, and half an answer is worse than the old whole one --
-    // so the sentence has to name the address.
-    //
-    // AND IT HAS TO BE SHORT. This lede grew into a 180-word paragraph that
-    // explained WebDAV, the profile's stability, the per-session
-    // authorization, the password's lifetime and what is written to disk --
-    // "The connect page text is HORRIBLE. It overly explains, a wall of text
-    // for a page that can just configure CyberDuck." A word budget is a crude
-    // assertion and it is the only one that catches the thing that actually
-    // went wrong, which is length.
+    // THIS LEDE HAS BEEN CUT THREE TIMES. It was a 180-word paragraph about
+    // WebDAV, the profile's stability, the per-session authorization and what
+    // is written to disk -- "The connect page text is HORRIBLE. It overly
+    // explains, a wall of text for a page that can just configure CyberDuck."
+    // What survived that cut was one sentence about what the page ISN'T
+    // ("This page does not browse files — the file manager does — it sets
+    // Cyberduck up"), and the verdict on that was "USELESS". So it is deleted,
+    // and this test is what keeps it deleted; the word budget comes down with
+    // it, because a budget that is not tightened after a cut is a licence to
+    // grow back.
     await openConnect(page, session);
     const blurb = page.getByTestId("connect-blurb");
-    await expect(blurb).toContainText("does not browse files");
-    await expect(blurb.locator('a[href="/"]')).toHaveCount(1);
+    await expect(blurb).not.toContainText("does not browse files");
+    await expect(blurb).not.toContainText("file manager");
     const words = ((await blurb.textContent()) ?? "").trim().split(/\s+/).length;
-    expect(words, "the lede is a line, not an essay").toBeLessThan(55);
+    expect(words, "the lede is a line, not an essay").toBeLessThan(30);
 
     // The concrete thing, named and linked. A user who has never heard the
     // word "Cyberduck" cannot act on "connect another program"; a link can be
@@ -120,12 +118,38 @@ test.describe("the two addresses", () => {
     await expect(duck).toHaveAttribute("href", "https://cyberduck.io/");
     await expect(duck).toHaveAttribute("rel", /noopener/);
 
+    // AND THE DOWNLOAD, which was the hole: every control on this page
+    // configures Cyberduck, and a reader who does not have it had nowhere to
+    // go. It says "Download", so it reads as one before it is clicked.
+    const dl = page.getByTestId("cyberduck-download");
+    await expect(dl).toHaveAttribute("href", "https://cyberduck.io/download/");
+    await expect(dl).toHaveAttribute("rel", /noopener/);
+    await expect(dl).toContainText(/download/i);
+
     // And the whole page's prose is now beside its controls rather than above
     // them: the paragraph that began "The Cyberduck profile is the same file
     // every session" is gone, and nothing on the page says it.
     const main = page.locator("main");
     await expect(main).not.toContainText("the same file every session");
     await expect(main).not.toContainText("Nothing handed out here can publish");
+  });
+
+  test("no password reaches this page", async ({ page, session }) => {
+    // PASSWORD AUTH IS GONE, and a deletion needs an assertion more than an
+    // addition does: the username and password rows, the bookmark that opened
+    // the Basic path, and the shown-once notice that existed only to warn
+    // about the password all had ids, and this counts every one of them at
+    // zero. The credential desk still hands out a profile and a bookmark.
+    await openConnect(page, session);
+    for (const gone of [
+      "credential-basic-user",
+      "credential-basic-password",
+      "credential-notice",
+      "download-basic",
+    ]) {
+      await expect(page.getByTestId(gone)).toHaveCount(0);
+    }
+    await expect(page.locator("main")).not.toContainText(/password/i);
   });
 
   test("the footer is at the bottom of the viewport, on a short page", async ({

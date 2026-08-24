@@ -75,14 +75,17 @@ export type DurabilityLine = {
 /**
  * The one-line answer to "is my data in the federation yet", AND NOTHING ELSE.
  *
- * It used to open lowercase, mid-sentence, and it repeated two facts the app
- * bar already carries: the session's mode ("read-only.", which is a chip three
- * inches to the right) and the generation ("(generation 5)", which is beside
- * the branch). The owner's verdict was "strangely capitalized and repeats
- * things elsewhere in the UI", and both halves were true. So: a capitalised
- * sentence, no mode, no generation. Where the volume stands is the app bar's
- * job; whether the user's bytes are safe is this line's, and it is the only
- * line on either surface that answers it.
+ * IT IS THE ONLY LINE. A running seal used to be said twice -- this countdown,
+ * and a second paragraph under it reading "publishing… — the seal freezes the
+ * overlay, so uploads resume in a moment". The owner's verdict was "This data
+ * could all be on the same line!", so the countdown clause BECOMES the
+ * publishing clause while a seal runs and the paragraph under it renders
+ * nothing (ui/Durability.tsx).
+ *
+ * THE IDLE CLAUSE WENT WITH THAT EDIT. ", or 30s after this tab closes" was
+ * true and was not worth the width. The behaviour is untouched --
+ * cmd/pelfs/idleseal.go still seals a session whose last tab went away -- and
+ * a publish that happens that way still says so when it lands.
  *
  * What did NOT get shortened away is the distinction. Three glyphs, three
  * characters, and "on this machine only" never wearing the check --
@@ -126,18 +129,19 @@ export function describe(s: BrowseState | null): DurabilityLine {
   }
   const sending =
     s.upload_backlog > 0 ? ` ${GLYPH.sending} Sending ${bytes(s.upload_backlog)}.` : "";
-  // The idle clause is not decoration: it is the promise that closing this
-  // tab publishes rather than abandoning. Said only when the server says
-  // idle sealing is on for this session, and in cmd/pelfs/browse.html's
-  // words, because the two surfaces have one vocabulary.
-  const idle =
-    s.idle_seal_s && s.idle_seal_s > 0 ? `, or ${secs(s.idle_seal_s)} after this tab closes` : "";
+  // A seal in flight REPLACES the countdown rather than standing under it: a
+  // countdown to a publish that is already running is two answers to one
+  // question, and they are the pair the owner asked to collapse.
+  const when =
+    s.publish && s.publish.state === "running" && s.publish.reason !== "branch"
+      ? "Publishing now."
+      : `Next publish in ${secs(s.next_publish_s)}.`;
   return {
     state: "staged",
     glyph: GLYPH.staged,
     text:
       `${s.staged_files} file${s.staged_files === 1 ? "" : "s"} (${bytes(s.staged_bytes)}) ` +
-      `on this machine only. Next publish in ${secs(s.next_publish_s)}${idle}.${sending}`,
+      `on this machine only. ${when}${sending}`,
   };
 }
 
@@ -173,16 +177,31 @@ export function publishState(s: BrowseState | null): PublishState {
   return "ready";
 }
 
-export const PUBLISH_HINT: Record<PublishState, string> = {
-  ready: "",
-  connecting: "(waiting for the volume)",
-  // Nothing: the line above is the whole answer, and it is the server's.
+/**
+ * ONE CONTROL, WEARING ITS OWN STATE.
+ *
+ * There used to be a hint beside the button as well as the button: a disabled
+ * control reading "Publish now" with "(nothing to publish)" next to it says one
+ * thing twice, and the owner said so -- "duplicate info". So the label IS the
+ * state, and there is nothing beside it.
+ *
+ * An empty label means NO BUTTON AT ALL: a failed open has no volume to publish
+ * to, and a read-only session gets READ_ONLY_HINT where the control would be.
+ */
+export const PUBLISH_LABEL: Record<PublishState, string> = {
+  ready: "Publish now",
+  nothing: "Nothing to publish",
+  running: "Publishing",
+  // A branch switch takes the same job slot and is NOT a publish, so it does
+  // not borrow the word: the button says what is actually happening.
+  switching: "Switching branches",
+  connecting: "Waiting for the volume",
   failed: "",
-  "read-only": "(read-only session — restart with --rw to publish)",
-  running: "(publishing — this holds the overlay, so writes wait)",
-  switching: "(switching branches — this holds the overlay, so writes wait)",
-  nothing: "(nothing to publish)",
+  "read-only": "",
 };
+
+/** The one session that gets a sentence instead of a control. */
+export const READ_ONLY_HINT = "(read-only session — restart with --rw to publish)";
 
 /**
  * A lease this session no longer holds means everything the user does from

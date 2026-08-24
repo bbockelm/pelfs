@@ -93,16 +93,26 @@ func TestTheTwoSurfacesShareOneDurabilityVocabulary(t *testing.T) {
 	// publish in" became "Next publish in". What did NOT change is the thing
 	// this test exists for: the two surfaces still say it in the same words, so
 	// a later edit to one of them still fails here.
+	//
+	// IT GOT SHORTER AGAIN, and the same rule applies to what left. ", or 30s
+	// after this tab closes" is gone from both surfaces -- the idle seal still
+	// happens (cmd/pelfs/idleseal.go), it is just not worth the width -- and
+	// the publish HINTS are gone with it: one control now wears its own state,
+	// so "(nothing to publish)" beside a disabled "Publish now" became the
+	// button's own label. The labels are the vocabulary now, and they are
+	// pinned here exactly as the sentences were.
 	for _, phrase := range []string{
 		"on this machine only",
 		"Everything here is in the federation.",
 		"Next publish in",
-		// The idle clause. It is the promise that closing the tab publishes
-		// rather than abandons, and it was on the connection page only until
-		// the wiring pass -- so the surface that can actually stage files was
-		// the one that did not make the promise.
-		"after this tab closes",
-		"(nothing to publish)",
+		// The seal in flight, which REPLACES the countdown rather than
+		// standing under it: one line, on both surfaces.
+		"Publishing now.",
+		// The three button labels the owner specified: disabled-grey,
+		// blue, disabled-grey.
+		"Nothing to publish",
+		"Publish now",
+		"Publishing",
 		"(read-only session — restart with --rw to publish)",
 		// THE FAILED OPEN. The server serves a whole sentence in
 		// `state.error` -- what refused, where this session's state
@@ -115,8 +125,9 @@ func TestTheTwoSurfacesShareOneDurabilityVocabulary(t *testing.T) {
 		// job slot with reason "branch" (cmd/pelfs/browsebranch.go), and a
 		// surface that rendered it as "publishing" would tell the user
 		// their bytes were going to the federation while the session
-		// reopened an overlay on another head.
-		"(switching branches — this holds the overlay, so writes wait)",
+		// reopened an overlay on another head. It is the button's label
+		// now, and it still must not borrow the other one's word.
+		"Switching branches",
 	} {
 		if !strings.Contains(page, phrase) {
 			t.Errorf("cmd/pelfs/browse.html no longer says %q", phrase)

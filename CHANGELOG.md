@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+**A hostile pack can no longer panic a reader.** The stored-trailer length in
+a pack footer is eight bytes an origin chooses, and the bound check on it
+(`idxLen+footerSize > size`) overflowed: at MaxInt64 the sum wraps negative,
+passes, and the slice derived from it panics whatever was reading the pack — a
+mount, a `pelfs ls`, a browse session. CI's fuzzer found it; the crasher is
+checked in under `internal/packstore/testdata/fuzz/FuzzParseTail`. Lengths off
+a footer are now bounded by subtraction against the object's real size, which
+cannot overflow, and the same class is closed in the table trailer: the extent
+check moved above the trailer form (the table form read offsets and lengths as
+raw uint64s and skipped it), the record WIDTH the table declares is checked
+against the layout its readers assume, and the dead-list bound is computed in
+int64 so a 32-bit build cannot slice with a negative one.
+
 **A volume that will not open says why, on the page.** Both surfaces rendered
 every phase that was not `ready` as "reading the overlay…", so a session
 refused by a leftover branch lease looked exactly like one that was about to

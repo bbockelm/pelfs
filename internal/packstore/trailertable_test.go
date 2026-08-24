@@ -1,9 +1,12 @@
 package packstore
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/hex"
 	"testing"
+
+	"github.com/bbockelm/pelfs/internal/packidx"
 )
 
 func idHex(n uint64) string {
@@ -147,5 +150,79 @@ func TestTruncatedTableTrailerIsRefused(t *testing.T) {
 		if _, err := decodeTrailer(stored[:n], magicT); err == nil {
 			t.Errorf("a %d-byte prefix of a %d-byte trailer was accepted", n, len(stored))
 		}
+	}
+}
+
+// The table form reads an entry as offset/length/type at fixed offsets
+// inside a record whose WIDTH the untrusted bytes declare. A table
+// announcing a narrower record (or a shorter key) would have every reader
+// index past the end of what Lookup and At hand back, so the shape is
+// checked once, where the trailer is opened.
+func TestATableTrailerWithTheWrongShapeIsRefused(t *testing.T) {
+	shapes := []struct {
+		name              string
+		keyLen, recordLen int
+	}{
+		{"no record at all", packidx.KeySize, 0},
+		{"record too short for the type byte", packidx.KeySize, 16},
+		{"truncated keys", 12, tableRecord},
+	}
+	for _, sh := range shapes {
+		t.Run(sh.name, func(t *testing.T) {
+			b := packidx.NewBuilder(sh.keyLen, sh.recordLen, 0)
+			key := idBytes(1)
+			if err := b.Add(key[:sh.keyLen], make([]byte, sh.recordLen)); err != nil {
+				t.Fatal(err)
+			}
+			table := b.Encode()
+			stored := make([]byte, tableHeader+len(table))
+			copy(stored[0:8], tableMagic)
+			copy(stored[tableHeader:], table)
+
+			if _, err := decodeTrailer(stored, magicT); err == nil {
+				t.Errorf("decodeTrailer accepted a table of %d-byte keys and %d-byte records",
+					sh.keyLen, sh.recordLen)
+			}
+			if _, ok := LookupStored(stored, key); ok {
+				t.Errorf("LookupStored answered from a table of %d-byte keys and %d-byte records",
+					sh.keyLen, sh.recordLen)
+			}
+		})
+	}
+}
+
+// Extents in the table form are raw uint64s, so the sign check the JSON
+// path had always done has to cover this form too — it lives above the
+// form now. An entry whose length reads back negative must not reach a
+// range read by either door.
+func TestATableEntryWithANegativeExtentIsRefused(t *testing.T) {
+	tr := &trailer{Version: 1, Created: 1}
+	tr.Entries = append(tr.Entries, PackEntry{Key: idHex(7), Off: 0, Length: 4})
+	stored, _, err := encodeTrailer(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The key appears twice — once as the table's sample, once at the head
+	// of the record. The record is the later of the two, and its value
+	// follows the key.
+	key := idBytes(7)
+	at := bytes.LastIndex(stored, key[:])
+	if at < 0 {
+		t.Fatal("the entry's key is not in the encoded table")
+	}
+	for _, field := range []struct {
+		name string
+		off  int
+	}{{"offset", 0}, {"length", 8}} {
+		t.Run(field.name, func(t *testing.T) {
+			bad := bytes.Clone(stored)
+			binary.LittleEndian.PutUint64(bad[at+packidx.KeySize+field.off:], 1<<63)
+			if _, err := decodeTrailer(bad, magicT); err == nil {
+				t.Errorf("decodeTrailer accepted a negative %s", field.name)
+			}
+			if e, ok := LookupStored(bad, key); ok {
+				t.Errorf("LookupStored answered with %+v, whose %s is negative", e, field.name)
+			}
+		})
 	}
 }

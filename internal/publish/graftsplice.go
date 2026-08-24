@@ -629,37 +629,51 @@ func (s *GraftSpliceSource) Readdir(ctx context.Context, ino uint64) ([]SrcEntry
 		}
 		sort.Strings(names)
 		for _, name := range names {
-			if onSpine && name == s.comps[d] {
-				// The one entry the splice owns. Dropped here and
-				// re-stated below, which is also how a removal works:
-				// dropped and not re-stated.
+			if onSpine && name == s.comps[d] && (d+1 == len(s.comps) || s.baseIno[d+1] == 0) {
+				// The one entry the splice owns: the graft root itself, or
+				// a path component the base does not have under this name
+				// as a directory. Dropped here and re-stated below —
+				// except for a removal, which drops it and states nothing.
 				continue
 			}
+			// EVERY OTHER ENTRY IS THE BASE'S OWN, INCLUDING A SPINE
+			// DIRECTORY THE VOLUME ALREADY HAS, and it is passed through
+			// untouched rather than re-described.
+			//
+			// That is load-bearing and was a bug once: publish's walk
+			// records an inode's attributes from the LISTING that named it
+			// (only the root is Stat'ed), so a spine directory re-stated
+			// here from its inode and type alone would be published with
+			// mode 0 — an existing directory on the graft path made
+			// inaccessible by grafting underneath it.
 			out = append(out, SrcEntry{Name: name, Node: srcNodeFromGenfs(ents[name].Node)})
 		}
 	}
-	if onSpine && s.spineIno[d+1] != 0 {
+	if onSpine && s.spineNeedsStating(d) {
 		out = append(out, SrcEntry{Name: s.comps[d], Node: s.spineNode(d + 1)})
 	}
 	return out, nil
 }
 
-// spineNode is the node published for the directory at depth d of the
-// path: the base's own node where the base has it (so an existing
-// directory keeps its mode, owner and times), the graft's synthesized one
-// where it does not, and the graft root at the end.
+// spineNeedsStating reports whether the entry for depth d+1 has to be
+// synthesized here rather than passed through from the base.
+func (s *GraftSpliceSource) spineNeedsStating(d int) bool {
+	if s.spineIno[d+1] == 0 {
+		return false
+	}
+	return d+1 == len(s.comps) || s.baseIno[d+1] == 0
+}
+
+// spineNode is the node published for a directory the splice itself
+// states: the graft root at the end of the path, or a directory on the way
+// to it that the volume does not have. A directory the volume DOES have is
+// never described here — it comes through its parent's listing, with its
+// own mode, owner and times (see Readdir).
 func (s *GraftSpliceSource) spineNode(d int) SrcNode {
 	if d == len(s.comps) {
 		return s.mountNode
 	}
-	if s.baseIno[d] != 0 {
-		// Attributes come from Stat, which routes to the base; only the
-		// inode and type have to be right here, because publish reads
-		// every attribute it records through Stat during the walk.
-		return SrcNode{Inode: s.baseIno[d], Type: catalog.TypeDir}
-	}
-	n := s.nodeOfGraft(s.g.SpineInode(d - 1))
-	return n
+	return s.nodeOfGraft(s.g.SpineInode(d - 1))
 }
 
 // nodeOfGraft is one graft-source node, published under its shifted

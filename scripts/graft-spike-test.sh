@@ -528,6 +528,8 @@ GEN_BEFORE=$("$WORK/pelfs" fsck --state-dir "$WORK/state2" "$VOL2" 2>/dev/null |
 echo "the branch is still on generation ${GEN_BEFORE:-?} after two refusals"
 
 echo
+echo "-- the mode of a directory ON the graft path, before --"
+DOCS_MODE_BEFORE=$(stat -c %a "$WORK/ref2/docs")
 echo "-- and now the graft itself, into the populated volume --"
 "$WORK/pelfs" graft --state-dir "$WORK/state2" --block 1048576 "$VOL2" /ext "$EXT" \
     2>&1 | tee "$WORK/g-ok.log" | sed 's/^/    /'
@@ -562,6 +564,15 @@ for f in keep.txt docs/readme.txt docs/big.bin busy/mine.txt busy/mine2.txt; do
 done
 [ -d "$WORK/mnt2/empty" ] || { echo "FAIL: the empty directory did not survive the graft" >&2; exit 1; }
 echo "PASS: all $BASE_FILES pre-existing files, and the empty directory, read unchanged"
+# A directory ON the graft path is the one that could lose its attributes:
+# publish records an inode's attributes from the listing that named it, so a
+# spine directory re-described by the splice from its inode alone would be
+# republished as mode 0.
+"$WORK/pelfs" graft --state-dir "$WORK/state2" --list "$VOL2" >/dev/null
+DOCS_MODE_AFTER=$(stat -c %a "$WORK/mnt2/docs")
+[ "$DOCS_MODE_AFTER" = "$DOCS_MODE_BEFORE" ] || {
+  echo "FAIL: /docs is mode $DOCS_MODE_AFTER after the graft, was $DOCS_MODE_BEFORE" >&2; exit 1; }
+echo "PASS: directories keep their mode ($DOCS_MODE_BEFORE) across the splice"
 # And the grafted tree, from a prefix that holds none of the volume's bytes.
 cmp "$WORK/ref/data/small.txt" "$WORK/mnt2/ext/data/small.txt"
 cmp "$WORK/ref/data/nested/mid.bin" "$WORK/mnt2/ext/data/nested/mid.bin"

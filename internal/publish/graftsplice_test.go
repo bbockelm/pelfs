@@ -376,6 +376,30 @@ func TestGraftKeepsAnExistingDirectorysIdentity(t *testing.T) {
 	if got := strings.Join(names(t, fs, "/docs"), ","); got != "ext,readme.txt" {
 		t.Fatalf("/docs holds %q after the graft", got)
 	}
+	// AND ITS ATTRIBUTES. Publish records an inode's attributes from the
+	// LISTING that named it -- only the root is Stat'ed -- so a spine
+	// directory re-described by the splice from its inode and type alone
+	// would be published with mode 0, making an existing directory
+	// inaccessible because something was grafted underneath it. That was a
+	// real bug in this file's first draft.
+	ctx := context.Background()
+	was, err := fs0.GetAttr(ctx, docsIno)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now, err := fs.GetAttr(ctx, lookup(t, fs, "/docs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if now.Mode != was.Mode || now.UID != was.UID || now.GID != was.GID || now.MtimeNS != was.MtimeNS {
+		t.Fatalf("/docs was republished as mode %o uid %d gid %d mtime %d, was mode %o uid %d gid %d mtime %d",
+			now.Mode, now.UID, now.GID, now.MtimeNS, was.Mode, was.UID, was.GID, was.MtimeNS)
+	}
+	// Nlink is recomputed from the namespace by publish, so it MUST have
+	// moved: /docs gained a subdirectory.
+	if now.Nlink != was.Nlink+1 {
+		t.Fatalf("/docs has nlink %d after gaining a subdirectory, was %d", now.Nlink, was.Nlink)
+	}
 }
 
 // ---- the collision matrix ----

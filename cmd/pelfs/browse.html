@@ -211,10 +211,13 @@
   button[hidden] { display: none; }
   .statusrow { display: flex; gap: .9rem; align-items: baseline; flex-wrap: wrap; }
   .statusrow #durability { flex: 1 1 20rem; }
-  .statusrow #publish-hint { margin-left: auto; }
+  /* Whichever of the two is present goes to the right edge. Only one ever
+     is: the read-only session gets the sentence and no button, and every
+     other session gets the button and nothing beside it. */
+  .statusrow #publish-hint, .statusrow #publish { margin-left: auto; }
   #publish-hint, #publish-status { color: var(--muted); font-size: .8rem; }
   #publish-status { margin: .35rem 0 0; }
-  #publish-status:empty { display: none; }
+  #publish-hint:empty, #publish-status:empty { display: none; }
   .connect h2 { font-size: 1rem; margin: 0 0 .2rem; }
   .connect p { margin: 0 0 .6rem; color: var(--muted); font-size: .88rem; }
   .connect form { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; margin: .8rem 0; }

@@ -2,6 +2,7 @@ package localoauth
 
 import (
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -136,21 +137,52 @@ func (s *Server) exchangeCode(w http.ResponseWriter, r *http.Request) {
 		tokenError(w, http.StatusBadRequest, "invalid_grant")
 		return
 	}
+	// The client that presents the code must be the client it was issued
+	// to. The client_id is a secret, so it is looked up in constant time;
+	// the refs it resolves to are not secrets and compare plainly. Resolved
+	// HERE, before the single-use check, because the used-code branch needs
+	// it to tell a retry from a replay.
+	c := s.findClient(clientID)
 	if found.used {
-		// A REPLAY. Either a bug or an attack, and both deserve a number
-		// (A7's "a replayed code is a hard failure and is counted"). The
-		// code leaked, so the token the first exchange bought is the thing
-		// at risk: revoke it (RFC 6819 §5.2.1.1).
-		s.counts.CodeReplays++
-		s.grants = filterGrants(s.grants, func(g *grant) bool { return g.ref != found.grantRef })
-		s.codes = filterCodes(s.codes, func(c *code) bool { return c != found })
+		// A CODE PRESENTED TWICE, AND THE TWO REASONS IT HAPPENS ARE NOT
+		// THE SAME EVENT.
+		//
+		// RFC 6819 §5.2.1.1's rule — a replayed code means the code leaked,
+		// so revoke what the first exchange bought — is the right answer to
+		// a caller who has the CODE. It is the wrong answer to the client
+		// that asked for the code retrying its own POST after a lost
+		// response, and that is a real thing an HTTP client does: the user
+		// loses a working connection because their laptop's wifi dropped a
+		// packet.
+		//
+		// PKCE tells the two apart, and it is the only thing on this
+		// endpoint that can. The code_verifier NEVER LEAVES THE CLIENT: it
+		// is not in the authorization request, not in the redirect, not in
+		// the callback URL, not in any log. A caller who presents the used
+		// code together with a verifier that hashes to the challenge the
+		// code was bound to — and the right client_id, and the right
+		// redirect_uri — is in possession of the secret that defines this
+		// client. That is the client retrying. A caller who has the code
+		// and not the verifier is exactly the attacker §5.2.1.1 describes.
+		// Nothing is conceded by the distinction: an attacker who held the
+		// verifier as well could simply have made the FIRST exchange.
+		//
+		// EITHER WAY THE CODE IS STILL SINGLE USE: neither branch mints a
+		// token. What differs is whether the grant the first exchange
+		// bought is destroyed, and whether this is counted as an attack.
+		retry := c != nil && c.ref == found.clientRef &&
+			subtle.ConstantTimeCompare([]byte(redirect), []byte(found.redirect)) == 1 &&
+			subtle.ConstantTimeCompare([]byte(s256(verifier)), []byte(found.challenge)) == 1
+		if retry {
+			s.counts.CodeRetries++
+		} else {
+			s.counts.CodeReplays++
+			s.grants = filterGrants(s.grants, func(g *grant) bool { return g.ref != found.grantRef })
+			s.codes = filterCodes(s.codes, func(x *code) bool { return x != found })
+		}
 		tokenError(w, http.StatusBadRequest, "invalid_grant")
 		return
 	}
-	// The client that presents the code must be the client it was issued
-	// to. The client_id is a secret, so it is looked up in constant time;
-	// the refs it resolves to are not secrets and compare plainly.
-	c := s.findClient(clientID)
 	if c == nil || c.ref != found.clientRef {
 		s.counts.UnknownClients++
 		tokenError(w, http.StatusBadRequest, "invalid_grant")
@@ -193,17 +225,39 @@ func (s *Server) exchangeCode(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// refresh is `grant_type=refresh_token`.
+// refresh is `grant_type=refresh_token`, and it is THE WHOLE OF THE
+// no-click reconnect.
 //
-// THE REFRESH TOKEN IS NOT ROTATED, deliberately. Rotation's benefit is
-// detecting the theft of a persisted refresh token, and nothing here is
-// persisted: the token dies with the process either way. Its cost is real —
-// a client that does not store the rotated value loses access, and
-// Cyberduck's handling of a rotated token on the WebDAV path is in
-// docs/design-webui.md's "could not be verified" list — so the stable token
-// is the safe half of the trade. This is also where the no-re-prompt
-// property of verification 2e lives: a client that holds a refresh token
-// reconnects for the life of the process without another consent screen.
+// A client that holds a refresh token never revisits /oauth/authorize —
+// Cyberduck's OAuth2RequestInterceptor refreshes before a request goes out
+// and only falls back to an authorization when the refresh fails. With
+// Config.Grants set the grant survives the process, so this endpoint answers
+// a Cyberduck that saved its token last week and there is no consent screen
+// in the path at all. That is the feature, and grants.go says why it is not
+// the thing the consent gesture exists to stop.
+//
+// TWO THINGS IT CHECKS THAT AN EPHEMERAL SERVER DID NOT NEED:
+//
+//   - the lookup is under refreshMac, i.e. the STORE's key when there is a
+//     store, so a token minted by a previous process is recognisable. Access
+//     tokens keep the per-process key and are not recognisable, which is
+//     why an adopted grant serves nothing at /dav/* until it is refreshed.
+//   - refreshExpires. A persisted grant has a hard ceiling (RefreshTTL) and
+//     it is enforced here as well as at load time, because a process that
+//     has been up for weeks would otherwise go on renewing a row nothing has
+//     re-read.
+//
+// THE REFRESH TOKEN IS NOT ROTATED, deliberately, and the argument changed
+// with persistence rather than survived it. Rotation detects the theft of a
+// stored refresh token — which now matters, where before the token died with
+// the process. What it costs is a client that fails to store the rotated
+// value losing access silently, and Cyberduck's handling of a rotated token
+// on the WebDAV path is in docs/design-webui.md's "could not be verified"
+// list: it is the one behaviour we could not confirm, on the one client this
+// path exists for. Shipping rotation we cannot verify would trade a theft we
+// can already bound (RefreshTTL, a visible row, a revoke button that reaches
+// the disk) for a breakage we cannot. Revisit it when a real Cyberduck has
+// been measured against a rotating server.
 func (s *Server) refresh(w http.ResponseWriter, r *http.Request) {
 	presented := r.PostFormValue("refresh_token")
 	clientID := r.PostFormValue("client_id")
@@ -211,10 +265,9 @@ func (s *Server) refresh(w http.ResponseWriter, r *http.Request) {
 		tokenError(w, http.StatusBadRequest, "invalid_grant")
 		return
 	}
+	mac := s.refreshMac(presented)
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	mac := s.mac(presented)
+	now := s.cfg.Now()
 	var found *grant
 	for _, g := range s.grants {
 		if subtle.ConstantTimeCompare(mac[:], g.macRefresh[:]) == 1 {
@@ -222,28 +275,48 @@ func (s *Server) refresh(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if found == nil {
+		s.mu.Unlock()
+		tokenError(w, http.StatusBadRequest, "invalid_grant")
+		return
+	}
+	if !found.refreshExpires.IsZero() && now.After(found.refreshExpires) {
+		// Aged out. Drop it rather than leaving a row that answers this the
+		// same way forever; the client's next move is the consent screen,
+		// which is the right one.
+		s.grants = filterGrants(s.grants, func(g *grant) bool { return g != found })
+		s.mu.Unlock()
 		tokenError(w, http.StatusBadRequest, "invalid_grant")
 		return
 	}
 	c := s.findClient(clientID)
 	if c == nil || c.ref != found.clientRef {
 		s.counts.UnknownClients++
+		s.mu.Unlock()
 		tokenError(w, http.StatusBadRequest, "invalid_grant")
 		return
 	}
 	access, err := mint()
 	if err != nil {
+		s.mu.Unlock()
 		tokenError(w, http.StatusInternalServerError, "server_error")
 		return
 	}
-	now := s.cfg.Now()
 	found.macAccess = s.mac(access)
 	found.expires = now.Add(AccessTTL)
 	found.lastUsed = now
+	scopes := strings.Join(found.scopes, " ")
+	ref, persistent := found.ref, found.persistent
+	s.mu.Unlock()
+	// Outside the lock, and best effort: recording when a grant was last
+	// used is what lets a user judge a row on the page, and it is not worth
+	// failing a refresh the client is entitled to because a disk was busy.
+	if persistent && s.cfg.Grants != nil {
+		_ = s.cfg.Grants.touch(ref, now)
+	}
 	writeToken(w, tokenResponse{
 		AccessToken: access, TokenType: "Bearer",
 		ExpiresIn: int(AccessTTL.Seconds()), RefreshToken: presented,
-		Scope: strings.Join(found.scopes, " "),
+		Scope: scopes,
 	})
 }
 
@@ -264,7 +337,7 @@ func (s *Server) newGrantLocked(c *client, scopes []string, write bool) (*grant,
 	now := s.cfg.Now()
 	g := &grant{
 		ref: ref, clientRef: c.ref, label: c.label,
-		macAccess: s.mac(access), macRefresh: s.mac(refresh),
+		macAccess: s.mac(access), macRefresh: s.refreshMac(refresh),
 		// The ceiling, for the third time: even a code that somehow carries
 		// write on a read-only session produces a read-only grant.
 		write:  write && s.cfg.Writable,
@@ -274,6 +347,32 @@ func (s *Server) newGrantLocked(c *client, scopes []string, write bool) (*grant,
 	if write && !s.cfg.Writable {
 		s.counts.ScopeClamped++
 		g.scopes = []string{ScopeRead}
+	}
+	// THE DURABLE HALF, and it is written BEFORE the grant is live in
+	// memory.
+	//
+	// This is the ONE place in this package that touches a disk while
+	// holding s.mu, and it is deliberate rather than overlooked: Revoke goes
+	// out of its way to write outside the lock because a /dav/* request must
+	// never wait on a disk, and the same argument does not reach here. This
+	// runs once per grant, on the exchange that follows a human pressing
+	// Authorize, and the thing it is protecting is the atomicity of "the
+	// code is spent AND the grant exists AND the grant is durable". A grant that serves requests but is not on disk is one that
+	// silently stops working at the next restart, which is the bug this
+	// feature exists to fix arriving from the other side; a grant on disk
+	// that this process forgot is harmless — nothing can present it until
+	// something adopts it. So a failed write fails the exchange.
+	if s.cfg.Grants != nil {
+		g.refreshExpires = now.Add(RefreshTTL)
+		g.persistent = true
+		if err := s.cfg.Grants.save(grantRecord{
+			Ref: ref, Label: c.label, Redirect: c.redirect, Write: g.write,
+			Scopes:  append([]string(nil), g.scopes...),
+			Refresh: base64.RawURLEncoding.EncodeToString(g.macRefresh[:]),
+			Issued:  now.UTC(), Expires: g.refreshExpires.UTC(),
+		}); err != nil {
+			return nil, "", "", err
+		}
 	}
 	s.grants = append(s.grants, g)
 	return g, access, refresh, nil

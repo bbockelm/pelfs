@@ -124,9 +124,12 @@ type GraftStats struct {
 	// Resolved is the arena doing its job.
 	Resolved, Fetches, Bytes int64
 	// Failures counts external fetches that failed, Mismatch the subset
-	// that arrived and did not hash to the identity that was asked for.
+	// that are GRAFT-INTEGRITY failures (grafterr.go): the bytes arrived
+	// and did not hash to the identity that was asked for, or the source
+	// object no longer covers the range the generation named.
 	// Mismatch is the number that matters: it is the source having changed
 	// under a signed generation, and it is never zero for a benign reason.
+	// A Failures count with Mismatch at zero is a network, not a source.
 	Failures, Mismatch int64
 	// Cached counts blocks served from this machine's disk instead of
 	// from the source, and CacheBad blocks that were on disk and did not
@@ -369,10 +372,13 @@ func (fs *FS) readGraftChunk(ctx context.Context, e *graftEntry, l graft.Loc, id
 			e.sb.Path, e.sb.Source, l.Key, l.Off, l.Length, rerr)
 	}
 	if int64(len(buf)) != l.Length {
+		// AN INTEGRITY FAILURE, not a transport one, and the two are
+		// separate error classes (grafterr.go): the source answered, and
+		// what it holds is shorter than the signed generation says. A
+		// retry returns the same short object.
 		fs.grafts.stats.failures.Add(1)
-		return nil, fmt.Errorf("genfs: graft %s: read %s/%s [%d,+%d): short read (%d bytes) — "+
-			"the source object has changed or been truncated; `pelfs graft --refresh %s` republishes it",
-			e.sb.Path, e.sb.Source, l.Key, l.Off, l.Length, len(buf), e.sb.Path)
+		fs.grafts.stats.mismatch.Add(1)
+		return nil, graftShortObject(e, l.Key, l.Off, l.Length, int64(len(buf)))
 	}
 	if id := fs.grafts.verify.Sum(buf); id.Hex() != idHex {
 		fs.grafts.stats.failures.Add(1)
@@ -382,10 +388,7 @@ func (fs *FS) readGraftChunk(ctx context.Context, e *graftEntry, l graft.Loc, id
 		// rather than the volume, and what to run about it. Serving these
 		// bytes is not an option — the whole of the graft's integrity
 		// story is this comparison.
-		return nil, fmt.Errorf("genfs: graft %s: %s/%s [%d,+%d) hashes to %s, the generation "+
-			"says %s — the graft source has changed since it was spidered, so these bytes are "+
-			"NOT what this volume published; run `pelfs graft --refresh %s` to republish it",
-			e.sb.Path, e.sb.Source, l.Key, l.Off, l.Length, id.Hex(), idHex, e.sb.Path)
+		return nil, graftHashMismatch(e, l.Key, l.Off, l.Length, id.Hex(), idHex)
 	}
 	fs.grafts.stats.bytes.Add(int64(len(buf)))
 	fs.grafts.stats.resolved.Add(1)

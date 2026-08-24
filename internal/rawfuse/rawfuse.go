@@ -68,6 +68,23 @@ const dirtyValidity = time.Second
 // looked up (or already forgot).
 var errStale = fuse.Status(syscall.ESTALE)
 
+// errGraftIntegrity maps genfs.ErrGraftIntegrity: a grafted block arrived
+// and was NOT the block the signed generation names (genfs/grafterr.go).
+//
+// EBADMSG rather than EIO, and the difference is operational rather than
+// aesthetic. EIO from a grafted read used to mean either "the third party
+// was unreachable" — worth retrying, probably worth retrying in a second —
+// or "the third party republished the file" — where every retry for the
+// rest of time returns the same wrong bytes and the only way forward is
+// `pelfs graft --refresh`. A job that retries on EIO would spin forever on
+// the second. Transport failures keep EIO; this is the one that says stop.
+//
+// "Bad message" is also the honest sentence for it: the message that
+// arrived is not the message that was asked for. It is what a user sees
+// from cp, tar or dd, and it is distinctive enough to search for, where
+// "Input/output error" is the generic muddle.
+var errGraftIntegrity = fuse.Status(syscall.EBADMSG)
+
 // reader is the read surface both layers implement: genfs.FS over a clean
 // generation and overlay.FS over the merged view. overlay's Node/DirEntry
 // are aliases of the genfs types, so one shape serves both.
@@ -271,6 +288,13 @@ func errStatus(err error) fuse.Status {
 		return fuse.EISDIR
 	case errors.Is(err, context.Canceled):
 		return fuse.EINTR
+	case errors.Is(err, genfs.ErrGraftIntegrity):
+		// Recognized, so it never reaches logUnexpected — but it is still
+		// logged, and with MORE care than an unrecognized error, because
+		// the message is the only place a user learns which graft and
+		// which object changed under them.
+		logGraftIntegrity(err)
+		return errGraftIntegrity
 	}
 	// Anything unrecognized becomes EIO. Log it: a bare "Input/output
 	// error" reaching a user through tar or cp, with no record anywhere
@@ -282,6 +306,41 @@ func errStatus(err error) fuse.Status {
 	logUnexpected(err)
 	return fuse.EIO
 }
+
+// logGraftIntegrity reports a graft-integrity failure, on its own
+// suppression budget rather than the EIO explainer's.
+//
+// It has to be said out loud: a graft-integrity failure is the one
+// failure in this system that is neither damage nor a bug — an upstream
+// maintainer republished a file for a perfectly good reason — and the only
+// record of WHICH graft and WHICH object is this line. It shares nothing
+// with the EIO counter so that a mount drowning in unrelated EIOs cannot
+// suppress the one message that names a changed source.
+func logGraftIntegrity(err error) {
+	now := time.Now().UnixNano()
+	last := graftReportedAt.Load()
+	if now-last < int64(graftReportEvery) || !graftReportedAt.CompareAndSwap(last, now) {
+		graftSuppressed.Add(1)
+		return
+	}
+	if n := graftSuppressed.Swap(0); n > 0 {
+		ui.Error("graft integrity failure, returning EBADMSG (\"Bad message\"): {error} "+
+			"(and {suppressed} more like it since the last report)", "error", err, "suppressed", n)
+		return
+	}
+	ui.Error("graft integrity failure, returning EBADMSG (\"Bad message\"): {error}", "error", err)
+}
+
+// graftReportEvery is deliberately shorter than eioReportEvery: one
+// changed source object answers every read of the file that holds it, so
+// the line repeats, but a person watching a job fail wants it promptly and
+// there is exactly one sentence per changed object to say.
+const graftReportEvery = 5 * time.Second
+
+var (
+	graftSuppressed atomic.Int64
+	graftReportedAt atomic.Int64
+)
 
 // eioReportEvery bounds how often the EIO explainer speaks. One
 // untranslatable error is almost never one operation -- a broken file

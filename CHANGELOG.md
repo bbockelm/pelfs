@@ -13,6 +13,45 @@ dropped ", or 30s after this tab closes"; the idle seal itself is unchanged.
 gained a **Download Cyberduck** link, which it never had. The credential panel
 no longer shows a username, a password, a password-path bookmark or the
 shown-once notice — password auth is going away in favour of OAuth.
+**Publishing a rename no longer costs the volume.** Renaming one file and
+checkpointing took 54.7 s on a mounted volume, 19.9 MiB of it DOWNLOADED to
+publish a change that moves no bytes. The seal's carry-forward check
+(`genfs.ContentOf`) proved every reused chunk still had a home by building the
+generation's whole location map — one pack-trailer fetch per pack in the
+volume — so the cost of publishing a rename was set by how big the volume was
+and not by how big the change was. Presence now resolves through the
+generation's own multi-pack index, which names the pack an identity went into,
+held against the signed pack list; the whole-generation sweep survives only as
+the fallback for a volume with no index to answer from, which is the only
+thing entitled to say a chunk is absent. The cost is that this one caller
+accepts the index's 12-byte key without confirming the full 32 — a ~10^-13
+false positive, reachable only on a volume that is already missing a chunk,
+against a check whose old price was the whole volume; the argument is written
+out at `packIndex.holds`. Measured on the same fixture, a rename in a 98-pack
+volume went from 103 objects and 9.0 MiB to 7 objects and 20.7 KiB, and the
+number no longer grows with the volume.
+`TestMetadataOnlySealDoesNotFetchTheVolume` asserts the object COUNT — counts
+are deterministic where wall clock is not — and
+`TestContentOfStillReportsASweptPackAsAbsent` pins the half that must not be
+traded away.
+
+**A rename is unpublished work, and the page is told so now.** The durability
+panel is fed from `genSession.pressure()`, which reported staged bytes and
+dirty inodes — and a rename writes neither, only namespace edges. So renaming
+a file in the browser left the page saying there was nothing to publish, and
+the idle sealer agreed with it and never sealed when the last tab closed. The
+seal itself never had the hole (`checkpoint` and `sealAtExit` have always
+tested `DirtyEdges`), which is why this cost a prompt rather than the data.
+`pressure()` now reports edges too, `/api/v1/info` carries `dirty_edges` and an
+`unpublished` boolean computed from the same predicate the seal uses, and the
+idle sealer counts a rename as both a change and something to publish.
+
+**A seal says how much of itself was the mount following it.** The swap phase
+re-descends every inode the KERNEL is holding, so its cost is set by how much
+of the tree the session has browsed and not at all by how much changed; the
+line after a checkpoint now reports that resident count beside the inodes
+returned to clean, so an eight-second swap on a three-inode seal is a number
+rather than a mystery.
 
 **A hostile pack can no longer panic a reader.** The stored-trailer length in
 a pack footer is eight bytes an origin chooses, and the bound check on it

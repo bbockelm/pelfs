@@ -193,23 +193,36 @@ func TestEvictionNeverTurnsIntoAbsence(t *testing.T) {
 	res := publishVolume(t, v, inner, publish.Options{TargetPackSize: 512 << 10})
 
 	fs := openFS(t, inner, res.Superblock, genfs.Options{CacheDir: t.TempDir()})
-	// ContentOf is the seal's carry-forward check: it asks for the whole
-	// location map and then reports anything it cannot find as gone.
-	for _, p := range paths {
-		n, err := fs.LookupPath(ctx, p)
-		if err != nil {
-			t.Fatalf("lookup %s: %v", p, err)
-		}
-		if _, err := fs.ContentOf(ctx, n.Inode); err != nil {
-			t.Fatalf("ContentOf %s: %v", p, err)
+	// ContentOf is the seal's carry-forward check: it reports anything it
+	// cannot confirm as gone. Every file here holds well over the cap's
+	// worth of locations, so by the time the second pass runs the first
+	// pass's entries have all been evicted — which is the state the claim
+	// is about. Both passes must still answer.
+	//
+	// This is asserted as the PROPERTY rather than as the mechanism that
+	// used to deliver it. The mechanism was "ask for the whole location
+	// map", which is one trailer fetch per pack in the volume and was the
+	// dominant cost of a metadata-only seal; presence now resolves through
+	// the generation's own multi-pack index instead. A test that pinned
+	// the old mechanism would have forbidden the fix while saying nothing
+	// about the thing that must not break.
+	for pass := 1; pass <= 2; pass++ {
+		for _, p := range paths {
+			n, err := fs.LookupPath(ctx, p)
+			if err != nil {
+				t.Fatalf("pass %d: lookup %s: %v", pass, p, err)
+			}
+			c, err := fs.ContentOf(ctx, n.Inode)
+			if err != nil {
+				t.Fatalf("pass %d: ContentOf %s: %v", pass, p, err)
+			}
+			if len(c.Refs) == 0 {
+				t.Fatalf("pass %d: %s came back with no chunk refs", pass, p)
+			}
 		}
 	}
-	// A caller that asked for every location holds every location: the cap
-	// governs what a READ accumulates, not what an inventory asked for.
-	if held, packs := fs.HeldPackLocations(), fs.IndexedPacks(); held <= 4 {
-		t.Errorf("after a whole-map request the mount holds %d locations across %d packs; the cap was "+
-			"applied to a caller that explicitly asked for all of them", held, packs)
-	}
+	t.Logf("20 whole-file confirmations under a %d-location cap held %d locations across %d packs",
+		4, fs.HeldPackLocations(), fs.IndexedPacks())
 }
 
 // mountCost is what a cold mount pays before it can answer its first

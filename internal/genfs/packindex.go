@@ -407,6 +407,139 @@ func (x *packIndex) locatePlaced(ctx context.Context, key string) (packLoc, bool
 	return x.probeHints(ctx, key)
 }
 
+// holds answers PRESENCE — is key in some pack this generation lists —
+// without resolving where, and it is the third question this file
+// answers. locate asks "where are the bytes I am about to read", which
+// must be exact and is worth a sweep. locatePlaced asks "would storing
+// these bytes again be a waste", which may answer "not cheaply". This one
+// must never say "absent" about content that is there, exactly like
+// locate, but has no use for the extent — so it is entitled to accept
+// evidence that names a pack without opening it.
+//
+// The caller is ContentOf, the seal's carry-forward check, and getting
+// this question wrong was the headline cost of a metadata-only seal: it
+// used to ask for the WHOLE location map, one trailer fetch per pack in
+// the volume, so renaming a file downloaded tens of megabytes of trailers
+// that nothing then read. The map is a means, not the question.
+//
+// The steps, cheapest first, and each of them is a sound YES:
+//
+//   - the hot cache, where a location was already resolved and verified;
+//   - trailers already on disk, which cost no requests;
+//   - the multi-pack index, which names the pack outright.
+//
+// The index step is where this differs from locate, and the difference is
+// deliberate — and it is the one part of this worth arguing with, so the
+// argument is written out.
+//
+// locate fetches the named pack's trailer, because it needs the extent
+// and only the trailer carries it. Presence does not, so this stops at
+// the name. The name is trustworthy: the index is fetched under the hash
+// the SIGNED superblock records (mpi.Fetch), and the name it produces is
+// held against the SIGNED pack list (entry), so what an index hit means
+// is "the generation's own record of what it packed says this identity
+// went into a pack this generation still lists".
+//
+// WHAT IS GIVEN UP is the trailer's confirmation of the FULL identity. An
+// mpi entry keys on 12 bytes, not 32, on the stated reasoning that a
+// truncated key can only produce a false positive because the caller
+// checks what it finds (internal/mpi) — and this caller, uniquely, does
+// not go and look. So a 96-bit prefix collision reads as presence here
+// where every other consumer would catch it. Two things make that the
+// right trade rather than a hole:
+//
+//   - A false positive is only reachable on a volume that is ALREADY
+//     damaged. If the identity is genuinely stored, the answer was right
+//     whatever route produced it; the collision only matters when the real
+//     chunk is missing, and then it needs a ~10^-13 event on top.
+//   - The alternative is a trailer fetch per pack the reused content
+//     touches, which for a volume of a few large files in one catalog is
+//     every pack in the volume — the exact cost being removed. A check
+//     whose price is the volume is not a check anyone can afford to keep
+//     turned on.
+//
+// And the chunk is verified against its identity when it is READ, which
+// is where a missing chunk surfaces in any case. This is a standing
+// consistency check on the base generation, not the thing that makes the
+// format sound.
+//
+// The other failure this must not have — a pack retention has SWEPT
+// reading as live — is not affected, because it is settled by the pack
+// list rather than by the key: hintsName ignores any name the generation
+// no longer lists, and an identity with no listed name falls through to
+// the sweep. TestContentOfStillReportsASweptPackAsAbsent pins it.
+//
+// Filed as KL-21 in docs/known-issues.md.
+//
+// Only when nothing cheap can confirm it does this fall through to the
+// sweep — because a NO is the answer that costs a re-upload or a refused
+// seal, and no cache is entitled to produce one. So the expensive path
+// survives for the case it was built for (a volume with no index, or one
+// whose index missed a generation) and stops being the price of every
+// seal on a healthy one.
+func (x *packIndex) holds(ctx context.Context, key string) (bool, error) {
+	if _, ok := x.lookup(key); ok {
+		return true, nil
+	}
+	if x.holdsCheaply(ctx, key) {
+		return true, nil
+	}
+	// Nothing that costs a round trip or less could confirm it, and only a
+	// sweep may say "absent".
+	if err := x.all(ctx); err != nil {
+		return false, err
+	}
+	_, ok := x.lookup(key)
+	return ok, nil
+}
+
+// holdsCheaply is holds without the sweep: a YES, or "could not say".
+// Split out so the sweep runs with loadMu free, which all() takes itself.
+func (x *packIndex) holdsCheaply(ctx context.Context, key string) bool {
+	x.loadMu.Lock()
+	defer x.loadMu.Unlock()
+	if _, ok := x.lookup(key); ok {
+		return true
+	}
+	if _, ok := x.mergeLocal(key); ok {
+		return true
+	}
+	return x.hintsName(ctx, key)
+}
+
+// hintsName reports whether the generation's multi-pack index places key
+// in a pack this generation still lists. It is probeHints with the
+// trailer fetch removed, for the caller that wants the pack's NAME rather
+// than the extent inside it — and therefore, unlike probeHints, it
+// answers on the index's 12-byte key without confirming the full 32. See
+// holds for why that is the trade taken; nothing else may use this.
+func (x *packIndex) hintsName(ctx context.Context, key string) bool {
+	if x.hints == nil {
+		return false
+	}
+	var id [32]byte
+	if len(key) != 2*len(id) {
+		return false
+	}
+	if _, err := hex.Decode(id[:], []byte(key)); err != nil {
+		return false
+	}
+	x.warmed.Do(func() { x.hints.Warm(ctx) })
+	names, ok := x.hints.Lookup(ctx, id)
+	if !ok {
+		return false
+	}
+	for _, name := range names {
+		// A name with no row in the signed pack list is a name nothing
+		// authorizes reading, and a pack retention has already swept is
+		// exactly what this check exists to catch.
+		if _, listed := x.entry(name); listed {
+			return true
+		}
+	}
+	return false
+}
+
 // Placement is where a chunk this generation already holds is stored: the
 // pack, the extent inside it, and nothing about how to decode it. Alg and
 // key id are not here because a pack trailer does not record them — they
@@ -638,11 +771,19 @@ const indexWorkers = 8
 // all populates the index from every listed pack.
 //
 // It exists for the callers that need to reason about content they are not
-// about to read: fsck, a seal checking which chunk identities this
-// generation still carries, and a prefetch that wants the volume local.
+// about to read, and there are two left: a prefetch that wants the volume
+// local, and holds when nothing cheaper could confirm an identity. (fsck
+// used to be named here and is not a caller at all — internal/fsck builds
+// its own external-sorted, mmap'd index and never touches this one.)
 // Those callers must ask for it — no read path builds it, and one that
 // consulted a partial map would answer "missing" for content that is
 // merely un-probed.
+//
+// The seal's carry-forward check was the third, and its departure is why
+// a metadata-only checkpoint stopped costing one trailer fetch per pack in
+// the volume: it wanted PRESENCE, which the generation's own multi-pack
+// index answers, and only a presence it cannot confirm reaches here (see
+// holds).
 //
 // They are also the only callers that ask for the cap to be lifted, and
 // asking is the point: a caller that wants every location has asked for

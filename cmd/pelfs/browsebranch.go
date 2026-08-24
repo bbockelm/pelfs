@@ -121,7 +121,7 @@ type branchList struct {
 // overlay, and it exists because genSession.pressure() folds three
 // different answers into one.
 //
-// pressure() returns (-1, -1) for "read-only", for "mid-seal" and for
+// pressure() returns all -1 for "read-only", for "mid-seal" and for
 // "unreadable" alike, which is right for a durability panel (all three
 // mean "do not believe a zero") and wrong here: a READ-ONLY session has
 // nothing to strand and must be allowed to switch, while a session whose

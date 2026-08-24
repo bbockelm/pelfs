@@ -33,11 +33,18 @@ import (
 // It reports those numbers AND holds them to a bound. For a long time it
 // only reported: it stated the claim in this comment and then t.Logf'd,
 // so a regression that made every seal rewrite the whole namespace would
-// have printed larger numbers and passed. Phase 5 exists to make the
-// bound checkable — it dirties every inode without staging a byte, so
+// have printed larger numbers and passed. The LAST phase exists to make
+// the bound checkable — it dirties every inode without staging a byte, so
 // what it costs IS whole-tree catalog construction, and the one-file
 // phases are measured against it. See sealCostBounds below for the
 // numbers and the headroom.
+//
+// The catalog counts are not the whole cost, and one phase is here to say
+// so. A rename writes the same catalogs a one-file create does and used to
+// cost far more, because the carry-forward check fetched a trailer per
+// pack in the volume; that shows up in the GET column of the per-phase log
+// and in nothing sealCostBounds looks at. The count-based gate for it is
+// TestMetadataOnlySealDoesNotFetchTheVolume, which runs unconditionally.
 //
 // It is skipped unless PELFS_BIGSEAL is set: the fixture alone is minutes
 // of work, which does not belong in the ordinary test run.
@@ -81,7 +88,7 @@ func TestBigTreeSealCost(t *testing.T) {
 	head = timedSeal(t, "initial seal", inner, ov, head, priv, index, "")
 	cost["initial"] = head.Stats
 
-	for phase := 2; phase <= 5; phase++ {
+	for phase := 2; phase <= 6; phase++ {
 		_ = ov.Close()
 		_ = gfs.Close()
 		// Reopen exactly as a fresh mount does: a new genfs over the
@@ -130,6 +137,29 @@ func TestBigTreeSealCost(t *testing.T) {
 			head = timedSeal(t, "one-file seal (deep)", inner, ov, head, priv, index, "")
 			cost["onefile-deep"] = head.Stats
 		case 5:
+			// A METADATA-ONLY change: a rename moves a name and not one
+			// byte. It is measured beside the two one-file phases because
+			// it is the case that regressed — a rename used to cost the
+			// carry-forward check a trailer fetch per pack in the volume,
+			// which is invisible in the catalog counts the bounds below
+			// look at and visible only in the GET column timedSeal logs.
+			deep, err := ov.Lookup(ctx, 1, "top001")
+			if err != nil {
+				t.Fatalf("lookup top001: %v", err)
+			}
+			sub, err := ov.Lookup(ctx, deep.Inode, "sub001")
+			if err != nil {
+				t.Fatalf("lookup sub001: %v", err)
+			}
+			if _, err := ov.Lookup(ctx, sub.Inode, "f0000.c"); err != nil {
+				t.Fatalf("lookup f0000.c: %v", err)
+			}
+			if err := ov.Rename(ctx, sub.Inode, "f0000.c", sub.Inode, "renamed.c"); err != nil {
+				t.Fatalf("rename f0000.c: %v", err)
+			}
+			head = timedSeal(t, "rename seal (deep, metadata only)", inner, ov, head, priv, index, "")
+			cost["rename-deep"] = head.Stats
+		case 6:
 			// The untar shape: every inode dirty, no byte of content new.
 			// Whatever this seal costs is catalog construction and nothing
 			// else, which is the only way to read the cost honestly — an
@@ -162,6 +192,7 @@ func TestBigTreeSealCost(t *testing.T) {
 //	unchanged                        0      12          890               11
 //	one-file (root)                  1      11          890               11
 //	one-file (deep)                  2      10          926               10
+//	rename (deep)                    1      11          890               11
 //	whole-tree                      12       0         1286                0
 //
 // The bounds below sit at roughly 2x the measured values, which is loose
@@ -216,7 +247,7 @@ func sealCostBounds(t *testing.T, cost map[string]publish.Stats) {
 	if limit < 1 {
 		limit = 1
 	}
-	for _, phase := range []string{"onefile-root", "onefile-deep"} {
+	for _, phase := range []string{"onefile-root", "onefile-deep", "rename-deep"} {
 		one, ok := cost[phase]
 		if !ok {
 			t.Fatalf("no %q seal was recorded", phase)

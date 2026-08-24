@@ -743,6 +743,73 @@ Coalescing adjacent live entries is the single biggest lever measured on
 the old implementation: 9,000 requests down to 132 for 1.7x the bytes.
 Any repack built here should start with it.
 
+## What a METADATA-ONLY seal costs, and what it scales with
+
+The claim this design is judged by is seal-cost-proportional-to-change, and
+the case that tests it hardest is a change with no content at all: a
+rename. It moves a name and not one byte. Publishing one took 40.8 s and
+downloaded 19.9 MiB on a real volume, which is a direct contradiction of
+the claim, so the numbers are written down here rather than left as a
+slogan.
+
+**Where the 19.9 MiB went, measured.** Nothing to do with the write path.
+The seal's carry-forward check — `genfs.ContentOf`, which hands the seal
+the chunk records the base generation already published so nothing is
+re-chunked — proved each reused identity still had a home by building the
+generation's WHOLE location map: one pack-trailer fetch per pack in the
+volume, ~128 KiB each, in parallel eight at a time. On a 20,000-file
+fixture that is 72 requests and 8.8 MiB; on the owner's volume it was
+19.9 MiB, and it is the whole of the 39 s that ran before the first pack
+reached the wire. The check asked WHERE when the question was WHETHER.
+
+**What it costs now.** Presence resolves through the generation's own
+multi-pack index, which names the pack an identity was placed in, held
+against the signed pack list; a hit needs no pack opened. The
+whole-generation sweep remains, as the fallback for an identity no index
+can account for — it is still the only thing entitled to say "present in no
+listed pack", and the caller's response to that is to re-upload a file it
+already has or to refuse the seal.
+
+The price of not opening the pack is that this caller, alone among the
+index's consumers, does not confirm the full 32-byte identity behind the
+index's 12-byte key. A ~10^-13 false positive, and only on a volume where
+the chunk is genuinely missing — set against a check whose old price was
+one request per pack in the volume, on every seal. A retention sweep is
+NOT affected: that is settled by the pack list, which the index name is
+held against, not by the key. The argument is written out at
+`packIndex.holds`.
+
+So, per seal, a metadata-only change is proportional to:
+
+| term | scales with | irreducible? |
+| --- | --- | --- |
+| index + manifest segments | log(volume), a few objects | yes — the signed pack list authorizes reading anything |
+| the base catalogs the walk reads | the catalogs on the path from the change to the root, plus the root catalog's own span | yes, given the walk |
+| catalogs rewritten and uploaded | the same set | yes — a changed name changes its directory's catalog and every catalog above it |
+| superblock flip | one write, two reads | yes — a generation must be signed and named |
+| pack trailers | **nothing**, on an indexed volume | was O(packs); now not paid |
+
+Measured on a 98-pack fixture, the same rename before and after: 103
+objects and 9.0 MiB, against 7 objects and 20.7 KiB. The gate is
+`TestMetadataOnlySealDoesNotFetchTheVolume`, and it asserts the object
+COUNT rather than a duration — counts are decided by the code and are the
+same on every machine, where a wall-clock bound over a federation flakes
+until somebody raises it into meaninglessness.
+
+**What is still not proportional to the change, and is not this fix.** Two
+phases either side of the publish, both reported and neither small:
+
+- The **freeze** vacuums the overlay's SQLite database and reads its whole
+  edge map, so it scales with what the session has BROWSED (every descent
+  persists a base chain), not with what it changed. `overlay.Snapshot`
+  reports its four parts separately — vacuum, staged pin, namespace, open
+  — so a slow freeze already says which part it was.
+- The **swap** re-descends every inode the KERNEL is holding, twice: once
+  to capture what it was told and once against the new generation. That is
+  O(resident), which is again what was browsed. The seal line now reports
+  the resident count beside it, so an eight-second swap on a three-inode
+  seal reads as a number rather than a mystery.
+
 ## What this does not solve
 
 - **The walk and transform still dominate a seal.** Profiling puts them

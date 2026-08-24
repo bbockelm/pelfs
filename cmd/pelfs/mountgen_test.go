@@ -834,9 +834,9 @@ func TestCheckpointFiresUnderWritePressure(t *testing.T) {
 			return
 		}
 		if time.Now().After(deadline) {
-			staged, nodes := g.pressure()
-			t.Fatalf("staged %d bytes across %d dirty inodes without a checkpoint; "+
-				"only the hour-long timer could publish it", staged, nodes)
+			staged, nodes, edges := g.pressure()
+			t.Fatalf("staged %d bytes across %d dirty inodes and %d dirty edges without a "+
+				"checkpoint; only the hour-long timer could publish it", staged, nodes, edges)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}

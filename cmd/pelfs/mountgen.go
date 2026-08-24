@@ -1913,7 +1913,16 @@ func (g *genSession) sealLocked(ctx context.Context, follow bool) (*publish.Resu
 		// the overlay are different work under different locks — genfs's
 		// swap lock and the overlay's — and a single "follow" number
 		// cannot say which of them the mount was waiting behind.
-		if _, err := g.gfs.Swap(ctx, res.Superblock); err != nil {
+		//
+		// The swap's own number is reported because the phase clock cannot
+		// explain itself: a swap re-descends every inode the KERNEL is
+		// holding, twice — once to capture what it was told and once
+		// against the new generation — so its cost is set by how much of
+		// the tree this session has browsed and not at all by how much of
+		// it changed. A three-inode seal whose swap took eight seconds is
+		// not a mystery once the resident count is on the line beside it.
+		swapped, err := g.gfs.Swap(ctx, res.Superblock)
+		if err != nil {
 			ui.Warn("sealed generation {generation}, but the mount could not follow it ({error}); inodes stay dirty",
 				"generation", res.Superblock.Generation, "error", err)
 		} else if rep, err := g.markSwapped(phases).Rebase(ctx, snap.Seq(), overlay.Options{
@@ -1923,7 +1932,10 @@ func (g *genSession) sealLocked(ctx context.Context, follow bool) (*publish.Resu
 			ui.Warn("sealed generation {generation}, but rebase failed ({error}); inodes stay dirty",
 				"generation", res.Superblock.Generation, "error", err)
 		} else {
-			ui.Info("{clean} returned to clean; {dirty} still dirty",
+			ui.Info("the mount followed generation {generation}: {resident} re-descended, "+
+				"{clean} returned to clean, {dirty} still dirty",
+				"generation", res.Superblock.Generation,
+				"resident", ui.Count(swapped.Resident, "resident inode"),
 				"clean", ui.Count(len(rep.Clean), "inode"), "dirty", rep.Dirty)
 			g.stats.Update(func(sum *stats.Summary) { sum.RebasedClean += int64(len(rep.Clean)) })
 		}
@@ -2093,24 +2105,38 @@ func pressureSampleInterval(every time.Duration) time.Duration {
 }
 
 // pressure reports what the overlay is holding that a checkpoint would
-// publish: staged content bytes, and dirty inodes. Both are -1 when the
-// overlay cannot be sampled (it is being sealed, or is gone).
+// publish: staged content bytes, dirty inodes, and dirty namespace edges.
+// All three are -1 when the overlay cannot be sampled (it is being
+// sealed, or is gone).
 //
-// The two are sampled together, from one Stats call, because they are two
-// meters on the same thing and a session can be at the limit of either
-// without approaching the other: a video file is bytes without inodes, an
+// They are sampled together, from one Stats call, because they are meters
+// on the same thing and a session can be at the limit of one without
+// approaching the others: a video file is bytes without inodes, an
 // unpacked source tree is inodes without bytes.
-func (g *genSession) pressure() (bytes int64, nodes int) {
+//
+// EDGES ARE THE THIRD because a change can move no bytes and touch no
+// inode row and still be a change. A rename is exactly that: it writes a
+// whiteout for the old name and an edge for the new one and nothing else
+// (overlay.Rename), so a session whose only change is a rename reported
+// zero staged bytes and zero dirty inodes — and the browser's durability
+// panel, which is fed from here, told the user there was nothing to
+// publish while an unpublished rename sat in the overlay. The SEALING
+// decisions never had this hole (checkpoint and sealAtExit have always
+// tested DirtyEdges too), which is what made it a reporting bug rather
+// than a data-loss one: the rename did get published, just never on the
+// user's say-so. Two meters and a predicate that disagree are one meter
+// too few.
+func (g *genSession) pressure() (bytes int64, nodes, edges int) {
 	g.ovMu.RLock()
 	defer g.ovMu.RUnlock()
 	if g.ov == nil || g.spent {
-		return -1, -1
+		return -1, -1, -1
 	}
 	st, err := g.ov.Stats()
 	if err != nil {
-		return -1, -1
+		return -1, -1, -1
 	}
-	return st.StagedBytes, st.DirtyNodes
+	return st.StagedBytes, st.DirtyNodes, st.DirtyEdges
 }
 
 // checkpointDrainNotice is how long the exit path waits for a checkpoint
@@ -2234,7 +2260,13 @@ func (g *genSession) checkpointPeriodically(ctx context.Context, every time.Dura
 			if ctx.Err() != nil {
 				return
 			}
-			staged, nodes := g.pressure()
+			// Edges are deliberately NOT a write-pressure trigger: this
+			// path exists to keep the uplink and the machine's memory
+			// inside their limits, and a namespace change consumes
+			// neither. The interval tick publishes it, and the idle sealer
+			// and the durability panel are where a user's rename has to be
+			// visible.
+			staged, nodes, _ := g.pressure()
 			if !checkpointDue(staged, nodes) {
 				continue
 			}

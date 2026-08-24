@@ -187,18 +187,24 @@ measured at 169-174 bytes each, so 15.8-16.2 GiB at 100M objects.
 (`internal/genfs/packindex.go:278-287`) sets `unbounded` one-way and is
 called from `packIndex.all` (`:657`). Callers of `all` at HEAD:
 
-- `FS.ContentOf` — `internal/genfs/read.go:155`, protecting the "present in
-  no listed pack" verdict at `read.go:178`. Reached from the seal walk
-  (`internal/overlay/accessors.go:381` → `internal/publish/source.go:305`)
-  **and from an ordinary write's copy-up** (`internal/memtable/base.go:71`
-  ← `internal/overlay/write.go:528`), so this is reachable without sealing.
-  It has grown three more non-test call sites since C2 was written, all of
-  which lift the cap: `internal/merge/merge.go:595` and `:599` (both sides
-  of a three-way compare), `internal/merge/apply.go:381`, and
-  `internal/memtable/recover.go:557`. So `pelfs merge` — a v0.2 verb that
-  did not exist when this was measured — holds every location of BOTH
-  generations, and the entry's old count of "two whole-map callers"
-  understated the exposure.
+- `FS.ContentOf` — **NO LONGER, on a volume with an index** (renameseal-agent,
+  2026-08-24). It called `all` to protect the "present in no listed pack"
+  verdict, which made the verdict cost one trailer fetch per pack in the
+  volume — the headline defect behind a 40.8 s publish of a one-file rename.
+  It now asks `packIndex.holds` (`internal/genfs/packindex.go`), which
+  answers presence from the hot map, from local trailers, and from the
+  generation's own multi-pack index held against the signed pack list, and
+  falls through to `all` only when none of those can confirm an identity.
+  So the cap is lifted for a volume whose index does not cover an
+  identity — an old generation written before indexes existed, or one whose
+  index upload failed — and not otherwise. Every caller of `ContentOf`
+  inherits that: the seal walk
+  (`internal/overlay/accessors.go:381` → `internal/publish/source.go:305`),
+  an ordinary write's copy-up (`internal/memtable/base.go:71` ←
+  `internal/overlay/write.go:528`), `internal/merge/merge.go:595` and
+  `:599`, `internal/merge/apply.go:381`, and
+  `internal/memtable/recover.go:557`. `pelfs merge` over two INDEXED
+  generations no longer holds every location of both.
 - `FS.Prefetch` — `internal/genfs/prefetch.go:110`.
 - `FS.LoadPackIndex` (`packindex.go:627`) has no non-test callers.
 
@@ -212,9 +218,17 @@ into a sorted, mmap'd, binary-searchable table" step was built — as
 it wrongly.
 
 **Pinned by an executable test: PARTLY.** `TestLocationHeap`
-(`internal/genfs/packindex_test.go:543`, gated on `PELFS_LOCATION_HEAP=1`)
-measures per-location heap and pins the CAP; nothing fails because the
-callers above bypass it.
+(`internal/genfs/packindex_test.go`, gated on `PELFS_LOCATION_HEAP=1`)
+measures per-location heap and pins the CAP; nothing fails because
+`Prefetch` still bypasses it. What IS pinned, ungated, is that `ContentOf`
+no longer does: `TestContentOfDoesNotIndexTheGeneration`
+(`internal/genfs/contentofcost_test.go`) confirms every file in a 32-pack
+generation in one request, and `TestMetadataOnlySealDoesNotFetchTheVolume`
+(`internal/publish/renameseal_test.go`) bounds the objects a rename's seal
+may fetch in a 98-pack volume. The remaining work is the same as it was —
+spill the merged trailers into a `packidx` table under `CacheDir` and
+binary-search it — but it is now the answer for `Prefetch` and for the
+index-less fallback, not for every seal.
 
 ### KI-9. A repack stamps its condemned-ledger rows from the wall clock
 
@@ -774,6 +788,51 @@ the screen is pinned by `webui/frontend/tests/chrome.spec.ts` ("no legend,
 no search caveat, no upload caveat -- the chrome states nothing"), which
 counts them at zero. The partial-search behaviour itself is an absence and
 is pinned by nothing.
+
+### KL-21. The seal's carry-forward check trusts the index's 12-byte key
+
+Filed at `a212428` by renameseal-agent, as the stated cost of removing the
+whole-generation trailer sweep from `genfs.ContentOf` (see KI-8).
+
+An `mpi` entry keys on 12 bytes of identity, not 32, on the reasoning
+written at `internal/mpi/mpi.go:15`: *"a truncated key can only produce a
+FALSE POSITIVE: the caller holds the full identity and checks what it
+finds"*. Every other consumer does check — `probeHints` fetches the named
+pack's trailer and confirms the full 32 bytes before it returns a location.
+`packIndex.hintsName`, which answers the PRESENCE question for the seal's
+carry-forward check, does not: it stops at the pack's name, because
+fetching the trailer is exactly the per-pack cost being removed.
+
+**Consequence.** A 96-bit prefix collision reads as "present in a listed
+pack" for a chunk that is not there, and the seal carries the record
+forward into a signed generation. It is only reachable when the real chunk
+is genuinely missing — if the identity is stored, the answer was right by
+whatever route — so it needs a damaged volume AND a ~10^-13 event. The
+damage surfaces on read, where the chunk is verified against its identity,
+which is where a missing chunk surfaces in any case.
+
+**What is NOT affected: a swept pack.** That is settled by the SIGNED pack
+list rather than by the key — `hintsName` ignores any name the generation
+no longer lists, and an identity with no listed name falls through to the
+whole-generation sweep, which is still the only thing entitled to say
+"present in no listed pack".
+
+**The exact alternative was measured and refused.** Confirming through the
+trailer costs one request per pack the reused content touches, which for a
+volume of a few large files under one catalog is every pack in the volume —
+the defect this replaced, on every seal. A check whose price is the volume
+does not stay switched on. Making it both exact and cheap means a wider
+key, which is a format change to `mpi` (16 bytes/entry is 1.6 GB at 100M
+objects; 20 would be 2.0), or spilling confirmed trailers to a local
+`packidx` table — the same step KI-8 wants for `Prefetch`.
+
+**Pinned by an executable test: the half that matters, yes.**
+`TestContentOfStillReportsASweptPackAsAbsent`
+(`internal/genfs/contentofcost_test.go`) drops a pack from the list while
+leaving the index naming it and requires "present in no listed pack"; it
+fails if the pack-list guard is removed. The collision itself is not
+pinned and cannot practically be — constructing a 96-bit BLAKE3 prefix
+collision is the test.
 
 ---
 

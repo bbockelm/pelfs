@@ -102,11 +102,18 @@ type mockEntry struct {
 type mockAPI struct {
 	sessions *browsesession.Manager
 
-	mu      sync.Mutex
-	ent     map[string]*mockEntry
-	gen     uint64
-	staged  int
-	sbytes  int64
+	mu     sync.Mutex
+	ent    map[string]*mockEntry
+	gen    uint64
+	staged int
+	sbytes int64
+	// sedges is unpublished NAMESPACE: what a rename leaves behind. It is
+	// separate from staged because the SERVER reports it separately, and
+	// for the reason the server has to — a rename moves no bytes and
+	// writes no inode row, so a mock that recorded one as a staged FILE
+	// would be a contract this suite could not use to catch the page
+	// reading the wrong field.
+	sedges  int
 	job     *mockJob
 	mode    string
 	volume  string
@@ -159,7 +166,7 @@ func newMockAPI(m *browsesession.Manager) *mockAPI {
 // which is the same class of flakiness as a fixed sleep.
 func (a *mockAPI) seed() {
 	a.ent = map[string]*mockEntry{}
-	a.gen, a.staged, a.sbytes, a.job = 87, 0, 0, nil
+	a.gen, a.staged, a.sbytes, a.sedges, a.job = 87, 0, 0, 0, nil
 	a.branch, a.phase, a.openErr, a.switchStall = "main", "ready", "", 300*time.Millisecond
 	now := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
 	add := func(id string, dir bool, size int64) {
@@ -384,7 +391,9 @@ func (a *mockAPI) rename(w http.ResponseWriter, r *http.Request) {
 	}
 	to := join(path.Dir(id), req.Name)
 	a.movePath(e, to)
-	a.stage(1, 0)
+	// A whiteout for the old name and an edge for the new one; no staged
+	// file and no staged byte, exactly as overlay.Rename leaves it.
+	a.stageEdges(2)
 	writeMockJSON(w, http.StatusOK, map[string]any{"result": map[string]any{"id": to}})
 }
 
@@ -574,6 +583,10 @@ func (a *mockAPI) stage(files int, bytes int64) {
 	a.sbytes += bytes
 }
 
+// stageEdges records unpublished namespace — a name added, removed, or
+// moved — which is what a rename produces and all it produces.
+func (a *mockAPI) stageEdges(n int) { a.sedges += n }
+
 func join(dir, name string) string {
 	if dir == "" || dir == "/" {
 		return "/" + strings.TrimPrefix(name, "/")
@@ -599,6 +612,8 @@ func (a *mockAPI) state() map[string]any {
 		"staged_files":   a.staged,
 		"staged_bytes":   a.sbytes,
 		"dirty_nodes":    a.staged,
+		"dirty_edges":    a.sedges,
+		"unpublished":    a.staged > 0 || a.sedges > 0,
 		"upload_backlog": 0,
 		"next_publish_s": 221,
 		"test_hooks":     false,
@@ -695,7 +710,7 @@ func (a *mockAPI) publish(w http.ResponseWriter, _ *http.Request) {
 		a.gen++
 		job.State, job.Ended = "done", time.Now()
 		job.Summary = fmt.Sprintf("generation %d", a.gen)
-		a.staged, a.sbytes = 0, 0
+		a.staged, a.sbytes, a.sedges = 0, 0, 0
 		for _, e := range a.ent {
 			e.staged = false
 		}
@@ -735,7 +750,7 @@ func (a *mockAPI) branches(w http.ResponseWriter, _ *http.Request) {
 			// above may have moved past the listing's, and the only row that
 			// can be carrying staged work.
 			row["generation"] = a.gen
-			row["staged"] = a.staged > 0
+			row["staged"] = a.staged > 0 || a.sedges > 0
 		}
 		rows = append(rows, row)
 	}
@@ -787,7 +802,7 @@ func (a *mockAPI) switchBranch(w http.ResponseWriter, r *http.Request) {
 			"job":    id})
 		return
 	}
-	if a.staged > 0 {
+	if a.staged > 0 || a.sedges > 0 {
 		from := a.branch
 		a.mu.Unlock()
 		writeMockJSON(w, http.StatusConflict, map[string]string{

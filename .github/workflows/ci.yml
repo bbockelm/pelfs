@@ -242,7 +242,7 @@ jobs:
         run: PELICAN_BIN="$GITHUB_WORKSPACE/pelican-bin" ./scripts/integration-pelican.sh
 
   fuzz:
-    # Six targets at 30s each, plus the corpus replay. ~4 minutes.
+    # Seven targets at 30s each, plus the corpus replay. ~4 minutes.
     #
     # Tier 1 (parsers): unrestricted — pure functions over untrusted
     # federation bytes, safe to run anywhere. Short smoke runs on top of
@@ -266,7 +266,8 @@ jobs:
                    internal/superblock/testdata/fuzz/FuzzDecodeVerify \
                    internal/entrycodec/testdata/fuzz/FuzzDecode \
                    internal/chunkid/testdata/fuzz/FuzzChunker \
-                   internal/catalog/testdata/fuzz/FuzzStaticCatalog; do
+                   internal/catalog/testdata/fuzz/FuzzStaticCatalog \
+                   internal/packidx/testdata/fuzz/FuzzOpenTable; do
             n=$(find "$d" -type f 2>/dev/null | wc -l)
             [ "$n" -gt 0 ] || { echo "no corpus in $d" >&2; exit 1; }
             echo "$d: $n inputs"
@@ -280,7 +281,8 @@ jobs:
             "internal/superblock FuzzDecodeVerify" \
             "internal/entrycodec FuzzDecode" \
             "internal/chunkid FuzzChunker" \
-            "internal/catalog FuzzStaticCatalog"; do
+            "internal/catalog FuzzStaticCatalog" \
+            "internal/packidx FuzzOpenTable"; do
             set -- $t
             echo "== $2 =="
             CGO_ENABLED=0 go test -run xxx -fuzz "^$2\$" -fuzztime 30s "./$1/"

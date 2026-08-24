@@ -15,6 +15,18 @@ raw uint64s and skipped it), the record WIDTH the table declares is checked
 against the layout its readers assume, and the dead-list bound is computed in
 int64 so a 32-bit build cannot slice with a negative one.
 
+**The sorted lookup table both index formats go through is fuzzed now.**
+`internal/packidx` is what a pack trailer, a multi-pack index and a graft
+index all parse their entries with, and it had no fuzz target at all —
+`FuzzOpenTable` covers `Open`, `ParseHeader`, `SampleExtent` and the windowed
+lookup path a remote reader uses. It found a window computed from an
+attacker-chosen count and stride coming back with a NEGATIVE length, which
+would have been a range request for -19998176189952 bytes; both remote readers
+reject that today, which is the argument for rejecting it where it is
+computed rather than at each caller. `FuzzDecodeTrailer` now also hands the
+decoder the TABLE form, which it had never once tried — the form every pack
+written today carries.
+
 **A volume that will not open says why, on the page.** Both surfaces rendered
 every phase that was not `ready` as "reading the overlay…", so a session
 refused by a leftover branch lease looked exactly like one that was about to

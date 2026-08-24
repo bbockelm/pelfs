@@ -89,7 +89,18 @@ func TestWrongGuessDoesNotInvalidateTheLaunchURL(t *testing.T) {
 	}
 	// Same length, one byte different: the case a constant-time compare is
 	// for, and the case a prefix compare would get wrong.
-	near := "B" + bt[1:]
+	//
+	// The replacement character is chosen against the token rather than
+	// hardcoded. "B"+bt[1:] is the REAL token whenever the token happens to
+	// start with 'B', which a base64url alphabet makes a 1-in-64 event: it
+	// passed locally forever and failed two CI jobs on one commit, reporting
+	// "a near-miss token was accepted" -- which reads like an authentication
+	// bypass and is really a test asserting that a token is not itself.
+	swap := byte('B')
+	if bt[0] == swap {
+		swap = 'C'
+	}
+	near := string(swap) + bt[1:]
 	if _, err := m.Exchange(near); err == nil {
 		t.Fatal("a near-miss token was accepted")
 	}

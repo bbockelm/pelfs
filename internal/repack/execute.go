@@ -75,7 +75,10 @@ type ExecOptions struct {
 	// Refs and Branch name the mutable head this publishes onto, and
 	// SigningKey signs the generation. A repack produces a signed
 	// superblock like any other publisher, and is refused without a key
-	// rather than producing an unsigned one.
+	// rather than producing an unsigned one — UNLESS the head it is
+	// repacking is itself unsigned, in which case it inherits that and
+	// needs no key (superblock.SignAs). A repack must never be able to
+	// change how a volume is authenticated.
 	Refs       *refs.Store
 	Branch     string
 	SigningKey ed25519.PrivateKey
@@ -153,8 +156,16 @@ func Execute(ctx context.Context, o ExecOptions) (*Result, error) {
 		if o.Refs == nil || o.Branch == "" {
 			return nil, errors.New("repack: Refs and Branch are required to publish")
 		}
-		if len(o.SigningKey) == 0 {
+		// An unsigned volume needs no key, and must not be given one: the
+		// generation this builds inherits the head's mode, so a key here
+		// would be a repack quietly signing a volume nobody asked to sign.
+		unsigned := o.Head != nil && o.Head.IsUnsigned()
+		if len(o.SigningKey) == 0 && !unsigned {
 			return nil, errors.New("repack: a signing key is required to publish")
+		}
+		if len(o.SigningKey) != 0 && unsigned {
+			return nil, fmt.Errorf("repack: %w: the head being repacked carries no signature",
+				superblock.ErrSigningChange)
 		}
 	}
 	// CollectReachable is what makes this different from a plan: the
@@ -951,7 +962,7 @@ func repackedSuperblock(ctx context.Context, o ExecOptions, prev *superblock.Sup
 	if err := sb.Validate(); err != nil {
 		return nil, nil, fmt.Errorf("repack: %w", err)
 	}
-	if err := sb.Sign(o.SigningKey); err != nil {
+	if err := sb.SignAs(o.Head, o.SigningKey); err != nil {
 		return nil, nil, fmt.Errorf("repack: %w", err)
 	}
 	raw, err := sb.Encode()

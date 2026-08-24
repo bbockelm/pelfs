@@ -55,7 +55,10 @@ func FastForward(ctx context.Context, o ApplyOptions) (*superblock.Superblock, e
 	if o.Refs == nil || o.Branch == "" {
 		return nil, errors.New("merge: Refs and Branch are required to publish")
 	}
-	if len(o.SigningKey) == 0 {
+	// A merge onto an unsigned volume needs no key and must not be given
+	// one: it inherits how the branch it publishes onto is authenticated
+	// (superblock.SignAs), and only `pelfs rotate` changes that.
+	if len(o.SigningKey) == 0 && !o.Ours.IsUnsigned() {
 		return nil, errors.New("merge: a signing key is required to publish")
 	}
 	if o.Plan.Direction == "ours" || o.Plan.Direction == "already equal" {
@@ -98,7 +101,7 @@ func FastForward(ctx context.Context, o ApplyOptions) (*superblock.Superblock, e
 		sb.Maint = nil
 	}
 	sb.Signature = [64]byte{}
-	if err := sb.Sign(o.SigningKey); err != nil {
+	if err := sb.SignAs(o.Ours, o.SigningKey); err != nil {
 		return nil, fmt.Errorf("merge: %w", err)
 	}
 	raw, err := sb.Encode()

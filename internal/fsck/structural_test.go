@@ -1,7 +1,9 @@
 package fsck_test
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -108,13 +110,29 @@ func (g *genBuilder) seal(root [32]byte, shards []superblock.ShardEntry) *superb
 		g.t.Fatal(err)
 	}
 	g.pw = nil
-	return &superblock.Superblock{
+	sb := &superblock.Superblock{
 		FormatVersion: superblock.FormatV2,
 		RootCatalog:   root,
 		PackList:      []superblock.PackEntry{{Name: sp.Name, TrailerHash: sp.TrailerHash, Size: sp.Size}},
 		Shards:        shards,
 		NextInode:     1000,
 	}
+	// SIGNED, even though nothing here verifies it. fsck now reports a
+	// generation with no signature (KindUnsigned), which is a true and
+	// deliberate finding — and a fixture that skipped signing would carry
+	// it into every structural test as an extra problem, so these tests
+	// would be asserting on the fixture's shortcut rather than on damage.
+	if err := sb.Sign(testSigningKey(g.t)); err != nil {
+		g.t.Fatal(err)
+	}
+	return sb
+}
+
+// testSigningKey is a deterministic key for fixtures: what it signs is
+// never verified here, only counted as "this generation has a signature".
+func testSigningKey(t *testing.T) ed25519.PrivateKey {
+	t.Helper()
+	return ed25519.NewKeyFromSeed(bytes.Repeat([]byte{7}, ed25519.SeedSize))
 }
 
 func dirNode(inode int64, nlink uint32) catalog.Node {

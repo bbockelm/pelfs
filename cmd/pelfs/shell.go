@@ -47,7 +47,12 @@ func cmdShell(args []string) int {
 		// would be a flag that silently does nothing on every prefix that
 		// already holds a volume. Choosing the window is `pelfs init`'s job,
 		// which is the command whose whole purpose is creation.
-		if err := initVolumeAt(o, prefix, branch, signingKey, 0); err != nil {
+		// Signed, always. --allow-unsigned is consent to READ a volume that
+		// is already unsigned; creating one is a different decision and it
+		// is `pelfs init --unsigned` that makes it. A shell that created an
+		// unsigned volume because a read flag happened to be on the command
+		// line would be the footgun this whole feature is guarding against.
+		if err := initVolumeAt(o, prefix, branch, signingKey, 0, false); err != nil {
 			return exitErr(fmt.Errorf("create volume: %w", err))
 		}
 	}

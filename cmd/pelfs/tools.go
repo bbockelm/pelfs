@@ -43,7 +43,9 @@ func volumeStore(ctx context.Context, o *cmdOpts, prefix, pubkeyHex string) (pel
 		}
 		trusted = k
 	}
-	rstore, err := refs.New(inner, stateDir, trusted)
+	rstore, err := refs.NewWithPolicy(inner, stateDir, refs.Policy{
+		Trusted: trusted, AllowUnsigned: o.allowUnsigned,
+	})
 	if err != nil {
 		return nil, nil, "", err
 	}

@@ -232,7 +232,10 @@ func cmdGraft(args []string) int {
 	if err != nil {
 		return exitErr(err)
 	}
-	signingKey, err := loadOrCreateSigningKey(signingKeyFileIn(stateDir, ""), nil)
+	// The head, not nil: a graft publishes a successor, so it must sign the
+	// way the head does — and on an unsigned volume it must not MINT a key,
+	// which is what a nil predecessor would have it do.
+	signingKey, err := loadOrCreateSigningKey(signingKeyFileIn(stateDir, ""), head.Superblock)
 	if err != nil {
 		return exitErr(err)
 	}

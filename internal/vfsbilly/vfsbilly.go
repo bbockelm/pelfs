@@ -46,6 +46,7 @@ import (
 	"github.com/bbockelm/pelfs/internal/catalog"
 	"github.com/bbockelm/pelfs/internal/genfs"
 	"github.com/bbockelm/pelfs/internal/idmap"
+	"github.com/bbockelm/pelfs/internal/mounterr"
 	"github.com/bbockelm/pelfs/internal/overlay"
 )
 
@@ -442,7 +443,41 @@ func sentinel(err error) error {
 	case errors.Is(err, overlay.ErrIsDir):
 		return syscall.EISDIR
 	}
+	// Nothing above translated it, so go-nfs will answer NFS3ERR_IO (or
+	// NFS3ERR_SERVERFAULT, which a client reports the same way): the
+	// payload is about to get an unexplained I/O error from a read it
+	// had no reason to think could fail. That is the FUSE frontend's
+	// errStatus fall-through, reached by a different road, and it is
+	// reported to the same latch so a job supervisor sees one event
+	// whichever backend the mount happens to be using
+	// (internal/mounterr, internal/chirp).
+	if !chosen(err) {
+		mounterr.Fail(mounterr.FrontendNFS, err)
+	}
 	return err
+}
+
+// chosen reports whether err is an answer THIS package decided on, as
+// opposed to a failure from a layer below that nothing here understands.
+//
+// The distinction is a type, not a list of errnos, and that is
+// deliberate: every deliberate refusal in this file is a bare
+// syscall.Errno handed to pe (or an *os.PathError built by accessErr,
+// permErr or roErr, which never reaches here). A store error, a
+// federation error, a corrupt-pack error is always something else -- a
+// wrapped error, a sentinel, an *os.PathError from the staging disk --
+// so the assertion separates the two without a table that would go stale
+// the first time a new errno is used.
+//
+// ENOSPC is the one exception worth naming. go-nfs maps it to
+// NFS3ERR_NOSPC rather than to NFS3ERR_IO (statusFromWriteError), so the
+// payload gets a specific, catchable answer and the mount has not
+// "broken" in the sense this latch means.
+func chosen(err error) bool {
+	if _, ok := err.(syscall.Errno); ok {
+		return true
+	}
+	return errors.Is(err, syscall.ENOSPC)
 }
 
 // roErr refuses a mutating call on a read-only binding. EPERM, not a bare

@@ -35,6 +35,7 @@ import (
 	"github.com/bbockelm/pelfs/internal/fsperm"
 	"github.com/bbockelm/pelfs/internal/genfs"
 	"github.com/bbockelm/pelfs/internal/idmap"
+	"github.com/bbockelm/pelfs/internal/mounterr"
 	"github.com/bbockelm/pelfs/internal/overlay"
 	"github.com/bbockelm/pelfs/internal/ui"
 )
@@ -303,6 +304,16 @@ func errStatus(err error) fuse.Status {
 	// is the one that most needs explaining. These are meant to be rare;
 	// if a workload produces them in bulk, the count carried by the next
 	// report is the signal.
+	//
+	// This line is also where the failure stops being ours and becomes
+	// the PAYLOAD's: the process on the other side of the mount is about
+	// to get an error it very likely does not check for, from a read it
+	// had no reason to expect could fail. A supervisor watching the job
+	// -- an HTCondor starter, via internal/chirp -- can act on that, and
+	// this is the only instant at which it is knowable. Latched, so a
+	// tar that trips it ten thousand times reports once, and free after
+	// the first (internal/mounterr).
+	mounterr.Fail(mounterr.FrontendFUSE, err)
 	logUnexpected(err)
 	return fuse.EIO
 }

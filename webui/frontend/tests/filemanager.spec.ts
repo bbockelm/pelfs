@@ -55,9 +55,11 @@ test.describe("the file manager", () => {
     await expect(page.getByTestId("pelfs-shell")).toBeVisible();
     await expect(card(page, "/data")).toBeVisible();
     await expect(card(page, "/README.txt")).toBeVisible();
-    // The durability panel is above the files, not behind a tab.
+    // The durability panel is above the files, not behind a tab, and it is its
+    // own panel rather than a strip of prose (tests/chrome.spec.ts holds that
+    // line in detail).
     await expect(page.getByTestId("durability")).toBeVisible();
-    await expect(page.getByTestId("durability-legend")).toBeVisible();
+    await expect(page.getByTestId("pelfs-durability-panel")).toBeVisible();
   });
 
   test("one listing per directory, and exactly one -- the store asks twice", async ({
@@ -98,13 +100,18 @@ test.describe("the file manager", () => {
     await expect(cap).toBeVisible();
     await expect(cap).toHaveAttribute("data-listing-total", "6000");
     await expect(cap).toHaveAttribute("data-listing-returned", "5000");
+    // The summary carries the two numbers, which is the whole of what a user
+    // needs to know that the folder is bigger than the screen.
+    await expect(cap).toContainText("5,000");
     await expect(cap).toContainText("6,000");
-    await expect(cap).toContainText("shown in part");
-    // And it names what to do instead, rather than leaving the user stuck.
+    // Opened, it says why and what to do instead, rather than leaving the
+    // user stuck.
+    await cap.locator("summary").click();
+    await expect(cap.locator(".pelfs-caveat__body")).toContainText("not virtualized");
     await expect(cap).toContainText("pelfs mount");
   });
 
-  test("the partial search is admitted in words, beside the search box", async ({
+  test("the partial search is admitted, beside the search box, and says how much", async ({
     page,
     session,
   }) => {
@@ -112,21 +119,29 @@ test.describe("the file manager", () => {
     // step "search"): the store filters what it has. Combined with the cap,
     // "no results" means "not in what this tab loaded", which is a different
     // statement from "not in your volume".
+    //
+    // WHAT CHANGED HERE, and it was a defect and not a preference: this used
+    // to be a full-width paragraph above the grid, reading "Search below is
+    // partial by design: it matches only what this tab has already loaded and
+    // never asks the server..." before anybody had typed anything. The fact is
+    // still on the screen, still beside the pane whose search box it is about,
+    // and still without a tooltip -- a tooltip does not exist on a touch
+    // screen -- but it is a summary you can open rather than a confession you
+    // must read. The long form is asserted in tests/chrome.spec.ts.
     await openPelfs(page, session);
     const notice = page.getByTestId("search-scope");
-    // Before anyone types: the caveat is already on the screen, as a
-    // sentence, in the strip directly above the toolbar whose search box sits
-    // at its left. Not a tooltip -- a tooltip does not exist on a touch
-    // screen and is invisible to anyone who does not think to hover.
     await expect(notice).toBeVisible();
     await expect(notice).toHaveAttribute("data-searching", "no");
-    await expect(notice).toContainText("partial by design");
+    await expect(notice).toContainText("loaded rows");
 
     const box = page.getByPlaceholder("Search");
     await box.fill("sample");
+    // While a search is running the summary says HOW MUCH was searched, which
+    // is the number a user needs to judge "no results" -- and it is a fact the
+    // old paragraph did not carry until you read to the end of it.
     await expect(notice).toHaveAttribute("data-searching", "yes");
-    await expect(notice).toContainText("This search is partial");
-    await expect(notice).toContainText("asks the server nothing");
+    await expect(notice).toContainText("searching");
+    await expect(page.getByTestId("search-scope-count")).not.toBeEmpty();
   });
 
   test("create a folder: the mutation is application/json, or the guard 415s it", async ({

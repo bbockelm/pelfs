@@ -11,8 +11,10 @@ import { MODE, expect, openPelfs, resetHooks, test, testHook } from "./pelfs";
  * data is there."
  *
  * So the assertions here are not "the panel renders". They are:
- *   - staged and published are DIFFERENT CHARACTERS, not two colours of one;
- *   - the legend is on the screen, always, not in a tooltip;
+ *   - the three states render THREE DIFFERENT CHARACTERS, not two colours of
+ *     one, and this is read out of the panel in each state rather than out of
+ *     a legend: the legend is gone (it was a second copy of the sentence's own
+ *     words) and the glyph that matters is the one the panel actually shows;
  *   - `data-durability` moves to "staged" when something is staged and back
  *     to "published" when it is not, and the words move with it.
  *
@@ -43,24 +45,36 @@ test.describe("durability", () => {
     await request.dispose();
   });
 
-  test("staged and published are different characters, and the legend is always visible", async ({
+  test("the three states render three different characters", async ({
     page,
     session,
+    playwright,
   }) => {
+    // THE ASSERTION THE WHOLE PANEL IS FOR, and it is now made against the
+    // panel in each state rather than against a legend. Two shades of one
+    // glyph would pass a colour check and fail every colour-blind user, so the
+    // SHAPE has to differ -- and what has to differ is what the panel SHOWS,
+    // which a legend could get right while the sentences got it wrong.
+    const request = await playwright.request.newContext();
     await openPelfs(page, session);
+    const glyph = page.getByTestId("durability-glyph");
 
-    const legend = page.getByTestId("durability-legend");
-    await expect(legend).toBeVisible();
+    // A fresh volume: nothing staged, so this is the published glyph.
+    await expect(page.getByTestId("durability")).toHaveAttribute("data-durability", "published");
+    const published = ((await glyph.textContent()) ?? "").trim();
 
-    const staged = (await page.getByTestId("glyph-staged").textContent())?.trim() ?? "";
-    const sending = (await page.getByTestId("glyph-sending").textContent())?.trim() ?? "";
-    const published = (await page.getByTestId("glyph-published").textContent())?.trim() ?? "";
+    await testHook(request, session, { staged_files: 2, staged_bytes: 2048, upload_backlog: 4096 });
+    await expect(page.getByTestId("durability")).toHaveAttribute("data-durability", "staged");
+    const staged = ((await glyph.textContent()) ?? "").trim();
+
+    // The third one is inside the sentence, next to the word it qualifies --
+    // which is the whole reason the legend was redundant. Read it from there.
+    const line = ((await page.getByTestId("durability").textContent()) ?? "").trim();
+    const sending = (/(\S+)\s+sending/.exec(line) ?? ["", ""])[1];
 
     expect(staged, "the staged glyph must exist").not.toBe("");
     expect(published, "the published glyph must exist").not.toBe("");
-    // The assertion the whole panel is for. Two shades of one glyph would
-    // pass a colour check and fail every colour-blind user, so the SHAPE has
-    // to differ.
+    expect(sending, "the sending glyph must exist").not.toBe("");
     expect(
       published,
       "'on this machine only' and 'in the federation' must not be the same character",
@@ -68,9 +82,9 @@ test.describe("durability", () => {
     expect(sending).not.toBe(staged);
     expect(sending).not.toBe(published);
 
-    // And the legend has to say what each one means, in words.
-    await expect(legend).toContainText("on this machine only");
-    await expect(legend).toContainText("in the federation");
+    // And the words are beside the glyphs, in the sentence itself.
+    await expect(page.getByTestId("durability")).toContainText("on this machine only");
+    await request.dispose();
   });
 
   test("data-durability follows the volume: published -> staged -> published", async ({

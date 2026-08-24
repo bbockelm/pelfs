@@ -1,45 +1,104 @@
 /*
- * The palette, in ONE place.
+ * THE PALETTE AND THE SURFACES, IN ONE PLACE -- for this app's chrome AND for
+ * the file manager inside it, which is the half that used to be missing.
  *
- * The three brand values are read from the Pelican Platform's own source,
- * not from a screenshot: web_ui/frontend/components/ThemeProvider.tsx:34-39
- * in the pelican checkout gives primary #0885ff, primary.light #CFE4FF and
- * secondary #FFFFFA. The public branding page agrees on the first two.
+ * The three brand values are read from the Pelican Platform's own source, not
+ * from a screenshot: web_ui/frontend/components/ThemeProvider.tsx:34-39 in the
+ * pelican checkout gives primary #0885ff, primary.light #CFE4FF and secondary
+ * #FFFFFA. The public branding page agrees on the first two. They are used as
+ * an ACCENT -- the wordmark's "fs", the primary button, the focus ring, the
+ * selection -- and never as a flat fill: the Pelican web UI's own restraint is
+ * the reference, and a localhost file browser painted brand-blue would read as
+ * a marketing page rather than a tool.
+ *
+ * THE SECOND HALF OF THIS FILE IS THE COMPONENT'S THEME, and it belongs here
+ * rather than in ui/app.css because it is the same decision. @svar-ui's themes
+ * are a complete set of --wx-* tokens (see vite.config.ts's
+ * dropRemoteFontFaces for how they reach the bundle at all), and the page read
+ * as two programs bolted together while the component kept Willow's #37a9ef
+ * and Open Sans and the chrome used #0885ff and the platform stack. One
+ * palette, one typeface, two renderings of one surface system.
  *
  * The durability colours are pelfs's own, and deliberately NOT shades of the
- * brand blue: the whole point of the durability panel is that "on this
- * machine only" and "in the federation" are unmistakably different, and
- * doing that in two blues would fail at the one job it has.
+ * brand blue: the whole point of the durability panel is that "on this machine
+ * only" and "in the federation" are unmistakably different, and doing that in
+ * two blues would fail at the one job it has.
  */
 :root {
+  color-scheme: light dark;
+
   --pelfs-primary: #0885ff;
   --pelfs-primary-light: #cfe4ff;
+  --pelfs-primary-hover: #0a75dd;
+  /* Brand blue is ~3:1 on white: enough for a border, a fill or a focus ring,
+     not for small text. Text that has to BE the accent uses this instead. */
+  --pelfs-primary-ink: #0a5cb0;
   --pelfs-secondary: #fffffa;
 
   /* pelfs's own two, for durability state only. */
   --pelfs-local-only: #b45309; /* amber-700: on this machine only */
   --pelfs-federated: #15803d; /* green-700: in the federation */
+  --pelfs-warn-wash: #fdf6e7;
+  --pelfs-warn-rule: #e8cf96;
+  --pelfs-bad-wash: #fdeceb;
+  --pelfs-bad-rule: #edaba6;
+  --pelfs-bad-ink: #8c231c;
 
-  --pelfs-ink: #101828;
-  --pelfs-ink-muted: #5b6472;
-  --pelfs-rule: #e4e7ec;
-  --pelfs-ground: var(--pelfs-secondary);
+  /* The surface system. `ground` is the recess the panels sit on, and it is
+     also the file manager's own background, so the file panel and its contents
+     are one surface rather than a pale rectangle inside a white one. */
+  --pelfs-ground: #eef0f5;
+  --pelfs-surface: #ffffff;
+  --pelfs-surface-alt: #f7f8fa;
+  --pelfs-ink: #2c2f3c;
+  --pelfs-ink-muted: #646b7c;
+  --pelfs-rule: #e1e4ea;
+  --pelfs-shadow: 0 1px 2px rgba(44, 47, 60, 0.06), 0 3px 10px rgba(44, 47, 60, 0.08);
+  --pelfs-radius: 10px;
+  --pelfs-radius-sm: 6px;
 
   --pelfs-font:
     ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --pelfs-font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
 }
 
-/* The UI is a localhost tool, not a website: it inherits the platform's
-   dark-mode preference rather than shipping a theme switcher. */
+/* The UI is a localhost tool, not a website: it follows the platform's
+   dark-mode preference rather than shipping a theme switcher.
+
+   This block used to be the whole of dark mode, and the result was measurably
+   wrong: the chrome went dark, the file manager stayed on its light theme and
+   inherited `color: #e8eaed` from body, so every file name was near-white text
+   on a near-white card. The fix is not to drop dark mode but to hand the
+   component its own dark theme as well -- App.tsx selects <WillowDark> on
+   exactly this media query, and the values below are matched to it. */
 @media (prefers-color-scheme: dark) {
   :root {
-    --pelfs-ink: #e8eaed;
-    --pelfs-ink-muted: #9aa4b2;
-    --pelfs-rule: #2b313b;
-    --pelfs-ground: #12161c;
+    /* Darker than the light theme's blue, not lighter: it is a FILL here
+       (the primary button, the segmented control's active cell) and white on
+       #58aeff is 2.4:1. Text that has to be the accent uses -ink, which goes
+       the other way. */
+    --pelfs-primary: #2b84d8;
+    --pelfs-primary-light: #1d3f66;
+    --pelfs-primary-hover: #3d95e8;
+    --pelfs-primary-ink: #8cc8ff;
+
     --pelfs-local-only: #f0a034;
     --pelfs-federated: #4ade80;
+    --pelfs-warn-wash: #332c1c;
+    --pelfs-warn-rule: #6b5a2e;
+    --pelfs-bad-wash: #35211f;
+    --pelfs-bad-rule: #7a3a34;
+    --pelfs-bad-ink: #f2b8b3;
+
+    /* Matched to .wx-willow-dark-theme: background #2a2b2d, background-alt
+       #384047, the file manager's own ground #2b343b. */
+    --pelfs-ground: #21262b;
+    --pelfs-surface: #2a2b2d;
+    --pelfs-surface-alt: #31353a;
+    --pelfs-ink: rgba(255, 255, 255, 0.9);
+    --pelfs-ink-muted: #a2a8b5;
+    --pelfs-rule: #384047;
+    --pelfs-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
   }
 }
 
@@ -54,6 +113,47 @@ body {
   background: var(--pelfs-ground);
   color: var(--pelfs-ink);
   font-family: var(--pelfs-font);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+/* ---- the component's theme, in the app's palette --------------------------
+ *
+ * These are @svar-ui's own tokens, redefined on its own theme classes. Same
+ * specificity as the vendor rule, so source order decides -- which is why
+ * main.tsx imports all.css FIRST and this file after it.
+ *
+ * Only the tokens that carry identity are touched: the accent, the typeface,
+ * the surfaces and the rules. Everything else -- spacing, the widget
+ * geometries, the state colours -- stays the vendor's, because a theme that
+ * overrides everything is a fork, and the next version bump is when you find
+ * out. */
+.wx-willow-theme,
+.wx-willow-dark-theme {
+  --wx-font-family: var(--pelfs-font);
+  --wx-color-primary: var(--pelfs-primary);
+  --wx-color-font: var(--pelfs-ink);
+  --wx-background: var(--pelfs-surface);
+  --wx-background-alt: var(--pelfs-surface-alt);
+  --wx-border-color: var(--pelfs-rule);
+  --wx-fm-background: var(--pelfs-ground);
+  --wx-fm-grid-border: 1px solid var(--pelfs-rule);
+  /* The panel this component sits in already has a border and a shadow of its
+     own (ui/app.css, .pelfs-panel), so the vendor's per-element shadows would
+     be a second frame inside the first. A hairline instead. */
+  --wx-fm-box-shadow: none;
+}
+
+.wx-willow-theme {
+  --wx-color-primary-selected: var(--pelfs-primary-light);
+  --wx-background-hover: #e9edf3;
+  --wx-fm-select-background: var(--pelfs-primary-light);
+}
+
+.wx-willow-dark-theme {
+  --wx-color-primary-selected: var(--pelfs-primary-light);
+  --wx-background-hover: #22272c;
+  --wx-fm-select-background: var(--pelfs-primary-light);
 }
 
 /* ---- the wordmark ---------------------------------------------------- */
@@ -62,20 +162,22 @@ body {
   display: flex;
   align-items: center;
   gap: 0.55rem;
+  min-width: 0;
 }
 
 .pelfs-brand__mark {
-  /* The mark is used unmodified, at its own aspect ratio. Nothing is drawn
-     on top of it, which is why this treatment is a wordmark and not a logo
-     edit -- see docs/design-webui.md, "Branding". */
-  height: 28px;
+  /* The mark is used unmodified, at its own aspect ratio. Nothing is drawn on
+     top of it, which is why this treatment is a wordmark and not a logo edit
+     -- see docs/design-webui.md, "Branding". */
+  height: 26px;
   width: auto;
   display: block;
+  flex: none;
 }
 
 .pelfs-brand__word {
-  font-size: 1.25rem;
-  font-weight: 600;
+  font-size: 1.15rem;
+  font-weight: 650;
   letter-spacing: -0.01em;
   line-height: 1;
   color: var(--pelfs-ink);
@@ -85,12 +187,20 @@ body {
    wordmark. The bird is untouched. */
 .pelfs-brand__word em {
   font-style: normal;
-  color: var(--pelfs-primary);
+  color: var(--pelfs-primary-ink);
 }
 
+/* The volume this session is serving. Monospace because it is an address, and
+   truncated rather than wrapped because a long pelican:// URL must not push
+   the chrome around. */
 .pelfs-brand__sub {
+  font-family: var(--pelfs-font-mono);
   font-size: 0.75rem;
   color: var(--pelfs-ink-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
 }
 
 /* No footer rules: there is no footer. See Brand.tsx for whose call that

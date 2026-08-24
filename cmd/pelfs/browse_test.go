@@ -439,7 +439,7 @@ func TestPageIsOneFileWithANonceAndTheTestIDsAPlaywrightSuiteNeeds(t *testing.T)
 	// The hooks a browser driver selects on.
 	for _, id := range []string{
 		"volume", "mode", "branch-generation", "lease", "lease-banner", "phase-banner",
-		"durability", "durability-legend", "glyph-staged", "glyph-sending", "glyph-published",
+		"durability",
 		"publish-button", "publish-hint", "publish-status", "connect-another-program",
 		"stream-status", "noscript", "test-hooks-banner", "body",
 		// The anchor to the other surface. Each page carries exactly one,
@@ -463,14 +463,27 @@ func TestPageIsOneFileWithANonceAndTheTestIDsAPlaywrightSuiteNeeds(t *testing.T)
 			t.Errorf("the page has no data-testid=%q", id)
 		}
 	}
-	// The two glyphs must not be the same character. This is the one
+	// The three glyphs must be three different characters. This is the one
 	// rendering rule docs/design-webui.md states as a requirement: a file
 	// that looks uploaded and is not in the federation is the worst
 	// ambiguity this page could carry.
-	staged := glyphFor(t, page, "glyph-staged")
-	published := glyphFor(t, page, "glyph-published")
+	//
+	// They are read out of the durability sentences themselves, which is
+	// where they now live: the page used to carry a LEGEND under the line
+	// ("● on this machine only / ◔ sending / ✓ in the federation") and the
+	// three ids this test used to select on were its. The legend is gone --
+	// every glyph already appears beside its own words in the sentence it
+	// belongs to, so the row was a second copy of the text -- and the
+	// contract it stood for is asserted here instead, against the strings
+	// the page will actually render.
+	staged := glyphFor(t, page, "staged")
+	sending := glyphFor(t, page, "sending")
+	published := glyphFor(t, page, "published")
 	if staged == published {
 		t.Errorf("staged and published render the same glyph (%q)", staged)
+	}
+	if sending == staged || sending == published {
+		t.Errorf("sending renders the same glyph as another state (%q)", sending)
 	}
 	// This page still has no file manager on it, and the person who
 	// expected one has to be told that on the page rather than in a release
@@ -516,13 +529,13 @@ func TestPageIsOneFileWithANonceAndTheTestIDsAPlaywrightSuiteNeeds(t *testing.T)
 	}
 }
 
-// glyphFor extracts the character inside the element with this test id.
-func glyphFor(t *testing.T, page, id string) string {
+// glyphFor extracts the character this page renders for one durability state.
+func glyphFor(t *testing.T, page, state string) string {
 	t.Helper()
-	re := regexp.MustCompile(`data-testid="` + id + `">([^<]+)<`)
+	re := regexp.MustCompile(`class="glyph ` + state + `">([^<]+)<`)
 	m := re.FindStringSubmatch(page)
 	if m == nil {
-		t.Fatalf("no glyph for %s", id)
+		t.Fatalf("the page renders no glyph for the %q state", state)
 	}
 	return m[1]
 }

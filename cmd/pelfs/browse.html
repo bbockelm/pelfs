@@ -30,61 +30,132 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>pelfs — {{.Volume}}</title>
 <style nonce="{{.Nonce}}">
+  /*
+   * The connection page's own stylesheet, and it is a SECOND rendering of the
+   * app's design rather than a second design: the palette, the surfaces, the
+   * radii and the focus ring are the ones in webui/frontend/src/brand/brand.css
+   * and ui/app.css, transcribed. The two pages are one product and a user
+   * walks between them with one click, so a different grey here reads as a
+   * different program.
+   */
   :root {
+    color-scheme: light dark;
     /* Pelican Platform's palette, from web_ui/frontend/components/ThemeProvider.tsx. */
     --brand: #0885ff;
     --brand-light: #CFE4FF;
-    --ground: #FFFFFA;
-    --ink: #1a2029;
-    --muted: #5b6672;
-    --rule: #dfe4ea;
+    --brand-ink: #0a5cb0;
+    --ground: #eef0f5;
+    --surface: #ffffff;
+    --surface-alt: #f7f8fa;
+    --ink: #2c2f3c;
+    --muted: #646b7c;
+    --rule: #e1e4ea;
+    --shadow: 0 1px 2px rgba(44, 47, 60, .06), 0 3px 10px rgba(44, 47, 60, .08);
+    --radius: 10px;
+    --radius-sm: 6px;
     /* pelfs's own two colours, and they are deliberately NOT brand chrome:
        the whole point of the durability panel is that "on this machine"
        and "in the federation" are unmistakably different, and doing that
        in two shades of the brand blue would fail. */
     --staged: #b45309;
     --published: #157f3d;
+    --warn-wash: #fdf6e7;
+    --warn-rule: #e8cf96;
+    --bad-wash: #fdeceb;
+    --bad-rule: #edaba6;
+    --bad-ink: #8c231c;
+  }
+  /* The app follows the platform's dark-mode preference; so does this, or the
+     one-click walk between the two pages flashes white. */
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --brand: #2b84d8;
+      --brand-light: #1d3f66;
+      --brand-ink: #8cc8ff;
+      --ground: #21262b;
+      --surface: #2a2b2d;
+      --surface-alt: #31353a;
+      --ink: rgba(255, 255, 255, .9);
+      --muted: #a2a8b5;
+      --rule: #384047;
+      --shadow: 0 1px 2px rgba(0, 0, 0, .3);
+      --staged: #f0a034;
+      --published: #4ade80;
+      --warn-wash: #332c1c;
+      --warn-rule: #6b5a2e;
+      --bad-wash: #35211f;
+      --bad-rule: #7a3a34;
+      --bad-ink: #f2b8b3;
+    }
   }
   * { box-sizing: border-box; }
   body {
-    margin: 0; padding: 2.5rem 1.5rem;
+    margin: 0; padding: 0;
     background: var(--ground); color: var(--ink);
-    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
   }
-  main { max-width: 44rem; margin: 0 auto; }
-  h1 { font-size: 1.35rem; font-weight: 600; margin: 0; letter-spacing: -0.01em; }
+  /* The app bar, transcribed: a white bar with a brand seam under it. */
+  header.bar {
+    display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;
+    padding: .5rem 1rem; background: var(--surface);
+    border-bottom: 1px solid var(--rule);
+    box-shadow: inset 0 -3px 0 -1px var(--brand);
+  }
+  main { max-width: 52rem; margin: 0 auto; padding: .9rem 1rem 2rem; }
+  section.panel {
+    background: var(--surface); border: 1px solid var(--rule);
+    border-radius: var(--radius); box-shadow: var(--shadow);
+    padding: .8rem .9rem; margin: 0 0 .75rem;
+  }
+  section.panel.status { border-left: 3px solid var(--rule); }
+  section.panel.status[data-durability="staged"] { border-left-color: var(--staged); }
+  section.panel.status[data-durability="published"] { border-left-color: var(--published); }
+  h1 { font-size: 1.15rem; font-weight: 650; margin: 0; letter-spacing: -.01em;
+       display: flex; align-items: center; gap: .45rem; min-width: 0; }
+  h1 .mark { height: 26px; width: auto; display: block; flex: none; }
   h1 .pel { color: var(--ink); }
-  h1 .fs { color: var(--brand); }
-  h1 .vol { font-weight: 400; color: var(--muted); font-size: 1rem; word-break: break-all; }
-  .row { display: flex; gap: 1rem; align-items: baseline; justify-content: space-between; flex-wrap: wrap; }
+  h1 .fs { color: var(--brand-ink); }
+  h1 .vol {
+    font-weight: 400; color: var(--muted); font-size: .75rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all;
+  }
+  .facts { display: flex; align-items: center; gap: .75rem; flex-wrap: wrap; margin-left: auto; }
   .badge {
-    font-size: .8rem; padding: .12rem .5rem; border-radius: 999px;
-    background: var(--brand-light); color: #10365e; white-space: nowrap;
+    font-size: .72rem; font-weight: 600; letter-spacing: .02em; text-transform: uppercase;
+    padding: .16rem .5rem; border-radius: 999px; white-space: nowrap;
+    background: var(--surface-alt); border: 1px solid var(--rule); color: var(--muted);
   }
-  .sub { color: var(--muted); font-size: .92rem; margin-top: .15rem; }
-  hr { border: 0; border-top: 1px solid var(--rule); margin: 1.4rem 0; }
+  .sub { color: var(--muted); font-size: .78rem; white-space: nowrap; }
+  .navlink {
+    font-size: .8rem; font-weight: 600; text-decoration: none; color: var(--brand-ink);
+    border: 1px solid var(--rule); border-radius: var(--radius-sm); padding: .3rem .7rem;
+    white-space: nowrap;
+  }
+  .navlink:hover { background: var(--surface-alt); }
+  a { color: var(--brand-ink); }
+  :is(a, button, input, summary):focus-visible {
+    outline: 2px solid var(--brand); outline-offset: 1px; border-radius: 3px;
+  }
   .banner {
-    padding: .7rem .9rem; border-radius: .4rem; margin: 1rem 0;
-    background: var(--brand-light); border: 1px solid #a9cdf7;
+    padding: .6rem .8rem; border-radius: var(--radius-sm); margin: 0 0 .75rem;
+    background: var(--surface); border: 1px solid var(--rule);
+    border-left: 3px solid var(--brand); box-shadow: var(--shadow);
   }
-  .banner.warn { background: #fdf3e3; border-color: #e6c98a; }
-  .banner.bad { background: #fdecec; border-color: #e9a7a7; }
+  .banner.warn { background: var(--warn-wash); border-color: var(--warn-rule); border-left-color: var(--staged); }
+  .banner.bad { background: var(--bad-wash); border-color: var(--bad-rule); border-left-color: #c0392b; color: var(--bad-ink); }
   .banner[hidden] { display: none; }
-  #durability { font-size: 1.05rem; margin: .2rem 0 1rem; }
+  #durability { font-size: .95rem; margin: 0; }
   .glyph { font-weight: 700; margin-right: .35rem; }
   .glyph.staged { color: var(--staged); }
   .glyph.published { color: var(--published); }
   .glyph.sending { color: var(--brand); }
-  .nav { margin: .6rem 0 0; font-size: .92rem; }
-  .nav a { color: var(--brand); }
-  .legend { display: flex; gap: 1.4rem; flex-wrap: wrap; color: var(--muted); font-size: .86rem; }
   /* The SSO card. Brand-light rather than a warning colour: being asked to
      log in is normal, not a fault. */
   .sso {
-    padding: .8rem .9rem; border-radius: .4rem; margin: 1rem 0;
-    background: var(--brand-light); border: 1px solid #a9cdf7;
+    padding: .8rem .9rem; border-radius: var(--radius-sm); margin: 0 0 .75rem;
+    background: var(--brand-light); border: 1px solid var(--rule);
   }
-  .sso[data-expired="true"] { background: #f4f5f6; border-color: var(--rule); color: var(--muted); }
+  .sso[data-expired="true"] { background: var(--surface-alt); color: var(--muted); }
   .sso h2 { font-size: 1rem; margin: 0 0 .35rem; }
   .sso .code {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -96,44 +167,58 @@
     font-weight: 400; padding: .2rem .55rem; font-size: .85rem;
   }
   button {
-    font: inherit; font-weight: 600; cursor: pointer;
-    background: var(--brand); color: #fff; border: 1px solid #036;
-    border-radius: .35rem; padding: .45rem 1rem;
+    font: inherit; font-size: .85rem; font-weight: 600; cursor: pointer;
+    background: var(--brand); color: #fff; border: 1px solid transparent;
+    border-radius: var(--radius-sm); padding: .35rem .85rem;
   }
-  button:disabled { background: #e8ebee; color: #8b949e; border-color: var(--rule); cursor: not-allowed; }
-  .publishrow { display: flex; gap: .8rem; align-items: center; flex-wrap: wrap; }
-  #publish-hint, #publish-status { color: var(--muted); font-size: .9rem; }
+  button:hover:not(:disabled) { filter: brightness(1.08); }
+  button:disabled { background: var(--surface-alt); color: var(--muted); border-color: var(--rule); cursor: not-allowed; }
+  button[hidden] { display: none; }
+  .statusrow { display: flex; gap: .9rem; align-items: baseline; flex-wrap: wrap; }
+  .statusrow #durability { flex: 1 1 20rem; }
+  .statusrow #publish-hint { margin-left: auto; }
+  #publish-hint, #publish-status { color: var(--muted); font-size: .8rem; }
+  #publish-status { margin: .35rem 0 0; }
+  #publish-status:empty { display: none; }
   .connect h2 { font-size: 1rem; margin: 0 0 .2rem; }
-  .connect p { margin: 0 0 .6rem; color: var(--muted); font-size: .92rem; }
+  .connect p { margin: 0 0 .6rem; color: var(--muted); font-size: .88rem; }
   .connect form { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; margin: .8rem 0; }
   .connect input[type="text"] {
-    font: inherit; padding: .4rem .6rem; border: 1px solid var(--rule);
-    border-radius: .35rem; background: #fff; color: var(--ink); min-width: 14rem;
+    font: inherit; padding: .35rem .6rem; border: 1px solid var(--rule);
+    border-radius: var(--radius-sm); background: var(--surface); color: var(--ink); min-width: 14rem;
   }
-  .connect label { font-size: .92rem; color: var(--muted); }
+  .connect input[type="text"]:focus { border-color: var(--brand); outline: 2px solid var(--brand); outline-offset: -1px; }
+  .connect label { font-size: .88rem; color: var(--muted); }
   .connect label input { margin-right: .3rem; }
   .cred {
-    padding: .8rem .9rem; border-radius: .4rem; margin: 1rem 0;
-    background: var(--brand-light); border: 1px solid #a9cdf7;
+    padding: .8rem .9rem; border-radius: var(--radius-sm); margin: .75rem 0;
+    background: var(--brand-light); border: 1px solid var(--rule);
   }
   .cred h3 { font-size: .95rem; margin: 0 0 .4rem; }
   .cred .files { display: flex; gap: .5rem; flex-wrap: wrap; margin: .6rem 0; }
-  .cred .files button { font-size: .88rem; padding: .35rem .7rem; }
+  .cred .files button { font-size: .82rem; padding: .3rem .7rem; }
   .cred dl { display: grid; grid-template-columns: max-content 1fr; gap: .15rem .8rem; margin: .5rem 0 0; }
-  .cred dt { color: var(--muted); font-size: .86rem; }
-  .cred dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .86rem; user-select: all; word-break: break-all; }
-  .cred .once { color: var(--staged); font-size: .86rem; margin: .5rem 0 0; }
-  table.creds { border-collapse: collapse; width: 100%; margin: .6rem 0; font-size: .9rem; }
-  table.creds th { text-align: left; color: var(--muted); font-weight: 500; font-size: .82rem; }
+  .cred dt { color: var(--muted); font-size: .82rem; }
+  .cred dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .82rem; user-select: all; word-break: break-all; }
+  .cred .once { color: var(--staged); font-size: .82rem; margin: .5rem 0 0; }
+  table.creds { border-collapse: collapse; width: 100%; margin: .6rem 0; font-size: .88rem; }
+  table.creds th { text-align: left; color: var(--muted); font-weight: 500; font-size: .78rem; }
   table.creds th, table.creds td { padding: .3rem .5rem .3rem 0; border-bottom: 1px solid var(--rule); }
   table.creds button {
     background: transparent; color: var(--muted); border: 1px solid var(--rule);
-    font-weight: 400; padding: .15rem .5rem; font-size: .84rem;
+    font-weight: 400; padding: .15rem .5rem; font-size: .8rem;
   }
   table.creds[hidden], .cred[hidden], #connect-empty[hidden] { display: none; }
-  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .9em; }
-  footer { margin-top: 2rem; color: var(--muted); font-size: .8rem; }
-  #stream-status { font-size: .8rem; color: var(--muted); }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .92em; }
+  footer {
+    display: flex; gap: .9rem; align-items: center;
+    padding: .35rem 1rem; background: var(--surface); border-top: 1px solid var(--rule);
+    font-size: .75rem; color: var(--muted);
+  }
+  #stream-status::before { content: "\25cf"; margin-right: .35rem; color: var(--published); }
+  #stream-status[data-stream="connecting"]::before,
+  #stream-status[data-stream="reconnecting"]::before { color: var(--staged); }
+  #stream-status[data-stream="closed"]::before { color: var(--muted); }
 </style>
 </head>
 <body data-phase="connecting" data-testid="body">
@@ -149,24 +234,29 @@
   </div>
 </noscript>
 
-<main>
-  <div class="row">
-    <h1><span class="pel">pel</span><span class="fs">fs</span>
-      <span class="vol" data-testid="volume">{{.Volume}}</span></h1>
+<header class="bar">
+  <!-- The same wordmark the file manager wears: the Pelican mark, unmodified,
+       beside "pelfs" with the "fs" in the brand blue. The asset is the
+       bundle's, served at /brand/{file} (cmd/pelfs/browse.go's route table),
+       and the CSP on this page allows `img-src 'self'`. Nothing is drawn on
+       top of the mark -- see webui/frontend/src/brand/Brand.tsx. -->
+  <h1><img class="mark" src="/brand/PelicanPlatformLogo_Icon.png" width="26" height="26"
+        alt="Pelican Platform mark"><span class="pel">pel</span><span class="fs">fs</span>
+    <span class="vol" data-testid="volume">{{.Volume}}</span></h1>
+  <div class="facts">
+    <span class="sub" data-testid="branch-generation">branch —, generation —</span>
+    <span class="sub" data-testid="lease">lease: —</span>
     <span class="badge" data-testid="mode">read-only</span>
+    <!-- The other half of the pair. `/` is the file manager and this is
+         `/connect`; each page carries exactly one anchor to the other, so
+         neither becomes a dead end. A plain <a>, not a fetch: the session
+         token is in sessionStorage, which is per-ORIGIN and survives a
+         same-origin navigation, so following this link costs nothing. -->
+    <a class="navlink" href="/" data-testid="app-link">← Files</a>
   </div>
-  <div class="row">
-    <div class="sub" data-testid="branch-generation">branch —, generation —</div>
-    <div class="sub" data-testid="lease">lease: —</div>
-  </div>
+</header>
 
-  <!-- The other half of the pair. `/` is the file manager and this is
-       `/connect`; each page carries exactly one anchor to the other, so
-       neither becomes a dead end. A plain <a>, not a fetch: the session
-       token is in sessionStorage, which is per-ORIGIN and survives a
-       same-origin navigation, so following this link costs nothing. -->
-  <nav class="nav"><a href="/" data-testid="app-link">← Files</a></nav>
-
+<main>
   <div class="banner" data-testid="phase-banner">
     connecting to the federation — this is where your institution may ask you to
     approve access. The terminal shows the same prompt.
@@ -178,37 +268,36 @@
     It exists for the browser-driver test suite. Never use it on real data.
   </div>
 
-  <div class="banner bad" data-testid="lease-banner" hidden></div>
-
   <!-- The SSO cards (U13). A LIST, not a modal: two namespaces can each
        open a device flow, and a modal would have to hide one of two things
        the user has to do. Empty and hidden until a flow starts, which is
        usually within a second of the page loading. -->
   <div id="sso" data-testid="sso-cards" hidden></div>
 
-  <hr>
+  <!-- THE STATUS PANEL, and it is the same panel the file manager shows at
+       `/`: one /events snapshot, one vocabulary (webui/frontend/src/durability.ts
+       and internal/webui/durability_test.go), two renderings. There is no
+       glyph legend under it -- each glyph appears beside its own words in the
+       sentence, so a legend was a second copy of the text. -->
+  <section class="panel status" id="status-panel" data-testid="pelfs-durability-panel">
+    <div class="statusrow">
+      <p id="durability" data-testid="durability">reading the overlay…</p>
+      <span id="publish-hint" data-testid="publish-hint"></span>
+      <!-- HIDDEN until a frame says this session is writable, and REMOVED for
+           good if it says read-only: `pelfs browse` is read-only by default, and
+           a button you cannot press, under a line that has already said
+           "read-only", explaining read-only a third time, was the worst thing on
+           this page. See the app's ui/Durability.tsx, which does the same. -->
+      <button id="publish" data-testid="publish-button" data-publish-state="unknown" hidden disabled>
+        Publish now
+      </button>
+    </div>
+    <p id="publish-status" data-testid="publish-status"></p>
 
-  <p id="durability" data-testid="durability">reading the overlay…</p>
+    <div class="banner bad" data-testid="lease-banner" hidden></div>
+  </section>
 
-  <div class="legend" data-testid="durability-legend">
-    <span><span class="glyph staged" data-testid="glyph-staged">●</span>on this machine only</span>
-    <span><span class="glyph sending" data-testid="glyph-sending">◔</span>sending</span>
-    <span><span class="glyph published" data-testid="glyph-published">✓</span>in the federation</span>
-  </div>
-
-  <hr>
-
-  <div class="publishrow">
-    <button id="publish" data-testid="publish-button" data-publish-state="unknown" disabled>
-      Publish now
-    </button>
-    <span id="publish-hint" data-testid="publish-hint"></span>
-  </div>
-  <p id="publish-status" data-testid="publish-status"></p>
-
-  <hr>
-
-  <div class="connect" data-testid="connect-another-program">
+  <section class="panel connect" data-testid="connect-another-program">
     <h2>Connect another program</h2>
     <p data-testid="connect-blurb">
       This page does not browse files — <a href="/">the file manager</a>
@@ -254,12 +343,12 @@
       <thead><tr><th>connection</th><th>scope</th><th>last used</th><th></th></tr></thead>
       <tbody id="grant-rows"></tbody>
     </table>
-  </div>
-
-  <footer>
-    <div id="stream-status" data-testid="stream-status">connecting…</div>
-  </footer>
+  </section>
 </main>
+
+<footer>
+  <span id="stream-status" data-testid="stream-status">connecting…</span>
+</footer>
 
 <script nonce="{{.Nonce}}">
 (() => {
@@ -707,7 +796,7 @@
       d.dataset.durability = "published";
     } else {
       const sending = s.upload_backlog > 0
-        ? ` <span class="glyph sending">◔</span>sending ${bytes(s.upload_backlog)}.`
+        ? ` <span class="glyph sending">◔</span> sending ${bytes(s.upload_backlog)}.`
         : "";
       // The idle clause is not decoration: it is the promise that closing
       // this tab publishes rather than abandoning. Said only when the
@@ -722,8 +811,11 @@
         `${idle} (sooner under write pressure).${sending}`;
       d.dataset.durability = "staged";
     }
+    // The panel's left edge carries the same state as colour, the way the
+    // app's does (webui/frontend/src/ui/app.css, .pelfs-panel--status).
+    el("status-panel").dataset.durability = d.dataset.durability;
 
-    // The button.
+    // The button, and the one session that gets no button.
     const btn = el("publish"), hint = el("publish-hint");
     const job = s.publish;
     let state = "ready";
@@ -731,8 +823,18 @@
     else if (s.mode === "read-only") state = "read-only";
     else if (job && job.state === "running") state = "running";
     else if (s.staged_files === 0 && s.dirty_nodes === 0) state = "nothing";
-    btn.dataset.publishState = state;
-    btn.disabled = state !== "ready";
+    if (btn) {
+      if (state === "read-only") {
+        // One-way: `mode` is fixed for the life of the process (it is --rw at
+        // startup), so a session that reports read-only once will never
+        // report anything else, and the hint below is the whole answer.
+        btn.remove();
+      } else {
+        btn.dataset.publishState = state;
+        btn.disabled = state !== "ready";
+        btn.hidden = false;
+      }
+    }
     hint.textContent = {
       ready: "",
       connecting: "(waiting for the volume)",
@@ -765,7 +867,7 @@
 
   async function publish() {
     const btn = el("publish");
-    btn.disabled = true;
+    if (btn) btn.disabled = true;
     const res = await fetch("/api/v1/publish", {
       method: "POST",
       headers: { "Content-Type": "application/json", [SESSION_HEADER]: token },
@@ -845,7 +947,11 @@
     if (document.visibilityState === "hidden") beacon();
   });
 
-  el("publish").addEventListener("click", publish);
+  // Delegated, because the button is REMOVED in a read-only session: a
+  // listener attached to the element itself would throw at load time there.
+  document.addEventListener("click", (e) => {
+    if (e.target && e.target.id === "publish") publish();
+  });
   authenticate().then((tok) => {
     if (!tok) return;
     token = tok;

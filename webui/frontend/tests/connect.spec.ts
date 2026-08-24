@@ -83,9 +83,10 @@ test.describe("the two addresses", () => {
     const connectText = ((await connect.textContent()) ?? "").replace(/\s+/g, " ").trim();
 
     expect(appText, "the two panels must not word one state two ways").toBe(connectText);
-    // And the legend, which is what makes the glyphs mean anything.
-    await expect(page.getByTestId("durability-legend")).toContainText("on this machine only");
-    await expect(page.getByTestId("durability-legend")).toContainText("in the federation");
+    // Neither page carries a glyph legend any more -- each glyph appears
+    // beside its own words in the sentence, so the legend was a second copy of
+    // the text and it is deleted on both surfaces rather than on one.
+    await expect(page.getByTestId("durability-legend")).toHaveCount(0);
   });
 
   test("the connection page says where the file manager is", async ({ page, session }) => {

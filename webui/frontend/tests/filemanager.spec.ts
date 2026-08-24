@@ -165,8 +165,13 @@ test.describe("the file manager", () => {
     await expect(card(page, "/measurement.dat")).toBeVisible();
     const notice = page.getByTestId("upload-notice");
     await expect(notice).toBeVisible();
-    await expect(notice).toContainText("THIS MACHINE");
-    await expect(notice).toContainText("invisible to the federation");
+    // ONE SENTENCE, AND IT IS THE OWNER'S. Ours was four -- the overlay,
+    // durability against a crash, invisibility to the federation, and what the
+    // line above meant -- and the verdict was "WAAY to wordy". Asserted whole,
+    // because a budget would let it grow back up to the budget.
+    await expect(notice).toHaveText(
+      'File uploaded to local machine; click "Publish now" to push it to the federation',
+    );
     // And the durability line, which is the authority, agrees with it.
     await expect(page.getByTestId("durability")).toHaveAttribute("data-durability", "staged");
     await expect(page.getByTestId("durability")).toContainText("on this machine only");
@@ -352,8 +357,9 @@ test.describe("the file manager on a real volume", () => {
     // exactly what that means.
     await expect(card(page, "/measurement.dat")).toBeVisible();
     const notice = page.getByTestId("upload-notice");
-    await expect(notice).toContainText("THIS MACHINE");
-    await expect(notice).toContainText("invisible to the federation");
+    await expect(notice).toHaveText(
+      'File uploaded to local machine; click "Publish now" to push it to the federation',
+    );
     await expect(line).toHaveAttribute("data-durability", "staged");
     await expect(line).toContainText("on this machine only");
 

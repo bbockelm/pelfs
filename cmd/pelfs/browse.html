@@ -239,7 +239,6 @@
   .cred dl { display: grid; grid-template-columns: max-content 1fr; gap: .15rem .8rem; margin: .5rem 0 0; }
   .cred dt { color: var(--muted); font-size: .82rem; }
   .cred dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .82rem; user-select: all; word-break: break-all; }
-  .cred .once { color: var(--staged); font-size: .82rem; margin: .5rem 0 0; }
   table.creds { border-collapse: collapse; width: 100%; margin: .6rem 0; font-size: .88rem; }
   table.creds th { text-align: left; color: var(--muted); font-weight: 500; font-size: .78rem; }
   table.creds th, table.creds td { padding: .3rem .5rem .3rem 0; border-bottom: 1px solid var(--rule); }
@@ -340,30 +339,36 @@
 
   <!-- THE ACTION PAGE. It used to open with a 180-word paragraph that
        explained WebDAV, the profile's stability, the per-session
-       authorization, the password's lifetime and what is on disk, before the
-       reader reached a single control. The owner's verdict: "The connect page
-       text is HORRIBLE. It overly explains, a wall of text for a page that
-       can just configure CyberDuck."
+       authorization and what is on disk, before the reader reached a single
+       control. The owner's verdict: "The connect page text is HORRIBLE. It
+       overly explains, a wall of text for a page that can just configure
+       CyberDuck."
 
-       So this is a page with a verb on it. Cyberduck is named, and linked,
+       So this is a page with a verb on it. Cyberduck is named and linked,
        because "connect another program" told nobody what to do and most
-       people have never heard the word: the link is what turns the name into
-       something a person can act on, and it is an ordinary anchor a user
-       clicks -- nothing on this page FETCHES anything off this machine
+       people have never heard the word; and the DOWNLOAD is linked too,
+       because a reader who does not already have Cyberduck was stuck on a
+       page whose every control configures it. Both are ordinary anchors a
+       user clicks -- nothing here FETCHES anything off this machine
        (tests/loopback.spec.ts).
+
+       "This page does not browse files -- the file manager does -- it sets
+       Cyberduck up" is DELETED: "USELESS", and it was. The heading says what
+       the panel does, and "← Files" in the bar is the way back.
 
        Every remaining fact sits beside the control it is about rather than in
        a preamble above all of them: the WebDAV address under the form, the
-       profile's one-install-per-machine promise next to the download buttons,
-       the password's one-time nature next to the password. -->
+       profile's one-install-per-machine promise next to the download
+       buttons. -->
   <section class="panel connect" data-testid="connect-another-program">
     <h2>Connect with Cyberduck</h2>
     <p data-testid="connect-blurb">
       <a href="https://cyberduck.io/" target="_blank" rel="noopener noreferrer"
          data-testid="cyberduck-link">Cyberduck</a>
       is a free file browser for Mac and Windows that copies whole folders and keeps
-      going in the background. This page does not browse files &mdash;
-      <a href="/">the file manager</a> does &mdash; it sets Cyberduck up.
+      going in the background.
+      <a href="https://cyberduck.io/download/" target="_blank" rel="noopener noreferrer"
+         data-testid="cyberduck-download">Download Cyberduck</a>
     </p>
 
     <form data-testid="add-program-form" id="add-program">
@@ -384,10 +389,10 @@
       <code>mount_webdav</code> &mdash; at <code data-testid="dav-url">&mdash;</code>
     </p>
 
-    <!-- The one panel on this page that holds a secret. It is built once,
-         from the response to the POST that minted it, and it is never
-         re-fetched: internal/localoauth keeps HMACs, so these two values
-         exist nowhere pelfs can read them back. -->
+    <!-- The panel the POST's response builds: the generated files and the
+         WebDAV address. It holds no secret any more -- the credential is
+         OAuth, so there is no password to show once and nothing here to
+         copy down before it is gone. -->
     <div class="cred" id="credential-new" data-testid="credential-new" hidden></div>
 
     <p id="connect-empty" data-testid="connect-empty" hidden>
@@ -580,10 +585,9 @@
   // ---- the credential surface (U7/U8) -------------------------------------
   //
   // Three routes, all on the session-authenticated API surface: list, mint,
-  // revoke. The interesting one is mint, because its response is the only
-  // one on this listener that carries a secret — the per-client Basic
-  // password and, inside the profile, the client id — and neither can be
-  // fetched again.
+  // revoke. The one secret left in mint's response is the client id inside
+  // the generated profile; the Basic password this panel used to show is
+  // gone with password auth itself.
   //
   // THE FILES ARE SAVED FROM A BLOB, not from a link to a route. A download
   // link is an <a href>, an <a href> cannot set X-Pelfs-Session, and a
@@ -620,7 +624,7 @@
     return isNaN(d) ? "never" : d.toLocaleTimeString();
   }
 
-  // The one panel that holds a secret, built with textContent throughout.
+  // Built with textContent throughout.
   function showNewCredential(c) {
     const box = el("credential-new");
     box.textContent = "";
@@ -634,8 +638,12 @@
 
     const files = document.createElement("div");
     files.className = "files";
-    const ids = ["download-profile", "download-bookmark", "download-basic"];
-    (c.files || []).forEach((f, i) => {
+    // THE PASSWORD BOOKMARK IS NOT OFFERED. `*.basic.duck` is the bookmark
+    // that opens the Basic path, and password auth is gone; filtering on the
+    // name rather than the count means this holds whether or not the server
+    // is still generating the file.
+    const ids = ["download-profile", "download-bookmark"];
+    (c.files || []).filter((f) => !/\.basic\.duck$/.test(f.name)).forEach((f, i) => {
       const btn = document.createElement("button");
       btn.type = "button";
       btn.setAttribute("data-testid", ids[i] || "download-file");
@@ -669,15 +677,7 @@
       dl.appendChild(dd);
     };
     pair("WebDAV URL", c.dav_url, "credential-dav-url");
-    pair("username", c.basic_user, "credential-basic-user");
-    pair("password", c.basic_password, "credential-basic-password");
     box.appendChild(dl);
-
-    const once = document.createElement("p");
-    once.className = "once";
-    once.setAttribute("data-testid", "credential-notice");
-    once.textContent = c.notice;
-    box.appendChild(once);
   }
 
   function renderCredentials(list) {
@@ -776,8 +776,8 @@
     const d = e.target && e.target.dataset;
     if (!d || (!d.revokeClient && !d.revokeGrant)) return;
     const body = d.revokeClient ? { client: d.revokeClient } : { grant: d.revokeGrant };
-    // A revoked client's profile is dead for good, so the panel that showed
-    // its password goes with it rather than sitting there looking usable.
+    // A revoked client's profile is dead for good, so the panel offering it
+    // goes with it rather than sitting there looking usable.
     if (d.revokeClient && el("credential-new").dataset.ref === d.revokeClient) {
       el("credential-new").hidden = true;
       el("credential-new").textContent = "";
@@ -909,16 +909,17 @@
       const sending = s.upload_backlog > 0
         ? ` <span class="glyph sending">◔</span> Sending ${bytes(s.upload_backlog)}.`
         : "";
-      // The idle clause is not decoration: it is the promise that closing
-      // this tab publishes rather than abandoning. Said only when the
-      // server says idle sealing is on for this session.
-      const idle = s.idle_seal_s > 0
-        ? `, or ${secs(s.idle_seal_s)} after this tab closes`
-        : "";
+      // A seal in flight REPLACES the countdown rather than standing under
+      // it: a countdown to a publish that is already running was two answers
+      // to one question, on two lines. ", or 30s after this tab closes" went
+      // with the same edit — the behaviour stays, the width was not worth it.
+      const when = s.publish && s.publish.state === "running" && s.publish.reason !== "branch"
+        ? "Publishing now."
+        : `Next publish in ${secs(s.next_publish_s)}.`;
       d.innerHTML = `<span class="glyph staged">●</span>` +
         `${s.staged_files} file${s.staged_files === 1 ? "" : "s"} ` +
         `(${bytes(s.staged_bytes)}) on this machine only.` +
-        ` Next publish in ${secs(s.next_publish_s)}${idle}.${sending}`;
+        ` ${when}${sending}`;
       d.dataset.durability = "staged";
     }
     // The panel's left edge carries the same state as colour, the way the
@@ -939,6 +940,19 @@
       // session is reopening an overlay on another head.
       state = job.reason === "branch" ? "switching" : "running";
     } else if (s.staged_files === 0 && s.dirty_nodes === 0) state = "nothing";
+    // ONE CONTROL, WEARING ITS OWN STATE. A disabled "Publish now" with
+    // "(nothing to publish)" printed beside it was one fact twice, so the
+    // label IS the state and nothing stands next to it. Same map, same words,
+    // as the app's (webui/frontend/src/durability.ts, PUBLISH_LABEL).
+    const label = {
+      ready: "Publish now",
+      nothing: "Nothing to publish",
+      running: "Publishing",
+      switching: "Switching branches",
+      connecting: "Waiting for the volume",
+      failed: "",
+      "read-only": "",
+    }[state];
     if (btn) {
       if (state === "failed") {
         // No volume, so nothing to press and nothing to explain: the line
@@ -952,18 +966,12 @@
       } else {
         btn.dataset.publishState = state;
         btn.disabled = state !== "ready";
+        btn.textContent = label;
         btn.hidden = false;
       }
     }
-    hint.textContent = {
-      ready: "",
-      connecting: "(waiting for the volume)",
-      failed: "",
-      "read-only": "(read-only session — restart with --rw to publish)",
-      running: "(publishing — this holds the overlay, so writes wait)",
-      switching: "(switching branches — this holds the overlay, so writes wait)",
-      nothing: "(nothing to publish)",
-    }[state];
+    hint.textContent =
+      state === "read-only" ? "(read-only session — restart with --rw to publish)" : "";
 
     const st = el("publish-status");
     if (!job) {
@@ -974,10 +982,11 @@
       st.dataset.jobId = job.id;
       const switching = job.reason === "branch";
       if (job.state === "running") {
-        const s0 = Math.round((Date.now() - Date.parse(job.started)) / 1000);
-        st.textContent = switching
-          ? `switching branches… (${s0}s) — the overlay is reopened on the new head, so writes wait`
-          : `publishing… (${s0}s) — the seal freezes the overlay, so uploads resume in a moment`;
+        // Nothing. The line above says "Publishing now." and the button says
+        // "Publishing"; a third copy under both is the duplication the owner
+        // asked to collapse. The element and its data-* attributes stay,
+        // because that is how a driver follows the job.
+        st.textContent = "";
       } else if (job.state === "failed") {
         st.textContent = switching ? `branch switch failed: ${job.error}` : `publish failed: ${job.error}`;
       } else if (switching) {

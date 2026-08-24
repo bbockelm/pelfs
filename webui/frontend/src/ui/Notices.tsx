@@ -50,6 +50,10 @@ export function CapCaveat({ meta }: { meta: ListingMeta | null }) {
  * docs/design-guiclients.md measured the trap: 200 documents at ~2 MB fires
  * neither the 1 GiB nor the 200,000-inode pressure trigger, so nothing is
  * published for up to five minutes, and a browser tab has no unmount.
+ *
+ * IT IS ONE SENTENCE, AND IT IS THE OWNER'S ("WAAY to wordy" was the verdict on
+ * ours, which explained the overlay, crash durability and what the line above
+ * meant). The wording lives at its one call site in App.tsx.
  */
 export function UploadNotice({ text }: { text: string }) {
   if (!text) return null;

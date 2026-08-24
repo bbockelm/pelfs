@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+**Less to read on both web surfaces.** The upload notice is one sentence
+("File uploaded to local machine; click "Publish now" to push it to the
+federation"). The publish control is one button wearing its own state —
+*Nothing to publish* / *Publish now* / *Publishing* — with no hint beside it,
+and a running seal is said once, on the durability line ("Publishing now."),
+instead of under a countdown to a publish already in flight. The countdown
+dropped ", or 30s after this tab closes"; the idle seal itself is unchanged.
+`/connect` lost the sentence explaining that it does not browse files and
+gained a **Download Cyberduck** link, which it never had. The credential panel
+no longer shows a username, a password, a password-path bookmark or the
+shown-once notice — password auth is going away in favour of OAuth.
+
 **A hostile pack can no longer panic a reader.** The stored-trailer length in
 a pack footer is eight bytes an origin chooses, and the bound check on it
 (`idxLen+footerSize > size`) overflowed: at MaxInt64 the sum wraps negative,

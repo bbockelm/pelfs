@@ -448,7 +448,7 @@ func TestPageIsOneFileWithANonceAndTheTestIDsAPlaywrightSuiteNeeds(t *testing.T)
 		"app-link",
 		// The credential surface (U7/U8). The form and the two tables are
 		// in the shipped HTML; the rows, the revoke buttons and the panel
-		// that shows a password once are built by the script, so those ids
+		// the POST's response builds are made by the script, so those ids
 		// are checked in the script block below.
 		"connect-blurb", "dav-url", "add-program-form", "add-program-label",
 		"add-program-write", "add-program-write-label", "add-program-button",
@@ -485,19 +485,22 @@ func TestPageIsOneFileWithANonceAndTheTestIDsAPlaywrightSuiteNeeds(t *testing.T)
 	if sending == staged || sending == published {
 		t.Errorf("sending renders the same glyph as another state (%q)", sending)
 	}
-	// This page still has no file manager on it, and the person who
-	// expected one has to be told that on the page rather than in a release
-	// note — along with what to do instead, which is now a real answer
-	// (connect a program) rather than "use pelfs mount".
-	if !strings.Contains(page, "does not browse files") {
-		t.Error("the page does not say what it cannot do")
+	// THE LEDE'S DISCLAIMER IS DELETED, not shortened: "This page does not
+	// browse files — the file manager does — it sets Cyberduck up" was the
+	// whole answer when nothing browsed files, and once `/` did it was a
+	// sentence explaining the page you are already on. The owner's word for
+	// it was "USELESS". The way back is the bar's "← Files" anchor, which is
+	// the next check, and this one is what stops the sentence returning.
+	if strings.Contains(page, "does not browse files") {
+		t.Error("the page explains what it is not; the heading and the ← Files link are enough")
 	}
-	// ...and, since the wiring pass, WHERE the thing it cannot do lives.
-	// "This page does not browse files" was the whole answer when there was
-	// no file manager; it is half an answer now, and the missing half is one
-	// anchor.
 	if !strings.Contains(page, `href="/"`) {
 		t.Error("the page does not link to the file manager at /")
+	}
+	// AND THE DOWNLOAD, because a reader who does not have Cyberduck was
+	// stuck on a page whose every control configures it.
+	if !strings.Contains(page, `href="https://cyberduck.io/download/"`) {
+		t.Error("the page names Cyberduck but does not link to its download")
 	}
 	// No JavaScript at all is a real state a driver test will produce.
 	if !strings.Contains(page, "<noscript>") {
@@ -510,15 +513,27 @@ func TestPageIsOneFileWithANonceAndTheTestIDsAPlaywrightSuiteNeeds(t *testing.T)
 	for _, want := range []string{
 		`"sso-card"`, `"sso-url"`, `"sso-code"`, `"sso-dismiss"`, `"sso-note"`,
 		`navigator.sendBeacon`, `"/api/v1/beacon"`, `"pagehide"`, `"visibilitychange"`,
-		// The credential rows and the one panel that ever holds a secret.
+		// The credential rows and the panel the POST's response builds.
 		`"client-row"`, `"client-revoke"`, `"grant-row"`, `"grant-revoke"`,
-		`"credential-label"`, `"credential-dav-url"`, `"credential-basic-user"`,
-		`"credential-basic-password"`, `"credential-notice"`,
-		`"download-profile"`, `"download-bookmark"`, `"download-basic"`,
+		`"credential-label"`, `"credential-dav-url"`,
+		`"download-profile"`, `"download-bookmark"`,
 		`"/api/v1/credentials"`, `"/api/v1/credentials/revoke"`,
 	} {
 		if !strings.Contains(page, want) {
 			t.Errorf("the page's script does not carry %s", want)
+		}
+	}
+	// PASSWORD AUTH IS GONE, so the page shows no password. The username and
+	// password rows, the bookmark that opened the Basic path, and the
+	// shown-once notice that existed only to warn about the password are all
+	// deleted -- and a deletion needs an assertion more than an addition
+	// does, because nothing about a missing row fails on its own.
+	for _, gone := range []string{
+		`"credential-basic-user"`, `"credential-basic-password"`,
+		`"credential-notice"`, `"download-basic"`, "c.basic_password", "c.notice",
+	} {
+		if strings.Contains(page, gone) {
+			t.Errorf("the page still carries %s; password auth is gone", gone)
 		}
 	}
 	// A card is built with createElement and textContent. innerHTML with an

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -31,71 +32,120 @@ import (
 // mountErrorPolicy is what pelfs does the first time the mount answers
 // the payload with an unexplained I/O error.
 //
-// # Why `report` is the default and `hold` is not
+// # The failure this exists to prevent
 //
-// Chirp has no "hold me" verb, so there are exactly two routes to a held
-// job and they have different blast radii:
+// It is not the error. It is EXIT 0 WITH A CORRUPT RESULT.
 //
-//   - Declarative. pelfs sets ChirpPelfsMountError, and the submit file
-//     carries `periodic_hold = ChirpPelfsMountError =?= true`. The
-//     schedd holds the job at its next periodic evaluation, with a hold
-//     reason that names the failure. The job's own process is untouched
-//     until then.
+// Programs that read a filesystem overwhelmingly do not check read(2)
+// for EIO -- there was never a reason to think a read could fail -- so a
+// job handed one typically carries on, writes output, and exits
+// successfully. That output is indistinguishable from a correct answer
+// by anything downstream, and the job's own exit status vouches for it.
+// A user who is bad at error handling therefore does not get a crash;
+// they get a wrong scientific result with a green tick beside it.
 //
-//   - Imperative. pelfs kills the payload, which it owns as a child
-//     process under `pelfs shell -- cmd`, and exits with a distinctive
-//     status so `on_exit_hold` fires at once.
+// The cost asymmetry settles the default. Re-running a job costs some
+// CPU on a machine that was going to be busy anyway. Recording a wrong
+// result costs whatever gets built on top of it, possibly years later,
+// possibly after publication. So pelfs defaults to the behaviour that
+// makes the job RUN AGAIN rather than the one that records a success it
+// cannot vouch for.
 //
-// The second is faster and strictly more dangerous, and three things
-// argue against making it the default:
+// # Where enforcement actually happens
 //
-//  1. A transient error killing a ten-hour job is its own failure mode.
-//     The latch fires on the FIRST unexplained error, which is the right
-//     trigger for "tell someone" and a poor one for "destroy nine hours
-//     of work" -- and pelfs cannot tell a corrupt pack from a federation
-//     that was unreachable for the length of one read.
-//  2. It does not work everywhere. Under apptainer, pelfs is a
-//     `--fusemount` driver serving a descriptor its parent opened; it
-//     has no payload to kill and never sees one. Under `pelfs mount-gen`
-//     the same. Making the default a behaviour that only exists in one
-//     of three deployment shapes teaches users something false.
-//  3. The owner's goal -- "users don't have to be very good at catching
-//     exceptions" -- is met by a HELD JOB WITH A REAL HOLD REASON, not
-//     by a kill. A held job keeps its sandbox, tells the user what
-//     happened in words, and can be released. A killed one has thrown
-//     away the only copy of the failure's context.
+// The schedd, not this process. A chirp update is written into the
+// SHADOW's copy of the job ad -- the same ClassAd pointer the shadow's
+// UserPolicy evaluates at exit (shadow.cpp hands one jobAd to both
+// RemoteResource::setJobAd and shadow_user_policy.init) -- so a submit
+// file's on_exit_remove or on_exit_hold acts on it in every deployment
+// shape: `pelfs shell`, `pelfs mount-gen`, and an apptainer --fusemount
+// driver that never sees a payload process at all.
 //
-// So: report by default, everywhere; kill only when asked for, and only
-// where pelfs actually owns the process.
+// That is why the policy below is not about ownership. Every mode
+// publishes the attribute; what the modes choose is what PELFS does
+// locally, on top of it.
+//
+// # The modes
+//
+// Two independent things, which an earlier version of this flag
+// conflated: does pelfs stop the payload, and does pelfs refuse to
+// report a success it cannot vouch for.
+//
+//	              tell the job   stop the payload   exit non-zero
+//	rerun (default)    yes             no                yes
+//	abort              yes             yes               yes
+//	report             yes             no                no
+//	ignore             no              no                no
+//
+// The local exit status is REINFORCEMENT, not the mechanism. It matters
+// where pelfs owns the payload -- `pelfs shell -- cmd`, where pelfs's
+// status IS the job's -- because it makes a pool whose submit file
+// carries no policy expression still record a failure instead of a
+// success. Where pelfs owns nothing it is merely honest.
+//
+// There is no `hold` mode, and there was one. Holding is not something
+// this process can do: chirp has no such verb, and the decision belongs
+// in the submit file, where `on_exit_hold` composes with everything
+// else. See docs/design-chirp.md, which gives both expressions and says
+// when to reach for the second.
 type mountErrorPolicy string
 
 const (
-	// onMountErrorReport publishes the failure -- user log, job ad,
-	// pelfs's own output -- and lets the payload keep running.
+	// onMountErrorRerun is the default: publish the failure -- user log,
+	// job ad, pelfs's own output -- leave the payload alone, and exit
+	// non-zero so that a payload's exit 0 cannot stand as this session's
+	// verdict. The submit-side companion is on_exit_remove.
+	onMountErrorRerun mountErrorPolicy = "rerun"
+	// onMountErrorAbort additionally stops the payload. For a workload
+	// where continuing after the first bad read produces MORE corrupt
+	// output rather than merely finishing the same one.
+	onMountErrorAbort mountErrorPolicy = "abort"
+	// onMountErrorReport publishes everything and touches neither the
+	// payload nor the exit status. This was the old default, and it is
+	// now what a workload asks for when it genuinely handles I/O errors
+	// and wants only the telemetry.
 	onMountErrorReport mountErrorPolicy = "report"
-	// onMountErrorHold does that AND takes the payload down.
-	onMountErrorHold mountErrorPolicy = "hold"
-	// onMountErrorIgnore publishes nothing. It exists for the workload
-	// that legitimately expects I/O errors and handles them, where a
-	// periodic_hold expression somebody else wrote would be a nuisance.
+	// onMountErrorIgnore says nothing to the job at all. The periodic
+	// statistics continue; only the error latch is suppressed.
 	onMountErrorIgnore mountErrorPolicy = "ignore"
 )
 
-func parseMountErrorPolicy(s string) (mountErrorPolicy, error) {
-	switch mountErrorPolicy(s) {
-	case onMountErrorReport, onMountErrorHold, onMountErrorIgnore:
-		return mountErrorPolicy(s), nil
-	}
-	return "", fmt.Errorf("--on-mount-error must be report, hold or ignore (got %q)", s)
+// setsExitStatus reports whether this policy refuses to let a payload's
+// own exit status stand once the mount has failed.
+func (p mountErrorPolicy) setsExitStatus() bool {
+	return p == onMountErrorRerun || p == onMountErrorAbort
 }
 
-// exitMountError is the status pelfs exits with when --on-mount-error=hold
-// took the payload down.
+func parseMountErrorPolicy(s string) (mountErrorPolicy, error) {
+	switch mountErrorPolicy(s) {
+	case onMountErrorRerun, onMountErrorAbort, onMountErrorReport, onMountErrorIgnore:
+		return mountErrorPolicy(s), nil
+	}
+	if s == "hold" {
+		// Answered by name rather than by the generic list, because the
+		// person who typed it wants a real thing that pelfs cannot do and
+		// the submit file can.
+		return "", errors.New("--on-mount-error has no `hold`: holding a job is the schedd's, " +
+			"and it is asked for in the submit file with " +
+			"`on_exit_hold = (ChirpPelfsMountError =?= true)`, which works whether or not " +
+			"pelfs owns the payload. Use --on-mount-error=rerun (the default) or abort here")
+	}
+	return "", fmt.Errorf("--on-mount-error must be rerun, abort, report or ignore (got %q)", s)
+}
+
+// exitMountError is the status pelfs exits with when the mount failed
+// during a session run under `rerun` or `abort`.
 //
 // 75 is EX_TEMPFAIL from sysexits.h -- "temporary failure; the user is
 // invited to retry" -- which is exactly the claim being made, is
 // documented somewhere other than pelfs, and sits clear of both the
 // shell's 126/127 and the 128+signum range a killed process reports.
+//
+// It is the second line of defence, not the first: the job ad attribute
+// is what a submit-side policy acts on in every deployment shape. This
+// is what a pool with NO policy expression sees, and under `pelfs shell`
+// it is the job's own exit status, so an exit 0 the payload produced
+// after reading a broken file never reaches the queue as a success.
 const exitMountError = 75
 
 // takeDownGrace is how long a payload gets between the SIGTERM that asks
@@ -116,13 +166,17 @@ const chirpInterval = chirp.DefaultInterval
 // inside a job, which is nearly all of them.
 func (g *genSession) startJobReporting(ctx context.Context, o *cmdOpts, hasPayload bool) {
 	g.onMountError = o.onMountError
-	if g.onMountError == onMountErrorHold && !hasPayload {
-		// Say it once, at startup, rather than letting the user find out
-		// at the moment of failure that the flag did nothing.
-		ui.Warn("--on-mount-error=hold has no payload to take down in this mode "+
-			"(pelfs owns a child process only under `pelfs shell -- command`); "+
-			"the failure is still reported, pelfs still exits {code}, and `periodic_hold` on "+
-			"{attribute} still holds the job",
+	if g.onMountError == onMountErrorAbort && !hasPayload {
+		// Precise about what is and is not lost. The old version of this
+		// line implied that enforcement needed payload ownership, which
+		// is false and was the wrong lesson to teach: the attribute
+		// reaches the schedd either way, and the schedd is what acts.
+		ui.Warn("--on-mount-error=abort has no payload to stop in this mode "+
+			"(pelfs owns a child process only under `pelfs shell -- command`), "+
+			"so a mount error is reported and this process exits {code}, but nothing here "+
+			"interrupts the job's own program. Enforcement is the schedd's: "+
+			"`on_exit_remove = ({attribute} =!= true) || (NumJobCompletions > 2)` in the "+
+			"submit file re-runs the job whatever it exited with",
 			"code", exitMountError, "attribute", chirp.AttrMountError)
 	}
 
@@ -151,6 +205,15 @@ func (g *genSession) startJobReporting(ctx context.Context, o *cmdOpts, hasPaylo
 		// already visible in the job ad as a heartbeat that stopped
 		// advancing.
 		var said sync.Once
+		// One synchronous write per ATTEMPT, before anything else: the
+		// mount-error flag is sticky across a requeue, so a run that has
+		// not failed yet has to say so or it inherits the verdict of the
+		// run that got it requeued. See chirp.Reporter.Begin.
+		if err := r.Begin(); err != nil {
+			ui.Warn("could not clear {attribute} for this attempt: {error} "+
+				"(a policy expression may act on an earlier attempt's failure)",
+				"attribute", chirp.AttrMountError, "error", err)
+		}
 		go r.Run(ctx, chirpInterval, g.chirpSample, func(err error) {
 			said.Do(func() {
 				ui.Warn("chirp reporting to the job has stopped working: {error} "+
@@ -211,11 +274,12 @@ func (g *genSession) onMountFailure(ev mounterr.Event) {
 	if err := g.chirp.Fail(reason); err != nil {
 		ui.Warn("could not tell the HTCondor job about the mount error: {error}", "error", err)
 	} else if g.chirp.InJob() {
-		ui.Info("told the job: {attribute} = true (a submit file with `periodic_hold = {attribute} =?= true` will hold it)",
+		ui.Info("told the job: {attribute} = true (a submit file with "+
+			"`on_exit_remove = ({attribute} =!= true) || (NumJobCompletions > 2)` re-runs it)",
 			"attribute", chirp.AttrMountError)
 	}
 
-	if g.onMountError != onMountErrorHold {
+	if g.onMountError != onMountErrorAbort {
 		return
 	}
 	select {
@@ -224,25 +288,29 @@ func (g *genSession) onMountFailure(ev mounterr.Event) {
 	}
 }
 
-// mountErrorExit rewrites the session's exit status when
-// --on-mount-error=hold saw a failure.
+// mountErrorExit rewrites the session's exit status when the mount
+// failed and the policy is one that refuses to vouch for the run.
 //
-// It overrides the payload's OWN status deliberately, including a
-// successful one. A payload that read a truncated file, got EIO, and
-// exited 0 anyway is precisely the case this feature exists for: the
-// job "succeeded" and its output is wrong. In `report` mode nothing here
-// touches the status, because there the user has not asked pelfs to
-// have an opinion about their exit code.
+// It overrides the payload's OWN status, INCLUDING A SUCCESSFUL ONE, and
+// that is the entire point rather than an unfortunate side effect. A
+// payload that read a truncated file, got EIO, did not check for it, and
+// exited 0 is the failure this feature exists to prevent: the queue
+// would otherwise record a success over a corrupt result, and nothing
+// downstream could tell. Re-running costs CPU; recording it costs
+// whatever gets built on the answer.
+//
+// `report` and `ignore` leave the status alone, because there the user
+// has said they handle I/O errors themselves.
 func (g *genSession) mountErrorExit(code int) int {
-	if g.onMountError != onMountErrorHold {
+	if !g.onMountError.setsExitStatus() {
 		return code
 	}
 	ev, ok := mounterr.Fired()
 	if !ok {
 		return code
 	}
-	ui.Error("exiting {code} because the mount failed during this session ({error}); "+
-		"`on_exit_hold = ExitCode =?= {code}` in the submit file holds the job",
-		"code", exitMountError, "error", ev.Err)
+	ui.Error("exiting {code} rather than {was}: the mount handed this job an I/O error "+
+		"it could not explain ({error}), so this run cannot be reported as a success",
+		"code", exitMountError, "was", code, "error", ev.Err)
 	return exitMountError
 }

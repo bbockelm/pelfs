@@ -207,28 +207,38 @@ pelfs shell --prefetch background --stats-file $_CONDOR_SCRATCH_DIR/pelfs-stats.
 
 The statistics file above is read *after* the job. Inside an HTCondor job
 pelfs also reports **live**, over the Chirp protocol the `condor_starter`
-already offers, and — the point of the exercise — it says so the moment
-the mount hands your program an I/O error it cannot explain, so the job
-can be **held** instead of quietly producing wrong output.
+already offers.
 
-Nothing needs to be turned on for the periodic half: a starter enables
-delayed job-ad updates by default. Add one line for the error path, and
-one expression to act on it:
+The failure it exists to prevent is not the I/O error. It is **exit 0
+with a corrupt result**. Almost nothing checks `read(2)` for `EIO` —
+there was never a reason to think a read could fail — so a job handed one
+usually runs to completion, writes output, and exits successfully. That
+output is indistinguishable from a right answer by anything downstream.
+Re-running the job costs some CPU; recording a wrong scientific result
+costs whatever gets built on it.
+
+So pelfs sets `ChirpPelfsMountError` in the job ad the instant the mount
+hands the payload an error it cannot explain, and the submit file turns
+that into a re-run:
 
 ```
 +WantIOProxy = true
 
-periodic_hold         = (ChirpPelfsMountError =?= true)
-periodic_hold_reason  = strcat("pelfs mount error: ", \
-                               ifThenElse(ChirpPelfsMountErrorReason =?= undefined, \
-                                          "unexplained I/O error", \
-                                          ChirpPelfsMountErrorReason))
-periodic_hold_subcode = 1
+# Re-run if the mount broke, even if the payload exited 0.
+# Do NOT also set max_retries -- see docs/design-chirp.md.
+on_exit_remove = (ChirpPelfsMountError =!= true) || (NumJobCompletions > 2)
 ```
 
-The job then goes on hold with a reason like `pelfs mount error: fuse
-mount: read chunk 91af…: pack 3 trailer is truncated`, rather than
-running to completion on a file it only partly read.
+That is three attempts, the same bound `max_retries = 2` gives.
+Enforcement is the **schedd's**, not pelfs's: a chirp update lands in the
+shadow's copy of the job ad, which is the ad the exit policy is evaluated
+against — so this works under `pelfs shell`, under `pelfs mount-gen`, and
+under the apptainer `--fusemount` driver alike, and it works even with no
+`+WantIOProxy` line (that line buys the flag being visible *during* the
+run, which is what `periodic_hold` needs). Prefer `on_exit_hold` when the
+failure is one that will recur on every machine and you want a human to
+look; `docs/design-chirp.md` has both expressions, the `max_retries`
+composition trap, and when to reach for which.
 
 Nine attributes are published, all in the `ChirpPelfs` namespace (the
 `Chirp` prefix is required by the starter's default
@@ -240,20 +250,16 @@ Nine attributes are published, all in the `ChirpPelfs` namespace (the
 through the starter's *batched* update channel, so they cost the schedd
 nothing; only the error latch takes the synchronous path, and only once.
 
-`--on-mount-error` chooses what happens on that failure:
+`--on-mount-error` chooses what pelfs does locally, on top of publishing
+the attribute:
 
-- `report` (**default**) — user log, job ad, and pelfs's own stderr. The
-  payload keeps running; your `periodic_hold` decides its fate.
-- `hold` — the above, and then pelfs stops the payload it owns under
-  `pelfs shell -- cmd` and exits `75`, so `on_exit_hold = ExitCode =?= 75`
-  fires at once. Opt-in on purpose: a transient error killing a ten-hour
-  job is its own failure mode, and pelfs owns no payload at all under
-  apptainer or `pelfs mount-gen`.
-- `ignore` — say nothing to the job, for a workload that handles I/O
-  errors itself.
-
-`docs/design-chirp.md` has the attribute table, the cadence argument, and
-the wire-format details.
+- `rerun` (**default**) — user log, job ad, pelfs's own stderr, and pelfs
+  exits `75` so a payload's exit 0 cannot stand as this run's verdict.
+- `abort` — the above, and stop the payload. For when continuing past the
+  first bad read produces *more* corrupt output.
+- `report` — publish, and leave the exit status alone. For a workload
+  that genuinely handles I/O errors and wants only the telemetry.
+- `ignore` — say nothing to the job about the error.
 
 ### Inside a container: apptainer `--fusemount`
 
@@ -303,8 +309,8 @@ volume's data keys — the same key must be supplied on every later mount;
 `--volume-pubkey`, `--ignore-volume-lease` (proceed past a pelfs v0.1.0
 volume-wide lease — see *Caveats*), the two maintenance switches
 `--no-auto-repack` / `--no-auto-gc`, and `--on-mount-error`
-(`report` / `hold` / `ignore`; see *Telling the job how the mount is
-doing*).
+(`rerun` / `abort` / `report` / `ignore`; see *Telling the job how the
+mount is doing*).
 
 ## Messages
 

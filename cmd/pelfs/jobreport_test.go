@@ -19,21 +19,28 @@ import (
 	"github.com/bbockelm/pelfs/internal/ui"
 )
 
-// The default has to be the safe one, and it has to be the safe one on
-// every command: --on-mount-error lives in registerFlags, which every
-// subcommand shares.
-func TestOnMountErrorDefaultsToReport(t *testing.T) {
+// The default must refuse to report a success it cannot vouch for. The
+// danger is not the I/O error, it is exit 0 with a corrupt result:
+// almost nothing checks read(2) for EIO, so a job handed one runs to
+// completion and its output looks exactly like a right answer.
+//
+// It has to be the default on every command, because --on-mount-error
+// lives in registerFlags, which every subcommand shares.
+func TestOnMountErrorDefaultsToRerun(t *testing.T) {
 	o, _, err := parseArgs("shell", []string{"pelican://example/vol"}, 1, 2, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if o.onMountError != onMountErrorReport {
-		t.Fatalf("default is %q; killing a payload must never be what a user gets without asking", o.onMountError)
+	if o.onMountError != onMountErrorRerun {
+		t.Fatalf("default is %q; a mount error must not leave a payload's exit 0 standing", o.onMountError)
+	}
+	if !o.onMountError.setsExitStatus() {
+		t.Fatal("the default does not override the exit status")
 	}
 }
 
 func TestOnMountErrorFlagParsing(t *testing.T) {
-	for _, v := range []string{"report", "hold", "ignore"} {
+	for _, v := range []string{"rerun", "abort", "report", "ignore"} {
 		o, _, err := parseArgs("shell", []string{"--on-mount-error=" + v, "pelican://example/vol"}, 1, 2, nil)
 		if err != nil {
 			t.Fatalf("--on-mount-error=%s: %v", v, err)
@@ -42,10 +49,23 @@ func TestOnMountErrorFlagParsing(t *testing.T) {
 			t.Errorf("--on-mount-error=%s parsed as %q", v, o.onMountError)
 		}
 	}
-	for _, v := range []string{"", "kill", "true", "Hold "} {
+	for _, v := range []string{"", "kill", "true", "Rerun "} {
 		if _, _, err := parseArgs("shell", []string{"--on-mount-error=" + v, "pelican://example/vol"}, 1, 2, nil); err == nil {
 			t.Errorf("--on-mount-error=%q was accepted", v)
 		}
+	}
+}
+
+// `hold` was a mode and is not one: holding is the schedd's, asked for
+// in the submit file. Somebody who types it wants a real thing, so the
+// refusal has to hand them the expression rather than a list of words.
+func TestHoldIsRefusedWithTheSubmitExpression(t *testing.T) {
+	_, _, err := parseArgs("shell", []string{"--on-mount-error=hold", "pelican://example/vol"}, 1, 2, nil)
+	if err == nil {
+		t.Fatal("--on-mount-error=hold was accepted")
+	}
+	if !strings.Contains(err.Error(), "on_exit_hold") || !strings.Contains(err.Error(), chirp.AttrMountError) {
+		t.Fatalf("the refusal does not say how to actually hold the job: %v", err)
 	}
 }
 
@@ -60,12 +80,15 @@ func TestMountErrorExit(t *testing.T) {
 		code   int
 		want   int
 	}{
+		// THE case: the payload swallowed the EIO and exited 0. The queue
+		// must not record that as a success.
+		{"rerun overrides a success", onMountErrorRerun, true, 0, exitMountError},
+		{"rerun overrides a failure", onMountErrorRerun, true, 9, exitMountError},
+		{"rerun with no failure leaves it alone", onMountErrorRerun, false, 0, 0},
+		{"abort overrides a success", onMountErrorAbort, true, 0, exitMountError},
 		{"report leaves a success alone", onMountErrorReport, true, 0, 0},
 		{"report leaves a failure alone", onMountErrorReport, true, 3, 3},
 		{"ignore leaves it alone", onMountErrorIgnore, true, 0, 0},
-		{"hold with no failure leaves it alone", onMountErrorHold, false, 0, 0},
-		{"hold overrides a success", onMountErrorHold, true, 0, exitMountError},
-		{"hold overrides a failure", onMountErrorHold, true, 9, exitMountError},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -92,8 +115,9 @@ func TestOnMountFailureFollowsPolicy(t *testing.T) {
 		wantKill bool
 		wantSaid bool
 	}{
+		{onMountErrorRerun, false, true},
+		{onMountErrorAbort, true, true},
 		{onMountErrorReport, false, true},
-		{onMountErrorHold, true, true},
 		{onMountErrorIgnore, false, false},
 	}
 	for _, c := range cases {
@@ -236,7 +260,7 @@ func TestMountFailureReachesTheJobAd(t *testing.T) {
 	g := &genSession{
 		stats:        stats.New("pelican://f/p", "sess", filepath.Join(t.TempDir(), "s.json")),
 		chirp:        r,
-		onMountError: onMountErrorReport,
+		onMountError: onMountErrorRerun,
 		takeDown:     make(chan string, 1),
 	}
 	g.onMountFailure(mounterr.Event{

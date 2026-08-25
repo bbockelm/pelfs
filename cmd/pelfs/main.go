@@ -232,19 +232,26 @@ func registerFlags(fs *flag.FlagSet, o *cmdOpts) {
 	// repack was involved in -- an aborted publish, a deleted tag's closure
 	// -- is still collectable.)
 	fs.BoolVar(&o.noAutoGC, "no-auto-gc", false, "do not collect unreferenced objects in the background when the mount is idle (the sweep is `pelfs gc --delete`, with the same grace and retain-K windows and the same fail-closed rule)")
-	// Default `report`, and the aggressive option has to be typed: the
-	// reasoning for that choice is written out at mountErrorPolicy, and
-	// it is the one decision in this feature a user is entitled to
-	// disagree with.
-	o.onMountError = onMountErrorReport
+	// The default REFUSES to report a success it cannot vouch for. The
+	// danger is not the I/O error, it is exit 0 with a corrupt result:
+	// almost nothing checks read(2) for EIO, so a job handed one runs to
+	// completion and its output is indistinguishable from a right
+	// answer. Re-running costs CPU; recording a wrong scientific result
+	// costs whatever is built on it. The full argument is at
+	// mountErrorPolicy and in docs/design-chirp.md.
+	o.onMountError = onMountErrorRerun
 	// The backquoted word is flag's placeholder syntax, so it must be the
 	// value list and nothing else -- a stray pair of backquotes further
 	// into the sentence renames the argument to whatever they enclose.
 	fs.Func("on-mount-error", "what to do the first time the mount hands an HTCondor job an I/O error "+
-		"it cannot explain, one of `report|hold|ignore`: report (the default) writes the job's user "+
-		"log and sets ChirpPelfsMountError in the job ad for a periodic_hold expression to act on, "+
-		"leaving the payload running; hold does that and then stops the payload and exits "+
-		strconv.Itoa(exitMountError)+", for on_exit_hold; ignore says nothing to the job", func(v string) error {
+		"it cannot explain, one of `rerun|abort|report|ignore`. All but ignore set "+
+		"ChirpPelfsMountError in the job ad, which is what a submit-side on_exit_remove or "+
+		"on_exit_hold acts on in every deployment shape. rerun (the default) additionally exits "+
+		strconv.Itoa(exitMountError)+" so a payload's own exit 0 cannot stand as a success -- "+
+		"almost nothing checks read(2) for EIO, so the usual outcome of one is a completed job "+
+		"with a corrupt result, and re-running costs far less than recording a wrong answer. "+
+		"abort also stops the payload; report leaves the exit status alone; ignore says nothing "+
+		"to the job", func(v string) error {
 		p, err := parseMountErrorPolicy(v)
 		if err != nil {
 			return err

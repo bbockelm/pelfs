@@ -2,59 +2,95 @@
 
 ## Unreleased
 
-**A mount can tell the HTCondor job it is serving that it broke, while the
-job is still running.** `internal/stats` writes a summary so a supervisor can
-judge the session *after the fact*; that is the wrong artefact for a job still
-burning wall-clock on a broken mount. pelfs now speaks **Chirp** to the
-`condor_starter` that launched it (`internal/chirp`, a hand-written client —
-there is no Go one, and pelfs stays `CGO_ENABLED=0` with a tight `go.mod`) and
-publishes nine attributes into the job ad: session, generation, heartbeat,
-bytes down and up, upload backlog, transient federation errors, and on failure
-`ChirpPelfsMountError` / `ChirpPelfsMountErrorReason`. A submit file carrying
-`periodic_hold = (ChirpPelfsMountError =?= true)` then holds the job **with a
-hold reason naming the failure**, instead of letting it run to completion on a
-file it only partly read — which is the whole point: a user should not have to
-be good at catching exceptions to notice that their input was truncated.
+**A mount that broke must not let the job report success.** The danger is
+not the I/O error. It is **exit 0 with a corrupt result**: almost nothing
+checks `read(2)` for `EIO` — there was never a reason to think a read could
+fail — so a job handed one usually runs to completion, writes output, and
+exits successfully, and that output is indistinguishable from a right answer
+by anything downstream. Re-running a job costs some CPU on a machine that was
+going to be busy anyway; recording a wrong scientific result costs whatever
+gets built on top of it, possibly years later. That asymmetry is the feature.
 
-The error trigger is the instant a frontend answers the payload with an I/O
-error it cannot explain: `rawfuse.errStatus`'s fall-through to `EIO`, and
-`vfsbilly.sentinel`'s fall-through to what go-nfs turns into `NFS3ERR_IO`.
-`internal/mounterr` latches the first one — a broken file answers every read a
-`tar` issues, so the suppressed path is one atomic load and allocates nothing
-— and hands it to the session on a goroutine of its own, because calling a
-socket inline from a FUSE handler would turn "the mount reported an error"
-into "the mount hung". Deliberate answers do not latch: on the NFS side a bare
-`syscall.Errno` is this adapter's own choice, and `ENOSPC` gets its own NFS
-status rather than `IO`.
+pelfs now speaks **Chirp** to the `condor_starter` that launched it
+(`internal/chirp`, a hand-written client — there is no Go one, and pelfs stays
+`CGO_ENABLED=0` with a tight `go.mod`), and sets `ChirpPelfsMountError` in the
+job ad the instant either frontend hands the payload an I/O error it cannot
+explain. A submit file carrying
 
-`--on-mount-error=report|hold|ignore` chooses what happens, and **`report` is
-the default**. `hold` additionally stops the payload pelfs owns under `pelfs
-shell -- cmd` and exits 75 (`EX_TEMPFAIL`) so `on_exit_hold` fires at once,
-overriding even a successful exit status — a payload that got `EIO` and exited
-0 anyway is exactly the case. It is opt-in because a transient error killing a
-ten-hour job is its own failure mode, because pelfs owns no payload at all
-under apptainer or `pelfs mount-gen`, and because a held job with a real hold
-reason keeps its sandbox and can be released while a killed one has thrown the
-context away. The reasoning is written out at `mountErrorPolicy` and in
-`docs/design-chirp.md`.
+```
+on_exit_remove = (ChirpPelfsMountError =!= true) || (NumJobCompletions > 2)
+```
 
-Two findings from the HTCondor source shaped the design and are recorded
-because neither is guessable. Every attribute is named `ChirpPelfs…` and not
-`Pelfs…` because the starter refuses `set_job_attr_delayed` for any name that
-does not match `CHIRP_DELAYED_UPDATE_PREFIX`, whose shipped default is
-`Chirp*` — and refuses it in a way the client cannot see. And **the periodic
-half needs no submit-file change at all**: `WantDelayedUpdates` defaults to
-true, so a stock vanilla job already has the channel; `+WantIOProxy = true`
-buys the *immediate* update and the user-log line on the error path, and
-`Reporter.Fail` falls back to the delayed verb when it is missing, so a job
-that never opted in is still held, a few minutes later.
+then **re-runs the job** — three attempts, the same bound `max_retries = 2`
+gives — whatever the payload exited with.
 
-Cadence is the other half of not being a nuisance: everything on the timer
-uses `set_job_attr_delayed`, which the starter folds into the update it was
-going to send anyway (`STARTER_UPDATE_INTERVAL`, 300 s), so the one-minute
-interval governs only loopback round trips — and unchanged values are not
-resent, which reduces an idle mount's cycle to a single heartbeat write. Only
-the error latch pays the synchronous trip to the schedd, once.
+**Enforcement is the schedd's, not pelfs's**, and that turned out to matter
+more than anything else here. A chirp update is written into the *shadow's*
+copy of the job ad: `shadow.cpp` hands one `ClassAd*` to both
+`RemoteResource::setJobAd` and `shadow_user_policy.init`, so the ad
+`pseudo_set_job_attr` mutates is the ad `UserPolicy::AnalyzePolicy` evaluates
+at exit. The delayed channel reaches the same ad *in time*, because the
+starter drains its dictionary into the job **exit** ad as well as its periodic
+ones (`notifyJobExit` → `publishUpdateAd`) and the shadow applies that before
+`resourceExit`. So the expression works under `pelfs shell`, under `pelfs
+mount-gen`, and under an apptainer `--fusemount` driver that never sees a
+payload process — and it works with no submit-file change at all.
+`+WantIOProxy = true` buys the flag being visible *during* the run, which is
+what `periodic_hold` acts on and what survives an eviction.
+
+**`max_retries` does not compose with a hand-written `on_exit_remove`, and the
+combination silently defeats this.** `SubmitHash::SetJobRetries` generates
+`NumJobCompletions > JobMaxRetries || ExitCode =?= <success> || <yours>` — your
+expression is OR-ed in beside a disjunct that is already true for a payload
+that exited 0, so it can only make removal *more* likely, never less. Write
+the whole expression with its own bound (above), or keep `max_retries` and use
+`on_exit_hold` instead, which `SetJobRetries` assigns verbatim and which
+`AnalyzePolicy` checks *before* `OnExitRemove`. `docs/design-chirp.md` has all
+three ways out.
+
+**The flag is sticky, so pelfs clears it per attempt.** A chirp update goes
+into the schedd's job ad and survives the requeue the expression above causes;
+left alone, one bad run would requeue every later attempt on the strength of a
+failure that happened on another machine an hour ago. `chirp.Reporter.Begin`
+writes `ChirpPelfsMountError = false` once at mount time, on the same channel
+`Fail` uses — which is load-bearing, because the delayed updates are a
+dictionary the starter flushes on its own schedule and a `false` parked there
+beside an immediate `true` would land in the wrong order and revert the
+failure.
+
+`--on-mount-error` is `rerun` (default), `abort`, `report`, or `ignore`. It
+governs what pelfs does *locally*, on top of publishing the attribute: `rerun`
+exits 75 (`EX_TEMPFAIL`), overriding even a successful payload status, so a
+pool whose submit file carries no policy expression still records a failure;
+`abort` also stops the payload, for when continuing past the first bad read
+produces more corrupt output; `report` leaves the exit status alone; `ignore`
+says nothing. There is no `hold` mode and there was one — holding is the
+schedd's, asked for in the submit file, and typing `--on-mount-error=hold` now
+returns the expression that actually does it.
+
+Eight other attributes ride a one-minute timer: session, generation,
+heartbeat, bytes down and up, upload backlog, transient federation errors, and
+the error reason. All are named `ChirpPelfs…` and not `Pelfs…` because the
+starter refuses `set_job_attr_delayed` for any name that does not match
+`CHIRP_DELAYED_UPDATE_PREFIX`, whose shipped default is `Chirp*` — and refuses
+it in a way the client cannot see. Everything on the timer uses the delayed
+verb, which the starter folds into the update it was going to send anyway
+(`STARTER_UPDATE_INTERVAL`, 300 s), so the interval governs only loopback round
+trips; unchanged values are not resent, reducing an idle mount's cycle to a
+single heartbeat write. Only the error latch and the per-attempt reset pay a
+synchronous trip to the schedd.
+
+The trigger is the instant a frontend answers the payload with an I/O error it
+cannot explain: `rawfuse.errStatus`'s fall-through to `EIO` (and its
+graft-integrity branch, which is the mount failing to deliver bytes it
+promised rather than the filesystem answering), and `vfsbilly.sentinel`'s
+fall-through to what go-nfs turns into `NFS3ERR_IO`. `internal/mounterr`
+latches the first one — a broken file answers every read a `tar` issues, so the
+suppressed path is one atomic load and allocates nothing — and hands it to the
+session on a goroutine of its own, because calling a socket inline from a FUSE
+handler would turn "the mount reported an error" into "the mount hung".
+Deliberate answers do not latch: on the NFS side a bare `syscall.Errno` is this
+adapter's own choice, and `ENOSPC` gets its own NFS status rather than `IO`.
 
 `internal/chirp`'s tests carry a **fake starter** speaking the real wire
 format — the same `sscanf_chirp` unescaping, the same three gates, the same
@@ -62,11 +98,12 @@ numeric status lines, a wrong cookie answered while the socket is *kept*, an
 oversized request answered while it is *dropped* — and cover no config (the
 common case), malformed configs, discovery precedence, a rejecting starter, a
 **stalled** one on both the connect and the mid-session path, the delayed
-fallback, the latch firing exactly once under concurrency, and a table of
-hostile string values round-tripped through both escaping layers. That last
-one is the security case: an error message carries whatever a user put in a
-filename, so `SetJobAttr` takes an `Expr` rather than a `string` and the only
-constructor that emits its argument verbatim is called `Raw`.
+fallback, the per-attempt reset sharing a channel with the failure, the latch
+firing exactly once under concurrency, and a table of hostile string values
+round-tripped through both escaping layers. That last one is the security case:
+an error message carries whatever a user put in a filename, so `SetJobAttr`
+takes an `Expr` rather than a `string` and the only constructor that emits its
+argument verbatim is called `Raw`.
 
 Also fixed on the way past: `runInMount`'s signal goroutine was never joined,
 so it could still be inside a `Signal` call after `Wait` had reaped the child

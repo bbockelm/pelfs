@@ -444,3 +444,110 @@ func TestReporterIsInertAfterClose(t *testing.T) {
 		t.Fatalf("%d commands reached the starter after Close", n-before)
 	}
 }
+
+// The mount-error flag is STICKY: a chirp update is written into the
+// schedd's job ad, so it survives the requeue that the recommended
+// policy expression causes. Without a per-attempt reset, one bad run
+// would requeue every later attempt on the strength of a failure that
+// happened somewhere else an hour ago.
+func TestBeginClearsAPreviousAttemptsFailure(t *testing.T) {
+	s := newFakeStarter(t)
+
+	failed := reportFake(t, s, 2*time.Second)
+	if err := failed.Fail("pack 3 is truncated"); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := s.attr(AttrMountError); v != "true" {
+		t.Fatalf("%s = %q after a failure", AttrMountError, v)
+	}
+
+	// The next attempt of the same job, against the same queue entry.
+	next := reportFake(t, s, 2*time.Second)
+	if err := next.Begin(); err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	if v, ok := s.attr(AttrMountError); !ok || v != "false" {
+		t.Fatalf("%s = %q, %v; a fresh attempt inherited the last one's verdict", AttrMountError, v, ok)
+	}
+	// And the reason is deliberately left: Fail writes it before the
+	// flag, so a true flag always has this attempt's reason beside it,
+	// and a false flag with a stale reason is read by nothing.
+	if v, ok := s.attr(AttrErrorReason); !ok || !strings.Contains(v, "truncated") {
+		t.Errorf("%s = %q, %v", AttrErrorReason, v, ok)
+	}
+}
+
+// Begin and Fail must use the SAME channel. The delayed updates are a
+// dictionary the starter flushes on its own schedule, so a `false`
+// parked there while a `true` went out immediately would land in the
+// wrong order and revert the failure in the queue.
+func TestBeginAndFailShareOneChannel(t *testing.T) {
+	for _, updates := range []bool{true, false} {
+		name := "immediate"
+		if !updates {
+			name = "delayed fallback"
+		}
+		t.Run(name, func(t *testing.T) {
+			s := newFakeStarter(t)
+			s.set(func(s *fakeStarter) { s.updates = updates })
+			r := reportFake(t, s, 2*time.Second)
+			if err := r.Begin(); err != nil {
+				t.Fatal(err)
+			}
+			if err := r.Fail("boom"); err != nil {
+				t.Fatal(err)
+			}
+			var verbs []string
+			for _, c := range s.seen() {
+				if strings.HasPrefix(c.verb, "set_job_attr") && c.args[0] == AttrMountError {
+					verbs = append(verbs, c.verb)
+				}
+			}
+			if len(verbs) != 2 {
+				t.Fatalf("%d writes of %s, want 2 (the reset and the failure)", len(verbs), AttrMountError)
+			}
+			if verbs[0] != verbs[1] {
+				t.Fatalf("the reset went out as %q and the failure as %q; a delayed flush can "+
+					"then revert the failure", verbs[0], verbs[1])
+			}
+			if v, _ := s.attr(AttrMountError); v != "true" {
+				t.Fatalf("%s = %q after Begin then Fail", AttrMountError, v)
+			}
+		})
+	}
+}
+
+// Begin is one write per attempt, not per cycle, and it must not be
+// mistaken for a latch: it is called before any failure has happened.
+func TestBeginDoesNotLatch(t *testing.T) {
+	s := newFakeStarter(t)
+	r := reportFake(t, s, 2*time.Second)
+	if err := r.Begin(); err != nil {
+		t.Fatal(err)
+	}
+	if r.Failed() {
+		t.Fatal("Begin set the failure latch")
+	}
+	if err := r.Fail("boom"); err != nil {
+		t.Fatal(err)
+	}
+	if !r.Failed() {
+		t.Fatal("Fail after Begin did not latch")
+	}
+}
+
+// Inert reporters stay inert.
+func TestBeginIsInertOutsideAJob(t *testing.T) {
+	inEmptyDir(t)
+	r, err := Open(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Begin(); err != nil {
+		t.Errorf("Begin outside a job: %v", err)
+	}
+	var nilr *Reporter
+	if err := nilr.Begin(); err != nil {
+		t.Errorf("Begin on a nil reporter: %v", err)
+	}
+}

@@ -68,8 +68,18 @@
 // unmodified vanilla job, and the error latch's immediate update and its
 // user-log line need one line in the submit file. Reporter falls back
 // from the immediate form to the delayed form when the immediate one is
-// refused, so the attribute still arrives on a job that did not opt in;
-// it just arrives at the starter's next update instead of at once.
+// refused, so the attribute still arrives on a job that did not opt in.
+//
+// And it arrives IN TIME. The starter drains its delayed-update
+// dictionary into the job EXIT ad as well as into its periodic updates
+// (jic_shadow.cpp, notifyJobExit -> publishUpdateAd), the shadow applies
+// that ad before it calls the exit policy (pseudo_ops.cpp,
+// pseudo_job_exit -> updateFromStarter -> resourceExit), and the
+// shadow's job ad is the one UserPolicy evaluates. So an on_exit_remove
+// or on_exit_hold expression written against these attributes works on a
+// job with no submit-file changes at all; +WantIOProxy only makes the
+// value visible DURING the run, which is what periodic_hold needs and
+// what survives an eviction.
 package chirp
 
 import (

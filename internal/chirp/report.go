@@ -45,7 +45,8 @@ import (
 //     is a failed job.
 //   - MountError and MountErrorReason are the latch: the mount has
 //     already answered the payload with an I/O error it could not
-//     explain.
+//     explain. This pair is the whole point of the feature, and what it
+//     is for is spelled out at Fail.
 //
 // Everything else that was considered -- cache occupancy, eviction
 // counts, per-phase splits, dedup ratios -- answers a question asked
@@ -229,6 +230,51 @@ func (r *Reporter) Close() error {
 	return err
 }
 
+// Begin stamps the start of this ATTEMPT by setting the mount-error flag
+// to false.
+//
+// It exists because the attribute is STICKY. A chirp update is written
+// into the schedd's copy of the job ad, so it survives the job being
+// requeued -- and the recommended policy expression requeues a job whose
+// mount failed. Without this call, one bad run would leave the flag true
+// forever and every subsequent attempt would be requeued on the strength
+// of a failure that happened on some other machine an hour ago, until
+// the retry bound cut it off. With it, the flag means "THIS attempt's
+// mount failed", which is what every expression a user writes assumes.
+//
+// It goes out on the same channel Fail uses -- immediate where the job
+// ad allows it, delayed otherwise -- and that matters more than it
+// looks: the delayed updates are a dictionary the starter flushes on its
+// own schedule, so a `false` parked there and a `true` sent immediately
+// would land in the wrong order and revert the failure. Using one
+// channel for both makes the sequence unambiguous, because whether the
+// immediate verb works is a property of the job ad and does not change
+// mid-run.
+//
+// The REASON attribute is deliberately not cleared. Fail writes the
+// reason before the flag, so "flag is true" implies "reason is this
+// attempt's" at every instant, and a stale reason sitting beside a false
+// flag is the previous attempt's diagnosis -- worth keeping, and read by
+// nothing.
+func (r *Reporter) Begin() error {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.cfg.Host == "" || r.closed {
+		return nil
+	}
+	if err := r.connect(); err != nil {
+		return err
+	}
+	if err := r.setNowOrLater(AttrMountError, Bool(false)); err != nil {
+		r.faultLocked(err)
+		return err
+	}
+	return nil
+}
+
 // Publish refreshes the periodic attributes. Unchanged values are not
 // resent.
 func (r *Reporter) Publish(m Mount) error {
@@ -274,7 +320,31 @@ func (r *Reporter) Publish(m Mount) error {
 // Fail reports, exactly once, that the mount has answered the payload
 // with an I/O error.
 //
-// Three things happen and their ORDER is deliberate:
+// # What this is actually for
+//
+// The danger is not the error. The danger is EXIT 0 WITH A CORRUPT
+// RESULT. Programs that read a filesystem overwhelmingly do not check
+// read(2) for EIO -- there was no reason to think a read could fail --
+// so a job that was handed one very often runs to completion, writes
+// output, and exits successfully. Nothing downstream can tell that
+// output apart from a correct answer, and the job's own exit status
+// says it is fine.
+//
+// So this attribute exists to make that outcome un-recordable. A submit
+// file that evaluates it in on_exit_remove sends the job round again;
+// one that evaluates it in on_exit_hold stops it for a human. The cost
+// asymmetry is what settles which way to lean: re-running a job costs
+// some CPU, while recording a wrong scientific result costs whatever is
+// built on top of it, possibly years later.
+//
+// The enforcement is the SCHEDD's, not this process's. A chirp update
+// lands in the shadow's copy of the job ad (pseudo_ops.cpp:603 for the
+// immediate path, remoteresource.cpp:1647 for the delayed one), and the
+// shadow is what evaluates the exit policy -- so a policy expression
+// works in every deployment shape, including the ones where pelfs is a
+// --fusemount driver that never sees a payload process.
+//
+// Three things happen here and their ORDER is deliberate:
 //
 //  1. ulog, so the failure lands in the job's user log -- the file a
 //     person reads without running condor_q, and the only one of these
@@ -289,10 +359,16 @@ func (r *Reporter) Publish(m Mount) error {
 // makes "flag is true" imply "reason is present" at every instant.
 //
 // The immediate verb needs `+WantIOProxy = true` in the submit file. If
-// the starter refuses it, this falls back to the delayed verb: the
-// attribute still reaches the ad, just at the starter's next update
-// rather than at once. A job that never opted in still gets held, a few
-// minutes later than one that did.
+// the starter refuses it, this falls back to the delayed verb -- and
+// that fallback is stronger than it sounds: the starter drains its
+// delayed-update dictionary into the JOB EXIT AD as well as into its
+// periodic ones (jic_shadow.cpp, notifyJobExit -> publishUpdateAd), and
+// the shadow applies that ad BEFORE it evaluates the exit policy
+// (pseudo_ops.cpp, pseudo_job_exit). So an on_exit_remove or
+// on_exit_hold expression fires correctly even on a job that never
+// opted into anything. What +WantIOProxy buys is the value being in the
+// queue DURING the run -- which is what a periodic_hold can act on, and
+// what survives the job being evicted rather than exiting.
 func (r *Reporter) Fail(reason string) error {
 	if r == nil {
 		return nil

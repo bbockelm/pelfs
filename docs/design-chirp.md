@@ -185,8 +185,8 @@ would have worked only on a pool whose admin had changed that setting.
 | `ChirpPelfsBytesUp` | delayed | Output actually leaving the node. |
 | `ChirpPelfsUploadBacklog` | delayed | Bytes cut into packs and not yet sent — what is **lost** if the job is evicted now, and the best predictor of how long the seal after the payload takes. |
 | `ChirpPelfsObjectErrors` | delayed | Transient federation failures that were retried successfully. Rising here is a sick federation before it is a failed job. |
-| `ChirpPelfsMountError` | **immediate** | `true` once the mount has handed the payload an unexplained I/O error. |
-| `ChirpPelfsMountErrorReason` | **immediate** | One line of prose, for `periodic_hold_reason`. |
+| `ChirpPelfsMountError` | **immediate** | `false` at mount time, `true` once the mount has handed the payload an unexplained I/O error. What `on_exit_remove` / `on_exit_hold` / `periodic_hold` act on. |
+| `ChirpPelfsMountErrorReason` | **immediate** | One line of prose, for `on_exit_hold_reason` or `periodic_hold_reason`. |
 
 Everything considered and rejected — cache occupancy, eviction counts,
 per-phase splits, dedup ratios — answers a question asked *after* the
@@ -214,7 +214,8 @@ resent, so an idle mount's cycle is the single heartbeat write.
 
 The error latch is the one thing that would be worthless five minutes
 late, so it pays the synchronous trip — **once per session**, because it
-is latched.
+is latched. The per-attempt reset (`Begin`) is the only other
+synchronous write, and it is one per mount, not one per cycle.
 
 ## The error path
 

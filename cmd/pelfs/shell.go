@@ -91,12 +91,14 @@ func mountEnv(prefix, mountPoint string) []string {
 // form — it is exactly that command, so scripts can branch on the status
 // pelfs exits with.
 //
-// takeDown is how `--on-mount-error=hold` reaches the payload: a reason
+// takeDown is how `--on-mount-error=abort` reaches the payload: a reason
 // arriving on it means the mount has handed this process an I/O error it
 // could not explain, and the payload is to be stopped rather than left
-// to produce plausible garbage. Nil in every other mode, and nil is the
-// ordinary case — see mountErrorPolicy for why the aggressive behaviour
-// is opt-in.
+// to produce more output nobody can trust. Nil in every other mode, and
+// nil is the ordinary case — the DEFAULT does not stop the payload, it
+// refuses to let its exit status stand (see mountErrorPolicy), because
+// enforcement belongs to the schedd and stopping a running program is
+// the one part of this that cannot be taken back.
 func runInMount(o *cmdOpts, prefix, mountPoint string, command []string, takeDown <-chan string) int {
 	argv := command
 	if len(argv) == 0 {
@@ -179,7 +181,7 @@ func runInMount(o *cmdOpts, prefix, mountPoint string, command []string, takeDow
 			case <-done:
 				return
 			case reason := <-takeDown:
-				ui.Error("stopping the payload: {reason} (--on-mount-error=hold)", "reason", reason)
+				ui.Error("stopping the payload: {reason} (--on-mount-error=abort)", "reason", reason)
 				if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
 					ui.Warn("could not signal the payload: {error}", "error", err)
 					continue

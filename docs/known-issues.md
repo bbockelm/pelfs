@@ -834,6 +834,45 @@ fails if the pack-list guard is removed. The collision itself is not
 pinned and cannot practically be — constructing a 96-bit BLAKE3 prefix
 collision is the test.
 
+### KL-22. One SQLite connection serves both halves of the content journal, so a slow `Located` transaction stalls every writer
+
+Filed at `e0fad28` by flakehunt-agent, alongside the promotion-trigger fix
+in `internal/memtable/store.go` (which shrank the exposure by two orders of
+magnitude but did not remove it).
+
+`overlay.contentJournal` opens its database with `db.SetMaxOpenConns(1)`
+(`internal/overlay/journal.go:96`), which is what makes its statements safe
+to share. `Append` and `Adopted` are called by the writer WITH the store's
+mutex held; `Located` is called by a flusher WITHOUT it, and — since the
+ring began holding a batch until its location record was durable — two
+flushers can be inside `Located` at once. All of them queue on the one
+connection.
+
+**Consequence.** A `Located` transaction that is slow for any reason — a
+cold WAL, a contended disk, a busy timeout — is a transaction the next
+`Write` waits behind while HOLDING `Store.mu`, so the stall is not confined
+to the flusher: every reader and writer of the store is behind it. It is a
+latency spike and never a wrong answer.
+
+**Why it is smaller than it was.** The promotion trigger used to start a
+pack run on nearly every write whenever the tail lagged, so a slow uplink
+produced hundreds of `Located` transactions where it should produce a
+handful (measured: 271 against 2 over 6 MiB). With the trigger measuring
+aged-and-unclaimed bytes instead of ring occupancy, the number of these
+transactions is a function of bytes written, which is what the design
+always claimed.
+
+**Not attempted here.** The fix is either a second connection for the
+flusher's writes (SQLite serialises writers anyway, so this moves the wait
+off `Store.mu` rather than removing it) or making `Located` asynchronous
+with respect to the writer entirely. Both are write-path design decisions
+rather than defect repairs.
+
+**Pinned by an executable test: no.** The contract it violates is now
+written down — `memtable.Journal.Located` says out loud that it is called
+off the store's lock and may be called concurrently — but nothing exercises
+a slow journal against a writer.
+
 ---
 
 ## `CHANGELOG.md` v0.1.0 *Known limitations*: status on main

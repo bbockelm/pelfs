@@ -39,9 +39,14 @@ type Journal interface {
 	Adopted(h Handle, a AdoptedExtent) error
 	// Located records where a flush put things: the extents that now have
 	// chunk slices, the chunks those name, and the packs holding them.
-	// Also called with the store's lock held, from the flusher rather
-	// than the writer — so an implementation never sees two calls at
-	// once, and needs no lock of its own.
+	//
+	// Unlike Append and Adopted it is called WITHOUT the store's lock,
+	// from the flusher, and it may be called CONCURRENTLY: a run releases
+	// the packing flag when it publishes and only then waits for its
+	// uploads and writes this record, so the next run can already be here
+	// when the previous one still is. An implementation needs its own
+	// synchronisation, and a slow one must not be assumed to be blocking
+	// only one goroutine.
 	Located(l Location) error
 }
 

@@ -18,9 +18,10 @@ import (
 // recorded is enough to rebuild from, without pulling SQLite into a
 // package that has no other use for it.
 type memJournal struct {
-	// The store calls a journal under its own lock, so an implementation
-	// never sees concurrent calls — but a TEST reading what was recorded
-	// is a third goroutine, and that needs its own guard.
+	// Append and Adopted arrive under the store's lock, but Located does
+	// not and can overlap with itself (see the Journal interface), and a
+	// TEST reading what was recorded is a third goroutine again. All
+	// three reasons want the same guard.
 	mu       sync.Mutex
 	entries  []JournalEntry
 	handles  map[Handle][]ChunkSlice

@@ -214,7 +214,7 @@ func TestDeletingABranchLetsTheNameBeReusedFromThePast(t *testing.T) {
 	// The volume pin is NOT forgotten: a deleted branch says nothing about
 	// the volume's identity, and dropping the pin would mean the next fetch
 	// silently trusted whatever it was served.
-	if pinned, err := s.readPin(); err != nil || pinned == nil {
+	if pinned, err := s.readPin(); err != nil || !pinned.present() {
 		t.Fatalf("deleting a branch dropped the volume key pin (%v)", err)
 	}
 

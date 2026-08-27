@@ -1,22 +1,48 @@
 ARCH  := $(shell go env GOARCH)
 
-.PHONY: all build linux test e2e integration mount-gate browse-gate oauth-browser opfuzz hostile hostile-long hostile-encrypted hostile-retro unprivileged crash big-tree vet clean
+.PHONY: all build linux test ui ui-check e2e integration mount-gate browse-gate oauth-browser opfuzz hostile hostile-long hostile-encrypted hostile-retro unprivileged crash big-tree vet clean help
 
 all: build
 
-build:
+# THE WEB UI IS EMBEDDED FROM A COMMITTED BUNDLE, AND THAT CAN GO STALE.
+#
+# `go build` embeds internal/webui/dist exactly as it is committed and never
+# runs `go generate`. On a plain checkout that is the whole point -- a
+# contributor with no Node still gets a working UI, and nothing in the Go build
+# ever asks for a JavaScript toolchain. The cost is that when webui/frontend is
+# newer than the bundle, `make` used to embed the OLD one and say nothing,
+# which from the outside is indistinguishable from a change that did not
+# happen. It was reported in those words.
+#
+# So every target that produces a BINARY, or runs tests against one, first asks
+# whether the bundle still matches its sources -- by content, not by timestamp
+# (scripts/webui-inputs.sh says why). On an unmodified checkout the answer is
+# yes, in ~30ms, silently, with no Node involved. When it is no, the bundle is
+# regenerated if Node is here and the build FAILS with the command to run if it
+# is not. The one thing it never does is carry on quietly.
+ui-check:
+	@scripts/webui-stale.sh
+
+# Rebuild the committed bundle deliberately: `go generate ./internal/webui`
+# runs scripts/webui-build.sh, and both outputs -- internal/webui/dist and
+# internal/webui/third_party.txt -- are meant to be committed with the change
+# that caused them. Needs Node; nothing else here does.
+ui:
+	CGO_ENABLED=0 go generate ./internal/webui
+
+build: ui-check
 	CGO_ENABLED=0 go build -o bin/pelfs ./cmd/pelfs
 
 # Linux binary for the containerized test harnesses, which cross-compile on
 # the host because the test image carries no toolchain.
-linux:
+linux: ui-check
 	CGO_ENABLED=0 GOOS=linux GOARCH=$(ARCH) go build -o bin/pelfs-linux-$(ARCH) ./cmd/pelfs
 
 # ./... rather than ./internal/...: cmd/pelfs holds the tests for the mount
 # session itself — the exit seal, the checkpoint cadence, what a FAILED seal
 # leaves behind — and leaving them out of the project's own test target
 # meant the paths closest to a user were the ones it did not check.
-test:
+test: ui-check
 	CGO_ENABLED=0 go test ./...
 
 e2e:
@@ -34,7 +60,7 @@ mount-gate:
 # reinstalled -- which is the check that an installed Cyberduck profile is
 # not single-use. ~2min after the image build; the run itself is
 # --network none.
-browse-gate:
+browse-gate: ui-check
 	./scripts/browse-gate-docker.sh
 
 # The one gate with a REAL BROWSER and REAL Cyberduck on the same flow.
@@ -46,7 +72,7 @@ browse-gate:
 # blocking the 303 that hands the authorization to the client. Neither is
 # visible to a client that does not implement the Fetch standard and CSP.
 # ~40s after the image build; the run itself is --network none.
-oauth-browser:
+oauth-browser: ui-check
 	./scripts/oauth-browser-docker.sh
 
 integration:
@@ -111,3 +137,22 @@ vet:
 
 clean:
 	rm -rf bin
+
+# What there is to run. Not every target -- the gates below the line explain
+# themselves in this file's comments -- but the ones a person types.
+help:
+	@echo 'build        the pelfs binary (checks the committed web bundle first)'
+	@echo 'test         go test ./... (same check)'
+	@echo 'vet          go vet ./...'
+	@echo 'ui           rebuild the committed web bundle; needs Node. Commit'
+	@echo '             internal/webui/dist, third_party.txt and bundle.inputs'
+	@echo 'ui-check     is the committed bundle still what webui/frontend builds?'
+	@echo 'linux        cross-compiled binary for the container harnesses'
+	@echo 'clean        rm -rf bin'
+	@echo
+	@echo 'gates (each one launches a container; see the comments in the Makefile):'
+	@echo '  e2e mount-gate browse-gate oauth-browser integration opfuzz'
+	@echo '  hostile hostile-long hostile-encrypted hostile-retro'
+	@echo '  crash big-tree unprivileged'
+	@echo
+	@echo 'UI_STALE=allow builds with the committed bundle even when it is stale.'

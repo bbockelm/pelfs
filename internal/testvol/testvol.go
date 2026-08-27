@@ -54,6 +54,10 @@ type Options struct {
 	Branch string
 	// SigningKey signs every generation; nil mints one.
 	SigningKey ed25519.PrivateKey
+	// Unsigned builds a volume with NO signing key, the way
+	// `pelfs init --unsigned` does. It suppresses the mint above, so that a
+	// fixture cannot end up with a key it then declines to use.
+	Unsigned bool
 	// DEK/IdentityKey/KeyID/KeyTable make the volume encrypted. They are
 	// passed through to every publish and to the genfs that reads it back.
 	DEK         []byte
@@ -91,7 +95,7 @@ func New(t testing.TB, inner pelicanobj.Store, o Options) *Volume {
 	if o.Branch == "" {
 		o.Branch = "main"
 	}
-	if o.SigningKey == nil {
+	if o.SigningKey == nil && !o.Unsigned {
 		_, priv, err := ed25519.GenerateKey(rand.Reader)
 		if err != nil {
 			t.Fatalf("generate signing key: %v", err)
@@ -109,6 +113,7 @@ func New(t testing.TB, inner pelicanobj.Store, o Options) *Volume {
 		SpoolDir:    v.dir,
 		Branch:      o.Branch,
 		SigningKey:  o.SigningKey,
+		Unsigned:    o.Unsigned,
 		VolumeID:    o.VolumeID,
 		DEK:         o.DEK,
 		IdentityKey: o.IdentityKey,

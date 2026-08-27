@@ -48,6 +48,18 @@ export type BrowseState = {
   staged_files: number;
   staged_bytes: number;
   dirty_nodes: number;
+  /** Unpublished NAMESPACE: names added, removed, or moved. */
+  dirty_edges: number;
+  /**
+   * THE PREDICATE, and the field the panel keys off. The server computes it
+   * from the same expression the seal uses (cmd/pelfs/browse.go), so "the page
+   * says there is something to publish" and "publishing would write a
+   * generation" cannot disagree. It is deliberately a BOOLEAN and not a count:
+   * a count invites this page to re-derive the predicate out of the counters,
+   * which is exactly how a rename came to render as nothing to publish. The
+   * counters above are for SHOWING; this is for deciding.
+   */
+  unpublished: boolean;
   upload_backlog: number;
   /** A floor, not a promise: write pressure can fire a checkpoint sooner. */
   next_publish_s: number;

@@ -880,7 +880,9 @@ already defines.
   private key, `--encrypt-key`, unlocked by `$PELFS_KEY_PASSPHRASE` —
   wraps DEKs and the identity key for confidentiality. They have different
   lifecycles and different audiences: every reader verifies signatures,
-  only key-holders decrypt. An unencrypted volume still has a signing key.
+  only key-holders decrypt. An unencrypted volume still has a signing key —
+  unless it was created without one on purpose, which is its own section
+  ("Unsigned volumes", below).
 - **First-mount trust**: an explicit `--volume-pubkey`, else
   trust-on-first-use with the key pinned under the state directory
   (`refs/volume.pub`) and loud errors on change — the SSH model.
@@ -987,6 +989,207 @@ already defines.
   retain window may read an unsigned pack trailer to FIND a backup but
   verifies the backup itself before believing a word of it — a scavenged
   document can only ever make the sweep keep MORE.
+
+## Unsigned volumes
+
+A volume may be created with **no signing key at all** (`pelfs init
+--unsigned`). It is a development convenience — a throwaway volume under a
+prefix only one person can write, living for twenty minutes, with no key to
+mint, carry or lose — and it is the one shape of this format that gives up
+the integrity root. Everything below is about making that a decision rather
+than an accident.
+
+### There is no "unsigned" field
+
+An unsigned generation is one whose `SigningPub` and `Signature` are both
+zero (`superblock.IsUnsigned`). **The marker is the absence of the
+credential**, so there is nothing to forge: a boolean saying "I am unsigned"
+would be attacker-controlled on exactly the documents where it mattered —
+an unsigned superblock is unauthenticated by definition, so every byte in
+it is whatever the last writer chose — and any code keying off the field
+instead of off "no signature verifies" would be a bypass waiting to be
+written.
+
+It also costs no format change, which puts an **old binary** on the right
+side of the boundary for free: it has never heard of any of this, calls
+`Verify`, and gets `ErrBadSignature`. A hard refusal is the correct answer
+for a reader that cannot express consent.
+
+The corollary is that a deliberate downgrade and a stripped signature are
+*the same document*. Nothing distinguishes them, ever, so nothing tries.
+
+### How a reader knows, and what it does
+
+The decision belongs entirely to the **reader**, and lives in one place
+(`internal/refs`, `checkSigningKind`). Three rules:
+
+1. **An unsigned volume never TOFUs.** Trust-on-first-use bootstraps trust
+   in a *key*; there is no key, so there is nothing to bootstrap, and
+   accepting would mean nothing more than "whoever can write this prefix".
+   First contact with an unsigned head is refused unless the reader passed
+   `--allow-unsigned`. That flag **is** the consent, and it is why "I forgot
+   to configure signing" can never become "anyone who can write this prefix
+   owns my filesystem".
+2. **The consent is recorded once, in the volume pin.**
+   `<state-dir>/refs/volume.pub` holds either a hex key or the literal
+   `unsigned` — the *same file*, so "what is this volume's identity" has
+   exactly one answer on disk and a change of kind is a comparison rather
+   than a search. Two files could disagree, and the disagreement is
+   precisely the attack. After the pin, no flag is needed again: the
+   loudness moves to the reporting surfaces below.
+3. **`--volume-pubkey` and an unsigned head is always a refusal.** You named
+   a key to verify against; there is no signature to check.
+
+`pelfs init --unsigned` and `pelfs rotate --to-unsigned/--to-signed` re-pin
+the machine that ran them, because that machine's user typed the command.
+Nothing else does.
+
+### Downgrade protection
+
+**A pin that changes kind is always a refusal, in both directions, and no
+flag lifts it.**
+
+- Signed yesterday, unsigned today (`refs.ErrSignatureDropped`): a
+  deliberate downgrade and an attack are byte-identical, so the reader does
+  not guess. It refuses, names the pin file, and a **human** decides — out
+  of band, exactly as after a key compromise. The remedy for a legitimate
+  downgrade is to delete `<state-dir>/refs/volume.pub` and re-read with
+  `--allow-unsigned`. It is deliberately a manual, per-volume act with no
+  flag that can be typed by habit; the shape is `ssh`'s "offending key in
+  known_hosts:3".
+- Unsigned yesterday, signed today (`refs.ErrSignatureAppeared`): refused
+  for a sharper reason. Adopting the key would hand the pin to whoever
+  published it, and on an unsigned volume that is *anyone who can write the
+  prefix* — turning a loud "this is unsigned" into a quiet "this is signed,
+  all good".
+
+**The custody chain does not carry a downgrade, and will not.** `NextPub`
+announces a successor *key* and never "no key"; `superblock.Validate`
+refuses an unsigned document that announces anything at all, since an
+announcement is worth exactly the signature over it. The reason is not
+cryptographic — a signed "I am about to stop signing" would be perfectly
+authentic. It is that **a writer would be deciding what a reader's mount
+accepts.** A volume's owner may stop signing whenever they like; they may
+not thereby turn integrity checking off on somebody else's machine,
+silently, at the next poll. A server does not get to announce "from now on,
+plaintext".
+
+### Rotating between the modes
+
+`pelfs rotate --to-unsigned` and `--to-signed`, report-only by default like
+every other shape of `pelfs rotate`. **One content-neutral generation per
+branch, not two:** a key rotation needs two because the reader's pin has to
+be carried across a gap and only a signed announcement can carry it; a mode
+change carries nothing, by the decision above.
+
+- `--to-unsigned` **needs no signing key**, and that is deliberate.
+  Publishing an unsigned superblock takes none by definition, and anyone who
+  can write the prefix could write one without this command; demanding a key
+  would only make the downgrade impossible in the case where it is most
+  wanted — a volume whose key was lost. What it *does* check is that a key
+  present on this machine matches the head, so a wrong state directory
+  cannot downgrade a volume its owner is still signing. The old key is
+  **archived read-only**, never deleted: it is the volume's only surviving
+  identity and the only way back to a tag frozen before the downgrade
+  (`--volume-pubkey`).
+- `--to-signed` mints a key (or adopts one already beside the volume) and
+  signs one generation per branch. **It does not make the past
+  trustworthy.** The signature attests to what the volume holds *now* — pack
+  set, root catalog, every identity below it, which is a real root going
+  forward — and says nothing about how it got there: while the volume was
+  unsigned anyone who could write the prefix could change it, and this signs
+  whatever they left. It is not a repair, and rotating back is not a
+  restoration either — it mints a *new* identity, so the readers a downgrade
+  broke stay broken.
+- `VerifyChain` is **untouched by all of this**. An unsigned head fails
+  `Verify` under the trusted key and under any announced successor, so it
+  never reaches a chain step in either direction. "Retiring the last key"
+  therefore has no meaning in the chain: it is a local key-file operation
+  (`rotate.Keys.Retire`, Promote's other half) plus a refusal that every
+  reader but one has to clear by hand.
+
+Both directions break every **tag**, for the reason a key rotation does: a
+tag is immutable and verified against the pinned identity with no chain
+step. After a downgrade the archived key still reads them with
+`--volume-pubkey`; after an upgrade nothing does, because they never had a
+signature.
+
+### Marking
+
+An unsigned volume says so everywhere a user might look, so that inheriting
+one never requires reading a superblock:
+
+| surface | text |
+| --- | --- |
+| `pelfs init --unsigned` | `UNSIGNED volume: anyone who can write this prefix can replace it undetectably. Other machines need --allow-unsigned to read it` |
+| mount, every time | `UNSIGNED volume: nothing here is authenticated` |
+| `pelfs status` | `rw on main, unsigned` |
+| `pelfs fsck` | `warning: unsigned: /: this generation carries no signature; nothing below it is authenticated` |
+| browse page | the `unsigned` field on `browseState` |
+
+`fsck` reports it as a **warning, not damage** — the volume is exactly as
+its owner made it and every invariant holds, so the run still says
+"generation is consistent" and exits 0. `--strict` is where a user asks for
+the opposite, and on an unsigned volume `--strict` exits 1. It is the first
+and only entry in `fsck.warningKinds`, which existed for precisely this
+shape of finding.
+
+### Blast radius: what is given up, and what is not
+
+The signature's entire value is **against an attacker who can write the
+prefix but is not the owner**. Without write access, unsigned costs nothing
+at all. With it, the attacker could already destroy availability (the threat
+model concedes that: the origin is dumb storage and cannot verify
+signatures). So what the signature uniquely buys is **integrity under write
+compromise** — the inability to serve forged content that readers accept as
+genuine — and that is the whole of what an unsigned volume gives up.
+
+WHAT IS LOST:
+
+- **Authenticity of the root.** An attacker who can write `refs/main` can
+  publish a wholly self-consistent alternate tree: their own root catalog,
+  their own pack set, their own file contents. Every reader accepts it.
+- **Rollback to an older genuine generation**, undetectably, for any reader
+  that has not seen the newer one (`checkMonotonic` is local state).
+- **The integrity of the policy knobs.** `Params.TGrace`, the condemned
+  ledgers, `RetainK` — all signed fields, all now attacker-writable, so a
+  forged head could steer `pelfs gc --delete` into reclaiming live objects.
+  This adds nothing in practice: whoever can rewrite the ref could delete
+  the packs directly, which is strictly worse and already inside the
+  availability half of the threat model. The ledgers were protecting against
+  *accidents*, and unsigned only matters to someone with write access.
+- **Every tag's meaning.** A tag on an unsigned volume is a name someone
+  with write access froze. It pins objects against the sweep exactly as
+  before; it attests to nothing.
+
+WHAT STILL HOLDS, independently of the signature:
+
+- **The hash tree, below the root.** Chunk identities are content hashes and
+  readers still rehash them, so corruption, truncation and any tampering
+  *below* the superblock are caught exactly as before. Integrity degrades
+  from *authentic* to *internally consistent* — and the root is precisely
+  what the signature protected.
+- **Encryption, completely.** DEKs are wrapped under the user's RSA KEK,
+  which no superblock rewrite reaches. On an **encrypted** unsigned volume
+  an attacker can delete, reorder, or replay old ciphertext, but cannot
+  forge content: catalogs and chunks are AES-GCM under a DEK they do not
+  hold, so a substituted entry fails to open rather than serving wrong
+  bytes, and a re-wrapped key table fails to unwrap under the legitimate
+  KEK. **An encrypted unsigned volume loses far less than a plaintext one**,
+  and that is worth knowing when choosing.
+- **The rollback check**, as far as local state reaches: a served generation
+  older than one this client already accepted is still refused
+  (`refs.ErrRollback`). It catches stale caches; it does not catch an
+  attacker, who simply writes a higher number.
+- **The retention grace as a mechanism.** The window still holds objects for
+  its stated duration and the sweep still fails closed on a ref it cannot
+  read. What is gone is any guarantee about *which* duration the volume
+  states.
+- **The flip's compare-and-swap and the advisory lease.** Concurrency
+  safety is orthogonal to signing.
+
+The one-line rule: **an unsigned volume is exactly as trustworthy as the ACL
+on its prefix.** Use one where that ACL is you, and nowhere else.
 
 ## Integrity and encryption
 

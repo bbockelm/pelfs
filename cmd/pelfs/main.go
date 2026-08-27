@@ -19,6 +19,7 @@
 //	pelfs cache  [clear] <prefix>    show, or free, the local cache
 //	pelfs browse [--rw] <prefix>     a page on 127.0.0.1: durability, and publish
 //	pelfs rotate [--apply] <prefix>  replace the volume signing key
+//	pelfs rotate --to-unsigned|--to-signed <prefix>  stop or start signing it
 //	pelfs rescue [--apply] <prefix>  rebuild refs from packs after a disaster
 package main
 
@@ -100,6 +101,9 @@ func usage() {
 
 Usage:
   pelfs init   [flags] pelican://<federation>/<prefix>    create a new volume
+  pelfs init   --unsigned [flags] <prefix>                create one with NO signing key,
+                                                          for throwaway work; readers need
+                                                          --allow-unsigned
   pelfs shell  [flags] <prefix>                           mount + subshell
   pelfs shell  [flags] <prefix> -- <command> [args...]    mount + run one command
   pelfs mount  [flags] [--rw] <prefix> [mountpoint]       background mount
@@ -139,6 +143,10 @@ Usage:
   pelfs rotate [--apply] [flags] <prefix>                 replace the volume signing key
                                                           through the custody chain; reports
                                                           what it would break by default
+  pelfs rotate --to-unsigned|--to-signed [--apply] <prefix>
+                                                          stop, or start, signing this volume.
+                                                          Every other reader must clear its pin
+                                                          by hand either way
   pelfs rescue [--apply] [flags] <prefix>                 rebuild the refs from the packs'
                                                           superblock backups, for the day
                                                           the refs are gone; never deletes
@@ -175,6 +183,7 @@ type cmdOpts struct {
 	cacheSize         string
 	noAutoRepack      bool
 	noAutoGC          bool
+	allowUnsigned     bool
 }
 
 func registerFlags(fs *flag.FlagSet, o *cmdOpts) {
@@ -200,6 +209,15 @@ func registerFlags(fs *flag.FlagSet, o *cmdOpts) {
 	// should have to be typed out. It ignores rather than steals: this
 	// release never writes that object (internal/lease, package comment).
 	fs.BoolVar(&o.ignoreVolumeLease, "ignore-volume-lease", false, "proceed past a live meta/lease.json left by a pelfs v0.1.0 client, which locks the whole volume and does not say which branch it writes")
+	// Common rather than per-command, because it is a property of the
+	// VOLUME and every verb that reads one has to be able to say it: a user
+	// who can mount an unsigned volume but cannot fsck or gc it has a
+	// volume that rots. It is the reader's consent to serve a volume with
+	// no integrity root, and it deliberately does NOT override a pin — see
+	// internal/refs.
+	fs.BoolVar(&o.allowUnsigned, "allow-unsigned", false, "read a volume that carries no signature at all "+
+		"(`pelfs init --unsigned`). Nothing about such a volume is authenticated: anyone who can write the "+
+		"prefix can replace its contents undetectably. Refused on any volume this client has already seen signed")
 	fs.BoolVar(&o.noAcquireToken, "no-acquire-token", false, "never run interactive token-acquisition flows; rely on discovered tokens only")
 	fs.BoolVar(&o.insecure, "insecure", false, "skip TLS verification (test federations only)")
 	// --debug opens a channel, so it is wired where it is defined rather

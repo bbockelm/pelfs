@@ -37,6 +37,16 @@ import (
 // the seal path actually touch.
 func newGenSession(t *testing.T, rw bool) *genSession {
 	t.Helper()
+	return newGenSessionMode(t, rw, false)
+}
+
+// newGenSessionMode is newGenSession with the volume's signing mode as a
+// parameter: `unsigned` builds the volume `pelfs init --unsigned` builds,
+// with no key anywhere and the pin recording that. It exists so the SEAL
+// path can be exercised on such a volume — the one place a writer could
+// mint a key and silently sign a volume every reader has pinned unsigned.
+func newGenSessionMode(t *testing.T, rw, unsigned bool) *genSession {
+	t.Helper()
 	ctx := context.Background()
 	srv := httptest.NewServer(fakeorigin.Handler(t.TempDir()))
 	t.Cleanup(srv.Close)
@@ -54,25 +64,28 @@ func newGenSession(t *testing.T, rw bool) *genSession {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(stateDir) })
 
-	_, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	keyPath := filepath.Join(stateDir, "v2-signing.key")
-	if err := os.WriteFile(keyPath, []byte(hex.EncodeToString(priv)+"\n"), 0600); err != nil {
-		t.Fatal(err)
+	var priv ed25519.PrivateKey
+	if !unsigned {
+		if _, priv, err = ed25519.GenerateKey(rand.Reader); err != nil {
+			t.Fatal(err)
+		}
+		keyPath := filepath.Join(stateDir, "v2-signing.key")
+		if err := os.WriteFile(keyPath, []byte(hex.EncodeToString(priv)+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
 	}
 	var volID [16]byte
 	if _, err := rand.Read(volID[:]); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := publish.InitVolume(ctx, publish.Options{
-		Inner: inner, SpoolDir: stateDir, Branch: "main", SigningKey: priv, VolumeID: volID,
+		Inner: inner, SpoolDir: stateDir, Branch: "main", SigningKey: priv,
+		Unsigned: unsigned, VolumeID: volID,
 	}); err != nil {
 		t.Fatalf("InitVolume: %v", err)
 	}
 
-	rstore, err := refs.New(inner, stateDir, nil)
+	rstore, err := refs.NewWithPolicy(inner, stateDir, refs.Policy{AllowUnsigned: unsigned})
 	if err != nil {
 		t.Fatal(err)
 	}

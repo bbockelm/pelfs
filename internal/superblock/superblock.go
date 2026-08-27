@@ -173,6 +173,111 @@ type GraftEntry struct {
 func (g GraftEntry) RefName() string { return g.Path }
 func (g GraftEntry) RefSize() int64  { return g.Size }
 
+// ImportBudgetBytes is what the import list may take of the superblock
+// write budget (size.go) before a seal refuses to add another.
+//
+// It is sized like GraftBudgetBytes and for the same reason: an import is
+// an operator-scale event — a person types a source prefix and waits
+// hours — so tens are plausible and thousands are a misuse. An entry with
+// a realistic path and a handful of lineage rows encodes to roughly 250
+// bytes, so this carries about 65.
+//
+// UNLIKE the graft list, THIS ONE CANNOT BE TRIMMED TO MAKE ROOM, and
+// that is the thing to know before raising or lowering it. Every entry
+// carries a lineage claim, and a lineage claim is PERMANENT: the numbers
+// were handed out to files that are in the tree and in every tag and
+// retired generation that names it, so dropping the row would let a later
+// `pelfs branch` draw the same slice and start allocating numbers this
+// volume has already used. A volume that fills this budget has to stop
+// importing, not start forgetting.
+const ImportBudgetBytes = 16 << 10
+
+// LineagePair is one row of an import's inode renumbering: the lineage a
+// SOURCE inode was allocated from, and the lineage of this volume it was
+// renumbered into (internal/inodemap).
+//
+// The map is per-lineage rather than per-inode because that is the only
+// form that fits. A tree holds hundreds of millions of inodes and a
+// handful of lineages, and the renumbering leaves the low 40 bits — the
+// allocation counter — untouched, so a lineage pair describes every inode
+// that lineage ever allocated in five bytes.
+type LineagePair struct {
+	From uint32 `cbor:"from"`
+	To   uint32 `cbor:"to"`
+}
+
+// ImportEntry is the provenance of one `pelfs import`: which volume's
+// generation was copied in, where it landed, and the inode renumbering it
+// was given.
+//
+// # It is deliberately NOT a Fork
+//
+// A Fork says "a generation of THIS volume", and merge reads it that way
+// (Fork.Base is fetched and diffed against). An imported generation
+// belongs to a different volume, signed by a different key, and is not a
+// base for anything here. Recording it as a Fork would make the next
+// merge take a foreign tree as its common ancestor, which is a wrong
+// answer rather than a missing one.
+//
+// # The two jobs it does
+//
+//   - IT IS THE LINEAGE CLAIM, and this is the load-bearing one. Nothing
+//     else in the format records the set of lineages a tree contains:
+//     Fork.Lineage names what a generation ALLOCATES FROM, Catalogs[].Inode
+//     samples whichever directories happen to root a catalog, and Shards
+//     cover only promoted inodes. So a volume that has imported and
+//     records nothing would let the next `pelfs branch` draw a lineage the
+//     imported tree is already using, and the two would hand out the same
+//     numbers for different files — the exact collision per-branch
+//     lineages exist to prevent. `pickLineage` reads Lineages from here.
+//   - It answers "where did this come from", which after an import is a
+//     question nothing else can answer. An import copies the bytes and
+//     re-signs under our key, so the tree is indistinguishable from one
+//     this volume produced. Source, SourceVolumeID, SourceGeneration and
+//     SourceHash are what a later reader has to go on.
+//
+// # Why entries are never removed
+//
+// Deleting the imported subtree does not release its lineages. The
+// numbers were handed out, and every tag, every retired generation and
+// every reader still on an older generation is entitled to keep using
+// them. So Path is PROVENANCE and not a live locator — it says where the
+// tree landed when it was imported, and stays true about that even after
+// the tree is moved or deleted.
+type ImportEntry struct {
+	// Path is where the imported tree landed in this volume.
+	Path string `cbor:"path"`
+	// Source is the prefix it was read from, SourceBranch the ref or tag
+	// within it. Both are for a human; neither is resolved at read time,
+	// because an import depends on nothing after it lands.
+	Source       string `cbor:"source"`
+	SourceBranch string `cbor:"source_branch,omitempty"`
+	// SourceVolumeID, SourceGeneration and SourceHash identify the exact
+	// generation that was copied. SourceHash is the wire hash of that
+	// superblock, which is what makes the claim checkable by anyone who
+	// still has the source volume.
+	SourceVolumeID   [16]byte `cbor:"source_volume_id"`
+	SourceGeneration uint64   `cbor:"source_generation"`
+	SourceHash       [32]byte `cbor:"source_hash"`
+	// SourcePub is the Ed25519 key the source generation was signed by,
+	// verified at import time. Recorded so a later reader can tell which
+	// custody the bytes arrived from without holding the source volume.
+	SourcePub [32]byte `cbor:"source_pub"`
+	// ImportedUnixNano is when it landed.
+	ImportedUnixNano int64 `cbor:"imported_unix_nano"`
+	// Lineages is the renumbering, ascending by From. Every lineage named
+	// in To is taken by this volume forever (see the type comment).
+	Lineages []LineagePair `cbor:"lineages"`
+	// Files, Inodes and Bytes are what was copied — reportable facts that
+	// cost nothing to record and a whole-tree walk to recompute.
+	Files  uint64 `cbor:"files,omitempty"`
+	Inodes uint64 `cbor:"inodes,omitempty"`
+	Bytes  int64  `cbor:"bytes,omitempty"`
+}
+
+func (i ImportEntry) RefName() string { return i.Path }
+func (i ImportEntry) RefSize() int64  { return int64(len(i.Path)) }
+
 // CondemnedPack records a pack repack removed from the pack list: the
 // name and when it was condemned. Publish carries entries forward until
 // they age past Params.TGraceSeconds, then drops them; GC retains
@@ -560,6 +665,16 @@ type Superblock struct {
 	// object each entry names, exactly as a manifest segment is. The
 	// superblock must not grow with the number of grafted FILES.
 	Grafts []GraftEntry `cbor:"grafts,omitempty"`
+	// Imports is the provenance of every `pelfs import` this branch has
+	// taken, and the inode renumbering each was given (ImportEntry).
+	//
+	// UNLIKE Grafts, IT NAMES NO DEPENDENCY. An import copies the bytes
+	// into this volume's own packs and re-signs under this volume's key,
+	// so nothing here is resolved at read time and a reader that ignores
+	// the field mounts and reads correctly. What it would lose is the
+	// LINEAGE CLAIM, which is why this is carried forward by every seal
+	// and never trimmed: see ImportEntry.
+	Imports []ImportEntry `cbor:"imports,omitempty"`
 	// RootCatalogHint, when set, is where the root catalog was written (see
 	// RootHint). Optional in both directions: a writer that does not track
 	// it omits it, and a reader that finds it absent — or finds it stale —
@@ -669,6 +784,42 @@ type Superblock struct {
 // place to be wrong. Resolving the packs themselves is manifest.Packs,
 // which needs an object store and so cannot live here.
 func (sb *Superblock) PacksAreInManifests() bool { return len(sb.Manifests) > 0 }
+
+// TakenLineages is every inode lineage this generation is KNOWN to have
+// handed numbers out of: the original lineage 0, the lineage this branch
+// allocates from, and every lineage an import renumbered a foreign tree
+// into.
+//
+// "Known" is the honest word and the limit is worth stating where the
+// method is. Lineage 0 is always included because every volume began
+// there and inode 1 is in it on every volume there has ever been.
+// Fork.Lineage is what this branch allocates from now. Imports are what
+// this branch bought from elsewhere. What is NOT here — and cannot be,
+// because the format does not record it — is a lineage this tree gained
+// by MERGING a branch that has since been deleted: the merged inodes are
+// in the tree, and no field names their lineage. That residue is
+// docs/known-issues.md KL-7's other half, and the only thing that closes
+// it is a walk.
+//
+// So this is a floor on what is taken, never a ceiling, and every caller
+// is a caller that must not REUSE a taken lineage — where a floor is the
+// safe direction.
+func (sb *Superblock) TakenLineages() map[uint32]bool {
+	out := map[uint32]bool{0: true}
+	if sb == nil {
+		return out
+	}
+	if sb.Fork != nil {
+		out[sb.Fork.Lineage] = true
+	}
+	out[LineageOf(sb.NextInode)] = true
+	for _, im := range sb.Imports {
+		for _, l := range im.Lineages {
+			out[l.To] = true
+		}
+	}
+	return out
+}
 
 var (
 	encMode cbor.EncMode

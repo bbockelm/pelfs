@@ -158,6 +158,8 @@ func (sb *Superblock) Contributors() []Contributor {
 		{"condemned", EncodedLen(sb.Condemned), len(sb.Condemned)},
 		{"condemned_indexes", EncodedLen(sb.CondemnedIndexes), len(sb.CondemnedIndexes)},
 		{"condemned_manifests", EncodedLen(sb.CondemnedManifests), len(sb.CondemnedManifests)},
+		{"grafts", EncodedLen(sb.Grafts), len(sb.Grafts)},
+		{"imports", EncodedLen(sb.Imports), len(sb.Imports)},
 	}
 	// Heaviest first, ties broken by name so the message a user reports is
 	// reproducible.
@@ -221,6 +223,9 @@ func remedy(field string) string {
 			"not with the volume — a longer --snapshot-interval is the lever"
 	case "shards":
 		return "; shards grow with the hard-linked file count"
+	case "imports":
+		return "; the import list cannot be trimmed — every entry is a permanent inode-lineage " +
+			"claim (superblock.ImportEntry) — so a volume at this share has to stop importing"
 	default:
 		return ""
 	}

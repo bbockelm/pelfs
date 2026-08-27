@@ -2,8 +2,6 @@ package main
 
 import (
 	"crypto/ed25519"
-	"crypto/rand"
-	"encoding/binary"
 	"time"
 
 	"context"
@@ -11,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 
+	"github.com/bbockelm/pelfs/internal/inodemap"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/refs"
 	"github.com/bbockelm/pelfs/internal/superblock"
@@ -452,10 +451,40 @@ func forkGeneration(src *superblock.Superblock, srcRaw []byte, from, fromTag, ba
 // generation cannot be branched from or merged, so it cannot collide with
 // anything either.
 func pickLineage(ctx context.Context, inner pelicanobj.Store, rstore *refs.Store) (uint32, error) {
+	taken, err := takenLineages(ctx, inner, rstore)
+	if err != nil {
+		return 0, err
+	}
+	drawn, err := inodemap.Draw(1, inodemap.TakenIn(taken))
+	if err != nil {
+		return 0, err
+	}
+	return drawn[0], nil
+}
+
+// takenLineages is every inode lineage this volume has handed numbers out
+// of, as far as anything addressable can say.
+//
+// THE ONE ALLOCATOR. Branches, tags and imports all consume from the same
+// 23-bit space, and until imports existed only the first two did — so
+// this is the function that has to know about all three or a `pelfs
+// branch` after a `pelfs import` draws a lineage the imported tree is
+// already using. That collision is silent: both sides allocate happily,
+// the numbers only meet at a merge, and by then they are in signed
+// generations and tags.
+//
+// It reads every branch head and every tag, which is every generation
+// this volume can still name, and each superblock contributes what IT
+// knows (superblock.TakenLineages: its fork lineage, its allocator's
+// lineage, and every lineage an import renumbered into it). It is not
+// exhaustive — a retired generation nobody names could hold a lineage
+// this misses — but such a generation cannot be branched from or merged,
+// so it cannot collide with anything either.
+func takenLineages(ctx context.Context, inner pelicanobj.Store, rstore *refs.Store) (map[uint32]bool, error) {
 	taken := map[uint32]bool{0: true} // 0 is the original lineage
 	branches, err := listRefNames(ctx, inner, refs.RefDirKey)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	for _, b := range branches {
 		f, err := rstore.Fetch(ctx, b)
@@ -463,36 +492,26 @@ func pickLineage(ctx context.Context, inner pelicanobj.Store, rstore *refs.Store
 			// An unreadable ref cannot be branched from, but it can still
 			// be holding a lineage. Failing closed: a lineage collision is
 			// silent, and this is the only place that can prevent one.
-			return 0, fmt.Errorf("cannot check branch %s for its inode lineage: %w", b, err)
+			return nil, fmt.Errorf("cannot check branch %s for its inode lineage: %w", b, err)
 		}
-		taken[lineageOf(f.Superblock)] = true
+		for l := range f.Superblock.TakenLineages() {
+			taken[l] = true
+		}
 	}
 	tags, err := listRefNames(ctx, inner, refs.TagDirKey)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	for _, t := range tags {
 		sb, _, err := rstore.FetchTag(ctx, t)
 		if err != nil {
-			return 0, fmt.Errorf("cannot check tag %s for its inode lineage: %w", t, err)
+			return nil, fmt.Errorf("cannot check tag %s for its inode lineage: %w", t, err)
 		}
-		taken[lineageOf(sb)] = true
-	}
-	// 23 bits (superblock.MaxLineage: every inode has to fit in a signed
-	// 64-bit integer, because storage is SQLite). A draw collides with a
-	// hundred taken lineages about once in 84,000 tries; the loop is here
-	// for correctness, not for luck.
-	for range 1000 {
-		var b [4]byte
-		if _, err := rand.Read(b[:]); err != nil {
-			return 0, err
-		}
-		l := binary.BigEndian.Uint32(b[:]) & superblock.MaxLineage
-		if l != 0 && !taken[l] {
-			return l, nil
+		for l := range sb.TakenLineages() {
+			taken[l] = true
 		}
 	}
-	return 0, errors.New("could not find an unused inode lineage after 1000 draws")
+	return taken, nil
 }
 
 // lineageOf is the lineage a generation allocates from: its fork record's,

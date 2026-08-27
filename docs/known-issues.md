@@ -838,7 +838,8 @@ collision is the test.
 
 Filed at `e0fad28` by flakehunt-agent, alongside the promotion-trigger fix
 in `internal/memtable/store.go` (which shrank the exposure by two orders of
-magnitude but did not remove it).
+magnitude but did not remove it). **Re-verified against `63d0f4c`**, which
+changes nothing here: `internal/overlay/journal.go` is untouched by it.
 
 `overlay.contentJournal` opens its database with `db.SetMaxOpenConns(1)`
 (`internal/overlay/journal.go:96`), which is what makes its statements safe

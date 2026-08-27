@@ -145,6 +145,55 @@ unsigned volume still says "generation is consistent" and still exits 0.
 `pelfs fsck --strict` on an unsigned volume now exits 1, which is what
 `--strict` means.
 
+**`pelfs fsck` can be run on a grafted volume.** It reported EVERY grafted
+file as `missing-chunk` and exited 1 on a perfectly healthy volume, because a
+grafted chunk is in no pack by design and `checkChunkRef` had the same absence
+check `genfs.ContentOf` and `genfs.Prefetch` both had before they were taught
+that a graft is a LOCATION rather than a hole. It is now the third: grafted
+blocks go into the SAME sorted identity index as packed chunks — a `graft`
+marker in the record's spare bits, no wider record, no resident set — so a
+grafted chunkref resolves through one binary search over a spill file and an
+identity in NEITHER layer is still `missing-chunk` and still damage.
+
+Which of the things that can go wrong with a graft are damage follows one
+line: **the volume's own objects are damage; a third party's storage is a
+warning.** A lost or corrupt graft index, an entry that contradicts the object
+it names, a catalog and an index that disagree about a block, and a graft on
+an encrypted volume are `SeverityError` — nobody but this volume's operator
+can fix them. A source object that changed, went missing, or could not be
+reached, a graft nothing references, and a stale recorded path are
+`SeverityWarning`: pelfs never held those bytes, the fix is `pelfs graft
+--refresh` rather than a restore, and an fsck that went red on an upstream
+maintainer's routine republish is an fsck people stop running. A **deleted**
+source object is still a warning, and that is deliberate — fsck cannot tell a
+deletion from an expired token or a partition, and classifying an outage as
+corruption is the mistake `genfs` already refuses to make. `--strict` is how
+an operator opts into failing on any of it.
+
+**Two check depths, and the report says which one you paid for.**
+`--grafts=head` (the default) stats every source object — presence, size, and
+mtime against the generation's own timestamp, which is a one-sided test that
+can only fire on a source that moved after it was spidered. It reads no source
+bytes: 100,000 HEADs for a 10 TB graft. `--grafts=deep` re-reads and re-hashes
+every referenced external block, and `--deep` implies it unless `--grafts` was
+typed, because "the bytes" should mean the bytes in whichever layer holds
+them. `--grafts=none` touches no third party at all. The graft INDEX is read
+on every run regardless, because grafted chunkrefs cannot resolve without it —
+which also makes fsck the only thing that verifies a large index against the
+hash the superblock signs, since a mount reads it by window and never holds
+it. The report prints `2 source objects stat'd by HEAD — … a same-length edit
+is invisible to this mode` or `4 external blocks re-read from the source and
+re-hashed (3021440 bytes)`, never just "checked".
+
+The size comparison is sound under deduplication, which took the argument in
+`graftObject.exactSize`: the index collapses duplicate identities, so the
+highest byte it names in an object is a LOWER BOUND on that object's size, and
+an equality claim is made only when the surviving records tile the object and
+end in a short block. `internal/graft` gained the sequential block enumerator
+the spike deleted a 336 MB-at-10.5M-blocks helper rather than ship — one
+ranged request, one buffer, the string table, and nothing per block; measured
+flat at 8x the block count.
+
 **Less to read on both web surfaces.** The upload notice is one sentence
 ("File uploaded to local machine; click "Publish now" to push it to the
 federation"). The publish control is one button wearing its own state —

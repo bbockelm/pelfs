@@ -672,12 +672,181 @@ echo "PASS: --remove dropped one graft and left the volume, and the other graft,
 unmount_at "$WORK/mnt2"; wait "$MOUNT_PID" 2>/dev/null || true; MOUNT_PID=
 
 echo
-echo "-- and fsck still parses the result --"
-"$WORK/pelfs" fsck --state-dir "$WORK/state2" "$VOL2" 2>&1 | tail -5 | sed 's/^/    /' || true
-echo "(fsck reports grafted files as missing chunks today; that is item 2, not this one)"
+echo "===================================================================="
+echo "  10. fsck ON A GRAFTED VOLUME"
+echo "===================================================================="
+# Item 2's second half. Until now `pelfs fsck` reported EVERY grafted file
+# as `missing-chunk` and exited 1 on a perfectly healthy volume: a grafted
+# chunk is in no pack BY DESIGN, and checkChunkRef had the same absence
+# check genfs.ContentOf and genfs.Prefetch both had before they were taught
+# that a graft is a LOCATION rather than a hole.
+#
+# VOL2 is the volume worth checking, because it is the mixed case: this
+# volume's own packed content (keep.txt, docs/, after.txt) side by side
+# with a graft at /busy, both swept in one pass.
+#
+# What is asserted here is the SEVERITY CONTRACT, because that is what an
+# operator's cron reads:
+#
+#   healthy grafted volume         -> clean, exit 0 (and 0 under --strict)
+#   the SOURCE moved on            -> warning, exit 0; exit 1 under --strict
+#   the volume's own index is gone -> damage, exit 1
+#
+# and the difference between the two check depths, which is four orders of
+# magnitude of cost and has to be visible in the output.
+
+echo "-- a healthy grafted volume must be CLEAN and exit 0 --"
+set +e
+"$WORK/pelfs" fsck --state-dir "$WORK/state2" "$VOL2" >"$WORK/fsck-ok.log" 2>&1
+rc=$?
+set -e
+sed 's/^/    /' "$WORK/fsck-ok.log"
+[ "$rc" -eq 0 ] || { echo "FAIL: fsck exited $rc on a healthy grafted volume" >&2; exit 1; }
+grep -q 'generation is consistent' "$WORK/fsck-ok.log" || {
+  echo "FAIL: fsck did not call a healthy grafted volume consistent" >&2; exit 1; }
+if grep -qi 'missing-chunk' "$WORK/fsck-ok.log"; then
+  echo "FAIL: fsck STILL reports grafted files as missing chunks. That is the whole of item 2:" >&2
+  echo "      a grafted chunk is in no pack by design, and reporting it as damage makes fsck" >&2
+  echo "      unusable on the volumes this feature exists for." >&2
+  exit 1
+fi
+if grep -qi 'warning' "$WORK/fsck-ok.log"; then
+  echo "FAIL: a healthy grafted volume produced warnings" >&2; exit 1
+fi
+grep -q "stat.d by HEAD" "$WORK/fsck-ok.log" || {
+  echo "FAIL: the report does not say what the default check actually cost" >&2; exit 1; }
+echo "PASS: clean, exit 0, and the report states the cheap mode's claim rather than 'checked'"
+
+set +e
+"$WORK/pelfs" fsck --state-dir "$WORK/state2" --strict "$VOL2" >/dev/null 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || { echo "FAIL: --strict failed a healthy grafted volume (exit $rc)" >&2; exit 1; }
+echo "PASS: --strict on a healthy grafted volume is still 0"
+
+echo
+echo "-- the two depths, and the different claims they earn --"
+"$WORK/pelfs" fsck --state-dir "$WORK/state2" --grafts=deep "$VOL2" 2>&1 \
+  | tee "$WORK/fsck-deep.log" | sed 's/^/    /'
+grep -q 're-read from the source and re-hashed' "$WORK/fsck-deep.log" || {
+  echo "FAIL: --grafts=deep does not report what it moved" >&2; exit 1; }
+grep -q 'generation is consistent' "$WORK/fsck-deep.log" || {
+  echo "FAIL: --grafts=deep found something on a healthy volume" >&2; exit 1; }
+echo "PASS: the deep mode re-read every external block and says so in bytes"
+
+echo
+echo "-- A SOURCE THAT MOVED ON IS A WARNING, NOT DAMAGE --"
+# The volume is intact. A third party with no obligation to it republished
+# a file, which is the event a graft EXISTS to expose -- so this must not
+# turn an operator's nightly fsck red, and --strict is how somebody who
+# wants it to opts in.
+MB="$WORK/origin/ext/data/multiblock.bin"
+cp "$MB" "$WORK/mb.orig"
+head -c 2000000 "$WORK/mb.orig" > "$MB"
+echo "truncated ext/data/multiblock.bin from 2621440 to 2000000 bytes at the source"
+
+set +e
+"$WORK/pelfs" fsck --state-dir "$WORK/state2" "$VOL2" >"$WORK/fsck-moved.log" 2>&1
+rc=$?
+set -e
+sed 's/^/    /' "$WORK/fsck-moved.log"
+[ "$rc" -eq 0 ] || {
+  echo "FAIL: a moved SOURCE exited $rc. A graft source republishing is not this volume's" >&2
+  echo "      damage, and an fsck that cries wolf is an fsck people stop running." >&2
+  exit 1; }
+grep -q 'warning: graft-source-changed' "$WORK/fsck-moved.log" || {
+  echo "FAIL: a moved source was not reported as a warning" >&2; exit 1; }
+grep -q -- '--refresh' "$WORK/fsck-moved.log" || {
+  echo "FAIL: the warning does not name the fix" >&2; exit 1; }
+if grep -q 'is damaged' "$WORK/fsck-moved.log"; then
+  echo "FAIL: a moved source was called damage" >&2; exit 1
+fi
+echo "PASS: warning, exit 0, and it names the graft, the object and \`--refresh\`"
+
+set +e
+"$WORK/pelfs" fsck --state-dir "$WORK/state2" --strict "$VOL2" >"$WORK/fsck-strict.log" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || { echo "FAIL: --strict exited $rc on a warning" >&2; cat "$WORK/fsck-strict.log" >&2; exit 1; }
+grep -q 'failing on --strict' "$WORK/fsck-strict.log" || {
+  echo "FAIL: --strict did not say why it failed" >&2; exit 1; }
+echo "PASS: the same volume exits 1 under --strict -- opt-in, not default"
+
+echo
+echo "-- THE EDIT THE CHEAP MODE CANNOT SEE, and the mode that can --"
+# One byte, same length, same mtime: the exact mutation section 5 uses,
+# and the exact thing a HEAD cannot catch. The cheap mode has to be SILENT
+# here rather than guess, and the report has to have said so up front.
+cp "$WORK/mb.orig" "$MB"
+printf 'X' | dd of="$MB" bs=1 seek=1500000 conv=notrunc 2>/dev/null
+touch -r "$WORK/mb.orig" "$MB"
+echo "one byte at offset 1500000; length and mtime unchanged"
+
+set +e
+"$WORK/pelfs" fsck --state-dir "$WORK/state2" --strict "$VOL2" >"$WORK/fsck-cheap.log" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || {
+  echo "FAIL: the cheap mode claimed to see a same-length edit (exit $rc)" >&2
+  cat "$WORK/fsck-cheap.log" >&2; exit 1; }
+grep -q 'same-length edit is invisible to this mode' "$WORK/fsck-cheap.log" || {
+  echo "FAIL: the cheap mode does not admit what it cannot see" >&2; exit 1; }
+echo "PASS: silent, exit 0 -- and the report already said this is what it would do"
+
+set +e
+"$WORK/pelfs" fsck --state-dir "$WORK/state2" --grafts=deep "$VOL2" >"$WORK/fsck-deep2.log" 2>&1
+rc=$?
+set -e
+sed 's/^/    /' "$WORK/fsck-deep2.log"
+[ "$rc" -eq 0 ] || { echo "FAIL: deep mode called a moved source damage (exit $rc)" >&2; exit 1; }
+grep -q 'warning: graft-source-changed' "$WORK/fsck-deep2.log" || {
+  echo "FAIL: --grafts=deep did not catch a one-byte edit" >&2; exit 1; }
+grep -q 'hashes to' "$WORK/fsck-deep2.log" || {
+  echo "FAIL: the deep finding does not name the hash it got" >&2; exit 1; }
+set +e
+"$WORK/pelfs" fsck --state-dir "$WORK/state2" --grafts=deep --strict "$VOL2" >/dev/null 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || { echo "FAIL: --grafts=deep --strict exited $rc on a changed block" >&2; exit 1; }
+echo "PASS: only the deep mode sees it -- warning at exit 0, exit 1 under --strict"
+
+# Put the source back, so the last test is about the volume and nothing else.
+cp "$WORK/mb.orig" "$MB"
+touch -r "$WORK/mb.orig" "$MB"
+
+echo
+echo "-- AND THE VOLUME'S OWN OBJECT GOING MISSING IS DAMAGE --"
+# The other side of the line. A graft index lives under THIS volume's
+# prefix, is hash-named, and is the only record of where a grafted file's
+# bytes are. Losing it is not news about a third party; it is a generation
+# no reader can serve, and only this volume's operator can fix it.
+mv "$WORK/origin/vol2/grafts" "$WORK/grafts.away"
+set +e
+"$WORK/pelfs" fsck --state-dir "$WORK/state2" "$VOL2" >"$WORK/fsck-broken.log" 2>&1
+rc=$?
+set -e
+sed 's/^/    /' "$WORK/fsck-broken.log"
+[ "$rc" -eq 1 ] || { echo "FAIL: a lost graft index exited $rc, not 1" >&2; exit 1; }
+grep -q 'error: graft-index' "$WORK/fsck-broken.log" || {
+  echo "FAIL: a lost graft index was not reported as damage" >&2; exit 1; }
+grep -q 'is damaged' "$WORK/fsck-broken.log" || {
+  echo "FAIL: fsck did not call the generation damaged" >&2; exit 1; }
+grep -q 'missing-chunk' "$WORK/fsck-broken.log" || {
+  echo "FAIL: with no index, the files under the graft have no location and must be missing" >&2
+  exit 1; }
+echo "PASS: damage, exit 1 -- the volume's own object, not a third party's"
+
+mv "$WORK/grafts.away" "$WORK/origin/vol2/grafts"
+set +e
+"$WORK/pelfs" fsck --state-dir "$WORK/state2" --strict "$VOL2" >/dev/null 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || { echo "FAIL: fsck did not recover when the index came back (exit $rc)" >&2; exit 1; }
+echo "PASS: and it is clean again the moment the index is back"
 
 echo
 echo "===================================================================="
-echo "  the spike answers both questions: yes, and yes -- and a graft now"
-echo "  goes into a volume that already has content in it"
+echo "  the spike answers both questions: yes, and yes -- a graft goes into a"
+echo "  volume that already has content in it, and fsck can now be run on the"
+echo "  result: clean at exit 0, a moved source a warning, lost metadata damage"
 echo "===================================================================="

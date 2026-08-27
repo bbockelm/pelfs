@@ -151,6 +151,45 @@ const (
 	// KindChunk: deep mode only — a chunk could not be fetched, decoded,
 	// or (unencrypted volumes) did not hash to its identity.
 	KindChunk = "chunk"
+
+	// The graft kinds (internal/fsck/graft.go, which has the argument for
+	// where the line between the two severities falls). The first three
+	// are about THIS VOLUME's own objects and are damage; the rest are
+	// about a third party's storage, or about a field only a report
+	// reads, and are warnings.
+
+	// KindGraftIndex: a graft's index object — the only record of where
+	// its bytes live — could not be read, does not hash to what the
+	// superblock names, or is not a table this build can walk.
+	KindGraftIndex = "graft-index"
+	// KindGraftEntry: the signed graft entry contradicts the index object
+	// it names, or names a configuration no reader will serve.
+	KindGraftEntry = "graft-entry"
+	// KindGraftBlock: a chunkref resolved in a graft index and the two
+	// disagree about the block — its length, or a codec a grafted block
+	// cannot have.
+	KindGraftBlock = "graft-block"
+	// KindGraftSourceMissing: a source object the generation places
+	// blocks in is not at the source. WARNING: the volume is intact, and
+	// pelfs never held those bytes.
+	KindGraftSourceMissing = "graft-source-missing"
+	// KindGraftSourceChanged: the source object is there and is not what
+	// it was — a different length, an mtime after this generation, or (in
+	// deep mode) bytes that no longer hash to the identity the catalog
+	// names. WARNING: an upstream republish is what a graft is FOR.
+	KindGraftSourceChanged = "graft-source-changed"
+	// KindGraftUnchecked: the source could not be asked. WARNING, and a
+	// kind of its own because "I did not check" is a different claim from
+	// "I checked and it was fine".
+	KindGraftUnchecked = "graft-unchecked"
+	// KindGraftUnreferenced: a graft the namespace never resolves
+	// through. WARNING: a dependency on a third party that nothing uses.
+	KindGraftUnreferenced = "graft-unreferenced"
+	// KindGraftMetadata: a field of the graft entry that only reporting
+	// and a future refresh read — the recorded path after a rename, a
+	// duplicate path, a block policy that could not have cut this index.
+	// WARNING: reads are unaffected.
+	KindGraftMetadata = "graft-metadata"
 )
 
 // Severity is the second axis of a finding, beside Kind. Kind says WHAT
@@ -197,17 +236,29 @@ func (s Severity) String() string {
 // can never disagree. This set is therefore the whole of the axis, and
 // adding a kind to it is the whole of making that kind a warning.
 //
-// It holds exactly one kind, and the shape of that kind is the argument
-// for the axis. Every OTHER failure this package reports is a generation
-// contradicting itself — an object the signed pack list names and the
-// federation does not have, bytes that do not hash to the identity
-// referencing them, a dirent with no inode — and all of that is damage.
-// KindUnsigned is not: the volume is exactly as its owner made it, every
-// invariant holds, and the check still has to say so out loud because a
-// person who inherits the volume must not have to read a superblock to
-// find out it has no integrity root.
+// It holds two families, and they are here for one reason rather than
+// seven: NEITHER IS THIS VOLUME CONTRADICTING ITSELF.
+//
+// KindUnsigned is the volume exactly as its owner made it — every
+// invariant holds, and the check still says so out loud because a person
+// who inherits the volume must not have to read a superblock to find out
+// it has no integrity root.
+//
+// The graft kinds are not about this volume's objects at all. A graft
+// source belongs to a third party with no obligation to this generation,
+// its moving is the event a graft exists to expose, and the fix is
+// `pelfs graft --refresh` rather than a restore from backup. Nothing this
+// volume owns and can repair is in this set, and nothing that was already
+// reported was reclassified into it — a check that used to fail a volume
+// still fails it. See internal/fsck/graft.go for the line and the two
+// cases that look like exceptions and are not.
 var warningKinds = map[string]struct{}{
-	KindUnsigned: {},
+	KindUnsigned:           {},
+	KindGraftSourceMissing: {},
+	KindGraftSourceChanged: {},
+	KindGraftUnchecked:     {},
+	KindGraftUnreferenced:  {},
+	KindGraftMetadata:      {},
 }
 
 // SeverityOf reports how a Kind is classified. A kind this build has never
@@ -244,6 +295,21 @@ type Options struct {
 	// all but name: the index is the one structure here that grows with
 	// object count rather than with pack, catalog or shard count.
 	SortBytes int
+	// GraftOpener opens a transport for one graft's SOURCE prefix, and is
+	// the reader's veto in the shape genfs.Options.GraftOpener already
+	// has: it is handed the URL the signature covers and may refuse it.
+	//
+	// THE OPENER IS THE GATE AND GraftDepth IS THE DIAL. With no opener,
+	// no third party is contacted whatever the depth says — which is why
+	// the zero-valued Options never leaves this volume's prefix, even
+	// though the zero GraftDepth is GraftHead.
+	GraftOpener func(ctx context.Context, source string) (pelicanobj.Store, error)
+	// GraftDepth is how much of a graft's source to check: GraftHead (the
+	// default) stats each source object, GraftNone touches none of them,
+	// GraftDeep re-reads and re-hashes every referenced external block.
+	// It does NOT govern the graft index, which is read on every run
+	// because grafted chunkrefs cannot resolve without it.
+	GraftDepth GraftDepth
 }
 
 // Problem is one finding. Path locates it: a namespace path for tree
@@ -277,6 +343,24 @@ type Report struct {
 	// Bytes is the logical size of the namespace: the sum of regular-file
 	// lengths, counted once per inode.
 	Bytes int64
+	// Grafts is how many graft roots the generation names, GraftBlocks
+	// how many external blocks their indexes hold, and GraftObjects how
+	// many source objects those indexes name. All three come from the
+	// index objects, which are read on every run.
+	Grafts, GraftBlocks, GraftObjects int
+	// GraftChunks is how many of Chunks resolved through a graft rather
+	// than through a pack — the part of this namespace whose bytes are
+	// somebody else's.
+	GraftChunks int
+	// GraftDepth is what this run actually did to the SOURCES, which is
+	// the difference between two claims a report would otherwise print
+	// the same way. GraftObjectsChecked counts objects stat'd by HEAD;
+	// GraftBlocksVerified and GraftBytesVerified count blocks re-read
+	// from the source and re-hashed.
+	GraftDepth          GraftDepth
+	GraftObjectsChecked int
+	GraftBlocksVerified int
+	GraftBytesVerified  int64
 	// Problems holds EVERY finding, errors first and then warnings, each
 	// group sorted by path then kind. Damage leads because that is what
 	// the reader of a long report is looking for.
@@ -314,12 +398,18 @@ func (r *Report) Damaged() bool { return r.Errors() > 0 }
 // and a compile error is how each one got asked.
 func (r *Report) Clean() bool { return len(r.Problems) == 0 }
 
-// packLoc locates one pack entry, from the identity index built out of the
-// generation's verified pack trailers.
+// packLoc locates one entry, from the identity index built out of the
+// generation's verified pack trailers AND its graft indexes. Location is
+// (container, offset, length) whichever layer holds it, so one struct
+// serves both; graft says which layer, and is -1 for a pack.
 type packLoc struct {
 	pack   string
 	off    int64
 	length int64
+	// graft indexes checker.grafts when the bytes are external, and
+	// objOrd names the source object within that graft (graftCheck.keyAt).
+	graft  int
+	objOrd uint32
 }
 
 // The identity index's record layout (internal/extsort). The pack is an
@@ -337,6 +427,24 @@ func putLoc(dst []byte, id [32]byte, pack int, off, length int64) {
 	binary.LittleEndian.PutUint32(dst[idLen:], uint32(pack))
 	binary.LittleEndian.PutUint64(dst[idLen+4:], uint64(off))
 	binary.LittleEndian.PutUint64(dst[idLen+12:], uint64(length))
+}
+
+// putGraftLoc writes an EXTERNAL location into the same record.
+//
+// It fits without growing the record, and the two places it borrows are
+// both provably spare. The ordinal field's top bit is free because a
+// generation cannot have two billion packs, and it marks the record as
+// graft-side. The length field's top 32 bits are free because a graft
+// block cannot reach 4 GiB — BlockPolicy.Validate refuses a ceiling over
+// 1 GiB, "because the ceiling is the minimum verified read, and a read
+// that large is a download" — so the object ordinal rides there, and a
+// grafted block's location is complete without a wider record or a
+// second table. Pack records keep the full 64-bit length they always had.
+func putGraftLoc(dst []byte, id [32]byte, graft int, obj uint32, off, length int64) {
+	copy(dst[0:idLen], id[:])
+	binary.LittleEndian.PutUint32(dst[idLen:], graftOrd|uint32(graft))
+	binary.LittleEndian.PutUint64(dst[idLen+4:], uint64(off))
+	binary.LittleEndian.PutUint64(dst[idLen+12:], uint64(obj)<<32|uint64(uint32(length)))
 }
 
 // errNotIndexed marks an identity that resolves in no listed pack, so the
@@ -371,6 +479,10 @@ type checker struct {
 	// Content addressing means one identity backs many files, and counting
 	// or fetching it twice would misreport the generation (seenChunk).
 	seen []uint64
+
+	// grafts is the generation's graft roots, in superblock order — the
+	// order an identity record's ordinal names.
+	grafts []*graftCheck
 
 	// verify carries deep mode's work to its pool, which runs FOR THE
 	// LENGTH OF THE WALK rather than after it. Nil when Deep is off.
@@ -429,6 +541,7 @@ func Check(ctx context.Context, o Options) (*Report, error) {
 		shards:   make(map[string]catalog.Reader),
 	}
 	defer c.closeShards()
+	defer c.closeGraftSources()
 
 	// FIRST, because it frames every finding below it. On a signed volume
 	// "the pack list says X" is a statement the volume's owner made; on an
@@ -440,11 +553,33 @@ func Check(ctx context.Context, o Options) (*Report, error) {
 		c.problem(KindUnsigned, "/", "this generation carries no signature; nothing below it is authenticated")
 	}
 
-	if err := c.checkPacks(ctx); err != nil {
+	// THE IDENTITY INDEX CARRIES BOTH LOCATION LAYERS, and it is built
+	// once, here, from the pack trailers and then from the graft indexes.
+	// A grafted chunkref is not a hole and not damage: it resolves in a
+	// graft the way a packed one resolves in a pack, and the cheapest
+	// place to make that true is the table both are already searched in.
+	sorter := extsort.New(c.spillDir, "index", idLen, locRecLen, c.o.SortBytes)
+	defer sorter.Close() //nolint:errcheck
+	if err := c.checkPacks(ctx, sorter); err != nil {
 		c.sortProblems()
 		return c.rep, err
 	}
+	if err := c.openGrafts(ctx, sorter); err != nil {
+		c.sortProblems()
+		return c.rep, err
+	}
+	index, err := sorter.Table()
+	if err != nil {
+		c.sortProblems()
+		return c.rep, fmt.Errorf("fsck: building the identity index: %w", err)
+	}
+	c.index = index
 	defer c.index.Close() //nolint:errcheck
+
+	// Before the walk, so that deep mode can skip the blocks of an object
+	// already known to be absent rather than making one failed request
+	// per block for a fact already reported once.
+	c.checkGraftSources(ctx)
 
 	root, rootHex, err := c.openRoot(ctx)
 	if err != nil {
@@ -456,6 +591,7 @@ func Check(ctx context.Context, o Options) (*Report, error) {
 	c.walk(ctx, root, rootHex)
 	c.releaseCatalog(root, rootHex)
 	c.stopVerifiers()
+	c.reportGraftUsage()
 
 	c.sortProblems()
 	if err := ctx.Err(); err != nil {
@@ -501,7 +637,7 @@ func (c *checker) sortProblems() {
 // sort that cannot spill or map. That one is fatal where a bad pack is
 // not: a half-built index would report intact files as missing, which is
 // the report that gets a healthy volume restored from backup.
-func (c *checker) checkPacks(ctx context.Context) error {
+func (c *checker) checkPacks(ctx context.Context, sorter *extsort.Sorter) error {
 	// The pack set comes from the manifest when the generation has one and
 	// from the inline list otherwise (manifest.Packs). An unreadable
 	// manifest is reported as one problem and leaves the index empty, so
@@ -510,19 +646,15 @@ func (c *checker) checkPacks(ctx context.Context) error {
 	// content cannot be found. It is not a fatal error, because fsck's
 	// contract is to report every failure rather than to stop at the
 	// first.
-	sorter := extsort.New(c.spillDir, "index", idLen, locRecLen, c.o.SortBytes)
-	defer sorter.Close() //nolint:errcheck
-
 	packs, err := manifest.Packs(ctx, c.o.Inner, c.o.SB)
 	if err != nil {
 		c.problem(KindMissingManifest, manifest.Dir, "%v", err)
 		// Not fatal, and the empty index is the point: everything
 		// downstream then surfaces as missing, which is the truth about a
-		// generation whose pack set cannot be read.
-		var terr error
-		if c.index, terr = sorter.Table(); terr != nil {
-			return fmt.Errorf("fsck: building the identity index: %w", terr)
-		}
+		// generation whose pack set cannot be read. The grafts are still
+		// indexed after this returns, so a graft-only generation whose
+		// manifest is unreadable still reports its grafted files as
+		// intact and its packed ones as missing.
 		return nil
 	}
 	for _, pe := range packs {
@@ -571,10 +703,6 @@ func (c *checker) checkPacks(ctx context.Context) error {
 	// packs naming the same bytes. All of them are kept: they may differ in
 	// STORED length if they were compressed differently, and a chunkref
 	// matching any one of them is intact (locate).
-	c.index, err = sorter.Table()
-	if err != nil {
-		return fmt.Errorf("fsck: building the identity index: %w", err)
-	}
 	return nil
 }
 
@@ -593,10 +721,32 @@ func (c *checker) locate(id [32]byte, wantLen int64) (packLoc, int, bool) {
 	if n == 0 {
 		return packLoc{}, 0, false
 	}
+	// A PACK WINS A TIE, and the tie is real: identity is the same BLAKE3
+	// function in both location layers, so an identity held by a pack and
+	// by a graft names the same bytes and either location serves a correct
+	// read. Preferring the pack costs nothing and is the better answer on
+	// every axis — it is this volume's own object, it needs no third
+	// party, and deep mode verifies it without leaving the prefix. It is
+	// also what makes a file that was written over a grafted one count as
+	// packed, which is what it is.
+	var (
+		ext  packLoc
+		have bool
+	)
 	for i := at; i < at+n; i++ {
-		if loc := c.decodeLoc(i); loc.length == wantLen {
+		loc := c.decodeLoc(i)
+		if loc.length != wantLen {
+			continue
+		}
+		if loc.graft < 0 {
 			return loc, at, true
 		}
+		if !have {
+			ext, have = loc, true
+		}
+	}
+	if have {
+		return ext, at, true
 	}
 	return c.decodeLoc(at), at, true
 }
@@ -604,10 +754,19 @@ func (c *checker) locate(id [32]byte, wantLen int64) (packLoc, int, bool) {
 func (c *checker) decodeLoc(i int) packLoc {
 	rec := c.index.At(i)
 	ord := binary.LittleEndian.Uint32(rec[idLen:])
+	raw := binary.LittleEndian.Uint64(rec[idLen+12:])
 	loc := packLoc{
-		off:    int64(binary.LittleEndian.Uint64(rec[idLen+4:])),
-		length: int64(binary.LittleEndian.Uint64(rec[idLen+12:])),
+		off:   int64(binary.LittleEndian.Uint64(rec[idLen+4:])),
+		graft: -1,
 	}
+	if ord&graftOrd != 0 {
+		// See putGraftLoc: an external record splits the length word.
+		loc.graft = int(ord &^ graftOrd)
+		loc.objOrd = uint32(raw >> 32)
+		loc.length = int64(uint32(raw))
+		return loc
+	}
+	loc.length = int64(raw)
 	if int(ord) < len(c.packNames) {
 		loc.pack = c.packNames[ord]
 	}

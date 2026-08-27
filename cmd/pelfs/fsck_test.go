@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"flag"
 	"strings"
 	"testing"
 
@@ -28,9 +29,10 @@ import (
 //     appears without the warnings that came with it.
 
 func warning(path string) fsck.Problem {
-	// Kind is a stand-in until the first real warning kind lands with the
-	// feature that produces it; the exit contract is driven by Severity.
-	return fsck.Problem{Kind: "stale-graft", Severity: fsck.SeverityWarning, Path: path, Detail: "source moved"}
+	// A source that moved on: the warning the axis was built for, and now
+	// a real kind rather than a stand-in.
+	return fsck.Problem{Kind: fsck.KindGraftSourceChanged, Severity: fsck.SeverityWarning,
+		Path: path, Detail: "source moved"}
 }
 
 func damage(path string) fsck.Problem {
@@ -115,10 +117,107 @@ func TestFsckReportLeadsEveryFindingWithItsSeverity(t *testing.T) {
 	if !strings.Contains(out, "  error: missing-chunk: /a: resolves in no listed pack\n") {
 		t.Errorf("damage line missing or reshaped:\n%s", out)
 	}
-	if !strings.Contains(out, "  warning: stale-graft: /ext/b: source moved\n") {
+	if !strings.Contains(out, "  warning: graft-source-changed: /ext/b: source moved\n") {
 		t.Errorf("warning line missing or reshaped:\n%s", out)
 	}
 	if !strings.Contains(out, "generation 7") || !strings.Contains(out, "3 packs") {
 		t.Errorf("the counts a script parses are gone:\n%s", out)
+	}
+}
+
+// TestGraftClaimSaysWhatWasActuallyDone — the report line for the graft
+// half of a check.
+//
+// The two depths differ by four orders of magnitude, and a report that
+// called both of them "checked" would invite a reader to believe the
+// expensive claim after paying for the cheap one. So each states exactly
+// what it did, and the cheap one states what it cannot see.
+func TestGraftClaimSaysWhatWasActuallyDone(t *testing.T) {
+	head := graftClaim(&fsck.Report{
+		GraftDepth: fsck.GraftHead, GraftObjectsChecked: 100000, GraftObjects: 100000,
+	})
+	if !strings.Contains(head, "100000 source objects") || !strings.Contains(head, "HEAD") {
+		t.Errorf("the cheap claim does not say what it counted: %q", head)
+	}
+	if !strings.Contains(head, "same-length edit is invisible") {
+		t.Errorf("the cheap claim does not say what it cannot see: %q", head)
+	}
+	if strings.Contains(head, "re-hashed") {
+		t.Errorf("the cheap claim borrows the expensive mode's word: %q", head)
+	}
+
+	deep := graftClaim(&fsck.Report{
+		GraftDepth: fsck.GraftDeep, GraftBlocksVerified: 10485760,
+		GraftBytesVerified: 10 << 40, GraftObjectsChecked: 100000,
+	})
+	if !strings.Contains(deep, "re-hashed") || !strings.Contains(deep, "10995116277760 bytes") {
+		t.Errorf("the deep claim does not say what it moved: %q", deep)
+	}
+
+	none := graftClaim(&fsck.Report{GraftDepth: fsck.GraftNone})
+	if !strings.Contains(none, "no source was contacted") {
+		t.Errorf("the none claim does not say it looked at nothing: %q", none)
+	}
+}
+
+// TestTheGraftReportLinesAppearOnlyForAGraftedVolume. A volume with no
+// grafts must print exactly what it printed before: this work is not a
+// reason for every other volume's report to grow two lines.
+func TestTheGraftReportLinesAppearOnlyForAGraftedVolume(t *testing.T) {
+	var plain, grafted bytes.Buffer
+	printFsckReport(&plain, 3, false, &fsck.Report{Packs: 2})
+	printFsckReport(&grafted, 3, false, &fsck.Report{
+		Packs: 2, Grafts: 1, GraftChunks: 4096, GraftObjects: 12,
+		GraftDepth: fsck.GraftHead, GraftObjectsChecked: 12,
+	})
+	if strings.Contains(plain.String(), "grafts:") || strings.Contains(plain.String(), "source:") {
+		t.Errorf("an ungrafted volume grew graft lines:\n%s", plain.String())
+	}
+	for _, want := range []string{"1 root", "4096 external chunks", "12 source objects", "source:"} {
+		if !strings.Contains(grafted.String(), want) {
+			t.Errorf("the grafted report does not contain %q:\n%s", want, grafted.String())
+		}
+	}
+}
+
+// TestDeepImpliesGraftDeepUnlessTold. `--deep` means the bytes, in
+// whichever layer holds them: a 95%-graft volume answering `--deep` with
+// "every chunk fetched and verified" while having read none of the bytes
+// anyone stores there would be a lie by omission. Saying --grafts wins,
+// because declining a 10 TB re-read over somebody else's network while
+// still verifying this volume's own packs is a reasonable thing to want.
+func TestDeepImpliesGraftDeepUnlessTold(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want fsck.GraftDepth
+	}{
+		{args: nil, want: fsck.GraftHead},
+		{args: []string{"--deep"}, want: fsck.GraftDeep},
+		{args: []string{"--deep", "--grafts=head"}, want: fsck.GraftHead},
+		{args: []string{"--deep", "--grafts=none"}, want: fsck.GraftNone},
+		{args: []string{"--grafts=deep"}, want: fsck.GraftDeep},
+	} {
+		fs := flag.NewFlagSet("fsck", flag.ContinueOnError)
+		deep := fs.Bool("deep", false, "")
+		grafts := fs.String("grafts", "head", "")
+		if err := fs.Parse(tc.args); err != nil {
+			t.Fatal(err)
+		}
+		depth, err := fsck.ParseGraftDepth(*grafts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if *deep && !flagWasSet(fs, "grafts") {
+			depth = fsck.GraftDeep
+		}
+		if depth != tc.want {
+			t.Errorf("%v gave graft depth %v, want %v", tc.args, depth, tc.want)
+		}
+	}
+}
+
+func TestParseGraftDepthRefusesNonsense(t *testing.T) {
+	if _, err := fsck.ParseGraftDepth("shallow"); err == nil {
+		t.Fatal("--grafts=shallow was accepted")
 	}
 }

@@ -2,6 +2,64 @@
 
 ## Unreleased
 
+**`pelfs import` copies another pelfs volume in, and the result depends on
+nobody.** `pelfs import <volume> <path> <source-prefix>` reads a foreign
+volume's published generation, carries every byte it needs out of that
+volume's packs and into this one's, renumbers its inodes into lineages this
+volume owns, rebuilds the catalogs and signs the lot under this volume's key.
+Afterwards nothing under `<path>` resolves anywhere else: `pelfs gc` on the
+source cannot take it away, `pelfs fsck` here is conclusive about it, and
+`pelfs rescue` can rebuild it from our packs alone. It is the opposite bargain
+from `pelfs graft`, which stores none of the bytes and depends on the source
+forever, and it buys fidelity with it — modes, owners, times, xattrs, symlinks
+and **hardlinks** all survive, where a graft publishes 0444/0555 and no links
+at all.
+
+The bytes are copied **stored** — already compressed, already encrypted —
+which is repack's own property and means an import needs no data key and
+cannot change what a chunk resolves to. It refuses rather than guesses at the
+three boundaries where it could be wrong: a source that serves grafts (those
+bytes were never in a pack), a source in a different encryption domain (which
+would be a real repack, and the message says so), and any chunk identity the
+source's own packs turn out not to hold (a signed generation with a dangling
+chunkref is worse than a failed import). The collision matrix at the
+destination path is `pelfs graft`'s: an empty directory is adopted, a
+populated one or a file needs `--replace` and is announced with a count, a
+non-directory on the way is named, and the volume root is refused with what to
+do instead.
+
+**Interruption-safe, and resumable.** Nothing an import writes is referenced
+until the ref flips, so a killed run leaves the branch exactly where it was
+and a heap of objects the next `pelfs gc` collects — pinned by a test that
+kills the store mid-copy and reads the branch back through a cold cache. A
+checkpoint records each uploaded pack *after* it lands and the source packs it
+consumed *after that*, so a resume verifies every recorded pack against its
+trailer hash and re-copies whatever is gone. The lease is taken after the
+copy, not before it: the copy touches nothing of this volume, and holding the
+branch for the hours it takes would stop a mount checkpointing for no reason.
+
+**Inode lineages now come from one allocator.** `superblock.ImportEntry`
+records an import's provenance — source volume, generation, wire hash, signing
+key — and its inode renumbering, and `pickLineage` reads the claim so a later
+`pelfs branch` can never draw a lineage an imported tree is already using. The
+claim is permanent and the list is never trimmed: the numbers are in tags and
+retired generations too. `internal/inodemap` is the renumbering itself, one
+destination lineage per source lineage with the allocation counter carried
+through, which makes injectivity, signed-64-bit safety and within-lineage
+contiguity properties of the scheme rather than things to check; an inode in a
+lineage the map does not declare is refused, never folded into a default,
+because a quiet alias is unrecoverable where a loud refusal is not.
+
+**This is most of the tool `docs/known-issues.md` KL-7 has been waiting for,
+and not all of it.** KL-7 is two branches cut before lineages existed, both
+allocating from lineage 0, which `pelfs merge` diagnoses and cannot fix
+because nothing renumbers an inode space. `inodemap.NewAbove` is the
+conditional form that case needs — the inodes allocated *before* the fork mean
+the same file on both sides and must not move, so only what each side
+allocated for itself is renumbered — and it is tested. What is still missing
+is a `pelfs renumber` verb to apply it, and, for a v0.1.0 branch with no fork
+record, somewhere for the cut to come from. KL-7 says so.
+
 **Less to read on both web surfaces.** The upload notice is one sentence
 ("File uploaded to local machine; click "Publish now" to push it to the
 federation"). The publish control is one button wearing its own state —

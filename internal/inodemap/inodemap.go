@@ -101,6 +101,21 @@ var ErrUndeclaredLineage = errors.New("inodemap: source inode is in a lineage th
 // signed superblock and a table nothing could carry.
 type Map struct {
 	to map[uint32]uint32
+	// cut is the CONDITIONAL form: inodes strictly below it are left
+	// alone, and only the ones at or above it are renumbered. Zero
+	// renumbers everything, which is what an import wants.
+	//
+	// It exists for the OTHER caller this package was built for. Two
+	// branches cut before lineages existed both allocate from lineage 0
+	// (docs/known-issues.md KL-7), and renumbering one of them wholesale
+	// would be wrong in a way that is easy to miss: the inodes they
+	// allocated BEFORE the fork mean the same file on both sides, and
+	// that equality is the whole reason a three-way merge can pair them
+	// up. Move those and the merge sees every pre-fork file as new on one
+	// side, which is a replacement wearing a merge's clothes. Only the
+	// numbers each side allocated FOR ITSELF may move, and the cut is
+	// where that begins.
+	cut uint64
 }
 
 // New builds a map from source-lineage to destination-lineage pairs and
@@ -116,6 +131,28 @@ func New(pairs map[uint32]uint32) (*Map, error) {
 	}
 	return m, nil
 }
+
+// NewAbove is New for the CONDITIONAL renumbering: inodes strictly below
+// cut keep their numbers and everything at or above it is renumbered.
+//
+// It stays injective, and the argument is short: a pass-through inode
+// keeps its source lineage, a renumbered one lands in a DRAWN lineage,
+// and a drawn lineage is by construction one this volume does not
+// already use — so the two images cannot meet. Above the cut the
+// ordinary argument applies unchanged.
+//
+// cut == 0 is New.
+func NewAbove(pairs map[uint32]uint32, cut uint64) (*Map, error) {
+	m, err := New(pairs)
+	if err != nil {
+		return nil, err
+	}
+	m.cut = cut
+	return m, nil
+}
+
+// Cut is the threshold below which inodes are left alone, 0 when none.
+func (m *Map) Cut() uint64 { return m.cut }
 
 // Check refuses a map that is not a bijection onto lineages that fit, and
 // names which pair is at fault.
@@ -153,6 +190,11 @@ func (m *Map) Check() error {
 // does not declare rather than passing it through or folding it into a
 // default, for the reason the package comment gives.
 func (m *Map) Remap(ino uint64) (uint64, error) {
+	if m.cut != 0 && ino < m.cut {
+		// Below the cut: this number means the same file on both sides
+		// and must not move. See Map.cut.
+		return ino, nil
+	}
 	from := superblock.LineageOf(ino)
 	to, ok := m.to[from]
 	if !ok {
@@ -339,6 +381,9 @@ func DrawFor(sources []uint32, taken func(uint32) bool) (*Map, error) {
 // It is well defined precisely because Remap is injective, which Check
 // guarantees before a map exists.
 func (m *Map) Unmap(ino uint64) (uint64, error) {
+	if m.cut != 0 && ino < m.cut {
+		return ino, nil
+	}
 	to := superblock.LineageOf(ino)
 	for from, cand := range m.to {
 		if cand == to {
@@ -359,6 +404,9 @@ func (m *Map) Unmap(ino uint64) (uint64, error) {
 // spaces are disjoint by construction and the test cannot be fooled by a
 // tree that grew.
 func (m *Map) Holds(ino uint64) bool {
+	if m.cut != 0 && ino < m.cut {
+		return false
+	}
 	to := superblock.LineageOf(ino)
 	for _, cand := range m.to {
 		if cand == to {

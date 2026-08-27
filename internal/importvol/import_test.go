@@ -3,6 +3,7 @@ package importvol_test
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"io"
@@ -15,8 +16,10 @@ import (
 
 	"github.com/bbockelm/pelfs/internal/genfs"
 	"github.com/bbockelm/pelfs/internal/importvol"
+	"github.com/bbockelm/pelfs/internal/inodemap"
 	"github.com/bbockelm/pelfs/internal/pelicanobj"
 	"github.com/bbockelm/pelfs/internal/publish"
+	"github.com/bbockelm/pelfs/internal/refs"
 	"github.com/bbockelm/pelfs/internal/superblock"
 	"github.com/bbockelm/pelfs/internal/testvol"
 )
@@ -804,4 +807,77 @@ func TestAPlaintextImportTranslatesNoKeyIDs(t *testing.T) {
 	}
 }
 
-var _ = newKey
+// TestAnInodeInAnUndeclaredLineageIsRefusedAtTheSplice is the guard where
+// it actually has to hold. The unit test in internal/inodemap proves the
+// map refuses; this proves the refusal reaches the seal instead of being
+// swallowed somewhere between them.
+//
+// The case it stands for is a source that GAINED a lineage between the
+// scan and the copy — a merge landing on the source branch while the
+// hours of copying ran. Passing such an inode through untranslated would
+// alias it onto a number this volume may already have handed out, in a
+// generation that signs and mounts.
+func TestAnInodeInAnUndeclaredLineageIsRefusedAtTheSplice(t *testing.T) {
+	b := newBed(t)
+	populate(t, b.src)
+	b.src.Publish(publish.Options{})
+	srcFS := coldOpen(t, b.srcObj, b.src.Superblock())
+	base := coldOpen(t, b.dstObj, b.dst.Superblock())
+
+	// A map that declares a lineage the tree does not contain, and does
+	// not declare the one it does.
+	blind, err := inodemap.New(map[uint32]uint32{424242: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = publish.NewImportSpliceSource(context.Background(), publish.ImportSpliceOptions{
+		Base: base, Prev: b.dst.Superblock(), Src: srcFS, Map: blind, Mount: "/imported",
+	})
+	if !errors.Is(err, inodemap.ErrUndeclaredLineage) {
+		t.Fatalf("got %v, want %v", err, inodemap.ErrUndeclaredLineage)
+	}
+	t.Logf("refused: %v", err)
+
+	// And the branch is untouched, because nothing was published.
+	head := headOf(t, b.dstObj, "main")
+	if head.Superblock.Generation != b.dst.Superblock().Generation {
+		t.Fatal("a refused splice moved the branch")
+	}
+}
+
+// TestTheSourceSignatureIsCheckedBeforeAnythingIsRead pins that an import
+// reads the source THROUGH the ref store, which verifies, rather than
+// around it. The check is what "we imported what they published" rests
+// on, and after the import their signature has nothing left to sign in
+// our document.
+func TestTheSourceSignatureIsCheckedBeforeAnythingIsRead(t *testing.T) {
+	b := newBed(t)
+	populate(t, b.src)
+	b.src.Publish(publish.Options{})
+
+	// A ref store pinned to the WRONG key: what a reader gets when
+	// somebody else's volume is served under a source's name.
+	rs, err := refs.New(b.srcObj, t.TempDir(), newKey(t).Public().(ed25519.PublicKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rs.Fetch(context.Background(), "main"); err == nil {
+		t.Fatal("a source signed by another key was accepted")
+	} else {
+		t.Logf("refused: %v", err)
+	}
+	// The right key verifies, and is what the import proceeds from.
+	right, err := refs.New(b.srcObj, t.TempDir(),
+		ed25519.PublicKey(b.src.Superblock().SigningPub[:]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := right.Fetch(context.Background(), "main")
+	if err != nil {
+		t.Fatalf("the source's own key did not verify it: %v", err)
+	}
+	if f.Superblock.Generation != b.src.Superblock().Generation {
+		t.Fatalf("fetched generation %d, want %d", f.Superblock.Generation,
+			b.src.Superblock().Generation)
+	}
+}

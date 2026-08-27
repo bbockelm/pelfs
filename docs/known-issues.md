@@ -398,17 +398,46 @@ The merge does not guess: `findCollisions` (`internal/merge/merge.go`)
 reports every colliding inode and `Plan.FirstFreeInode` names the number one
 side must be shifted above, and `Apply` refuses any plan with collisions
 (`cmd/pelfs/merge.go:309-337` prints it). **Nothing in the tool performs the
-shift** — `grep -rn renumber` finds only messages and comments — so for a
-pair of v0.1.0 branches this is a diagnosis and not yet a path. Not fixed
-here because renumbering an inode space is a rewrite of every catalog on one
-side, which is a repack-class operation and a separate design.
+shift.**
+
+**Partly addressed by `pelfs import`, and it is worth being exact about
+which part.** `internal/inodemap` is now the renumbering this issue has
+been missing, and it arrived from the other direction — an import has to
+renumber a foreign volume's inodes into lineages this one owns, which is
+the same operation. What it gives KL-7:
+
+- **The map, including the form this case specifically needs.**
+  `inodemap.NewAbove(pairs, cut)` renumbers only inodes at or above a cut
+  and leaves the rest alone, which is the whole difficulty here: the
+  numbers allocated BEFORE the fork mean the same file on both sides, and
+  a three-way merge pairs them up by exactly that equality, so a
+  wholesale remap would make every pre-fork file look new on one side.
+  `TestAWholesaleRemapWouldMoveTheInodesTwoBranchesSHARE` shows both
+  halves.
+- **A lineage nobody else holds.** `inodemap.Draw` through
+  `cmd/pelfs/branch.go takenLineages`, which now unions every branch,
+  every tag and every recorded import (`superblock.TakenLineages`).
+- **A permanent record of the claim**, so the renumbered lineage can
+  never be drawn again (`superblock.ImportEntry`).
+- **Proof it survives a real tree**: `pelfs import` renumbers a whole
+  published volume into another, hardlinks, inode shards, symlinks and
+  xattrs included, verified through a mount in `make mount-gate`.
+
+**What is still missing, and it is the reason this issue stays open:** a
+verb. There is no `pelfs renumber`, and for a v0.1.0 branch — the only
+kind this issue is about — there is also nowhere for the cut to come
+from, because such a branch records no `Fork.BaseNextInode`. Both are
+specified in `docs/TODO.md` under "import-agent", including why pointing
+`pelfs import` at the other branch is NOT the fix (it copies every byte
+again and renumbers the shared pre-fork inodes as well).
 
 **Pinned by an executable test: YES**, for the refusal and its inverse:
 `TestInodesAllocatedOnBothSidesCollide`,
 `TestAForkedLineageHasNoInodeCollisions` and
 `TestInheritedInodesFromAThirdLineageAreNotCollisions` in
-`internal/merge/`. The renumbering that does not exist is, of course,
-pinned by nothing.
+`internal/merge/`; and now for the renumbering itself, in
+`internal/inodemap/` and `internal/importvol/`. The VERB that would join
+them is, of course, pinned by nothing.
 
 ### KL-8. On a passed /dev/fuse descriptor, pelfs checks permissions and reaches two places the kernel would have
 

@@ -37,9 +37,16 @@ cleanup() {
   if mount | grep -q " $WORK/nfsmnt "; then
     umount "$WORK/nfsmnt" 2>/dev/null || umount -l "$WORK/nfsmnt" 2>/dev/null || true
   fi
+  # The import leg mounts a SECOND volume at its own mountpoint; a leaked
+  # mount here hangs the rm -rf below exactly as a leaked NFS one does.
+  if mountpoint -q "$WORK/imnt" 2>/dev/null || mount | grep -q " $WORK/imnt "; then
+    fusermount3 -u "$WORK/imnt" 2>/dev/null || fusermount -u "$WORK/imnt" 2>/dev/null || \
+      umount "$WORK/imnt" 2>/dev/null || true
+  fi
   [ -n "${ORIGIN_PID:-}" ] && kill "$ORIGIN_PID" 2>/dev/null || true
   [ -n "${MOUNT_PID:-}" ] && kill "$MOUNT_PID" 2>/dev/null || true
   [ -n "${NFS_PID:-}" ] && kill "$NFS_PID" 2>/dev/null || true
+  [ -n "${MOUNT2_PID:-}" ] && kill "$MOUNT2_PID" 2>/dev/null || true
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -412,6 +419,102 @@ if touch "$WORK/mnt/should-fail" 2>/dev/null; then
   exit 1
 fi
 echo "read-only enforced"
+
+# ---------------------------------------------------------------------------
+# `pelfs import`: copy this volume into a SECOND one and check the copy is
+# the original, through a real mount.
+#
+# It runs HERE, while the source volume's head is still exactly the tree
+# in $WORK/src, so `diff -r` can compare the imported tree against the
+# files on disk rather than against a moving target. Everything after this
+# point modifies the source volume.
+#
+# Two imports, not one, and the second is the interesting one: it splices
+# into a volume that already has content (the first import's tree), which
+# is what exercises the carry-forward half, and it draws a SECOND inode
+# lineage that must not collide with the first.
+# ---------------------------------------------------------------------------
+echo "== import: copying this volume into a second one =="
+PREFIX2="http://127.0.0.1:18999/vol2"
+mkdir -p "$WORK/imnt"
+"$WORK/pelfs" init --state-dir "$WORK/state-import" "$PREFIX2"
+
+"$WORK/pelfs" import --state-dir "$WORK/state-import" --no-lease \
+  "$PREFIX2" /theirs "$PREFIX" 2>&1 | tee "$WORK/import1.log"
+grep -q "renumbering: source lineage" "$WORK/import1.log" || {
+  echo "the import did not report a renumbering" >&2; exit 1; }
+grep -q "resolves to $PREFIX" "$WORK/import1.log" || {
+  echo "the import did not say the volume stopped depending on the source" >&2; exit 1; }
+
+echo "== import: a second one, into a volume that now has content =="
+"$WORK/pelfs" import --state-dir "$WORK/state-import" --no-lease \
+  "$PREFIX2" /again "$PREFIX" 2>&1 | tee "$WORK/import2.log"
+
+echo "== import: mounting the result COLD =="
+"$WORK/pelfs" mount-gen --state-dir "$WORK/state-import-cold" "$PREFIX2" "$WORK/imnt" &
+MOUNT2_PID=$!
+for _ in $(seq 200); do
+  [ -e "$WORK/imnt/theirs/dir/small.txt" ] && break
+  sleep 0.1
+done
+[ -e "$WORK/imnt/theirs/dir/small.txt" ] || { echo "the imported mount did not come up" >&2; exit 1; }
+
+echo "== import: diffing the imported trees against the source files =="
+diff -r --no-dereference "$WORK/src" "$WORK/imnt/theirs"
+diff -r --no-dereference "$WORK/src" "$WORK/imnt/again"
+echo "both imported trees match the source byte for byte"
+
+# The fidelity a graft cannot give: symlinks and hardlinks survive.
+[ -L "$WORK/imnt/theirs/dir/link" ] || { echo "the imported symlink lost its type" >&2; exit 1; }
+ilinks=$(stat -c %h "$WORK/imnt/theirs/dir/big.bin")
+[ "$ilinks" -ge 2 ] || { echo "the imported hardlink count is $ilinks, want >= 2" >&2; exit 1; }
+a=$(stat -c %i "$WORK/imnt/theirs/dir/big.bin")
+b=$(stat -c %i "$WORK/imnt/theirs/dir/hard.bin")
+[ "$a" = "$b" ] || { echo "the imported hardlink pair is inodes $a and $b" >&2; exit 1; }
+echo "imported symlink + hardlink metadata preserved (both links are inode $a)"
+
+# The renumbering: the two imports of ONE source tree must not share a
+# single inode number, or the second draw collided with the first.
+c=$(stat -c %i "$WORK/imnt/again/dir/big.bin")
+[ "$a" != "$c" ] || { echo "both imports gave dir/big.bin inode $a" >&2; exit 1; }
+mine=$(stat -c %i "$WORK/imnt")
+[ "$a" != "$mine" ] && [ "$c" != "$mine" ] || { echo "an import took the volume root's inode" >&2; exit 1; }
+echo "the two imports are disjoint inode spaces (big.bin is $a in one and $c in the other)"
+
+"$WORK/pelfs" import --list --state-dir "$WORK/state-import" "$PREFIX2" 2>&1 | tee "$WORK/import-list.log"
+[ "$(grep -c '^' "$WORK/import-list.log")" -ge 2 ] || {
+  echo "--list did not report both imports" >&2; exit 1; }
+
+echo "== import: fsck the result =="
+"$WORK/pelfs" fsck --deep --state-dir "$WORK/state-import" "$PREFIX2"
+echo "fsck is clean on the imported volume"
+
+echo "== import: sealing a generation on top of an imported tree =="
+unmount_at "$WORK/imnt"
+wait "$MOUNT2_PID" 2>/dev/null || true
+"$WORK/pelfs" mount-gen --rw --no-lease --state-dir "$WORK/state-import" "$PREFIX2" "$WORK/imnt" &
+MOUNT2_PID=$!
+for _ in $(seq 200); do [ -e "$WORK/imnt/theirs/dir/small.txt" ] && break; sleep 0.1; done
+echo "written after the import" > "$WORK/imnt/theirs/dir/added.txt"
+rm "$WORK/imnt/again/dir/small.txt"
+unmount_at "$WORK/imnt"
+wait "$MOUNT2_PID" 2>/dev/null || true
+
+echo "== import: cold remount of the generation sealed on top =="
+"$WORK/pelfs" mount-gen --state-dir "$WORK/state-import-cold2" "$PREFIX2" "$WORK/imnt" &
+MOUNT2_PID=$!
+for _ in $(seq 200); do [ -e "$WORK/imnt/theirs/dir/added.txt" ] && break; sleep 0.1; done
+grep -q "written after the import" "$WORK/imnt/theirs/dir/added.txt" || {
+  echo "the file written over the imported tree did not survive the seal" >&2; exit 1; }
+[ ! -e "$WORK/imnt/again/dir/small.txt" ] || {
+  echo "a file deleted from the imported tree came back" >&2; exit 1; }
+cmp "$WORK/src/dir/big.bin" "$WORK/imnt/theirs/dir/big.bin"
+cmp "$WORK/src/dir/big.bin" "$WORK/imnt/again/dir/big.bin"
+"$WORK/pelfs" fsck --deep --state-dir "$WORK/state-import" "$PREFIX2"
+unmount_at "$WORK/imnt"
+wait "$MOUNT2_PID" 2>/dev/null || true
+echo "== import: PASS — copied, renumbered, mounted cold, written over, sealed and fsck'd =="
+
 
 echo "== read-write round trip: mount --rw, modify, seal, verify =="
 unmount_at "$WORK/mnt"

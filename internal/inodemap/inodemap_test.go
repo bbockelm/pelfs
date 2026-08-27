@@ -270,3 +270,92 @@ func TestAnEmptyMapIsRefused(t *testing.T) {
 		t.Fatal("an empty map was accepted")
 	}
 }
+
+// ---- the conditional form, which is what docs/known-issues.md KL-7 needs ----
+
+// TestAWholesaleRemapWouldMoveTheInodesTwoBranchesSHARE is the reason the
+// conditional form exists, shown before the fix rather than asserted
+// after it. Two branches cut before lineages existed both allocate from
+// lineage 0; the numbers they allocated BEFORE the fork mean the same
+// file on both sides, and a merge pairs them up by exactly that equality.
+func TestAWholesaleRemapWouldMoveTheInodesTwoBranchesSHARE(t *testing.T) {
+	const forkAt = 100 // every inode below this predates the fork
+	shared := []uint64{2, 3, 57}
+	blanket, err := New(map[uint32]uint32{0: 4242})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ino := range shared {
+		got, err := blanket.Remap(ino)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got == ino {
+			t.Fatalf("a wholesale map left shared inode %d alone", ino)
+		}
+	}
+	t.Logf("EVIDENCE: a wholesale map moves shared inode %d to %d — after which a merge sees "+
+		"every pre-fork file as new on that side, which is a replacement wearing a merge's clothes",
+		shared[0], mustRemap(t, blanket, shared[0]))
+
+	cut, err := NewAbove(map[uint32]uint32{0: 4242}, forkAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ino := range shared {
+		got, err := cut.Remap(ino)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != ino {
+			t.Fatalf("the conditional map moved shared inode %d to %d", ino, got)
+		}
+		if cut.Holds(ino) {
+			t.Fatalf("the conditional map claims shared inode %d", ino)
+		}
+	}
+	// And everything the branch allocated for ITSELF does move, into a
+	// lineage the other side has never allocated from.
+	own := []uint64{forkAt, forkAt + 1, forkAt + 900}
+	seen := map[uint64]bool{}
+	for _, ino := range own {
+		got, err := cut.Remap(ino)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got == ino {
+			t.Fatalf("the conditional map left post-fork inode %d alone", ino)
+		}
+		if superblock.LineageOf(got) != 4242 {
+			t.Fatalf("post-fork inode %d landed in lineage %d", ino, superblock.LineageOf(got))
+		}
+		if seen[got] {
+			t.Fatalf("post-fork inode %d collided on %d", ino, got)
+		}
+		seen[got] = true
+		if back, err := cut.Unmap(got); err != nil || back != ino {
+			t.Fatalf("Unmap(Remap(%d)) = %d, %v", ino, back, err)
+		}
+	}
+	// The two images cannot meet: a pass-through keeps lineage 0 and a
+	// renumbered one is in a drawn lineage.
+	for _, ino := range shared {
+		for got := range seen {
+			if ino == got {
+				t.Fatalf("shared inode %d collides with a renumbered inode", ino)
+			}
+		}
+	}
+	t.Logf("EVIDENCE: with a cut at %d, %d shared inodes keep their numbers and %d post-fork "+
+		"inodes move into lineage 4242, and the two sets are disjoint",
+		forkAt, len(shared), len(own))
+}
+
+func mustRemap(t *testing.T, m *Map, ino uint64) uint64 {
+	t.Helper()
+	got, err := m.Remap(ino)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got
+}

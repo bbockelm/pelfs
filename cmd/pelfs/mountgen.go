@@ -153,6 +153,24 @@ type genSession struct {
 	sb      *superblock.Superblock
 	prevRaw []byte
 
+	// branchMu guards branch, which was immutable until `pelfs browse`
+	// grew a branch picker (cmd/pelfs/browsebranch.go). It is its own
+	// mutex and not g.mu because the readers that are NOT on the seal path
+	// — the control socket's status, the page's state sample — must keep
+	// answering while a seal or a switch holds g.mu for minutes.
+	//
+	// The switch writes it holding BOTH: g.mu, so no seal can be running,
+	// and this one, so an unlocked reader sees one branch or the other and
+	// never a torn string.
+	branchMu sync.RWMutex
+
+	// leaseFor takes the advisory lease on ANOTHER branch of this volume,
+	// with the same options this session's own lease was taken with. Set
+	// by acquireLease and therefore nil in a session that holds no lease
+	// (read-only, or --no-lease), which is exactly the set of sessions
+	// that need no lease to switch branches.
+	leaseFor func(ctx context.Context, branch string) (*lease.Lease, error)
+
 	// ovMu guards overlay LIVENESS only, never a seal in progress: the
 	// statistics sampler must keep answering while a checkpoint runs, and
 	// overlay.FS serializes its own operations anyway.
@@ -721,6 +739,13 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		// deliberately, because packs are immutable and content-addressed —
 		// remounting a volume must not re-fetch what the last mount already
 		// pulled down.
+		//
+		// GraftOpener is the reader's veto over the external sources this
+		// generation names (graft.go, genfs/graft.go). Supplying one is
+		// what makes a grafted volume mountable at all; supplying nil
+		// would refuse every graft, which is the right default for a
+		// caller that has not thought about it.
+		GraftOpener: graftOpener(o),
 	})
 	if err != nil {
 		return fail(err)
@@ -1083,6 +1108,25 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 // hide a live holder or resurrect a dead one. It never goes through the
 // statistics wrapper's sibling encryption layers either — a client with
 // the wrong volume key must still see that the branch is busy.
+// currentBranch is the branch this session is on RIGHT NOW, which stopped
+// being a constant when `pelfs browse` grew a branch picker. Every reader
+// outside the seal lock must go through here.
+func (g *genSession) currentBranch() string {
+	g.branchMu.RLock()
+	defer g.branchMu.RUnlock()
+	return g.branch
+}
+
+// setBranch moves the session onto another branch. The caller holds g.mu —
+// which is what makes this safe rather than merely atomic: the branch and
+// the generation it names have to move together, and g.mu is what no seal
+// can be running across.
+func (g *genSession) setBranch(name string) {
+	g.branchMu.Lock()
+	g.branch = name
+	g.branchMu.Unlock()
+}
+
 func (g *genSession) acquireLease(ctx context.Context, o *cmdOpts, prefix string) (*lease.Lease, error) {
 	metaStore, err := pelicanobj.New(ctx, pelicanobj.Config{
 		PrefixURL:    prefix,
@@ -1094,33 +1138,49 @@ func (g *genSession) acquireLease(ctx context.Context, o *cmdOpts, prefix string
 	if err != nil {
 		return nil, err
 	}
-	l, err := lease.Acquire(ctx, lease.Options{
-		Store:             metaStore,
-		Session:           g.sessionID,
-		Branch:            g.branch,
-		Steal:             o.stealLease,
-		IgnoreVolumeLease: o.ignoreVolumeLease,
-		OnConflict: func(holder *lease.Info) {
-			g.stats.Update(func(sum *stats.Summary) { sum.LeaseConflictObserved = true })
-			// STOP CHECKPOINTING. Every seal from here on is refused by
-			// fenceSeal, and a periodic checkpointer that keeps ticking
-			// would freeze the overlay, walk the dirty set and upload packs
-			// on its interval, forever, to be told each time what it was
-			// told the first time. The work is not lost by stopping — it
-			// stays in the overlay, which is where a refused seal leaves it
-			// anyway.
-			g.haltCheckpointer()
-			// "this branch", not "this prefix": another writer on another
-			// branch is now ordinary, and only a writer on OURS is the
-			// emergency this warning is for.
-			ui.Warn("another client took over branch {branch}: {holder}\n"+
-				"concurrent writers on one branch WILL corrupt each other; stop one of them.\n"+
-				"this session keeps serving but will no longer PUBLISH: checkpointing is stopped and\n"+
-				"the seal at unmount will be REFUSED, keeping this session's work in its overlay.\n"+
-				"remount to take a fresh lease and reseal on top of whatever that client published.",
-				"branch", g.branch, "holder", holder.Describe())
-		},
-	})
+	// take is the acquisition with the branch as a PARAMETER, so the same
+	// options can be used again for another branch: `pelfs browse`'s
+	// picker moves a writable session between branches, and the lease is
+	// per branch (internal/lease), so it has to move with it. Recorded on
+	// the session as leaseFor rather than rebuilt there, because the
+	// options include the store, the steal flag and the conflict handler,
+	// and a second opinion about any of them would be a second lease
+	// policy.
+	take := func(ctx context.Context, branch string) (*lease.Lease, error) {
+		return lease.Acquire(ctx, lease.Options{
+			Store:             metaStore,
+			Session:           g.sessionID,
+			Branch:            branch,
+			Steal:             o.stealLease,
+			IgnoreVolumeLease: o.ignoreVolumeLease,
+			OnConflict: func(holder *lease.Info) {
+				g.stats.Update(func(sum *stats.Summary) { sum.LeaseConflictObserved = true })
+				// STOP CHECKPOINTING. Every seal from here on is refused by
+				// fenceSeal, and a periodic checkpointer that keeps ticking
+				// would freeze the overlay, walk the dirty set and upload
+				// packs on its interval, forever, to be told each time what
+				// it was told the first time. The work is not lost by
+				// stopping — it stays in the overlay, which is where a
+				// refused seal leaves it anyway.
+				g.haltCheckpointer()
+				// "this branch", not "this prefix": another writer on
+				// another branch is now ordinary, and only a writer on
+				// OURS is the emergency this warning is for. It is the
+				// branch this lease was taken for, not the session's
+				// current one, because a browse session can move between
+				// them and a warning naming the wrong one is worse than no
+				// warning.
+				ui.Warn("another client took over branch {branch}: {holder}\n"+
+					"concurrent writers on one branch WILL corrupt each other; stop one of them.\n"+
+					"this session keeps serving but will no longer PUBLISH: checkpointing is stopped and\n"+
+					"the seal at unmount will be REFUSED, keeping this session's work in its overlay.\n"+
+					"remount to take a fresh lease and reseal on top of whatever that client published.",
+					"branch", branch, "holder", holder.Describe())
+			},
+		})
+	}
+	g.leaseFor = take
+	l, err := take(ctx, g.currentBranch())
 	if err != nil {
 		return nil, err
 	}
@@ -1239,64 +1299,189 @@ func (g *genSession) releaseLease() {
 	g.down.mark("lease release")
 }
 
-// runPrefetch honors the shared --prefetch flag's three modes.
+// runPrefetch honors the shared --prefetch flag's modes.
 //
-// What a prefetch moves is PACKS, not decoded chunks (genfs/prefetch.go):
-// a pack is the unit of transfer and everything a read needs comes out of
-// one, so "the data is local" and "the packs are local" are the same
-// statement, and the second costs no decode.
+// What a prefetch moves is PACKS — a pack is the unit of transfer and
+// everything a read needs comes out of one, so "the data is local" and
+// "the packs are local" are the same statement (genfs/prefetch.go) — plus,
+// on a grafted volume, the GRAFTED BLOCKS, which are not in any pack and
+// have a local tier of their own (genfs/graftcache.go).
+//
+// # Prefetching a graft is not materializing it
+//
+// The two were conflated once, and the difference decides what this
+// function is allowed to do:
+//
+//	MATERIALIZE writes grafted bytes into PUBLISHED packs — the write
+//	lease, a new generation, and the file is not grafted any more. It
+//	changes the volume, so it is `pelfs graft --materialize`, not
+//	something a mount does on the way up.
+//
+//	PREFETCH puts the bytes in the LOCAL CACHE. No lease, no publish, no
+//	generation, nothing ungrafted. The volume is untouched and the file is
+//	still grafted; this machine simply already has the bytes, verified
+//	against the identity the signed catalog names.
+//
+// So `--prefetch all` fetches grafted blocks, because that is exactly what
+// the person who typed it asked for. What it does NOT do is pretend the
+// dependency is gone: the volume still names the source, another reader
+// still fetches from it, and `pelfs graft --list` still says so.
+//
+// # The three modes
+//
+//	all      Make everything local: every pack, and every grafted block.
+//	         Refuse to mount if anything could not be made local — or if
+//	         it does not FIT, which is the honest refusal and carries both
+//	         numbers.
+//	packs    Packs only. Grafted bytes stay remote and are WARNED about,
+//	         by graft and by source. The mount comes up. This is the mode
+//	         for a cache too small for the graft.
+//	background   `all`, asynchronously and at half the transfer pool, with
+//	         every refusal downgraded to a warning.
 func (g *genSession) runPrefetch(ctx context.Context, mode string) error {
-	record := func(rep *genfs.PrefetchReport, complete bool) {
+	record := func(rep *genfs.PrefetchReport) {
 		g.stats.Update(func(sum *stats.Summary) {
 			sum.PrefetchPacks = int64(rep.Packs + rep.Cached)
 			sum.PrefetchBytes = rep.Bytes
 			sum.PrefetchFetchedBytes = rep.Fetched
 			sum.PrefetchFailed = int64(rep.Failed)
-			sum.PrefetchComplete = complete
+			sum.PrefetchGraftedChunks = int64(rep.Grafted)
+			sum.PrefetchGraftedBytes = rep.GraftedBytes
+			sum.PrefetchGraftLocalBytes = rep.GraftLocalBytes
+			// FullyLocal, never `Failed == 0`: a report with grafted bytes
+			// still at their source is not a local volume, and this field
+			// is what a batch system reads to decide whether it is.
+			sum.PrefetchComplete = rep.FullyLocal()
 		})
 		_ = g.stats.Flush()
 	}
+	// warnRemoteGrafts is the sentence a packs-only prefetch owes the
+	// user. It names the graft and its source, because "some bytes are
+	// remote" is not actionable and "reads under /sw still fetch from X"
+	// is.
+	warnRemoteGrafts := func(rep *genfs.PrefetchReport) {
+		for _, gr := range rep.GraftRoots {
+			ui.Warn("prefetch: {path} is GRAFTED from {source} and this mode does not fetch it — "+
+				"reads under it will go to {source} ({bytes} of grafted content in this "+
+				"generation). `--prefetch all` fetches and verifies it into the local cache",
+				"path", gr.Path, "source", gr.Source, "bytes", ui.ByteCount(rep.GraftedBytes))
+		}
+		ui.Warn("prefetch: this volume is NOT fully local: {chunks} chunks ({bytes}) live at a "+
+			"graft source", "chunks", rep.Grafted-rep.GraftLocal,
+			"bytes", ui.ByteCount(rep.GraftedBytes-rep.GraftLocalBytes))
+	}
+	// budgetMessage is the refusal that actually helps: both numbers, and
+	// which graft is the large one.
+	budgetMessage := func(b *genfs.PrefetchBudgetError) error {
+		if b.GraftBytes > 0 {
+			var names []string
+			for _, gr := range b.GraftRoots {
+				names = append(names, fmt.Sprintf("%s <- %s (%s)", gr.Path, gr.Source, ui.ByteCount(gr.Bytes)))
+			}
+			// The pack clause is omitted when the graft alone already
+			// blows the budget: that check runs off the signed superblock
+			// BEFORE anything is walked, so "0 B in 0 packs" there would
+			// describe a walk that never happened rather than the volume.
+			packs := ""
+			if b.Packs > 0 {
+				packs = fmt.Sprintf("%s in %d packs and ", ui.ByteCount(b.Need-b.GraftBytes), b.Packs)
+			}
+			return fmt.Errorf("prefetch: refusing to mount: making this generation local needs %s — "+
+				"%s%s grafted from %s — and the local cache budget is %s. "+
+				"Raise --cache-size above %s, or use `--prefetch packs` to make the packed content "+
+				"local and read the grafted content from its source",
+				ui.ByteCount(b.Need), packs,
+				ui.ByteCount(b.GraftBytes), strings.Join(names, ", "),
+				ui.ByteCount(b.Budget), ui.ByteCount(b.Need))
+		}
+		return fmt.Errorf("prefetch: refusing to mount: the generation is %s in %d packs and the local cache budget is %s; "+
+			"raise --cache-size, or use --prefetch none and read from the federation",
+			ui.ByteCount(b.Need), b.Packs, ui.ByteCount(b.Budget))
+	}
+	report := func(rep *genfs.PrefetchReport) {
+		ui.Info("prefetched {packs} packs ({cached} already cached) across {files} files, "+
+			"{bytes} local ({fetched} transferred); fully local: {complete}",
+			"packs", rep.Packs, "cached", rep.Cached, "files", rep.Files,
+			"bytes", ui.ByteCount(rep.Bytes), "fetched", ui.ByteCount(rep.Fetched),
+			"complete", rep.FullyLocal())
+		if rep.GraftLocal > 0 {
+			ui.Info("prefetched {local} of {total} grafted blocks ({bytes} local, {fetched} "+
+				"transferred from the graft source); the files are still grafted and the volume "+
+				"is unchanged — this is a local copy, not a materialization",
+				"local", rep.GraftLocal, "total", rep.Grafted,
+				"bytes", ui.ByteCount(rep.GraftLocalBytes), "fetched", ui.ByteCount(rep.GraftFetched))
+		}
+	}
 	switch mode {
 	case "", "none":
-	case "all":
-		ui.Info("prefetching the generation's packs into the local cache...")
-		rep, err := g.gfs.Prefetch(ctx, pelicanobj.TransferWorkers())
+	case "all", "packs":
+		strict := mode == "all"
+		if strict {
+			ui.Info("prefetching the generation's packs, and any grafted blocks, into the local cache...")
+		} else {
+			ui.Info("prefetching the generation's packs into the local cache...")
+		}
+		rep, err := g.gfs.Prefetch(ctx, genfs.PrefetchOptions{
+			Workers: pelicanobj.TransferWorkers(), Grafts: strict,
+		})
 		if err != nil {
 			// A generation larger than the cache budget is the one refusal
 			// worth spelling out: nothing is wrong with the volume or with
 			// the federation, the disk is simply too small for what was
-			// asked, and the two numbers say so.
+			// asked, and the numbers say so.
 			var budget *genfs.PrefetchBudgetError
 			if errors.As(err, &budget) {
-				return fmt.Errorf("prefetch: refusing to mount: the generation is %s in %d packs and the local cache budget is %s; "+
-					"raise --cache-size, or use --prefetch none and read from the federation",
-					ui.ByteCount(budget.Need), budget.Packs, ui.ByteCount(budget.Budget))
+				return budgetMessage(budget)
 			}
 			return fmt.Errorf("prefetch: %w", err)
 		}
-		record(rep, rep.Failed == 0)
+		record(rep)
 		if rep.Failed > 0 {
-			return fmt.Errorf("prefetch: %d pack(s) could not be made local (%v); refusing to mount",
-				rep.Failed, rep.Sample)
+			if strict {
+				return fmt.Errorf("prefetch: %d item(s) could not be made local (%v); refusing to mount",
+					rep.Failed, rep.Sample)
+			}
+			ui.Warn("prefetch: {failed} item(s) could not be made local ({sample})",
+				"failed", rep.Failed, "sample", rep.Sample)
 		}
-		ui.Info("prefetched {packs} packs ({cached} already cached) across {files} files, {bytes} local ({fetched} transferred)",
-			"packs", rep.Packs, "cached", rep.Cached, "files", rep.Files,
-			"bytes", ui.ByteCount(rep.Bytes), "fetched", ui.ByteCount(rep.Fetched))
+		if !strict && rep.Grafted > rep.GraftLocal {
+			warnRemoteGrafts(rep)
+		}
+		if strict && !rep.FullyLocal() {
+			// Belt and braces over the Failed check above: whatever the
+			// reason, `--prefetch all` may not come up claiming a volume
+			// is local when it is not.
+			return fmt.Errorf("prefetch: refusing to mount: %d of %d grafted blocks could not be "+
+				"made local", rep.Grafted-rep.GraftLocal, rep.Grafted)
+		}
+		report(rep)
 	case "background":
 		go func() {
 			// Half the transfer pool, so warming never starves the
 			// interactive I/O the mount is serving.
-			rep, err := g.gfs.Prefetch(ctx, max(1, pelicanobj.TransferWorkers()/2))
+			rep, err := g.gfs.Prefetch(ctx, genfs.PrefetchOptions{
+				Workers: max(1, pelicanobj.TransferWorkers()/2), Grafts: true,
+			})
 			if err != nil {
+				var budget *genfs.PrefetchBudgetError
+				if errors.As(err, &budget) {
+					ui.Warn("background prefetch: {error}", "error", budgetMessage(budget))
+					return
+				}
 				ui.Warn("background prefetch: {error}", "error", err)
 				return
 			}
-			record(rep, rep.Failed == 0)
-			ui.Info("background prefetch done: {packs} packs, {failed} failed, {fetched} transferred",
-				"packs", rep.Packs, "failed", rep.Failed, "fetched", ui.ByteCount(rep.Fetched))
+			record(rep)
+			if rep.Grafted > rep.GraftLocal {
+				warnRemoteGrafts(rep)
+			}
+			ui.Info("background prefetch done: {packs} packs, {grafted} grafted blocks, {failed} failed, "+
+				"{fetched} transferred; fully local: {complete}",
+				"packs", rep.Packs, "grafted", rep.GraftLocal, "failed", rep.Failed,
+				"fetched", ui.ByteCount(rep.Fetched+rep.GraftFetched), "complete", rep.FullyLocal())
 		}()
 	default:
-		return fmt.Errorf("unknown --prefetch %q (want none, all, or background)", mode)
+		return fmt.Errorf("unknown --prefetch %q (want none, all, packs, or background)", mode)
 	}
 	return nil
 }
@@ -1807,7 +1992,16 @@ func (g *genSession) sealLocked(ctx context.Context, follow bool) (*publish.Resu
 		// the overlay are different work under different locks — genfs's
 		// swap lock and the overlay's — and a single "follow" number
 		// cannot say which of them the mount was waiting behind.
-		if _, err := g.gfs.Swap(ctx, res.Superblock); err != nil {
+		//
+		// The swap's own number is reported because the phase clock cannot
+		// explain itself: a swap re-descends every inode the KERNEL is
+		// holding, twice — once to capture what it was told and once
+		// against the new generation — so its cost is set by how much of
+		// the tree this session has browsed and not at all by how much of
+		// it changed. A three-inode seal whose swap took eight seconds is
+		// not a mystery once the resident count is on the line beside it.
+		swapped, err := g.gfs.Swap(ctx, res.Superblock)
+		if err != nil {
 			ui.Warn("sealed generation {generation}, but the mount could not follow it ({error}); inodes stay dirty",
 				"generation", res.Superblock.Generation, "error", err)
 		} else if rep, err := g.markSwapped(phases).Rebase(ctx, snap.Seq(), overlay.Options{
@@ -1817,7 +2011,10 @@ func (g *genSession) sealLocked(ctx context.Context, follow bool) (*publish.Resu
 			ui.Warn("sealed generation {generation}, but rebase failed ({error}); inodes stay dirty",
 				"generation", res.Superblock.Generation, "error", err)
 		} else {
-			ui.Info("{clean} returned to clean; {dirty} still dirty",
+			ui.Info("the mount followed generation {generation}: {resident} re-descended, "+
+				"{clean} returned to clean, {dirty} still dirty",
+				"generation", res.Superblock.Generation,
+				"resident", ui.Count(swapped.Resident, "resident inode"),
 				"clean", ui.Count(len(rep.Clean), "inode"), "dirty", rep.Dirty)
 			g.stats.Update(func(sum *stats.Summary) { sum.RebasedClean += int64(len(rep.Clean)) })
 		}
@@ -1987,24 +2184,38 @@ func pressureSampleInterval(every time.Duration) time.Duration {
 }
 
 // pressure reports what the overlay is holding that a checkpoint would
-// publish: staged content bytes, and dirty inodes. Both are -1 when the
-// overlay cannot be sampled (it is being sealed, or is gone).
+// publish: staged content bytes, dirty inodes, and dirty namespace edges.
+// All three are -1 when the overlay cannot be sampled (it is being
+// sealed, or is gone).
 //
-// The two are sampled together, from one Stats call, because they are two
-// meters on the same thing and a session can be at the limit of either
-// without approaching the other: a video file is bytes without inodes, an
+// They are sampled together, from one Stats call, because they are meters
+// on the same thing and a session can be at the limit of one without
+// approaching the others: a video file is bytes without inodes, an
 // unpacked source tree is inodes without bytes.
-func (g *genSession) pressure() (bytes int64, nodes int) {
+//
+// EDGES ARE THE THIRD because a change can move no bytes and touch no
+// inode row and still be a change. A rename is exactly that: it writes a
+// whiteout for the old name and an edge for the new one and nothing else
+// (overlay.Rename), so a session whose only change is a rename reported
+// zero staged bytes and zero dirty inodes — and the browser's durability
+// panel, which is fed from here, told the user there was nothing to
+// publish while an unpublished rename sat in the overlay. The SEALING
+// decisions never had this hole (checkpoint and sealAtExit have always
+// tested DirtyEdges too), which is what made it a reporting bug rather
+// than a data-loss one: the rename did get published, just never on the
+// user's say-so. Two meters and a predicate that disagree are one meter
+// too few.
+func (g *genSession) pressure() (bytes int64, nodes, edges int) {
 	g.ovMu.RLock()
 	defer g.ovMu.RUnlock()
 	if g.ov == nil || g.spent {
-		return -1, -1
+		return -1, -1, -1
 	}
 	st, err := g.ov.Stats()
 	if err != nil {
-		return -1, -1
+		return -1, -1, -1
 	}
-	return st.StagedBytes, st.DirtyNodes
+	return st.StagedBytes, st.DirtyNodes, st.DirtyEdges
 }
 
 // checkpointDrainNotice is how long the exit path waits for a checkpoint
@@ -2128,7 +2339,13 @@ func (g *genSession) checkpointPeriodically(ctx context.Context, every time.Dura
 			if ctx.Err() != nil {
 				return
 			}
-			staged, nodes := g.pressure()
+			// Edges are deliberately NOT a write-pressure trigger: this
+			// path exists to keep the uplink and the machine's memory
+			// inside their limits, and a namespace change consumes
+			// neither. The interval tick publishes it, and the idle sealer
+			// and the durability panel are where a user's rename has to be
+			// visible.
+			staged, nodes, _ := g.pressure()
 			if !checkpointDue(staged, nodes) {
 				continue
 			}
@@ -2449,7 +2666,7 @@ func (g *genSession) controlHooks() control.Hooks {
 			if g.tag != "" {
 				st["tag"] = g.tag
 			} else {
-				st["branch"] = g.branch
+				st["branch"] = g.currentBranch()
 			}
 			// When this volume last collected, and what it got back. The
 			// status socket is where someone looks when they suspect a mount

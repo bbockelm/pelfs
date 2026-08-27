@@ -103,8 +103,60 @@ func knownTrailerMagic(m string) bool {
 	return m == magic || m == magicZ || m == magicT
 }
 
-// decodeTrailer parses stored trailer bytes according to the footer magic.
+// idxLenFromFooter reads the stored trailer's length out of a footer and
+// bounds it against the object's REAL size, which is the only thing that
+// makes it safe to slice or allocate with.
+//
+// Those eight bytes are untrusted: they come off the federation, and a
+// hostile or corrupt origin picks them. The obvious check —
+// idxLen+footerSize > size — is wrong, because at idxLen near MaxInt64
+// the sum wraps to a negative number and passes, and every bound derived
+// from it is negative too. A fuzzer found exactly that: a 16-byte "pack"
+// whose footer claimed 0x7fffffffffffffff bytes of trailer, which panicked
+// parseTail with slice bounds [-9223372036854775807:]. The crasher is
+// checked in at testdata/fuzz/FuzzParseTail/7a3b9f86271a383e.
+//
+// Subtracting instead of adding is what removes the overflow: size is
+// known to be at least footerSize before the comparison is made, so
+// size-footerSize cannot underflow, and idxLen is compared against a
+// number that is genuinely in range.
+func idxLenFromFooter(footer []byte, size int64) (int64, error) {
+	if size < footerSize {
+		return 0, fmt.Errorf("pack too small (%d bytes)", size)
+	}
+	idxLen := int64(binary.LittleEndian.Uint64(footer[:8]))
+	if idxLen <= 0 || idxLen > size-footerSize {
+		return 0, fmt.Errorf("bad index length %d (pack is %d bytes)", idxLen, size)
+	}
+	return idxLen, nil
+}
+
+// decodeTrailer parses stored trailer bytes according to the footer magic
+// and validates every extent it hands back.
+//
+// The extent check lives HERE, above the form, and not in the JSON path
+// where it started: the table form reads its offsets and lengths as raw
+// uint64s, so it produced negative extents that the JSON path would have
+// rejected, and a check that only one of three encodings performs is not
+// a check. Every form goes through this gate.
 func decodeTrailer(stored []byte, m string) (*trailer, error) {
+	tr, err := decodeTrailerForm(stored, m)
+	if err != nil {
+		return nil, err
+	}
+	// Trailers are untrusted federation bytes: an entry with a negative
+	// or overflowing extent must never reach the range-read path.
+	for _, e := range tr.Entries {
+		if e.Off < 0 || e.Length < 0 || e.Off+e.Length < 0 {
+			return nil, fmt.Errorf("parse index: entry %q has invalid extent [%d,+%d)", e.Key, e.Off, e.Length)
+		}
+	}
+	return tr, nil
+}
+
+// decodeTrailerForm decodes one stored form. Validation is decodeTrailer's
+// job, so that no form can be added without it.
+func decodeTrailerForm(stored []byte, m string) (*trailer, error) {
 	if m == magicT {
 		return decodeTable(stored)
 	}
@@ -121,13 +173,6 @@ func decodeTrailer(stored []byte, m string) (*trailer, error) {
 	}
 	if tr.Version != 1 {
 		return nil, fmt.Errorf("unsupported pack version %d", tr.Version)
-	}
-	// Trailers are untrusted federation bytes: an entry with a negative
-	// or overflowing extent must never reach the range-read path.
-	for _, e := range tr.Entries {
-		if e.Off < 0 || e.Length < 0 || e.Off+e.Length < 0 {
-			return nil, fmt.Errorf("parse index: entry %q has invalid extent [%d,+%d)", e.Key, e.Off, e.Length)
-		}
 	}
 	return &tr, nil
 }
@@ -244,9 +289,9 @@ func StoredTrailerFrom(r io.ReaderAt, size int64) ([]byte, error) {
 	if m := string(footer[8:]); !knownTrailerMagic(m) {
 		return nil, fmt.Errorf("bad pack magic")
 	}
-	idxLen := int64(binary.LittleEndian.Uint64(footer[:8]))
-	if idxLen <= 0 || idxLen+footerSize > size {
-		return nil, fmt.Errorf("bad index length %d", idxLen)
+	idxLen, err := idxLenFromFooter(footer[:], size)
+	if err != nil {
+		return nil, err
 	}
 	stored := make([]byte, idxLen)
 	if _, err := r.ReadAt(stored, size-footerSize-idxLen); err != nil {
@@ -313,12 +358,12 @@ func parseTail(ctx context.Context, inner pelicanobj.Store, name string, size in
 	if !knownTrailerMagic(m) {
 		return nil, nil, 0, fmt.Errorf("bad pack magic")
 	}
-	idxLen := int64(binary.LittleEndian.Uint64(buf[len(buf)-16 : len(buf)-8]))
-	if idxLen <= 0 || idxLen+footerSize > size {
-		return nil, nil, 0, fmt.Errorf("bad index length %d", idxLen)
+	idxLen, err := idxLenFromFooter(buf[len(buf)-footerSize:], size)
+	if err != nil {
+		return nil, nil, 0, err
 	}
+	// idxLen is now bounded by size, so neither sum below can overflow.
 	var stored []byte
-	var err error
 	if idxLen+footerSize <= int64(len(buf)) {
 		stored = buf[int64(len(buf))-footerSize-idxLen : int64(len(buf))-footerSize]
 	} else {

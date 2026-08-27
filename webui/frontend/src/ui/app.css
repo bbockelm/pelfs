@@ -1,63 +1,234 @@
 /*
- * The app's own chrome: the header, the durability panel, the notices and the
- * status line. Everything inside the file manager is the component's.
+ * THE APP'S OWN CHROME: an app bar, a workspace, and two panels on it.
  *
- * The colours come from src/brand/brand.css, which reads the Pelican
- * Platform's palette from its own source. The two durability colours are
- * pelfs's own and deliberately NOT shades of the brand blue -- the whole
- * point of the panel is that "on this machine only" and "in the federation"
- * are unmistakably different.
+ * The layout is the answer to a specific complaint about the first version of
+ * this page -- "there is no physical separation between the config and the file
+ * browser, hard to tell they're separate elements". It had none: every part of
+ * the page was a full-bleed strip on one flat ground, separated by hairlines,
+ * so the durability panel, the notices and the file manager read as one
+ * undifferentiated column of text with a grid at the bottom.
+ *
+ * So there are three levels and nothing else:
+ *
+ *   the app bar     who and what: the wordmark, the volume, the session's
+ *                   facts, and the one link off this page. Fixed, thin.
+ *   the workspace    a recessed ground (--pelfs-ground) that holds panels.
+ *   a panel          a surface with a border, a radius and a shadow. Two of
+ *                    them: what is published (the status panel) and the files.
+ *
+ * Everything inside the file panel below its own header is the component's,
+ * themed in src/brand/brand.css. The handful of rules at the bottom of this
+ * file are the exceptions, and each one says why.
  */
 
+/* A COLUMN THAT FILLS THE VIEWPORT, which is what keeps the status line on the
+   bottom edge rather than wherever the content happens to stop ("the footer is
+   not at the bottom of the browser"). `height` and `min-height` together
+   because the two failure modes are opposite: without the first a short page
+   (the no-session shell) leaves the bar floating mid-screen, and without the
+   second a viewport shorter than the app bar plus the bar clips instead of
+   scrolling. The workspace between them is the part that scrolls. */
 .pelfs-app {
   display: flex;
   flex-direction: column;
   height: 100%;
-  min-height: 0;
+  min-height: 100%;
+  background: var(--pelfs-ground);
 }
 
-.pelfs-header {
+/* ---- the app bar ------------------------------------------------------ */
+
+.pelfs-appbar {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 1rem;
   flex-wrap: wrap;
-  padding: 0.6rem 1rem;
+  padding: 0.5rem 1rem;
+  background: var(--pelfs-surface);
   border-bottom: 1px solid var(--pelfs-rule);
+  /* The one place the brand colour is allowed to be a block of colour: a
+     2px seam under the bar. Enough to say whose tool this is; not a banner. */
+  box-shadow: inset 0 -3px 0 -1px var(--pelfs-primary);
+  flex: none;
 }
 
-.pelfs-header__right {
+.pelfs-appbar__id {
   display: flex;
-  align-items: baseline;
-  gap: 1rem;
+  align-items: center;
+  gap: 0.6rem;
+  min-width: 0;
+  flex: 1 1 22rem;
+}
+
+.pelfs-appbar__facts {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
   flex-wrap: wrap;
+  margin-left: auto;
 }
 
-.pelfs-sub,
-.pelfs-muted {
+/* branch/generation and the lease: the session's facts, in the order a person
+   asks for them. Small, muted, and not competing with the durability line. */
+.pelfs-fact {
   color: var(--pelfs-ink-muted);
-  font-size: 0.82rem;
-}
-
-.pelfs-badge {
   font-size: 0.78rem;
-  padding: 0.12rem 0.5rem;
-  border-radius: 999px;
-  background: var(--pelfs-primary-light);
-  color: #10365e;
   white-space: nowrap;
 }
 
-/* ---- durability ------------------------------------------------------- */
-
-.pelfs-durability {
-  padding: 0.8rem 1rem 0.6rem;
-  border-bottom: 1px solid var(--pelfs-rule);
+.pelfs-fact code,
+.pelfs-fact b {
+  font-weight: 600;
+  color: var(--pelfs-ink);
 }
 
-.pelfs-durability__line {
-  margin: 0 0 0.4rem;
-  font-size: 1rem;
+.pelfs-chip {
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  padding: 0.16rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--pelfs-rule);
+  background: var(--pelfs-surface-alt);
+  color: var(--pelfs-ink-muted);
+  white-space: nowrap;
+}
+
+/* A writable session is the exceptional one and the one worth marking, so it
+   gets the accent and read-only gets the quiet default. */
+.pelfs-chip[data-mode="read-write"] {
+  background: var(--pelfs-primary-light);
+  border-color: transparent;
+  color: var(--pelfs-primary-ink);
+}
+
+/* ---- the workspace and its panels ------------------------------------ */
+
+.pelfs-workspace {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding: 0.75rem 1rem 1rem;
+  overflow: auto;
+}
+
+.pelfs-workspace--prose {
+  display: block;
+  max-width: 44rem;
+  padding: 1.5rem 1rem;
+}
+
+.pelfs-panel {
+  background: var(--pelfs-surface);
+  border: 1px solid var(--pelfs-rule);
+  border-radius: var(--pelfs-radius);
+  box-shadow: var(--pelfs-shadow);
+  flex: none;
+}
+
+/* THE STATUS PANEL: the one thing a file manager cannot give.
+   The left edge carries the state as colour as well as words, so the panel
+   itself changes when something is staged -- the same information the glyph
+   carries, at a size you cannot miss. */
+.pelfs-panel--status {
+  padding: 0.7rem 0.9rem;
+  border-left: 3px solid var(--pelfs-rule);
+}
+
+.pelfs-panel--status[data-durability="staged"] {
+  border-left-color: var(--pelfs-local-only);
+}
+
+.pelfs-panel--status[data-durability="published"] {
+  border-left-color: var(--pelfs-federated);
+}
+
+/* A FAILED OPEN IS A STOPPED STATE, NOT A LOADING ONE. This is the one place
+   the panel is allowed to be loud: there is no volume, the reader's next
+   action is inside the sentence, and a quiet line here is what left people
+   watching "reading the overlay…" forever. */
+.pelfs-panel--status[data-durability="failed"] {
+  border-left-color: #c0392b;
+  background: var(--pelfs-bad-wash);
+  border-color: var(--pelfs-bad-rule);
+  color: var(--pelfs-bad-ink);
+}
+
+/* THE FILE PANEL: a frame around the component, and the component fills it.
+   `overflow: hidden` is what makes the radius real at the corners of the
+   vendor's own toolbar. */
+.pelfs-panel--files {
+  flex: 1 1 auto;
+  min-height: 22rem;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 0;
+}
+
+.pelfs-panel__bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  padding: 0.3rem 0.6rem;
+  background: var(--pelfs-surface-alt);
+  border-bottom: 1px solid var(--pelfs-rule);
+  min-height: 1.9rem;
+}
+
+.pelfs-path {
+  font-family: var(--pelfs-font-mono);
+  font-size: 0.75rem;
+  color: var(--pelfs-ink-muted);
+  padding-left: 0.2rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pelfs-panel__bar-spacer {
+  flex: 1;
+}
+
+.pelfs-panel__body {
+  flex: 1;
+  min-height: 0;
+  background: var(--pelfs-ground);
+}
+
+/* ---- the durability line --------------------------------------------- */
+
+.pelfs-status {
+  display: flex;
+  align-items: baseline;
+  gap: 0.9rem;
+  flex-wrap: wrap;
+}
+
+.pelfs-status__line {
+  margin: 0;
+  flex: 1 1 20rem;
+  font-size: 0.95rem;
+}
+
+/* pre-wrap because the server's failure sentence is MULTI-LINE -- what
+   refused, where this session's state directory is, what to do next -- and
+   flowing those three into one paragraph is how a path stops being
+   copy-pasteable. */
+.pelfs-status__line--failed {
+  white-space: pre-wrap;
+}
+
+.pelfs-status__aside {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  margin-left: auto;
 }
 
 .pelfs-glyph {
@@ -77,97 +248,240 @@
   color: var(--pelfs-federated);
 }
 
-.pelfs-legend {
-  display: flex;
-  gap: 1.4rem;
-  flex-wrap: wrap;
-  color: var(--pelfs-ink-muted);
-  font-size: 0.82rem;
-  margin-bottom: 0.6rem;
+.pelfs-glyph--failed {
+  color: #c0392b;
 }
 
-.pelfs-publishrow {
-  display: flex;
-  align-items: center;
-  gap: 0.8rem;
-  flex-wrap: wrap;
+.pelfs-status__note {
+  margin: 0.35rem 0 0;
+  font-size: 0.8rem;
+  color: var(--pelfs-ink-muted);
 }
+
+.pelfs-status__note:empty {
+  display: none;
+}
+
+/* ---- buttons and links ----------------------------------------------- */
 
 .pelfs-button {
   font: inherit;
+  font-size: 0.85rem;
   font-weight: 600;
   cursor: pointer;
   background: var(--pelfs-primary);
   color: #fff;
-  border: 1px solid #036;
-  border-radius: 0.35rem;
-  padding: 0.4rem 0.9rem;
+  border: 1px solid transparent;
+  border-radius: var(--pelfs-radius-sm);
+  padding: 0.35rem 0.85rem;
+  white-space: nowrap;
+}
+
+.pelfs-button:hover:not(:disabled) {
+  background: var(--pelfs-primary-hover);
 }
 
 .pelfs-button:disabled {
-  background: #e8ebee;
-  color: #8b949e;
+  background: var(--pelfs-surface-alt);
+  color: var(--pelfs-ink-muted);
   border-color: var(--pelfs-rule);
   cursor: not-allowed;
 }
 
 .pelfs-button--quiet {
   background: transparent;
-  color: var(--pelfs-primary);
-  border-color: var(--pelfs-primary);
+  color: var(--pelfs-primary-ink);
+  border-color: var(--pelfs-rule);
 }
 
-/* ---- notices and banners --------------------------------------------- */
-
-.pelfs-notices {
-  padding: 0.5rem 1rem 0;
+.pelfs-button--quiet:hover:not(:disabled) {
+  background: var(--pelfs-surface-alt);
 }
 
-.pelfs-notice {
-  margin: 0 0 0.35rem;
-  font-size: 0.85rem;
+/* Navigation dressed as a control: /connect is a page, so it is an <a>, but
+   it sits in the app bar next to chips and has to look like it belongs. */
+.pelfs-navlink {
+  font-size: 0.8rem;
+  font-weight: 600;
+  text-decoration: none;
+  color: var(--pelfs-primary-ink);
+  border: 1px solid var(--pelfs-rule);
+  border-radius: var(--pelfs-radius-sm);
+  padding: 0.3rem 0.7rem;
+  white-space: nowrap;
+}
+
+.pelfs-navlink:hover {
+  background: var(--pelfs-surface-alt);
+}
+
+/* An anchor in the app's own prose. The component's own links are its. */
+.pelfs-link {
+  color: var(--pelfs-primary-ink);
+}
+
+/* ONE focus treatment for everything focusable in the chrome. The brand blue
+   is the accent, and this is where it earns its place: it is the only ring on
+   the page, so it is unambiguous. */
+.pelfs-app :is(a, button, summary, input, select):focus-visible {
+  outline: 2px solid var(--pelfs-primary);
+  outline-offset: 1px;
+  border-radius: 3px;
+}
+
+/* ---- the one count on the pane's bar --------------------------------- */
+
+/*
+ * WHAT USED TO BE HERE: eight rules for a <details> disclosure -- a dashed
+ * pill, a "?" affordance, an absolutely positioned popover -- built so the
+ * search caveat and the cap explanation could be on the screen without being
+ * a paragraph. The owner asked for the search caveat gone twice, and the
+ * second ask was specifically about the disclosure that hid it. So the
+ * mechanism is deleted with the text: what is left is a folder's entry count,
+ * which is a fact rather than a caveat, and a count needs no popover.
+ */
+.pelfs-count {
+  font-size: 0.75rem;
   color: var(--pelfs-ink-muted);
-  max-width: 62rem;
+  padding: 0.1rem 0.45rem;
+  border: 1px solid var(--pelfs-rule);
+  border-radius: 999px;
+  white-space: nowrap;
 }
 
-.pelfs-notice--cap,
-.pelfs-notice--staged {
+/* ---- the branch control ---------------------------------------------- */
+
+/*
+ * A <select> in the app bar, dressed as the chip it replaced (ui/BranchPicker
+ * .tsx). It has to read as something you can open -- that is the whole
+ * request -- so it keeps the native disclosure arrow and gets the surface and
+ * border a control has, rather than being restyled into looking like the text
+ * it used to be.
+ */
+.pelfs-branch {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.pelfs-branch__label {
+  color: var(--pelfs-ink-muted);
+}
+
+.pelfs-branch__select {
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 600;
   color: var(--pelfs-ink);
-  border-left: 3px solid var(--pelfs-local-only);
-  padding-left: 0.6rem;
+  background: var(--pelfs-surface-alt);
+  border: 1px solid var(--pelfs-rule);
+  border-radius: var(--pelfs-radius-sm);
+  padding: 0.1rem 0.3rem;
+  max-width: 14rem;
+  cursor: pointer;
 }
 
-.pelfs-banner {
-  margin: 0.6rem 1rem;
+.pelfs-branch__select:hover:not(:disabled) {
+  border-color: var(--pelfs-ink-muted);
+}
+
+.pelfs-branch__select:disabled {
+  cursor: progress;
+  color: var(--pelfs-ink-muted);
+}
+
+/* A switch this tab asked for and the server has not confirmed, or a refusal.
+   Beside the control, never in place of the branch it still shows. */
+.pelfs-branch__note {
+  color: var(--pelfs-local-only);
+  font-size: 0.72rem;
+  white-space: normal;
+}
+
+/* ---- notices, banners, the status line ------------------------------- */
+
+.pelfs-note {
+  margin: 0;
   padding: 0.6rem 0.8rem;
-  border-radius: 0.4rem;
-  background: var(--pelfs-primary-light);
-  border: 1px solid #a9cdf7;
-  font-size: 0.9rem;
+  border-radius: var(--pelfs-radius-sm);
+  border: 1px solid var(--pelfs-rule);
+  border-left: 3px solid var(--pelfs-primary);
+  background: var(--pelfs-surface);
+  box-shadow: var(--pelfs-shadow);
+  font-size: 0.85rem;
+  flex: none;
 }
 
-.pelfs-banner--warn {
-  background: #fdf3e3;
-  border-color: #e6c98a;
-  color: #4a3208;
+.pelfs-note--staged {
+  border-left-color: var(--pelfs-local-only);
 }
 
-.pelfs-banner--bad {
-  background: #fdecec;
-  border-color: #e9a7a7;
-  color: #5a1616;
+.pelfs-note--warn {
+  background: var(--pelfs-warn-wash);
+  border-color: var(--pelfs-warn-rule);
+  border-left-color: var(--pelfs-local-only);
 }
 
-/* ---- the grid, and the line under it --------------------------------- */
+.pelfs-note--bad {
+  background: var(--pelfs-bad-wash);
+  border-color: var(--pelfs-bad-rule);
+  border-left-color: #c0392b;
+  color: var(--pelfs-bad-ink);
+}
 
-.pelfs-main {
+.pelfs-note__more {
+  display: block;
+  margin-top: 0.3rem;
+  font-size: 0.78rem;
+  color: var(--pelfs-ink-muted);
+}
+
+.pelfs-note--bad .pelfs-note__more {
+  color: inherit;
+}
+
+.pelfs-muted {
+  color: var(--pelfs-ink-muted);
+  font-size: 0.82rem;
+}
+
+.pelfs-statusline {
+  display: flex;
+  gap: 0.9rem;
+  flex-wrap: wrap;
+  align-items: center;
+  padding: 0.35rem 1rem;
+  background: var(--pelfs-surface);
+  border-top: 1px solid var(--pelfs-rule);
+  font-size: 0.75rem;
+  color: var(--pelfs-ink-muted);
+  flex: none;
+}
+
+.pelfs-statusline__spacer {
   flex: 1;
-  min-height: 0;
 }
 
-.pelfs-main--prose {
-  padding: 1.5rem 1rem;
-  max-width: 44rem;
+/* The stream light. A dot with a colour and a word beside it: the word is what
+   carries the meaning, the dot is what makes it findable. */
+.pelfs-stream::before {
+  content: "\25cf";
+  margin-right: 0.35rem;
+  color: var(--pelfs-federated);
+}
+
+.pelfs-stream[data-stream="connecting"]::before,
+.pelfs-stream[data-stream="reconnecting"]::before {
+  color: var(--pelfs-local-only);
+}
+
+.pelfs-stream[data-stream="closed"]::before {
+  color: var(--pelfs-ink-muted);
+}
+
+code {
+  font-family: var(--pelfs-font-mono);
+  font-size: 0.92em;
 }
 
 /* The no-JavaScript notice (index.html). A class and not a style attribute:
@@ -181,20 +495,73 @@
   font-family: var(--pelfs-font);
 }
 
-/* An anchor in the app's own chrome. The file manager's own links are the
-   component's; these are the two the page owns (the connection page, and the
-   third-party notices). */
-.pelfs-link {
-  color: var(--pelfs-primary);
+/* ---- the component, and the four things this file changes about it ---- */
+
+.pelfs-fm,
+.pelfs-fm > .wx-theme {
+  height: 100%;
+  min-height: 0;
 }
 
-.pelfs-statusline {
-  display: flex;
-  gap: 1rem;
-  flex-wrap: wrap;
-  align-items: baseline;
-  padding: 0.4rem 1rem;
-  border-top: 1px solid var(--pelfs-rule);
-  font-size: 0.8rem;
-  color: var(--pelfs-ink-muted);
+/*
+ * 1. THE UPLOADER'S FILE INPUT IS NOT A CONTROL, and it was being drawn as
+ *    one. @svar-ui/react-uploader mounts <input type="file"> in the layout and
+ *    hides it from its OWN stylesheet; that stylesheet reached the bundle only
+ *    when main.tsx started importing all.css, and before that the native
+ *    "Choose Files / No file chosen" widget sat in the middle of the file
+ *    pane, 253px wide, pushing the folder tree sideways. This rule is
+ *    belt-and-braces on that fix: the input must never be visible, whatever
+ *    the vendor's class hashes do next. Playwright's setInputFiles works on a
+ *    hidden input, and the visible way to upload is the toolbar's own
+ *    "Add New -> Upload file" (or a drop onto the pane).
+ */
+.pelfs-fm input[type="file"] {
+  position: absolute;
+  width: 0;
+  height: 0;
+  opacity: 0;
+}
+
+/*
+ * 2. THE SEARCH BOX HAS TO LOOK LIKE A TEXT BOX. The vendor styles it with
+ *    `border: var(--wx-border)`, which resolved to `0px none` while the base
+ *    theme tokens were missing -- so the one input on the page was invisible
+ *    ("couldn't tell 'search' was a text box, no color differentiation").
+ *    The tokens are defined now, and these three rules make it unmistakable:
+ *    a surface, a real border, and a focus ring in the brand blue.
+ */
+.pelfs-fm .wx-search-input {
+  max-width: 22rem;
+}
+
+.pelfs-fm .wx-search-input input {
+  background: var(--pelfs-surface);
+  border: 1px solid var(--pelfs-rule);
+  border-radius: var(--pelfs-radius-sm);
+  color: var(--pelfs-ink);
+}
+
+.pelfs-fm .wx-search-input input:focus,
+.pelfs-fm .wx-search-input input:focus-visible {
+  border-color: var(--pelfs-primary);
+  outline: 2px solid var(--pelfs-primary);
+  outline-offset: -1px;
+}
+
+/* 3. The pane already lives in a panel with a radius; the vendor's own
+      rounded top corners inside it would be a frame inside a frame. */
+.pelfs-fm .wx-toolbar,
+.pelfs-fm .wx-breadcrumbs {
+  border-radius: 0;
+}
+
+.pelfs-fm .wx-toolbar {
+  border-bottom: 1px solid var(--pelfs-rule);
+}
+
+/* 4. The tree and the drive meter are the file manager's left column, and it
+      is a column: give it a rule so it reads as one. */
+.pelfs-fm .wx-sidebar .wx-wrapper {
+  border: 1px solid var(--pelfs-rule);
+  border-radius: var(--pelfs-radius-sm);
 }

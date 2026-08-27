@@ -49,6 +49,15 @@
 //     during the walk rather than after it.
 //
 // What stays resident is proportional to packs, catalogs and shards.
+//
+// # Findings have two axes
+//
+// A finding carries a Kind (what was found) and a Severity (whether the
+// volume is damaged by it). Every Kind here is damage today; the axis
+// exists so that the checks arriving next — a graft whose external source
+// has moved, a reference that cannot be verified from this volume's own
+// objects — can be reported without calling a healthy volume broken. See
+// Severity, and warningKinds for how a kind becomes a warning.
 package fsck
 
 import (
@@ -82,8 +91,9 @@ const (
 	identityAlgoKeyed = "blake3-256-keyed"
 )
 
-// Problem kinds. Every failure carries one of these so callers can filter
-// without parsing prose; Detail holds the human half.
+// Problem kinds. Every finding carries one of these so callers can filter
+// without parsing prose; Detail holds the human half. Every kind below is
+// damage — see Severity and warningKinds for the other half of the axis.
 const (
 	// KindMissingPack: a pack in the signed pack list is not in the
 	// federation (or cannot be stat'd).
@@ -139,6 +149,72 @@ const (
 	KindChunk = "chunk"
 )
 
+// Severity is the second axis of a finding, beside Kind. Kind says WHAT
+// was found; Severity says what it means for the volume:
+//
+//   - SeverityError — the generation is DAMAGED. Something it states about
+//     itself is not true of the objects behind it, and a reader will get
+//     wrong bytes or an error where the generation promised data.
+//   - SeverityWarning — something an operator should see that is NOT
+//     damage. The volume is fine; a fact about it is worth knowing.
+//
+// The axis exists because without it the only way to report the second
+// kind of thing is to call it damage, and an fsck that reports damage on a
+// healthy volume is an fsck people stop running. What follows from that is
+// the exit contract in cmd/pelfs/fsck.go: warnings alone do not fail a
+// run unless --strict asks them to.
+type Severity int
+
+const (
+	// SeverityError is the zero value ON PURPOSE. A Problem built without
+	// stating a severity — by a caller, by a future kind whose author
+	// forgot, by a decoder — is damage, because the failure that costs
+	// something is a warning silently swallowing real damage, never the
+	// reverse.
+	SeverityError Severity = iota
+	// SeverityWarning is a finding that is not damage.
+	SeverityWarning
+)
+
+// String is the word that appears in fsck's output, and what a script
+// greps for.
+func (s Severity) String() string {
+	if s == SeverityWarning {
+		return "warning"
+	}
+	return "error"
+}
+
+// warningKinds is the set of Kinds that are NOT damage.
+//
+// Severity is a property of the KIND, not of the individual finding: a
+// kind that means damage in one place and advice in another is two kinds,
+// so that a caller filtering by Kind and a caller filtering by Severity
+// can never disagree. This set is therefore the whole of the axis, and
+// adding a kind to it is the whole of making that kind a warning.
+//
+// It is EMPTY, and that is a statement rather than an omission. Every
+// failure this package can report is a generation contradicting itself —
+// an object the signed pack list names and the federation does not have,
+// bytes that do not hash to the identity referencing them, a dirent with
+// no inode. None of that is "worth knowing"; all of it is damage, and
+// nothing was reclassified to give the new axis something to carry. The
+// two warnings it exists for arrive with the features that produce them:
+// a graft whose external source has changed (which is what a graft is
+// FOR, so it cannot be a failure), and a reference whose pinned source
+// cannot be checked from this volume's objects alone.
+var warningKinds = map[string]struct{}{}
+
+// SeverityOf reports how a Kind is classified. A kind this build has never
+// heard of is an error: fsck must never quietly downgrade a finding it
+// does not recognize.
+func SeverityOf(kind string) Severity {
+	if _, ok := warningKinds[kind]; ok {
+		return SeverityWarning
+	}
+	return SeverityError
+}
+
 // Options configures Check.
 type Options struct {
 	// Inner is the raw transport for pack range reads.
@@ -165,13 +241,17 @@ type Options struct {
 	SortBytes int
 }
 
-// Problem is one failure. Path locates it: a namespace path for tree
+// Problem is one finding. Path locates it: a namespace path for tree
 // problems, "packs/<name>" for pack problems, "shards/<first>-<last>" for
-// shard-routing problems.
+// shard-routing problems. Severity says whether it is damage; it follows
+// from Kind (SeverityOf) and is carried on the finding so that anything
+// holding a single Problem — a printed line, a filtered slice — still
+// knows.
 type Problem struct {
-	Kind   string
-	Path   string
-	Detail string
+	Kind     string
+	Severity Severity
+	Path     string
+	Detail   string
 }
 
 // Report summarizes one check. Counts cover what was successfully
@@ -192,12 +272,42 @@ type Report struct {
 	// Bytes is the logical size of the namespace: the sum of regular-file
 	// lengths, counted once per inode.
 	Bytes int64
-	// Problems holds EVERY failure found, sorted by path then kind.
+	// Problems holds EVERY finding, errors first and then warnings, each
+	// group sorted by path then kind. Damage leads because that is what
+	// the reader of a long report is looking for.
 	Problems []Problem
 }
 
-// OK reports a generation with no problems.
-func (r *Report) OK() bool { return len(r.Problems) == 0 }
+// Errors counts findings that mean the generation is damaged.
+func (r *Report) Errors() int { return r.count(SeverityError) }
+
+// Warnings counts findings that are not damage.
+func (r *Report) Warnings() int { return r.count(SeverityWarning) }
+
+func (r *Report) count(s Severity) int {
+	n := 0
+	for i := range r.Problems {
+		if r.Problems[i].Severity == s {
+			n++
+		}
+	}
+	return n
+}
+
+// Damaged reports whether the generation is damaged: at least one
+// SeverityError finding. This is the predicate an exit status is built
+// from — warnings do not make a volume damaged.
+func (r *Report) Damaged() bool { return r.Errors() > 0 }
+
+// Clean reports a check that found NOTHING, of either severity.
+//
+// There is deliberately no OK(): it used to mean "no problems at all",
+// and the moment some findings stopped being damage, every caller of it
+// had to decide which of the two questions it had really been asking —
+// "is this volume sound" (Damaged) or "is there anything to show a human"
+// (Clean). Answering that at each call site was the point of removing it,
+// and a compile error is how each one got asked.
+func (r *Report) Clean() bool { return len(r.Problems) == 0 }
 
 // packLoc locates one pack entry, from the identity index built out of the
 // generation's verified pack trailers.
@@ -342,12 +452,20 @@ func Check(ctx context.Context, o Options) (*Report, error) {
 func (c *checker) problem(kind, path, format string, args ...any) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.rep.Problems = append(c.rep.Problems, Problem{Kind: kind, Path: path, Detail: fmt.Sprintf(format, args...)})
+	c.rep.Problems = append(c.rep.Problems, Problem{
+		Kind:     kind,
+		Severity: SeverityOf(kind),
+		Path:     path,
+		Detail:   fmt.Sprintf(format, args...),
+	})
 }
 
 func (c *checker) sortProblems() {
 	sort.SliceStable(c.rep.Problems, func(i, j int) bool {
 		a, b := c.rep.Problems[i], c.rep.Problems[j]
+		if a.Severity != b.Severity {
+			return a.Severity < b.Severity // SeverityError first
+		}
 		if a.Path != b.Path {
 			return a.Path < b.Path
 		}

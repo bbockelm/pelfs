@@ -68,7 +68,7 @@ func newBrowseFixture(t *testing.T, rw bool, hooks bool) *browseFixture {
 	// generated WebDAV profile, which is why the server is built after the
 	// listener rather than before it.
 	port := srv.Listener.Addr().(*net.TCPAddr).Port
-	bs, err := newBrowseServer(g.prefix, a, 5*time.Minute, m, port)
+	bs, err := newBrowseServer(g.prefix, a, 5*time.Minute, m, port, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -439,7 +439,7 @@ func TestPageIsOneFileWithANonceAndTheTestIDsAPlaywrightSuiteNeeds(t *testing.T)
 	// The hooks a browser driver selects on.
 	for _, id := range []string{
 		"volume", "mode", "branch-generation", "lease", "lease-banner", "phase-banner",
-		"durability", "durability-legend", "glyph-staged", "glyph-sending", "glyph-published",
+		"durability",
 		"publish-button", "publish-hint", "publish-status", "connect-another-program",
 		"stream-status", "noscript", "test-hooks-banner", "body",
 		// The anchor to the other surface. Each page carries exactly one,
@@ -448,7 +448,7 @@ func TestPageIsOneFileWithANonceAndTheTestIDsAPlaywrightSuiteNeeds(t *testing.T)
 		"app-link",
 		// The credential surface (U7/U8). The form and the two tables are
 		// in the shipped HTML; the rows, the revoke buttons and the panel
-		// that shows a password once are built by the script, so those ids
+		// the POST's response builds are made by the script, so those ids
 		// are checked in the script block below.
 		"connect-blurb", "dav-url", "add-program-form", "add-program-label",
 		"add-program-write", "add-program-write-label", "add-program-button",
@@ -463,28 +463,44 @@ func TestPageIsOneFileWithANonceAndTheTestIDsAPlaywrightSuiteNeeds(t *testing.T)
 			t.Errorf("the page has no data-testid=%q", id)
 		}
 	}
-	// The two glyphs must not be the same character. This is the one
+	// The three glyphs must be three different characters. This is the one
 	// rendering rule docs/design-webui.md states as a requirement: a file
 	// that looks uploaded and is not in the federation is the worst
 	// ambiguity this page could carry.
-	staged := glyphFor(t, page, "glyph-staged")
-	published := glyphFor(t, page, "glyph-published")
+	//
+	// They are read out of the durability sentences themselves, which is
+	// where they now live: the page used to carry a LEGEND under the line
+	// ("● on this machine only / ◔ sending / ✓ in the federation") and the
+	// three ids this test used to select on were its. The legend is gone --
+	// every glyph already appears beside its own words in the sentence it
+	// belongs to, so the row was a second copy of the text -- and the
+	// contract it stood for is asserted here instead, against the strings
+	// the page will actually render.
+	staged := glyphFor(t, page, "staged")
+	sending := glyphFor(t, page, "sending")
+	published := glyphFor(t, page, "published")
 	if staged == published {
 		t.Errorf("staged and published render the same glyph (%q)", staged)
 	}
-	// This page still has no file manager on it, and the person who
-	// expected one has to be told that on the page rather than in a release
-	// note — along with what to do instead, which is now a real answer
-	// (connect a program) rather than "use pelfs mount".
-	if !strings.Contains(page, "does not browse files") {
-		t.Error("the page does not say what it cannot do")
+	if sending == staged || sending == published {
+		t.Errorf("sending renders the same glyph as another state (%q)", sending)
 	}
-	// ...and, since the wiring pass, WHERE the thing it cannot do lives.
-	// "This page does not browse files" was the whole answer when there was
-	// no file manager; it is half an answer now, and the missing half is one
-	// anchor.
+	// THE LEDE'S DISCLAIMER IS DELETED, not shortened: "This page does not
+	// browse files — the file manager does — it sets Cyberduck up" was the
+	// whole answer when nothing browsed files, and once `/` did it was a
+	// sentence explaining the page you are already on. The owner's word for
+	// it was "USELESS". The way back is the bar's "← Files" anchor, which is
+	// the next check, and this one is what stops the sentence returning.
+	if strings.Contains(page, "does not browse files") {
+		t.Error("the page explains what it is not; the heading and the ← Files link are enough")
+	}
 	if !strings.Contains(page, `href="/"`) {
 		t.Error("the page does not link to the file manager at /")
+	}
+	// AND THE DOWNLOAD, because a reader who does not have Cyberduck was
+	// stuck on a page whose every control configures it.
+	if !strings.Contains(page, `href="https://cyberduck.io/download/"`) {
+		t.Error("the page names Cyberduck but does not link to its download")
 	}
 	// No JavaScript at all is a real state a driver test will produce.
 	if !strings.Contains(page, "<noscript>") {
@@ -497,15 +513,33 @@ func TestPageIsOneFileWithANonceAndTheTestIDsAPlaywrightSuiteNeeds(t *testing.T)
 	for _, want := range []string{
 		`"sso-card"`, `"sso-url"`, `"sso-code"`, `"sso-dismiss"`, `"sso-note"`,
 		`navigator.sendBeacon`, `"/api/v1/beacon"`, `"pagehide"`, `"visibilitychange"`,
-		// The credential rows and the one panel that ever holds a secret.
+		// The credential rows. FOUR HOOKS CAME OUT OF THIS LIST with the
+		// password path -- `credential-basic-user`,
+		// `credential-basic-password`, `download-basic` and
+		// `credential-notice` -- because the server no longer has the data
+		// behind any of them: there is no Basic credential, no third
+		// download, and no one-time password notice to render. A hook
+		// asserted here that nothing can fill is a contract with nobody.
 		`"client-row"`, `"client-revoke"`, `"grant-row"`, `"grant-revoke"`,
-		`"credential-label"`, `"credential-dav-url"`, `"credential-basic-user"`,
-		`"credential-basic-password"`, `"credential-notice"`,
-		`"download-profile"`, `"download-bookmark"`, `"download-basic"`,
+		`"credential-label"`, `"credential-dav-url"`,
+		`"download-profile"`, `"download-bookmark"`,
 		`"/api/v1/credentials"`, `"/api/v1/credentials/revoke"`,
 	} {
 		if !strings.Contains(page, want) {
 			t.Errorf("the page's script does not carry %s", want)
+		}
+	}
+	// PASSWORD AUTH IS GONE, so the page shows no password. The username and
+	// password rows, the bookmark that opened the Basic path, and the
+	// shown-once notice that existed only to warn about the password are all
+	// deleted -- and a deletion needs an assertion more than an addition
+	// does, because nothing about a missing row fails on its own.
+	for _, gone := range []string{
+		`"credential-basic-user"`, `"credential-basic-password"`,
+		`"credential-notice"`, `"download-basic"`, "c.basic_password", "c.notice",
+	} {
+		if strings.Contains(page, gone) {
+			t.Errorf("the page still carries %s; password auth is gone", gone)
 		}
 	}
 	// A card is built with createElement and textContent. innerHTML with an
@@ -516,13 +550,13 @@ func TestPageIsOneFileWithANonceAndTheTestIDsAPlaywrightSuiteNeeds(t *testing.T)
 	}
 }
 
-// glyphFor extracts the character inside the element with this test id.
-func glyphFor(t *testing.T, page, id string) string {
+// glyphFor extracts the character this page renders for one durability state.
+func glyphFor(t *testing.T, page, state string) string {
 	t.Helper()
-	re := regexp.MustCompile(`data-testid="` + id + `">([^<]+)<`)
+	re := regexp.MustCompile(`class="glyph ` + state + `">([^<]+)<`)
 	m := re.FindStringSubmatch(page)
 	if m == nil {
-		t.Fatalf("no glyph for %s", id)
+		t.Fatalf("the page renders no glyph for the %q state", state)
 	}
 	return m[1]
 }

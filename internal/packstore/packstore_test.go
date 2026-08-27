@@ -1,11 +1,14 @@
 package packstore
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/bbockelm/pelfs/internal/fakeorigin"
@@ -117,6 +120,65 @@ func TestFetchTrailerSurvivesRangeLiar(t *testing.T) {
 		data := readObj(t, inner, PackDirKey+"/"+sealed.Name, e.Off, e.Length)
 		if string(data) != string(want[e.Key]) {
 			t.Fatalf("entry %s read back wrong", e.Key)
+		}
+	}
+}
+
+// The stored-trailer length in a pack footer is eight bytes a hostile or
+// corrupt origin picks, and it reaches a slice bound. A 16-byte "pack"
+// whose footer claimed 0x7fffffffffffffff bytes of trailer used to panic
+// parseTail with slice bounds [-9223372036854775807:] — the sum
+// idxLen+footerSize wrapped negative and passed the bound check. The
+// crasher is checked in as
+// testdata/fuzz/FuzzParseTail/7a3b9f86271a383e; this pins the whole
+// class, both entry points, and the error text that internal/retention
+// and internal/rescue classify a doomed pack by.
+func TestATailLengthCannotEscapeTheObject(t *testing.T) {
+	claims := map[string]uint64{
+		"max int64":         1<<63 - 1,
+		"max uint64":        ^uint64(0),
+		"absurd positive":   1 << 60,
+		"negative as int64": 1 << 63,
+		"one past the end":  1,
+		"zero":              0,
+	}
+	for name, idxLen := range claims {
+		t.Run(name, func(t *testing.T) {
+			// The whole object is the footer, so a trailer of ANY positive
+			// length is outside it.
+			pack := make([]byte, footerSize)
+			binary.LittleEndian.PutUint64(pack[:8], idxLen)
+			copy(pack[8:], magic)
+
+			// nil store: a length this far out must be refused before any
+			// range read is attempted, so nothing here can dial out.
+			_, _, _, err := parseTail(context.Background(), nil, "p-0-test", int64(len(pack)), pack)
+			if err == nil {
+				t.Fatalf("parseTail accepted an index length of %d in a %d-byte pack", idxLen, len(pack))
+			}
+			if !strings.Contains(err.Error(), "bad index length") {
+				t.Errorf("parseTail said %q, which retention and rescue will not recognize as a doomed pack", err)
+			}
+			if _, err := StoredTrailerFrom(bytes.NewReader(pack), int64(len(pack))); err == nil {
+				t.Fatalf("StoredTrailerFrom accepted an index length of %d in a %d-byte pack", idxLen, len(pack))
+			}
+		})
+	}
+}
+
+// A pack smaller than its own footer, and a size that disagrees with the
+// bytes in hand, are the other two ways the footer arithmetic can be fed
+// a number it cannot subtract from.
+func TestAPackTooSmallForItsFooterIsRefused(t *testing.T) {
+	pack := make([]byte, footerSize)
+	binary.LittleEndian.PutUint64(pack[:8], 1)
+	copy(pack[8:], magic)
+	for _, size := range []int64{0, footerSize - 1, -1, -1 << 62} {
+		if _, _, _, err := parseTail(context.Background(), nil, "p-0-test", size, pack); err == nil {
+			t.Errorf("parseTail accepted a listed size of %d", size)
+		}
+		if _, err := StoredTrailerFrom(bytes.NewReader(pack), size); err == nil {
+			t.Errorf("StoredTrailerFrom accepted a listed size of %d", size)
 		}
 	}
 }

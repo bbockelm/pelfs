@@ -83,19 +83,115 @@ test.describe("the two addresses", () => {
     const connectText = ((await connect.textContent()) ?? "").replace(/\s+/g, " ").trim();
 
     expect(appText, "the two panels must not word one state two ways").toBe(connectText);
-    // And the legend, which is what makes the glyphs mean anything.
-    await expect(page.getByTestId("durability-legend")).toContainText("on this machine only");
-    await expect(page.getByTestId("durability-legend")).toContainText("in the federation");
+    // Neither page carries a glyph legend any more -- each glyph appears
+    // beside its own words in the sentence, so the legend was a second copy of
+    // the text and it is deleted on both surfaces rather than on one.
+    await expect(page.getByTestId("durability-legend")).toHaveCount(0);
   });
 
-  test("the connection page says where the file manager is", async ({ page, session }) => {
-    // M1's page carried one honest sentence about its own limits: "this page
-    // does not browse files". That was the whole answer when nothing did. Now
-    // something does, and half an answer is worse than the old whole one --
-    // so the sentence has to name the address.
+  test("the lede names Cyberduck, links its download, and explains nothing", async ({
+    page,
+    session,
+  }) => {
+    // THIS LEDE HAS BEEN CUT THREE TIMES. It was a 180-word paragraph about
+    // WebDAV, the profile's stability, the per-session authorization and what
+    // is written to disk -- "The connect page text is HORRIBLE. It overly
+    // explains, a wall of text for a page that can just configure CyberDuck."
+    // What survived that cut was one sentence about what the page ISN'T
+    // ("This page does not browse files — the file manager does — it sets
+    // Cyberduck up"), and the verdict on that was "USELESS". So it is deleted,
+    // and this test is what keeps it deleted; the word budget comes down with
+    // it, because a budget that is not tightened after a cut is a licence to
+    // grow back.
     await openConnect(page, session);
     const blurb = page.getByTestId("connect-blurb");
-    await expect(blurb).toContainText("does not browse files");
-    await expect(blurb.locator('a[href="/"]')).toHaveCount(1);
+    await expect(blurb).not.toContainText("does not browse files");
+    await expect(blurb).not.toContainText("file manager");
+    const words = ((await blurb.textContent()) ?? "").trim().split(/\s+/).length;
+    expect(words, "the lede is a line, not an essay").toBeLessThan(30);
+
+    // The concrete thing, named and linked. A user who has never heard the
+    // word "Cyberduck" cannot act on "connect another program"; a link can be
+    // clicked. It is an ordinary anchor -- tests/loopback.spec.ts is what
+    // proves the page still FETCHES nothing off this machine.
+    const duck = page.getByTestId("cyberduck-link");
+    await expect(duck).toHaveAttribute("href", "https://cyberduck.io/");
+    await expect(duck).toHaveAttribute("rel", /noopener/);
+
+    // AND THE DOWNLOAD, which was the hole: every control on this page
+    // configures Cyberduck, and a reader who does not have it had nowhere to
+    // go. It says "Download", so it reads as one before it is clicked.
+    const dl = page.getByTestId("cyberduck-download");
+    await expect(dl).toHaveAttribute("href", "https://cyberduck.io/download/");
+    await expect(dl).toHaveAttribute("rel", /noopener/);
+    await expect(dl).toContainText(/download/i);
+
+    // And the whole page's prose is now beside its controls rather than above
+    // them: the paragraph that began "The Cyberduck profile is the same file
+    // every session" is gone, and nothing on the page says it.
+    const main = page.locator("main");
+    await expect(main).not.toContainText("the same file every session");
+    await expect(main).not.toContainText("Nothing handed out here can publish");
+  });
+
+  test("no password reaches this page", async ({ page, session }) => {
+    // PASSWORD AUTH IS GONE, and a deletion needs an assertion more than an
+    // addition does: the username and password rows, the bookmark that opened
+    // the Basic path, and the shown-once notice that existed only to warn
+    // about the password all had ids, and this counts every one of them at
+    // zero. The credential desk still hands out a profile and a bookmark.
+    await openConnect(page, session);
+    for (const gone of [
+      "credential-basic-user",
+      "credential-basic-password",
+      "credential-notice",
+      "download-basic",
+    ]) {
+      await expect(page.getByTestId(gone)).toHaveCount(0);
+    }
+    await expect(page.locator("main")).not.toContainText(/password/i);
+  });
+
+  test("the footer is at the bottom of the viewport, on a short page", async ({
+    page,
+    session,
+  }) => {
+    // "The footer is not at the bottom of the browser on /connect." This page
+    // is three panels on a good day and one on a read-only session, so normal
+    // flow left the status line halfway up the viewport with grey ground under
+    // it. Geometry, not a class name: how it is pinned is a design choice and
+    // where it lands is not.
+    await openConnect(page, session);
+    await expect(page.getByTestId("connect-another-program")).toBeVisible();
+    const footer = page.locator("footer");
+    const box = (await footer.boundingBox())!;
+    const viewport = page.viewportSize()!;
+    expect(
+      viewport.height - (box.y + box.height),
+      "the footer's bottom edge is the viewport's",
+    ).toBeLessThan(2);
+    // And the page is not scrolled to get there: a footer that is only at the
+    // bottom because the document is taller than the window is the bug.
+    expect(await page.evaluate(() => window.scrollY)).toBe(0);
+  });
+
+  test("the wordmark goes home", async ({ page, session }) => {
+    // "I feel like I should be able to click the 'pelfs' / Pelican logo at the
+    // upper-left to go back to 'home'." Every web page in the world has taught
+    // that gesture, and this one did not answer it.
+    await openConnect(page, session);
+    const home = page.getByTestId("brand-home");
+    await expect(home).toHaveAttribute("href", "/");
+    // It has to LOOK clickable where it navigates, and the cheapest honest
+    // check of that is the cursor the browser resolves for it.
+    expect(await home.evaluate((el) => getComputedStyle(el).cursor)).toBe("pointer");
+    // The mark and the word are both inside the anchor, which is what makes
+    // the target the size a person aims at.
+    await expect(home.locator("img")).toHaveCount(1);
+    await expect(home).toContainText("pelfs");
+
+    await home.click();
+    await expect(page.getByTestId("pelfs-shell")).toBeVisible();
+    await expect(page.getByTestId("session-error")).toHaveCount(0);
   });
 });

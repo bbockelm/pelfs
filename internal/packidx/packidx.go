@@ -237,10 +237,23 @@ func (h *Header) Window(key []byte) (off, length int64, ok bool) {
 		// the first record IS the first sample.
 		return 0, 0, false
 	}
-	first := i * h.Stride
-	last := min(first+h.Stride, h.Count) // exclusive
+	// Count and Stride are the header's own numbers, which for a remote
+	// reader means bytes off the federation that nothing has yet held
+	// against the object. Widened to int64 so the product cannot wrap,
+	// and the window is refused rather than returned inside out: with a
+	// Count below the samples' reach, last-first went NEGATIVE and this
+	// returned an extent of [29997264285088,+-19998176189952) — a range
+	// request with a negative length. Both remote readers happen to
+	// reject that today, which is exactly the argument for checking it
+	// here: a bound only the callers apply is a bound the next caller
+	// will not have.
+	first := int64(i) * int64(h.Stride)
+	last := min(first+int64(h.Stride), int64(h.Count)) // exclusive
+	if last <= first {
+		return 0, 0, false
+	}
 	entry := int64(h.KeyLen + h.RecordLen)
-	return h.base + int64(first)*entry, int64(last-first) * entry, true
+	return h.base + first*entry, (last - first) * entry, true
 }
 
 func (h *Header) sampleAt(i int) []byte { return h.samples[i*h.KeyLen : (i+1)*h.KeyLen] }

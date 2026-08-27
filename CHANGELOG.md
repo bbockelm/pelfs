@@ -2,6 +2,285 @@
 
 ## Unreleased
 
+**Less to read on both web surfaces.** The upload notice is one sentence
+("File uploaded to local machine; click "Publish now" to push it to the
+federation"). The publish control is one button wearing its own state —
+*Nothing to publish* / *Publish now* / *Publishing* — with no hint beside it,
+and a running seal is said once, on the durability line ("Publishing now."),
+instead of under a countdown to a publish already in flight. The countdown
+dropped ", or 30s after this tab closes"; the idle seal itself is unchanged.
+`/connect` lost the sentence explaining that it does not browse files and
+gained a **Download Cyberduck** link, which it never had. The credential panel
+no longer shows a username, a password, a password-path bookmark or the
+shown-once notice — password auth is going away in favour of OAuth.
+**Publishing a rename no longer costs the volume.** Renaming one file and
+checkpointing took 54.7 s on a mounted volume, 19.9 MiB of it DOWNLOADED to
+publish a change that moves no bytes. The seal's carry-forward check
+(`genfs.ContentOf`) proved every reused chunk still had a home by building the
+generation's whole location map — one pack-trailer fetch per pack in the
+volume — so the cost of publishing a rename was set by how big the volume was
+and not by how big the change was. Presence now resolves through the
+generation's own multi-pack index, which names the pack an identity went into,
+held against the signed pack list; the whole-generation sweep survives only as
+the fallback for a volume with no index to answer from, which is the only
+thing entitled to say a chunk is absent. The cost is that this one caller
+accepts the index's 12-byte key without confirming the full 32 — a ~10^-13
+false positive, reachable only on a volume that is already missing a chunk,
+against a check whose old price was the whole volume; the argument is written
+out at `packIndex.holds`. Measured on the same fixture, a rename in a 98-pack
+volume went from 103 objects and 9.0 MiB to 7 objects and 20.7 KiB, and the
+number no longer grows with the volume.
+`TestMetadataOnlySealDoesNotFetchTheVolume` asserts the object COUNT — counts
+are deterministic where wall clock is not — and
+`TestContentOfStillReportsASweptPackAsAbsent` pins the half that must not be
+traded away.
+
+**A rename is unpublished work, and the page is told so now.** The durability
+panel is fed from `genSession.pressure()`, which reported staged bytes and
+dirty inodes — and a rename writes neither, only namespace edges. So renaming
+a file in the browser left the page saying there was nothing to publish, and
+the idle sealer agreed with it and never sealed when the last tab closed. The
+seal itself never had the hole (`checkpoint` and `sealAtExit` have always
+tested `DirtyEdges`), which is why this cost a prompt rather than the data.
+`pressure()` now reports edges too, `/api/v1/info` carries `dirty_edges` and an
+`unpublished` boolean computed from the same predicate the seal uses, and the
+idle sealer counts a rename as both a change and something to publish.
+
+**A seal says how much of itself was the mount following it.** The swap phase
+re-descends every inode the KERNEL is holding, so its cost is set by how much
+of the tree the session has browsed and not at all by how much changed; the
+line after a checkpoint now reports that resident count beside the inodes
+returned to clean, so an eight-second swap on a three-inode seal is a number
+rather than a mystery.
+**A saved Cyberduck bookmark reconnects with no click.** `pelfs browse` now
+records the OAuth grants a human authorized in
+`<state-dir>/browse-grants.key`, so a program that has been authorized once
+reconnects across a restart without a consent screen. Consent itself is still
+never remembered at `/oauth/authorize` — that is the control that stops a page
+you happened to visit from driving the endpoint — and the two are different
+things: a client holding a refresh token talks to `/oauth/token` and never
+reaches `/authorize` at all. The file holds an HMAC of each refresh token and
+never the token, carries a 30-day ceiling, and every row is listed on the
+connection page with its own revoke button that deletes it from disk before
+reporting success.
+
+**Pressing Authorize lands you on a success page, and pressing it twice does
+not error.** The consent POST used to redirect straight to the WebDAV client's
+loopback listener, which answers by closing the connection — so the browser
+died on a blank tab at the moment the flow had worked. It now answers a page
+that says which program reached which volume, with the authorization delivered
+from one hidden frame. A second press answers "already connected" instead of a
+replay refusal; it mints nothing and re-sends nothing. At the token endpoint, a
+used code presented again *with* its PKCE verifier is the client retrying and
+costs it nothing, while one presented without the verifier still revokes the
+grant the first exchange bought.
+
+**Password authentication is gone from `pelfs browse`.** No per-client HTTP
+Basic credential is minted, no password bookmark is generated, and none is in
+the credential response; `/dav/*` accepts an OAuth Bearer token and offers
+exactly one challenge. The consent screen lost its callback-URL row and its
+paragraph of reassurance — it names the program, the volume and the scope.
+
+**A hostile pack can no longer panic a reader.** The stored-trailer length in
+a pack footer is eight bytes an origin chooses, and the bound check on it
+(`idxLen+footerSize > size`) overflowed: at MaxInt64 the sum wraps negative,
+passes, and the slice derived from it panics whatever was reading the pack — a
+mount, a `pelfs ls`, a browse session. CI's fuzzer found it; the crasher is
+checked in under `internal/packstore/testdata/fuzz/FuzzParseTail`. Lengths off
+a footer are now bounded by subtraction against the object's real size, which
+cannot overflow, and the same class is closed in the table trailer: the extent
+check moved above the trailer form (the table form read offsets and lengths as
+raw uint64s and skipped it), the record WIDTH the table declares is checked
+against the layout its readers assume, and the dead-list bound is computed in
+int64 so a 32-bit build cannot slice with a negative one.
+
+**The sorted lookup table both index formats go through is fuzzed now.**
+`internal/packidx` is what a pack trailer, a multi-pack index and a graft
+index all parse their entries with, and it had no fuzz target at all —
+`FuzzOpenTable` covers `Open`, `ParseHeader`, `SampleExtent` and the windowed
+lookup path a remote reader uses. It found a window computed from an
+attacker-chosen count and stride coming back with a NEGATIVE length, which
+would have been a range request for -19998176189952 bytes; both remote readers
+reject that today, which is the argument for rejecting it where it is
+computed rather than at each caller. `FuzzDecodeTrailer` now also hands the
+decoder the TABLE form, which it had never once tried — the form every pack
+written today carries.
+
+**A volume that will not open says why, on the page.** Both surfaces rendered
+every phase that was not `ready` as "reading the overlay…", so a session
+refused by a leftover branch lease looked exactly like one that was about to
+open. A failed open now renders the server's whole sentence — what refused,
+this session's state directory, and what to do next — as a stopped state
+rather than a progress message, and no publish control beside it.
+
+**A branch switch no longer reads as a publish.** `POST /api/v1/branch`
+reports progress in the publish job slot with `reason: "branch"`; the page
+reads the reason and says the session is switching branches, which is what is
+happening — nothing is being written to the federation.
+
+**The branch pill is a control.** `GET /api/v1/branches` lists the volume's
+branches with the generation, head and staged flag the picker needs, and
+`POST /api/v1/branch` switches — 202 with progress on `/events` like a
+publish job, because reopening a volume at another generation is not
+instant. A switch reuses the generation swap a checkpoint already uses
+(`genfs.Swap`), so the WebDAV handler, the JSON data plane and the
+durability panel follow it rather than being kept in sync. A session with
+unpublished work answers **409, "publish or discard first"** — nothing is
+discarded to make a switch possible — and a read-only session is **not**
+refused: it has no overlay to strand and no lease to move, which makes it
+the safest form of the operation.
+
+**`pelfs browse` listens on 8443 when it can.** The port is the first free
+one at or above 8443, probed a hundred ports up before falling back to an
+OS-chosen one — replacing a hash of the volume URL, which gave every volume
+its own port in the 61000s and no user a port they could predict. The
+session says which port it got and, when it is not 8443, that a profile from
+an earlier session names a different one. Because the port no longer
+identifies the volume, a generated profile's `Vendor` now does: two volumes
+install as two profiles, and a bookmark that reaches a session serving
+another volume is refused by a page naming the volume that listener IS
+serving, rather than opening the wrong files. `docs/known-issues.md` KL-20
+has the cost; `docs/design-webui.md`'s threat-model audit is re-run for a
+port that is published rather than merely guessable.
+
+**`pelfs browse` no longer disappears behind its own page.** A volume that
+refuses to open — most often a killed session's branch lease, which outlives
+its holder by a TTL — used to end the process inside the second the browser
+took to attach, leaving a tab retrying against a closed port and a durability
+panel stuck on "reading the overlay…". The failure is now served: the reason,
+the holder and this session's state directory go on the page, the listener
+stays up for a browser to attach and show them, and the exit is orderly (every
+stream gets `event: bye`). It is bounded in both directions — 15s with nobody
+watching, 60s after the last tab closes, and Ctrl-C at any time — and the exit
+code is unchanged. A session's exit now says which door it left by.
+
+**A publish leaves the session running, and something finally asserts it.**
+Nothing changed in the publish path; what changed is that
+`scripts/browse-gate.sh` used to `kill -TERM` the session on the line after
+the 202, so a session that ended on its own after publishing was green
+everywhere. The gate now checks the process, the data plane and the event
+stream after the publish, and two new tests drive the real verb through both
+triggers — the button and the automatic seal, which no gate had ever run.
+
+**The browse UI says less.** The status line's whole-file-upload caveat and the
+search-scope caveat are **deleted**, not shortened or hidden behind a
+disclosure; both facts live in `docs/known-issues.md` (KL-15, KL-19) and an
+upload that fails still says so when it fails. The durability sentence no
+longer repeats the mode chip or the generation — published reads
+"Everything here is in the federation." on both surfaces. `/connect` is an
+action page: **Connect with Cyberduck**, with a link to cyberduck.io and each
+remaining fact beside the control it describes, in place of a 180-word
+preamble. The footer is pinned to the bottom of the viewport on both pages,
+the wordmark on `/connect` links home, and the branch pill is a real picker
+where the server offers `GET /api/v1/branches` (and today's static pill where
+it does not).
+
+**The file manager looks like a file manager.** The app shipped one of the eight
+stylesheets the component needs (`style.css`, not `all.css`), so thirteen base
+theme tokens were undefined and the menu, the modal, the segmented view switch
+and the uploader's hidden file input had no rules at all: cards were
+transparent, the search box's border computed to `0px none`, the "Add New" menu
+rendered as bare text over the folder tree, and a native "Choose Files" widget
+sat in the middle of the file pane. The complete stylesheet is now imported,
+with its six cdn.svar.dev `@font-face` rules dropped at build time — nothing
+loads off loopback, and the suite still proves it for a whole session. Dark
+mode used to leave the component on its light theme, rendering white file names
+on white cards; both themes now follow the platform and share one palette.
+Cost: +13 KB gzipped.
+
+**The page is laid out as a tool**: an app bar, and two panels — what is
+published, and the files — with borders and space between them instead of
+full-bleed strips of prose. The glyph legend is gone (each glyph already sits
+beside its own words; the three-distinct-characters contract is asserted
+against what the panel renders). The "search is partial" paragraph is a quiet
+chip on the file pane's own bar that opens to the full sentence. A **read-only
+session renders no publish control at all** — it says so once, where the button
+would have been — and "Connect a program" moved to the app bar, off the
+publish line.
+
+**`pelfs browse` connects Cyberduck again.** Two bugs made every real-browser
+authorization fail, and neither was visible to the curl-driven gates. A
+browser sends `Origin: null` on a form POST when the page carries
+`Referrer-Policy: no-referrer`, so every consent click was answered
+`403 origin refused`; and Chromium enforces `form-action` on the redirects of
+a form submission, so the 303 that hands the code to the client was blocked
+by the consent page's own CSP, reported to the console and nowhere else. The
+navigation surface now serves `Referrer-Policy: same-origin` and the consent
+page's `form-action` names the client's exact callback. New gate:
+`make oauth-browser` — a real Chromium and real `duck` on one flow.
+
+**The browse port is stable per volume**, derived from the prefix
+(61000–65535), so a saved Cyberduck bookmark is no longer single-use;
+`--port` overrides it and a taken port falls back with a warning naming both.
+The port was never a secret and the audit is in `docs/design-webui.md`.
+
+**And the generated Cyberduck profile survives a restart too, so install it
+once.** Its `OAuth Client ID` is derived from a per-volume key in the state
+directory (`browse-identity.key`, mode 0600, written on the first download)
+instead of minted per download, so the file comes out byte-identical every
+time and the copy already installed keeps working. No token and no password
+is persisted, and **consent is still required on every authorization** — the
+bookmark and the profile stop being one-time-use; the one Authorize click per
+session does not go away. Revoking a program now deletes its identity, so its
+profile is dead for good rather than until the next restart, and the API says
+so with a 500 if that could not be written. Closes KL-17; KL-18 (a local
+process can squat a predictable port) stands.
+
+**Generated bookmarks have names.** Cyberduck read `Default Nickname` and
+`Name` from the profile, neither of which pelfs set, so every bookmark showed
+`127.0.0.1 - WebDAV (HTTP)`. They now read `pelfs: <volume> (<label>)`.
+
+**A refusal at `/oauth/authorize` explains itself on the page** instead of
+three words of `text/plain`, and a callback-port mismatch names both ports.
+
+**`pelfs graft` splices into a volume that already has content in it.** Until
+now grafting a foreign Pelican tree replaced the volume's namespace, so the
+only usable sequence was `pelfs init` then `pelfs graft` — which is not what
+anybody wants a graft for. A graft is now spliced in at one path: everything
+else keeps its inodes, its attributes and the content records the previous
+generation published, and the catalogs outside the graft path are carried
+forward rather than rebuilt, so a graft into a large volume rewrites the path
+and does not read the rest. `docs/design-graft.md`, Decision 14.
+
+**What is at the graft path is decided per case, and nothing is replaced
+silently.** A populated directory is refused — with its entry count and two of
+its names — unless you pass `--replace`; so is a file. An *empty* directory is
+adopted, because nothing is lost. Re-grafting the same source at the same path
+is refused and told to use `--refresh`, which is what it is; a graft from a
+*different* source replaces the old one and says whose storage this volume
+will start fetching from instead. A graft inside an existing graft, or one
+that would swallow one, is refused by name. Every refusal ends in what to do
+instead.
+
+**`pelfs graft --remove`** drops a graft and publishes a generation that does
+not serve it and does not name its source. It reads nothing. It is also the
+way out that the nesting refusals now offer.
+
+**A graft is a write, so it behaves like one.** The signing key and the whole
+path check happen *before* the walk, which at TB scale is hours; the advisory
+branch lease is taken after the walk and before the flip, so a graft no longer
+blocks a mount from checkpointing while it reads somebody else's storage; and
+the branch head is re-read afterwards, so a graft cannot silently revert writes
+a mount sealed while the spider ran. A killed `pelfs graft` leaves the volume
+on its previous generation.
+
+**A graft-integrity failure is its own error class.** When a graft source has
+been republished under a signed generation, the read still fails closed with
+the same message — naming the graft, the object, the range, both hashes, what
+changed and the fix — but it is now `genfs.ErrGraftIntegrity`, carries the
+evidence on a typed error, and maps to **`EBADMSG` ("Bad message")** instead of
+`EIO`. The distinction is operational: an unreachable source is worth
+retrying, and a changed one never will be until somebody runs `pelfs graft
+--refresh`, and one errno could not say which. The log line no longer reads
+"returning EIO for an unrecognized error", and it has its own budget so a mount
+full of unrelated errors cannot suppress the one message that names a changed
+source.
+
+*Known limitation, and it is not new:* an out-of-band publish — a graft, a
+repack, a merge, a second writer — strands an unsealed write overlay left in
+the same state directory, and `pelfs mount --rw` then refuses it. `pelfs
+graft` now warns about this before it starts.
+
 **`pelfs browse` opens the file manager.** `GET /` is now the React file
 manager — `internal/webui`'s committed bundle, on the route table — and the
 hand-written connection page moved to **`GET /connect`**, where the credential
@@ -43,6 +322,46 @@ page a user lands on:**
   a manual reload. The page now takes its readiness from the same event stream
   the durability panel reads, and shows the panel and the connection banner
   while it waits.
+
+### `pelfs fsck` findings now have a severity, and a warning does not fail a run
+
+`fsck` had one verdict: anything it found was damage, and any finding exited
+1. That is right for everything it checks today and wrong for two checks
+arriving next, where the thing being reported is normal rather than broken —
+an external source a volume points at having been republished, or a pinned
+source that cannot be verified from this volume's objects alone. Under the
+old model those would exit 1 on a perfectly healthy volume, and an operator
+who learns that `fsck` cries wolf stops running `fsck`.
+
+What changes for an operator:
+
+- **Nothing was reclassified.** Every check `fsck` ships still reports
+  damage, still exits 1, and reports it in the same words. Nothing produces
+  a warning yet; this release is the tier, not a user of it.
+- **Exit status is unchanged for damage and for a healthy volume**: 0 when
+  nothing was found, 1 when the generation is damaged or the check could not
+  run, 2 for a usage error. Warnings alone will exit **0** — a script that
+  reads "nonzero means broken" will not start failing on a volume that is
+  fine.
+- **`--strict`** fails on warnings too, for a cron job that wants any
+  finding to be an alert. It exits 1, like damage: the flag means "a warning
+  is an error".
+- **Every finding line now leads with its severity** — `error: missing-chunk:
+  /path: ...` — so a line lifted out of the report by a grep still says
+  whether it is damage. The kind, path and detail behind it are unchanged.
+- **The summary line names the warnings it is standing next to.** A run with
+  warnings and no damage says `generation is consistent, with 2 warnings to
+  read above (not damage)`, so "consistent" is never the whole story when it
+  is not. The words `generation is consistent` still appear whenever the
+  generation is consistent, which is what existing greps match.
+
+For anyone using `internal/fsck` directly: `Problem` carries a `Severity`
+(`SeverityError` is the zero value, so an unstated severity is damage),
+`Report` gained `Errors()`, `Warnings()`, `Damaged()` and `Clean()`, and
+`Report.OK()` is **gone**. It used to mean "no findings at all"; with two
+severities every caller has to say which question it is asking — "is this
+volume sound" (`Damaged`) or "is there anything to show a human" (`Clean`) —
+and removing it is how each one got asked.
 
 ### Fixed
 

@@ -55,9 +55,11 @@ test.describe("the file manager", () => {
     await expect(page.getByTestId("pelfs-shell")).toBeVisible();
     await expect(card(page, "/data")).toBeVisible();
     await expect(card(page, "/README.txt")).toBeVisible();
-    // The durability panel is above the files, not behind a tab.
+    // The durability panel is above the files, not behind a tab, and it is its
+    // own panel rather than a strip of prose (tests/chrome.spec.ts holds that
+    // line in detail).
     await expect(page.getByTestId("durability")).toBeVisible();
-    await expect(page.getByTestId("durability-legend")).toBeVisible();
+    await expect(page.getByTestId("pelfs-durability-panel")).toBeVisible();
   });
 
   test("one listing per directory, and exactly one -- the store asks twice", async ({
@@ -98,37 +100,28 @@ test.describe("the file manager", () => {
     await expect(cap).toBeVisible();
     await expect(cap).toHaveAttribute("data-listing-total", "6000");
     await expect(cap).toHaveAttribute("data-listing-returned", "5000");
+    // The two numbers, which is the whole of what a user needs to know that
+    // the folder is bigger than the screen.
+    await expect(cap).toContainText("5,000");
     await expect(cap).toContainText("6,000");
-    await expect(cap).toContainText("shown in part");
-    // And it names what to do instead, rather than leaving the user stuck.
-    await expect(cap).toContainText("pelfs mount");
+    // AND NOTHING ELSE. The disclosure that used to open to a paragraph about
+    // virtualization and heap size is deleted: a count is a fact, and the
+    // explanation of why the cap exists is not something a person standing in
+    // a folder needs. It is not a <details> any more, so there is nothing to
+    // open and no hidden body to assert.
+    await expect(cap.locator("summary")).toHaveCount(0);
   });
 
-  test("the partial search is admitted in words, beside the search box", async ({
-    page,
-    session,
-  }) => {
-    // Typing in the toolbar's search box fires NO request (recording.json,
-    // step "search"): the store filters what it has. Combined with the cap,
-    // "no results" means "not in what this tab loaded", which is a different
-    // statement from "not in your volume".
-    await openPelfs(page, session);
-    const notice = page.getByTestId("search-scope");
-    // Before anyone types: the caveat is already on the screen, as a
-    // sentence, in the strip directly above the toolbar whose search box sits
-    // at its left. Not a tooltip -- a tooltip does not exist on a touch
-    // screen and is invisible to anyone who does not think to hover.
-    await expect(notice).toBeVisible();
-    await expect(notice).toHaveAttribute("data-searching", "no");
-    await expect(notice).toContainText("partial by design");
-
-    const box = page.getByPlaceholder("Search");
-    await box.fill("sample");
-    await expect(notice).toHaveAttribute("data-searching", "yes");
-    await expect(notice).toContainText("This search is partial");
-    await expect(notice).toContainText("asks the server nothing");
-  });
-
+  /*
+   * DELETED: "the partial search is admitted, beside the search box, and says
+   * how much". It drove the <details> chip and the "searching N loaded rows"
+   * summary, and both are gone from the UI on the owner's instruction, given
+   * twice -- so the spec goes with them rather than being weakened into
+   * asserting a smaller version of something he asked to have removed. The
+   * fact it was defending is KL-19 in docs/known-issues.md; that the chip
+   * STAYS gone is asserted in tests/chrome.spec.ts, which is the file that
+   * owns "what is on the screen".
+   */
   test("create a folder: the mutation is application/json, or the guard 415s it", async ({
     page,
     session,
@@ -172,8 +165,13 @@ test.describe("the file manager", () => {
     await expect(card(page, "/measurement.dat")).toBeVisible();
     const notice = page.getByTestId("upload-notice");
     await expect(notice).toBeVisible();
-    await expect(notice).toContainText("THIS MACHINE");
-    await expect(notice).toContainText("invisible to the federation");
+    // ONE SENTENCE, AND IT IS THE OWNER'S. Ours was four -- the overlay,
+    // durability against a crash, invisibility to the federation, and what the
+    // line above meant -- and the verdict was "WAAY to wordy". Asserted whole,
+    // because a budget would let it grow back up to the budget.
+    await expect(notice).toHaveText(
+      'File uploaded to local machine; click "Publish now" to push it to the federation',
+    );
     // And the durability line, which is the authority, agrees with it.
     await expect(page.getByTestId("durability")).toHaveAttribute("data-durability", "staged");
     await expect(page.getByTestId("durability")).toContainText("on this machine only");
@@ -359,8 +357,9 @@ test.describe("the file manager on a real volume", () => {
     // exactly what that means.
     await expect(card(page, "/measurement.dat")).toBeVisible();
     const notice = page.getByTestId("upload-notice");
-    await expect(notice).toContainText("THIS MACHINE");
-    await expect(notice).toContainText("invisible to the federation");
+    await expect(notice).toHaveText(
+      'File uploaded to local machine; click "Publish now" to push it to the federation',
+    );
     await expect(line).toHaveAttribute("data-durability", "staged");
     await expect(line).toContainText("on this machine only");
 

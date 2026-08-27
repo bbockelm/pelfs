@@ -126,6 +126,19 @@ type Options struct {
 	// once and exits pays the smaller number; anything that reads a file
 	// twice pays the larger one.
 	ChunkArenaBytes int64
+	// GraftOpener builds a transport for one graft SOURCE prefix
+	// (graft.go). It is a function rather than a set of stores because
+	// genfs must not construct transports — it takes Inner rather than a
+	// Config, and a graft source is a different prefix and often a
+	// different federation.
+	//
+	// It is also THE READER'S VETO. A generation's grafts are signed, so
+	// the URLs are tamper-evident, but tamper-evident is not safe: a
+	// grafted volume makes the READER's client fetch URLs the volume's
+	// author chose, from the reader's own network position. Returning an
+	// error here refuses the source and fails the mount, which is the
+	// only place that decision can be enforced. Nil refuses every graft.
+	GraftOpener func(ctx context.Context, source string) (pelicanobj.Store, error)
 }
 
 // Node is one inode's attributes: catalog.Node with a kernel-shaped uint64
@@ -223,6 +236,14 @@ type FS struct {
 
 	cats *catCache
 	ext  *extentCache
+	// grafts is the external location layer, nil on a volume with none
+	// (graft.go). A nil table is the whole of the cost grafts impose on a
+	// volume that has none.
+	grafts *graftTable
+	// graftCache is the local disk tier for grafted blocks
+	// (graftcache.go), nil on a volume with no grafts or a mount with
+	// whole-pack caching turned off.
+	graftCache *graftCache
 
 	// swapMu makes a generation swap atomic with respect to filesystem
 	// operations: every operation holds it for READ for its whole
@@ -392,6 +413,15 @@ func Open(ctx context.Context, o Options) (*FS, error) {
 		root.Close() //nolint:errcheck
 		return nil, fmt.Errorf("genfs: unknown identity algo %q", algo)
 	}
+	// After the identity algo is known, because a graft is refused on a
+	// keyed-identity volume, and before anything can read: a mount that
+	// cannot load a graft index must fail rather than serve the tree with
+	// a hole in it (graft.go).
+	if err := fs.openGrafts(ctx, o); err != nil {
+		root.Close()     //nolint:errcheck
+		fs.arena.Close() //nolint:errcheck
+		return nil, err
+	}
 	fs.cats = newCatCache(fs, o.MaxOpenCatalogs, rootHex, root)
 	// Now, and not before the root catalog is open and pinned: this is
 	// what enforces the budget on a cache an earlier session left behind
@@ -412,6 +442,7 @@ func (fs *FS) Close() error {
 	if aerr := fs.arena.Close(); err == nil {
 		err = aerr
 	}
+	fs.closeGrafts()
 	return err
 }
 

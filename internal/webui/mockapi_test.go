@@ -102,20 +102,45 @@ type mockEntry struct {
 type mockAPI struct {
 	sessions *browsesession.Manager
 
-	mu      sync.Mutex
-	ent     map[string]*mockEntry
-	gen     uint64
-	staged  int
-	sbytes  int64
+	mu     sync.Mutex
+	ent    map[string]*mockEntry
+	gen    uint64
+	staged int
+	sbytes int64
+	// sedges is unpublished NAMESPACE: what a rename leaves behind. It is
+	// separate from staged because the SERVER reports it separately, and
+	// for the reason the server has to — a rename moves no bytes and
+	// writes no inode row, so a mock that recorded one as a staged FILE
+	// would be a contract this suite could not use to catch the page
+	// reading the wrong field.
+	sedges  int
 	job     *mockJob
 	mode    string
 	volume  string
+	branch  string
 	streams int
+	// phase and openErr are the failed open, which is a state of the SERVER
+	// and not of any volume: `pelfs browse` prints the URL and serves the
+	// page before it opens the volume, so a refusal -- a branch lease a
+	// killed --rw session left behind is the ordinary one -- reaches a tab
+	// that is already loaded. The page has to render it as a stopped state
+	// rather than as progress, and this is the only way the embed server can
+	// put it on screen.
+	phase   string
+	openErr string
+	// switchStall is how long a branch switch takes, and it is settable for
+	// the same reason `pelfs browse --test-hooks` has publish_stall_ms: a
+	// driver asserting what the page says WHILE a switch runs cannot race a
+	// 300 ms job, and the suite's rule is that nothing waits on a guess.
+	switchStall time.Duration
 }
 
 type mockJob struct {
-	ID      string    `json:"id"`
-	State   string    `json:"state"`
+	ID    string `json:"id"`
+	State string `json:"state"`
+	// Reason is cmd/pelfs/browse.go's: "user", "idle", or "branch" for a
+	// switch, which takes this same slot and is NOT a publish.
+	Reason  string    `json:"reason,omitempty"`
 	Started time.Time `json:"started"`
 	Ended   time.Time `json:"ended,omitzero"`
 	Summary string    `json:"summary,omitempty"`
@@ -141,7 +166,8 @@ func newMockAPI(m *browsesession.Manager) *mockAPI {
 // which is the same class of flakiness as a fixed sleep.
 func (a *mockAPI) seed() {
 	a.ent = map[string]*mockEntry{}
-	a.gen, a.staged, a.sbytes, a.job = 87, 0, 0, nil
+	a.gen, a.staged, a.sbytes, a.sedges, a.job = 87, 0, 0, 0, nil
+	a.branch, a.phase, a.openErr, a.switchStall = "main", "ready", "", 300*time.Millisecond
 	now := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
 	add := func(id string, dir bool, size int64) {
 		a.ent[id] = &mockEntry{id: id, dir: dir, size: size, mtime: now, body: "pelfs mock bytes for " + id + "\n"}
@@ -199,6 +225,15 @@ func (a *mockAPI) mount(mux *http.ServeMux) {
 	mux.Handle("DELETE /api/v1/files", api(a.remove))
 	mux.Handle("POST /api/v1/upload", api(a.upload))
 	mux.Handle("POST /api/v1/publish", api(a.publish))
+	// THE BRANCH ROUTES, which the embed server did not have and so did not
+	// exercise: with no `/api/v1/branches` here, `listBranches` reported
+	// "unsupported" and ui/BranchPicker.tsx degraded to the static pill it
+	// renders when the route has not landed. Everything the picker actually
+	// is -- a select, a switch, a refusal with the server's reason in it --
+	// was reachable in browse mode only. They are cmd/pelfs/browsebranch.go's
+	// contract, status for status.
+	mux.Handle("GET /api/v1/branches", api(a.branches))
+	mux.Handle("POST /api/v1/branch", api(a.switchBranch))
 	mux.Handle("POST /api/v1/download", api(a.mintTicket))
 	// The same route name M1 gives its own driver hook, so one helper in the
 	// browser suite drives both surfaces. It only ever puts this in-memory
@@ -356,7 +391,9 @@ func (a *mockAPI) rename(w http.ResponseWriter, r *http.Request) {
 	}
 	to := join(path.Dir(id), req.Name)
 	a.movePath(e, to)
-	a.stage(1, 0)
+	// A whiteout for the old name and an edge for the new one; no staged
+	// file and no staged byte, exactly as overlay.Rename leaves it.
+	a.stageEdges(2)
 	writeMockJSON(w, http.StatusOK, map[string]any{"result": map[string]any{"id": to}})
 }
 
@@ -546,6 +583,10 @@ func (a *mockAPI) stage(files int, bytes int64) {
 	a.sbytes += bytes
 }
 
+// stageEdges records unpublished namespace — a name added, removed, or
+// moved — which is what a rename produces and all it produces.
+func (a *mockAPI) stageEdges(n int) { a.sedges += n }
+
 func join(dir, name string) string {
 	if dir == "" || dir == "/" {
 		return "/" + strings.TrimPrefix(name, "/")
@@ -562,15 +603,17 @@ func (a *mockAPI) state() map[string]any {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	st := map[string]any{
-		"phase":          "ready",
+		"phase":          a.phase,
 		"volume":         a.volume,
 		"mode":           a.mode,
-		"branch":         "main",
+		"branch":         a.branch,
 		"generation":     a.gen,
 		"lease":          "held",
 		"staged_files":   a.staged,
 		"staged_bytes":   a.sbytes,
 		"dirty_nodes":    a.staged,
+		"dirty_edges":    a.sedges,
+		"unpublished":    a.staged > 0 || a.sedges > 0,
 		"upload_backlog": 0,
 		"next_publish_s": 221,
 		"test_hooks":     false,
@@ -581,12 +624,60 @@ func (a *mockAPI) state() map[string]any {
 	if a.job != nil {
 		st["publish"] = *a.job
 	}
+	if a.phase == "failed" {
+		st["error"] = a.openErr
+	}
 	return st
 }
 
-func (a *mockAPI) resetHook(w http.ResponseWriter, _ *http.Request) {
+// resetHook is the driver hook, and it does two things.
+//
+// `{"reset": true}` (or an empty body) puts the volume back the way it started
+// -- see seed for why a browser suite has to be order-independent.
+//
+// `{"mode": "read-only"}` is the second, and it exists for one assertion the
+// browser suite cannot otherwise make: `pelfs browse` is READ-ONLY BY DEFAULT,
+// and the whole point of the shipped design is that such a session renders no
+// publish control at all rather than a disabled one explaining itself. The
+// harness runs `pelfs browse --rw` (it has to: the publish path is the other
+// thing under test), so read-only is not reachable there, and this mock is the
+// only server in the suite that can report it.
+//
+// `{"phase": "failed", "error": "…"}` is the third, and it is the state the
+// owner actually hit: a `--rw` session refused by a branch lease its own
+// killed predecessor left behind. The refusal is SERVED rather than raced
+// now (cmd/pelfs/browsefail.go), and what the page does with it is a UI
+// property -- so it has to be drivable from a browser. `pelfs browse` has no
+// hook for it (a real failed open ends that process), which makes this the
+// only server in the suite that can put a failed phase on the screen.
+//
+// `{"switch_stall_ms": N}` is the fourth: it slows the branch switch so a
+// driver can assert what the page says while one is running, the way
+// `pelfs browse --test-hooks`'s publish_stall_ms does for a seal.
+func (a *mockAPI) resetHook(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Reset bool   `json:"reset"`
+		Mode  string `json:"mode"`
+		Phase string `json:"phase"`
+		Error string `json:"error"`
+		// Milliseconds, so a spec can watch a switch that is still running.
+		SwitchStallMS int `json:"switch_stall_ms"`
+	}
+	// A body is optional and a malformed one is not worth a 400 here: the
+	// zero value is "reset", which is what every caller but one wants.
+	_ = json.NewDecoder(r.Body).Decode(&req)
 	a.mu.Lock()
-	a.seed()
+	switch {
+	case req.SwitchStallMS > 0:
+		a.switchStall = time.Duration(req.SwitchStallMS) * time.Millisecond
+	case req.Phase == "failed":
+		a.phase, a.openErr = "failed", req.Error
+	case req.Mode == "read-only" || req.Mode == "read-write":
+		a.mode = req.Mode
+	default:
+		a.seed()
+		a.mode = "read-write"
+	}
 	a.mu.Unlock()
 	writeMockJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
@@ -619,12 +710,141 @@ func (a *mockAPI) publish(w http.ResponseWriter, _ *http.Request) {
 		a.gen++
 		job.State, job.Ended = "done", time.Now()
 		job.Summary = fmt.Sprintf("generation %d", a.gen)
-		a.staged, a.sbytes = 0, 0
+		a.staged, a.sbytes, a.sedges = 0, 0, 0
 		for _, e := range a.ent {
 			e.staged = false
 		}
 	}()
 	writeMockJSON(w, http.StatusAccepted, map[string]any{"job": job.ID, "watch": "/events"})
+}
+
+// ---- the branches ---------------------------------------------------------
+
+// mockBranches is the volume's ref listing. Three, because one is not a
+// choice and the picker's whole purpose is choosing: the session starts on
+// main, dev is somewhere else to go, and release is the third row that proves
+// the control is a list and not a toggle.
+var mockBranches = []struct {
+	name string
+	gen  uint64
+	head string
+}{
+	{"main", 87, "3f1a9c04d7b2e610"},
+	{"dev", 91, "a02c77e4159b3d8f"},
+	{"release", 74, "c81d5b6602aa4f39"},
+}
+
+// branches is `GET /api/v1/branches`, in cmd/pelfs/browsebranch.go's shape:
+// {current, branches:[{name, generation, head, staged}]}, and `current` is
+// always one of the rows -- ui/BranchPicker.tsx renders the select's value
+// from it, and a value with no matching option is a control showing the
+// wrong branch.
+func (a *mockAPI) branches(w http.ResponseWriter, _ *http.Request) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	rows := make([]map[string]any, 0, len(mockBranches))
+	for _, b := range mockBranches {
+		row := map[string]any{"name": b.name, "generation": b.gen, "head": b.head}
+		if b.name == a.branch {
+			// The generation this session is actually on, which the publish
+			// above may have moved past the listing's, and the only row that
+			// can be carrying staged work.
+			row["generation"] = a.gen
+			row["staged"] = a.staged > 0 || a.sedges > 0
+		}
+		rows = append(rows, row)
+	}
+	writeMockJSON(w, http.StatusOK, map[string]any{"current": a.branch, "branches": rows})
+}
+
+// switchBranch is `POST /api/v1/branch`: 202 and a JOB, never a synchronous
+// answer, plus the refusal that matters to a person.
+//
+// THE 409 IS THE INTERESTING ONE. A picker that silently discarded an overlay
+// would lose an afternoon of uploads to one click, so a session with staged
+// work is refused -- and the refusal carries a `reason` the page can put on
+// the screen, which is why the words here are cmd/pelfs/browsebranch.go's
+// own rather than something shorter.
+//
+// A READ-ONLY SESSION IS NOT REFUSED, and that is faithful rather than lax:
+// browsebranch.go records the decision explicitly (it has no overlay to
+// strand, no lease to move and nothing to publish, so a switch is a swap and
+// nothing else). The client handles a 403 anyway; this server, like the real
+// one, never sends it.
+func (a *mockAPI) switchBranch(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeMockJSON(w, http.StatusBadRequest, map[string]string{"error": "expected a JSON body"})
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	known := false
+	for _, b := range mockBranches {
+		if b.name == name {
+			known = true
+		}
+	}
+	if !known {
+		writeMockJSON(w, http.StatusNotFound, map[string]string{
+			"error": "no branch named " + name + " in this volume"})
+		return
+	}
+
+	a.mu.Lock()
+	if a.job != nil && a.job.State == "running" {
+		id := a.job.ID
+		a.mu.Unlock()
+		writeMockJSON(w, http.StatusConflict, map[string]string{
+			"error":  "a publish is running; switching would strand it",
+			"reason": "wait for the publish to finish, then switch",
+			"job":    id})
+		return
+	}
+	if a.staged > 0 || a.sedges > 0 {
+		from := a.branch
+		a.mu.Unlock()
+		writeMockJSON(w, http.StatusConflict, map[string]string{
+			"error": "this session has work staged on " + from + " that is not published yet",
+			"reason": "publish or discard first — switching branches cannot carry it across, " +
+				"and pelfs will not throw it away to make the switch possible"})
+		return
+	}
+	// REASON "branch", which is the whole point of this route taking the
+	// publish slot rather than a slot of its own: the page reads the reason
+	// and says "switching branches", not "publishing".
+	job := &mockJob{
+		ID:      fmt.Sprintf("mock-%d", time.Now().UnixNano()%1e6),
+		State:   "running",
+		Reason:  "branch",
+		Started: time.Now(),
+	}
+	a.job = job
+	stall := a.switchStall
+	a.mu.Unlock()
+	go func() {
+		// Long enough for a driver to observe "switching branches…" on the
+		// stream, short enough not to pad the gate. The same trade the
+		// publish above makes, and settable when a spec has to assert what
+		// the page says mid-switch.
+		time.Sleep(stall)
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		for _, b := range mockBranches {
+			if b.name == name {
+				a.gen = b.gen
+			}
+		}
+		a.branch = name
+		job.State, job.Ended = "done", time.Now()
+		// cmd/pelfs/browsebranch.go's own summary, so the page's "switched:"
+		// line reads the same in both modes.
+		job.Summary = fmt.Sprintf("on %s at generation %d", name, a.gen)
+	}()
+	writeMockJSON(w, http.StatusAccepted, map[string]any{
+		"job": job.ID, "watch": "/events", "branch": name,
+	})
 }
 
 func (a *mockAPI) mintTicket(w http.ResponseWriter, r *http.Request) {

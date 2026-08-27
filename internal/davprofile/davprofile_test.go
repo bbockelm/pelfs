@@ -12,11 +12,13 @@ package davprofile_test
 // authorization server. What it found is recorded in that script's header.
 
 import (
+	"bytes"
 	"encoding/xml"
 	"flag"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -34,7 +36,6 @@ const (
 	fixedPort     = 49731
 	fixedClientID = "Zm9yLXRoZS1nb2xkZW4tZmlsZS1vbmx5LTMyLWJ5dGVz"
 	fixedVolume   = "pelican://osg-htc.org/user/bbockelman"
-	fixedBasic    = "pelfs-QUJDRGVmZ2g"
 )
 
 func params(write bool) davprofile.Params {
@@ -44,7 +45,6 @@ func params(write bool) davprofile.Params {
 		ClientID:    fixedClientID,
 		RedirectURI: davprofile.RedirectURI(davprofile.DefaultCallbackPort),
 		Write:       write,
-		BasicUser:   fixedBasic,
 		Label:       "Cyberduck",
 	}
 }
@@ -77,7 +77,6 @@ func TestGoldenFiles(t *testing.T) {
 		{"profile-ro.cyberduckprofile", davprofile.Profile, params(false)},
 		{"profile-rw.cyberduckprofile", davprofile.Profile, params(true)},
 		{"bookmark.duck", davprofile.Bookmark, params(false)},
-		{"bookmark-basic.duck", davprofile.BasicBookmark, params(false)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := tc.gen(tc.p)
@@ -331,23 +330,51 @@ func TestTheProfileTraps(t *testing.T) {
 		}
 	})
 
-	t.Run("the Vendor is unique per session", func(t *testing.T) {
-		// Profile.java uses Vendor as the profile's identity; two
-		// concurrent `pelfs browse` sessions are two different servers, and
-		// a shared identity means the second install replaces the first.
+	t.Run("the Vendor is the volume, not the port", func(t *testing.T) {
+		// Profile.java uses Vendor as the profile's identity, and a
+		// bookmark's Provider names it. Two VOLUMES must therefore be two
+		// Vendors — or the second install replaces the first and a
+		// bookmark saved for one volume resolves to the other's profile,
+		// carrying the other's OAuth client.
+		//
+		// And two PORTS for one volume must be ONE Vendor, which is the
+		// half that changed: `pelfs browse` probes upward from 8443, so a
+		// volume's port moves whenever something else got there first, and
+		// a Vendor that moved with it would make every such session a
+		// different profile identity for the same volume.
 		e, _ := find(es, "Vendor")
 		if !strings.HasPrefix(e.val, davprofile.VendorPrefix) {
 			t.Errorf("Vendor = %q", e.val)
 		}
-		p := params(true)
-		p.Port = 49732
-		other, err := davprofile.Profile(p)
+		if !strings.Contains(e.val, davprofile.VolumeTag(fixedVolume)) {
+			t.Errorf("Vendor = %q, which does not name the volume", e.val)
+		}
+		if strings.Contains(e.val, strconv.Itoa(fixedPort)) {
+			t.Errorf("Vendor = %q still carries the port", e.val)
+		}
+
+		samePort := params(true)
+		samePort.Port = 49732
+		other, err := davprofile.Profile(samePort)
 		if err != nil {
 			t.Fatal(err)
 		}
 		e2, _ := find(parsePlist(t, other), "Vendor")
-		if e2.val == e.val {
-			t.Errorf("two listeners generated the same Vendor %q", e.val)
+		if e2.val != e.val {
+			t.Errorf("the same volume on another port is a different profile identity: %q vs %q",
+				e2.val, e.val)
+		}
+
+		otherVol := params(true)
+		otherVol.Volume = fixedVolume + "/second"
+		third, err := davprofile.Profile(otherVol)
+		if err != nil {
+			t.Fatal(err)
+		}
+		e3, _ := find(parsePlist(t, third), "Vendor")
+		if e3.val == e.val {
+			t.Errorf("two volumes generated the same Vendor %q — one profile would "+
+				"replace the other, and a bookmark would follow it to the wrong volume", e.val)
 		}
 	})
 }
@@ -369,41 +396,14 @@ func TestBookmarksBindToTheProfileAndCarryNoPassword(t *testing.T) {
 		t.Error("the OAuth bookmark offers a username, but the profile sets " +
 			"Username Configurable false")
 	}
-	for _, name := range []string{"bookmark", "basic bookmark"} {
-		var raw []byte
-		if name == "bookmark" {
-			raw = b
-		} else {
-			raw, err = davprofile.BasicBookmark(p)
-			if err != nil {
-				t.Fatal(err)
-			}
-		}
-		// HostDictionary.java has no Password key: neither file can carry
-		// the secret, which is why the Basic path costs the user one paste.
-		if strings.Contains(string(raw), "<key>Password</key>") {
-			t.Errorf("the %s carries a Password key", name)
-		}
-		if strings.ContainsRune(string(raw), '$') {
-			t.Errorf("the %s contains a '$'", name)
-		}
+	// HostDictionary.java has no Password key, so a bookmark cannot carry a
+	// secret at all — which is why OAuth is the only way a downloaded file
+	// becomes a working connection with nothing for the user to type.
+	if strings.Contains(string(b), "<key>Password</key>") {
+		t.Error("the bookmark carries a Password key")
 	}
-
-	basic, err := davprofile.BasicBookmark(p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	bes := parsePlist(t, basic)
-	if e, ok := find(bes, "Username"); !ok || e.val != fixedBasic {
-		t.Errorf("Username = %+v, want %q", e, fixedBasic)
-	}
-	if _, ok := find(bes, "Provider"); ok {
-		t.Error("the contingency bookmark names the profile's Provider; it must " +
-			"work whether or not the profile is installed")
-	}
-	p.BasicUser = ""
-	if _, err := davprofile.BasicBookmark(p); err == nil {
-		t.Error("a contingency bookmark with no username was generated")
+	if strings.ContainsRune(string(b), '$') {
+		t.Error("the bookmark contains a '$'")
 	}
 }
 
@@ -477,9 +477,14 @@ func TestURLHelpers(t *testing.T) {
 			t.Errorf("%q names localhost", u)
 		}
 	}
-	d := params(false).Details()
-	if d.URL != davprofile.DAVURL(fixedPort) || d.Username != fixedBasic || !d.Preemptive {
+	// Details is what a client with no profile format at all is pointed at:
+	// the DAV URL and whether this session will accept writes.
+	d := params(true).Details()
+	if d.URL != davprofile.DAVURL(fixedPort) || !d.Writable {
 		t.Errorf("Details = %+v", d)
+	}
+	if ro := params(false).Details(); ro.Writable {
+		t.Errorf("a read-only session's Details = %+v", ro)
 	}
 	if name := davprofile.FileName(params(false), "cyberduckprofile"); name != "pelfs-49731.cyberduckprofile" {
 		t.Errorf("FileName = %q", name)
@@ -502,7 +507,7 @@ func TestTheGeneratorAndTheServerAgree(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := params(false)
-	p.ClientID, p.RedirectURI, p.BasicUser = c.ID, c.Redirect, c.BasicUser
+	p.ClientID, p.RedirectURI = c.ID, c.Redirect
 	b, err := davprofile.Profile(p)
 	if err != nil {
 		t.Fatal(err)
@@ -519,3 +524,74 @@ func TestTheGeneratorAndTheServerAgree(t *testing.T) {
 type onesession struct{}
 
 func (onesession) Sessions() int { return 1 }
+
+// TestNamesTheUserReads is the regression test for "each time I click on it,
+// it just says '127.0.0.1 - WebDAV (HTTP)'; no clue which each is".
+//
+// The golden files already pin the bytes. What they cannot say is WHICH KEY
+// Cyberduck reads to produce that name, and getting that wrong is how the
+// bug happened: the old code set the `.duck`'s `Nickname` — correctly, it is
+// the key HostDictionary.java reads — and nothing at all on the profile,
+// where the key is `Default Nickname` and where `Name` is the string the
+// "127.0.0.1 – …" fallback ends in. davprofile.Params.nickname quotes
+// BookmarkNameProvider.java's three-way precedence in full.
+func TestNamesTheUserReads(t *testing.T) {
+	p := params(false)
+	prof, err := davprofile.Profile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	book, err := davprofile.Bookmark(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 1. The PROFILE carries `Default Nickname` — the key
+	// BookmarkNameProvider consults for a bookmark with no nickname of its
+	// own, which is every bookmark a user creates from the installed profile
+	// himself.
+	if !bytes.Contains(prof, []byte("<key>Default Nickname</key>")) {
+		t.Error("the profile has no `Default Nickname`, so any bookmark the user " +
+			"makes from it falls through to \"127.0.0.1 – <protocol name>\"")
+	}
+	// And NOT `Nickname`, which a Profile has no key for at all: writing it
+	// would look right in a diff and do nothing.
+	if bytes.Contains(prof, []byte("<key>Nickname</key>")) {
+		t.Error("the profile writes `Nickname`, which Profile.java does not read")
+	}
+	// 2. `Name`, which is the tail of that fallback. Absent, Profile.java
+	// returns parent.getName() — and the built-in dav parent's name is the
+	// literal "WebDAV (HTTP)" the report quoted.
+	if !bytes.Contains(prof, []byte("<key>Name</key>")) {
+		t.Error("the profile has no `Name`, so Cyberduck calls this protocol " +
+			"\"WebDAV (HTTP)\" like every other WebDAV bookmark")
+	}
+
+	// 3. THE NAMES THEMSELVES NAME THE VOLUME AND THE PROGRAM, which is what
+	// "no clue which each is" was asking for. Two of these in a list have to
+	// be distinguishable, and the two things that distinguish them are the
+	// volume and the label the user typed.
+	for _, tc := range []struct {
+		what string
+		b    []byte
+	}{{"the profile", prof}, {"the .duck", book}} {
+		for _, want := range []string{"pelfs", "osg-htc.org/user/bbockelman", "Cyberduck"} {
+			if !bytes.Contains(tc.b, []byte(want)) {
+				t.Errorf("%s's name does not contain %q", tc.what, want)
+			}
+		}
+	}
+	// The bookmark carries its own `Nickname`, precedence (1) above, which
+	// wins over the profile's `Default Nickname` and the fallback both.
+	if !bytes.Contains(book, []byte("<key>Nickname</key>")) {
+		t.Error("the .duck has no `Nickname` of its own, so its name comes from " +
+			"the profile rather than from the bookmark the user opened")
+	}
+	// No en dash, no smart quotes: the same rule description() states, and
+	// for the same reason — a plist read by a Java StringSubstitutor and an
+	// XML parser is one place fewer to be clever.
+	for _, b := range [][]byte{prof, book} {
+		if bytes.ContainsRune(b, '–') || bytes.ContainsRune(b, '—') {
+			t.Error("a generated name contains an en or em dash")
+		}
+	}
+}

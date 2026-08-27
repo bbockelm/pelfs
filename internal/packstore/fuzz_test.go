@@ -30,16 +30,34 @@ func FuzzDecodeTrailer(f *testing.F) {
 	f.Add([]byte{}, true)
 
 	f.Fuzz(func(t *testing.T, data []byte, compressed bool) {
+		// The bool chooses between the two JSON forms, as it always has.
+		// The TABLE form is tried on top of it, unconditionally: it is the
+		// form every pack written today carries, and this target had never
+		// once handed the decoder a magicT — which is how a hole in it
+		// survived. The table reads extents as raw uint64s and so skipped
+		// the sign check the JSON path had always applied.
+		//
+		// The bool stays in the signature because the checked-in corpus is
+		// encoded with it.
 		m := magic
 		if compressed {
 			m = magicZ
 		}
-		tr, err := decodeTrailer(data, m)
-		if err != nil {
-			return
-		}
-		if tr.Version != 1 {
-			t.Fatalf("decodeTrailer accepted version %d", tr.Version)
+		for _, form := range []string{m, magicT} {
+			tr, err := decodeTrailer(data, form)
+			if err != nil {
+				continue
+			}
+			if tr.Version != 1 {
+				t.Fatalf("decodeTrailer accepted version %d", tr.Version)
+			}
+			// Whatever form it arrived in, an entry that would send a
+			// range read to a negative offset must not get out of here.
+			for _, e := range tr.Entries {
+				if e.Off < 0 || e.Length < 0 || e.Off+e.Length < 0 {
+					t.Fatalf("decodeTrailer (%s) accepted extent %+v", form, e)
+				}
+			}
 		}
 	})
 }

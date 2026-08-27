@@ -1,0 +1,355 @@
+/*
+ * THE ICON LAYER, and it exists because the icons the file manager asks for
+ * are not in the bundle and were never replaced.
+ *
+ * WHAT WAS BROKEN. `<Willow fonts={false}>` and `icons="simple"` in App.tsx
+ * are both correct and both stay: the theme otherwise injects
+ * <link rel=stylesheet href=https://cdn.svar.dev/fonts/wxi/wx-icons.css> and
+ * the default icon callback builds https://cdn.svar.dev/icons/... per file
+ * extension, which would tell a CDN which file extensions a physicist is
+ * looking at and would make the tool useless on an air-gapped machine
+ * (vite.config.ts's offlineAssets plugin, internal/webui's
+ * TestNoRemoteOriginsInStylesheetsOrPage and tests/loopback.spec.ts all exist
+ * to keep that shut). But nothing was shipped IN PLACE of the CDN, and
+ * wx-icons.css is an icon FONT: with it absent, every `<i class="wxi-...">`
+ * the component renders is an empty inline box. A folder did not look like a
+ * folder, a file did not look like a file, and the toolbar's refresh, back,
+ * sidebar, preview, view-mode and per-row menu buttons were blank clickable
+ * squares. Reported from real use on macOS as "none of the icons work".
+ *
+ * WHY THIS IS CSS AND NOT THE COMPONENT'S OWN `icons` PROP. The prop exists
+ * -- `icons?: ((file, size) => string | false) | "simple"` in
+ * node_modules/@svar-ui/react-filemanager/types/index.d.ts -- and a callback
+ * returning a `data:` URI would work. It was not used, for two reasons:
+ *
+ *   1. Its return value becomes an `<img src>` (dist/index.es.js, the
+ *      `wx-card-preview` and `wx-icon` elements). An <img> cannot take
+ *      `currentColor`, so every entry icon would have a colour baked into it
+ *      -- and the theme, the palette and the dark-mode block in
+ *      brand/brand.css are all things somebody is going to change. A mask
+ *      painted with `currentColor` follows whatever colour the component or a
+ *      later redesign puts on the element, with no coordination.
+ *   2. It only reaches file and folder entries. The toolbar, the breadcrumb
+ *      refresh, the tree's expand arrows, the context menu and the "Add New"
+ *      menu are the SAME bug and the prop cannot touch any of them, so using
+ *      it would have fixed the smaller half and left the reported symptom
+ *      standing.
+ *
+ * So this file styles ANOTHER PROJECT'S MARKUP, deliberately and with its
+ * eyes open. That is real coupling: it keys off SVAR's `wxi-*` and `mdi-*`
+ * class names, off its `data-id` attribute carrying the entry's path, and off
+ * its habit of sizing icons with `font-size` and colouring them with `color`.
+ * A @svar-ui minor bump can therefore leave a glyph blank. The failure mode is
+ * benign (a blank box, which is exactly today's behaviour) and the fix is one
+ * line -- see HOW TO ADD A GLYPH at the bottom of this file.
+ *
+ * WHOSE ARTWORK THIS IS. pelfs's own. Every path below is hand-authored on a
+ * 24x24 grid, so the repository's Apache-2.0 licence covers it and
+ * internal/webui/third_party.txt needs no new entry. That is not squeamishness
+ * about Lucide (ISC) or Bootstrap Icons (MIT), both of which would have been
+ * fine to inline; it is that third_party.txt is GENERATED from
+ * `pnpm licenses list --prod --json` by tools/third-party.mjs, so an
+ * attribution for a set that is not an npm package has nowhere to live in it.
+ * Adding one would mean either a hand edit that `pnpm run notices` erases on
+ * the next build -- and then CI's regenerate-and-diff gate fails -- or a
+ * special case in the generator to carry vendored artwork. Owning the artwork
+ * costs an afternoon of bezier fiddling and removes that whole question.
+ *
+ * WHY MASK AND NOT background-image. `background-color: currentColor` behind a
+ * mask means one glyph serves every size and every colour the component
+ * chooses: `.wx-preview i` is 105px in the brand primary, `.wx-name-cell i` is
+ * 24px, `.wx-more i` is 24px in the muted icon colour, and the toolbar's
+ * `.wx-preview-icon i:before` sets a colour of its own. Sizing off `1em` and
+ * painting with `currentColor` picks all of that up untouched, which is also
+ * what keeps a visual redesign of the surrounding chrome from breaking the
+ * icons.
+ */
+
+/*
+ * The glyphs, once each, on :root rather than on .pelfs-app -- because SVAR
+ * PORTALS its menus and modals. react-core's portal walks up for a
+ * [data-wx-portal-root] and otherwise mounts on the document's top node, so a
+ * context menu's <i> elements are siblings of .pelfs-app, not descendants of
+ * it. Custom properties on :root reach both.
+ *
+ * All artwork is `stroke='black'` on a 24-unit grid: with mask-mode
+ * match-source only the ALPHA matters, so the colour here is just "opaque" and
+ * the ink comes from currentColor at paint time.
+ */
+:root {
+  /* An empty SVG, and it is load-bearing: it is the fallback for a class this
+     file has no glyph for, and an all-transparent mask paints nothing. Without
+     it, `mask-image: var(--pelfs-glyph)` on an unknown class would be invalid
+     at computed-value time, fall back to `none`, and `background-color:
+     currentColor` would then paint a solid 1em block of ink. Blank is also the
+     right answer for a class SVAR uses to mean "no icon": its Icon component
+     renders `class="wx-icon wxi- "` when it is given an empty name. */
+  --pelfs-g-blank: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3C/svg%3E");
+
+  /* ---- entries: what a thing in the volume looks like ------------------ */
+
+  --pelfs-g-folder: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 17.6V6.4A1.4 1.4 0 0 1 4.4 5h4.3l2.1 2.2h8.8A1.4 1.4 0 0 1 21 8.6v9A1.4 1.4 0 0 1 19.6 19H4.4A1.4 1.4 0 0 1 3 17.6z'/%3E%3C/svg%3E");
+  --pelfs-g-folder-add: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 17.6V6.4A1.4 1.4 0 0 1 4.4 5h4.3l2.1 2.2h8.8A1.4 1.4 0 0 1 21 8.6v9A1.4 1.4 0 0 1 19.6 19H4.4A1.4 1.4 0 0 1 3 17.6z'/%3E%3Cpath d='M12 10.5v5M9.5 13h5'/%3E%3C/svg%3E");
+  --pelfs-g-file: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M13.5 2.8H6.8A1.8 1.8 0 0 0 5 4.6v14.8A1.8 1.8 0 0 0 6.8 21.2h10.4a1.8 1.8 0 0 0 1.8-1.8V8.3z'/%3E%3Cpath d='M13.5 2.8v5.5H19'/%3E%3C/svg%3E");
+  --pelfs-g-file-add: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M13.5 2.8H6.8A1.8 1.8 0 0 0 5 4.6v14.8A1.8 1.8 0 0 0 6.8 21.2h10.4a1.8 1.8 0 0 0 1.8-1.8V8.3z'/%3E%3Cpath d='M13.5 2.8v5.5H19'/%3E%3Cpath d='M12 12.2v5.2M9.4 14.8h5.2'/%3E%3C/svg%3E");
+  --pelfs-g-file-up: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M13.5 2.8H6.8A1.8 1.8 0 0 0 5 4.6v14.8A1.8 1.8 0 0 0 6.8 21.2h10.4a1.8 1.8 0 0 0 1.8-1.8V8.3z'/%3E%3Cpath d='M13.5 2.8v5.5H19'/%3E%3Cpath d='M12 17.6v-5.4M9.7 14.5 12 12.2l2.3 2.3'/%3E%3C/svg%3E");
+  --pelfs-g-file-many: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M13.9 2.5H8.5A1.6 1.6 0 0 0 6.9 4.1v12.4a1.6 1.6 0 0 0 1.6 1.6h8.4a1.6 1.6 0 0 0 1.6-1.6V7.1z'/%3E%3Cpath d='M13.9 2.5v4.6h4.6'/%3E%3Cpath d='M4.5 7.5v12.4a1.6 1.6 0 0 0 1.6 1.6h8.4'/%3E%3C/svg%3E");
+  --pelfs-g-text: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M13.5 2.8H6.8A1.8 1.8 0 0 0 5 4.6v14.8A1.8 1.8 0 0 0 6.8 21.2h10.4a1.8 1.8 0 0 0 1.8-1.8V8.3z'/%3E%3Cpath d='M13.5 2.8v5.5H19'/%3E%3Cpath d='M8.6 12.6h6.8M8.6 16.2h4.4'/%3E%3C/svg%3E");
+  --pelfs-g-archive: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='2.6' y='4' width='18.8' height='4.6' rx='1'/%3E%3Cpath d='M4.6 8.6v10.2a1.5 1.5 0 0 0 1.5 1.5h11.8a1.5 1.5 0 0 0 1.5-1.5V8.6'/%3E%3Cpath d='M10 12.6h4'/%3E%3C/svg%3E");
+  --pelfs-g-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='3' y='4.5' width='18' height='15' rx='2'/%3E%3Ccircle cx='8.5' cy='10' r='1.7'/%3E%3Cpath d='M21 15.4l-4.8-4.8L6.6 19.5'/%3E%3C/svg%3E");
+  --pelfs-g-data: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cellipse cx='12' cy='5.8' rx='7.2' ry='2.8'/%3E%3Cpath d='M4.8 5.8v6c0 1.55 3.22 2.8 7.2 2.8s7.2-1.25 7.2-2.8v-6'/%3E%3Cpath d='M4.8 11.8v6c0 1.55 3.22 2.8 7.2 2.8s7.2-1.25 7.2-2.8v-6'/%3E%3C/svg%3E");
+
+  /* ---- chrome: the buttons, the tree, the menus ------------------------ */
+
+  --pelfs-g-chevron-down: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9.5l6 6 6-6'/%3E%3C/svg%3E");
+  --pelfs-g-chevron-up: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 14.5l6-6 6 6'/%3E%3C/svg%3E");
+  --pelfs-g-chevron-left: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M14.5 6l-6 6 6 6'/%3E%3C/svg%3E");
+  --pelfs-g-chevron-right: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M9.5 6l6 6-6 6'/%3E%3C/svg%3E");
+  --pelfs-g-chevron-dbl-left: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M17.5 6l-6 6 6 6M11 6l-6 6 6 6'/%3E%3C/svg%3E");
+  --pelfs-g-chevron-dbl-right: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6.5 6l6 6-6 6M13 6l6 6-6 6'/%3E%3C/svg%3E");
+  --pelfs-g-arrow-left: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M19.5 12H4.5M10.5 6l-6 6 6 6'/%3E%3C/svg%3E");
+  --pelfs-g-close: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 6l12 12M18 6L6 18'/%3E%3C/svg%3E");
+  --pelfs-g-check: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4.5 12.8l4.8 4.8L19.5 7.4'/%3E%3C/svg%3E");
+  --pelfs-g-plus: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 5v14M5 12h14'/%3E%3C/svg%3E");
+  --pelfs-g-download: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 3.5v11M7.5 10 12 14.5 16.5 10'/%3E%3Cpath d='M4.5 19.5h15'/%3E%3C/svg%3E");
+  --pelfs-g-refresh: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20.2 12a8.2 8.2 0 1 1-2.5-5.9'/%3E%3Cpath d='M20.2 3.8v4.7h-4.7'/%3E%3C/svg%3E");
+  --pelfs-g-eye: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M2.2 12S6 5.8 12 5.8 21.8 12 21.8 12 18 18.2 12 18.2 2.2 12 2.2 12z'/%3E%3Ccircle cx='12' cy='12' r='2.6'/%3E%3C/svg%3E");
+  --pelfs-g-rows: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 6.5h2M9 6.5h11M4 12h2M9 12h11M4 17.5h2M9 17.5h11'/%3E%3C/svg%3E");
+  --pelfs-g-grid: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='3.5' y='3.5' width='7' height='7' rx='1'/%3E%3Crect x='13.5' y='3.5' width='7' height='7' rx='1'/%3E%3Crect x='3.5' y='13.5' width='7' height='7' rx='1'/%3E%3Crect x='13.5' y='13.5' width='7' height='7' rx='1'/%3E%3C/svg%3E");
+  --pelfs-g-columns: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='4' y='4' width='7' height='16' rx='1.2'/%3E%3Crect x='13' y='4' width='7' height='16' rx='1.2'/%3E%3C/svg%3E");
+  --pelfs-g-sidebar: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='3' y='4.5' width='18' height='15' rx='2'/%3E%3Cpath d='M9.4 4.5v15'/%3E%3C/svg%3E");
+  --pelfs-g-search: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='10.6' cy='10.6' r='6.4'/%3E%3Cpath d='M20 20l-4.9-4.9'/%3E%3C/svg%3E");
+  --pelfs-g-copy: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='9' y='9' width='11.5' height='11.5' rx='2'/%3E%3Cpath d='M5.5 15h-1A1 1 0 0 1 3.5 14V4.5a1 1 0 0 1 1-1H14a1 1 0 0 1 1 1v1'/%3E%3C/svg%3E");
+  --pelfs-g-cut: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='6.2' cy='6.2' r='2.7'/%3E%3Ccircle cx='6.2' cy='17.8' r='2.7'/%3E%3Cpath d='M8.4 8.1 19.5 18M8.4 15.9 19.5 6'/%3E%3C/svg%3E");
+  --pelfs-g-paste: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M9 4.2H7.2a1.8 1.8 0 0 0-1.8 1.8v13.4a1.8 1.8 0 0 0 1.8 1.8h9.6a1.8 1.8 0 0 0 1.8-1.8V6a1.8 1.8 0 0 0-1.8-1.8H15'/%3E%3Crect x='9' y='2.4' width='6' height='3.8' rx='1'/%3E%3C/svg%3E");
+  --pelfs-g-pencil: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4.2 19.8h4L19.6 8.4l-4-4L4.2 15.8z'/%3E%3Cpath d='M13.9 6.1l4 4'/%3E%3C/svg%3E");
+  --pelfs-g-trash: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 7h16M9.5 7V4.2h5V7M6.2 7l1 13.2h9.6L18 7'/%3E%3Cpath d='M10.2 11v5.6M13.8 11v5.6'/%3E%3C/svg%3E");
+  --pelfs-g-dots-v: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='black'%3E%3Ccircle cx='12' cy='5.4' r='1.9'/%3E%3Ccircle cx='12' cy='12' r='1.9'/%3E%3Ccircle cx='12' cy='18.6' r='1.9'/%3E%3C/svg%3E");
+  --pelfs-g-dots-h: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='black'%3E%3Ccircle cx='5.4' cy='12' r='1.9'/%3E%3Ccircle cx='12' cy='12' r='1.9'/%3E%3Ccircle cx='18.6' cy='12' r='1.9'/%3E%3C/svg%3E");
+  --pelfs-g-grip: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='black'%3E%3Ccircle cx='9' cy='6' r='1.6'/%3E%3Ccircle cx='15' cy='6' r='1.6'/%3E%3Ccircle cx='9' cy='12' r='1.6'/%3E%3Ccircle cx='15' cy='12' r='1.6'/%3E%3Ccircle cx='9' cy='18' r='1.6'/%3E%3Ccircle cx='15' cy='18' r='1.6'/%3E%3C/svg%3E");
+  --pelfs-g-question: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3.5 4.5h17v11.2h-7.8L9 20v-4.3H3.5z'/%3E%3Cpath d='M9.7 8.2a2.4 2.4 0 1 1 2.4 2.4v1.1'/%3E%3Ccircle cx='12.1' cy='13.6' r='0.9' fill='black' stroke='none'/%3E%3C/svg%3E");
+  --pelfs-g-alert: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 3.2 2.4 20h19.2z'/%3E%3Cpath d='M12 9.4v4.8'/%3E%3Ccircle cx='12' cy='17.4' r='0.9' fill='black' stroke='none'/%3E%3C/svg%3E");
+  --pelfs-g-funnel: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3.2 5h17.6l-6.8 8v7l-4-2v-5z'/%3E%3C/svg%3E");
+  --pelfs-g-calendar: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='3.2' y='5' width='17.6' height='16' rx='2'/%3E%3Cpath d='M3.2 10h17.6M8 3v4M16 3v4'/%3E%3C/svg%3E");
+  --pelfs-g-clock: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='8.8'/%3E%3Cpath d='M12 6.8V12l3.8 2.2'/%3E%3C/svg%3E");
+}
+
+/*
+ * THE ONE RULE THAT DRAWS ANYTHING.
+ *
+ * `[class^="wxi-"], [class*=" wxi-"]` is the same pair of selectors
+ * cdn.svar.dev's own wx-icons.css uses, so it matches exactly the elements
+ * SVAR expects to be an icon and nothing else. `mdi-` is there because
+ * @svar-ui/filemanager-store's "Add New" menu hands out Material Design Icons
+ * class names (`mdi mdi-folder-plus-outline` and two siblings) rather than its
+ * own -- a wart in the component, not a choice here.
+ *
+ * Scoped to .pelfs-app AND to SVAR's three theme roots. .pelfs-app is the
+ * app's own container and covers the file manager in the page; the theme-root
+ * classes are what a portaled menu or modal is wrapped in (react-core's portal
+ * renders `wx-<theme>-theme` on the div it mounts), and those mount OUTSIDE
+ * .pelfs-app. All three themes are listed rather than just willow so that
+ * switching the theme element in App.tsx does not silently blank the menus.
+ */
+:is(.pelfs-app, .wx-willow-theme, .wx-willow-dark-theme, .wx-material-theme)
+  :is([class^="wxi-"], [class*=" wxi-"], [class^="mdi-"], [class*=" mdi-"])::before {
+  content: "";
+  display: inline-block;
+  /* 1em, so the component's own font-size rules keep deciding how big an icon
+     is: 105px in a card's preview area, 24px in a table row, 22px in the tree,
+     var(--wx-icon-size) in a toolbar button. Nothing here needs to know. */
+  width: 1em;
+  height: 1em;
+  vertical-align: -0.125em;
+  flex-shrink: 0;
+  /* currentColor, which is the point of the whole mask approach: the ink comes
+     from whatever `color` the component -- or a later redesign of the
+     surrounding chrome -- has already put on the element. */
+  background-color: currentColor;
+  -webkit-mask-image: var(--pelfs-glyph, var(--pelfs-g-blank));
+  mask-image: var(--pelfs-glyph, var(--pelfs-g-blank));
+  -webkit-mask-repeat: no-repeat;
+  mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  mask-position: center;
+  -webkit-mask-size: contain;
+  mask-size: contain;
+}
+
+/*
+ * The class-to-glyph table, and it is deliberately NOT scoped.
+ *
+ * `--pelfs-glyph` is an inert custom property everywhere except on an element
+ * the rule above matches, so scoping this table would buy nothing and would
+ * mean repeating that four-class :is() prefix forty times. It is set on the
+ * ELEMENT rather than on its ::before for two reasons: custom properties
+ * inherit, so the ::before picks it up anyway, and the per-extension rules
+ * further down then override it by plain specificity.
+ *
+ * One entry per glyph SVAR can actually render on this page, which is what
+ * keeps the --pelfs-g-blank fallback unreachable except where SVAR asks for a
+ * blank on purpose. Several names share a glyph on purpose: `delete` and
+ * `delete-outline` are one trash can here, because there is no reason for the
+ * outline and filled variants of the same idea to be two drawings.
+ *
+ * These are flat selectors and not a nested block on purpose. Native CSS
+ * nesting would read better and Vite would ship it as written -- `&` is not
+ * lowered for `build.target: "es2022"`, which is a JavaScript target and says
+ * nothing about a browser -- so the nesting would reach the user's browser
+ * raw. It resolves everywhere current, but this file is the thing that renders
+ * when the rest of the page cannot, and it is not worth one syntax gamble.
+ */
+
+/* ---- entries ------------------------------------------------------------ */
+.wxi-folder { --pelfs-glyph: var(--pelfs-g-folder); }
+.wxi-file { --pelfs-glyph: var(--pelfs-g-file); }
+.wxi-file-multiple-outline { --pelfs-glyph: var(--pelfs-g-file-many); }
+
+/* The three "Add New" entries, and each glyph is what its CLASS NAME says --
+   which in the menu reads wrong, because SVAR's own table has the two swapped:
+   @svar-ui/filemanager-store's getMenuOptions() pairs `mdi-folder-plus-outline`
+   with the text "Add new file" and `mdi-file-plus-outline` with "Add new
+   folder". Confirmed on screen. Swapping them HERE would fix the symptom by
+   making this file lie about what a class means, and would invert again the day
+   SVAR corrects its table. The fix belongs in App.tsx's `menuOptions` prop,
+   which can hand the menu a corrected list; until somebody does that, a
+   faithful mapping is the honest state to leave this in. */
+.mdi-folder-plus-outline { --pelfs-glyph: var(--pelfs-g-folder-add); }
+.mdi-file-plus-outline { --pelfs-glyph: var(--pelfs-g-file-add); }
+.mdi-file-upload-outline { --pelfs-glyph: var(--pelfs-g-file-up); }
+
+/* ---- navigation --------------------------------------------------------- */
+.wxi-angle-down { --pelfs-glyph: var(--pelfs-g-chevron-down); }
+.wxi-angle-up { --pelfs-glyph: var(--pelfs-g-chevron-up); }
+.wxi-angle-left { --pelfs-glyph: var(--pelfs-g-chevron-left); }
+.wxi-angle-right { --pelfs-glyph: var(--pelfs-g-chevron-right); }
+.wxi-angle-dbl-left { --pelfs-glyph: var(--pelfs-g-chevron-dbl-left); }
+.wxi-angle-dbl-right { --pelfs-glyph: var(--pelfs-g-chevron-dbl-right); }
+.wxi-arrow-left { --pelfs-glyph: var(--pelfs-g-arrow-left); }
+
+/* ---- toolbar, breadcrumbs, tree ----------------------------------------- */
+.wxi-refresh,
+.wxi-loading { --pelfs-glyph: var(--pelfs-g-refresh); }
+.wxi-subtask { --pelfs-glyph: var(--pelfs-g-sidebar); }
+.wxi-eye { --pelfs-glyph: var(--pelfs-g-eye); }
+.wxi-view-sequential { --pelfs-glyph: var(--pelfs-g-rows); }
+.wxi-view-grid { --pelfs-glyph: var(--pelfs-g-grid); }
+.wxi-view-column { --pelfs-glyph: var(--pelfs-g-columns); }
+.wxi-search { --pelfs-glyph: var(--pelfs-g-search); }
+.wxi-dots-v { --pelfs-glyph: var(--pelfs-g-dots-v); }
+.wxi-dots-h { --pelfs-glyph: var(--pelfs-g-dots-h); }
+.wxi-drag { --pelfs-glyph: var(--pelfs-g-grip); }
+
+/* ---- context menu, modals, grid editors --------------------------------- */
+.wxi-close { --pelfs-glyph: var(--pelfs-g-close); }
+.wxi-check { --pelfs-glyph: var(--pelfs-g-check); }
+.wxi-plus,
+.wxi-table-row-plus-before,
+.wxi-table-row-plus-after { --pelfs-glyph: var(--pelfs-g-plus); }
+.wxi-download { --pelfs-glyph: var(--pelfs-g-download); }
+.wxi-content-copy { --pelfs-glyph: var(--pelfs-g-copy); }
+.wxi-content-cut { --pelfs-glyph: var(--pelfs-g-cut); }
+.wxi-content-paste { --pelfs-glyph: var(--pelfs-g-paste); }
+.wxi-edit,
+.wxi-edit-outline { --pelfs-glyph: var(--pelfs-g-pencil); }
+.wxi-delete,
+.wxi-delete-outline { --pelfs-glyph: var(--pelfs-g-trash); }
+.wxi-message-question-outline { --pelfs-glyph: var(--pelfs-g-question); }
+.wxi-alert { --pelfs-glyph: var(--pelfs-g-alert); }
+.wxi-filter-multiple-outline,
+.wxi-filter-plus-outline { --pelfs-glyph: var(--pelfs-g-funnel); }
+.wxi-calendar { --pelfs-glyph: var(--pelfs-g-calendar); }
+.wxi-clock { --pelfs-glyph: var(--pelfs-g-clock); }
+
+/*
+ * FILE TYPE, from the only place the DOM offers it.
+ *
+ * With icons="simple" the component renders `<i class="wxi-{type}">`, and type
+ * is only ever "file" or "folder" -- the extension is not in the class, not in
+ * a data attribute of its own, and not anywhere else on the element. What IS
+ * there is `data-id` on the enclosing card (`.wx-item`) and on the enclosing
+ * table row: SVAR's setID() writes the entry's id with a ":" in front, and in
+ * this API the id IS the path (api/provider.ts), so `[data-id$=".root" i]`
+ * reads the extension off the path the same way tests/pelfs.ts's `card()`
+ * helper already reads the whole id.
+ *
+ * THAT IS COUPLING, and it is the one place here that goes past class names.
+ * It fails SAFE: a change in how SVAR writes the id loses the type
+ * distinction and leaves the generic file glyph, which is legible and
+ * correct-if-unspecific rather than wrong. The `i` flag is what makes
+ * SAMPLE.ROOT match, and a volume written on a case-insensitive filesystem
+ * will have both spellings in it.
+ *
+ * A folder that happens to be named `release.zip` keeps its folder icon: the
+ * selectors all end at `.wxi-file`, and a folder's <i> carries `.wxi-folder`.
+ *
+ * Four families, deliberately not more. The list is aimed at what this
+ * audience keeps in a volume -- .root, .h5, .sif and .parquet are "opaque
+ * data" rather than "binary" as a desktop would mean it -- and the grouping
+ * stops where a reader would have to guess which family an extension landed
+ * in.
+ */
+
+/* Archives: the whole point is that the thing has to be unpacked first. */
+:is(
+  [data-id$=".zip" i], [data-id$=".tar" i], [data-id$=".gz" i], [data-id$=".tgz" i],
+  [data-id$=".bz2" i], [data-id$=".xz" i], [data-id$=".zst" i], [data-id$=".7z" i],
+  [data-id$=".rar" i], [data-id$=".jar" i]
+) .wxi-file { --pelfs-glyph: var(--pelfs-g-archive); }
+
+/* Pictures, and .pdf with them: everything here is "a thing you look at", and
+   none of it is previewable in this UI on purpose (App.tsx, A5). */
+:is(
+  [data-id$=".png" i], [data-id$=".jpg" i], [data-id$=".jpeg" i], [data-id$=".gif" i],
+  [data-id$=".svg" i], [data-id$=".webp" i], [data-id$=".bmp" i], [data-id$=".tif" i],
+  [data-id$=".tiff" i], [data-id$=".pdf" i], [data-id$=".eps" i]
+) .wxi-file { --pelfs-glyph: var(--pelfs-g-image); }
+
+/* Text a human reads or edits, code included: one family, because "is this a
+   script or a config file" is not a distinction an icon should be making at 24
+   pixels. */
+:is(
+  [data-id$=".txt" i], [data-id$=".md" i], [data-id$=".log" i], [data-id$=".json" i],
+  [data-id$=".yaml" i], [data-id$=".yml" i], [data-id$=".toml" i], [data-id$=".ini" i],
+  [data-id$=".cfg" i], [data-id$=".conf" i], [data-id$=".csv" i], [data-id$=".tsv" i],
+  [data-id$=".xml" i], [data-id$=".html" i], [data-id$=".css" i], [data-id$=".py" i],
+  [data-id$=".sh" i], [data-id$=".go" i], [data-id$=".c" i], [data-id$=".h" i],
+  [data-id$=".cc" i], [data-id$=".cpp" i], [data-id$=".js" i], [data-id$=".ts" i],
+  [data-id$=".r" i], [data-id$=".ipynb" i], [data-id$=".sub" i], [data-id$=".dag" i]
+) .wxi-file { --pelfs-glyph: var(--pelfs-g-text); }
+
+/* Opaque bytes: scientific data formats, container images and machine code.
+   These are the files this tool exists to move, and they are exactly the ones
+   a user must not expect to open in a browser. */
+:is(
+  [data-id$=".root" i], [data-id$=".h5" i], [data-id$=".hdf5" i], [data-id$=".nc" i],
+  [data-id$=".parquet" i], [data-id$=".npy" i], [data-id$=".npz" i], [data-id$=".pkl" i],
+  [data-id$=".sif" i], [data-id$=".iso" i], [data-id$=".img" i], [data-id$=".qcow2" i],
+  [data-id$=".so" i], [data-id$=".dylib" i], [data-id$=".exe" i], [data-id$=".o" i],
+  [data-id$=".bin" i], [data-id$=".dat" i], [data-id$=".db" i], [data-id$=".sqlite" i]
+) .wxi-file { --pelfs-glyph: var(--pelfs-g-data); }
+
+/*
+ * HOW TO ADD A GLYPH, because the next person to need one will be looking for
+ * this paragraph.
+ *
+ *   1. Find the class SVAR is asking for. It is on an <i> element and starts
+ *      `wxi-` (or, for the "Add New" menu, `mdi-`). A blank square where an
+ *      icon belongs means there is no entry for that class below.
+ *   2. Add a `--pelfs-g-<name>` to the :root block. Draw on a 24x24 grid,
+ *      `fill='none' stroke='black' stroke-width='2'` with round caps and
+ *      joins, and percent-encode `<` and `>` as %3C and %3E. Do NOT use a `#`
+ *      colour -- it terminates the URL as a fragment, and the colour is
+ *      irrelevant anyway: the mask uses alpha and the ink is currentColor.
+ *   3. Add one line to the class-to-glyph table.
+ *
+ * There is nothing to import and no build step: main.tsx pulls this file in,
+ * and vite inlines the data URIs as written.
+ *
+ * The one thing that will bite you: a remote URL. vite.config.ts's
+ * offlineAssets plugin and internal/webui's
+ * TestNoRemoteOriginsInStylesheetsOrPage both scan built CSS for
+ * `url(//host/...)`, and tests/loopback.spec.ts fails on any request that
+ * leaves 127.0.0.1. A data: URI is fine; a link to an icon CDN, however
+ * convenient, is the bug this file was written to fix.
+ */

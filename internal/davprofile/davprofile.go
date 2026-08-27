@@ -53,23 +53,32 @@
 // A PASSWORD. `HostDictionary.java`'s key set has `Protocol`, `Provider`,
 // `Hostname`, `Port`, `Path`, `Username`, `Nickname` and friends, and no
 // `Password` key at all — so neither a `.cyberduckprofile` nor a `.duck`
-// bookmark can carry the HTTP Basic secret. That is exactly why the OAuth
-// path is worth building (it is the only way a downloaded file becomes a
-// working connection with no typing) and why the Basic credential is
-// nonetheless generated for every client: it is the contingency if the
-// OAuth flow will not run, and it is the path every non-Cyberduck client
-// uses — WinSCP, rclone, macOS `mount_webdav`, the Windows redirector. The
-// contingency costs the user one paste, and BasicBookmark is what makes it
-// only one.
+// bookmark can carry a secret a user would otherwise have to type. That is
+// exactly why the OAuth path is worth building: it is the only way a
+// downloaded file becomes a working connection with no typing at all.
+//
+// THERE IS NO PASSWORD CONTINGENCY ANY MORE. This package used to generate
+// one — a `BasicBookmark` carrying a per-client HTTP Basic username, with
+// the password pasted in by hand — and it is gone, with
+// internal/localoauth's Basic credential. A second credential that
+// authenticates at /dav/* in one hop, with no gesture in front of it and no
+// expiry behind it, was the weakest thing on the listener, and its only job
+// was to cover a flow that now works in a real browser with real Cyberduck
+// on every gate this repo runs. A client that cannot do OAuth is a client
+// that does not connect to `pelfs browse`; that is the deliberate answer
+// rather than an oversight.
 package davprofile
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/xml"
 	"fmt"
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // DefaultCallbackPort is the loopback port pelfs writes into a generated
@@ -92,10 +101,27 @@ const CallbackPath = "/pelfs/oauth/callback"
 // Path` wants the trailing slash.
 const DAVPath = "/dav/"
 
-// VendorPrefix is the profile identity's stem. The full Vendor includes the
-// listener's port (see Params.vendor) because the profile's Vendor must be
-// unique and two concurrent `pelfs browse` sessions are two different
-// servers.
+// VendorPrefix is the profile identity's stem. The full Vendor names the
+// VOLUME (see Params.vendor), because that is what a profile is a profile
+// for and it is no longer implied by anything else in the file.
+//
+// It used to name the listener's PORT, which worked only while the port
+// identified the volume: the port was derived from the prefix URL by a
+// hash, so one volume meant one port meant one Vendor. `pelfs browse` now
+// probes upward from 8443 (cmd/pelfs/browseport.go), so two volumes take
+// 8443 and 8444 in whatever order they happened to start, and tomorrow's
+// 8443 may be a different volume from today's. A port-keyed Vendor under
+// that rule is a COLLISION: installing volume B's profile would replace
+// volume A's, and volume A's saved bookmark — which resolves to a profile
+// by this string — would carry volume B's OAuth client into whatever is
+// on the port. That is "a bookmark quietly opening another volume's
+// files", which must not be reachable by accident.
+//
+// Keyed on the volume it cannot happen: two volumes are two profiles, A's
+// bookmark keeps resolving to A's profile and therefore keeps presenting
+// A's client_id, and a session serving another volume answers
+// internal/localoauth's refusal page — which names the volume it IS
+// serving, so the user can see what happened.
 const VendorPrefix = "org.pelicanplatform.pelfs.local"
 
 // Params is one generated download: one client, one session, one set of
@@ -111,9 +137,16 @@ type Params struct {
 	// a list of bookmarks, so it is the volume rather than a UUID.
 	Volume string
 
-	// ClientID is the OAuth client_id from internal/localoauth: a
-	// per-download secret, and the key that turns OAuth on. A blank one is
-	// an error rather than a default, per trap 1.
+	// ClientID is the OAuth client_id from internal/localoauth: a secret
+	// only a profile download carries, and the key that turns OAuth on. A
+	// blank one is an error rather than a default, per trap 1.
+	//
+	// IT IS USUALLY THE SAME STRING EVERY SESSION — internal/localoauth
+	// derives it from a per-volume key in the state directory — which is what
+	// makes this package's determinism load-bearing rather than tidy: a
+	// profile a user installed once has to keep matching the one pelfs would
+	// generate today, byte for byte. Nothing here may grow a timestamp, a
+	// nonce or a map iteration.
 	ClientID string
 
 	// RedirectURI is the loopback callback, with an explicit port. Build it
@@ -126,11 +159,6 @@ type Params struct {
 	// A read-only browse session must not set it (internal/localoauth
 	// refuses the client registration, which is where that is enforced).
 	Write bool
-
-	// BasicUser is the per-client HTTP Basic username, used by
-	// BasicBookmark and by Details. Optional for Profile, which offers no
-	// password field at all.
-	BasicUser string
 
 	// Label names the client in a bookmark's nickname: "Cyberduck". Falls
 	// back to "pelfs".
@@ -170,7 +198,32 @@ func (p Params) Scopes() []string {
 }
 
 func (p Params) vendor() string {
-	return VendorPrefix + "." + strconv.Itoa(p.Port)
+	return VendorPrefix + "." + VolumeTag(p.Volume)
+}
+
+// VolumeTag is a volume's identity inside a profile identifier: a short,
+// stable, filename-safe digest of the volume URL.
+//
+// SHA-256 truncated to six bytes, which is a collision every 2^24 volumes
+// by the birthday bound and is not a security boundary in either
+// direction: it decides which PROFILE a bookmark resolves to, and every
+// credential behind that profile is checked by internal/localoauth against
+// the client roster of the session actually answering. Two volumes that
+// collided here would produce one profile identity, which is exactly the
+// behaviour of the port-keyed Vendor this replaced — no worse, and
+// vanishingly rarer.
+//
+// The leading "v" is so the component is not a bare number: this string
+// goes into a reverse-DNS-shaped identifier, and a segment starting with a
+// digit is the kind of thing a parser somewhere decides to have an opinion
+// about.
+//
+// DETERMINISM IS LOAD-BEARING, as everywhere in this package: a profile a
+// user installed once has to keep matching the one pelfs would generate
+// today, byte for byte.
+func VolumeTag(volume string) string {
+	sum := sha256.Sum256([]byte(volume))
+	return "v" + hex.EncodeToString(sum[:6])
 }
 
 func (p Params) description() string {
@@ -185,15 +238,112 @@ func (p Params) description() string {
 	// No em dash, no smart quotes: this string lands in a plist that a Java
 	// StringSubstitutor and an XML parser both read, and plain ASCII is one
 	// fewer thing to go wrong.
-	return "pelfs " + v + " (" + mode + ", this session only)"
+	//
+	// IT USED TO SAY "this session only", which was true of the profile when
+	// the client id was minted per download and is not true now: the id is
+	// derived from a per-volume key in the state directory, so this file is
+	// the same file next session and installing it again is unnecessary
+	// (internal/localoauth's identity.go). What IS still per session is the
+	// authorization — a human clicks Authorize on every /oauth/authorize, and
+	// this string is one of the few places a user reads about the profile
+	// with no page in front of them, so it says both halves.
+	return "pelfs " + v + " (" + mode + "; install once, authorize once per session)"
 }
 
+// nickname is the ONE STRING A USER READS IN A LIST OF BOOKMARKS, and
+// getting it wrong is what "each time I click on it, it just says
+// '127.0.0.1 - WebDAV (HTTP)'; no clue which each is" was.
+//
+// That string is Cyberduck's own fallback, and it is worth writing out
+// where it comes from because it names the two keys this package has to
+// set and the two it must not confuse them with. BookmarkNameProvider.java:
+//
+//	if(StringUtils.isEmpty(bookmark.getNickname())) {
+//	    if(StringUtils.isNotBlank(bookmark.getProtocol().getDefaultNickname())) {
+//	        return bookmark.getProtocol().getDefaultNickname();
+//	    }
+//	    final String hostname = toHostname(bookmark, username);
+//	    ...
+//	    return hostname + StringUtils.SPACE + '\u2013' + StringUtils.SPACE
+//	        + bookmark.getProtocol().getName();
+//	}
+//	return bookmark.getNickname();
+//
+// So there are exactly three places a name can come from, in order:
+//
+//  1. the BOOKMARK's `Nickname` — HostDictionary.java reads that key
+//     (`bookmark.setNickname(...)`), so it belongs in the `.duck`;
+//  2. the PROTOCOL's `Default Nickname` — Profile.java's
+//     DEFAULT_NICKNAME_KEY, so it belongs in the `.cyberduckprofile`, and
+//     it is the one that names every bookmark a user creates from the
+//     profile HIMSELF rather than by opening our `.duck`;
+//  3. hostname + en dash + the PROTOCOL's `Name` — Profile.java's
+//     NAME_KEY, which falls through to `parent.getName()` when absent, and
+//     the built-in `dav` parent's name is the literal string "WebDAV
+//     (HTTP)".
+//
+// The old code set (1) and neither (2) nor (3), which is why a bookmark the
+// user made from the installed profile — and any UI that shows the protocol
+// name rather than the bookmark name — read "127.0.0.1 – WebDAV (HTTP)".
+// Note also that `Description` is NOT in that list at all: it is
+// DESCRIPTION_KEY and it shows in the profile chooser, never in the
+// bookmark list. Setting it was not setting a name.
+//
+// The shape is "pelfs: <volume> (<label>)": the volume first, because it is
+// what distinguishes two of these from each other, and the label — what
+// the user typed on the connection page when generating the download — in
+// parentheses, because it is what distinguishes two clients on the same
+// volume.
 func (p Params) nickname() string {
 	label := p.Label
 	if label == "" {
 		label = "pelfs"
 	}
-	return label + " - pelfs " + p.Volume
+	v := shortVolume(p.Volume)
+	if v == "" {
+		return "pelfs (" + label + ")"
+	}
+	return "pelfs: " + v + " (" + label + ")"
+}
+
+// protocolName is the profile's `Name`: what Cyberduck shows wherever it
+// names the PROTOCOL rather than the bookmark — the New Bookmark dropdown,
+// and the tail of the fallback in nickname's quotation. Without it that is
+// "WebDAV (HTTP)" for every pelfs profile a user has installed, which is
+// true and useless.
+func (p Params) protocolName() string {
+	if v := shortVolume(p.Volume); v != "" {
+		return "pelfs " + v
+	}
+	return "pelfs"
+}
+
+// shortVolume is the volume as a person recognises it: the scheme dropped,
+// because every pelfs volume has the same one and it is the widest column
+// in the name.
+//
+// "pelican://osg-htc.org/user/bbockelman" becomes
+// "osg-htc.org/user/bbockelman". A long one is truncated from the FRONT,
+// keeping the tail, because the tail is the part that differs between two
+// volumes in the same federation and the head is the part that does not.
+func shortVolume(volume string) string {
+	v := strings.TrimSpace(volume)
+	if i := strings.Index(v, "://"); i >= 0 {
+		v = v[i+len("://"):]
+	}
+	v = strings.Trim(v, "/")
+	const max = 48
+	if len(v) > max {
+		// A rune boundary rather than a byte one: a truncated multi-byte
+		// character in a plist string is a parse error in the client, not
+		// a cosmetic problem.
+		cut := v[len(v)-max:]
+		for len(cut) > 0 && !utf8.ValidString(cut) {
+			cut = cut[1:]
+		}
+		v = "..." + cut
+	}
+	return v
 }
 
 // Profile is the `.cyberduckprofile`: a plist that installs by double-click
@@ -209,7 +359,7 @@ func (p Params) nickname() string {
 //	                 REQUIRED by internal/localoauth, not merely accepted
 //	Password         impossible — no such key exists (see the package
 //	                 comment)
-//	any secret but the client id, which is minted per download, so
+//	any secret but the client id, which only a profile download carries, so
 //	possessing the profile is the whole of what identifies the client
 func Profile(p Params) ([]byte, error) {
 	if err := p.check(); err != nil {
@@ -227,7 +377,13 @@ func Profile(p Params) ([]byte, error) {
 	// `dav` is plain HTTP; `davs` would be TLS, and this listener has none.
 	w.str("Protocol", "dav")
 	w.str("Vendor", p.vendor())
+	w.str("Name", p.protocolName())
 	w.str("Description", p.description())
+	// `Default Nickname` (Profile.java's DEFAULT_NICKNAME_KEY), not
+	// `Nickname`: a Profile has no such key, and BookmarkNameProvider
+	// consults this one for any bookmark whose own Nickname is empty. See
+	// Params.nickname for the three-way precedence this is the middle of.
+	w.str("Default Nickname", p.nickname())
 	w.str("Default Hostname", "127.0.0.1")
 	w.integer("Default Port", p.Port)
 	w.str("Default Path", DAVPath)
@@ -275,60 +431,29 @@ func Bookmark(p Params) ([]byte, error) {
 	return w.bytes()
 }
 
-// BasicBookmark is the contingency, and the path every client that is not
-// Cyberduck or Mountain Duck takes: the built-in WebDAV protocol, this
-// listener, and the per-client Basic username filled in. The PASSWORD IS
-// NOT IN IT and cannot be — HostDictionary has no such key — so this costs
-// the user exactly one paste, which is the price docs/design-webui.md's
-// verification 2g quotes.
-//
-// It deliberately does NOT name the profile's Provider: this bookmark must
-// work whether or not the profile is installed, because its whole reason to
-// exist is the case where the OAuth path is not working.
-func BasicBookmark(p Params) ([]byte, error) {
-	if err := p.check(); err != nil {
-		return nil, err
-	}
-	if p.BasicUser == "" {
-		return nil, fmt.Errorf("davprofile: BasicBookmark needs the per-client Basic username")
-	}
-	w := newPlist()
-	w.str("Protocol", "dav")
-	w.str("Hostname", "127.0.0.1")
-	w.str("Port", strconv.Itoa(p.Port))
-	w.str("Path", DAVPath)
-	w.str("Username", p.BasicUser)
-	w.str("Nickname", p.nickname()+" (password)")
-	w.str("Comment", p.description()+" - paste the password pelfs showed you")
-	return w.bytes()
-}
-
-// FileName is the download's filename, with no `/` and no space, for one of
-// "cyberduckprofile", "duck" or "basic.duck".
+// FileName is the download's filename, with no `/` and no space, for
+// "cyberduckprofile" or "duck".
 func FileName(p Params, ext string) string {
 	base := "pelfs-" + strconv.Itoa(p.Port)
 	return base + "." + ext
 }
 
 // Details is the plain connection information for a client with no profile
-// format at all: rclone, WinSCP, `mount_webdav`, curl. It is what the UI
-// shows beside the download buttons.
+// format at all. It is what the UI shows beside the download buttons.
+//
+// It has no username and no `preemptive` flag any more: there is no password
+// credential to send, preemptively or otherwise. What a non-Cyberduck client
+// needs from this listener is the URL and an OAuth Bearer token it obtained
+// through the same authorization-code flow — rclone's
+// `--webdav-bearer-token` is the shape of it.
 type Details struct {
 	URL      string
-	Username string
 	Writable bool
-	// Preemptive says the Basic credential must be sent without waiting for
-	// a challenge, which is what Cyberduck does
-	// (`webdav.basic.preemptive=true`, docs/design-guiclients.md) and what
-	// rclone and curl do by default.
-	Preemptive bool
 }
 
-// Details returns the plain connection information. The password is not in
-// it: the caller has it once, from internal/localoauth, and shows it once.
+// Details returns the plain connection information.
 func (p Params) Details() Details {
-	return Details{URL: DAVURL(p.Port), Username: p.BasicUser,
-		Writable: p.Write, Preemptive: true}
+	return Details{URL: DAVURL(p.Port), Writable: p.Write}
 }
 
 // check is trap 4 plus the ordinary sanity: no `$` anywhere, no control
@@ -337,7 +462,7 @@ func (p Params) check() error {
 	if p.Port <= 0 || p.Port > 65535 {
 		return fmt.Errorf("davprofile: port %d is not a port", p.Port)
 	}
-	for _, v := range []string{p.Volume, p.ClientID, p.RedirectURI, p.BasicUser, p.Label} {
+	for _, v := range []string{p.Volume, p.ClientID, p.RedirectURI, p.Label} {
 		if err := checkValue(v); err != nil {
 			return err
 		}

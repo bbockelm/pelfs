@@ -124,6 +124,10 @@ type browseArgs struct {
 	rw        bool
 	open      bool
 	testHooks bool
+	// port is --port: 0 means "the first free port at or above 8443", -1
+	// means "an OS-chosen ephemeral one", anything else is an exact
+	// request. See browseListen.
+	port int
 }
 
 // cmdBrowse implements `pelfs browse [flags] <prefix>`.
@@ -140,6 +144,7 @@ func cmdBrowse(args []string) int {
 		// somebody runs.
 		fs.BoolVar(&a.rw, "rw", false, "open read-write: a local overlay, a branch lease, and a seal at exit (default: read-only)")
 		fs.BoolVar(&a.open, "open", false, "launch the platform's browser at the URL (the URL is printed either way)")
+		fs.IntVar(&a.port, "port", 0, browsePortUsage)
 		fs.BoolVar(&a.testHooks, "test-hooks", false, browseTestHooksUsage)
 	})
 	if err != nil {
@@ -204,24 +209,52 @@ func runBrowse(o *cmdOpts, prefix string, a browseArgs) int {
 	})
 
 	// ---- 1. The listener, the guard and the page, before anything that
-	// can touch the network. tcp4 explicitly, and 127.0.0.1 rather than
-	// 0.0.0.0: internal/nfsmount.Serve's comment applies word for word
-	// ("a hostname like 'localhost' can resolve to ::1 where nothing
-	// listens"), and binding the wildcard address would put this UI on the
-	// machine's LAN address — a mistake that turns a local threat model
-	// into a network one.
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	// can touch the network. The port is PROBED FROM 8443 UPWARD rather
+	// than taken from the OS, because it is baked into every connection
+	// file this session hands out and an OS-chosen one made every generated
+	// profile and saved bookmark single-use; the probe, the window and the
+	// security reasoning are all in cmd/pelfs/browseport.go.
+	ln, probed, err := browseListen(a.port)
 	if err != nil {
 		_ = g.stats.Finalize(1, false)
-		return exitErr(fmt.Errorf("browse listen: %w", err))
+		return exitErr(err)
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
+	sayBrowsePort(port, a.port, probed)
 	sessions, err := browsesession.New()
 	if err != nil {
 		_ = g.stats.Finalize(1, false)
 		return exitErr(err)
 	}
-	bs, err := newBrowseServer(prefix, a, o.snapshotInterval, sessions, port)
+	// The persistent client identity lives in the state directory, beside
+	// the volume signing key and under the same 0700 — and it is created
+	// LAZILY, so a session that never generates a connection profile leaves
+	// no new secret behind. Opening it can fail (a file from a future pelfs,
+	// a corrupt one), and that is a startup failure rather than a surprise
+	// at the first download: a session that cannot agree with the profiles
+	// this volume has already handed out should not be serving one.
+	identity, err := localoauth.OpenIdentity(stateDir)
+	if err != nil {
+		_ = g.stats.Finalize(1, false)
+		return exitErr(err)
+	}
+	// And the grants a human already authorized, beside it and under the
+	// same rules — 0600, lazily created, atomically written. This is what
+	// makes a saved Cyberduck bookmark reconnect across a restart with NO
+	// CLICK: the refresh token the client is holding is recognised because
+	// this file remembers an HMAC of it. Consent is unchanged and is still
+	// required to CREATE a grant; internal/localoauth/grants.go is the
+	// argument for why those are different things.
+	//
+	// Unreadable is a startup failure for the same reason the identity is:
+	// the alternative is silently forgetting every connection, which looks
+	// to the user exactly like the bug this file exists to fix.
+	grants, err := localoauth.OpenGrants(stateDir)
+	if err != nil {
+		_ = g.stats.Finalize(1, false)
+		return exitErr(err)
+	}
+	bs, err := newBrowseServer(prefix, a, o.snapshotInterval, sessions, port, identity, grants)
 	if err != nil {
 		_ = g.stats.Finalize(1, false)
 		return exitErr(err)
@@ -278,12 +311,47 @@ func runBrowse(o *cmdOpts, prefix string, a browseArgs) int {
 
 	// ---- 3. Now the volume. This is where a device-flow prompt fires,
 	// and by construction the page is already loadable when it does.
+	//
+	// A FAILURE HERE DOES NOT END THE PROCESS AT ONCE, and that is the fix
+	// for the report this comment is written under: "whenever I start
+	// read-write, I just get a page that says 'reading the overlay…'. Never
+	// seems to progress." The page had already been printed, opened and
+	// loaded by the time the open failed — a killed session's branch lease
+	// is the ordinary way in, since it outlives its holder by a TTL — and
+	// the process then exited inside the second it took the browser to
+	// attach. What the user was left looking at was a tab whose event
+	// stream had died against a closed port, and a page that renders every
+	// phase that is not "ready" with the same "reading the overlay…" line.
+	// Nothing about it said the volume had refused to open, or why.
+	//
+	// So the failure is now SERVED rather than raced: the reason goes on
+	// the page, the listener stays up long enough for a browser to attach
+	// and show it, and the exit is an orderly Shutdown, which sends every
+	// stream `event: bye` — the difference between a page that says "pelfs
+	// browse is exiting" and a page that says nothing at all. The exit code
+	// is unchanged, and so is the terminal's error line: a script sees what
+	// it always saw, a few seconds later.
 	fail := func(err error) int {
+		err = browseOpenFailure(err, stateDir, prefix)
+		// setFailed FIRST, so the frame is already queued for any stream
+		// that is attached by the time the terminal line is written.
 		bs.setFailed(err)
-		_ = g.stats.Finalize(1, false)
-		// The page's stream carries the failure, but the terminal is still
-		// where a pelfs error belongs: the tab may never have been opened.
-		return exitErr(err)
+		// The terminal is still where a pelfs error belongs — the tab may
+		// never have been opened at all — it is simply no longer the only
+		// place the reason exists.
+		code := exitErr(err)
+		bs.lingerAfterFailedOpen(guard.Origin())
+		// The orderly close, in the teardown's order and for its reasons:
+		// the streams are told the process is leaving, and Shutdown can
+		// then return instead of waiting on a response that is open by
+		// design. There is no volume to seal and no lease to release —
+		// nothing below this line in the happy path has run.
+		bs.closeStreams()
+		shutCtx, cancelShut := context.WithTimeout(ctx, 5*time.Second)
+		_ = srv.Shutdown(shutCtx)
+		cancelShut()
+		_ = g.stats.Finalize(code, false)
+		return code
 	}
 	raw, err := pelicanobj.New(ctx, pelicanobj.Config{
 		PrefixURL:    prefix,
@@ -450,8 +518,15 @@ func runBrowse(o *cmdOpts, prefix string, a browseArgs) int {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
 	code := 0
+	// WHICH DOOR THE SESSION LEFT BY IS SAID OUT LOUD. There are three, they
+	// mean entirely different things — the user asked, a test asked, the
+	// listener died — and until this line the teardown that follows looked
+	// identical for all three. "The browse server shut down on its own" is a
+	// report that cannot be diagnosed from a log that does not say whether a
+	// signal arrived, so the log now says.
 	select {
-	case <-sigs:
+	case sig := <-sigs:
+		ui.Info("{signal} received; stopping this browse session", "signal", sig)
 	case <-browseStop:
 	case err := <-serveErr:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -600,6 +675,7 @@ type browseServer struct {
 	// mid-publish would be the one lie this page must not tell.
 	stagedBytes int64
 	stagedNodes int
+	stagedEdges int
 	// publishing state, and the last job's outcome.
 	job *publishJob
 	// lastPublish anchors "next automatic publish in ...". The periodic
@@ -639,10 +715,14 @@ type browseServer struct {
 // testOverrides is what --test-hooks lets the browser-driver suite set.
 // Every field is inert unless the flag was passed.
 type testOverrides struct {
-	on            bool
-	lease         string
-	stagedFiles   int
-	stagedBytes   int64
+	on          bool
+	lease       string
+	stagedFiles int
+	stagedBytes int64
+	// dirtyEdges stages an unpublished NAMESPACE change — a rename — which
+	// is the one kind of staged work the other overrides cannot express,
+	// because it moves no bytes and touches no inode row.
+	dirtyEdges    int
 	uploadBacklog int64
 	publishStall  time.Duration
 	// downloadBody, when set, registers a synthetic download source so the
@@ -670,9 +750,24 @@ type publishJob struct {
 // It returns an error because two of the three pieces can refuse to be
 // built — a negative listing cap, a read-only session that was asked for a
 // writable authorization server — and both are startup failures rather than
-// 500s on the first request.
+// 500s on the first request. A third refusal joined them with the
+// persistent client identity: an identity file in the state directory that
+// cannot be read is a startup failure too, because the alternative is
+// serving a session whose generated profiles disagree with the ones the
+// user has installed.
+//
+// `id` is the persistent client identity (internal/localoauth's
+// identity.go): the per-volume key that makes a generated
+// .cyberduckprofile byte-identical across restarts. `grants` is the
+// persistent grant roster (grants.go): what makes a program that has been
+// authorized once reconnect after a restart with no consent screen. nil for
+// either is the ephemeral server this verb started with — every client id
+// crypto/rand, every credential dead at exit — which is what the tests that
+// are not about persistence pass. `grants` without `id` is refused by
+// localoauth.New, because a grant is bound to a persistent identity.
 func newBrowseServer(prefix string, a browseArgs, interval time.Duration,
-	m *browsesession.Manager, port int) (*browseServer, error) {
+	m *browsesession.Manager, port int, id *localoauth.Identity,
+	grants *localoauth.GrantStore) (*browseServer, error) {
 	b := &browseServer{
 		prefix:      prefix,
 		args:        a,
@@ -697,10 +792,19 @@ func newBrowseServer(prefix string, a browseArgs, interval time.Duration,
 	// browse` cannot even register a client that could ask for
 	// pelfs.write. Sessions is the browser-session presence check (A7
 	// control 2): *browsesession.Manager satisfies it as it stands.
+	//
+	// Identity is what makes the CLIENT identity outlive the process;
+	// Grants is what makes the CONNECTION outlive it. Between them a saved
+	// bookmark works next session with no download, no reinstall and no
+	// click. What does NOT change is the gesture that creates a grant in the
+	// first place: consent is required on every /oauth/authorize, never
+	// remembered there, and there is no password on this listener at all.
 	if b.oauth, err = localoauth.New(localoauth.Config{
 		Writable: a.rw,
 		Volume:   prefix,
 		Sessions: m,
+		Identity: id,
+		Grants:   grants,
 	}); err != nil {
 		return nil, err
 	}
@@ -855,6 +959,12 @@ func (b *browseServer) routes(g *httpguard.Guard) http.Handler {
 	// its own surfaces, which is why this is one line and not eleven.
 	b.api.Register(r)
 
+	// ---- the branch picker (cmd/pelfs/browsebranch.go) ------------------
+	//
+	// On the page's surface and nowhere else: a WebDAV client's credential
+	// cannot move the session it is connected to.
+	b.registerBranchRoutes(r)
+
 	if b.args.testHooks {
 		r.HandleFunc(httpguard.SurfaceAPI, "POST /api/v1/testhook", b.serveTestHook)
 	}
@@ -956,12 +1066,26 @@ type browseState struct {
 	Lease    string  `json:"lease"`
 	LeaseAge float64 `json:"lease_age_s,omitempty"`
 
-	// Durability. Two counters, never one: what is on this machine and
+	// Durability. Several counters, never one: what is on this machine and
 	// what is in the federation are different facts and the page must
 	// never merge them into a single checkmark.
-	StagedFiles   int   `json:"staged_files"`
-	StagedBytes   int64 `json:"staged_bytes"`
-	DirtyNodes    int   `json:"dirty_nodes"`
+	StagedFiles int   `json:"staged_files"`
+	StagedBytes int64 `json:"staged_bytes"`
+	DirtyNodes  int   `json:"dirty_nodes"`
+	// DirtyEdges is unpublished NAMESPACE: names added, removed, or moved.
+	// It is here because a rename moves no bytes and writes no inode row,
+	// so a panel keyed on the two counters above told a user who had just
+	// renamed a file that there was nothing to publish.
+	DirtyEdges int `json:"dirty_edges"`
+	// Unpublished is the PREDICATE, computed here rather than left to the
+	// page to assemble out of the counters — which is how the panel came
+	// to disagree with the seal in the first place. It is the same
+	// expression checkpoint and sealAtExit use to decide whether a seal
+	// has anything to do, so "the page says there is something to publish"
+	// and "publishing would write a generation" cannot drift apart again.
+	// The counters stay for the page to SHOW; this is what it should key
+	// off.
+	Unpublished   bool  `json:"unpublished"`
 	UploadBacklog int64 `json:"upload_backlog"`
 	// NextPublishS is a floor, not a promise: write pressure can fire a
 	// checkpoint sooner, and the page says so.
@@ -1061,10 +1185,15 @@ func (b *browseServer) state() browseState {
 	b.mu.Unlock()
 
 	st := browseState{
-		Phase:     phase,
-		Error:     openErr,
-		Volume:    b.prefix,
-		Mode:      "read-only",
+		Phase:  phase,
+		Error:  openErr,
+		Volume: b.prefix,
+		Mode:   "read-only",
+		// The branch the flags asked for until the volume is open, and the
+		// one the SESSION is on after that. They differ the moment the
+		// branch picker is used, and a durability panel still naming the
+		// branch a switch moved off is the stale binding this route was
+		// most at risk of.
 		Branch:    b.args.branch,
 		Lease:     "none",
 		Publish:   job,
@@ -1086,20 +1215,22 @@ func (b *browseServer) state() browseState {
 	if g == nil {
 		return st
 	}
+	st.Branch = g.currentBranch()
 	st.Generation = g.gfs.Generation()
 	if g.lease != nil {
 		ls := g.lease.State()
 		st.Lease, st.LeaseAge = ls.Name(), ls.Age.Seconds()
 	}
-	bytes, nodes := g.pressure()
+	bytes, nodes, edges := g.pressure()
 	b.mu.Lock()
 	if bytes >= 0 {
 		// A readable sample replaces the remembered one. A -1 means the
 		// overlay is mid-seal, and the last known numbers are the truth
 		// about what the seal is publishing — not zero.
-		b.stagedBytes, b.stagedNodes = bytes, nodes
+		b.stagedBytes, b.stagedNodes, b.stagedEdges = bytes, nodes, edges
 	}
 	st.StagedBytes, st.DirtyNodes = b.stagedBytes, b.stagedNodes
+	st.DirtyEdges = b.stagedEdges
 	b.mu.Unlock()
 	// StagedFiles is the file count behind those bytes; overlay.Stats has
 	// it, and pressure() (shared with the checkpoint policy) does not
@@ -1130,10 +1261,17 @@ func (b *browseServer) state() browseState {
 			st.StagedBytes = over.stagedBytes
 			st.DirtyNodes = over.stagedFiles
 		}
+		if over.dirtyEdges != 0 {
+			st.DirtyEdges = over.dirtyEdges
+		}
 		if over.uploadBacklog != 0 {
 			st.UploadBacklog = over.uploadBacklog
 		}
 	}
+	// Last, so it is the truth about the state actually being reported —
+	// overrides included, since a driver test that stages an edge must see
+	// the page behave as it would for a real one.
+	st.Unpublished = st.DirtyNodes != 0 || st.DirtyEdges != 0
 	if b.args.rw && b.interval > 0 {
 		left := b.interval - time.Since(last)
 		if left < 0 {
@@ -1601,6 +1739,7 @@ func (b *browseServer) serveTestHook(w http.ResponseWriter, r *http.Request) {
 		Lease          string `json:"lease"`
 		StagedFiles    int    `json:"staged_files"`
 		StagedBytes    int64  `json:"staged_bytes"`
+		DirtyEdges     int    `json:"dirty_edges"`
 		UploadBacklog  int64  `json:"upload_backlog"`
 		PublishStallMS int    `json:"publish_stall_ms"`
 		DownloadBody   string `json:"download_body"`
@@ -1617,6 +1756,7 @@ func (b *browseServer) serveTestHook(w http.ResponseWriter, r *http.Request) {
 		b.over.lease = req.Lease
 		b.over.stagedFiles = req.StagedFiles
 		b.over.stagedBytes = req.StagedBytes
+		b.over.dirtyEdges = req.DirtyEdges
 		b.over.uploadBacklog = req.UploadBacklog
 		b.over.publishStall = time.Duration(req.PublishStallMS) * time.Millisecond
 		b.over.downloadBody = req.DownloadBody

@@ -23,7 +23,7 @@ test.describe("publish", () => {
     await request.dispose();
   });
 
-  test("the button is disabled when there is nothing to publish, and says why", async ({
+  test("the button is disabled when there is nothing to publish, and says so itself", async ({
     page,
     session,
   }) => {
@@ -31,9 +31,12 @@ test.describe("publish", () => {
     const button = page.getByTestId("publish-button");
     await expect(button).toHaveAttribute("data-publish-state", "nothing");
     await expect(button).toBeDisabled();
-    // "(nothing to publish)" is the whole point: a disabled control with no
-    // explanation is indistinguishable from a broken one.
-    await expect(page.getByTestId("publish-hint")).toContainText("nothing to publish");
+    // ONE CONTROL, THREE STATES. A disabled "Publish now" with "(nothing to
+    // publish)" beside it was one fact rendered twice, so the label is the
+    // state and there is nothing next to it -- which this asserts by counting
+    // the hint at zero as well as reading the label.
+    await expect(button).toHaveText("Nothing to publish");
+    await expect(page.getByTestId("publish-hint")).toHaveCount(0);
   });
 
   test("click -> 202 -> the job reaches done", async ({ page, session, playwright }) => {
@@ -82,7 +85,14 @@ test.describe("publish", () => {
     await expect(status).toHaveAttribute("data-job-state", "running");
     // While a publish holds the overlay the UI must not offer another one.
     await expect(button).toBeDisabled();
-    await expect(page.getByTestId("publish-hint")).toContainText("publishing");
+    await expect(button).toHaveText("Publishing");
+    // ONE LINE, NOT THREE. The durability line says it is publishing instead
+    // of counting down to a publish already in flight, and the paragraph that
+    // used to add "the seal freezes the overlay, so uploads resume in a
+    // moment" under both of them says nothing at all.
+    await expect(page.getByTestId("durability")).toContainText("Publishing now.");
+    await expect(page.getByTestId("durability")).not.toContainText("Next publish in");
+    await expect(status).toHaveText("");
     const runningJob = await status.getAttribute("data-job-id");
     expect(runningJob, "the page must name the job it is watching").toBeTruthy();
 

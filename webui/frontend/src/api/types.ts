@@ -83,6 +83,15 @@ export type SsoPrompt = {
 export type PublishJob = {
   id: string;
   state: "running" | "done" | "failed" | "idle";
+  /**
+   * WHO ASKED, and it is not always a publish at all: "user" is the button,
+   * "idle" is the seal that runs when the last tab has been gone a while, and
+   * "branch" is `POST /api/v1/branch` -- a switch, reported in this slot
+   * because a switch and a seal both hold the session lock end to end. The
+   * page reads it: "publishing…" over a branch switch would say the user's
+   * bytes are going to the federation when they are not.
+   */
+  reason?: string;
   started: string;
   ended?: string;
   summary?: string;
@@ -134,6 +143,36 @@ export type ListingMeta = {
   total?: number;
   /** The cap the server applied, if it said. */
   cap?: number;
+};
+
+/**
+ * One branch, as `GET /api/v1/branches` reports it.
+ *
+ * ASSUMED, and this is the whole of what the branch picker needs from the
+ * sibling building the route (api/branches.ts states the contract in full):
+ * a name, the generation it is on, its head, and whether it has staged work.
+ * `head` is carried because the list is also the answer to "which of these is
+ * the one I published from", and dropping it from the type would make that a
+ * second request later.
+ */
+export type Branch = {
+  name: string;
+  /**
+   * Optional, and not because the contract makes it so: the picker also has to
+   * render the branch the /events snapshot names when the list has not caught
+   * up with it yet, and that stand-in has a name and nothing else.
+   */
+  generation?: number;
+  head?: string;
+  /** This branch has work staged against it that a switch would strand. */
+  staged?: boolean;
+};
+
+/** `GET /api/v1/branches` -> this. ASSUMED; see api/branches.ts. */
+export type BranchList = {
+  /** The branch this session is on. Must be one of `branches`. */
+  current: string;
+  branches: Branch[];
 };
 
 /** `POST /api/v1/download` -> this. Not assumed: M1 serves it. */

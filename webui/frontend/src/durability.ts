@@ -31,9 +31,20 @@ export const GLYPH = {
   staged: "●", // ● filled dot: on this machine only
   sending: "◔", // ◔ moving arc: packs in flight
   published: "✓", // ✓ check: named by a generation in the federation
+  failed: "✗", // ✗ cross: the volume never opened, so none of the above is known
 } as const;
 
-export type Durability = "unknown" | "staged" | "published";
+export type Durability = "unknown" | "staged" | "published" | "failed";
+
+/**
+ * The lead-in on a failed open, and the ONLY words this file adds to one.
+ *
+ * Everything after it is the server's own sentence, verbatim: it names the
+ * state directory and the next step (wait out the branch lease, or point at
+ * another state dir), and a page that paraphrased or truncated it would take
+ * away the one thing the reader can act on.
+ */
+export const OPEN_FAILED = "pelfs could not open this volume.";
 
 export function bytes(n: number): string {
   if (!n) return "0 B";
@@ -61,61 +72,136 @@ export type DurabilityLine = {
   text: string;
 };
 
-/** The one-line answer to "is my data in the federation yet". */
+/**
+ * The one-line answer to "is my data in the federation yet", AND NOTHING ELSE.
+ *
+ * IT IS THE ONLY LINE. A running seal used to be said twice -- this countdown,
+ * and a second paragraph under it reading "publishing… — the seal freezes the
+ * overlay, so uploads resume in a moment". The owner's verdict was "This data
+ * could all be on the same line!", so the countdown clause BECOMES the
+ * publishing clause while a seal runs and the paragraph under it renders
+ * nothing (ui/Durability.tsx).
+ *
+ * THE IDLE CLAUSE WENT WITH THAT EDIT. ", or 30s after this tab closes" was
+ * true and was not worth the width. The behaviour is untouched --
+ * cmd/pelfs/idleseal.go still seals a session whose last tab went away -- and
+ * a publish that happens that way still says so when it lands.
+ *
+ * What did NOT get shortened away is the distinction. Three glyphs, three
+ * characters, and "on this machine only" never wearing the check --
+ * internal/webui/durability_test.go and tests/durability.spec.ts both fail if
+ * that erodes.
+ */
 export function describe(s: BrowseState | null): DurabilityLine {
-  if (!s || s.phase !== "ready") {
-    return { state: "unknown", glyph: "", text: "reading the overlay…" };
-  }
-  if (s.mode === "read-only") {
+  // A FAILED OPEN IS NOT A SLOW ONE, and this line is where the difference
+  // used to be lost. Every phase that was not "ready" rendered as "Reading
+  // the overlay…", so the volume refusing to open -- a branch lease left
+  // behind by a `--rw` session that did not exit cleanly is the ordinary way
+  // in -- looked exactly like a volume that was about to open. That is the
+  // report: "whenever I start read-write, I just get a page that says
+  // 'reading the overlay…'. Never seems to progress."
+  //
+  // The server now SERVES the reason rather than racing the browser with it
+  // (cmd/pelfs/browsefail.go): the listener stays up, and `error` carries a
+  // whole sentence -- what refused, where this session's state directory is,
+  // and what to do next. So this renders that sentence, unedited, and stops
+  // claiming progress.
+  if (s && s.phase === "failed") {
     return {
-      state: "published",
-      glyph: GLYPH.published,
-      text: `read-only. everything here is in the federation (generation ${s.generation}).`,
+      state: "failed",
+      glyph: GLYPH.failed,
+      text: s.error ? `${OPEN_FAILED}\n${s.error}` : OPEN_FAILED,
     };
   }
-  if (s.staged_files === 0 && s.dirty_nodes === 0) {
+  if (!s || s.phase !== "ready") {
+    return { state: "unknown", glyph: "", text: "Reading the overlay…" };
+  }
+  // A read-only session and a writable one with nothing staged are the same
+  // answer to the only question this line asks, so they are the same sentence.
+  // The difference between them is a mode chip and a publish control, both of
+  // which are elsewhere and neither of which is durability.
+  if (s.mode === "read-only" || (s.staged_files === 0 && s.dirty_nodes === 0)) {
     return {
       state: "published",
       glyph: GLYPH.published,
-      text: `nothing staged. everything here is in the federation (generation ${s.generation}).`,
+      text: "Everything here is in the federation.",
     };
   }
   const sending =
-    s.upload_backlog > 0 ? ` ${GLYPH.sending} sending ${bytes(s.upload_backlog)}.` : "";
-  // The idle clause is not decoration: it is the promise that closing this
-  // tab publishes rather than abandoning. Said only when the server says
-  // idle sealing is on for this session, and in cmd/pelfs/browse.html's
-  // words, because the two surfaces have one vocabulary.
-  const idle = s.idle_seal_s && s.idle_seal_s > 0
-    ? `, or ${secs(s.idle_seal_s)} after this tab closes`
-    : "";
+    s.upload_backlog > 0 ? ` ${GLYPH.sending} Sending ${bytes(s.upload_backlog)}.` : "";
+  // A seal in flight REPLACES the countdown rather than standing under it: a
+  // countdown to a publish that is already running is two answers to one
+  // question, and they are the pair the owner asked to collapse.
+  const when =
+    s.publish && s.publish.state === "running" && s.publish.reason !== "branch"
+      ? "Publishing now."
+      : `Next publish in ${secs(s.next_publish_s)}.`;
   return {
     state: "staged",
     glyph: GLYPH.staged,
     text:
       `${s.staged_files} file${s.staged_files === 1 ? "" : "s"} (${bytes(s.staged_bytes)}) ` +
-      `on this machine only — next automatic publish in ${secs(s.next_publish_s)}` +
-      `${idle} (sooner under write pressure).${sending}`,
+      `on this machine only. ${when}${sending}`,
   };
 }
 
-export type PublishState = "ready" | "connecting" | "read-only" | "running" | "nothing";
+export type PublishState =
+  | "ready"
+  | "connecting"
+  | "failed"
+  | "read-only"
+  | "running"
+  | "switching"
+  | "nothing";
 
+/**
+ * `switching` and `running` are the SAME job slot and not the same event.
+ *
+ * `POST /api/v1/branch` reports its progress as a publish job with
+ * `reason: "branch"` (cmd/pelfs/browsebranch.go), because a switch and a seal
+ * both hold the session lock for their whole duration and a second slot would
+ * only be a second name for the same queue. Rendering it as "publishing…"
+ * would tell the user their bytes are being written to the federation while
+ * the session is reopening an overlay on another branch head, which is the
+ * one thing this panel exists not to do.
+ */
 export function publishState(s: BrowseState | null): PublishState {
-  if (!s || s.phase !== "ready") return "connecting";
+  if (!s) return "connecting";
+  if (s.phase === "failed") return "failed";
+  if (s.phase !== "ready") return "connecting";
   if (s.mode === "read-only") return "read-only";
-  if (s.publish && s.publish.state === "running") return "running";
+  if (s.publish && s.publish.state === "running") {
+    return s.publish.reason === "branch" ? "switching" : "running";
+  }
   if (s.staged_files === 0 && s.dirty_nodes === 0) return "nothing";
   return "ready";
 }
 
-export const PUBLISH_HINT: Record<PublishState, string> = {
-  ready: "",
-  connecting: "(waiting for the volume)",
-  "read-only": "(read-only session — restart with --rw to publish)",
-  running: "(publishing — this holds the overlay, so writes wait)",
-  nothing: "(nothing to publish)",
+/**
+ * ONE CONTROL, WEARING ITS OWN STATE.
+ *
+ * There used to be a hint beside the button as well as the button: a disabled
+ * control reading "Publish now" with "(nothing to publish)" next to it says one
+ * thing twice, and the owner said so -- "duplicate info". So the label IS the
+ * state, and there is nothing beside it.
+ *
+ * An empty label means NO BUTTON AT ALL: a failed open has no volume to publish
+ * to, and a read-only session gets READ_ONLY_HINT where the control would be.
+ */
+export const PUBLISH_LABEL: Record<PublishState, string> = {
+  ready: "Publish now",
+  nothing: "Nothing to publish",
+  running: "Publishing",
+  // A branch switch takes the same job slot and is NOT a publish, so it does
+  // not borrow the word: the button says what is actually happening.
+  switching: "Switching branches",
+  connecting: "Waiting for the volume",
+  failed: "",
+  "read-only": "",
 };
+
+/** The one session that gets a sentence instead of a control. */
+export const READ_ONLY_HINT = "(read-only session — restart with --rw to publish)";
 
 /**
  * A lease this session no longer holds means everything the user does from

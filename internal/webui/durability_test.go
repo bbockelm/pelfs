@@ -45,13 +45,19 @@ func TestTheTwoSurfacesShareOneDurabilityVocabulary(t *testing.T) {
 	page := readRepoFile(t, "cmd", "pelfs", "browse.html")
 	app := readRepoFile(t, "webui", "frontend", "src", "durability.ts")
 
-	// The three glyphs, as literal characters. They are three DIFFERENT
-	// characters on purpose: colour alone would fail roughly one man in
-	// twelve, so the shape carries the meaning.
+	// The glyphs, as literal characters. They are all DIFFERENT characters
+	// on purpose: colour alone would fail roughly one man in twelve, so the
+	// shape carries the meaning.
 	glyphs := map[string]string{
 		"staged":    "●",
 		"sending":   "◔",
 		"published": "✓",
+		// The fourth is the volume that never opened. It is here for the
+		// same reason as the other three: a failed open is a state a reader
+		// must be able to tell from the others at a glance, and it acquired
+		// a glyph when both surfaces stopped rendering it as "reading the
+		// overlay…".
+		"failed": "✗",
 	}
 	seen := map[string]string{}
 	for name, glyph := range glyphs {
@@ -60,7 +66,7 @@ func TestTheTwoSurfacesShareOneDurabilityVocabulary(t *testing.T) {
 		}
 		if !strings.Contains(app, glyph) {
 			t.Errorf("webui/frontend/src/durability.ts no longer contains the %q glyph %q\n"+
-				"The two surfaces must render the same three characters; see this test's comment.",
+				"The two surfaces must render the same characters; see this test's comment.",
 				name, glyph)
 		}
 		if other, clash := seen[glyph]; clash {
@@ -73,18 +79,55 @@ func TestTheTwoSurfacesShareOneDurabilityVocabulary(t *testing.T) {
 	// The sentences a user reads. Not the whole prose -- these are the
 	// phrases that carry the distinction, and rewording one surface's copy of
 	// them without the other is the drift this test catches.
+	//
+	// THE LIST GOT SHORTER ON PURPOSE, and this is the one place the reason is
+	// worth recording. The published sentence used to read "read-only.
+	// everything here is in the federation (generation 5)." on one surface and
+	// "nothing staged. everything here is …" on the other -- lowercase,
+	// mid-sentence, and repeating two facts the app bar already carries (the
+	// mode chip and the generation). The owner's verdict was "strangely
+	// capitalized and repeats things elsewhere in the UI", so both surfaces now
+	// say "Everything here is in the federation." for every published state and
+	// neither says the mode or the generation. "nothing staged" and "sooner
+	// under write pressure" left the vocabulary with that edit; "next automatic
+	// publish in" became "Next publish in". What did NOT change is the thing
+	// this test exists for: the two surfaces still say it in the same words, so
+	// a later edit to one of them still fails here.
+	//
+	// IT GOT SHORTER AGAIN, and the same rule applies to what left. ", or 30s
+	// after this tab closes" is gone from both surfaces -- the idle seal still
+	// happens (cmd/pelfs/idleseal.go), it is just not worth the width -- and
+	// the publish HINTS are gone with it: one control now wears its own state,
+	// so "(nothing to publish)" beside a disabled "Publish now" became the
+	// button's own label. The labels are the vocabulary now, and they are
+	// pinned here exactly as the sentences were.
 	for _, phrase := range []string{
 		"on this machine only",
-		"in the federation",
-		"nothing staged",
-		"next automatic publish in",
-		// The idle clause. It is the promise that closing the tab publishes
-		// rather than abandons, and it was on the connection page only until
-		// the wiring pass -- so the surface that can actually stage files was
-		// the one that did not make the promise.
-		"after this tab closes",
-		"(nothing to publish)",
+		"Everything here is in the federation.",
+		"Next publish in",
+		// The seal in flight, which REPLACES the countdown rather than
+		// standing under it: one line, on both surfaces.
+		"Publishing now.",
+		// The three button labels the owner specified: disabled-grey,
+		// blue, disabled-grey.
+		"Nothing to publish",
+		"Publish now",
+		"Publishing",
 		"(read-only session — restart with --rw to publish)",
+		// THE FAILED OPEN. The server serves a whole sentence in
+		// `state.error` -- what refused, where this session's state
+		// directory is, what to do next (cmd/pelfs/browsefail.go) -- and
+		// both surfaces render it VERBATIM under this one fixed lead-in.
+		// The lead-in is the only wording either page adds, so it is the
+		// only part of that state there is anything to keep in step.
+		"pelfs could not open this volume.",
+		// A BRANCH SWITCH IS NOT A PUBLISH. It is reported in the publish
+		// job slot with reason "branch" (cmd/pelfs/browsebranch.go), and a
+		// surface that rendered it as "publishing" would tell the user
+		// their bytes were going to the federation while the session
+		// reopened an overlay on another head. It is the button's label
+		// now, and it still must not borrow the other one's word.
+		"Switching branches",
 	} {
 		if !strings.Contains(page, phrase) {
 			t.Errorf("cmd/pelfs/browse.html no longer says %q", phrase)
@@ -95,9 +138,9 @@ func TestTheTwoSurfacesShareOneDurabilityVocabulary(t *testing.T) {
 		}
 	}
 
-	// The three values of data-durability, which are the suite's handle on
+	// The values of data-durability, which are the suite's handle on
 	// all of the above (webui/frontend/tests/durability.spec.ts).
-	for _, state := range []string{"unknown", "staged", "published"} {
+	for _, state := range []string{"unknown", "staged", "published", "failed"} {
 		if !strings.Contains(page, `"`+state+`"`) {
 			t.Errorf("cmd/pelfs/browse.html no longer produces data-durability=%q", state)
 		}

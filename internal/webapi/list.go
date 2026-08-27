@@ -433,6 +433,19 @@ type flightCall struct {
 
 func newFlight() *flight { return &flight{calls: map[string]*flightCall{}} }
 
+// flightJoined, when non-nil, is called by a caller that found a call already
+// in flight, just before it waits on it.
+//
+// It exists for one test and is nil in every build that matters. Collapsing
+// cannot be asserted by timing: a test that starts N goroutines and counts
+// readdirs is asserting a scheduling outcome, and eight 50-entry listings can
+// finish one after another on an idle machine with nothing to merge. That
+// test passed on a busy laptop and failed on an idle CI runner, twice. The
+// join is the only moment a follower is observably inside the guard, so a
+// test can hold the leader until every follower has arrived and then assert
+// exactly one readdir.
+var flightJoined func()
+
 // do runs fn for key, or waits for the fn already running for it. The result
 // is shared by pointer and must be treated as READ-ONLY by every caller: two
 // responses can be rendering the same listing at the same instant, so a
@@ -441,6 +454,9 @@ func (f *flight) do(key string, fn func() (*listing, error)) (*listing, error) {
 	f.mu.Lock()
 	if c, ok := f.calls[key]; ok {
 		f.mu.Unlock()
+		if flightJoined != nil {
+			flightJoined()
+		}
 		c.wg.Wait()
 		return c.res, c.err
 	}

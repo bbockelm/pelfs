@@ -12,6 +12,7 @@ package localoauth
 
 import (
 	"encoding/json"
+	"html"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -124,6 +125,37 @@ func (h *harness) consent(ticket, decision string) *httptest.ResponseRecorder {
 	return w
 }
 
+// deliverRE finds the success page's one hidden frame, which is where the
+// authorization now reaches the client. It replaced a 303: see
+// connectedPage.
+var deliverRE = regexp.MustCompile(`<iframe class="deliver" src="([^"]*)"`)
+
+// deliver is the URL the success page hands the authorization to — byte for
+// byte the URL the consent POST used to answer 303 with. It asserts on the
+// way that the POST answered a PAGE and not a redirect, which is the fix for
+// "when I click Authorize, nothing happens in the browser".
+//
+// html/template escapes the `&` between code and state in an attribute, so it
+// is unescaped here rather than in every caller.
+func (h *harness) deliver(w *httptest.ResponseRecorder) *url.URL {
+	h.t.Helper()
+	if w.Code != http.StatusOK {
+		h.t.Fatalf("consent POST: status %d, want 200\n%s", w.Code, w.Body.String())
+	}
+	if loc := w.Header().Get("Location"); loc != "" {
+		h.t.Fatalf("the consent POST redirected to %q; a success is a page now", loc)
+	}
+	m := deliverRE.FindStringSubmatch(w.Body.String())
+	if m == nil {
+		h.t.Fatalf("no delivery frame on the page the consent POST answered:\n%s", w.Body.String())
+	}
+	u, err := url.Parse(html.UnescapeString(m[1]))
+	if err != nil {
+		h.t.Fatalf("delivery URL: %v", err)
+	}
+	return u
+}
+
 // code drives the whole front channel and returns the authorization code.
 func (h *harness) code() string {
 	h.t.Helper()
@@ -131,16 +163,9 @@ func (h *harness) code() string {
 	if page.Code != http.StatusOK {
 		h.t.Fatalf("consent page: status %d\n%s", page.Code, page.Body.String())
 	}
-	w := h.consent(h.ticket(page), "allow")
-	if w.Code != http.StatusSeeOther {
-		h.t.Fatalf("consent POST: status %d, want 303\n%s", w.Code, w.Body.String())
-	}
-	loc, err := url.Parse(w.Header().Get("Location"))
-	if err != nil {
-		h.t.Fatalf("Location: %v", err)
-	}
+	loc := h.deliver(h.consent(h.ticket(page), "allow"))
 	if got, want := loc.Scheme+"://"+loc.Host+loc.Path, h.client.Redirect; got != want {
-		h.t.Fatalf("redirected to %q, want %q", got, want)
+		h.t.Fatalf("the authorization is delivered to %q, want %q", got, want)
 	}
 	if got := loc.Query().Get("state"); got != "cyberduck-state-value" {
 		h.t.Fatalf("state came back as %q", got)
@@ -284,7 +309,51 @@ func TestTamperedCodeVerifierIsRefusedAndBurnsTheCode(t *testing.T) {
 	}
 }
 
-func TestReplayedCodeIsCountedAndRevokesWhatTheFirstOneBought(t *testing.T) {
+// TestReplayedCodeWithoutTheVerifierIsCountedAndRevokes is RFC 6819
+// §5.2.1.1's case and the hostile half of the used-code branch: a caller who
+// has the CODE and not the PKCE verifier. Nothing but the code can have
+// leaked to them — the verifier never leaves the client — so the token the
+// first exchange bought is what is at risk, and it goes.
+func TestReplayedCodeWithoutTheVerifierIsCountedAndRevokes(t *testing.T) {
+	h := newHarness(t, false)
+	code := h.code()
+	_, first := h.exchange(code, testVerifier)
+	if _, ok := h.s.Verify(first.AccessToken); !ok {
+		t.Fatal("the first exchange did not produce a working token")
+	}
+	// A verifier of legal SHAPE (or the request never reaches the code at
+	// all) that is not the one the challenge was built from: exactly what an
+	// attacker who scraped the code out of a callback URL can produce.
+	stolen := "Xelfs-test-verifier-0123456789-abcdefghijklm"
+	w, second := h.exchange(code, stolen)
+	if w.Code != http.StatusBadRequest || second.AccessToken != "" {
+		t.Fatalf("replay: status %d body %s", w.Code, w.Body.String())
+	}
+	if got := h.s.Counts().CodeReplays; got != 1 {
+		t.Errorf("CodeReplays = %d, want 1", got)
+	}
+	if got := h.s.Counts().CodeRetries; got != 0 {
+		t.Errorf("CodeRetries = %d on a replay, want 0", got)
+	}
+	if _, ok := h.s.Verify(first.AccessToken); ok {
+		t.Error("a replayed code did not revoke the grant the first exchange created")
+	}
+	if n := len(h.s.Grants()); n != 0 {
+		t.Errorf("%d grants survive a replay", n)
+	}
+}
+
+// TestTheClientRetryingItsOwnExchangeIsNotAReplay is the benign half, and the
+// distinction is the whole point: a client whose token response was lost
+// retries the same POST, with the same code AND the same verifier. That is
+// the client the code was issued to, proving it with a secret that never left
+// it, so destroying the grant would be punishing the user for a dropped
+// packet.
+//
+// What must NOT change: the code is still single use. The retry gets
+// invalid_grant like everything else on this endpoint; it just does not cost
+// the user their connection.
+func TestTheClientRetryingItsOwnExchangeIsNotAReplay(t *testing.T) {
 	h := newHarness(t, false)
 	code := h.code()
 	_, first := h.exchange(code, testVerifier)
@@ -292,19 +361,29 @@ func TestReplayedCodeIsCountedAndRevokesWhatTheFirstOneBought(t *testing.T) {
 		t.Fatal("the first exchange did not produce a working token")
 	}
 	w, second := h.exchange(code, testVerifier)
-	if w.Code != http.StatusBadRequest || second.AccessToken != "" {
-		t.Fatalf("replay: status %d body %s", w.Code, w.Body.String())
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("a retried exchange was answered %d; the code is single use", w.Code)
 	}
+	if second.AccessToken != "" {
+		t.Error("a retried exchange minted a SECOND token from one code")
+	}
+	if got := h.s.Counts().CodeRetries; got != 1 {
+		t.Errorf("CodeRetries = %d, want 1", got)
+	}
+	if got := h.s.Counts().CodeReplays; got != 0 {
+		t.Errorf("CodeReplays = %d, want 0: the client proved it holds the verifier", got)
+	}
+	if _, ok := h.s.Verify(first.AccessToken); !ok {
+		t.Error("the client's own retry destroyed the connection it already had")
+	}
+	// And a caller who follows the retry WITHOUT the verifier is still a
+	// replay: the row is not made permanently safe by one honest retry.
+	h.exchange(code, "Xelfs-test-verifier-0123456789-abcdefghijklm")
 	if got := h.s.Counts().CodeReplays; got != 1 {
-		t.Errorf("CodeReplays = %d, want 1", got)
+		t.Errorf("a verifier-less presentation after a retry: CodeReplays = %d, want 1", got)
 	}
-	// A replay means the code leaked, so the token it bought is what is at
-	// risk (RFC 6819 §5.2.1.1).
 	if _, ok := h.s.Verify(first.AccessToken); ok {
-		t.Error("a replayed code did not revoke the grant the first exchange created")
-	}
-	if n := len(h.s.Grants()); n != 0 {
-		t.Errorf("%d grants survive a replay", n)
+		t.Error("the replay after the retry did not revoke the grant")
 	}
 }
 
@@ -413,17 +492,38 @@ func TestConsentIsStructural(t *testing.T) {
 		}
 	})
 
-	t.Run("the page names what is being authorized", func(t *testing.T) {
+	t.Run("the page names what is being authorized, and nothing else", func(t *testing.T) {
+		// THE THREE FACTS THAT MAKE THE CLICK MEANINGFUL, and they are the
+		// whole page now: which program, which volume, what access.
 		h := newHarness(t, false)
 		body := h.get(h.query()).Body.String()
 		for _, want := range []string{"Cyberduck", "pelican://osg-htc.org/user/bbockelman",
-			h.client.Redirect, "read only"} {
+			"read only"} {
 			if !strings.Contains(body, want) {
 				t.Errorf("the consent page does not name %q", want)
 			}
 		}
 		if strings.Contains(body, h.client.ID) {
 			t.Error("the consent page renders the client_id, which is a secret")
+		}
+		// AND THE TWO THINGS THAT WERE DELETED, pinned so they do not come
+		// back the next time somebody feels a screen looks bare.
+		//
+		// The callback row ("sends the authorization to
+		// http://127.0.0.1:52001/…"): a loopback URL with a port in it is
+		// not something a person can act on, and the control it looked like
+		// it was doing is done unconditionally in the handler, byte for
+		// byte, whatever the screen says.
+		if strings.Contains(body, h.client.Redirect) {
+			t.Error("the consent page is back to naming the callback URL, " +
+				"which the owner called useless and which no user can act on")
+		}
+		// The essay under the buttons. The page is facts and a decision.
+		for _, gone := range []string{"one thing standing", "it can never publish",
+			"a page you happened to visit"} {
+			if strings.Contains(body, gone) {
+				t.Errorf("the consent page grew prose back: %q", gone)
+			}
 		}
 	})
 
@@ -448,16 +548,69 @@ func TestConsentIsStructural(t *testing.T) {
 		}
 	})
 
-	t.Run("a ticket is single use", func(t *testing.T) {
+	t.Run("a ticket is single use, and a second press is not an error", func(t *testing.T) {
+		// THE REPORT: "if I click it twice, I get an error." It was a bare
+		// refusal page, because a spent ticket was indistinguishable from a
+		// forged one. It is distinguishable now, on evidence: the ticket is
+		// 32 bytes that existed in one HTML body, so a caller who can
+		// produce it was SHOWN that page.
+		//
+		// What must not move is the single-use rule, and this asserts it
+		// where it counts: after the second press there is still exactly ONE
+		// code, and the page carries no second delivery.
 		h := newHarness(t, false)
 		ticket := h.ticket(h.get(h.query()))
-		if w := h.consent(ticket, "allow"); w.Code != http.StatusSeeOther {
-			t.Fatalf("first submit: status %d", w.Code)
+		first := h.consent(ticket, "allow")
+		if first.Code != http.StatusOK {
+			t.Fatalf("first submit: status %d", first.Code)
 		}
 		w := h.consent(ticket, "allow")
-		if w.Code != http.StatusBadRequest || w.Header().Get("Location") != "" {
-			t.Errorf("a resubmitted consent page minted a second code: %d %q",
-				w.Code, w.Header().Get("Location"))
+		if w.Code != http.StatusOK {
+			t.Errorf("a second press answered %d; a user who just connected must not "+
+				"be shown an error", w.Code)
+		}
+		if !strings.Contains(w.Body.String(), "Already connected") {
+			t.Errorf("a second press does not say the program is already connected:\n%s",
+				w.Body.String())
+		}
+		if deliverRE.MatchString(w.Body.String()) {
+			t.Error("a second press re-delivered the authorization, which is a code " +
+				"presented twice and would revoke the grant")
+		}
+		h.s.mu.Lock()
+		n := len(h.s.codes)
+		h.s.mu.Unlock()
+		if n != 1 {
+			t.Errorf("%d codes after two presses of one screen, want 1", n)
+		}
+		if got := h.s.Counts().ConsentRepeats; got != 1 {
+			t.Errorf("ConsentRepeats = %d, want 1", got)
+		}
+		if got := h.s.Counts().ConsentTicketsRefused; got != 0 {
+			t.Errorf("ConsentTicketsRefused = %d: a re-press is not a forgery", got)
+		}
+	})
+
+	t.Run("a second press after the grant is gone says so", func(t *testing.T) {
+		// The other half of "already connected": if there is nothing there
+		// any more — the user revoked it between presses — saying "already
+		// connected" would be a lie, so the page says what is true instead.
+		h := newHarness(t, false)
+		ticket := h.ticket(h.get(h.query()))
+		loc := h.deliver(h.consent(ticket, "allow"))
+		h.exchange(loc.Query().Get("code"), testVerifier)
+		if ok, err := h.s.RevokeGrant(h.s.Grants()[0].Ref); !ok || err != nil {
+			t.Fatalf("RevokeGrant: %v %v", ok, err)
+		}
+		w := h.consent(ticket, "allow")
+		if w.Code != http.StatusOK {
+			t.Errorf("status %d", w.Code)
+		}
+		if strings.Contains(w.Body.String(), "Already connected") {
+			t.Error("the page claims a revoked connection is live")
+		}
+		if !strings.Contains(w.Body.String(), "already been used") {
+			t.Errorf("the page does not say the authorization is spent:\n%s", w.Body.String())
 		}
 	})
 
@@ -474,9 +627,15 @@ func TestConsentIsStructural(t *testing.T) {
 		if got := h.s.Counts().ConsentDenied; got != 1 {
 			t.Errorf("ConsentDenied = %d, want 1", got)
 		}
-		// And the ticket is spent, so Deny cannot be followed by Allow.
-		if w := h.consent(ticket, "allow"); w.Code != http.StatusBadRequest {
-			t.Errorf("a denied screen was re-answered: %d", w.Code)
+		// And the ticket is spent, so Deny cannot be followed by Allow. The
+		// page says the same thing it said the first time — pressing a
+		// button twice is not an error condition — and the assertion that
+		// matters is that nothing was minted.
+		if w := h.consent(ticket, "allow"); !strings.Contains(w.Body.String(), "Not authorized") {
+			t.Errorf("a denied screen was re-answered with %d:\n%s", w.Code, w.Body.String())
+		}
+		if n := len(h.s.codes); n != 0 {
+			t.Errorf("%d codes after Deny then Allow", n)
 		}
 	})
 
@@ -591,8 +750,7 @@ func TestWritableSessionMintsBothKinds(t *testing.T) {
 	q := h.query()
 	q.Set("scope", ScopeRead)
 	page := h.get(q)
-	w := h.consent(h.ticket(page), "allow")
-	loc, _ := url.Parse(w.Header().Get("Location"))
+	loc := h.deliver(h.consent(h.ticket(page), "allow"))
 	_, tok2 := h.exchange(loc.Query().Get("code"), testVerifier)
 	if g, ok := h.s.Verify(tok2.AccessToken); !ok || g.Write {
 		t.Errorf("a read-only client on a --rw session got Write=%v", g.Write)
@@ -630,8 +788,8 @@ func TestRevocation(t *testing.T) {
 		h := newHarness(t, false)
 		_, tok := h.exchange(h.code(), testVerifier)
 		ref := h.s.Grants()[0].Ref
-		if !h.s.RevokeGrant(ref) {
-			t.Fatal("RevokeGrant reported nothing to revoke")
+		if ok, err := h.s.RevokeGrant(ref); !ok || err != nil {
+			t.Fatalf("RevokeGrant reported nothing to revoke: %v %v", ok, err)
 		}
 		if _, ok := h.s.Verify(tok.AccessToken); ok {
 			t.Error("a revoked token still verifies")
@@ -654,23 +812,22 @@ func TestRevocation(t *testing.T) {
 		_, tok := h.exchange(h.code(), testVerifier)
 		page := h.get(h.query()) // a live consent page, too
 		ticket := h.ticket(page)
-		if !h.s.Revoke(h.client.Ref) {
-			t.Fatal("Revoke reported nothing to revoke")
+		if ok, err := h.s.Revoke(h.client.Ref); !ok || err != nil {
+			t.Fatalf("Revoke reported nothing to revoke: %v %v", ok, err)
 		}
 		if _, ok := h.s.Verify(tok.AccessToken); ok {
 			t.Error("a revoked client's OAuth token still verifies")
 		}
-		if _, ok := h.s.verifyBasic(h.client.BasicUser, h.client.BasicPassword); ok {
-			t.Error("a revoked client's Basic credential still verifies")
-		}
-		if w := h.consent(ticket, "allow"); w.Code != http.StatusBadRequest {
-			t.Errorf("a revoked client's outstanding consent page still authorized: %d", w.Code)
+		if w := h.consent(ticket, "allow"); w.Code != http.StatusBadRequest ||
+			deliverRE.MatchString(w.Body.String()) {
+			t.Errorf("a revoked client's outstanding consent page still authorized: %d\n%s",
+				w.Code, w.Body.String())
 		}
 		if w := h.get(h.query()); w.Code != http.StatusBadRequest {
 			t.Errorf("a revoked client_id is still known: %d", w.Code)
 		}
-		if h.s.Revoke(h.client.Ref) {
-			t.Error("Revoke succeeded twice")
+		if ok, err := h.s.Revoke(h.client.Ref); ok || err != nil {
+			t.Errorf("Revoke succeeded twice: %v %v", ok, err)
 		}
 	})
 
@@ -702,37 +859,6 @@ func TestRevocation(t *testing.T) {
 			t.Error("a token from a previous process verified against a new one")
 		}
 	})
-}
-
-func TestBasicCredentialIsPerClientAndRevocable(t *testing.T) {
-	h := newHarness(t, false)
-	if !strings.HasPrefix(h.client.BasicUser, "pelfs-") || h.client.BasicPassword == "" {
-		t.Fatalf("client credentials look wrong: %q %q", h.client.BasicUser, h.client.BasicPassword)
-	}
-	if _, ok := h.s.verifyBasic(h.client.BasicUser, h.client.BasicPassword); !ok {
-		t.Fatal("the Basic credential does not verify")
-	}
-	if _, ok := h.s.verifyBasic(h.client.BasicUser, "wrong"); ok {
-		t.Error("a wrong password verified")
-	}
-	if _, ok := h.s.verifyBasic("pelfs-nobody", h.client.BasicPassword); ok {
-		t.Error("a wrong username verified")
-	}
-	if _, ok := h.s.verifyBasic("", ""); ok {
-		t.Error("an empty credential verified")
-	}
-	second, err := h.s.NewClient(ClientRequest{Label: "WinSCP",
-		RedirectURI: davprofile.RedirectURI(52004)})
-	if err != nil {
-		t.Fatalf("NewClient: %v", err)
-	}
-	if second.BasicUser == h.client.BasicUser || second.BasicPassword == h.client.BasicPassword {
-		t.Error("two clients share a credential")
-	}
-	h.s.Revoke(h.client.Ref)
-	if _, ok := h.s.verifyBasic(second.BasicUser, second.BasicPassword); !ok {
-		t.Error("revoking one client's credential killed another's")
-	}
 }
 
 // ------------------------------------------------------- the A7 row-by-row
@@ -810,7 +936,7 @@ func TestA7Controls(t *testing.T) {
 		}
 	})
 
-	t.Run("4 client_id is a per-download secret", func(t *testing.T) {
+	t.Run("4 client_id is a secret only a profile download carries", func(t *testing.T) {
 		h := newHarness(t, false)
 		if len(h.client.ID) < 40 {
 			t.Errorf("client_id is %d characters; it should be 32 random bytes", len(h.client.ID))
@@ -871,7 +997,7 @@ func TestA7Controls(t *testing.T) {
 		if page.Code != http.StatusOK {
 			t.Fatalf("a bare navigation was refused: %d", page.Code)
 		}
-		if w := h.consent(h.ticket(page), "allow"); w.Code != http.StatusSeeOther {
+		if w := h.consent(h.ticket(page), "allow"); w.Code != http.StatusOK {
 			t.Fatalf("a bare consent submit was refused: %d", w.Code)
 		}
 	})
@@ -968,20 +1094,16 @@ func TestStateIsOptionalAndEchoedVerbatim(t *testing.T) {
 	q := h.query()
 	q.Del("state")
 	page := h.get(q)
-	w := h.consent(h.ticket(page), "allow")
-	loc, err := url.Parse(w.Header().Get("Location"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	loc := h.deliver(h.consent(h.ticket(page), "allow"))
 	if loc.Query().Has("state") {
 		t.Error("a request with no state came back with one")
 	}
 	// A state a client chose, with characters that must survive a round
-	// trip through a query string.
+	// trip through a query string AND through an HTML attribute, which is
+	// where the delivery URL now lives.
 	q.Set("state", "a b&c=d/e?f")
 	page = h.get(q)
-	w = h.consent(h.ticket(page), "allow")
-	loc, _ = url.Parse(w.Header().Get("Location"))
+	loc = h.deliver(h.consent(h.ticket(page), "allow"))
 	if got := loc.Query().Get("state"); got != "a b&c=d/e?f" {
 		t.Errorf("state came back as %q", got)
 	}
@@ -995,6 +1117,12 @@ func TestCheckRedirectURI(t *testing.T) {
 	}
 	bad := []string{
 		"", "not a url", "://x",
+		"http://127.0.0.1:52001/c b",              // a space would truncate the CSP header
+		"http://127.0.0.1:52001/c;b",              // a `;` would end the form-action directive
+		"http://127.0.0.1:52001/c,b",              // a `,` would split the header
+		"http://127.0.0.1:52001/c'b",              // a quote in a CSP source expression
+		"http://127.0.0.1:52001/c\"b",             // ditto
+		"http://127.0.0.1:52001/c\tb",             // a control character
 		"https://127.0.0.1:52001/cb",              // no TLS on this listener
 		"http://127.0.0.1/pelfs/oauth/callback",   // NO PORT — the trap
 		"http://127.0.0.1:0/pelfs/oauth/callback", // port 0, ditto
@@ -1054,5 +1182,206 @@ func TestS256MatchesRFC7636AppendixB(t *testing.T) {
 	}
 	if !validChallenge(want) {
 		t.Error("the RFC's own challenge is rejected")
+	}
+}
+
+// --------------------------------------- the policies on the three pages,
+//                                          one of which was load-bearing and wrong
+
+// TestTheCallbackIsNamedByExactlyOneDirective is the regression test for the
+// second of the two bugs that made every real-browser Cyberduck connection
+// fail, carried forward to where the mechanism moved.
+//
+// THE BUG: `form-action` is enforced by Chromium on the REDIRECTS of a form
+// submission, not only on its first hop, and a successful authorization used
+// to 303 the consent POST to the client's own loopback listener — a different
+// origin. `form-action 'self'` blocked the last step of the flow with
+//
+//	Sending form data to 'http://127.0.0.1:PORT/oauth/authorize' violates
+//	the following Content Security Policy directive: "form-action 'self'".
+//	The request has been blocked.
+//
+// and NOTHING ELSE: no status code, no failed response the server can see. A
+// CSP violation is reported to the browser console and nowhere else, which is
+// why every server-side test passed and why a curl-driven gate could never
+// have caught it.
+//
+// WHAT CHANGED: the consent POST does not redirect at all any more
+// (connectedPage). It answers a success page, and the authorization is
+// delivered from that page's one hidden frame. So the client's callback must
+// now be named by `frame-src` on the SUCCESS page, and must NOT be named on
+// the consent page — a cross-origin form target nothing uses is a thing that
+// rots. Both halves are asserted, because getting either one wrong is the
+// same silent failure as before.
+//
+// scripts/oauth-browser-docker.sh is the gate that watches the console. This
+// is the cheap Go pin under it.
+func TestTheCallbackIsNamedByExactlyOneDirective(t *testing.T) {
+	h := newHarness(t, false)
+	page := h.get(h.query())
+	if page.Code != http.StatusOK {
+		t.Fatalf("consent page: %d", page.Code)
+	}
+	csp := page.Header().Get("Content-Security-Policy")
+	if !strings.Contains(csp, "form-action 'self';") {
+		t.Errorf("the consent page's form cannot post to its own origin: %s", csp)
+	}
+	if strings.Contains(csp, h.client.Redirect) {
+		t.Errorf("the consent page's CSP still names the client's callback; nothing on "+
+			"that page goes there any more:\n  %s", csp)
+	}
+	// The clauses that are the structural half of "one real user gesture"
+	// and of "the ticket cannot be exfiltrated".
+	for _, want := range []string{
+		"script-src 'none'", "default-src 'none'", "frame-ancestors 'none'",
+		"base-uri 'none'",
+	} {
+		if !strings.Contains(csp, want) {
+			t.Errorf("the consent CSP lost %q: %s", want, csp)
+		}
+	}
+
+	// THE SUCCESS PAGE, which is where the callback URL lives now.
+	w := h.consent(h.ticket(page), "allow")
+	scsp := w.Header().Get("Content-Security-Policy")
+	if !strings.Contains(scsp, "frame-src "+h.client.Redirect) {
+		t.Errorf("the success page's CSP does not name the client's callback in\n"+
+			"frame-src, so the delivery that ends the flow is blocked by our own\n"+
+			"policy:\n  %s", scsp)
+	}
+	for _, want := range []string{"script-src 'none'", "form-action 'none'",
+		"frame-ancestors 'none'"} {
+		if !strings.Contains(scsp, want) {
+			t.Errorf("the success page's CSP lost %q: %s", want, scsp)
+		}
+	}
+	// And the page itself is a page: something a person can read, saying
+	// which program reached which volume. That is the whole of the first
+	// report ("nothing happens in the browser").
+	body := w.Body.String()
+	for _, want := range []string{"Connected", "Cyberduck",
+		"pelican://osg-htc.org/user/bbockelman", "close this tab"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the success page does not say %q:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "<script") {
+		t.Error("the success page grew a script")
+	}
+
+	// A page with NO form and NO frame gets `form-action 'none'` and names
+	// no callback: a refusal page must not carry a URL from the request
+	// into a header.
+	q := h.query()
+	q.Set("client_id", "not-a-client")
+	refusal := h.get(q)
+	rcsp := refusal.Header().Get("Content-Security-Policy")
+	if !strings.Contains(rcsp, "form-action 'none'") {
+		t.Errorf("a refusal page's CSP allows a form action: %s", rcsp)
+	}
+	if strings.Contains(rcsp, "127.0.0.1:") {
+		t.Errorf("a refusal page's CSP names a callback: %s", rcsp)
+	}
+	if strings.Contains(rcsp, "frame-src") {
+		t.Errorf("a refusal page's CSP allows a frame: %s", rcsp)
+	}
+}
+
+// TestRedirectMismatchPageNamesBothPorts is the third thing the bug report
+// asked for and the reason loopbackPort exists: "a refusal at
+// /oauth/authorize must explain itself on the page in terms a user can act on
+// ('this profile expects a callback on port X; Cyberduck asked for port Y')
+// without echoing attacker-controlled strings".
+//
+// The two numbers are safe where the two strings are not: each has been
+// through strconv.Atoi and back, so what reaches the page can only be an
+// integer in 1..65535.
+func TestRedirectMismatchPageNamesBothPorts(t *testing.T) {
+	h := newHarness(t, false)
+	q := h.query()
+	q.Set("redirect_uri", "http://127.0.0.1:61033/pelfs/oauth/callback")
+	w := h.get(q)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400", w.Code)
+	}
+	body := w.Body.String()
+	for _, want := range []string{"52001", "61033"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the refusal page does not name port %s:\n%s", want, body)
+		}
+	}
+	// And still no echo. The sent URL, the client id and the path are all
+	// strings a caller chose.
+	for _, forbidden := range []string{q.Get("redirect_uri"), h.client.ID} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("the refusal page echoes %q back to the user", forbidden)
+		}
+	}
+
+	// A redirect_uri whose port cannot be read as an integer falls back to
+	// saying less rather than to guessing — and to echoing nothing.
+	q.Set("redirect_uri", "http://127.0.0.1:notaport/cb")
+	w2 := h.get(q)
+	if w2.Code != http.StatusBadRequest {
+		t.Errorf("status %d, want 400", w2.Code)
+	}
+	if strings.Contains(w2.Body.String(), "notaport") {
+		t.Error("the refusal page echoes an unparseable port back to the user")
+	}
+}
+
+// TestABookmarkFromAnotherVolumeIsRefusedByName is the case a shared port
+// range creates, and the reason the refusal page names the volume.
+//
+// `pelfs browse` probes upward from 8443, so port 8443 is whichever volume
+// started first. A Cyberduck bookmark names a PORT — so tomorrow it can
+// reach a session serving somebody else's volume. What must NOT happen is
+// that it works: the bookmark carries its own profile's client_id (the
+// profile's Vendor is keyed on the volume, davprofile.VolumeTag, so it
+// resolves to its own profile whatever the port), that client_id names
+// nothing here, and the request is refused.
+//
+// What must ALSO not happen is that the refusal is illegible. "The client
+// identifier does not name a client this pelfs session knows" is, on its
+// own, indistinguishable from a corrupt profile — and sends the user off to
+// re-download the one file that was never wrong.
+func TestABookmarkFromAnotherVolumeIsRefusedByName(t *testing.T) {
+	h := newHarness(t, false)
+
+	// The other volume's session, and the client id its profile carries.
+	other, err := New(Config{
+		Writable: false,
+		Volume:   "pelican://osg-htc.org/user/someone-else",
+		Sessions: fakeSessions(1),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	theirs, err := other.NewClient(ClientRequest{
+		Label:       "Cyberduck",
+		RedirectURI: davprofile.RedirectURI(davprofile.DefaultCallbackPort),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	q := h.query()
+	q.Set("client_id", theirs.ID)
+	w := h.get(q)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("another volume's client was accepted: %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "pelican://osg-htc.org/user/bbockelman") {
+		t.Error("the refusal does not name the volume this listener is serving, so a user " +
+			"cannot tell a wrong-volume bookmark from a corrupt profile")
+	}
+	// And it still says nothing about the request: the volume is this
+	// process's own configuration, and the client id is the caller's.
+	if strings.Contains(body, theirs.ID) {
+		t.Error("the refusal echoes the client_id it was sent")
+	}
+	if strings.Contains(body, "someone-else") {
+		t.Error("the refusal names the OTHER volume, which this session cannot know")
 	}
 }

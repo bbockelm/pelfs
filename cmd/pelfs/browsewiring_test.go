@@ -14,10 +14,14 @@ package main
 // on a fakeorigin, through browseServer.routes.
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
+	"html"
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -28,7 +32,8 @@ import (
 )
 
 // mintCredential runs the page's own registration call and returns the
-// response, secrets and all.
+// response. There is no secret in it any more — the client id is inside the
+// generated profile, and there is no password at all.
 func (f *browseFixture) mintCredential(t *testing.T, label string, write bool) credentialResponse {
 	t.Helper()
 	body, _ := json.Marshal(map[string]any{"label": label, "write": write})
@@ -70,10 +75,174 @@ func (f *browseFixture) raw(t *testing.T, method, path, auth, body string) *http
 	return res
 }
 
-func basicAuth(user, pass string) string {
-	req, _ := http.NewRequest("GET", "http://x/", nil)
-	req.SetBasicAuth(user, pass)
-	return req.Header.Get("Authorization")
+// consentTicketRE scrapes the ticket out of the form on the consent page.
+// The ticket exists in exactly one place — the body of a page rendered in
+// the user's own browser — which is the whole of A7 control 6, so a test
+// that wants a token presses the button like everybody else.
+var consentTicketRE = regexp.MustCompile(`name="consent_ticket" value="([^"]+)"`)
+
+// deliverRE pulls the authorization out of the SUCCESS PAGE. Pressing
+// Authorize answers 200 with a page rather than a 303: the code reaches the
+// client from a hidden frame whose src is the URL the redirect used to name
+// (internal/localoauth's connectedPage says why). So this regexp is where a
+// test stands in for Cyberduck's loopback listener.
+var deliverRE = regexp.MustCompile(`<iframe class="deliver" src="([^"]+)"`)
+
+// oauthTokens is what a client holds when the flow is done: the access token
+// it sends to /dav/*, and the refresh token it saves to reconnect later.
+type oauthTokens struct{ access, refresh string }
+
+// oauthConnect runs the genuine authorization-code + PKCE flow in-process
+// and returns the tokens, exactly as Cyberduck would end up holding them.
+//
+// THIS IS THE ONLY WAY ONTO /dav/* NOW. HTTP Basic is gone from this
+// listener — vfsdav.Bearer is the whole of the DAV auth — so every test
+// below that touches WebDAV has to navigate the consent screen, press
+// Authorize and exchange the code. That is a feature rather than a tax: the
+// credential a test carries is the one a real client would be holding.
+//
+// A live browse session is required for /oauth/authorize to answer at all
+// (A7 control 2), so the caller must have exchanged a bootstrap first; every
+// fixture in this package does that when it is built.
+func oauthConnect(t *testing.T, hc *http.Client, origin, clientID, redirect, scope string) oauthTokens {
+	t.Helper()
+	// PKCE: the verifier never leaves this function, only its SHA-256 does.
+	const verifier = "pelfs-wiring-verifier-0123456789-abcdefghijklmnopqrst"
+	sum := sha256.Sum256([]byte(verifier))
+	q := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {clientID},
+		"redirect_uri":          {redirect},
+		"scope":                 {scope},
+		"state":                 {"state-from-the-client"},
+		"code_challenge":        {base64.RawURLEncoding.EncodeToString(sum[:])},
+		"code_challenge_method": {"S256"},
+	}
+	// The navigation Cyberduck's browser launcher makes: top level, no
+	// credential of ours, and cross-site by definition.
+	req, err := http.NewRequest(http.MethodGet, origin+"/oauth/authorize?"+q.Encode(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Sec-Fetch-Site", "none")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	res, err := hc.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, _ := io.ReadAll(res.Body)
+	res.Body.Close() //nolint:errcheck
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("GET /oauth/authorize: %d\n%s", res.StatusCode, page)
+	}
+	m := consentTicketRE.FindSubmatch(page)
+	if m == nil {
+		t.Fatalf("no consent ticket on the authorization page:\n%s", page)
+	}
+
+	// The click: a same-origin form POST with the headers a browser sends
+	// for one.
+	form := url.Values{"consent_ticket": {string(m[1])}, "decision": {"allow"}}
+	req, err = http.NewRequest(http.MethodPost, origin+"/oauth/authorize",
+		strings.NewReader(form.Encode()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", origin)
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	res, err = hc.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, _ = io.ReadAll(res.Body)
+	res.Body.Close() //nolint:errcheck
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("POST /oauth/authorize: %d, want the 200 success page\n%s", res.StatusCode, page)
+	}
+	d := deliverRE.FindSubmatch(page)
+	if d == nil {
+		t.Fatalf("the success page carries no delivery frame:\n%s", page)
+	}
+	// html/template escaped the URL into the attribute, so `&` arrived as
+	// `&amp;`. A browser unescapes before it fetches the frame, and so does
+	// this.
+	deliver, err := url.Parse(html.UnescapeString(string(d[1])))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(deliver.String(), redirect+"?") {
+		t.Fatalf("the frame delivers to %q, want the registered callback %q", deliver, redirect)
+	}
+	if got := deliver.Query().Get("state"); got != "state-from-the-client" {
+		t.Fatalf("the delivered state is %q", got)
+	}
+
+	// The back channel.
+	status, tok := oauthToken(t, hc, origin, url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {deliver.Query().Get("code")},
+		"code_verifier": {verifier},
+		"redirect_uri":  {redirect},
+		"client_id":     {clientID},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("POST /oauth/token: %d %v", status, tok)
+	}
+	access, _ := tok["access_token"].(string)
+	if access == "" {
+		t.Fatalf("no access token came out of the code exchange: %v", tok)
+	}
+	refresh, _ := tok["refresh_token"].(string)
+	return oauthTokens{access: access, refresh: refresh}
+}
+
+// oauthToken is one POST /oauth/token, whatever the grant type, shaped like
+// the request google-oauth-client sends from inside Cyberduck: form-encoded,
+// no Origin, no fetch metadata, and no credential but the ones in the body.
+//
+// It hands back the status rather than insisting on success. The refusal of
+// a revoked or expired grant is as much a property as the acceptance of a
+// live one, and cmd/pelfs/browseidentity_test.go asserts both through this.
+func oauthToken(t *testing.T, hc *http.Client, origin string, form url.Values) (int, map[string]any) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, origin+"/oauth/token",
+		strings.NewReader(form.Encode()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	res, err := hc.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(res.Body)
+	res.Body.Close() //nolint:errcheck
+	out := map[string]any{}
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatalf("POST /oauth/token: %v in %s", err, body)
+	}
+	return res.StatusCode, out
+}
+
+// bearer connects a minted credential for real and returns the
+// Authorization header a WebDAV client would then send. `scope` is what the
+// client asks for; the session's own mode is still the ceiling on it.
+func (f *browseFixture) bearer(t *testing.T, c credentialResponse, scope string) string {
+	t.Helper()
+	var profile string
+	for _, file := range c.Files {
+		if strings.HasSuffix(file.Name, ".cyberduckprofile") {
+			profile = file.Content
+		}
+	}
+	if profile == "" {
+		t.Fatalf("no .cyberduckprofile in the credential response: %+v", c)
+	}
+	tok := oauthConnect(t, f.srv.Client(), f.srv.URL,
+		clientIDOf(t, profile), c.RedirectURI, scope)
+	return "Bearer " + tok.access
 }
 
 // TestTheJSONAPIReachesThisSessionsOverlay is U11 mounted: an upload through
@@ -120,12 +289,13 @@ func TestTheJSONAPIReachesThisSessionsOverlay(t *testing.T) {
 		t.Errorf("a listing with no count headers: %v", res.Header)
 	}
 
-	// And the SAME file over WebDAV, through a credential the page minted.
-	// This is the whole wiring pass in one assertion: one overlay, two
-	// surfaces, one permission model.
+	// And the SAME file over WebDAV, through a credential the page minted
+	// and then a token the OAuth flow actually issued for it. This is the
+	// whole wiring pass in one assertion: one overlay, two surfaces, one
+	// permission model.
 	c := f.mintCredential(t, "rclone in a test", true)
-	dav := f.raw(t, http.MethodGet, davprofile.DAVPath+"wired.txt",
-		basicAuth(c.BasicUser, c.BasicPassword), "")
+	auth := f.bearer(t, c, localoauth.ScopeRead+" "+localoauth.ScopeWrite)
+	dav := f.raw(t, http.MethodGet, davprofile.DAVPath+"wired.txt", auth, "")
 	got, _ := io.ReadAll(dav.Body)
 	dav.Body.Close() //nolint:errcheck
 	if dav.StatusCode != http.StatusOK || string(got) != "through the JSON API\n" {
@@ -136,7 +306,7 @@ func TestTheJSONAPIReachesThisSessionsOverlay(t *testing.T) {
 	// it, which is the direction that would break if the two surfaces held
 	// separate bindings.
 	put := f.raw(t, http.MethodPut, davprofile.DAVPath+"fromdav.txt",
-		basicAuth(c.BasicUser, c.BasicPassword), "written over WebDAV")
+		auth, "written over WebDAV")
 	put.Body.Close() //nolint:errcheck
 	if put.StatusCode != http.StatusCreated {
 		t.Fatalf("PUT over WebDAV: %d, want 201", put.StatusCode)
@@ -171,7 +341,7 @@ func TestTheTwoPrincipalsNeverMeetOnTheVerbsRouteTable(t *testing.T) {
 	f := newBrowseFixture(t, true, false)
 	f.bs.setReady(f.g, t.Context())
 	c := f.mintCredential(t, "Cyberduck", true)
-	auth := basicAuth(c.BasicUser, c.BasicPassword)
+	auth := f.bearer(t, c, localoauth.ScopeRead+" "+localoauth.ScopeWrite)
 
 	t.Run("the session token is not a DAV credential", func(t *testing.T) {
 		req, err := http.NewRequest("PROPFIND", f.srv.URL+davprofile.DAVPath, nil)
@@ -317,17 +487,17 @@ func TestCredentialSurfaceListsAndRevokes(t *testing.T) {
 	}
 
 	c := f.mintCredential(t, "Cyberduck", true)
-	// Everything a WebDAV client needs, and the two secrets that are handed
-	// back exactly once.
-	if c.BasicUser == "" || c.BasicPassword == "" {
-		t.Fatal("no Basic credential in the registration")
-	}
+	// Everything a WebDAV client needs. The redirect is the whole allowlist,
+	// so it has to be the one pelfs itself wrote into the profile.
 	if c.RedirectURI != davprofile.RedirectURI(davprofile.DefaultCallbackPort) {
 		t.Errorf("redirect_uri = %q; it must be the loopback callback pelfs writes "+
 			"into the profile, because that string is the whole allowlist", c.RedirectURI)
 	}
-	if len(c.Files) != 3 {
-		t.Fatalf("%d generated files, want 3", len(c.Files))
+	// Two generated files, not three: the profile and the bookmark that
+	// drives it. The third was the bookmark for the password path, and there
+	// is no password path.
+	if len(c.Files) != 2 {
+		t.Fatalf("%d generated files, want 2", len(c.Files))
 	}
 	var profile string
 	for _, file := range c.Files {
@@ -362,14 +532,14 @@ func TestCredentialSurfaceListsAndRevokes(t *testing.T) {
 		t.Errorf("the listed client = %+v", got.Clients[0])
 	}
 	// No secret in the inventory. The list is what a page keeps on screen,
-	// re-fetches on a timer and would render into the DOM; the secrets are
-	// handed back exactly once, by the POST that minted them.
+	// re-fetches on a timer and would render into the DOM; the one secret
+	// this listener still issues — the client id — travels inside the
+	// generated profile and must never appear as a field beside it.
 	rawList := f.do("GET", "/api/v1/credentials", "", f.tok)
 	rawBody, _ := io.ReadAll(rawList.Body)
 	rawList.Body.Close() //nolint:errcheck
 	for what, secret := range map[string]string{
-		"the Basic password": c.BasicPassword,
-		"the client id":      clientIDOf(t, profile),
+		"the client id": clientIDOf(t, profile),
 	} {
 		if strings.Contains(string(rawBody), secret) {
 			t.Errorf("the credential list carries %s", what)
@@ -378,7 +548,7 @@ func TestCredentialSurfaceListsAndRevokes(t *testing.T) {
 
 	// The credential works before the revoke and does not after it. This is
 	// the property the button is for.
-	auth := basicAuth(c.BasicUser, c.BasicPassword)
+	auth := f.bearer(t, c, localoauth.ScopeRead+" "+localoauth.ScopeWrite)
 	before := f.raw(t, "PROPFIND", davprofile.DAVPath, auth, "")
 	before.Body.Close() //nolint:errcheck
 	if before.StatusCode != http.StatusMultiStatus {
@@ -433,16 +603,18 @@ func TestReadOnlyBrowseCannotMintAWritableCredentialOrPublish(t *testing.T) {
 	// 2. A read-only credential is still minted, because a WebDAV client
 	// that can only read is a perfectly good thing to want.
 	c := f.mintCredential(t, "rclone", false)
-	auth := basicAuth(c.BasicUser, c.BasicPassword)
+	auth := f.bearer(t, c, localoauth.ScopeRead)
 	propfind := f.raw(t, "PROPFIND", davprofile.DAVPath, auth, "")
 	propfind.Body.Close() //nolint:errcheck
 	if propfind.StatusCode != http.StatusMultiStatus {
 		t.Fatalf("PROPFIND with a read-only credential: %d, want 207", propfind.StatusCode)
 	}
 
-	// 3. And it cannot write. 403 and not 401: a 401 sends the client back
-	// to ask for a password, which is the wrong instruction and, for an
-	// OAuth profile, a dialog with no field in it.
+	// 3. And it cannot write. 403 and not 401: this listener's only
+	// challenge is `Bearer`, so a 401 tells the client its token is no good
+	// and sends it back through the consent screen for a fresh one — which
+	// would issue exactly the same read-only token and fail again. 403 says
+	// the true thing instead: the token is fine and the scope is not.
 	put := f.raw(t, http.MethodPut, davprofile.DAVPath+"refused.txt", auth, "nope")
 	put.Body.Close() //nolint:errcheck
 	if put.StatusCode != http.StatusForbidden {
@@ -476,9 +648,14 @@ func TestReadOnlyBrowseCannotMintAWritableCredentialOrPublish(t *testing.T) {
 }
 
 // clientIDOf digs the client_id out of a generated profile. The id is a
-// per-download secret and this is the only place a test may look at one: it
-// is here so that the "no secret in the inventory" check above can name the
-// value it is looking for rather than trusting a field name.
+// secret the profile download is the ONLY carrier of — there is no field for
+// it beside the files, and never was — so every test that has to name a
+// client reads it out of the bytes a user would install, exactly as
+// Cyberduck does. That is what makes the "no secret in the inventory" check
+// above worth anything: it names the real value rather than trusting a field
+// name, and it is the same value oauthConnect authorizes with.
+// (cmd/pelfs/browseidentity_test.go has its own, because it asserts
+// something different: that the id is the SAME one after a restart.)
 func clientIDOf(t *testing.T, profile string) string {
 	t.Helper()
 	const key = "<key>OAuth Client ID</key>"

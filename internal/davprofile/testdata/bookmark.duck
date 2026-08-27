@@ -5,7 +5,7 @@
 	<key>Protocol</key>
 	<string>dav</string>
 	<key>Provider</key>
-	<string>org.pelicanplatform.pelfs.local.49731</string>
+	<string>org.pelicanplatform.pelfs.local.v23a4a9699c14</string>
 	<key>Hostname</key>
 	<string>127.0.0.1</string>
 	<key>Port</key>
@@ -13,8 +13,8 @@
 	<key>Path</key>
 	<string>/dav/</string>
 	<key>Nickname</key>
-	<string>Cyberduck - pelfs pelican://osg-htc.org/user/bbockelman</string>
+	<string>pelfs: osg-htc.org/user/bbockelman (Cyberduck)</string>
 	<key>Comment</key>
-	<string>pelfs pelican://osg-htc.org/user/bbockelman (read-only, this session only)</string>
+	<string>pelfs pelican://osg-htc.org/user/bbockelman (read-only; install once, authorize once per session)</string>
 </dict>
 </plist>

@@ -1,14 +1,7 @@
 import { useState } from "react";
 import type { BrowseState } from "../api/types";
 import { publish } from "../api/control";
-import { CONNECT } from "../routes";
-import {
-  GLYPH,
-  LEASE_WORDS,
-  PUBLISH_HINT,
-  describe,
-  publishState,
-} from "../durability";
+import { LEASE_WORDS, PUBLISH_LABEL, READ_ONLY_HINT, describe, publishState } from "../durability";
 
 /**
  * The durability panel: the two things a file manager cannot give.
@@ -19,8 +12,42 @@ import {
  * internal/webui/durability_test.go for what fails if the two ever drift. The
  * reason it is HERE as well as there is that a user of the file manager must
  * not have to go and look: the whole trap this milestone exists to close is a
- * finished drag-and-drop that nobody publishes, and a link is not a
- * substitute for the sentence.
+ * finished drag-and-drop that nobody publishes, and a link is not a substitute
+ * for the sentence.
+ *
+ * THREE THINGS ABOUT ITS LAYOUT ARE DELIBERATE, AND ALL THREE WERE COMPLAINTS.
+ *
+ * THERE IS ONE CONTROL AND NO HINT BESIDE IT. A disabled "Publish now" with
+ * "(nothing to publish)" printed next to it is one fact rendered twice; the
+ * button now wears the state (../durability.ts, PUBLISH_LABEL) and nothing
+ * stands next to it. A running job is the same collapse: the durability line
+ * says "Publishing now.", the button says "Publishing", and the paragraph that
+ * used to add "the seal freezes the overlay, so uploads resume in a moment"
+ * under a countdown to a publish already in flight renders nothing at all.
+ *
+ * THERE IS NO LEGEND. This panel used to carry, under the line, a row reading
+ * "● on this machine only / ◔ sending / ✓ in the federation". It was there to
+ * teach the glyphs -- but each glyph already appears beside its own words in
+ * the sentence it belongs to, so the row was a second copy of the text with
+ * nothing in it the sentence did not have ("Bizarre, not needed, duplicate of
+ * the actual text"). The contract it was standing for is unaffected and still
+ * asserted: three states, three DIFFERENT characters, staged never looking
+ * like published (webui/frontend/tests/durability.spec.ts reads the glyph the
+ * panel actually renders in each state and compares them).
+ *
+ * A FAILED OPEN RENDERS NO CONTROL EITHER, and the line becomes the server's
+ * sentence rather than a progress message. There is no volume, so a publish
+ * button is a lever attached to nothing and "(waiting for the volume)" is a
+ * promise nobody is keeping. What the reader needs is in `state.error` and
+ * nowhere else on this page.
+ *
+ * A READ-ONLY SESSION RENDERS NO PUBLISH CONTROL AT ALL. It used to render a
+ * disabled one with "(read-only session — restart with --rw to publish)"
+ * beside it, at the top of the page: a button you cannot press, under a line
+ * that has already said "read-only", explaining a third time what read-only
+ * means. Now the sentence is said once, where the control would have been, and
+ * there is nothing to press. `pelfs browse` is read-only by DEFAULT, so this
+ * is the common case, not a corner.
  */
 export function Durability({
   state,
@@ -58,85 +85,77 @@ export function Durability({
 
   // The job's own state wins over the click's, because it is the truth: the
   // click only says the request was accepted.
+  //
+  // A RUNNING JOB SAYS NOTHING HERE. What it is doing is on the line above and
+  // on the button, and a third copy under both of them is what the owner meant
+  // by "This data could all be on the same line!". The element stays, because
+  // `data-job-state` and `data-job-id` are how a driver follows the job; only
+  // the prose goes. What is left is the OUTCOMES, which nothing else carries.
+  //
+  // A BRANCH SWITCH TAKES THIS SLOT TOO (reason "branch"; see ../durability.ts
+  // and cmd/pelfs/browsebranch.go), and it is not a publish: nothing is being
+  // written to the federation, the session is reopening on another head. The
+  // outcome lines therefore fork on the reason rather than calling it all
+  // publishing.
+  const switching = job?.reason === "branch";
   let jobText = status;
   if (job && job.state === "running") {
-    jobText = "publishing… — the seal freezes the overlay, so uploads resume in a moment";
+    jobText = "";
   } else if (job && job.state === "failed") {
-    jobText = `publish failed: ${job.error}`;
+    jobText = switching ? `branch switch failed: ${job.error}` : `publish failed: ${job.error}`;
   } else if (job && job.state === "done" && !status) {
-    jobText = `published: ${job.summary}`;
+    jobText = switching ? `switched: ${job.summary}` : `published: ${job.summary}`;
   }
 
   return (
-    <section className="pelfs-durability" data-testid="pelfs-durability-panel">
-      <p
-        className={`pelfs-durability__line pelfs-durability__line--${line.state}`}
-        data-testid="durability"
-        data-durability={line.state}
-      >
-        {line.glyph ? (
-          <span className={`pelfs-glyph pelfs-glyph--${line.state}`} aria-hidden="true">
-            {line.glyph}
-          </span>
-        ) : null}
-        {line.text}
-      </p>
-
-      {/* The legend is ALWAYS visible, not a tooltip: it is what makes the
-          two glyphs mean something to somebody seeing them for the first
-          time, and a tooltip is invisible on a touch screen and to anybody
-          who does not think to hover. */}
-      <div className="pelfs-legend" data-testid="durability-legend">
-        <span>
-          <span className="pelfs-glyph pelfs-glyph--staged" data-testid="glyph-staged">
-            {GLYPH.staged}
-          </span>
-          on this machine only
-        </span>
-        <span>
-          <span className="pelfs-glyph pelfs-glyph--sending" data-testid="glyph-sending">
-            {GLYPH.sending}
-          </span>
-          sending
-        </span>
-        <span>
-          <span className="pelfs-glyph pelfs-glyph--published" data-testid="glyph-published">
-            {GLYPH.published}
-          </span>
-          in the federation
-        </span>
-      </div>
-
-      <div className="pelfs-publishrow">
-        <button
-          type="button"
-          className="pelfs-button"
-          data-testid="publish-button"
-          data-publish-state={pstate}
-          disabled={pstate !== "ready"}
-          onClick={() => {
-            onNotice("");
-            void onPublish();
-          }}
+    <section
+      className="pelfs-panel pelfs-panel--status"
+      data-testid="pelfs-durability-panel"
+      data-durability={line.state}
+    >
+      <div className="pelfs-status">
+        <p
+          className={`pelfs-status__line pelfs-status__line--${line.state}`}
+          data-testid="durability"
+          data-durability={line.state}
         >
-          Publish now
-        </button>
-        <span data-testid="publish-hint" className="pelfs-muted">
-          {PUBLISH_HINT[pstate]}
-        </span>
-        {/* The anchor the wiring pass owed this panel. `/connect` is the
-            connection page: the credential desk, the generated Cyberduck
-            profile, and the federation-login cards. A plain <a>, not a
-            fetch and not a reload of this app -- the session token lives in
-            sessionStorage, which is per-ORIGIN and survives a same-origin
-            navigation, so following it costs nothing and coming back costs
-            nothing. (What it must NOT be is a link that re-enters the
-            bootstrap exchange: that token is single-use and already
-            spent.) */}
-        <a className="pelfs-link" href={CONNECT} data-testid="connect-link">
-          Connect another program →
-        </a>
+          {line.glyph ? (
+            <span
+              className={`pelfs-glyph pelfs-glyph--${line.state}`}
+              data-testid="durability-glyph"
+              aria-hidden="true"
+            >
+              {line.glyph}
+            </span>
+          ) : null}
+          {line.text}
+        </p>
+
+        <div className="pelfs-status__aside">
+          {pstate === "failed" ? null : pstate === "read-only" ? (
+            // No control, one sentence: this session cannot publish and the
+            // way to change that is a flag on the command that started it.
+            <span data-testid="publish-hint" className="pelfs-muted">
+              {READ_ONLY_HINT}
+            </span>
+          ) : (
+            <button
+              type="button"
+              className="pelfs-button"
+              data-testid="publish-button"
+              data-publish-state={pstate}
+              disabled={pstate !== "ready"}
+              onClick={() => {
+                onNotice("");
+                void onPublish();
+              }}
+            >
+              {PUBLISH_LABEL[pstate]}
+            </button>
+          )}
+        </div>
       </div>
+
       <p
         data-testid="publish-status"
         data-job-state={job?.state ?? "none"}
@@ -146,13 +165,13 @@ export function Durability({
         // second request names the job the page is watching" needs the id on
         // the element, not in the prose.
         data-job-id={job?.id ?? ""}
-        className="pelfs-muted"
+        className="pelfs-status__note"
       >
         {jobText}
       </p>
 
       {state && LEASE_WORDS[state.lease] ? (
-        <p className="pelfs-banner pelfs-banner--bad" data-testid="lease-banner">
+        <p className="pelfs-note pelfs-note--bad" data-testid="lease-banner">
           {LEASE_WORDS[state.lease]}
         </p>
       ) : null}

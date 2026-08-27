@@ -66,6 +66,8 @@ func main() {
 		code = cmdMountGen(os.Args[2:])
 	case "fsck":
 		code = cmdFsck(os.Args[2:])
+	case "graft":
+		code = cmdGraft(os.Args[2:])
 	case "repack-plan":
 		code = cmdRepackPlan(os.Args[2:])
 	case "repack":
@@ -215,7 +217,7 @@ func registerFlags(fs *flag.FlagSet, o *cmdOpts) {
 	})
 	fs.StringVar(&o.backend, "backend", "auto", "how to attach the filesystem: auto, fuse, or nfs (loopback NFS server + the OS NFS client; no kext or macFUSE needed on macOS)")
 	fs.StringVar(&o.shellPath, "shell", "", "shell to launch (default: $SHELL, else /bin/sh)")
-	fs.StringVar(&o.prefetch, "prefetch", "none", "download the generation into the local cache at startup: none, all (blocking; refuse to start on any failure), or background")
+	fs.StringVar(&o.prefetch, "prefetch", "none", "download the generation into the local cache at startup: none, all (blocking; refuse to start on any failure OR any grafted content), packs (blocking; make the packs local and warn that grafted bytes are not), or background")
 	fs.StringVar(&o.statsFile, "stats-file", "", "write a JSON session-statistics summary to this path (default: <state-dir>/pelfs-stats.json)")
 	fs.StringVar(&o.cacheSize, "cache-size", "", "byte budget for the local cache of packs, decoded chunks, catalogs and trailers (e.g. 8G); default 4G")
 	fs.BoolVar(&o.noAutoRepack, "no-auto-repack", false, "do not repack in the background when the mount is idle and the branch has drifted")
@@ -242,8 +244,10 @@ func parseArgs(name string, args []string, minPos, maxPos int, extra func(*flag.
 	if fs.NArg() < minPos || fs.NArg() > maxPos {
 		return nil, nil, fmt.Errorf("expected %d-%d positional arguments, got %d", minPos, maxPos, fs.NArg())
 	}
-	if o.prefetch != "none" && o.prefetch != "all" && o.prefetch != "background" {
-		return nil, nil, fmt.Errorf("--prefetch must be none, all, or background")
+	switch o.prefetch {
+	case "none", "all", "packs", "background":
+	default:
+		return nil, nil, fmt.Errorf("--prefetch must be none, all, packs, or background")
 	}
 	return o, fs.Args(), nil
 }

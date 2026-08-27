@@ -17,6 +17,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"html"
 	"io"
 	"net"
 	"net/http"
@@ -125,10 +126,11 @@ func newStack(t *testing.T, writable bool) *stack {
 		t: t, srv: srv, oauth: oauth, client: c, sess: sess,
 		origin: guard.Origin(),
 		browser: &http.Client{
-			// The browser is driven one hop at a time: the 303 to
-			// Cyberduck's loopback listener must NOT be followed, because
-			// there is no Cyberduck here and the code is what the test
-			// wants.
+			// The browser is driven one hop at a time. Nothing on
+			// /oauth/authorize redirects any more — a success is a page
+			// with a delivery frame on it (localoauth's connectedPage) —
+			// but a client that silently followed one would hide a
+			// regression rather than fail on it.
 			CheckRedirect: func(*http.Request, []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
@@ -145,9 +147,10 @@ func challenge(v string) string {
 	return base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
-func basic(user, pass string) string {
-	return base64.StdEncoding.EncodeToString([]byte(user + ":" + pass))
-}
+// deliverRE finds the success page's one hidden frame, which is where a
+// successful authorization reaches the client now that the consent POST
+// answers a page instead of a 303.
+var deliverRE = regexp.MustCompile(`<iframe class="deliver" src="([^"]*)"`)
 
 // navigate is what Cyberduck's browser launcher does: a top-level
 // navigation, with no header of ours and no credential of any kind.
@@ -237,16 +240,24 @@ func (s *stack) connect(scope string) string {
 		s.t.Fatalf("no consent ticket:\n%s", body)
 	}
 	resp = s.submit(url.Values{"consent_ticket": {string(m[1])}, "decision": {"allow"}})
+	page, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusSeeOther {
-		s.t.Fatalf("consent: %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		s.t.Fatalf("consent: %d\n%s", resp.StatusCode, page)
 	}
-	loc, err := url.Parse(resp.Header.Get("Location"))
+	if got := resp.Header.Get("Location"); got != "" {
+		s.t.Fatalf("the consent POST redirected to %q; a success is a page now", got)
+	}
+	d := deliverRE.FindSubmatch(page)
+	if d == nil {
+		s.t.Fatalf("no delivery frame on the success page:\n%s", page)
+	}
+	loc, err := url.Parse(html.UnescapeString(string(d[1])))
 	if err != nil {
 		s.t.Fatal(err)
 	}
 	if !strings.HasPrefix(loc.String(), s.client.Redirect+"?") {
-		s.t.Fatalf("redirected to %q, want the registered callback", loc)
+		s.t.Fatalf("the authorization is delivered to %q, want the registered callback", loc)
 	}
 	if loc.Query().Get("state") != "state-from-the-client" {
 		s.t.Fatalf("state %q", loc.Query().Get("state"))
@@ -334,7 +345,9 @@ func TestEndToEndBearerTokenReachesTheWebDAVSurface(t *testing.T) {
 	})
 
 	t.Run("a revoked token stops working mid-connection", func(t *testing.T) {
-		s.oauth.RevokeGrant(s.oauth.Grants()[0].Ref)
+		if ok, err := s.oauth.RevokeGrant(s.oauth.Grants()[0].Ref); !ok || err != nil {
+			t.Fatalf("RevokeGrant: %v %v", ok, err)
+		}
 		resp := s.dav("PROPFIND", "/dav/", "Bearer "+access, "")
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusUnauthorized {
@@ -356,22 +369,6 @@ func TestEndToEndWritableSessionCanUpload(t *testing.T) {
 	body, _ := io.ReadAll(got.Body)
 	if string(body) != "written over WebDAV" {
 		t.Errorf("read back %q", body)
-	}
-}
-
-func TestEndToEndBasicCredentialIsTheOtherClientsPath(t *testing.T) {
-	s := newStack(t, false)
-	resp := s.dav("PROPFIND", "/dav/", "Basic "+basic(s.client.BasicUser, s.client.BasicPassword), "")
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusMultiStatus {
-		t.Fatalf("status %d, want 207", resp.StatusCode)
-	}
-	// And the same credential is read-only on a read-only session.
-	put := s.dav(http.MethodPut, "/dav/x.txt",
-		"Basic "+basic(s.client.BasicUser, s.client.BasicPassword), "x")
-	defer put.Body.Close()
-	if put.StatusCode != http.StatusForbidden {
-		t.Errorf("PUT with a read-only Basic credential: %d, want 403", put.StatusCode)
 	}
 }
 
@@ -433,32 +430,35 @@ func TestTheTwoPrincipalsNeverMeet(t *testing.T) {
 	})
 }
 
-// TestChallengeNarrowing is verification 2d(iii): a client that offered a
-// Bearer token and was refused must not be told about Basic, or Cyberduck
-// may drop into a password prompt for a profile that has no password field.
-func TestChallengeNarrowing(t *testing.T) {
+// TestThereIsExactlyOneChallenge is verification 2d(iii), and it is a
+// stronger statement than it used to be.
+//
+// The rule was "a client that offered a Bearer token and was refused must not
+// be told about Basic, or Cyberduck may drop into a password prompt for a
+// profile that has no password field", and it was kept by narrowing a
+// two-scheme challenge to whichever scheme the client tried. There is only
+// one scheme now, so the prompt this protects against cannot be reached at
+// all — including by an ANONYMOUS request, which used to be offered both.
+//
+// A Basic credential is not merely unchallenged; it is unaccepted.
+func TestThereIsExactlyOneChallenge(t *testing.T) {
 	s := newStack(t, false)
 
-	resp := s.dav("PROPFIND", "/dav/", "Bearer not-a-real-token", "")
-	_ = resp.Body.Close()
-	got := resp.Header.Values("WWW-Authenticate")
-	if len(got) != 1 || !strings.HasPrefix(got[0], "Bearer ") {
-		t.Errorf("a refused Bearer was challenged with %q; want Bearer only", got)
-	}
-
-	resp = s.dav("PROPFIND", "/dav/", "Basic "+basic("nobody", "wrong"), "")
-	_ = resp.Body.Close()
-	got = resp.Header.Values("WWW-Authenticate")
-	if len(got) != 1 || !strings.HasPrefix(got[0], "Basic ") {
-		t.Errorf("a refused Basic was challenged with %q; want Basic only", got)
-	}
-
-	// A client that offered nothing discovers both paths.
-	resp = s.dav("PROPFIND", "/dav/", "", "")
-	_ = resp.Body.Close()
-	got = resp.Header.Values("WWW-Authenticate")
-	if len(got) != 2 {
-		t.Errorf("an anonymous request was challenged with %q; want both schemes", got)
+	for _, offered := range []string{
+		"Bearer not-a-real-token",
+		"Basic " + base64.StdEncoding.EncodeToString([]byte("pelfs-anyone:anything")),
+		"",
+	} {
+		resp := s.dav("PROPFIND", "/dav/", offered, "")
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("%q was answered %d, want 401", offered, resp.StatusCode)
+		}
+		got := resp.Header.Values("WWW-Authenticate")
+		if len(got) != 1 || !strings.HasPrefix(got[0], "Bearer ") {
+			t.Errorf("offering %q was challenged with %q; want Bearer, and only Bearer",
+				offered, got)
+		}
 	}
 }
 

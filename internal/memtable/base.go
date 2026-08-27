@@ -104,6 +104,33 @@ func (s *Store) Adopt(ctx context.Context, ino uint64, length int64) error {
 		s.mu.Unlock()
 		return nil
 	}
+	// UNGRAFT ON WRITE, and it is the same fallback a hole takes, for a
+	// reason worth stating rather than inheriting.
+	//
+	// Adoption by REFERENCE is what makes writing to a base file cheap:
+	// the records name chunks in packs the next superblock carries
+	// forward, so nothing moves. A GRAFT's records name blocks at a third
+	// party, and carrying those forward would leave the file half its own
+	// and half somebody else's — a file this session wrote, whose
+	// untouched spans still depend on a URL that may change under it, and
+	// whose mtime no longer matches the graft the freshness check would
+	// compare against. That file is not a graft any more and should not
+	// pretend to be one.
+	//
+	// So a write to a grafted file materializes THAT FILE: its bytes are
+	// pulled through the base read path — verified against the graft's
+	// identities on the way, so the copy-up cannot silently launder
+	// changed source bytes into a pack — and re-chunked and packed like
+	// any other write. It costs one file download.
+	//
+	// FILE granularity, not tree. Nothing here touches the file's grafted
+	// siblings, and nothing needs to: the overlay records a per-inode
+	// change, the seal reuses every inode it did not touch, and the graft
+	// list carries forward. A `touch` in a grafted tree is one file's
+	// worth of work, not a repack of the tree.
+	if c.External {
+		return s.adoptByReading(ctx, ino, length)
+	}
 	for _, r := range c.Refs {
 		if len(r.Identity) == 0 {
 			return s.adoptByReading(ctx, ino, length)

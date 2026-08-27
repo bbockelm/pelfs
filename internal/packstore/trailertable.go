@@ -95,14 +95,18 @@ func openTable(stored []byte) (*packidx.Table, *trailer, error) {
 	if !isTable(stored) || len(stored) < tableHeader {
 		return nil, nil, fmt.Errorf("packstore: not a table trailer")
 	}
-	deadBytes := int(binary.LittleEndian.Uint32(stored[16:]))
-	deadCount := int(binary.LittleEndian.Uint32(stored[20:]))
-	if tableHeader+deadBytes > len(stored) {
+	// deadBytes and deadCount are attacker-chosen uint32s. They are held
+	// in int64 and the bound is written as a SUBTRACTION: on a 32-bit
+	// build int(uint32) goes negative, and tableHeader+deadBytes then
+	// passes a check it should fail and slices with a negative bound.
+	deadBytes := int64(binary.LittleEndian.Uint32(stored[16:]))
+	deadCount := int64(binary.LittleEndian.Uint32(stored[20:]))
+	if deadBytes > int64(len(stored))-tableHeader {
 		return nil, nil, fmt.Errorf("packstore: trailer says %d bytes of dead names, holds %d",
 			deadBytes, len(stored)-tableHeader)
 	}
 	tr := &trailer{Version: 1, Created: int64(binary.LittleEndian.Uint64(stored[8:]))}
-	names := stored[tableHeader : tableHeader+deadBytes]
+	names := stored[tableHeader : tableHeader+int(deadBytes)]
 	for len(names) > 0 {
 		if len(names) < 2 {
 			return nil, nil, fmt.Errorf("packstore: truncated dead list")
@@ -115,12 +119,22 @@ func openTable(stored []byte) (*packidx.Table, *trailer, error) {
 		tr.Dead = append(tr.Dead, string(names[:n]))
 		names = names[n:]
 	}
-	if len(tr.Dead) != deadCount {
+	if int64(len(tr.Dead)) != deadCount {
 		return nil, nil, fmt.Errorf("packstore: trailer says %d dead packs, names hold %d", deadCount, len(tr.Dead))
 	}
-	tbl, err := packidx.Open(stored[tableHeader+deadBytes:])
+	tbl, err := packidx.Open(stored[tableHeader+int(deadBytes):])
 	if err != nil {
 		return nil, nil, err
+	}
+	// The table's SHAPE is part of the untrusted bytes too. Every reader
+	// below decodes a record as off/length/type at fixed offsets, so a
+	// table announcing a shorter record (a zero-byte one, say) would have
+	// them index past the end of what Lookup and At return. Refuse the
+	// trailer instead: this is the one place that knows what shape the
+	// records must have.
+	if tbl.KeyLen() != packidx.KeySize || tbl.RecordLen() != tableRecord {
+		return nil, nil, fmt.Errorf("packstore: trailer table has %d-byte keys and %d-byte records, want %d and %d",
+			tbl.KeyLen(), tbl.RecordLen(), packidx.KeySize, tableRecord)
 	}
 	return tbl, tr, nil
 }
@@ -141,10 +155,19 @@ func LookupStored(stored []byte, id [32]byte) (PackEntry, bool) {
 	if !ok {
 		return PackEntry{}, false
 	}
+	off := int64(binary.LittleEndian.Uint64(v[0:]))
+	length := int64(binary.LittleEndian.Uint64(v[8:]))
+	// Same gate decodeTrailer applies to the whole list, applied to the
+	// one entry: an extent read straight out of federation bytes must
+	// never reach a range read. A false here sends the caller down the
+	// path it already has for a trailer this cannot answer from.
+	if off < 0 || length < 0 || off+length < 0 {
+		return PackEntry{}, false
+	}
 	return PackEntry{
 		Key:    hex.EncodeToString(id[:]),
-		Off:    int64(binary.LittleEndian.Uint64(v[0:])),
-		Length: int64(binary.LittleEndian.Uint64(v[8:])),
+		Off:    off,
+		Length: length,
 		Type:   entryTypeName(v[16]),
 	}, true
 }

@@ -5,6 +5,19 @@ import { markUrl } from "./mark";
  * in the brand blue. Option 1 of the two the design offers, chosen because
  * nothing is drawn on top of the mark, so nothing about the mark can be got
  * wrong.
+ *
+ * IT IS NOT A LINK HERE, and that is the answer to "I feel like I should be
+ * able to click the 'pelfs' / Pelican logo at the upper-left to go back to
+ * 'home'" rather than a refusal of it. This component only ever renders on
+ * `/`, which IS home: the bundle is served at one address on both servers
+ * (cmd/pelfs/browse.go's route table, internal/webui's test server) and there
+ * is no router in it. A link to `/` from `/` would be a full reload of a
+ * single-page app -- it would throw away the directory the user had opened --
+ * in exchange for an affordance that goes nowhere.
+ *
+ * Where the wordmark DOES navigate is the other surface, `/connect`, and there
+ * it is an anchor that looks like one: cmd/pelfs/browse.html's `h1 .home`,
+ * asserted by tests/connect.spec.ts ("the wordmark goes home").
  */
 export function Brand({ subtitle }: { subtitle?: string }) {
   return (

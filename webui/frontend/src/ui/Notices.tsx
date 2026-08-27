@@ -1,76 +1,42 @@
 import type { ListingMeta } from "../api/types";
 
 /**
- * The two sentences this UI owes the user about its own limits, and they are
- * sentences rather than icons because both limits are silent.
+ * THE ONE COUNT THIS PANE STILL SHOWS, AND THE TWO CAVEATS THAT ARE GONE.
  *
- * MEASURED (internal/webui/testdata/svar-contract/u0-measurements.json):
+ * DELETED, on the owner's instruction, twice given: the search caveat. It was
+ * a paragraph above the grid ("Search below is partial by design…"), then a
+ * <details> chip beside the search box that opened to the same paragraph. The
+ * second was the wrong fix for the first -- "SAME PROBLEM WITH SEARCH ('search
+ * covers loaded rows'). I ASKED YOU TO DO THAT LAST ROUND." -- because moving
+ * an implementation confession into a disclosure keeps it on the screen. A
+ * tooltip would be the same move again, so there is no title attribute here
+ * either.
  *
- *   - The component does not virtualize. 100,000 entries produced 100,000
- *     card elements, 1,000,067 DOM nodes and 703 MB of JS heap, and 17.7 s to
- *     open in cards mode / 33.3 s in table mode. So the API caps a listing --
- *     the cap is the design, not a fallback -- and a capped listing that the
- *     UI does not admit to is a UI that says a directory has 5,000 entries
- *     when it has two million.
+ * The FACT is unchanged and it is not hidden: the component's search filters
+ * loaded rows and fires no request (measured, recording.json step "search"),
+ * so "no results" is not "not in your volume". It lives in
+ * docs/known-issues.md, where it is findable, dated and cross-referenced, and
+ * webapi.PartialSearchNotice still carries it on the wire for a client that
+ * wants to render it. This UI does not.
  *
- *   - Search is CLIENT-SIDE over loaded data only. Typing in the toolbar's
- *     search box fires no request at all (recording.json, step "search"); the
- *     store filters the subtree it happens to have. Combined with the cap,
- *     "no results" therefore means "not in what this tab has loaded", which
- *     is a different statement from "not in your volume" -- and the user
- *     cannot tell the two apart unless the UI says so.
- *
- * Both sentences sit immediately above the component's own toolbar, whose
- * search box is at its top left, so the search caveat is beside the box it is
- * about. Not a tooltip: a tooltip is invisible to a person who does not think
- * to hover, and on a touch screen it does not exist.
+ * WHAT STAYS is the COUNT, because it is not a caveat: a folder that holds two
+ * million entries and shows five thousand has to say five thousand of two
+ * million, or the pane is reporting a number that is not the directory's. That
+ * is a fact about the user's data, said in six words, with no disclosure and
+ * no explanation attached -- and it appears only when the numbers differ, so a
+ * normal folder shows nothing at all.
  */
-export function ListingNotices({
-  meta,
-  search,
-}: {
-  meta: ListingMeta | null;
-  search: string;
-}) {
-  const truncated = !!meta && meta.total !== undefined && meta.total > meta.returned;
-
+export function CapCaveat({ meta }: { meta: ListingMeta | null }) {
+  if (!meta || meta.total === undefined || meta.total <= meta.returned) return null;
   return (
-    <div className="pelfs-notices" data-testid="pelfs-notices">
-      <p className="pelfs-notice" data-testid="search-scope" data-searching={search ? "yes" : "no"}>
-        {search ? (
-          <>
-            <strong>This search is partial.</strong> It matches only the{" "}
-            <strong data-testid="search-scope-count">{meta?.returned ?? 0}</strong> entries this tab
-            has already loaded, in this folder and the folders you have opened. It asks the server
-            nothing. A file that exists but has not been listed here will not appear.
-          </>
-        ) : (
-          <>
-            Search below is <strong>partial by design</strong>: it matches only what this tab has
-            already loaded and never asks the server. For a whole-volume search, use{" "}
-            <code>pelfs mount</code> and your own tools.
-          </>
-        )}
-      </p>
-
-      {truncated ? (
-        <p
-          className="pelfs-notice pelfs-notice--cap"
-          data-testid="listing-cap"
-          data-listing-total={meta?.total}
-          data-listing-returned={meta?.returned}
-        >
-          <strong>This folder is shown in part.</strong> It holds{" "}
-          <strong>{meta?.total?.toLocaleString()}</strong> entries; this page is showing the first{" "}
-          <strong>{meta?.returned.toLocaleString()}</strong>
-          {meta?.cap ? ` (the server's cap is ${meta.cap.toLocaleString()})` : ""}. The browser
-          cannot render the rest — the file list is not virtualized, and{" "}
-          {meta?.total && meta.total >= 100000 ? "100,000" : "a directory this size"} entries costs
-          hundreds of megabytes of memory and tens of seconds. Use <code>pelfs mount</code>, a
-          WebDAV client, or a narrower path for a directory this large.
-        </p>
-      ) : null}
-    </div>
+    <span
+      className="pelfs-count"
+      data-testid="listing-cap"
+      data-listing-total={meta.total}
+      data-listing-returned={meta.returned}
+    >
+      showing {meta.returned.toLocaleString()} of {meta.total.toLocaleString()}
+    </span>
   );
 }
 
@@ -84,11 +50,15 @@ export function ListingNotices({
  * docs/design-guiclients.md measured the trap: 200 documents at ~2 MB fires
  * neither the 1 GiB nor the 200,000-inode pressure trigger, so nothing is
  * published for up to five minutes, and a browser tab has no unmount.
+ *
+ * IT IS ONE SENTENCE, AND IT IS THE OWNER'S ("WAAY to wordy" was the verdict on
+ * ours, which explained the overlay, crash durability and what the line above
+ * meant). The wording lives at its one call site in App.tsx.
  */
 export function UploadNotice({ text }: { text: string }) {
   if (!text) return null;
   return (
-    <p className="pelfs-notice pelfs-notice--staged" data-testid="upload-notice" role="status">
+    <p className="pelfs-note pelfs-note--staged" data-testid="upload-notice" role="status">
       {text}
     </p>
   );
@@ -115,16 +85,16 @@ export function UploadNotice({ text }: { text: string }) {
 export function ErrorBanner({ text, onReload }: { text: string; onReload: () => void }) {
   if (!text) return null;
   return (
-    <div className="pelfs-banner pelfs-banner--bad" data-testid="pelfs-error" role="alert">
+    <div className="pelfs-note pelfs-note--bad" data-testid="pelfs-error" role="alert">
       <span>{text}</span>{" "}
       <button type="button" className="pelfs-button pelfs-button--quiet" onClick={onReload}>
         Reload the listing
       </button>
-      <div className="pelfs-muted">
+      <span className="pelfs-note__more">
         The listing above has been read back from the volume, so what you see is what the volume
-        holds — the change you asked for is not in it. If this folder still looks wrong, the
-        server did not answer the re-read either, and a reload is the way to be sure.
-      </div>
+        holds — the change you asked for is not in it. If this folder still looks wrong, the server
+        did not answer the re-read either, and a reload is the way to be sure.
+      </span>
     </div>
   );
 }

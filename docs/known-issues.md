@@ -36,6 +36,17 @@ two rows were added to the table at the bottom, and the KI/KL entries that
 predate it were not re-checked (they were current at `0c2baf0` and nothing
 in `pelfs browse` touches them).
 
+**KL-17 was closed** by durableprofile-agent, one commit after it was
+filed. It said the next thing to fix on that path was "a client id derived
+from a per-volume key in the state directory so that a regenerated profile
+is byte-identical to the one the user already installed", and that is what
+landed: `internal/localoauth/identity.go`. Its row is in the table at the
+bottom, including the one thing the entry did NOT predict — that a pure
+function of the identity tuple lets a revoked profile be re-armed by
+re-adding the same label, which is why the derivation carries a per-entry
+epoch. **KL-18 stays open and is still true**: the port is derivable by any
+local process and can be squatted, and nothing in that work changes it.
+
 **KI-11 was closed at `b16784d`** by mount-app-agent, the pass that put the
 file manager on the route table — the same pass that made the defect
 reachable by a user at all, since until then nothing served the app. Its row
@@ -116,7 +127,7 @@ both zero. `pelfs ctl <mount> status` (`mountgen.go:2356-2422`) reports
 neither. Offline it IS answered
 twice, both by commands that do real work: `pelfs repack-plan` prints
 `packs: <n>, <bytes> (<pct> live)` (`cmd/pelfs/repackplan.go:190`) and
-`pelfs fsck` prints a pack count (`cmd/pelfs/fsck.go:94`). Auto-repack
+`pelfs fsck` prints a pack count (`cmd/pelfs/fsck.go:173`). Auto-repack
 narrowed this for volumes that ARE mounted writably; the volume this item
 was written for is the one nobody mounts.
 
@@ -176,18 +187,24 @@ measured at 169-174 bytes each, so 15.8-16.2 GiB at 100M objects.
 (`internal/genfs/packindex.go:278-287`) sets `unbounded` one-way and is
 called from `packIndex.all` (`:657`). Callers of `all` at HEAD:
 
-- `FS.ContentOf` — `internal/genfs/read.go:155`, protecting the "present in
-  no listed pack" verdict at `read.go:178`. Reached from the seal walk
-  (`internal/overlay/accessors.go:381` → `internal/publish/source.go:305`)
-  **and from an ordinary write's copy-up** (`internal/memtable/base.go:71`
-  ← `internal/overlay/write.go:528`), so this is reachable without sealing.
-  It has grown three more non-test call sites since C2 was written, all of
-  which lift the cap: `internal/merge/merge.go:595` and `:599` (both sides
-  of a three-way compare), `internal/merge/apply.go:381`, and
-  `internal/memtable/recover.go:557`. So `pelfs merge` — a v0.2 verb that
-  did not exist when this was measured — holds every location of BOTH
-  generations, and the entry's old count of "two whole-map callers"
-  understated the exposure.
+- `FS.ContentOf` — **NO LONGER, on a volume with an index** (renameseal-agent,
+  2026-08-24). It called `all` to protect the "present in no listed pack"
+  verdict, which made the verdict cost one trailer fetch per pack in the
+  volume — the headline defect behind a 40.8 s publish of a one-file rename.
+  It now asks `packIndex.holds` (`internal/genfs/packindex.go`), which
+  answers presence from the hot map, from local trailers, and from the
+  generation's own multi-pack index held against the signed pack list, and
+  falls through to `all` only when none of those can confirm an identity.
+  So the cap is lifted for a volume whose index does not cover an
+  identity — an old generation written before indexes existed, or one whose
+  index upload failed — and not otherwise. Every caller of `ContentOf`
+  inherits that: the seal walk
+  (`internal/overlay/accessors.go:381` → `internal/publish/source.go:305`),
+  an ordinary write's copy-up (`internal/memtable/base.go:71` ←
+  `internal/overlay/write.go:528`), `internal/merge/merge.go:595` and
+  `:599`, `internal/merge/apply.go:381`, and
+  `internal/memtable/recover.go:557`. `pelfs merge` over two INDEXED
+  generations no longer holds every location of both.
 - `FS.Prefetch` — `internal/genfs/prefetch.go:110`.
 - `FS.LoadPackIndex` (`packindex.go:627`) has no non-test callers.
 
@@ -201,9 +218,17 @@ into a sorted, mmap'd, binary-searchable table" step was built — as
 it wrongly.
 
 **Pinned by an executable test: PARTLY.** `TestLocationHeap`
-(`internal/genfs/packindex_test.go:543`, gated on `PELFS_LOCATION_HEAP=1`)
-measures per-location heap and pins the CAP; nothing fails because the
-callers above bypass it.
+(`internal/genfs/packindex_test.go`, gated on `PELFS_LOCATION_HEAP=1`)
+measures per-location heap and pins the CAP; nothing fails because
+`Prefetch` still bypasses it. What IS pinned, ungated, is that `ContentOf`
+no longer does: `TestContentOfDoesNotIndexTheGeneration`
+(`internal/genfs/contentofcost_test.go`) confirms every file in a 32-pack
+generation in one request, and `TestMetadataOnlySealDoesNotFetchTheVolume`
+(`internal/publish/renameseal_test.go`) bounds the objects a rename's seal
+may fetch in a 98-pack volume. The remaining work is the same as it was —
+spill the merged trailers into a `packidx` table under `CacheDir` and
+binary-search it — but it is now the answer for `Prefetch` and for the
+index-less fallback, not for every seal.
 
 ### KI-9. A repack stamps its condemned-ledger rows from the wall clock
 
@@ -607,6 +632,10 @@ and the shared durability vocabulary are pinned
 (`internal/webapi/upload_test.go`, `internal/webui/durability_test.go`).
 The absence of resume is pinned by nothing, being an absence.
 
+**Updated at `7bcce06` (uitext-agent):** the browse UI used to state this in
+its status line on every screen and no longer does — see KL-19 for the
+instruction and for the two sibling limits that left the chrome with it.
+
 ### KL-16. An NFS mount commits once per small file created, whether or not anything called `fsync`
 
 Filed at `b16784d` with the v0.2.1 release pass.
@@ -639,6 +668,171 @@ would mean asserting a wall-clock ratio. The BEHAVIOUR is pinned:
 `nfs_oncommit_test.go`, and `commit_gate` in
 `scripts/mount-gate-test.sh`, which asserts against a real kernel NFS
 client that a COMMIT is SENT.
+
+### KL-18. A predictable browse port can be squatted before pelfs starts
+
+Filed at `c01d35c` by oauthfix-agent, with the stable-port change, and
+recorded because the change is what makes it stateable rather than because
+it is new.
+
+The port is now PUBLISHED — `pelfs browse` takes the first free port at or
+above 8443 — so any local process can bind it first without computing
+anything. A user's saved bookmark would then reach the squatter instead of
+pelfs.
+
+**Updated at the probe (browseback-agent):** this used to say "derived from
+the volume, so any local process can compute it". The change from
+*computable* to *published* is a change in degree and not in kind, and the
+paragraph below was written for the computable case and applies unaltered.
+
+**Why this is accepted rather than fixed.** It is not a new capability: a
+process running as the user can already read the volume, the state
+directory and the federation tokens, so it does not need to impersonate a
+listener to do anything the listener could do. And pelfs does not
+cooperate quietly — the bind fails, `browseListen` reports it, and the
+session says on the terminal that it is on a different port and that a
+saved bookmark will not match. The whole of `docs/design-webui.md`'s
+threat model already refuses to rely on the port being unguessable ("a
+random port is not a secret … nothing in this design may rely on it"), and
+that claim was audited control by control — first for a derived port and
+again for a well-known one; see the "A WELL-KNOWN port is not a weaker
+port" note there.
+
+**Pinned by an executable test: PARTLY.** That a taken port is stepped over
+rather than silently bound, and that an exhausted window falls back and
+says so, are pinned (`cmd/pelfs/browseport_test.go`'s `stepsOverWhatIsTaken`
+and `fallsBackToTheKernelWhenTheWholeWindowIsGone`). The squat itself is
+not a behaviour to assert.
+
+### KL-20. A `pelfs browse` port no longer identifies a volume, so a profile is only good while its volume keeps its port
+
+Filed with the 8443 probe (browseback-agent).
+
+`pelfs browse` takes the first free port at or above 8443, so two volumes
+land on 8443 and 8444 **in whatever order they happened to start**. The
+port a bookmark names is therefore not a promise about which volume answers
+it, and it used to be: the port before this was a hash of the volume's
+prefix URL, so one volume meant one port for as long as the salt held.
+
+**What does NOT happen** is the outcome that would matter — a bookmark
+quietly opening another volume's files. The profile's `Vendor` is keyed on
+the volume (`davprofile.VolumeTag`), not on the port, so volume A's
+bookmark keeps resolving to volume A's profile and keeps presenting volume
+A's `client_id`. That names no client in a session serving volume B, so
+`/oauth/authorize` refuses — and the refusal page NAMES THE VOLUME THAT
+LISTENER IS SERVING, because "you have reached the wrong session" and "your
+profile is corrupt" are otherwise the same page.
+
+**What does happen, and is the accepted cost:** a profile whose volume did
+not get its usual port has to be downloaded again, because the profile
+carries `Default Port` and both OAuth URLs. The user is told: the session
+says on the terminal which port it got and, when it is not 8443, that a
+profile from an earlier session will not reach it.
+
+**Why accepted.** The alternative is the hash this replaced, and the owner
+asked for the probe by name: "I asked you to preferentially bind to a known
+port, such as 8443 … try probing starting at 8443 and going up." A port a
+human can predict and type is worth more than a port that never moves, and
+the cost of the move is one download rather than a wrong answer.
+
+**Pinned by an executable test: YES.** That the `Vendor` is keyed on the
+volume and not the port (`internal/davprofile/davprofile_test.go`, "the
+Vendor is the volume, not the port") and that another volume's client is
+refused by a page naming this session's volume
+(`internal/localoauth/localoauth_test.go`,
+`TestABookmarkFromAnotherVolumeIsRefusedByName`).
+
+### KL-19. `pelfs browse`'s search covers loaded rows only, and the page no longer says so
+
+Filed at `7bcce06` by uitext-agent, and filed HERE because it was deleted
+from the screen.
+
+The file manager's search box is client-side: typing in it fires no request
+at all (measured, `internal/webui/testdata/svar-contract/recording.json`,
+step `search`) and the store filters the rows that tab has already loaded.
+A listing is also capped, because the component does not virtualize
+(100,000 entries produced 703 MB of heap). So **"no results" in that box
+means "not in what this tab has loaded", not "not in your volume"** — for a
+whole-volume search, use `pelfs mount`, a WebDAV client, or a narrower
+path.
+
+Two other limits of the same shape belong with it, since they were all in
+ambient chrome and are all now off it: **an upload is whole-file** (KL-15
+has the detail — a dropped connection restarts it and nothing can draw a
+progress bar until the request finishes), and **a capped folder shows the
+first N entries**. The pane still prints the count when it differs
+(`showing 5,000 of 6,000`), because that is a fact about the user's data
+rather than a caveat about ours.
+
+**Why the UI does not state them.** The owner asked twice, in writing, for
+both standing caveats off the page: *"'whole-file upload only: a dropped
+connection restarts it, and there is no progress bar…' which is the exact
+over-explaining crap I asked you to remove. NOTHING is valuable there for
+an inexperienced user"*, and *"SAME PROBLEM WITH SEARCH ('search covers
+loaded rows'). I ASKED YOU TO DO THAT LAST ROUND."* The earlier passes had
+each answered the complaint by making the sentence smaller and hiding it
+behind a disclosure, which is relocation rather than deletion. This entry
+is where the facts live instead. `webapi.PartialSearchNotice` still carries
+the search one on the wire (`GET /api/v1/info/{id}`), so a different client
+may render it; nothing in this repository has to.
+
+Where a limit actually bites, the user is still told AT THAT MOMENT — a
+failed upload reports its failure, and the app's own `UploadNotice` says
+what a *finished* upload does and does not mean. That is the distinction
+being drawn: an event, not ambient chrome.
+
+**Pinned by an executable test: PARTLY.** That the search is client-side is
+pinned by the recording (`internal/webui/contract_test.go` replays it, and
+a search step that grew a request would fail it). That the caveats stay OFF
+the screen is pinned by `webui/frontend/tests/chrome.spec.ts` ("no legend,
+no search caveat, no upload caveat -- the chrome states nothing"), which
+counts them at zero. The partial-search behaviour itself is an absence and
+is pinned by nothing.
+
+### KL-21. The seal's carry-forward check trusts the index's 12-byte key
+
+Filed at `a212428` by renameseal-agent, as the stated cost of removing the
+whole-generation trailer sweep from `genfs.ContentOf` (see KI-8).
+
+An `mpi` entry keys on 12 bytes of identity, not 32, on the reasoning
+written at `internal/mpi/mpi.go:15`: *"a truncated key can only produce a
+FALSE POSITIVE: the caller holds the full identity and checks what it
+finds"*. Every other consumer does check — `probeHints` fetches the named
+pack's trailer and confirms the full 32 bytes before it returns a location.
+`packIndex.hintsName`, which answers the PRESENCE question for the seal's
+carry-forward check, does not: it stops at the pack's name, because
+fetching the trailer is exactly the per-pack cost being removed.
+
+**Consequence.** A 96-bit prefix collision reads as "present in a listed
+pack" for a chunk that is not there, and the seal carries the record
+forward into a signed generation. It is only reachable when the real chunk
+is genuinely missing — if the identity is stored, the answer was right by
+whatever route — so it needs a damaged volume AND a ~10^-13 event. The
+damage surfaces on read, where the chunk is verified against its identity,
+which is where a missing chunk surfaces in any case.
+
+**What is NOT affected: a swept pack.** That is settled by the SIGNED pack
+list rather than by the key — `hintsName` ignores any name the generation
+no longer lists, and an identity with no listed name falls through to the
+whole-generation sweep, which is still the only thing entitled to say
+"present in no listed pack".
+
+**The exact alternative was measured and refused.** Confirming through the
+trailer costs one request per pack the reused content touches, which for a
+volume of a few large files under one catalog is every pack in the volume —
+the defect this replaced, on every seal. A check whose price is the volume
+does not stay switched on. Making it both exact and cheap means a wider
+key, which is a format change to `mpi` (16 bytes/entry is 1.6 GB at 100M
+objects; 20 would be 2.0), or spilling confirmed trailers to a local
+`packidx` table — the same step KI-8 wants for `Prefetch`.
+
+**Pinned by an executable test: the half that matters, yes.**
+`TestContentOfStillReportsASweptPackAsAbsent`
+(`internal/genfs/contentofcost_test.go`) drops a pack from the list while
+leaving the index naming it and requires "present in no listed pack"; it
+fails if the pack-list guard is removed. The collision itself is not
+pinned and cannot practically be — constructing a 96-bit BLAKE3 prefix
+collision is the test.
 
 ---
 
@@ -694,6 +888,7 @@ pass does not re-file them.
 | **A crash between a flush's publish and its location record loses that batch** (was KL-10) | **FIXED** by durability-agent: `publish` no longer reclaims the ring region a batch came from. It queues the region (`Store.locating`) and `journalLocated` releases it, so until the `Located` record binding handles to packs is durable the ring is still where recovery finds those extents — and a crash in the window loses nothing rather than one flush batch (2 MiB at the shipped pack target). Only a PREFIX is released, because that is all a ring can release: four upload workers finish out of order, so a batch is marked done and the tail advances over however many done batches sit at the front. `Flush` waits for the queue to drain, which is what makes "a flush means recorded" true as well as "a flush means uploaded". Pinned by `memtable.TestACrashBeforeTheLocatedRecordLosesNothing` and `memtable.TestTheRingIsNotReclaimedUntilTheLocatedRecordIsDurable` (`internal/memtable/losswindow_test.go`) — one through `Store.Durable`/`Recover`, one at the ring itself, neither killing anything. The cost was the reason it was deferred and it was MEASURED rather than argued (`memtable.TestMeasureRingHoldBackpressure`, `PELFS_RINGHOLD_MEASURE=1`): holding the ring moves the uplink's cost from the seal into the write phase and leaves end-to-end throughput alone. |
 | **`fsync` over NFS makes nothing durable** (was KI-10) | **FIXED** by commit-agent, and NOT where this file said the fix was. The COMMIT no-op was real but unreachable: `onWrite` wrote the constant FILE_SYNC into the stability field of every WRITE reply, and a Linux client queues a page for commit only when the reply said UNSTABLE — so it never sent a COMMIT. Measured before the fix on this repo's own mount-gate container: `dd conv=fsync` produced 2 WRITEs and **0** COMMITs; after, 1 COMMIT. The fork (`d92cb75`, pinned in `go.mod`) now exports `nfs.Committer`, which both `onWrite` and `onCommit` consult; `internal/vfsbilly` implements it with `overlay.FS.Sync`, the same body the FUSE frontend's `Fsync` calls. Pinned by `internal/vfsbilly/commit_test.go` (a commit syncs, a repeat commit is free), `internal/nfsmount/diag_internal_test.go` (the wrapper must not over-claim the interface), the fork's own `nfs_oncommit_test.go`, and `commit_gate` in `scripts/mount-gate-test.sh`, which asserts against a real kernel NFS client that a COMMIT is SENT. |
 | **A refused mutation in the file manager resolved to `undefined`, so a failed rename looked successful** (was KI-11) | **FIXED** by mount-app-agent, and the mechanism was not the one this file named. The entry said `PelfsDataProvider` "calls `super.send()`", so upstream's swallowed rejection reached the app: it does not — `send()` is a full override that does its own fetch and REJECTS on `!res.ok`, which was true when the entry was written. What actually kept the lie on the screen is a step further on: the STORE applies every mutation optimistically (`@svar-ui/filemanager-store`'s `rename-file` renames the node and re-parents its children before the provider is reached), and a rejection rolls none of that back — so the banner said "that did not happen" beside a row showing that it had. Of the three options this file offered, the second was taken: `PelfsDataProvider.getHandlers` (`webui/frontend/src/api/provider.ts`) wraps each of the five mutating handlers, and on a rejection RE-LISTS the directories the event touched and hands the answer to the store as `provide-data`, which replaces that directory outright. Deliberately not an inverse operation: undoing a rename in the store means keeping a second model of the volume, and the first case that model gets wrong is a batch whose fourth id failed. No copy of upstream's promise chain, so no re-read on every component upgrade. **Pinned by two executable tests**, which the entry said were the missing thing: `A REFUSED RENAME DOES NOT STAY ON THE SCREEN` and `a refused delete leaves the file where it was` (`webui/frontend/tests/filemanager.spec.ts`), driving a real 403 from a read-only path in the mock volume (`mockEntry.ro`, `internal/webui/mockapi_test.go`) and asserting BOTH halves — that the user is told, with the server's reason, and that the row is back under its original name. |
+| **KL-17.** A stable browse port made the BOOKMARK survive a restart; the CREDENTIAL in the generated profile did not, so the profile had to be reinstalled every session | **FIXED** by durableprofile-agent, with the shape KL-17 itself named: the `.cyberduckprofile`'s `OAuth Client ID` is now `HMAC-SHA256(key, label ‖ redirect ‖ write ‖ epoch)` under a 32-byte key in the state directory (`internal/localoauth/identity.go`; `browse-identity.key`, mode 0600, created lazily on the first download), so the generated profile is byte-identical across restarts and the one the user installed keeps working. What the entry did not foresee: a derivation over the tuple ALONE lets a revoked profile come back the moment the user re-adds the same label, so every entry carries a random epoch and `Revoke` destroys it — which is also what makes `Revoke` durable, and why it now returns an error (a revocation that did not reach the disk must not be reported as one). Unchanged on purpose, and said in the code, the docs and the page: no token and no Basic password is persisted, and **consent is still required on every `/authorize`** — the bookmark stops being one-time-use, the click per session does not. **Pinned by executable tests**, which is what the entry said was missing: `internal/localoauth/identity_test.go` (including that the first session's token and password are dead in the second, that a read-only session adopts a writable identity and refuses the SCOPE rather than disowning the client, and that a re-added label is a different client), `cmd/pelfs/browseidentity_test.go` (the page's own JSON across a restart on one port), and `scripts/browse-gate.sh` step 8 — two `pelfs browse` processes in sequence, REAL duck, the profile from the first session neither regenerated nor reinstalled, and its stale refresh token left in place on purpose. |
 | **C2**, the "fsck lifts the cap" claim | **STALE** in that detail — `internal/fsck` does not touch `packIndex`. The rest of C2 survives as KI-8. |
 | **F11** dead/unwired inventory; **G4**, **G6** doc-staleness sweeps | Real work, but hygiene and prose rather than defects or limitations. They stay in `docs/TODO.md`, which is what a punchlist is for. |
 | **`golang.org/x/net` is in `go.mod` as `// indirect`** while `internal/vfsdav` imports `webdav` directly (reported by the WebDAV pass, and predicted to be "promoted by the next `go mod tidy`") | **STALE — the promotion already happened.** `go.mod`'s direct `require` block carries `golang.org/x/net v0.56.0` with **no** `// indirect` marker, at the same version it was pinned at as an indirect. `docs/design-windows.md`'s "The Go half is already compliant" was updated to say so. Nothing to file. |

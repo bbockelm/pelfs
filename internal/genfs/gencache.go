@@ -222,6 +222,28 @@ func (fs *FS) evictCache() {
 	// (packTouchInterval, packfetch.go).
 	sort.Slice(files, func(i, j int) bool { return files[i].age.Before(files[j].age) })
 	pinned := fs.pinnedCatalogs()
+	// Blobs a `--prefetch all` filled with grafted blocks (graftcache.go).
+	// They are skipped on the first pass and taken on the second, and the
+	// two-pass shape is the whole answer to "what does fully local mean
+	// once eviction can take it back":
+	//
+	//   - a prefetched graft block is RE-FETCHABLE, so evicting one is
+	//     always safe — the read path falls back to the source. It is
+	//     therefore never worth failing a write or filling a disk to keep
+	//     one, which rules out an unconditional pin.
+	//   - but ordinary LRU would take them FIRST, because at the moment a
+	//     prefetch finishes they are the oldest thing in the cache and the
+	//     next catalog spill is the newest. A prefetch whose bytes are
+	//     evicted before anything reads them is a prefetch that did
+	//     nothing, which rules out no pin at all.
+	//
+	// So: preferred, not immortal. Everything else goes first, and if the
+	// cache is STILL over its cap afterwards the prefetched blobs go too —
+	// and that is recorded (notePinnedEvicted), because it is the moment a
+	// `--prefetch all` report stopped being true and nobody should have to
+	// infer it.
+	pinnedGraft := fs.graftCache.pinnedBlobs()
+	var deferred []cacheFile
 	skipped := 0
 	for _, f := range files {
 		if total <= low {
@@ -259,10 +281,33 @@ func (fs *FS) evictCache() {
 			}
 			continue
 		}
+		if _, prefetched := pinnedGraft[f.name]; prefetched {
+			deferred = append(deferred, f)
+			skipped++
+			continue
+		}
 		if err := os.Remove(f.path); err == nil {
 			total -= f.size
 			fs.cache.evictedFiles.Add(1)
 			fs.cache.evictedBytes.Add(f.size)
+		}
+	}
+	// The second pass. Only reached when everything else in the cache was
+	// not enough to get under the CAP — not merely under the low-water
+	// mark — so a prefetched blob survives ordinary churn and yields only
+	// to a cache that would otherwise overrun.
+	if total > fs.cacheCap {
+		for _, f := range deferred {
+			if total <= low {
+				break
+			}
+			if err := os.Remove(f.path); err == nil {
+				total -= f.size
+				skipped--
+				fs.cache.evictedFiles.Add(1)
+				fs.cache.evictedBytes.Add(f.size)
+				fs.graftCache.notePinnedEvicted(f.name, f.size)
+			}
 		}
 	}
 	fs.cache.used.Store(total)

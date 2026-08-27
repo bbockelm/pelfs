@@ -65,6 +65,7 @@ type idleFixture struct {
 	mu     sync.Mutex
 	staged int64
 	nodes  int
+	edges  int
 	seals  int
 	sealed chan struct{} // one send per completed seal
 	fail   error
@@ -77,7 +78,8 @@ func newIdleFixture(t *testing.T, interval time.Duration) *idleFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := newBrowseServer("pelican://fed/pfx", browseArgs{branch: "main", rw: true}, interval, m, 49731)
+	b, err := newBrowseServer("pelican://fed/pfx", browseArgs{branch: "main", rw: true},
+		interval, m, 49731, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,10 +104,10 @@ func newIdleFixture(t *testing.T, interval time.Duration) *idleFixture {
 	return f
 }
 
-func (f *idleFixture) pressure() (int64, int) {
+func (f *idleFixture) pressure() (int64, int, int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.staged, f.nodes
+	return f.staged, f.nodes, f.edges
 }
 
 func (f *idleFixture) seal(context.Context) (string, error) {
@@ -135,6 +137,15 @@ func (f *idleFixture) write(bytes int64) {
 	f.mu.Lock()
 	f.staged += bytes
 	f.nodes++
+	f.mu.Unlock()
+}
+
+// rename moves ONLY the edge counter, which is what a rename does to a
+// real overlay: a whiteout for the old name and an edge for the new one,
+// no inode row and no staged byte.
+func (f *idleFixture) rename() {
+	f.mu.Lock()
+	f.edges += 2
 	f.mu.Unlock()
 }
 
@@ -445,7 +456,7 @@ func TestAWriteOnAnySurfaceRestartsTheWindow(t *testing.T) {
 func TestNothingStagedNeverSeals(t *testing.T) {
 	f := newIdleFixture(t, 5*time.Minute)
 	f.mu.Lock()
-	f.staged, f.nodes = 0, 0
+	f.staged, f.nodes, f.edges = 0, 0, 0
 	f.mu.Unlock()
 	ch := f.attach()
 	f.detach(ch)
@@ -462,7 +473,7 @@ func TestAnUnreadableOverlayNeverSeals(t *testing.T) {
 	// gone. Neither is a moment to start another seal, and neither is a
 	// write.
 	f.mu.Lock()
-	f.staged, f.nodes = -1, -1
+	f.staged, f.nodes, f.edges = -1, -1, -1
 	f.mu.Unlock()
 	ch := f.attach()
 	f.detach(ch)

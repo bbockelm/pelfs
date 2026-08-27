@@ -135,7 +135,7 @@ func cmdImport(args []string) int {
 	if err != nil {
 		return exitErr(fmt.Errorf("open the import source %s: %w", source, err))
 	}
-	srcRefs, err := refsFor(srcInner, srcStateDir, srcPubkeyHex)
+	srcRefs, err := refsFor(o, srcInner, srcStateDir, srcPubkeyHex)
 	if err != nil {
 		return exitErr(err)
 	}
@@ -323,6 +323,16 @@ func cmdImport(args []string) int {
 			"copied; the tree is spliced into {now}, and the preflight is re-run against it",
 			"was", plan.generationAtPreflight, "now", head.Superblock.Generation)
 	}
+	// Re-checked against the RE-READ head, not redeclared: the preflight
+	// loaded this key hours ago and the head moved under it. An import
+	// publishes a successor, so it must sign the way the head signs NOW —
+	// and on an UNSIGNED volume it must not MINT a key, which is what a
+	// nil predecessor would have it do. `pelfs graft` re-loads here for
+	// exactly this reason.
+	signingKey, err = loadOrCreateSigningKey(signingKeyFileIn(stateDir, ""), head.Superblock)
+	if err != nil {
+		return exitErr(err)
+	}
 	base, err = openGraftBase(ctx, o, inner, stateDir, head.Superblock)
 	if err != nil {
 		return exitErr(err)
@@ -455,7 +465,7 @@ func fetchSource(ctx context.Context, rs *refs.Store, branch, tag string) (
 // key again, and what was copied is covered by OUR signature — but the
 // first fetch is still a trust decision, which is why --source-pubkey
 // exists and why the plan report names the key that signed what was read.
-func refsFor(inner pelicanobj.Store, stateDir, pubkeyHex string) (*refs.Store, error) {
+func refsFor(o *cmdOpts, inner pelicanobj.Store, stateDir, pubkeyHex string) (*refs.Store, error) {
 	var trusted ed25519.PublicKey
 	if pubkeyHex != "" {
 		k, err := hex.DecodeString(pubkeyHex)
@@ -464,7 +474,15 @@ func refsFor(inner pelicanobj.Store, stateDir, pubkeyHex string) (*refs.Store, e
 		}
 		trusted = k
 	}
-	return refs.New(inner, stateDir, trusted)
+	// --allow-unsigned reaches the SOURCE as well, and it has to: an
+	// unsigned volume never TOFUs, so without the flag an import of one is
+	// refused before a byte is read — which is the right default, because
+	// there is no key to bootstrap trust in and accepting would mean
+	// nothing more than "whoever can write that prefix". The flag is the
+	// consent, and it is the same consent a mount of that volume needs.
+	return refs.NewWithPolicy(inner, stateDir, refs.Policy{
+		Trusted: trusted, AllowUnsigned: o.allowUnsigned,
+	})
 }
 
 // loadKEK reads --encrypt-key when one was given. It is needed only when
@@ -501,6 +519,21 @@ func reportImportPlan(p *publish.ImportPlan, mount, source, ref string, sb *supe
 			ui.Info("{path} does not exist yet; these directories will be created for it: {dirs}",
 				"path", mount, "dirs", p.SyntheticDirs)
 		}
+	}
+	if sb.IsUnsigned() {
+		// Said as a WARNING, because it is the one fact about this import
+		// that no later check can recover. An unsigned source carries no
+		// evidence of who produced it, so what lands here is "whatever was
+		// at that prefix when we looked" — and once it is copied in and
+		// re-signed under OUR key, our signature vouches for it. There is
+		// no way to tell afterwards, which is why --allow-unsigned had to
+		// be typed to get here at all.
+		ui.Warn("source {source} {ref} is generation {gen} of volume {volume} and is UNSIGNED: "+
+			"nothing attests that it is what its owner published. Importing it copies those bytes "+
+			"in under this volume's own signature, and no later check can undo that",
+			"source", source, "ref", ref, "gen", sb.Generation,
+			"volume", fmt.Sprintf("%x", sb.VolumeID[:8]))
+		return
 	}
 	ui.Info("source {source} {ref} is generation {gen} of volume {volume}, signed by {pub} "+
 		"(verified before anything was read)",

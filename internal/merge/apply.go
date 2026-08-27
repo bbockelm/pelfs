@@ -74,8 +74,13 @@ func Apply(ctx context.Context, o ApplyOptions) (*publish.Result, error) {
 	if o.Plan.FastForward {
 		return nil, errors.New("merge: this is a fast-forward; FastForward publishes it without building a tree")
 	}
-	if o.Refs == nil || o.Branch == "" || len(o.SigningKey) == 0 {
-		return nil, errors.New("merge: Refs, Branch and SigningKey are required to publish")
+	if o.Refs == nil || o.Branch == "" {
+		return nil, errors.New("merge: Refs and Branch are required to publish")
+	}
+	// The key is required unless the branch has none — an unsigned volume
+	// merges unsigned, and publish refuses a key it was not meant to use.
+	if len(o.SigningKey) == 0 && !o.Ours.IsUnsigned() {
+		return nil, errors.New("merge: a signing key is required to publish")
 	}
 	if o.Inner == nil {
 		return nil, errors.New("merge: Inner is required")

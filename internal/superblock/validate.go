@@ -30,5 +30,15 @@ func (sb *Superblock) Validate() error {
 			"and %d manifest ref(s); a generation that records manifests must not also write PackList",
 			sb.Generation, len(sb.PackList), len(sb.Manifests))
 	}
+	// An UNSIGNED generation may not announce a successor key. NextPub is a
+	// signed promise about who signs next, and it is worth exactly the
+	// signature over it; on a document with no signature it is a sentence
+	// anyone with write access can write, so a reader that followed one
+	// would be led to a key of the attacker's choosing. Unsign clears it,
+	// and this is the check that catches a writer that set it afterwards.
+	if sb.IsUnsigned() && sb.NextPub != nil {
+		return fmt.Errorf("superblock: generation %d carries no signature but announces successor key %x; "+
+			"an unsigned document cannot make a promise about keys", sb.Generation, sb.NextPub[:8])
+	}
 	return nil
 }

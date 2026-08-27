@@ -60,6 +60,65 @@ allocated for itself is renumbered — and it is tested. What is still missing
 is a `pelfs renumber` verb to apply it, and, for a v0.1.0 branch with no fork
 record, somewhere for the cut to come from. KL-7 says so.
 
+**Volumes with no signing key, on purpose.** `pelfs init --unsigned` creates a
+volume whose superblocks carry no signature at all, for throwaway development
+on a prefix only you can write: nothing to mint, nothing to carry, nothing to
+lose. There is no new superblock field — an unsigned generation is one whose
+`SigningPub` and `Signature` are both zero, so **the marker is the absence of
+the credential** and there is nothing to forge; an older binary meets one,
+calls `Verify`, and refuses at the trust boundary with no change to it.
+
+Accepting one is the READER's decision and nothing in the document can make
+it. An unsigned volume **never trust-on-first-uses** — there is no key to
+bootstrap trust in, so accepting would mean only "whoever can write this
+prefix" — and first contact is refused unless the reader passes
+`--allow-unsigned` (a common flag, on every verb that reads a volume). The
+consent is then recorded in the volume pin, which now holds either a hex key
+or the literal `unsigned`, in the same file, so that a change of identity is a
+comparison rather than a search.
+
+**A pin that changes kind is always refused, both directions, and no flag
+lifts it.** A volume signed yesterday and unsigned today is either a
+deliberate downgrade or an attack, and the two are byte-identical documents —
+so pelfs does not guess: it refuses (`refs.ErrSignatureDropped`), names the
+pin file, and a human clears it. The mirror case (`ErrSignatureAppeared`)
+refuses because adopting a key that turned up on an unsigned volume would hand
+the pin to whoever published it. **The custody chain does not carry a
+downgrade and will not:** `NextPub` announces a successor key and never "no
+key", and `superblock.Validate` refuses an unsigned document that announces
+anything — a writer may stop signing, but must not be able to turn integrity
+checking off on somebody else's mount at the next poll.
+
+`pelfs rotate --to-unsigned` and `--to-signed` move an existing volume, one
+content-neutral generation per branch (a key rotation needs two only because a
+pin has to be carried across the gap; a mode change carries nothing). The
+downgrade needs no signing key — publishing an unsigned superblock takes none,
+and demanding one would make it impossible exactly when the key is what was
+lost — but it refuses if a key on this machine does not match the head, and it
+ARCHIVES the old key read-only rather than deleting it, since that key is the
+only way back to a tag frozen before the downgrade. `--to-signed` mints a new
+identity and attests to what the volume holds NOW, including anything an
+attacker left there while it was unsigned; it is not a repair, and it is said
+so out loud.
+
+No ordinary writer can move a volume between the two modes: a seal, a
+checkpoint, a repack, a merge and a rescue all inherit it from the parent
+(`superblock.SignAs`), and the key resolver every writer shares returns "no
+key" for an unsigned head instead of minting one — which would otherwise have
+signed a throwaway volume at its first checkpoint and broken every reader.
+
+The volume says so everywhere: `pelfs init` warns at creation, every mount
+logs `UNSIGNED volume: nothing here is authenticated`, `pelfs status` marks
+the mount `rw on main, unsigned`, `pelfs fsck` reports
+`warning: unsigned: /: this generation carries no signature; nothing below it
+is authenticated`, and the browse state carries an `unsigned` field.
+
+**`pelfs fsck` has its first warning kind.** `unsigned` is a warning and not
+damage — the volume is exactly as its owner made it — so a check of an
+unsigned volume still says "generation is consistent" and still exits 0.
+`pelfs fsck --strict` on an unsigned volume now exits 1, which is what
+`--strict` means.
+
 **Less to read on both web surfaces.** The upload notice is one sentence
 ("File uploaded to local machine; click "Publish now" to push it to the
 federation"). The publish control is one button wearing its own state —
@@ -103,6 +162,26 @@ tested `DirtyEdges`), which is why this cost a prompt rather than the data.
 `pressure()` now reports edges too, `/api/v1/info` carries `dirty_edges` and an
 `unpublished` boolean computed from the same predicate the seal uses, and the
 idle sealer counts a rename as both a change and something to publish.
+
+**And now the page shows it.** Both surfaces key off that `unpublished`
+boolean instead of re-deriving it from the byte counters, so a rename -- or a
+delete, a mkdir, a hardlink -- moves the durability panel into the staged
+state and enables *Publish now*, on `/` and on `/connect` alike. A change that
+stages no bytes gets its own sentence, "Changes on this machine only.", rather
+than the counted one reporting the size of the change as zero. The leave-site
+hint moved to the same predicate.
+
+**`make` cannot embed a stale web UI in silence.** `go build` embeds the
+committed `internal/webui/dist` and never runs `go generate` -- which is what
+lets a contributor with no Node build a working UI, and is also why a frontend
+edit that had not been rebuilt looked exactly like a change that did not
+happen. `make build`, `make test`, `make linux` and the two browser gates now
+compare webui/frontend against `internal/webui/bundle.inputs`, by CONTENT
+rather than by timestamp (a fresh clone writes the sources after the bundle, so
+every clean checkout would look stale), and either regenerate it or fail with
+the command to run. An unmodified checkout with no Node is untouched: the check
+costs ~30ms and says nothing. `make ui` regenerates deliberately and `make
+help` lists the targets.
 
 **A seal says how much of itself was the mount following it.** The swap phase
 re-descends every inode the KERNEL is holding, so its cost is set by how much

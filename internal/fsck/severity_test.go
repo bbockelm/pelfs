@@ -38,10 +38,36 @@ func TestEveryShippedKindIsDamage(t *testing.T) {
 				"silently would stop a script failing on real damage", kind, got)
 		}
 	}
-	if len(warningKinds) != 0 {
-		t.Errorf("warningKinds is no longer empty (%d entries): a kind became a warning, "+
-			"which is a change to what `pelfs fsck` exits on. Say so in the CHANGELOG "+
-			"and give it a test of its own here", len(warningKinds))
+	// One warning kind ships, and it is named here so that a SECOND one
+	// arriving without a decision still fails this test. The list above is
+	// the damage half; this is the whole of the other half.
+	want := map[string]struct{}{KindUnsigned: {}}
+	if len(warningKinds) != len(want) {
+		t.Fatalf("warningKinds has %d entries, want %d: a kind became a warning, which is a change to "+
+			"what `pelfs fsck --strict` exits on. Say so in the CHANGELOG and name it here",
+			len(warningKinds), len(want))
+	}
+	for k := range want {
+		if SeverityOf(k) != SeverityWarning {
+			t.Errorf("SeverityOf(%q) = %v, want warning", k, SeverityOf(k))
+		}
+	}
+}
+
+// TestUnsignedIsAWarningNotDamage pins the one reclassification: a volume
+// created with `pelfs init --unsigned` is not broken, so a check of it must
+// still say "generation is consistent" and exit 0 — otherwise every script
+// that runs fsck on a throwaway volume goes red and the operator learns
+// that fsck cries wolf.
+func TestUnsignedIsAWarningNotDamage(t *testing.T) {
+	rep := &Report{Problems: []Problem{
+		{Kind: KindUnsigned, Severity: SeverityOf(KindUnsigned), Path: "/"},
+	}}
+	if rep.Damaged() {
+		t.Fatal("an unsigned volume must not be reported as damaged: nothing about it contradicts itself")
+	}
+	if rep.Warnings() != 1 || rep.Errors() != 0 {
+		t.Fatalf("want 1 warning and 0 errors, got %d/%d", rep.Warnings(), rep.Errors())
 	}
 }
 

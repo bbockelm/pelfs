@@ -103,6 +103,13 @@ func TestTheTwoSurfacesShareOneDurabilityVocabulary(t *testing.T) {
 	// pinned here exactly as the sentences were.
 	for _, phrase := range []string{
 		"on this machine only",
+		// THE NAMESPACE-ONLY SENTENCE. A rename, a delete, a mkdir, a
+		// hardlink stage no bytes and no inode row, so the counted
+		// sentence would render "0 files (0 B) on this machine only" --
+		// the size of the change reported as zero while the line claims
+		// there is one. Two sentences, one on each side of
+		// `staged_files > 0`, and both surfaces carry both.
+		"Changes on this machine only.",
 		"Everything here is in the federation.",
 		"Next publish in",
 		// The seal in flight, which REPLACES the countdown rather than
@@ -135,6 +142,35 @@ func TestTheTwoSurfacesShareOneDurabilityVocabulary(t *testing.T) {
 		if !strings.Contains(app, phrase) {
 			t.Errorf("webui/frontend/src/durability.ts no longer says %q\n"+
 				"Both surfaces say it, or neither does.", phrase)
+		}
+	}
+
+	// THE FIELD THE PANEL DECIDES ON, which is the other half of the
+	// vocabulary and the half that had drifted.
+	//
+	// Both surfaces used to answer "is there anything to publish" by
+	// re-deriving the seal's predicate out of the counters --
+	// `staged_files === 0 && dirty_nodes === 0` -- and a rename writes
+	// neither, so a renamed file rendered as "Everything here is in the
+	// federation" over a button reading "Nothing to publish" while the seal
+	// knew better. `/api/v1/info` now carries `unpublished`, computed from
+	// the same expression `checkpoint` and `sealAtExit` use, and it is a
+	// BOOLEAN precisely so that a page cannot re-derive it and drift again.
+	//
+	// So this pins both directions: each surface reads the field, and
+	// neither still assembles the answer for itself.
+	for _, src := range []struct{ name, text string }{
+		{"cmd/pelfs/browse.html", page},
+		{"webui/frontend/src/durability.ts", app},
+	} {
+		if !strings.Contains(src.text, "unpublished") {
+			t.Errorf("%s no longer reads `unpublished`\n"+
+				"The predicate is the SERVER's; a surface that computes its own will "+
+				"disagree with the seal again.", src.name)
+		}
+		if strings.Contains(src.text, "dirty_nodes === 0") {
+			t.Errorf("%s decides whether there is work to publish by re-deriving it from "+
+				"the counters again; that is what `unpublished` replaced.", src.name)
 		}
 	}
 

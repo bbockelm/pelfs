@@ -96,7 +96,18 @@ type Applied struct {
 // restorable from somewhere else afterwards, and a ref is how you find out
 // what to look for.
 func Apply(ctx context.Context, o ApplyOptions, plan *BranchPlan, force bool) (*Applied, error) {
-	if len(o.SigningKey) != ed25519.PrivateKeySize {
+	// The key is what a rescued head is signed with — unless the document
+	// being rescued carries no signature, which is what an unsigned volume
+	// leaves behind. A rescue must restate what it found, and giving an
+	// unsigned volume a key here would publish a head every reader of that
+	// volume refuses (their pin says "unsigned"), which is the opposite of
+	// a rescue.
+	unsigned := plan.Chosen != nil && plan.Chosen.SB != nil && plan.Chosen.SB.IsUnsigned()
+	switch {
+	case unsigned && len(o.SigningKey) != 0:
+		return nil, fmt.Errorf("rescue --apply: %w: the recovered generation carries no signature",
+			superblock.ErrSigningChange)
+	case !unsigned && len(o.SigningKey) != ed25519.PrivateKeySize:
 		return nil, errors.New("rescue --apply: a rescued head is a new signed document, so it needs the " +
 			"volume's signing key")
 	}
@@ -129,7 +140,7 @@ func Apply(ctx context.Context, o ApplyOptions, plan *BranchPlan, force bool) (*
 	out := &Applied{
 		Branch: plan.Branch, Generation: sb.Generation, Packs: len(plan.Packs),
 		Replaced: plan.Current.Present, Shape: "inline",
-		SignedBy: hex.EncodeToString(o.SigningKey.Public().(ed25519.PublicKey)),
+		SignedBy: signedBy(o.SigningKey),
 	}
 	if mref != "" {
 		out.Shape, out.ManifestObject = "manifest", mref
@@ -168,7 +179,7 @@ func head(ctx context.Context, o ApplyOptions, plan *BranchPlan) (*superblock.Su
 	sb.Manifests = nil
 	sb.Signature = [64]byte{}
 
-	if raw, err := sign(&sb, o.SigningKey); err == nil {
+	if raw, err := sign(plan.Chosen.SB, &sb, o.SigningKey); err == nil {
 		if err := sb.Validate(); err != nil {
 			return nil, nil, "", err
 		}
@@ -204,7 +215,7 @@ func head(ctx context.Context, o ApplyOptions, plan *BranchPlan) (*superblock.Su
 		Name: name, Hash: hash, Size: int64(len(segRaw)), Packs: uint32(m.Len()),
 	}}
 	sb.Signature = [64]byte{}
-	raw, err := sign(&sb, o.SigningKey)
+	raw, err := sign(plan.Chosen.SB, &sb, o.SigningKey)
 	if err != nil {
 		return nil, nil, "", err
 	}
@@ -217,11 +228,21 @@ func head(ctx context.Context, o ApplyOptions, plan *BranchPlan) (*superblock.Su
 	return &sb, raw, name, nil
 }
 
-func sign(sb *superblock.Superblock, key ed25519.PrivateKey) ([]byte, error) {
-	if err := sb.Sign(key); err != nil {
+func sign(prev *superblock.Superblock, sb *superblock.Superblock, key ed25519.PrivateKey) ([]byte, error) {
+	if err := sb.SignAs(prev, key); err != nil {
 		return nil, err
 	}
 	return sb.Encode()
+}
+
+// signedBy names the key a rescued head is signed with, for the report.
+// An unsigned volume has none, and the report says so in the same field
+// rather than in a second one nobody would look at.
+func signedBy(key ed25519.PrivateKey) string {
+	if len(key) == 0 {
+		return "(unsigned)"
+	}
+	return hex.EncodeToString(key.Public().(ed25519.PublicKey))
 }
 
 func ids(cands []*Candidate) string {

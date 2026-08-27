@@ -386,7 +386,9 @@ func runBrowse(o *cmdOpts, prefix string, a browseArgs) int {
 		g.lease = l
 		defer g.down.timed("lease", g.releaseLease)
 	}
-	rstore, err := refs.New(g.inner, stateDir, trusted)
+	rstore, err := refs.NewWithPolicy(g.inner, stateDir, refs.Policy{
+		Trusted: trusted, AllowUnsigned: o.allowUnsigned,
+	})
 	if err != nil {
 		return fail(err)
 	}
@@ -1059,6 +1061,11 @@ type browseState struct {
 	Mode       string `json:"mode"`
 	Branch     string `json:"branch"`
 	Generation uint64 `json:"generation"`
+	// Unsigned says the volume carries no signature at all. It is a
+	// property of the VOLUME and cannot change under a session — no
+	// publish moves a volume between the two modes — so the page may
+	// render it as a standing badge rather than as a state that flickers.
+	Unsigned bool `json:"unsigned,omitempty"`
 	// Lease is the control socket's own vocabulary: held, stale,
 	// interrupted, lost — four different answers to "can this session
 	// still publish". "none" is a read-only or --no-lease session, which
@@ -1217,6 +1224,7 @@ func (b *browseServer) state() browseState {
 	}
 	st.Branch = g.currentBranch()
 	st.Generation = g.gfs.Generation()
+	st.Unsigned = g.sb != nil && g.sb.IsUnsigned()
 	if g.lease != nil {
 		ls := g.lease.State()
 		st.Lease, st.LeaseAge = ls.Name(), ls.Age.Seconds()

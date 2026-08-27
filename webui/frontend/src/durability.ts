@@ -120,7 +120,16 @@ export function describe(s: BrowseState | null): DurabilityLine {
   // answer to the only question this line asks, so they are the same sentence.
   // The difference between them is a mode chip and a publish control, both of
   // which are elsewhere and neither of which is durability.
-  if (s.mode === "read-only" || (s.staged_files === 0 && s.dirty_nodes === 0)) {
+  //
+  // `unpublished` AND NOT THE COUNTERS. This used to test the staged-file and
+  // dirty-inode counts for zero, which is a re-derivation of the seal's
+  // predicate -- and it was the wrong one: a rename writes no bytes and no
+  // inode row, only namespace edges, so the page told a user who had just
+  // renamed a file that everything was in the federation while the seal knew
+  // otherwise. The server now answers the predicate itself
+  // (cmd/pelfs/browse.go), so there is one definition of "there is something
+  // to publish" rather than two.
+  if (s.mode === "read-only" || !s.unpublished) {
     return {
       state: "published",
       glyph: GLYPH.published,
@@ -136,12 +145,22 @@ export function describe(s: BrowseState | null): DurabilityLine {
     s.publish && s.publish.state === "running" && s.publish.reason !== "branch"
       ? "Publishing now."
       : `Next publish in ${secs(s.next_publish_s)}.`;
+  // WHAT IS UNPUBLISHED IS NOT ALWAYS BYTES, and the sentence has to survive
+  // that. A rename, a delete, a mkdir, a hardlink stage namespace and nothing
+  // else, so the counted sentence would read "0 files (0 B) on this machine
+  // only" -- a line that reports the size of the change as zero while claiming
+  // there is one, which is the same ambiguity in a new place. The short
+  // sentence is the honest one: what the reader has to know is that it is here
+  // and not there, and the count was never the point.
+  const what =
+    s.staged_files > 0
+      ? `${s.staged_files} file${s.staged_files === 1 ? "" : "s"} (${bytes(s.staged_bytes)}) ` +
+        `on this machine only.`
+      : `Changes on this machine only.`;
   return {
     state: "staged",
     glyph: GLYPH.staged,
-    text:
-      `${s.staged_files} file${s.staged_files === 1 ? "" : "s"} (${bytes(s.staged_bytes)}) ` +
-      `on this machine only. ${when}${sending}`,
+    text: `${what} ${when}${sending}`,
   };
 }
 
@@ -173,7 +192,10 @@ export function publishState(s: BrowseState | null): PublishState {
   if (s.publish && s.publish.state === "running") {
     return s.publish.reason === "branch" ? "switching" : "running";
   }
-  if (s.staged_files === 0 && s.dirty_nodes === 0) return "nothing";
+  // The SAME predicate the line above uses, and the server's rather than this
+  // page's: a button reading "Nothing to publish" over a session that would
+  // publish a rename is the bug this field exists to end.
+  if (!s.unpublished) return "nothing";
   return "ready";
 }
 

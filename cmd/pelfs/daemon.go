@@ -192,13 +192,27 @@ func cmdMount(args []string) int {
 		fs.BoolVar(&a.noMemtable, "no-memtable", false, "with --rw, keep written content in staging files and chunk it all at the seal, instead of packing and uploading during the session")
 		fs.DurationVar(&a.poll, "poll", 0, "read-only: re-check the branch head this often and swap generations live (0 = pinned)")
 		fs.StringVar(&a.signingKeyPath, "signing-key", "", signingKeyUsage)
+		registerFinderFlags(fs, &a)
 	})
 	if err != nil {
 		return exitErr(err)
 	}
 	prefix := pos[0]
+	if a.finder {
+		finderBackend(o)
+	}
 	if a.backend, err = resolveBackend(o); err != nil {
 		return exitErr(err)
+	}
+	// Checked in the PARENT, before anything is spawned. The daemon child's
+	// only voice is daemon.log, so a --finder that cannot work here must
+	// say so on the terminal that asked for it -- otherwise a user who
+	// wanted a volume in the Finder gets a background process that exited
+	// and no reason why.
+	if a.finder {
+		if err := checkFinder(a.backend); err != nil {
+			return exitErr(err)
+		}
 	}
 
 	// The registry directory for a BACKGROUND mount, which is the default
@@ -216,9 +230,17 @@ func cmdMount(args []string) int {
 	infoPath := filepath.Join(dir, "mount.json")
 
 	if os.Getenv(daemonEnv) == "1" {
-		mountpoint := filepath.Join(o.stateDir, "mnt")
+		// A --finder mount with no mountpoint of its own is left EMPTY for
+		// runMountGen to fill in: where a Finder volume lands is chosen
+		// from the volume's name and what is available in /Volumes
+		// (cmd/pelfs/finder.go), and <state-dir>/mnt -- a path whose last
+		// component is the word "mnt" -- is precisely the name it must not
+		// have.
+		mountpoint := ""
 		if len(pos) > 1 {
 			mountpoint = pos[1]
+		} else if !a.finder {
+			mountpoint = filepath.Join(o.stateDir, "mnt")
 		}
 		// The daemon child IS the mount: runMountGen publishes the record
 		// this command's parent is waiting on, serves until SIGTERM, and

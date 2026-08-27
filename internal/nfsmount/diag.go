@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -202,8 +203,17 @@ func report(op, path, told string, err error) {
 
 // diagnose wraps fs so that every error it returns passes the explainer
 // before go-nfs gets a chance to discard it.
-func diagnose(fs billy.Filesystem) billy.Filesystem {
-	d := diagFS{Filesystem: fs}
+//
+// hide, when non-nil, is asked about the last component of every path this
+// filesystem is given, and a name it claims is a name the mount does not
+// have: lookups answer ENOENT and attempts to create one answer EACCES.
+// The filter rides in THIS wrapper rather than a second one because the
+// wrapper shape below is the expensive part -- one type per combination of
+// the optional interfaces go-nfs type-asserts for -- and a second wrapper
+// that answered those assertions differently would silently change which
+// RPCs the mount supports. What is filtered, and why, is finderfiles.go.
+func diagnose(fs billy.Filesystem, hide func(string) bool) billy.Filesystem {
+	d := diagFS{Filesystem: fs, hide: hide}
 	// None of billy.Change, nfs.HardLinker, nfs.PermissionChecker or
 	// nfs.Committer is part of billy.Filesystem, and go-nfs decides
 	// whether SETATTR, LINK, an honest ACCESS and a real COMMIT are
@@ -218,12 +228,18 @@ func diagnose(fs billy.Filesystem) billy.Filesystem {
 	// combination. Sixteen of them, which is the honest cost of four
 	// independent optional interfaces in a language with no dynamic
 	// composition; the alternative is a wrapper that lies about one.
+	//
+	// The hide filter cuts across all sixteen because it lives in diagFS,
+	// which every shape embeds; the two halves that carry their own
+	// methods and so need it passed in are diagLinker (a hidden name
+	// cannot be linked TO) and, deliberately, not diagCommitter -- see
+	// there.
 	ch, changeable := fs.(billy.Change)
 	ln, linkable := fs.(nfs.HardLinker)
 	pc, checks := fs.(nfs.PermissionChecker)
 	cm, commits := fs.(nfs.Committer)
 	c := diagChangeFS{diagFS: d, ch: ch}
-	l := diagLinker{ln}
+	l := diagLinker{ln: ln, hide: hide}
 	p := diagPermitter{pc}
 	m := diagCommitter{cm}
 	switch {
@@ -263,6 +279,27 @@ func diagnose(fs billy.Filesystem) billy.Filesystem {
 
 type diagFS struct {
 	billy.Filesystem
+	// hide is nil on every mount but a browsable one; see diagnose.
+	hide func(string) bool
+}
+
+// hidden reports whether p names something this mount refuses to have.
+// The predicate is asked about the last component only, which is what
+// makes it depth-independent and correct under Chroot.
+func (d *diagFS) hidden(p string) bool {
+	return d.hide != nil && d.hide(path.Base(path.Clean(p)))
+}
+
+// absent is the answer to a lookup of a hidden name, and refused is the
+// answer to an attempt to create one. Both are shapes go-nfs can already
+// translate -- NFS3ERR_NOENT and NFS3ERR_ACCES -- so neither reaches the
+// explainer as an error nobody can place.
+func absent(op, p string) error {
+	return &os.PathError{Op: op, Path: p, Err: syscall.ENOENT}
+}
+
+func refused(op, p string) error {
+	return &os.PathError{Op: op, Path: p, Err: syscall.EACCES}
 }
 
 type diagChangeFS struct {
@@ -273,10 +310,17 @@ type diagChangeFS struct {
 // diagLinker carries the hard-link half, so the two wrapper shapes that
 // need it share one implementation.
 type diagLinker struct {
-	ln nfs.HardLinker
+	ln   nfs.HardLinker
+	hide func(string) bool
 }
 
 func (d diagLinker) Link(oldname, newname string) error {
+	// A hidden name cannot be linked TO -- it does not exist -- so only
+	// the new name needs the check, and it gets the same refusal a create
+	// would.
+	if d.hide != nil && d.hide(path.Base(path.Clean(newname))) {
+		return refused("link", newname)
+	}
 	return explain("link", newname, toldEIO, d.ln.Link(oldname, newname))
 }
 
@@ -300,6 +344,13 @@ func (d diagPermitter) Permitted(path string) (nfs.Permission, error) {
 // most: a COMMIT is the only reply an application's fsync(2) is waiting
 // on, so an unexplained EIO there is an fsync failure with no cause
 // recorded anywhere.
+//
+// NO HIDE FILTER, unlike diagLinker. A COMMIT is issued against a file the
+// client already has a handle for, and on a mount with a filter there is
+// no way to get one for a hidden name: Create and an O_CREATE OpenFile
+// refuse it, Open and Lookup say it does not exist, and ReadDir does not
+// list it. A check here would be unreachable code claiming to be a
+// defence.
 type diagCommitter struct {
 	cm nfs.Committer
 }
@@ -436,30 +487,59 @@ func (d *diagFS) Capabilities() billy.Capability {
 }
 
 func (d *diagFS) Create(filename string) (billy.File, error) {
+	if d.hidden(filename) {
+		return nil, refused("create", filename)
+	}
 	f, err := d.Filesystem.Create(filename)
 	return d.wrap(f), explain("create", filename, toldEACCES, err)
 }
 
 func (d *diagFS) Open(filename string) (billy.File, error) {
+	if d.hidden(filename) {
+		return nil, absent("open", filename)
+	}
 	f, err := d.Filesystem.Open(filename)
 	return d.wrap(f), explain("open", filename, toldEACCES, err)
 }
 
 func (d *diagFS) OpenFile(filename string, flag int, perm os.FileMode) (billy.File, error) {
+	if d.hidden(filename) {
+		// Which refusal depends on what was asked. An open for reading is
+		// answered "there is no such file", the same as the lookup that
+		// preceded it; an open that would CREATE the file is answered
+		// "you may not", because saying ENOENT to a create invites the
+		// client to retry it forever.
+		if flag&os.O_CREATE != 0 {
+			return nil, refused("open", filename)
+		}
+		return nil, absent("open", filename)
+	}
 	f, err := d.Filesystem.OpenFile(filename, flag, perm)
 	return d.wrap(f), explain("open", filename, toldEACCES, err)
 }
 
 func (d *diagFS) Stat(filename string) (os.FileInfo, error) {
+	if d.hidden(filename) {
+		return nil, absent("stat", filename)
+	}
 	fi, err := d.Filesystem.Stat(filename)
 	return fi, explain("stat", filename, toldEIO, err)
 }
 
 func (d *diagFS) Rename(oldpath, newpath string) error {
+	if d.hidden(newpath) {
+		return refused("rename", newpath)
+	}
+	if d.hidden(oldpath) {
+		return absent("rename", oldpath)
+	}
 	return explain("rename", oldpath, toldEIO, d.Filesystem.Rename(oldpath, newpath))
 }
 
 func (d *diagFS) Remove(filename string) error {
+	if d.hidden(filename) {
+		return absent("remove", filename)
+	}
 	return explain("remove", filename, toldEIO, d.Filesystem.Remove(filename))
 }
 
@@ -468,25 +548,53 @@ func (d *diagFS) TempFile(dir, prefix string) (billy.File, error) {
 	return d.wrap(f), explain("tempfile", dir, toldEACCES, err)
 }
 
+// ReadDir hides rather than refuses: the directory is real and the listing
+// is the user's, so what a filter does here is leave its own names out of
+// it. A hidden name that is somehow already IN the volume -- committed by
+// a Linux client, or by a pelfs old enough to have sealed one -- therefore
+// stops being listed too, which is the consistent answer: every other
+// method here says it does not exist.
 func (d *diagFS) ReadDir(path string) ([]os.FileInfo, error) {
 	entries, err := d.Filesystem.ReadDir(path)
-	return entries, explain("readdir", path, toldENOTDIR, err)
+	if err != nil || d.hide == nil {
+		return entries, explain("readdir", path, toldENOTDIR, err)
+	}
+	kept := make([]os.FileInfo, 0, len(entries))
+	for _, fi := range entries {
+		if d.hide(fi.Name()) {
+			continue
+		}
+		kept = append(kept, fi)
+	}
+	return kept, nil
 }
 
 func (d *diagFS) MkdirAll(filename string, perm os.FileMode) error {
+	if d.hidden(filename) {
+		return refused("mkdir", filename)
+	}
 	return explain("mkdir", filename, toldEACCES, d.Filesystem.MkdirAll(filename, perm))
 }
 
 func (d *diagFS) Lstat(filename string) (os.FileInfo, error) {
+	if d.hidden(filename) {
+		return nil, absent("lstat", filename)
+	}
 	fi, err := d.Filesystem.Lstat(filename)
 	return fi, explain("lstat", filename, toldEIO, err)
 }
 
 func (d *diagFS) Symlink(target, link string) error {
+	if d.hidden(link) {
+		return refused("symlink", link)
+	}
 	return explain("symlink", link, toldEACCES, d.Filesystem.Symlink(target, link))
 }
 
 func (d *diagFS) Readlink(link string) (string, error) {
+	if d.hidden(link) {
+		return "", absent("readlink", link)
+	}
 	target, err := d.Filesystem.Readlink(link)
 	return target, explain("readlink", link, toldEACCES, err)
 }
@@ -496,22 +604,36 @@ func (d *diagFS) Chroot(path string) (billy.Filesystem, error) {
 	if err != nil {
 		return nil, explain("chroot", path, toldEIO, err)
 	}
-	return diagnose(inner), nil
+	// The filter follows the chroot unchanged: it matches on the last
+	// component, which a change of root does not touch.
+	return diagnose(inner, d.hide), nil
 }
 
 func (d *diagChangeFS) Chmod(name string, mode os.FileMode) error {
+	if d.hidden(name) {
+		return absent("chmod", name)
+	}
 	return attrErr("chmod", name, d.ch.Chmod(name, mode))
 }
 
 func (d *diagChangeFS) Lchown(name string, uid, gid int) error {
+	if d.hidden(name) {
+		return absent("lchown", name)
+	}
 	return attrErr("lchown", name, d.ch.Lchown(name, uid, gid))
 }
 
 func (d *diagChangeFS) Chown(name string, uid, gid int) error {
+	if d.hidden(name) {
+		return absent("chown", name)
+	}
 	return attrErr("chown", name, d.ch.Chown(name, uid, gid))
 }
 
 func (d *diagChangeFS) Chtimes(name string, atime, mtime time.Time) error {
+	if d.hidden(name) {
+		return absent("chtimes", name)
+	}
 	return attrErr("chtimes", name, d.ch.Chtimes(name, atime, mtime))
 }
 

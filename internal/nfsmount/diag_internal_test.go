@@ -177,13 +177,13 @@ func (f *allFS) Commit(path string) error {
 // for a commit that does nothing -- fsync(2) returning success over data
 // no layer ever made durable, which is KI-10 restored one level up.
 func TestDiagnosePreservesTheCommitInterface(t *testing.T) {
-	if _, ok := diagnose(memfs.New()).(nfs.Committer); ok {
+	if _, ok := diagnose(memfs.New(), nil).(nfs.Committer); ok {
 		t.Error("wrapper claims nfs.Committer for a filesystem that has none: go-nfs would answer " +
 			"UNSTABLE to writes and commit them nowhere")
 	}
 
 	inner := &commitFS{Filesystem: memfs.New()}
-	wrapped := diagnose(inner)
+	wrapped := diagnose(inner, nil)
 	c, ok := wrapped.(nfs.Committer)
 	if !ok {
 		t.Fatal("wrapper dropped nfs.Committer, so COMMIT goes back to answering without asking")
@@ -203,14 +203,14 @@ func TestDiagnosePreservesTheCommitInterface(t *testing.T) {
 
 	// A commit that fails must still fail through the wrapper: it is the
 	// only reply an application's fsync(2) is waiting on.
-	failing := diagnose(&commitFS{Filesystem: memfs.New(), fail: syscall.ENOSPC})
+	failing := diagnose(&commitFS{Filesystem: memfs.New(), fail: syscall.ENOSPC}, nil)
 	if err := failing.(nfs.Committer).Commit("/a.c"); !errors.Is(err, syscall.ENOSPC) {
 		t.Errorf("a failed commit came back as %v, want ENOSPC", err)
 	}
 
 	// And the full combination, which is the one the mount actually runs.
 	all := &allFS{chmodFS: chmodFS{Filesystem: memfs.New()}, granted: nfs.PermissionRead}
-	full := diagnose(all)
+	full := diagnose(all, nil)
 	if _, ok := full.(billy.Change); !ok {
 		t.Error("wrapper dropped billy.Change from the four-way shape")
 	}
@@ -228,6 +228,53 @@ func TestDiagnosePreservesTheCommitInterface(t *testing.T) {
 	}
 }
 
+// The four-way shape is also the shape a --finder mount runs, so the hide
+// filter has to survive it. It is the one thing the Committer work and the
+// Finder work touch in common: both are answered by WHICH wrapper type
+// diagnose returns, and a filter that was dropped from the widest
+// combination would leave the volume publishing .DS_Store on exactly the
+// mounts that can see the Finder.
+func TestDiagnoseKeepsTheFilterInTheFourWayShape(t *testing.T) {
+	all := &allFS{chmodFS: chmodFS{Filesystem: memfs.New()}, granted: nfs.PermissionRead}
+	full := diagnose(all, finderDropping)
+	for _, iface := range []struct {
+		name string
+		ok   bool
+	}{
+		{"billy.Change", func() bool { _, ok := full.(billy.Change); return ok }()},
+		{"nfs.HardLinker", func() bool { _, ok := full.(nfs.HardLinker); return ok }()},
+		{"nfs.PermissionChecker", func() bool { _, ok := full.(nfs.PermissionChecker); return ok }()},
+		{"nfs.Committer", func() bool { _, ok := full.(nfs.Committer); return ok }()},
+	} {
+		if !iface.ok {
+			t.Errorf("a filtered four-way wrapper dropped %s", iface.name)
+		}
+	}
+	if _, err := full.Create("/dir/.DS_Store"); !errors.Is(err, syscall.EACCES) {
+		t.Errorf("creating .DS_Store on a filtered four-way mount = %v, want EACCES", err)
+	}
+	if _, err := full.Stat("/dir/.DS_Store"); !errors.Is(err, syscall.ENOENT) {
+		t.Errorf("stat of .DS_Store on a filtered four-way mount = %v, want ENOENT", err)
+	}
+	// And the allowed neighbours the filter must never take: refusing an
+	// AppleDouble sidecar fails the Finder copy that writes it, and
+	// refusing .Trashes turns Move to Trash into an error.
+	for _, name := range []string{"/dir/._paper.pdf", "/.Trashes"} {
+		f, err := full.Create(name)
+		if err != nil {
+			t.Errorf("Create(%s) on a filtered four-way mount = %v, want success", name, err)
+			continue
+		}
+		_ = f.Close()
+	}
+	// A COMMIT still reaches the filesystem underneath: diagCommitter
+	// carries no filter, deliberately, because no handle for a hidden name
+	// can exist to commit.
+	if err := full.(nfs.Committer).Commit("/dir/._paper.pdf"); err != nil {
+		t.Errorf("Commit of an allowed name through a filtered wrapper: %v", err)
+	}
+}
+
 // The wrapper has to keep every property go-nfs tests for, or it changes
 // the server's behavior while explaining it: WriteCapability (absent, and
 // every mutating RPC is refused with ROFS), billy.Change (absent, and
@@ -239,7 +286,7 @@ func TestDiagnosePreservesTheCommitInterface(t *testing.T) {
 // filesystem behind it, and every ACCESS would come back granting nothing
 // -- a mount on which nothing can be opened at all.
 func TestDiagnosePreservesTheInterfacesGoNFSAsserts(t *testing.T) {
-	plain := diagnose(memfs.New())
+	plain := diagnose(memfs.New(), nil)
 	if _, ok := plain.(billy.Change); ok {
 		t.Error("wrapper claims billy.Change for a filesystem that has none")
 	}
@@ -250,7 +297,7 @@ func TestDiagnosePreservesTheInterfacesGoNFSAsserts(t *testing.T) {
 		t.Error("wrapper dropped WriteCapability")
 	}
 
-	changeable := diagnose(&chmodFS{Filesystem: memfs.New()})
+	changeable := diagnose(&chmodFS{Filesystem: memfs.New()}, nil)
 	if _, ok := changeable.(billy.Change); !ok {
 		t.Fatal("wrapper dropped billy.Change")
 	}
@@ -258,7 +305,7 @@ func TestDiagnosePreservesTheInterfacesGoNFSAsserts(t *testing.T) {
 		t.Error("wrapper invented nfs.PermissionChecker for a changeable filesystem")
 	}
 
-	checker := diagnose(&permFS{Filesystem: memfs.New(), granted: nfs.PermissionRead})
+	checker := diagnose(&permFS{Filesystem: memfs.New(), granted: nfs.PermissionRead}, nil)
 	pc, ok := checker.(nfs.PermissionChecker)
 	if !ok {
 		t.Fatal("wrapper dropped nfs.PermissionChecker")
@@ -271,7 +318,7 @@ func TestDiagnosePreservesTheInterfacesGoNFSAsserts(t *testing.T) {
 	both := diagnose(&changePermFS{
 		chmodFS: chmodFS{Filesystem: memfs.New()},
 		granted: nfs.PermissionRead | nfs.PermissionWrite,
-	})
+	}, nil)
 	if _, ok := both.(billy.Change); !ok {
 		t.Error("wrapper dropped billy.Change from a filesystem that also checks permissions")
 	}
@@ -313,7 +360,7 @@ func TestChangeErrorsCarryAnNFSStatus(t *testing.T) {
 			eioReportedAt.Store(0)
 			eioSuppressed.Store(0)
 
-			fs := diagnose(&chmodFS{Filesystem: memfs.New(), fail: tc.err})
+			fs := diagnose(&chmodFS{Filesystem: memfs.New(), fail: tc.err}, nil)
 			err := fs.(billy.Change).Chmod("/a.c", 0o644)
 			var st *nfs.NFSStatusError
 			if !errors.As(err, &st) {

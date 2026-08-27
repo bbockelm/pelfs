@@ -173,6 +173,29 @@ macOS shows its one-time "would like to access files on a network volume"
 permission prompt (TCC) for that app — click Allow once per app
 (Terminal, Finder, ...).
 
+### In the Finder, like a volume
+
+```
+pelfs mount --rw --finder pelican://<federation>/<prefix>
+```
+
+`--finder` (macOS, NFS backend) makes the mount a **Mac volume**: it appears
+in the Finder sidebar under Locations, named after the prefix or after
+`--volume-name`, with an eject button that seals the session and exits —
+the same thing `pelfs umount` does. It mounts on `/Volumes/<name>` when that
+directory exists and is yours, else on `~/Volumes/<name>`, and it prints the
+one-time `sudo mkdir`/`chown` that moves it into `/Volumes`.
+
+It also **refuses the Finder's bookkeeping files** (`.DS_Store`, and the
+metadata daemons' directories), which on a `--rw` mount would otherwise be
+sealed into the volume's history forever and re-published every time a
+window moves.
+
+Without `--finder` nothing changes: a pelfs mount stays invisible to the
+GUI, which is what scripts and CI depend on. `docs/finder.md` has the rest —
+the eject and `.DS_Store` reasoning, what is deliberately *not* filtered,
+and why the mount does not go through macOS's NetFS.
+
 ## Batch / JupyterLab usage (e.g. inside an HTCondor job)
 
 For a user working interactively inside a job sandbox, the intended pattern
@@ -249,8 +272,30 @@ volume's data keys — the same key must be supplied on every later mount;
 (where the overlay, caches, trust pin, and signing key live), `--poll`
 (read-only mounts follow the branch head live), `--no-seal`,
 `--volume-pubkey`, `--ignore-volume-lease` (proceed past a pelfs v0.1.0
-volume-wide lease — see *Caveats*), and the two maintenance switches
+volume-wide lease — see *Caveats*), `--finder` / `--volume-name` (macOS: a
+volume in the Finder sidebar), and the two maintenance switches
 `--no-auto-repack` / `--no-auto-gc`.
+
+## Credentials on macOS
+
+The Pelican client keeps its OAuth2 refresh tokens in an encrypted
+credential wallet, and remembers the password protecting it only for the
+life of one process — so on macOS every `pelfs` command asks again. pelfs
+takes the password from your **login Keychain** instead.
+
+Nothing to switch on. The first time you type the password at a terminal,
+pelfs offers to save it; after that it opens the wallet without asking. The
+item is called *pelfs (Pelican credential wallet)* in Keychain Access, and
+its Account is the path of the wallet it opens — **delete that item to
+revoke it**. If the password stops working (you changed it), pelfs says so,
+drops the stale value, and offers to store the new one.
+
+Set `$PELFS_NO_KEYCHAIN=1` to turn all of it off: no reads, no offers.
+`$PELFS_NO_BROWSER=1` is the matching switch for opening a browser during
+an interactive login. Neither reaches for Pelican's
+`$PELICAN_CLIENT_NOPASSWORD`, which stores the wallet *unencrypted*; the
+point here is the opposite trade — keep it encrypted, and let the OS hold
+the key.
 
 ## Messages
 

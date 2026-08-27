@@ -264,9 +264,28 @@ type genArgs struct {
 	noMemtable              bool
 	signingKeyPath, backend string
 	poll                    time.Duration
+	// finder makes the mount a Finder-visible macOS volume, and
+	// volumeName is what it should be called (cmd/pelfs/finder.go). Both
+	// are inert everywhere else: the default mount is deliberately
+	// invisible, because that is what every script, every gate and every
+	// Linux user has always got.
+	finder     bool
+	volumeName string
 	// background is set only by the `pelfs mount` daemon child, and it
 	// decides ONE thing: where the mount record goes. See registryRoot.
 	background bool
+}
+
+// registerFinderFlags puts --finder and --volume-name on a command that
+// mounts. Per command rather than in registerFlags, because they mean
+// nothing to `pelfs gc` or `pelfs tag` -- and not on `pelfs shell` at all,
+// which mounts on a temporary directory it deletes at exit: a volume in
+// the Finder sidebar whose name is pelfs-mnt-1234567 and which vanishes
+// when a subshell exits is not the thing this flag is for.
+func registerFinderFlags(fs *flag.FlagSet, a *genArgs) {
+	fs.BoolVar(&a.finder, "finder", false, "macOS only: mount a browsable volume that shows up in the Finder sidebar under "+
+		"a chosen name, refusing the Finder's own bookkeeping files; ejecting it in the Finder seals and ends the session")
+	fs.StringVar(&a.volumeName, "volume-name", "", "with --finder, the name the volume answers to (default: the last component of the prefix)")
 }
 
 // FOREGROUND, AND THE TRAILING -f APPTAINER ADDS.
@@ -319,6 +338,7 @@ func cmdMountGen(args []string) int {
 		fs.DurationVar(&a.poll, "poll", 0, "read-only: re-check the branch head this often and swap generations live (0 = pinned, the reproducible-batch default)")
 		fs.StringVar(&a.signingKeyPath, "signing-key", "", signingKeyUsage)
 		fs.Bool("foreground", false, "no-op: mount-gen always serves in the foreground. Accepted, before or after the mountpoint, because apptainer passes `-f` to a --fusemount driver")
+		registerFinderFlags(fs, &a)
 	})
 	if err != nil {
 		return exitErr(err)
@@ -335,8 +355,18 @@ func cmdMountGen(args []string) int {
 		if a.backend, err = passedFDBackend(o); err != nil {
 			return exitErr(err)
 		}
-	} else if a.backend, err = resolveBackend(o); err != nil {
-		return exitErr(err)
+	} else {
+		if a.finder {
+			finderBackend(o)
+		}
+		if a.backend, err = resolveBackend(o); err != nil {
+			return exitErr(err)
+		}
+	}
+	if a.finder {
+		if err := checkFinder(a.backend); err != nil {
+			return exitErr(err)
+		}
 	}
 	return runMountGen(o, pos[0], pos[1], command, a)
 }
@@ -519,6 +549,25 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	}
 	if err := os.MkdirAll(stateDir, 0700); err != nil {
 		return exitErr(err)
+	}
+
+	// Where a Finder volume goes, and what it is called, is decided before
+	// anything else happens: the mountpoint it resolves to is the one the
+	// session records, reports and mounts on. An empty mountpoint means
+	// "choose one", which only `pelfs mount --finder` passes.
+	var vol finderVolume
+	if a.finder {
+		var err error
+		if vol, err = finderMount(prefix, a.volumeName, mountpoint); err != nil {
+			return exitErr(err)
+		}
+		mountpoint = vol.MountPoint
+	} else if mountpoint == "" {
+		// Unreachable through either command -- `mount-gen` requires the
+		// path and `pelfs mount` defaults it -- and asserted rather than
+		// assumed, because an empty mountpoint reaches os.MkdirAll and
+		// mount_nfs as the current directory.
+		return exitErr(errors.New("no mountpoint: only a --finder mount may leave the choice to pelfs"))
 	}
 
 	g := &genSession{
@@ -784,10 +833,13 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		} else {
 			bfs = vfsbilly.NewReadOnly(g.gfs)
 		}
-		nfsSrv, err = nfsmount.Serve(bfs)
+		nfsSrv, err = nfsmount.Serve(bfs, nfsmount.ServeOptions{HideFinderFiles: a.finder})
 		if err == nil {
 			defer g.down.timed("server", func() { nfsSrv.Close() }) //nolint:errcheck
-			err = nfsSrv.Mount(mountpoint, "pelfs")
+			err = nfsSrv.Mount(mountpoint, nfsmount.MountOptions{
+				VolumeName: vol.Name,
+				Browsable:  a.finder,
+			})
 		}
 	case "fuse", "":
 		if rw {
@@ -829,6 +881,9 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	}
 	ui.Info("generation {generation} mounted {mode} on {mountpoint} (catalog-native)",
 		"generation", sb.Generation, "mode", mode, "mountpoint", mountpoint)
+	if a.finder {
+		reportFinderVolume(vol, rw)
+	}
 	if passedFD {
 		// Said out loud because both halves are surprising: the mount
 		// options this process asked for went nowhere (the parent's
@@ -937,7 +992,31 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 		sigs := make(chan os.Signal, 1)
 		signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
 		if nfsSrv != nil {
-			<-sigs
+			// THE EJECT PATH. A signal is not the only way a Finder volume
+			// ends: the volume has an eject button, and pressing it is how
+			// a Mac user says they are done. Eject detaches the mount and
+			// tells the server nothing — we are the server, and a client
+			// that has unmounted simply stops sending RPCs — so without a
+			// watch on the mount table this select would sit here forever
+			// with the session's unsealed overlay in it. The user would
+			// have every reason to think they had finished, and the next
+			// reboot or `kill` would strand the generation.
+			//
+			// Ejecting therefore means exactly what `pelfs umount` means:
+			// stop serving, seal, exit. The watch runs only for a
+			// browsable mount, because that is the only kind with an eject
+			// button; an outside `umount` of an ordinary mount still waits
+			// for its signal, as it always has.
+			var ejected <-chan struct{}
+			if a.finder {
+				ejected = nfsmount.WatchUnmount(sessionCtx, mountpoint)
+			}
+			select {
+			case <-sigs:
+			case <-ejected:
+				ui.Info("{mountpoint} is no longer mounted (ejected in the Finder, or unmounted from outside): "+
+					"sealing and exiting, the same as `pelfs umount`", "mountpoint", mountpoint)
+			}
 			g.beginTeardown()
 			if unmountErr = nfsmount.Unmount(mountpoint); unmountErr != nil {
 				ui.Error("unmount: {error}", "error", unmountErr)

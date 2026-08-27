@@ -395,7 +395,8 @@ that could lose or fabricate bytes are closed. And a volume can now be
 reached without FUSE at all: a page on `127.0.0.1` that says whether your
 data is in the federation and publishes it, a WebDAV endpoint for the
 clients people already have, a credential desk that connects Cyberduck with
-one double-click, an apptainer `--fusemount` driver so a job mounts its own
+one double-click, a Mac volume in the Finder sidebar with an eject button
+that seals, an apptainer `--fusemount` driver so a job mounts its own
 volume, and Windows binaries.
 
 The on-disk format is still `FormatVersion 2`, no volume needs converting,
@@ -865,6 +866,52 @@ are untouched — the removal only succeeds on an empty one.
   a ten-minute TTL, is dismissible by hand, and carries no token of any
   kind.
 
+- **`pelfs mount --rw --finder <prefix>` — a pelfs volume in the Finder.**
+  On macOS the volume appears in the **Finder sidebar under Locations**,
+  named after the prefix (or `--volume-name "Survey Data"`), with an eject
+  button. `docs/finder.md` is the whole story; the four parts:
+
+  **Visible.** The mount drops `nobrowse`, the option that keeps a mount out
+  of the macOS GUI, and lands on `/Volumes/<name>` when that directory
+  exists and is yours, else on `~/Volumes/<name>`. `/Volumes` is mode 755
+  root:wheel, so pelfs cannot create a directory there; the fallback prints
+  the one-time `sudo mkdir` + `chown` that moves the volume in. macOS's own
+  NetFS route to `/Volumes` was investigated and turned down — with the
+  evidence, including the URL form that really does carry a port through to
+  `mount_nfs` — in `docs/finder.md`.
+
+  **Named.** `mount_nfs` has no `volname` option, so which of the two
+  candidate sources macOS uses for a volume's name — the mount point's last
+  component, or the exported path — cannot be established without mounting.
+  Both are set to the chosen name, so the answer is the same either way.
+
+  **Ejectable.** Ejecting in the Finder unmounts the volume and tells the
+  server nothing: pelfs IS the server, and a client that unmounts simply
+  stops sending RPCs. Such a session used to sit waiting for a signal that
+  would never come, holding an **unsealed overlay** while the user believed
+  they had finished. A `--finder` session now polls the mount table
+  (`getfsstat(2)` with `MNT_NOWAIT`: one syscall, no RPC) and treats its
+  mount's disappearance exactly as `pelfs umount` — stop serving, drain
+  checkpoints, seal, exit. A mount table that cannot be read is never
+  treated as an unmount.
+
+  **Not polluted.** The Finder writes a `.DS_Store` in every directory a
+  user opens, and on a `--rw` mount those writes are chunked, packed,
+  uploaded, sealed and published — then rewritten the next time a window
+  moves. A `--finder` mount answers as though those names did not exist
+  (`ENOENT` to a lookup, `EACCES` to a create), which is the same answer a
+  read-only network volume gives, and the reason browsing an SMB share you
+  cannot write to leaves nothing behind. `._name` sidecars and `.Trashes`
+  are deliberately **left alone**: refusing them would break a copy and a
+  Move to Trash respectively.
+
+  Nothing changes without the flag: the default mount is still invisible to
+  the GUI, which is what every script, every gate and every Linux user
+  relies on. The flag is macOS-and-`--backend nfs` only and says so during
+  argument handling rather than doing nothing quietly, and it is not offered
+  on `pelfs shell`, whose mountpoint is a temporary directory it deletes at
+  exit.
+
 - **Windows builds.** `CGO_ENABLED=0 GOOS=windows go build ./...` succeeds
   for `amd64` and `arm64`, a CI job holds it there (build, vet, and two test
   lanes), and release tags now carry both. This is groundwork for a Windows
@@ -896,7 +943,13 @@ are untouched — the removal only succeeds on an empty one.
   sends `SIGTERM` because the exit path seals the overlay into the next
   generation, and Windows offers a detached process only
   `TerminateProcess`, which would strand the session unsealed while telling
-  the user it had been published. `internal/rotate`'s `syncDir`, the `errno`
+  the user it had been published. The two refusals are functions of `goos`
+  rather than of `runtime.GOOS` at the point of use, so a test on any
+  platform asserts that the platforms pelfs mounts on are not refused and
+  the one it does not is. The mount-table reader the Finder volume's eject
+  watch uses has no Windows implementation either, and reports "cannot
+  answer" rather than an empty table — every caller reads an error as
+  "still mounted", so the conservative branch is the one taken. `internal/rotate`'s `syncDir`, the `errno`
   comparisons in `internal/nfsmount/diag.go`, and everything that unlinks a
   file another handle still holds open remain Unix-shaped, and are listed
   rather than fixed (`docs/TODO.md`, winport-agent).
@@ -1075,6 +1128,16 @@ are untouched — the removal only succeeds on an empty one.
 - **A foreground session no longer creates a `vol-<id>` directory in the
   user's home**, and the mount registry no longer accumulates empty ones —
   *Upgrading*, item 6.
+
+- **A clean unmount is no longer reported as a failed one.**
+  `nfsmount.Unmount` treats a path that is no longer a mount point as
+  success. Before, a session whose mount had already gone — a Finder eject,
+  or any `umount` from another terminal — spent three seconds failing six
+  commands (`umount`, then `umount -f`, then `diskutil unmount force`) and
+  reported the last one's message as the session's unmount error. The state
+  the caller asked about is re-checked after a failed attempt too, so a
+  forced unmount that detaches the filesystem and then complains is a
+  success as well.
 
 ### Not in this release
 

@@ -63,8 +63,17 @@ func init() {
 	nfs.SetLogger(&quietLogger{Logger: nfs.Log})
 }
 
+// ServeOptions is how one server differs from the default.
+type ServeOptions struct {
+	// HideFinderFiles makes the served filesystem refuse the Finder's
+	// bookkeeping files (finderfiles.go). It belongs to a mount the Finder
+	// can SEE, which is why it is not the default: an invisible volume is
+	// never asked for a .DS_Store, and a Linux client never asks either.
+	HideFinderFiles bool
+}
+
 // Serve starts an NFSv3 server for bfs on a random 127.0.0.1 port.
-func Serve(bfs billy.Filesystem) (*Server, error) {
+func Serve(bfs billy.Filesystem, opts ServeOptions) (*Server, error) {
 	// IPv4 explicitly: mount_nfs is pointed at 127.0.0.1, and a hostname
 	// like "localhost" can resolve to ::1 where nothing listens.
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")
@@ -74,7 +83,11 @@ func Serve(bfs billy.Filesystem) (*Server, error) {
 	// diagnose sits between go-nfs and the filesystem so that an error
 	// go-nfs will flatten to NFS3ERR_IO is reported before it is lost
 	// (diag.go).
-	handler := nfshelper.NewNullAuthHandler(diagnose(bfs))
+	var hide func(string) bool
+	if opts.HideFinderFiles {
+		hide = finderDropping
+	}
+	handler := nfshelper.NewNullAuthHandler(diagnose(bfs, hide))
 	cached := newHandles(handler, handleCacheSize)
 	s := &Server{
 		Port:     ln.Addr().(*net.TCPAddr).Port,
@@ -92,75 +105,154 @@ func (s *Server) Close() error {
 	return s.ln.Close()
 }
 
+// MountOptions is how one mount differs from the default. The zero value
+// is the mount pelfs has always made: hidden from the Finder, exported as
+// "/", which is what every scripted and CI use of this backend relies on.
+type MountOptions struct {
+	// VolumeName, when set, is exported as "/<VolumeName>" instead of "/".
+	//
+	// It is a LABEL and nothing else: the handler answers MOUNT for any
+	// directory path with the same filesystem (go-nfs's NullAuthHandler
+	// ignores the request's dirpath), so the export path is free for us to
+	// choose. It is worth choosing because it is one of the two places a
+	// name for this volume can come from — the other being the last
+	// component of the mount point — and which of the two macOS shows for
+	// an NFS volume is not something a mount option can settle: mount_nfs
+	// has no `volname` (its manual page lists every option it takes, and
+	// there is none), so the name is whatever the client synthesizes.
+	// Setting both makes the answer the same either way.
+	VolumeName string
+	// Browsable drops the nobrowse mount option, which is what keeps a
+	// mount out of the macOS GUI (mount(8): "the mount point should not be
+	// visible via the GUI"). A browsable volume appears in the Finder
+	// sidebar under Locations, with an eject button — which is the whole
+	// point, and also the reason a session that sets this must watch the
+	// mount table (mounttable.go): eject detaches the mount and tells the
+	// server nothing.
+	Browsable bool
+}
+
 // Mount attaches the served filesystem at mountPoint using the OS NFS
 // client. On macOS this works unprivileged; note the first access from an
 // app may trigger the one-time "access files on a network volume"
 // permission prompt (TCC).
-func (s *Server) Mount(mountPoint, volumeName string) error {
+func (s *Server) Mount(mountPoint string, opts MountOptions) error {
 	// Fail fast if the server already died (e.g. port grabbed).
 	select {
 	case err := <-s.serveErr:
 		return fmt.Errorf("nfs server exited: %v", err)
 	default:
 	}
-	opts := []string{
-		"nolocks", // no NLM; local single-client mount
-		"vers=3",
-		"tcp",
-		fmt.Sprintf("port=%d", s.Port),
-		fmt.Sprintf("mountport=%d", s.Port),
-		"noresvport", // unprivileged client source port
-		"soft",       // fail I/O rather than wedge if our server dies
-		"retrans=3",
-		"actimeo=1", // we are the only writer; keep attr caching short
-		"nobrowse",  // keep Finder from indexing the volume
+	if err := mountRefusal(runtime.GOOS); err != nil {
+		return err
 	}
-	// The client command differs by platform: macOS ships mount_nfs and
-	// accepts its own option spellings, Linux mounts through mount(8)
-	// with -t nfs. Keeping both here means Linux CI can exercise the NFS
-	// frontend even though its reason for existing is macOS without
-	// macFUSE.
-	// WINDOWS IS REFUSED HERE, not left to fail as an exec. The default
-	// below is macOS's mount_nfs and the only override is Linux's mount(8),
-	// so a Windows build used to fall through to `mount_nfs` and report
-	// `executable file not found in %PATH%` — an error about a program the
-	// user never asked for. Windows does have an NFS client (Client for
-	// NFS, `mount.exe`), but it is an optional feature, it speaks a
-	// different option vocabulary, and it has never been exercised against
-	// this server; claiming support by guessing at its flags would be
-	// worse than saying so.
-	if runtime.GOOS == "windows" {
-		return fmt.Errorf("the NFS backend cannot attach a mount on Windows: " +
-			"pelfs drives the platform's own NFS client, and the Windows one (Client for NFS) " +
-			"is an optional feature this code has never been tested against")
-	}
-	name, args := "mount_nfs", []string{"-o", strings.Join(opts, ","), "127.0.0.1:/", mountPoint}
-	if runtime.GOOS == "linux" {
-		linuxOpts := []string{
-			"nolock", "vers=3", "tcp",
-			fmt.Sprintf("port=%d", s.Port),
-			fmt.Sprintf("mountport=%d", s.Port),
-			"noresvport", "soft", "retrans=3", "actimeo=1",
-		}
-		name, args = "mount", []string{"-t", "nfs", "-o", strings.Join(linuxOpts, ","), "127.0.0.1:/", mountPoint}
-	}
+	name, args := mountCommand(runtime.GOOS, s.Port, mountPoint, opts)
 	out, err := exec.Command(name, args...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s: %v: %s", name, err, strings.TrimSpace(string(out)))
 	}
-	_ = volumeName // reserved: could set via -o with future macOS support
 	return nil
+}
+
+// mountCommand builds the client invocation. It is a pure function of the
+// platform, the port and the options so that the argument list -- the one
+// thing about this backend that cannot be exercised without mounting
+// something -- can be asserted on both platforms.
+//
+// The client command differs by platform: macOS ships mount_nfs and
+// accepts its own option spellings, Linux mounts through mount(8) with
+// -t nfs. Keeping both here means Linux CI can exercise the NFS frontend
+// even though its reason for existing is macOS without macFUSE.
+func mountCommand(goos string, port int, mountPoint string, opts MountOptions) (string, []string) {
+	export := "127.0.0.1:/" + opts.VolumeName
+	if goos == "linux" {
+		linuxOpts := []string{
+			"nolock", "vers=3", "tcp",
+			fmt.Sprintf("port=%d", port),
+			fmt.Sprintf("mountport=%d", port),
+			"noresvport", "soft", "retrans=3", "actimeo=1",
+		}
+		return "mount", []string{"-t", "nfs", "-o", strings.Join(linuxOpts, ","), export, mountPoint}
+	}
+	o := []string{
+		"nolocks", // no NLM; local single-client mount
+		"vers=3",
+		"tcp",
+		fmt.Sprintf("port=%d", port),
+		fmt.Sprintf("mountport=%d", port),
+		"noresvport", // unprivileged client source port
+		"soft",       // fail I/O rather than wedge if our server dies
+		"retrans=3",
+		"actimeo=1", // we are the only writer; keep attr caching short
+	}
+	if !opts.Browsable {
+		o = append(o, "nobrowse") // keep the volume out of the GUI
+	}
+	return "mount_nfs", []string{"-o", strings.Join(o, ","), export, mountPoint}
+}
+
+// mountRefusal is the reason this platform cannot attach a mount, or nil
+// where it can.
+//
+// WINDOWS IS REFUSED, not left to fail as an exec. mountCommand defaults
+// to macOS's mount_nfs and its only override is Linux's mount(8), so a
+// Windows build used to fall through to `mount_nfs` and report
+// `executable file not found in %PATH%` -- an error about a program the
+// user never asked for. Windows does have an NFS client (Client for NFS,
+// `mount.exe`), but it is an optional feature, it speaks a different
+// option vocabulary, and it has never been exercised against this server;
+// claiming support by guessing at its flags would be worse than saying so.
+//
+// A FUNCTION OF goos, for the same reason mountCommand is one: a refusal
+// that could only be observed by running on the platform it refuses is a
+// refusal nothing in this repository can check. Mount asks it about
+// runtime.GOOS; a test asks it about every platform.
+//
+// It is here rather than inside mountCommand because mountCommand answers
+// "what would the arguments be", and for Windows there is no honest answer
+// to give -- not even a refusal, since its return type has no room for one.
+func mountRefusal(goos string) error {
+	if goos != "windows" {
+		return nil
+	}
+	return errors.New("the NFS backend cannot attach a mount on Windows: " +
+		"pelfs drives the platform's own NFS client, and the Windows one (Client for NFS) " +
+		"is an optional feature this code has never been tested against")
+}
+
+// unmountRefusal is the same question for the detach side.
+//
+// Nothing was ever mounted (mountRefusal above), so there is nothing to
+// detach -- and the escalation in Unmount would have run `umount` and then
+// macOS's `diskutil`, because the only platform test in it is for Linux.
+func unmountRefusal(goos string) error {
+	if goos != "windows" {
+		return nil
+	}
+	return errors.New("the NFS backend cannot unmount on Windows: nothing it could have mounted exists")
 }
 
 // Unmount detaches the filesystem, escalating to forced unmount after a few
 // polite attempts.
+//
+// A path that is no longer a mount point is success, not failure. Two
+// ordinary paths reach here that way: a Finder eject (or any outside
+// `umount`) has already detached the mount and the session is only now
+// running down, and the escalation below succeeded on an attempt whose
+// exit status the shell reported as an error. Without this, the first case
+// spends three seconds failing six commands and then reports the last
+// one's message as the session's unmount error -- which is how a clean
+// teardown came to be recorded as a failed one.
 func Unmount(mountPoint string) error {
-	// Nothing was ever mounted (Mount refuses on Windows), so there is
-	// nothing to detach — and the escalation below would have run `umount`
-	// and then macOS's `diskutil`, because the only platform test in it is
-	// for Linux.
-	if runtime.GOOS == "windows" {
-		return errors.New("the NFS backend cannot unmount on Windows: nothing it could have mounted exists")
+	// Refused BEFORE the mount-table question below, which on Windows has
+	// no answer to give: Entries reports that it cannot READ a mount table,
+	// which is an error and not a "no", so the "already gone" shortcut
+	// would not fire and the escalation would run.
+	if err := unmountRefusal(runtime.GOOS); err != nil {
+		return err
+	}
+	if mounted, err := Mounted(mountPoint); err == nil && !mounted {
+		return nil
 	}
 	var lastErr error
 	for attempt := 0; attempt < 6; attempt++ {
@@ -178,6 +270,13 @@ func Unmount(mountPoint string) error {
 				return nil
 			}
 			lastErr = fmt.Errorf("%s: %v: %s", strings.Join(c, " "), err, strings.TrimSpace(string(out)))
+		}
+		// The command failed but the mount may still be gone: a forced
+		// unmount that detached the filesystem and then complained, or an
+		// eject that landed between attempts. What the caller asked for is
+		// the state, not the exit status.
+		if mounted, err := Mounted(mountPoint); err == nil && !mounted {
+			return nil
 		}
 		time.Sleep(500 * time.Millisecond)
 	}

@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	crand "crypto/rand"
+	"crypto/rsa"
 	"errors"
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"math/rand/v2"
 	"slices"
 	"strings"
@@ -879,5 +882,395 @@ func TestTheSourceSignatureIsCheckedBeforeAnythingIsRead(t *testing.T) {
 	if f.Superblock.Generation != b.src.Superblock().Generation {
 		t.Fatalf("fetched generation %d, want %d", f.Superblock.Generation,
 			b.src.Superblock().Generation)
+	}
+}
+
+// TestAnImportIntoAnUnsignedVolumeStaysUnsigned is the interaction with
+// the mode a volume is authenticated in, which `pelfs rotate` is the only
+// command allowed to change.
+//
+// An import publishes a SUCCESSOR generation, so it must sign the way the
+// head signs — and on an unsigned volume that means not signing, and in
+// particular not MINTING a key. A mint here would sign the next
+// generation of a volume every reader has pinned as unsigned, which stops
+// verifying for all of them at once. The verb re-loads the key against
+// the head it actually publishes on for exactly this reason; this pins
+// that the machinery underneath it carries a nil key through.
+func TestAnImportIntoAnUnsignedVolumeStaysUnsigned(t *testing.T) {
+	b := newBedWith(t, testvol.Options{}, testvol.Options{Unsigned: true})
+	populate(t, b.src)
+	b.src.Publish(publish.Options{})
+	if !b.dst.Superblock().IsUnsigned() {
+		t.Fatal("the fixture did not make an unsigned volume")
+	}
+	if _, err := b.runImport(importOptions{Path: "/imported"}); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	// Read the head back the way a reader who consented to unsigned does.
+	rs, err := refs.NewWithPolicy(b.dstObj, t.TempDir(), refs.Policy{AllowUnsigned: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, err := rs.Fetch(context.Background(), "main")
+	if err != nil {
+		t.Fatalf("fetch the unsigned head: %v", err)
+	}
+	if !head.Superblock.IsUnsigned() {
+		t.Fatalf("the import signed generation %d of a volume that was unsigned, with key %x",
+			head.Superblock.Generation, head.Superblock.SigningPub[:8])
+	}
+	fs := coldOpen(t, b.dstObj, head.Superblock)
+	srcFS := coldOpen(t, b.srcObj, b.src.Superblock())
+	root := lookupPath(t, fs, "/imported")
+	want := tree(t, srcFS, genfs.RootInode, "")
+	got := tree(t, fs, root.Inode, "")
+	for p, line := range want {
+		if got[p] != line {
+			t.Errorf("%s differs on an unsigned destination", p)
+		}
+	}
+	t.Logf("EVIDENCE: generation %d is still unsigned (SigningPub and Signature both zero) and "+
+		"serves all %d imported paths", head.Superblock.Generation, len(want))
+}
+
+// TestTheRenumberingIsABijectionOverARealVolume is the proof asked for
+// over a REAL published volume rather than a table of numbers: build a
+// tree of a few hundred inodes with hardlinks in it, import it, and
+// compare the two namespaces path by path.
+//
+// Three properties, and each of them is a thing that would be silent if
+// it were false:
+//
+//   - INJECTIVE. Two source inodes landing on one destination inode makes
+//     two unrelated files into hardlinks of each other, in a generation
+//     that mounts and reads. The check is a count: as many distinct
+//     destination inodes as distinct source inodes.
+//   - SURJECTIVE ONTO THE PATHS. Every path in the source is a path here,
+//     and paths that shared an inode there share one here — which is
+//     what makes the inode shards come out right.
+//   - INSIDE THE SIGNED 64-BIT CEILING. The published catalogs are SQLITE
+//     here, on purpose: the ceiling exists because SQLite's integers are
+//     signed and an inode above 2^63 round-trips as a negative number and
+//     fails to scan back. Reading the whole tree out of a SQLite catalog
+//     through a COLD cache is the real form of that proof; the arithmetic
+//     check beside it is the cheap one.
+func TestTheRenumberingIsABijectionOverARealVolume(t *testing.T) {
+	b := newBed(t)
+	// A tree with enough shape to be worth measuring: nested directories,
+	// files of both content shapes, symlinks, and hardlinks whose identity
+	// as ONE inode is the thing a renumbering can quietly break.
+	top := b.src.Mkdir(testvol.RootInode, "tree")
+	var linkTargets []uint64
+	for d := range 16 {
+		dir := b.src.Mkdir(top, fmt.Sprintf("d%02d", d))
+		sub := b.src.Mkdir(dir, "sub")
+		for f := range 16 {
+			name := fmt.Sprintf("f%02d.bin", f)
+			var ino uint64
+			if f%3 == 0 {
+				ino = b.src.WriteFile(sub, name, bigBody(byte(d*16+f), 1<<16))
+			} else {
+				ino = b.src.WriteFile(sub, name, []byte(fmt.Sprintf("small %d/%d", d, f)))
+			}
+			if f == 0 {
+				linkTargets = append(linkTargets, ino)
+			}
+		}
+		b.src.Symlink(dir, "link", "sub/f00.bin")
+	}
+	// One hardlink per directory, all pointing back into the first one's
+	// files, so the promoted set spans the tree rather than sitting in a
+	// corner of it.
+	for i, ino := range linkTargets {
+		b.src.Link(ino, top, fmt.Sprintf("hard%02d.bin", i))
+	}
+	b.src.Publish(publish.Options{})
+
+	res, err := b.runImport(importOptions{Path: "/imported", SQLiteCatalogs: true})
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+
+	srcFS := coldOpen(t, b.srcObj, b.src.Superblock())
+	head := headOf(t, b.dstObj, "main")
+	dstFS := coldOpen(t, b.dstObj, head.Superblock)
+	srcInos := inodesByPath(t, srcFS, genfs.RootInode)
+	root := lookupPath(t, dstFS, "/imported")
+	dstInos := inodesByPath(t, dstFS, root.Inode)
+
+	if len(srcInos) < 200 {
+		t.Fatalf("the fixture built %d paths; this test is not worth running under 200", len(srcInos))
+	}
+	if len(dstInos) != len(srcInos) {
+		t.Fatalf("the source has %d paths and the import has %d", len(srcInos), len(dstInos))
+	}
+
+	// The map, read off the two namespaces rather than asked of the code:
+	// a renumbering is only correct if this is what a reader observes.
+	observed := map[uint64]uint64{} // source inode -> destination inode
+	inverse := map[uint64]uint64{}  // destination inode -> source inode
+	var highest uint64
+	for _, p := range slices.Sorted(maps.Keys(srcInos)) {
+		src, dst := srcInos[p], dstInos[p]
+		if dst == 0 {
+			t.Fatalf("%s is not in the imported tree", p)
+		}
+		if prev, ok := observed[src]; ok && prev != dst {
+			t.Fatalf("source inode %d is %d at one path and %d at another (%s) — not a function",
+				src, prev, dst, p)
+		}
+		if prev, ok := inverse[dst]; ok && prev != src {
+			t.Fatalf("NOT INJECTIVE: source inodes %d and %d both became %d (at %s)",
+				prev, src, dst, p)
+		}
+		observed[src], inverse[dst] = dst, src
+		if dst > highest {
+			highest = dst
+		}
+		// The cheap half of the ceiling check. The expensive half is that
+		// every one of these numbers was written to and read back from a
+		// SQLite catalog to get here.
+		if int64(dst) < 0 {
+			t.Fatalf("%s is inode %d, which round-trips through int64 as %d", p, dst, int64(dst))
+		}
+		if !res.Map.Holds(dst) {
+			t.Fatalf("%s is inode %d, which the map does not claim", p, dst)
+		}
+		if back, err := res.Map.Unmap(dst); err != nil || back != src {
+			t.Fatalf("Unmap(%d) = %d, %v; want %d", dst, back, err, src)
+		}
+	}
+	if len(observed) != len(inverse) {
+		t.Fatalf("%d distinct source inodes mapped onto %d distinct destination inodes",
+			len(observed), len(inverse))
+	}
+	// Hardlinks: paths that shared an inode in the source share one here.
+	shared := 0
+	for _, p := range slices.Sorted(maps.Keys(srcInos)) {
+		for _, q := range slices.Sorted(maps.Keys(srcInos)) {
+			if p < q && srcInos[p] == srcInos[q] {
+				shared++
+				if dstInos[p] != dstInos[q] {
+					t.Fatalf("%s and %s are one inode in the source and %d/%d here",
+						p, q, dstInos[p], dstInos[q])
+				}
+			}
+		}
+	}
+	if shared == 0 {
+		t.Fatal("the fixture produced no hardlinked pair, so this proves nothing about them")
+	}
+	t.Logf("EVIDENCE over a real published volume: %d paths, %d distinct source inodes onto "+
+		"%d distinct destination inodes (a bijection), %d hardlinked path pairs still sharing "+
+		"one inode, every number read back out of SQLite catalogs through a cold cache. The "+
+		"highest inode produced is %d, which is %.4f%% of the signed 64-bit ceiling",
+		len(srcInos), len(observed), len(inverse), shared, highest,
+		100*float64(highest)/float64(math.MaxInt64))
+}
+
+// ---- encryption, the case that is ALLOWED ----
+
+// encryptedPair builds two volumes encrypted under ONE data key and ONE
+// identity key but with DIFFERENT key IDs, which is the shape "same
+// custody" actually takes: a key id is an index into one volume's own
+// table, so the same key is id 1 on one and id 5 on another.
+func encryptedPair(t testing.TB) (kek *rsa.PrivateKey, dek, idKey []byte, srcTable, dstTable []superblock.KeyEntry) {
+	t.Helper()
+	kek, err := rsa.GenerateKey(crand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dek, idKey = make([]byte, 32), make([]byte, 32)
+	if _, err := crand.Read(dek); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := crand.Read(idKey); err != nil {
+		t.Fatal(err)
+	}
+	wrap := func(k []byte) []byte {
+		w, err := superblock.WrapKey(&kek.PublicKey, k)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return w
+	}
+	// RSA-OAEP is randomized, so each of these four wraps produces
+	// different bytes for the same key — which is precisely why custody
+	// cannot be decided by comparing wrapped bytes and needs the KEK.
+	srcTable = []superblock.KeyEntry{
+		{ID: 1, Kind: superblock.KeyKindDEK, Alg: superblock.KeyAlgRSAOAEPSHA256, Wrapped: wrap(dek)},
+		{ID: 2, Kind: superblock.KeyKindIdentity, Alg: superblock.KeyAlgRSAOAEPSHA256, Wrapped: wrap(idKey)},
+	}
+	dstTable = []superblock.KeyEntry{
+		{ID: 5, Kind: superblock.KeyKindDEK, Alg: superblock.KeyAlgRSAOAEPSHA256, Wrapped: wrap(dek)},
+		{ID: 6, Kind: superblock.KeyKindIdentity, Alg: superblock.KeyAlgRSAOAEPSHA256, Wrapped: wrap(idKey)},
+	}
+	return kek, dek, idKey, srcTable, dstTable
+}
+
+// TestImportingWithinOneEncryptionDomainCopiesStoredAndTranslatesKeyIDs is
+// the encrypted case an import is ALLOWED to do, end to end.
+//
+// The bytes are ciphertext and are carried across untouched — no data key
+// is used to move them, which is the property that makes a stored copy
+// safe at all. What DOES change is the key ID on every chunkref, because
+// an id indexes one volume's own key table and the same key is a
+// different number on each side. Getting that wrong would be silent:
+// merge's sameRef deliberately ignores CLen, Alg and KeyID, so anything
+// that compared refs across the boundary would call a plaintext ref and
+// an encrypted ref equal.
+func TestImportingWithinOneEncryptionDomainCopiesStoredAndTranslatesKeyIDs(t *testing.T) {
+	kek, dek, idKey, srcTable, dstTable := encryptedPair(t)
+	// The SAME data key and identity key on both sides, under DIFFERENT
+	// key ids, which is what "same custody" looks like in practice.
+	b := newBedWith(t,
+		testvol.Options{DEK: dek, IdentityKey: idKey, KeyID: 1, KeyTable: srcTable},
+		testvol.Options{DEK: dek, IdentityKey: idKey, KeyID: 5, KeyTable: dstTable})
+	populate(t, b.src)
+	b.src.Publish(publish.Options{})
+	if !isEncryptedSB(b.src.Superblock()) || !isEncryptedSB(b.dst.Superblock()) {
+		t.Fatal("the fixture did not produce two encrypted volumes")
+	}
+
+	custody, err := importvol.CheckCustody(b.src.Superblock(), b.dst.Superblock(), kek)
+	if err != nil {
+		t.Fatalf("two volumes under one key were refused: %v", err)
+	}
+	if !custody.Encrypted {
+		t.Fatal("custody does not report the volumes as encrypted")
+	}
+	if got, err := custody.Translate(1); err != nil || got != 5 {
+		t.Fatalf("Translate(1) = %d, %v; want the destination's id for the same DEK (5)", got, err)
+	}
+	if got, err := custody.Translate(2); err != nil || got != 6 {
+		t.Fatalf("Translate(2) = %d, %v; want 6", got, err)
+	}
+	if _, err := custody.Translate(9); err == nil {
+		t.Fatal("a chunkref naming a key id the source's table does not have was accepted")
+	}
+
+	res, err := b.runImport(importOptions{Path: "/imported", KEK: kek})
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if res.Copy.Copied == 0 {
+		t.Fatal("the copy carried nothing")
+	}
+
+	// The tree reads back through a COLD cache, with the data key, on
+	// both sides — which is the whole claim: the ciphertext moved and
+	// still decrypts.
+	srcFS := coldOpenWithDEK(t, b.srcObj, b.src.Superblock(), dek)
+	head := headOf(t, b.dstObj, "main")
+	dstFS := coldOpenWithDEK(t, b.dstObj, head.Superblock, dek)
+	want := tree(t, srcFS, genfs.RootInode, "")
+	root := lookupPath(t, dstFS, "/imported")
+	got := tree(t, dstFS, root.Inode, "")
+	if len(want) == 0 {
+		t.Fatal("the encrypted source tree is empty")
+	}
+	for _, p := range slices.Sorted(maps.Keys(want)) {
+		if got[p] != want[p] {
+			t.Errorf("%s:\n  source   %s\n  imported %s", p, want[p], got[p])
+		}
+	}
+
+	// And every imported chunkref now names THIS volume's key id, not the
+	// source's.
+	big := lookupPath(t, dstFS, "/imported/dir/sub/big.bin")
+	c, err := dstFS.ContentOf(context.Background(), big.Inode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Refs) == 0 {
+		t.Fatal("the imported 3 MiB file has no chunk records")
+	}
+	for i, ref := range c.Refs {
+		if ref.KeyID != 5 {
+			t.Errorf("imported chunk %d names key id %d, want this volume's 5", i, ref.KeyID)
+		}
+	}
+	t.Logf("EVIDENCE: %d paths identical through a cold decrypting read of each side, %d entries "+
+		"carried as ciphertext without a data key being used to move them, and every imported "+
+		"chunkref rewritten from the source's key id 1 to this volume's 5",
+		len(want), res.Copy.Copied)
+}
+
+// isEncryptedSB mirrors importvol's own test, from outside the package.
+func isEncryptedSB(sb *superblock.Superblock) bool {
+	for _, k := range sb.KeyTable {
+		if k.Kind == superblock.KeyKindDEK {
+			return true
+		}
+	}
+	return false
+}
+
+// TestTwoVolumesUnderDIFFERENTDataKeysAreRefusedWithTheRepackItWouldTake
+// is the encrypted case an import is NOT allowed to do, with real keys
+// rather than a stand-in — the wrapped bytes differ every time a key is
+// wrapped, so only actually unwrapping them can tell these two situations
+// apart, and the refusal has to rest on that rather than on a comparison
+// that would have been wrong either way.
+func TestTwoVolumesUnderDIFFERENTDataKeysAreRefusedWithTheRepackItWouldTake(t *testing.T) {
+	kek, dek, idKey, srcTable, _ := encryptedPair(t)
+	// A second data key, wrapped under the SAME user KEK: the operator
+	// holds both volumes, and they are still not one custody domain.
+	otherDEK := make([]byte, 32)
+	if _, err := crand.Read(otherDEK); err != nil {
+		t.Fatal(err)
+	}
+	wrap := func(k []byte) []byte {
+		w, err := superblock.WrapKey(&kek.PublicKey, k)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return w
+	}
+	src := &superblock.Superblock{CatalogKeyID: 1, KeyTable: srcTable}
+	dst := &superblock.Superblock{CatalogKeyID: 5, KeyTable: []superblock.KeyEntry{
+		{ID: 5, Kind: superblock.KeyKindDEK, Alg: superblock.KeyAlgRSAOAEPSHA256, Wrapped: wrap(otherDEK)},
+		{ID: 6, Kind: superblock.KeyKindIdentity, Alg: superblock.KeyAlgRSAOAEPSHA256, Wrapped: wrap(idKey)},
+	}}
+	_, err := importvol.CheckCustody(src, dst, kek)
+	if !errors.Is(err, importvol.ErrForeignCustody) {
+		t.Fatalf("got %v, want %v", err, importvol.ErrForeignCustody)
+	}
+	if !strings.Contains(err.Error(), "data-encryption keys") {
+		t.Fatalf("the refusal does not name which key differs: %v", err)
+	}
+	t.Logf("refused: %v", err)
+
+	// And the identity key alone is enough to refuse, even with one DEK:
+	// identity is keyed BLAKE3 over the plaintext, so an identity means a
+	// different thing under a different key and nothing here could
+	// recompute it.
+	otherID := make([]byte, 32)
+	if _, err := crand.Read(otherID); err != nil {
+		t.Fatal(err)
+	}
+	dst2 := &superblock.Superblock{CatalogKeyID: 5, KeyTable: []superblock.KeyEntry{
+		{ID: 5, Kind: superblock.KeyKindDEK, Alg: superblock.KeyAlgRSAOAEPSHA256, Wrapped: wrap(dek)},
+		{ID: 6, Kind: superblock.KeyKindIdentity, Alg: superblock.KeyAlgRSAOAEPSHA256, Wrapped: wrap(otherID)},
+	}}
+	_, err = importvol.CheckCustody(src, dst2, kek)
+	if !errors.Is(err, importvol.ErrForeignCustody) {
+		t.Fatalf("one DEK but two identity keys: got %v, want %v", err, importvol.ErrForeignCustody)
+	}
+	if !strings.Contains(err.Error(), "chunk-identity keys") {
+		t.Fatalf("the refusal does not name the identity key: %v", err)
+	}
+	t.Logf("refused: %v", err)
+
+	// A KEK that unwraps neither is its own refusal, and says so rather
+	// than reporting a key mismatch it never established.
+	stranger, err := rsa.GenerateKey(crand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := importvol.CheckCustody(src, dst, stranger); !errors.Is(err, importvol.ErrForeignCustody) {
+		t.Fatalf("a KEK that unwraps nothing: got %v", err)
+	} else {
+		t.Logf("refused: %v", err)
 	}
 }

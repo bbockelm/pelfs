@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/rsa"
 	"fmt"
 	"net/http/httptest"
 	"path/filepath"
@@ -32,9 +33,24 @@ type bed struct {
 	dstObj pelicanobj.Store
 	src    *testvol.Volume
 	dst    *testvol.Volume
+	// dstOpts is how the destination was built. testvol.Volume does not
+	// hand its options back and this package has no business teaching it
+	// to, so the fixture keeps its own copy — the encryption fields are
+	// what a publish onto that volume has to restate.
+	dstOpts testvol.Options
+	srcOpts testvol.Options
 }
 
 func newBed(t testing.TB) *bed {
+	return newBedWith(t, testvol.Options{}, testvol.Options{})
+}
+
+// newBedWith is newBed with either volume built to order — an unsigned
+// destination, say, or a pair encrypted under one key. Both volumes have
+// to be buildable here rather than replaceable afterwards: a testvol is
+// created by PUBLISHING generation 0 onto its prefix, so a second one on
+// the same prefix refuses.
+func newBedWith(t testing.TB, src, dst testvol.Options) *bed {
 	t.Helper()
 	root := t.TempDir()
 	srv := httptest.NewServer(fakeorigin.Handler(root))
@@ -47,12 +63,16 @@ func newBed(t testing.TB) *bed {
 		return s
 	}
 	b := &bed{t: t, root: root, srcObj: store("theirs"), dstObj: store("ours")}
-	b.src = testvol.New(t, b.srcObj, testvol.Options{
-		VolumeID: testvol.ParseUUID(t, "11111111-1111-1111-1111-111111111111"),
-	})
-	b.dst = testvol.New(t, b.dstObj, testvol.Options{
-		VolumeID: testvol.ParseUUID(t, "22222222-2222-2222-2222-222222222222"),
-	})
+	if src.VolumeID == ([16]byte{}) {
+		src.VolumeID = testvol.ParseUUID(t, "11111111-1111-1111-1111-111111111111")
+	}
+	b.src = testvol.New(t, b.srcObj, src)
+	b.srcOpts = src
+	if dst.VolumeID == ([16]byte{}) {
+		dst.VolumeID = testvol.ParseUUID(t, "22222222-2222-2222-2222-222222222222")
+	}
+	b.dst = testvol.New(t, b.dstObj, dst)
+	b.dstOpts = dst
 	return b
 }
 
@@ -60,9 +80,15 @@ func newBed(t testing.TB) *bed {
 // seen this volume does: a fresh cache directory, so nothing is answered
 // out of a cache the publish warmed.
 func coldOpen(t testing.TB, inner pelicanobj.Store, sb *superblock.Superblock) *genfs.FS {
+	return coldOpenWithDEK(t, inner, sb, nil)
+}
+
+// coldOpenWithDEK is coldOpen for an encrypted volume: same fresh cache
+// directory, plus the unwrapped data key a reader of one must hold.
+func coldOpenWithDEK(t testing.TB, inner pelicanobj.Store, sb *superblock.Superblock, dek []byte) *genfs.FS {
 	t.Helper()
 	fs, err := genfs.Open(context.Background(), genfs.Options{
-		Inner: inner, SB: sb, CacheDir: t.TempDir(),
+		Inner: inner, SB: sb, CacheDir: t.TempDir(), DEK: dek,
 	})
 	if err != nil {
 		t.Fatalf("genfs.Open: %v", err)
@@ -108,6 +134,16 @@ type importOptions struct {
 	// SkipPublish stops after the copy, for a test about what the copy
 	// alone leaves behind.
 	SkipPublish bool
+	// KEK is the user key-encryption key, needed only when either volume
+	// is encrypted: it is the only thing that can prove two wrapped keys
+	// are the same key.
+	KEK *rsa.PrivateKey
+	// SQLiteCatalogs publishes the generation as SQLite catalogs instead
+	// of the static format. It exists for the inode test: the signed
+	// 64-bit ceiling on inode numbers is a SQLITE constraint (its
+	// integers are signed), so a renumbering that claims to respect it
+	// should be made to round-trip through the storage that imposes it.
+	SQLiteCatalogs bool
 }
 
 type importResult struct {
@@ -137,10 +173,11 @@ func (b *bed) runImport(o importOptions) (*importResult, error) {
 	}
 
 	srcSB := b.src.Superblock()
-	srcFS := coldOpen(b.t, b.srcObj, srcSB)
+	srcFS := coldOpenWithDEK(b.t, b.srcObj, srcSB, b.srcOpts.DEK)
 	dstSB := b.dst.Superblock()
 
-	if _, err := importvol.CheckCustody(srcSB, dstSB, nil); err != nil {
+	custody, err := importvol.CheckCustody(srcSB, dstSB, o.KEK)
+	if err != nil {
 		return nil, err
 	}
 	scan, err := importvol.Walk(ctx, importvol.ScanOptions{
@@ -158,7 +195,7 @@ func (b *bed) runImport(o importOptions) (*importResult, error) {
 	}
 	res := &importResult{Scan: scan, Map: m}
 
-	base := coldOpen(b.t, b.dstObj, dstSB)
+	base := coldOpenWithDEK(b.t, b.dstObj, dstSB, b.dstOpts.DEK)
 	if _, err := publish.ImportPreflight(ctx, publish.ImportSpliceOptions{
 		Base: base, Prev: dstSB, Mount: o.Path, Replace: o.Replace,
 	}); err != nil {
@@ -191,7 +228,7 @@ func (b *bed) runImport(o importOptions) (*importResult, error) {
 	splice, err := publish.NewImportSpliceSource(ctx, publish.ImportSpliceOptions{
 		Base: base, Prev: dstSB, Src: srcFS, Map: m, SourceMark: srcSB.NextInode,
 		Mount: o.Path, Replace: o.Replace,
-		Packs: cp.Packs, Entries: cp.Entries,
+		Packs: cp.Packs, Entries: cp.Entries, TranslateKeyID: custody.Translate,
 	})
 	if err != nil {
 		return nil, err
@@ -207,7 +244,12 @@ func (b *bed) runImport(o importOptions) (*importResult, error) {
 	pub, err := publish.Publish(ctx, publish.Options{
 		Source: splice, Inner: dstObj, SpoolDir: spool, Branch: o.Branch,
 		SigningKey: b.dst.SigningKey(), Prev: dstSB, PrevRaw: b.dst.Raw(),
-		Imports: append(append([]superblock.ImportEntry(nil), dstSB.Imports...), entry),
+		SQLiteCatalogs: o.SQLiteCatalogs,
+		DEK:            b.dstOpts.DEK,
+		IdentityKey:    b.dstOpts.IdentityKey,
+		KeyID:          b.dstOpts.KeyID,
+		KeyTable:       b.dstOpts.KeyTable,
+		Imports:        append(append([]superblock.ImportEntry(nil), dstSB.Imports...), entry),
 	})
 	if err != nil {
 		return nil, err

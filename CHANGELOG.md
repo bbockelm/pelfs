@@ -17,16 +17,29 @@ at all.
 
 The bytes are copied **stored** — already compressed, already encrypted —
 which is repack's own property and means an import needs no data key and
-cannot change what a chunk resolves to. It refuses rather than guesses at the
-three boundaries where it could be wrong: a source that serves grafts (those
-bytes were never in a pack), a source in a different encryption domain (which
-would be a real repack, and the message says so), and any chunk identity the
-source's own packs turn out not to hold (a signed generation with a dangling
-chunkref is worse than a failed import). The collision matrix at the
+cannot change what a chunk resolves to. Two encrypted volumes under **one**
+data key and **one** identity key are therefore one custody domain and copy
+across untouched, with the per-chunkref key ids translated on the way (an id
+indexes one volume's own key table, so the same key is a different number on
+each side). Every other combination is refused with what it would take:
+different data keys, different identity keys, and plaintext-to-encrypted in
+either direction all mean decrypting and re-chunking every byte, which is a
+real repack. It refuses rather than guesses at the other two boundaries too: a
+source that serves grafts (those bytes were never in a pack), and any chunk
+identity the source's own packs turn out not to hold (a signed generation with
+a dangling chunkref is worse than a failed import). The collision matrix at the
 destination path is `pelfs graft`'s: an empty directory is adopted, a
 populated one or a file needs `--replace` and is announced with a count, a
 non-directory on the way is named, and the volume root is refused with what to
 do instead.
+
+It also leaves the mode a volume is authenticated in alone, which only
+`pelfs rotate` may change: an import onto an unsigned volume re-loads the key
+against the head it actually publishes on, so it publishes unsigned rather
+than minting a key every reader would then reject; and an **unsigned source**
+is refused without `--allow-unsigned` — the same consent a mount of it needs —
+because nothing attests such a tree is what its owner published, and our
+signature vouches for it the moment it lands.
 
 **Interruption-safe, and resumable.** Nothing an import writes is referenced
 until the ref flips, so a killed run leaves the branch exactly where it was

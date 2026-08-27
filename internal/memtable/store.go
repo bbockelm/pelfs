@@ -17,8 +17,9 @@ import (
 )
 
 // DefaultTableSize is the ring's capacity, and it must be LARGER than the
-// promotion distance or aging can never fire: Promotable is
-// used - distance, and used cannot exceed the ring. Setting the two equal
+// promotion distance or aging can never fire: what is promotable is
+// whatever sits behind head-distance, and the ring cannot hold more than
+// its own size. Setting the two equal
 // meant nothing was ever packed by age, so the only path that packed was
 // the one where a writer had already blocked on a full ring — a mount
 // that stops dead for the length of an upload, repeatedly. The gap
@@ -570,17 +571,25 @@ func (s *Store) Write(ctx context.Context, ino uint64, off int64, p []byte) erro
 	// it is what the runway between the distance and the ring's size buys
 	// — packing starts while the writer still has room.
 	//
-	// A run starts only once a PACK'S WORTH has aged, never the moment
-	// anything has. Promotable is used-distance, so a run leaves the
-	// residue at zero and the very next write makes it exactly that
+	// A run starts only once a PACK'S WORTH is waiting, never the moment
+	// anything is. A run takes everything aged and unclaimed, so it leaves
+	// that quantity at zero and the very next write makes it exactly that
 	// write's size: triggering on "anything" cut ONE BATCH PER WRITE.
 	// A kernel untar against a real federation turned into 5,105
 	// concurrent flushes of 3-6 KiB each, every one a 7-second round
 	// trip, and a seal that should have moved 1.7 GB moved 25 MB in two
 	// minutes. Federation cost is per OBJECT before it is per byte, so a
 	// batch has to be worth an object.
-	if s.promotion > 0 && !s.packing && int64(s.ring.Promotable(s.promotion)) >= s.promoteAt {
-		s.startPackLocked(ctx, s.promotion)
+	//
+	// UNCLAIMED is the load-bearing word, and promotableLocked is where it
+	// is defined. Asking the RING instead — head-tail-distance — counts
+	// the region of a batch that is already packed and is waiting only for
+	// its Located record, which never returns the quantity to zero and
+	// brings the whole pathology back through the ring's own accounting.
+	if s.promotion > 0 && !s.packing {
+		if from, to := s.promotableLocked(s.promotion); int64(to-from) >= s.promoteAt {
+			s.startPackLocked(ctx, s.promotion)
+		}
 	}
 	return nil
 }
@@ -750,6 +759,63 @@ func (s *Store) applyLocked(d map[Handle]int) {
 	}
 }
 
+// promotableLocked reports the ring region the next pack run would
+// actually take, [from, to), and how big it is. from is the oldest record
+// no run has claimed yet; to is the age boundary, head-distance, or the
+// head itself when distance is zero.
+//
+// It is deliberately NOT Ring.Promotable, which is head-tail-distance —
+// the whole OCCUPANCY, including the region of a batch that has already
+// been packed and published and is sitting there only until its Located
+// record makes the reclaim safe. That wait became the normal case when the
+// ring started holding a batch until its location record was durable, and
+// a trigger written against occupancy never recovers from it: once one run
+// has published, head-tail-distance stays at or above a pack's worth
+// forever, so EVERY subsequent write sees "a pack's worth is promotable"
+// and starts a run — which then cuts the single extent that has aged since
+// the last one. That is one batch per write, the pathology
+// TestPromotionBatchesAPackAtATime exists to catch, reached by a different
+// door than the one it was written for; measured against a 5ms upload it
+// turned 4,096 writes into 773 pack runs instead of 18.
+//
+// Measuring the span the cut would actually take is what makes the trigger
+// and the cut agree, and it is the only reason the residue really does
+// return to zero after a run — the claim the promotion rule rests on.
+func (s *Store) promotableLocked(distance uint64) (from, to uint64) {
+	if s.ring == nil {
+		return 0, 0
+	}
+	to = s.ring.Head()
+	if distance > 0 {
+		if to < distance {
+			return 0, 0
+		}
+		to -= distance
+	}
+	from = s.oldestUnpackedLocked()
+	if from >= to {
+		return to, to
+	}
+	return from, to
+}
+
+// oldestUnpackedLocked is the absolute ring position of the oldest record
+// no pack run has taken yet. It is the head when there is nothing left,
+// which makes an empty index promote nothing rather than everything.
+//
+// The scan is over s.order, which is ring order, and it stops at the first
+// handle the index still knows: publish trims both together, so this is
+// one step in the ordinary case and only walks when a record left the
+// index by some other route.
+func (s *Store) oldestUnpackedLocked() uint64 {
+	for _, h := range s.order {
+		if rec, ok := s.index[h]; ok {
+			return uint64(rec.Off)
+		}
+	}
+	return s.ring.Head()
+}
+
 // cutLocked takes the records at the tail that are old enough to pack.
 // distance is how far behind the head an extent must fall; zero takes
 // everything, which is what a flush asks for.
@@ -758,10 +824,7 @@ func (s *Store) applyLocked(d map[Handle]int) {
 // in the ring until their locations are published, because until then the
 // ring is the only place they exist.
 func (s *Store) cutLocked(distance uint64) *batch {
-	_, to := s.ring.PromotableRange(distance)
-	if distance == 0 {
-		to = s.ring.Head()
-	}
+	_, to := s.promotableLocked(distance)
 	b := &batch{
 		seq:    s.nextSeq,
 		live:   make(map[Handle]int),

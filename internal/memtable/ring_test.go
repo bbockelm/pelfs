@@ -388,19 +388,18 @@ func TestRingPromotionIsASubtraction(t *testing.T) {
 		}
 	}
 
-	// Past it, exactly the excess is eligible, and it starts at the tail.
+	// Past it, exactly the excess is behind the age line.
 	appendN(t, r, 2, payload)
 	want := r.Used() - distance
 	if got := r.Promotable(distance); got != want {
 		t.Fatalf("promotable %d, want %d", got, want)
 	}
-	from, to := r.PromotableRange(distance)
-	if from != r.Tail() {
-		t.Fatalf("promotion starts at %d, not the tail %d", from, r.Tail())
-	}
-	if to-from != want {
-		t.Fatalf("promotion range covers %d bytes, want %d", to-from, want)
-	}
+	// This is a measure of what the ring HOLDS and not of what a run would
+	// take -- see Promotable's own comment, and the store's
+	// promotableLocked for the quantity a trigger needs. The ring cannot
+	// answer that one: it does not know which of its bytes a pack run has
+	// already claimed.
+	to := r.Tail() + want
 
 	// Reclaiming what was promoted drops the ring back under the distance.
 	if _, err := r.Reclaim(to); err != nil {

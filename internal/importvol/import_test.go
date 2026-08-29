@@ -588,6 +588,151 @@ func TestTheScanFindsEveryLineageInTheTreeIncludingOnesTheSuperblockNeverNames(t
 		scan.Chunks, scan.ChunkRefs, scan.Lineages)
 }
 
+// TestTheSuperblockUndercountsTheLineagesInTheTree is the fact that makes
+// `pelfs import` WALK the source's catalogs rather than read the source's
+// superblock — measured on a real volume rather than argued.
+//
+// The fixture is the ordinary shape of a volume with history: branch it,
+// publish, branch it again. That leaves three kinds of file in the head's
+// tree — one from before any fork (lineage 0), one from the middle branch
+// (lineage 1234), one from the head branch (lineage 5678) — and the
+// middle branch's file is still there, because inheriting the base tree
+// is what a fork IS.
+//
+// The invariant, exactly as asserted below: the lineages the TREE contains
+// are a STRICT SUPERSET of the lineages the superblock reveals. Superset,
+// because a superblock never names a lineage that is not in the tree;
+// STRICT, because it can and does miss one that is. `Fork.Lineage` names
+// what a generation allocates FROM, `Catalogs[].Inode` samples whichever
+// directories happen to root a catalog, and `Shards` cover only promoted
+// inodes. Nothing in the format records the set.
+//
+// This is why importvol.Scan.Lineages comes from a walk, and why
+// inodemap.Remap refuses an inode whose lineage its map does not declare.
+func TestTheSuperblockUndercountsTheLineagesInTheTree(t *testing.T) {
+	const middleLineage, headLineage uint32 = 1234, 5678
+
+	b := newBed(t)
+	v := b.src
+
+	// Before any fork: lineage 0, where every volume begins and where its
+	// root inode 1 lives on every volume there has ever been.
+	v.WriteFile(testvol.RootInode, "before-any-fork.txt", []byte("gen 0"))
+	gen0 := v.Publish(publish.Options{})
+
+	// Branch once, and allocate a file out of the middle branch's lineage.
+	mid, midRaw := forkInto(t, v, gen0.Superblock, gen0.Raw, middleLineage, "middle", "main",
+		func(v *testvol.Volume) {
+			v.WriteFile(testvol.RootInode, "from-the-middle-branch.txt", []byte("middle"))
+		})
+
+	// Branch again, FROM the middle branch. The head inherits that file
+	// and its inode, and starts allocating out of a third lineage. The
+	// middle branch could be deleted at this point and nothing about the
+	// head would change — which is precisely the trouble.
+	head, _ := forkInto(t, v, mid, midRaw, headLineage, "head", "middle",
+		func(v *testvol.Volume) {
+			v.WriteFile(testvol.RootInode, "from-the-head-branch.txt", []byte("head"))
+		})
+
+	// What the tree ACTUALLY contains, from the walk an import runs.
+	fs := coldOpen(t, b.srcObj, head)
+	scan, err := importvol.Walk(context.Background(), importvol.ScanOptions{
+		FS: fs, SB: head, SpoolDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("walk the source: %v", err)
+	}
+	defer scan.Wants.Close() //nolint:errcheck
+	inTree := map[uint32]bool{}
+	for _, l := range scan.Lineages {
+		inTree[l] = true
+	}
+
+	// What the superblock ALONE reveals: everything a shortcut that
+	// declined to walk could possibly read. TakenLineages is lineage 0,
+	// the lineage this generation allocates from, and every import's
+	// claim; the two fields it deliberately leaves out are added here as
+	// well, so that the gap this test measures cannot be blamed on having
+	// consulted too few of them.
+	revealed := head.TakenLineages()
+	for _, c := range head.Catalogs {
+		revealed[superblock.LineageOf(c.Inode)] = true
+	}
+	for _, s := range head.Shards {
+		revealed[superblock.LineageOf(s.FirstInode)] = true
+		revealed[superblock.LineageOf(s.LastInode)] = true
+	}
+
+	revealedList := slices.Sorted(maps.Keys(revealed))
+	// SUPERSET. A superblock that named a lineage the tree does not hold
+	// would be a different bug: `pelfs branch` and `inodemap.Draw` read
+	// these as taken, so a phantom entry costs a lineage forever, and the
+	// two sets being merely incomparable is not something the walk-versus-
+	// superblock argument below would still hold over.
+	for _, l := range revealedList {
+		if !inTree[l] {
+			t.Errorf("the superblock names lineage %d, which the tree does not contain: "+
+				"the two sets are incomparable rather than nested", l)
+		}
+	}
+
+	// STRICT. This is the whole point of the test.
+	var missing []uint32
+	for _, l := range slices.Sorted(maps.Keys(inTree)) {
+		if !revealed[l] {
+			missing = append(missing, l)
+		}
+	}
+
+	listing := &strings.Builder{}
+	byPath := inodesByPath(t, fs, genfs.RootInode)
+	fmt.Fprintf(listing, "\n  inode %-18d (lineage %d)  /", genfs.RootInode,
+		superblock.LineageOf(genfs.RootInode))
+	for _, p := range slices.Sorted(maps.Keys(byPath)) {
+		fmt.Fprintf(listing, "\n  inode %-18d (lineage %d)  %s",
+			byPath[p], superblock.LineageOf(byPath[p]), p)
+	}
+
+	if len(missing) == 0 {
+		t.Fatalf("THE GAP THIS TEST PINS HAS CLOSED.\n"+
+			"the tree actually contains lineages %v\n"+
+			"the superblock alone reveals        %v\n%s\n\n"+
+			"These sets are now EQUAL on a volume built to make them differ: branched into "+
+			"lineage %d, published, branched again into lineage %d, with the middle branch's "+
+			"file still in the head's tree.\n\n"+
+			"IF THE FORMAT NOW RECORDS THE COMPLETE LINEAGE SET, this is good news and it is "+
+			"worth acting on: `pelfs import` walks the source's catalogs (importvol.Walk) "+
+			"ONLY because it cannot get this set from the source superblock, and it could "+
+			"stop. Read the new field, delete the walk's lineage collection, and rewrite this "+
+			"test as the equality it has become.\n\n"+
+			"IF INSTEAD THIS FIXTURE DRIFTED — the middle branch's file is no longer in the "+
+			"head's tree, or forkInto stopped producing a real fork — then the gap is still "+
+			"out there and this test has merely stopped looking at it. Fix the fixture; do "+
+			"not delete the test, and do NOT let it stand as licence to trust the superblock. "+
+			"An import that trusted it while the gap exists would draw no destination lineage "+
+			"for the undeclared one, and every inode in that lineage would go through the "+
+			"renumbering untranslated — two unrelated files landing on one inode number, "+
+			"which IS a hardlink, in a signed generation that mounts and reads and that "+
+			"nothing downstream can tell from the truth. Silent aliasing is the one outcome "+
+			"inodemap.Remap's ErrUndeclaredLineage refusal exists to prevent.",
+			slices.Sorted(maps.Keys(inTree)), revealedList, listing, middleLineage, headLineage)
+	}
+	if !slices.Equal(missing, []uint32{middleLineage}) {
+		t.Fatalf("the tree holds %v that the superblock does not name; this fixture is built to "+
+			"hide exactly one lineage, %d, so anything else here means the fixture is no longer "+
+			"the shape its comment describes", missing, middleLineage)
+	}
+
+	t.Logf("EVIDENCE: the superblock does NOT name lineage %d\n"+
+		"the tree actually contains lineages %v\n"+
+		"the superblock alone reveals        %v\n%s\n\n"+
+		"So the map `pelfs import` renumbers with cannot be derived from the source's "+
+		"superblock, and importvol.Walk's O(catalog bytes) walk is not an optimization "+
+		"anyone forgot to make.",
+		middleLineage, slices.Sorted(maps.Keys(inTree)), revealedList, listing)
+}
+
 func TestContentDedupSurvivesAnImport(t *testing.T) {
 	b := newBed(t)
 	body := bigBody(0x77, 3<<20)

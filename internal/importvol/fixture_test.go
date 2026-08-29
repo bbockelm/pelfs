@@ -359,3 +359,39 @@ func newKey(t testing.TB) ed25519.PrivateKey {
 	}
 	return priv
 }
+
+// forkInto publishes a fork generation in the named lineage onto its own
+// branch, does one generation of work on it, and returns that branch's
+// head.
+//
+// It is the shape `pelfs branch` produces and the same dance
+// internal/merge's forkAt makes: a fork is a generation that records
+// where it was cut from (Fork.Base, Fork.BaseNextInode) and starts
+// allocating out of a lineage of its own, so that the two sides cannot
+// hand the same number to different files.
+func forkInto(t testing.TB, v *testvol.Volume, base *superblock.Superblock, baseRaw []byte,
+	lineage uint32, branch, from string, work func(*testvol.Volume)) (*superblock.Superblock, []byte) {
+
+	t.Helper()
+	fork := *base
+	fork.Generation = base.Generation + 1
+	fork.PrevHash = superblock.Hash(baseRaw)
+	fork.Fork = &superblock.Fork{
+		Base: superblock.Hash(baseRaw), BaseGeneration: base.Generation,
+		BaseNextInode: base.NextInode, From: from, Lineage: lineage,
+	}
+	fork.NextInode = superblock.FirstInode(lineage)
+	fork.Signature = [64]byte{}
+	if err := fork.Sign(v.SigningKey()); err != nil {
+		t.Fatalf("sign the fork generation in lineage %d: %v", lineage, err)
+	}
+	raw, err := fork.Encode()
+	if err != nil {
+		t.Fatalf("encode the fork generation in lineage %d: %v", lineage, err)
+	}
+	v.Adopt(&fork, raw)
+	v.SetBranch(branch)
+	work(v)
+	res := v.Publish(publish.Options{})
+	return res.Superblock, res.Raw
+}

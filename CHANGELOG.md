@@ -63,6 +63,19 @@ contiguity properties of the scheme rather than things to check; an inode in a
 lineage the map does not declare is refused, never folded into a default,
 because a quiet alias is unrecoverable where a loud refusal is not.
 
+**Why that map has to come from a walk, now measured rather than argued.** A
+superblock does not record the set of inode lineages its own tree contains:
+`Fork.Lineage` names what a generation allocates *from*, `Catalogs[].Inode`
+samples whichever directories happen to root a catalog, and `Shards` cover
+only promoted inodes. So an import that read the source's superblock instead
+of walking its catalogs would build a map missing a lineage the tree is
+actually using. `TestTheSuperblockUndercountsTheLineagesInTheTree` builds the
+ordinary shape of a volume with history — branch, publish, branch again — and
+measures the gap: the tree holds lineages `[0 1234 5678]` and the superblock
+reveals `[0 5678]`, with the middle branch's file still in the head's tree and
+no field naming its lineage. The walk is `O(catalog bytes)`, not
+`O(data bytes)`, and it stays.
+
 **This is most of the tool `docs/known-issues.md` KL-7 has been waiting for,
 and not all of it.** KL-7 is two branches cut before lineages existed, both
 allocating from lineage 0, which `pelfs merge` diagnoses and cannot fix

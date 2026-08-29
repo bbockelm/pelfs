@@ -6,6 +6,12 @@
 # definition of how that output is produced. `go generate ./internal/webui`
 # runs exactly this and nothing else.
 #
+# It also records WHICH SOURCES the output was built from, by content, in
+# internal/webui/bundle.inputs. That file is what lets `make build` notice a
+# bundle older than its sources and refuse to embed it in silence
+# (scripts/webui-stale.sh); it is committed with the bundle, and the CI
+# regenerate-and-diff gate covers it too.
+#
 # THIS IS THE ONLY THING IN THE REPOSITORY THAT NEEDS NODE. `go build ./...`,
 # `go vet ./...` and `go test ./...` need none of it, because the bundle is in
 # the tree; that property is the whole point of committing it, and
@@ -26,6 +32,7 @@ root="$(cd "$here/.." && pwd)"
 front="$root/webui/frontend"
 dist="$root/internal/webui/dist"
 notices="$root/internal/webui/third_party.txt"
+inputs="$root/internal/webui/bundle.inputs"
 
 # pnpm is reached through whatever the machine has: a real pnpm on PATH, or
 # corepack, which every Node >= 16.9 ships and which reads the exact version
@@ -78,4 +85,19 @@ if [[ "${1:-}" == "--twice" ]]; then
     rm -f "$first" "$second"
 fi
 
-echo "webui-build: wrote $dist and $notices"
+# LAST, and only after a build that succeeded: the manifest is a claim that
+# dist was produced from these exact bytes, so writing it earlier would let a
+# failed build leave a claim behind that nothing had checked.
+{
+    cat <<'HDR'
+# What internal/webui/dist and internal/webui/third_party.txt were built from,
+# by CONTENT. Written by scripts/webui-build.sh and checked by
+# scripts/webui-stale.sh, which `make build` runs so that a bundle older than
+# its sources cannot be embedded in silence. Timestamps cannot do this job: a
+# fresh clone writes webui/frontend AFTER internal/webui/dist, so every clean
+# checkout would look stale. scripts/webui-inputs.sh defines what an input is.
+HDR
+    "$root/scripts/webui-inputs.sh"
+} >"$inputs"
+
+echo "webui-build: wrote $dist, $notices and $inputs"

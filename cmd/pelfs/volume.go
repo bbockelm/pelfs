@@ -32,7 +32,15 @@ func keyPassphrase() []byte { return []byte(os.Getenv("PELFS_KEY_PASSPHRASE")) }
 // SUCCESSOR generation without the key that signed the predecessor would
 // produce a superblock every reader rejects, so that is refused here
 // rather than discovered by readers.
+// An UNSIGNED volume returns (nil, nil): there is no key, publishing takes
+// none, and — the part that matters — this function must not MINT one. A
+// mint here would sign the next seal of a volume every reader has pinned
+// as unsigned, which is a volume that stops verifying for everyone at the
+// first checkpoint. See superblock.SignAs.
 func loadOrCreateSigningKey(path string, prev *superblock.Superblock) (ed25519.PrivateKey, error) {
+	if prev != nil && prev.IsUnsigned() {
+		return nil, nil
+	}
 	// A ROTATION INTERRUPTED AFTER ITS LAST FLIP LANDS HERE, and this is
 	// the one place that can finish it. `pelfs rotate` publishes the
 	// generation signed by the successor and then promotes the successor to
@@ -168,13 +176,19 @@ func signingKeyFileIn(stateDir, override string) string {
 // cmdInit creates a brand-new volume: generation 0 with an empty root.
 func cmdInit(args []string) int {
 	var branch, signingKey, grace string
+	var unsigned bool
 	o, pos, err := parseArgs("init", args, 1, 1, func(fs *flag.FlagSet, o *cmdOpts) {
 		fs.StringVar(&branch, "branch", "main", "ref name to create")
 		fs.StringVar(&signingKey, "signing-key", "", signingKeyUsage)
 		fs.StringVar(&grace, "grace", "", graceUsage)
+		fs.BoolVar(&unsigned, "unsigned", false, unsignedUsage)
 	})
 	if err != nil {
 		return exitErr(err)
+	}
+	if unsigned && signingKey != "" {
+		return exitErr(errors.New("--unsigned and --signing-key contradict each other: an unsigned volume " +
+			"has no signing key at all"))
 	}
 	window, err := parseGrace(grace)
 	if err != nil {
@@ -183,7 +197,7 @@ func cmdInit(args []string) int {
 	if window > 0 {
 		gracePacingNotice(window, o.snapshotInterval)
 	}
-	if err := initVolumeAt(o, pos[0], branch, signingKey, window); err != nil {
+	if err := initVolumeAt(o, pos[0], branch, signingKey, window, unsigned); err != nil {
 		return exitErr(err)
 	}
 	fmt.Printf("  mount it:    pelfs shell %s\n", pos[0])
@@ -263,7 +277,7 @@ func gracePacingNotice(grace, interval time.Duration) {
 // grace is the volume's T_grace, zero meaning the format's default. It can
 // only be set HERE, because generation 0 is the only generation that
 // chooses it: every seal after this carries the recorded value forward.
-func initVolumeAt(o *cmdOpts, prefix, branch, signingKeyPath string, grace time.Duration) error {
+func initVolumeAt(o *cmdOpts, prefix, branch, signingKeyPath string, grace time.Duration, unsigned bool) error {
 	ctx := context.Background()
 	stateDir := o.stateDir
 	if stateDir == "" {
@@ -292,10 +306,12 @@ func initVolumeAt(o *cmdOpts, prefix, branch, signingKeyPath string, grace time.
 	// An explicit key here means "create this volume under an identity I
 	// already have", which is how a volume gets a key its owner keeps
 	// somewhere other than the state directory. Absent, one is minted at
-	// that path — the ordinary case.
-	signingKey, err := loadOrCreateSigningKey(signingKeyFileIn(stateDir, signingKeyPath), nil)
-	if err != nil {
-		return err
+	// that path — the ordinary case. --unsigned mints nothing at all.
+	var signingKey ed25519.PrivateKey
+	if !unsigned {
+		if signingKey, err = loadOrCreateSigningKey(signingKeyFileIn(stateDir, signingKeyPath), nil); err != nil {
+			return err
+		}
 	}
 	var volID [16]byte
 	if _, err := rand.Read(volID[:]); err != nil {
@@ -306,6 +322,7 @@ func initVolumeAt(o *cmdOpts, prefix, branch, signingKeyPath string, grace time.
 		SpoolDir:   stateDir,
 		Branch:     branch,
 		SigningKey: signingKey,
+		Unsigned:   unsigned,
 		VolumeID:   volID,
 		Grace:      grace,
 	}
@@ -321,6 +338,15 @@ func initVolumeAt(o *cmdOpts, prefix, branch, signingKeyPath string, grace time.
 	if _, err := publish.InitVolume(ctx, popts); err != nil {
 		return err
 	}
+	if unsigned {
+		// THIS MACHINE consented by typing --unsigned, so it records the
+		// consent and does not have to type --allow-unsigned at every verb
+		// afterwards. Every OTHER machine still does: the pin is local, and
+		// it is the only thing that makes an unsigned volume readable.
+		if err := rstore.AcceptUnsigned(); err != nil {
+			return err
+		}
+	}
 	// The window is worth reporting even when it is the default: it is
 	// recorded on generation 0 and every later seal carries it, so this is
 	// the one moment it is decided and the only place a user sees the
@@ -331,8 +357,21 @@ func initVolumeAt(o *cmdOpts, prefix, branch, signingKeyPath string, grace time.
 	}
 	ui.Info("created volume {volume} on {ref} (generation 0, grace window {grace})",
 		"volume", fmt.Sprintf("%x", volID), "ref", refs.RefDirKey+"/"+branch, "grace", window)
+	if unsigned {
+		ui.Warn("UNSIGNED volume: anyone who can write this prefix can replace it undetectably. " +
+			"Other machines need --allow-unsigned to read it")
+	}
 	return nil
 }
+
+// unsignedUsage is the one description of `pelfs init --unsigned`.
+//
+// It leads with what is GIVEN UP rather than with what is saved, because
+// the saving is obvious from the flag name and the cost is not.
+const unsignedUsage = "create a volume with NO signing key, so nothing it publishes is authenticated. " +
+	"For throwaway work on a prefix only you can write: anyone else who can write it can replace the " +
+	"volume undetectably, and readers must pass --allow-unsigned. `pelfs rotate --to-signed` gives one a " +
+	"key later, but signs whatever it finds"
 
 // signingKeyUsage is the one description of --signing-key, shared by
 // every command that has it.

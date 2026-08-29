@@ -318,28 +318,31 @@ func (r *Ring) Reclaim(to uint64) (uint64, error) {
 	return to, r.writeFileHeader()
 }
 
-// Promotable reports how many bytes at the tail are old enough to pack,
-// given the promotion distance. Age is distance behind the head, so this
-// is one subtraction — the property that let the design drop discrete
+// Promotable reports how much of what the ring HOLDS sits behind the age
+// line, given the promotion distance. Age is distance behind the head, so
+// this is one subtraction — the property that let the design drop discrete
 // levels in favour of a single coordinate.
 //
 // It returns 0 rather than a negative when the ring holds less than the
 // distance, which is the common case for a short session: nothing is old
 // enough, so nothing is packed, and the seal at exit handles the lot.
+//
+// IT IS NOT A PROMOTION TRIGGER, and reading it as one is a defect this
+// package has already shipped once. head-tail is OCCUPANCY: it still
+// counts the region of a batch that has been packed and published and is
+// waiting only for its Located record before the tail may pass it. A
+// trigger built on it therefore stays satisfied for as long as that record
+// is in flight, and the run it keeps starting has nothing left to cut but
+// the one extent that aged since the last one. What a trigger wants is the
+// span between the oldest UNPACKED record and the age line, which is the
+// store's promotableLocked and not something the ring can answer: the ring
+// does not know which of its bytes a run has already claimed.
 func (r *Ring) Promotable(distance uint64) uint64 {
 	used := r.Used()
 	if used <= distance {
 		return 0
 	}
 	return used - distance
-}
-
-// PromotableRange reports the absolute positions a packer should consume,
-// [from, to). Packing works from the TAIL because that is where the
-// oldest bytes are, and age is the whole promotion rule.
-func (r *Ring) PromotableRange(distance uint64) (from, to uint64) {
-	tail := r.tail.Load()
-	return tail, tail + r.Promotable(distance)
 }
 
 // Sync flushes the mapping. Durability is the caller's policy; the ring

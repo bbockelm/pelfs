@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"flag"
 	"fmt"
@@ -11,6 +12,27 @@ import (
 	"github.com/bbockelm/pelfs/internal/rescue"
 	"github.com/bbockelm/pelfs/internal/ui"
 )
+
+// rescuedUnsigned reports that what this rescue recovered carries no
+// signature — an unsigned volume's history, which must be restated
+// unsigned or the rescued head verifies for nobody.
+//
+// It reads the CHOSEN candidates only. An ambiguous branch has nothing
+// chosen and contributes nothing, which is right: that branch is refused
+// anyway, and a rescue with nothing to restore needs no key either way.
+func rescuedUnsigned(rep *rescue.Report) bool {
+	found := false
+	for _, p := range rep.Branches {
+		if p.Chosen == nil || p.Chosen.SB == nil {
+			continue
+		}
+		if !p.Chosen.SB.IsUnsigned() {
+			return false
+		}
+		found = true
+	}
+	return found
+}
 
 // cmdRescue rebuilds a volume's refs from its packs, for the day the refs
 // are gone or unreadable.
@@ -79,9 +101,17 @@ func cmdRescue(args []string) int {
 	// that the head is missing or wrong — that is the whole reason to be
 	// running this. So the check cannot help and would refuse the rescue on
 	// the strength of the very document being rescued.
-	key, err := loadOrCreateSigningKey(filepath.Join(stateDir, "v2-signing.key"), nil)
-	if err != nil {
-		return exitErr(err)
+	//
+	// An UNSIGNED volume is the exception, and it has to be, because the
+	// nil above would otherwise MINT a key and re-publish the volume's
+	// history signed — which every reader of that volume refuses, their pin
+	// saying "unsigned". The evidence is the recovered document itself, so
+	// it is read off the report rather than guessed.
+	var key ed25519.PrivateKey
+	if !rescuedUnsigned(rep) {
+		if key, err = loadOrCreateSigningKey(filepath.Join(stateDir, "v2-signing.key"), nil); err != nil {
+			return exitErr(err)
+		}
 	}
 	aopts := rescue.ApplyOptions{Options: opts, SigningKey: key, Now: time.Now().UnixNano()}
 
@@ -202,7 +232,7 @@ func printApplied(res *rescue.Applied, rep *rescue.Report) {
 	// and re-signed with the live key), and that is re-issuing history under
 	// a new name.
 	ui.Info("signed by {key} — a rescued head is re-signed, so this is the key readers must trust for it",
-		"key", res.SignedBy[:16]+"...")
+		"key", short(res.SignedBy))
 	// The rollback check is local state, so this advice can only be given
 	// and not acted on from here.
 	ui.Warn("a client that already accepted a HIGHER generation on this branch will refuse the rescued head " +

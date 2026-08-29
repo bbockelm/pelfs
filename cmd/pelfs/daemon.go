@@ -44,8 +44,14 @@ type mountInfo struct {
 	// exclusion is per-branch now: "there is a writable mount on this
 	// prefix" no longer answers "will MY writable mount be refused", and
 	// the branch does.
-	Branch   string    `json:"branch,omitempty"`
-	LeaseKey string    `json:"lease_key,omitempty"`
+	Branch   string `json:"branch,omitempty"`
+	LeaseKey string `json:"lease_key,omitempty"`
+	// Unsigned records that the generation this mount serves carries no
+	// signature. It is in the RECORD rather than asked of the live mount
+	// because `pelfs status` must answer it for a mount that has wedged,
+	// and because it cannot change under a mount: a publish never moves a
+	// volume between the two modes (superblock.SignAs).
+	Unsigned bool      `json:"unsigned,omitempty"`
 	Started  time.Time `json:"started"`
 }
 
@@ -371,6 +377,12 @@ func cmdStatus(args []string) int {
 		}
 		if e.info.Branch != "" {
 			mode += " on " + e.info.Branch
+		}
+		// Two words on the line a user already reads, rather than a line of
+		// its own: someone scanning `pelfs status` for their mount must not
+		// be able to miss that one of them has no integrity root.
+		if e.info.Unsigned {
+			mode += ", unsigned"
 		}
 		fmt.Printf("%s\n  mountpoint: %s (%s)\n  pid: %d (%s), up since %s\n",
 			e.info.Prefix, e.info.MountPoint, mode, e.info.PID, state,

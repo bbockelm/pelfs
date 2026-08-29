@@ -293,13 +293,17 @@ export function App() {
   // interaction -- but it is the last chance to catch the exact gesture this
   // whole design is about: a finished upload and a closed laptop. The wording
   // is not ours to choose; the trigger is.
-  const staged = state?.staged_files ?? 0;
+  //
+  // The trigger is the server's `unpublished` predicate and not the staged
+  // file count, for the reason durability.ts gives: a session whose only
+  // unpublished work is a rename has no staged files and plenty to lose.
+  const unpublished = state?.unpublished ?? false;
   useEffect(() => {
-    if (staged <= 0) return;
+    if (!unpublished) return;
     const warn = (e: BeforeUnloadEvent) => e.preventDefault();
     window.addEventListener("beforeunload", warn);
     return () => window.removeEventListener("beforeunload", warn);
-  }, [staged]);
+  }, [unpublished]);
 
   // A SWITCH HOLDS THE OVERLAY THE WAY A SEAL DOES, so it blocks writes the
   // same way and the interception below has to cover both. It is not called

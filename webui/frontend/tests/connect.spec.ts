@@ -1,4 +1,13 @@
-import { CONNECT, MODE, expect, openConnect, openPelfs, test } from "./pelfs";
+import {
+  CONNECT,
+  MODE,
+  expect,
+  openConnect,
+  openPelfs,
+  resetHooks,
+  test,
+  testHook,
+} from "./pelfs";
 
 /**
  * THE TWO SURFACES HAVE TWO ADDRESSES, AND EACH ONE CAN BE REACHED FROM THE
@@ -87,6 +96,58 @@ test.describe("the two addresses", () => {
     // beside its own words in the sentence, so the legend was a second copy of
     // the text and it is deleted on both surfaces rather than on one.
     await expect(page.getByTestId("durability-legend")).toHaveCount(0);
+  });
+
+  test("a namespace-only change stages BOTH surfaces, in the same words", async ({
+    page,
+    session,
+    playwright,
+  }) => {
+    // THE RENAME, ON BOTH PANELS. A rename writes no bytes and no inode row,
+    // only namespace edges, and both surfaces used to answer "is there
+    // anything to publish" by testing the byte-shaped counters -- so a user
+    // who had just renamed a file was told, on whichever page they were
+    // looking at, that everything was in the federation, over a button
+    // reading "Nothing to publish". Both now key off the server's
+    // `unpublished` predicate, which is the seal's own.
+    //
+    // Driven ACROSS THE WIRE, not across two source files: the string
+    // comparison lives in internal/webui/durability_test.go and cannot catch
+    // a panel that renders the right words from the wrong state.
+    const request = await playwright.request.newContext();
+    // Edges and nothing else -- no staged files, no staged bytes.
+    await testHook(request, session, { dirty_edges: 2 });
+
+    const texts: string[] = [];
+    for (const open of [openPelfs, openConnect]) {
+      await open(page, session);
+      const line = page.getByTestId("durability");
+      await expect(line).toHaveAttribute("data-durability", "staged");
+      await expect(line).toContainText("Changes on this machine only.");
+      // The staged sentence is byte-shaped, and a surface that merely started
+      // rendering it would report the size of the change as zero while
+      // claiming there is one.
+      await expect(line).not.toContainText("0 files");
+      await expect(line).not.toContainText("0 B");
+
+      const button = page.getByTestId("publish-button");
+      await expect(button).toHaveAttribute("data-publish-state", "ready");
+      await expect(button).toHaveText("Publish now");
+      await expect(button).toBeEnabled();
+
+      // The countdown is normalised away: it is a live second count, so two
+      // page loads legitimately differ there and nowhere else.
+      texts.push(
+        ((await line.textContent()) ?? "")
+          .replace(/\s+/g, " ")
+          .replace(/Next publish in [^.]*\./, "Next publish in <countdown>.")
+          .trim(),
+      );
+    }
+    expect(texts[0], "the two panels must not word one state two ways").toBe(texts[1]);
+
+    await resetHooks(request, session);
+    await request.dispose();
   });
 
   test("the lede names Cyberduck, links its download, and explains nothing", async ({

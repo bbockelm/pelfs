@@ -803,3 +803,101 @@ func VerifyChain(prevRaw []byte, cur *Superblock, trusted ed25519.PublicKey) err
 	}
 	return nil
 }
+
+// ====================== VOLUMES WITH NO SIGNATURE ======================
+//
+// A volume may be created deliberately UNSIGNED: generation 0 and every
+// generation after it carry no signature at all, so no signing key has to
+// exist, be minted, or be carried around. It is a development convenience
+// — a volume that lives for twenty minutes under a prefix only one person
+// can write — and it is the one shape of this format that gives up the
+// integrity root.
+//
+// THERE IS NO NEW FIELD, and that is the decision worth reading. An
+// unsigned generation is one whose SigningPub and Signature are both zero:
+// the marker IS the absence of the credential, so there is nothing to
+// forge. A boolean saying "I am unsigned" would be attacker-controlled on
+// exactly the documents where it mattered — an unsigned superblock is
+// unauthenticated by definition, so every byte in it is whatever the last
+// writer chose — and any code that keyed off the field instead of off "no
+// signature verifies" would be a bypass waiting to be written.
+//
+// It also costs no format change, which means an OLD binary meets an
+// unsigned volume the right way round: it has never heard of any of this,
+// calls Verify, and gets ErrBadSignature. A hard refusal at the trust
+// boundary is the correct answer for a reader that cannot express consent.
+//
+// WHAT MAKES IT SAFE IS ENTIRELY ON THE READER'S SIDE. Nothing here
+// accepts an unsigned document; IsUnsigned only lets a caller say WHY it
+// refused. The decision to serve a volume with no integrity root belongs
+// to the reader (internal/refs: an explicit opt-in on first contact, and a
+// pin recording the answer thereafter), never to the document.
+
+// IsUnsigned reports a generation that carries no signature: both the
+// signing key it names and the signature itself are zero.
+//
+// It is a REPORTING predicate and a refusal-message predicate. It is never
+// a reason to accept anything: Verify is what accepts, it is untouched by
+// this, and a zero signature verifies under no key. Read it as "this
+// document makes no claim about who wrote it", which is true whether the
+// writer meant it or an attacker stripped the signature — the two are the
+// same document, and both are refused the same way.
+func (sb *Superblock) IsUnsigned() bool {
+	return sb.SigningPub == [32]byte{} && sb.Signature == [64]byte{}
+}
+
+// ErrSigningChange reports a writer that would have changed HOW a volume
+// is authenticated: signing a successor of an unsigned generation, or
+// leaving a successor of a signed one unsigned.
+//
+// It is a sentinel because the refusal is a feature and not a bug report.
+// A publish, a repack, a merge and a rescue must never be able to move a
+// volume between the two modes — an accidental upgrade would mint a key no
+// reader has pinned, and an accidental downgrade would drop the integrity
+// root of a volume whose readers are relying on it. Exactly one command
+// changes the mode, and it is spelled `pelfs rotate`.
+var ErrSigningChange = errors.New("this would change how the volume is authenticated")
+
+// SignAs authenticates sb the way prev already is: signed under key, or
+// left unsigned when prev carries no signature. prev is the generation sb
+// succeeds, and it is nil only for generation 0.
+//
+// EVERY ORDINARY WRITER GOES THROUGH THIS. That is the invariant: how a
+// volume is authenticated is a property of the VOLUME, decided once at
+// creation and changed only by an explicit rotation, so a seal, a
+// checkpoint, a repack, a merge and a rescue all inherit it rather than
+// each deciding for themselves. Rotation calls Sign and Unsign directly,
+// which is why those stay exported.
+//
+// The inheritance is safe to infer because prev did not arrive from
+// nowhere: it came through the trust boundary (internal/refs), which
+// either verified its signature under the pinned key or accepted it under
+// an explicit unsigned pin. So "the parent was unsigned" is a fact the
+// reader has already consented to, not a claim being taken on faith here.
+func (sb *Superblock) SignAs(prev *Superblock, key ed25519.PrivateKey) error {
+	if prev == nil || !prev.IsUnsigned() {
+		return sb.Sign(key)
+	}
+	if len(key) != 0 {
+		return fmt.Errorf("%w: generation %d succeeds an unsigned generation, so signing it would give the "+
+			"volume an integrity root no reader has pinned (`pelfs rotate --to-signed` does that deliberately)",
+			ErrSigningChange, sb.Generation)
+	}
+	sb.Unsign()
+	return nil
+}
+
+// Unsign leaves sb carrying no signature: no signing key, no signature,
+// and no successor announcement.
+//
+// NextPub goes with them, and not as tidiness. An announcement is a signed
+// promise about the next generation's key, and it is worth exactly the
+// signature over it; on a document with no signature it is a sentence
+// anyone can write, and a reader that acted on one would follow a stranger
+// to a key of the stranger's choosing. An unsigned generation therefore
+// makes no promises at all, and Validate refuses one that tries.
+func (sb *Superblock) Unsign() {
+	sb.SigningPub = [32]byte{}
+	sb.Signature = [64]byte{}
+	sb.NextPub = nil
+}

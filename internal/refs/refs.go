@@ -12,6 +12,37 @@
 //     rotation advances the pin only through a verified lineage step
 //     (superblock.VerifyChain); any other key change is a loud error.
 //
+//     A volume may also be deliberately UNSIGNED (superblock.IsUnsigned),
+//     and this package is the one place that decides whether to serve one.
+//     Three rules, and they are the whole of the safety:
+//
+//     AN UNSIGNED VOLUME NEVER TOFUs. Trust-on-first-use bootstraps trust
+//     in a KEY; there is no key, so there is nothing to bootstrap, and
+//     accepting would mean nothing more than "whoever can write this
+//     prefix". First contact with an unsigned head is therefore a refusal
+//     unless the reader said Policy.AllowUnsigned — that flag IS the
+//     consent, and without it "I forgot to configure signing" can never
+//     become "anyone who can write this prefix owns my filesystem".
+//
+//     A PIN THAT CHANGES KIND IS ALWAYS A REFUSAL, both directions. Signed
+//     yesterday and unsigned today is either a deliberate downgrade or an
+//     attack, and NOTHING IN THE BYTES DISTINGUISHES THEM — an unsigned
+//     document is unauthenticated by definition, so a forgery and an honest
+//     downgrade are the same document. This package does not try: it
+//     refuses and names the pin file, and a human decides out of band,
+//     exactly as they would after a key compromise. The mirror case
+//     refuses for a sharper reason — silently adopting a key that appeared
+//     on an unsigned volume would let anyone who can write the prefix
+//     promote themselves from "one of several writers" to "the pinned
+//     identity", turning a loud "this is unsigned" into a quiet "this is
+//     signed, all good".
+//
+//     THE CUSTODY CHAIN DOES NOT CARRY A DOWNGRADE. NextPub announces a
+//     successor KEY and never "no key" (superblock.Validate refuses an
+//     unsigned document that announces anything). A writer may stop
+//     signing; it must not be able to decide that somebody else's mount
+//     will accept unsigned bytes.
+//
 //   - The flip. Publishing a generation overwrites refs/<branch> guarded
 //     by the ETag observed at fetch time: writers detect a lost race
 //     instead of silently clobbering. The transports expose stat-ETags
@@ -54,6 +85,42 @@ var ErrStaleFlip = errors.New("ref changed since fetch (concurrent publish)")
 // the last accepted generation.
 var ErrUntrusted = errors.New("superblock not signed by the trusted key")
 
+// ErrUnsigned reports a volume whose head carries no signature, met by a
+// reader that has not consented to one.
+//
+// It is separate from ErrUntrusted because the two are opposite problems
+// with opposite advice. ErrUntrusted means "somebody signed this and it was
+// not who you trust" — a key question. This one means there is no key
+// question to ask: nothing about the document is authenticated, and the
+// only thing that can make it acceptable is the reader saying so.
+var ErrUnsigned = errors.New("volume carries no signature")
+
+// ErrSignatureDropped reports a head with no signature on a volume this
+// client has pinned to a KEY. Signed yesterday, unsigned today.
+//
+// THE REFUSAL IS THE FEATURE and it is not negotiable by any flag: a
+// deliberate downgrade and a forged one are byte-for-byte the same
+// document, so no amount of looking harder tells them apart, and the only
+// party that can is a human who knows whether they ran the downgrade.
+var ErrSignatureDropped = errors.New("volume was signed and this generation is not")
+
+// ErrSignatureAppeared reports a SIGNED head on a volume this client has
+// pinned as unsigned — the mirror of ErrSignatureDropped, and refused for
+// a sharper reason. Adopting the key would hand the pin to whoever
+// published it, and on an unsigned volume that is anyone who can write the
+// prefix; the reader would come away believing the volume secure and
+// belonging to a stranger.
+var ErrSignatureAppeared = errors.New("volume was unsigned and this generation is signed")
+
+// unsignedPin is what the volume pin file holds instead of a hex key when
+// the volume has no signature. It is in the SAME file as a key pin, so
+// that "what is this volume's identity" has exactly one answer on disk and
+// a change of kind is a comparison rather than a search: two files could
+// disagree, and the disagreement is precisely the attack.
+//
+// It cannot be confused with a key: readKeyFile requires 64 hex digits.
+const unsignedPin = "unsigned"
+
 // ErrRollback reports a branch head OLDER than the newest generation this
 // client already accepted on it.
 //
@@ -66,20 +133,42 @@ var ErrUntrusted = errors.New("superblock not signed by the trusted key")
 // caused it.
 var ErrRollback = errors.New("branch head went backwards (stale read)")
 
+// Policy is what the READER decided about this volume's identity before a
+// single byte was fetched. It is a type of its own because it is the only
+// input to the trust path that does not come off the wire — everything
+// else here is attacker-influenced, and the two must not be confusable.
+type Policy struct {
+	// Trusted, when non-nil, is an explicitly supplied key
+	// (--volume-pubkey): it is authoritative and TOFU never runs.
+	Trusted ed25519.PublicKey
+	// AllowUnsigned lets a volume with no signature be accepted on FIRST
+	// CONTACT (--allow-unsigned). It is consent to mount with no integrity
+	// root, and it is deliberately narrow: it does not override a pin, so
+	// it can never be typed by habit into accepting a volume that used to
+	// be signed. See the package comment.
+	AllowUnsigned bool
+}
+
 // Store reads and writes refs with trust enforcement and local pinning.
 type Store struct {
 	inner pelicanobj.Store
-	// stateDir persists, per branch, the pinned public key and the last
-	// accepted superblock (wire bytes, for custody-chain verification).
+	// stateDir persists, per branch, the pinned volume identity and the
+	// last accepted superblock (wire bytes, for custody-chain verification).
 	stateDir string
-	// trusted, when non-nil, is an explicitly supplied key: it is
-	// authoritative and TOFU never runs.
-	trusted ed25519.PublicKey
+	policy   Policy
 }
 
 // New builds a ref store. stateDir is the volume's local state directory;
 // trusted is an optional explicit public key (--volume-pubkey).
 func New(inner pelicanobj.Store, stateDir string, trusted ed25519.PublicKey) (*Store, error) {
+	return NewWithPolicy(inner, stateDir, Policy{Trusted: trusted})
+}
+
+// NewWithPolicy is New with the reader's full trust policy. New stays,
+// because most callers — every test, and every command with no opinion
+// about unsigned volumes — supply a key or nothing, and a knob nobody sets
+// should not appear at a hundred call sites.
+func NewWithPolicy(inner pelicanobj.Store, stateDir string, p Policy) (*Store, error) {
 	if err := os.MkdirAll(filepath.Join(stateDir, "refs"), 0700); err != nil {
 		return nil, err
 	}
@@ -97,7 +186,7 @@ func New(inner pelicanobj.Store, stateDir string, trusted ed25519.PublicKey) (*S
 	if d, ok := pelicanobj.AsDirectReader(inner); ok {
 		inner = d.DirectVariant()
 	}
-	return &Store{inner: inner, stateDir: stateDir, trusted: trusted}, nil
+	return &Store{inner: inner, stateDir: stateDir, policy: p}, nil
 }
 
 // Fetched is the result of one Fetch: the verified superblock, its wire
@@ -133,6 +222,11 @@ func (s *Store) lastPath(branch string) string {
 //     REPLACES the pin: the old key is retired, and sibling branches
 //     still signed by it fail until republished with the new key.
 //  3. No pin yet: trust-on-first-use — pin the embedded key, loudly.
+//
+// A head with NO signature never reaches any of the three: it is decided
+// first, by checkSigningKind, against the pin and the reader's consent
+// alone. See the package comment for why that decision belongs to the
+// reader and can never be made from the document.
 func (s *Store) Fetch(ctx context.Context, branch string) (*Fetched, error) {
 	if strings.ContainsAny(branch, "/\\") {
 		return nil, fmt.Errorf("invalid branch name %q", branch)
@@ -149,18 +243,37 @@ func (s *Store) Fetch(ctx context.Context, branch string) (*Fetched, error) {
 		return nil, err
 	}
 
-	if s.trusted != nil {
-		if err := sb.Verify(s.trusted); err != nil {
+	pinned, err := s.pinFor()
+	if err != nil {
+		return nil, err
+	}
+	// BEFORE ANY KEY QUESTION: is this volume the KIND of volume this
+	// client agreed to read? A signature that does not verify and a
+	// signature that is not there are different failures with different
+	// remedies, and mixing them is how one becomes mistaken for the other.
+	if err := s.checkSigningKind(sb, pinned, true); err != nil {
+		return nil, fmt.Errorf("ref %s: %w", branch, err)
+	}
+	if sb.IsUnsigned() {
+		// Consented to, above. The pin is written so the consent is given
+		// once per volume rather than typed at every command — the volume
+		// says "unsigned" on every surface that reports it instead
+		// (`pelfs status`, the mount line, fsck), which is where the
+		// loudness belongs.
+		if err := s.persist(branch, nil, raw); err != nil {
+			return nil, err
+		}
+		return &Fetched{Superblock: sb, Raw: raw, ETag: etag}, nil
+	}
+
+	if s.policy.Trusted != nil {
+		if err := sb.Verify(s.policy.Trusted); err != nil {
 			return nil, fmt.Errorf("ref %s: %w: %w", branch, ErrUntrusted, err)
 		}
 		return &Fetched{Superblock: sb, Raw: raw, ETag: etag}, nil
 	}
 
-	pinned, err := s.readPin()
-	if err != nil {
-		return nil, err
-	}
-	if pinned == nil {
+	if !pinned.present() {
 		// TOFU: nothing pinned yet. Loud, because this is the one moment
 		// an active attacker could substitute a key undetected.
 		ui.Warn("pinning volume key {key} on first use; verify the fingerprint out of band "+
@@ -174,8 +287,8 @@ func (s *Store) Fetch(ctx context.Context, branch string) (*Fetched, error) {
 		return &Fetched{Superblock: sb, Raw: raw, ETag: etag}, nil
 	}
 
-	if err := sb.Verify(pinned); err == nil {
-		if err := s.persist(branch, pinned, raw); err != nil {
+	if err := sb.Verify(pinned.key); err == nil {
+		if err := s.persist(branch, pinned.key, raw); err != nil {
 			return nil, err
 		}
 		return &Fetched{Superblock: sb, Raw: raw, ETag: etag}, nil
@@ -186,7 +299,7 @@ func (s *Store) Fetch(ctx context.Context, branch string) (*Fetched, error) {
 	if err != nil {
 		return nil, fmt.Errorf("ref %s: %w (no prior generation on record to rotate from)", branch, ErrUntrusted)
 	}
-	if err := superblock.VerifyChain(prevRaw, sb, pinned); err != nil {
+	if err := superblock.VerifyChain(prevRaw, sb, pinned.key); err != nil {
 		return nil, fmt.Errorf("ref %s: %w: %w", branch, ErrUntrusted, err)
 	}
 	ui.Warn("volume signing key rotated to {key} (announced by branch {branch}'s previous generation)",
@@ -195,6 +308,88 @@ func (s *Store) Fetch(ctx context.Context, branch string) (*Fetched, error) {
 		return nil, err
 	}
 	return &Fetched{Superblock: sb, Raw: raw, ETag: etag}, nil
+}
+
+// checkSigningKind decides whether sb is the KIND of document this client
+// will read at all: signed, or not signed. It runs before every key
+// question, on every path that accepts a superblock, and it is the only
+// place an unsigned volume is ever admitted.
+//
+// It never inspects the document to decide — an unsigned document says
+// nothing trustworthy about itself — only whether what arrived matches
+// what this reader already recorded or explicitly consented to.
+//
+// firstContact is true only for Fetch, and that asymmetry is the same one
+// TOFU already has: consent is given by reading a BRANCH HEAD, the mutable
+// object a writer chose to publish. A tag, and a superblock backup
+// scavenged out of a pack, are chosen by anyone who can write the key
+// space, so neither may establish what this volume IS — they may only be
+// read once it is established.
+func (s *Store) checkSigningKind(sb *superblock.Superblock, pinned pin, firstContact bool) error {
+	if !sb.IsUnsigned() {
+		if pinned.unsigned {
+			return fmt.Errorf("%w: generation %d is signed by %x, but this client recorded this volume as "+
+				"having no signing key. Accepting would pin whoever published it — on an unsigned volume, "+
+				"anyone who can write the prefix. If you rotated this volume to signed, delete %s and "+
+				"re-read; otherwise treat it as a takeover",
+				ErrSignatureAppeared, sb.Generation, sb.SigningPub[:8], s.pinPath())
+		}
+		return nil
+	}
+	switch {
+	case pinned.key != nil:
+		return fmt.Errorf("%w: generation %d carries no signature, but this client has this volume pinned "+
+			"to key %x. Nothing in an unsigned document distinguishes a deliberate downgrade from a "+
+			"forgery, so this is refused and no flag overrides it. If you ran `pelfs rotate --to-unsigned` "+
+			"on this volume, delete %s and re-read with --allow-unsigned; otherwise someone else is "+
+			"writing this prefix",
+			ErrSignatureDropped, sb.Generation, pinned.key[:8], s.pinPath())
+	case pinned.unsigned:
+		return nil
+	case s.policy.Trusted != nil:
+		return fmt.Errorf("%w: --volume-pubkey names a key to verify against and generation %d carries no "+
+			"signature at all", ErrUnsigned, sb.Generation)
+	case !firstContact:
+		return fmt.Errorf("%w: generation %d has no signature and this client has not recorded this volume "+
+			"as unsigned. Read a branch head first — a tag or a scavenged backup never establishes what a "+
+			"volume is", ErrUnsigned, sb.Generation)
+	case !s.policy.AllowUnsigned:
+		return fmt.Errorf("%w: generation %d has no signature, so nothing about this volume is "+
+			"authenticated and anyone who can write the prefix can replace it undetectably. "+
+			"Pass --allow-unsigned to read it anyway", ErrUnsigned, sb.Generation)
+	default:
+		ui.Warn("this volume is UNSIGNED, and this client is now pinned to that: nothing it serves is " +
+			"authenticated, and anyone who can write the prefix can replace it undetectably")
+		return nil
+	}
+}
+
+// AcceptUnsigned and AcceptSigned move this client's pin between the two
+// kinds of volume identity. They are the ONLY way past checkSigningKind,
+// and they exist for exactly one caller: `pelfs rotate --to-unsigned` and
+// `--to-signed`, called AFTER the flip that changed the volume.
+//
+// WHY THIS IS NOT A HOLE. The refusal these bypass is a refusal to guess
+// whether a change of kind was deliberate. The machine that just performed
+// the change does not have to guess — it did it, under a user who typed
+// the command — so it re-pins itself and stops refusing its own volume.
+// Every OTHER reader still refuses, and still needs a human. Nothing in a
+// fetched document can reach these; they are called from a command, never
+// from a code path that has just read bytes off the wire.
+//
+// Neither touches the per-branch last-accepted record: that is the rollback
+// check's memory, it is about generation numbers rather than identity, and
+// the next Fetch writes it.
+func (s *Store) AcceptUnsigned() error {
+	return writeAtomic(s.pinPath(), []byte(unsignedPin+"\n"))
+}
+
+// AcceptSigned re-pins to pub. See AcceptUnsigned.
+func (s *Store) AcceptSigned(pub ed25519.PublicKey) error {
+	if len(pub) != ed25519.PublicKeySize {
+		return fmt.Errorf("accept signed: key is %d bytes, want %d", len(pub), ed25519.PublicKeySize)
+	}
+	return writeAtomic(s.pinPath(), []byte(hex.EncodeToString(pub)+"\n"))
 }
 
 // Flip publishes raw (an encoded, signed superblock) to refs/<branch>.
@@ -488,16 +683,28 @@ func (s *Store) Verify(raw []byte) (*superblock.Superblock, error) {
 	if err != nil {
 		return nil, err
 	}
-	key := s.trusted
+	pinned, err := s.pinFor()
+	if err != nil {
+		return nil, err
+	}
+	if err := s.checkSigningKind(sb, pinned, false); err != nil {
+		return nil, err
+	}
+	if sb.IsUnsigned() {
+		// Reachable only under an unsigned pin (checkSigningKind refuses
+		// every other way in, including a bare --allow-unsigned: consent
+		// is established by reading a BRANCH, never by a document dug out
+		// of a pack). On such a volume there is nothing to authenticate
+		// against and a scavenged document can only ever make the sweep
+		// keep MORE, so it is accepted for what it is worth.
+		return sb, nil
+	}
+	key := s.policy.Trusted
 	if key == nil {
-		pinned, err := s.readPin()
-		if err != nil {
-			return nil, err
-		}
-		if pinned == nil {
+		if !pinned.present() {
 			return nil, fmt.Errorf("%w (no volume key pinned; fetch a branch first or supply --volume-pubkey)", ErrUntrusted)
 		}
-		key = pinned
+		key = pinned.key
 	}
 	if err := sb.Verify(key); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrUntrusted, err)
@@ -517,16 +724,26 @@ func (s *Store) FetchTag(ctx context.Context, name string) (*superblock.Superblo
 	if err != nil {
 		return nil, nil, fmt.Errorf("tag %s: %w", name, err)
 	}
-	key := s.trusted
+	pinned, err := s.pinFor()
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := s.checkSigningKind(sb, pinned, false); err != nil {
+		return nil, nil, fmt.Errorf("tag %s: %w", name, err)
+	}
+	if sb.IsUnsigned() {
+		// An unsigned pin, and nothing else — a tag establishes no trust
+		// even on an unsigned volume, exactly as it establishes none on a
+		// signed one. On a volume with no key a tag is a name someone with
+		// write access froze, which is all it ever was here.
+		return sb, raw, nil
+	}
+	key := s.policy.Trusted
 	if key == nil {
-		pinned, err := s.readPin()
-		if err != nil {
-			return nil, nil, err
-		}
-		if pinned == nil {
+		if !pinned.present() {
 			return nil, nil, fmt.Errorf("tag %s: %w (no volume key pinned; fetch a branch first or supply --volume-pubkey)", name, ErrUntrusted)
 		}
-		key = pinned
+		key = pinned.key
 	}
 	if err := sb.Verify(key); err != nil {
 		return nil, nil, fmt.Errorf("tag %s: %w: %w", name, ErrUntrusted, err)
@@ -578,12 +795,49 @@ func (s *Store) checkMonotonic(branch string, sb *superblock.Superblock) error {
 	return nil
 }
 
-func (s *Store) readPin() (ed25519.PublicKey, error) {
-	k, err := readKeyFile(s.pinPath())
-	if os.IsNotExist(err) {
-		return nil, nil
+// pin is this client's record of a volume's identity: a key, or the
+// statement that the volume has none, or nothing at all.
+//
+// Three states rather than a nullable key, because "no pin" and "pinned
+// unsigned" are the two that a boolean would blur — and they are the two
+// with opposite consequences. No pin means first contact, which consent
+// can open; pinned unsigned means this client already agreed once, and a
+// key turning up now is a change of identity.
+type pin struct {
+	key      ed25519.PublicKey
+	unsigned bool
+}
+
+func (p pin) present() bool { return p.key != nil || p.unsigned }
+
+// pinFor is readPin, except that an explicitly supplied key means the pin
+// is not consulted at all — which is the rule an explicit key has always
+// had ("a statement of intent": no TOFU, no rotation shortcut), and it
+// matters more now than it did. Reading the pin here would make a corrupt
+// or unreadable one fail the very command a user reaches for to get past
+// a broken pin.
+func (s *Store) pinFor() (pin, error) {
+	if s.policy.Trusted != nil {
+		return pin{}, nil
 	}
-	return k, err
+	return s.readPin()
+}
+
+// readPin reads the volume pin, which holds a hex key, the unsignedPin
+// sentinel, or does not exist.
+func (s *Store) readPin() (pin, error) {
+	b, err := os.ReadFile(s.pinPath())
+	if os.IsNotExist(err) {
+		return pin{}, nil
+	}
+	if err != nil {
+		return pin{}, err
+	}
+	if strings.TrimSpace(string(b)) == unsignedPin {
+		return pin{unsigned: true}, nil
+	}
+	k, err := parseKeyBytes(b, s.pinPath())
+	return pin{key: k}, err
 }
 
 func readKeyFile(path string) (ed25519.PublicKey, error) {
@@ -591,6 +845,10 @@ func readKeyFile(path string) (ed25519.PublicKey, error) {
 	if err != nil {
 		return nil, err
 	}
+	return parseKeyBytes(b, path)
+}
+
+func parseKeyBytes(b []byte, path string) (ed25519.PublicKey, error) {
 	k, err := hex.DecodeString(strings.TrimSpace(string(b)))
 	if err != nil || len(k) != ed25519.PublicKeySize {
 		return nil, fmt.Errorf("corrupt key pin %s", path)
@@ -599,9 +857,15 @@ func readKeyFile(path string) (ed25519.PublicKey, error) {
 }
 
 // persist atomically records the volume pin and the branch's last
-// accepted superblock.
+// accepted superblock. pub is nil for an unsigned volume, which writes the
+// sentinel — the same file either way, so the two kinds of identity can
+// never both be on record.
 func (s *Store) persist(branch string, pub []byte, raw []byte) error {
-	if err := writeAtomic(s.pinPath(), []byte(hex.EncodeToString(pub)+"\n")); err != nil {
+	body := unsignedPin + "\n"
+	if pub != nil {
+		body = hex.EncodeToString(pub) + "\n"
+	}
+	if err := writeAtomic(s.pinPath(), []byte(body)); err != nil {
 		return err
 	}
 	return writeAtomic(s.lastPath(branch), raw)

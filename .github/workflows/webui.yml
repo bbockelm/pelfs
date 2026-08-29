@@ -18,6 +18,8 @@ on:
       - "webui/**"
       - "internal/webui/**"
       - "scripts/webui-build.sh"
+      - "scripts/webui-inputs.sh"
+      - "scripts/webui-stale.sh"
       - "scripts/webui-playwright.sh"
       - ".github/workflows/webui.yml"
   pull_request:
@@ -26,6 +28,8 @@ on:
       - "webui/**"
       - "internal/webui/**"
       - "scripts/webui-build.sh"
+      - "scripts/webui-inputs.sh"
+      - "scripts/webui-stale.sh"
       - "scripts/webui-playwright.sh"
       - ".github/workflows/webui.yml"
       # And the server the browser suite drives. A change to the loopback
@@ -96,7 +100,8 @@ jobs:
 
       - name: The committed bundle must match its sources
         run: |
-          if ! git diff --exit-code -- internal/webui/dist internal/webui/third_party.txt; then
+          if ! git diff --exit-code -- internal/webui/dist internal/webui/third_party.txt \
+            internal/webui/bundle.inputs; then
             cat >&2 <<'MSG'
 
           The committed bundle does not match webui/frontend.
@@ -106,8 +111,8 @@ jobs:
           `go install ...@latest` work with no Node anywhere. The cost of that
           choice is exactly this gate. To fix:
 
-              go generate ./internal/webui
-              git add internal/webui/dist internal/webui/third_party.txt
+              make ui
+              git add internal/webui/dist internal/webui/third_party.txt internal/webui/bundle.inputs
 
           MSG
             exit 1
@@ -131,6 +136,11 @@ jobs:
       # runner image -- the tools are SHADOWED: a directory of stubs that
       # exit 127 goes first on PATH, so any attempt to run them fails exactly
       # as it would on a machine that never had them.
+      #
+      # `make ui-check` is in here for the same reason. It is what `make build`
+      # runs to keep a bundle older than its sources from being embedded in
+      # silence, and the property that must not break is that on an unmodified
+      # checkout it says nothing, needs no Node, and exits 0.
       - name: A Node-free Go build still works
         run: |
           shadow="$(mktemp -d)"
@@ -147,7 +157,7 @@ jobs:
           env -i \
             PATH="$clean" HOME="$HOME" CGO_ENABLED=0 \
             GOPATH="$(go env GOPATH)" GOMODCACHE="$(go env GOMODCACHE)" GOCACHE="$(go env GOCACHE)" \
-            sh -c 'go build ./... && go vet ./internal/webui/ && go test -count=1 ./internal/webui/'
+            sh -c 'make ui-check && go build ./... && go vet ./internal/webui/ && go test -count=1 ./internal/webui/'
 
   browser:
     # The browser half of the threat model, and the file manager driven

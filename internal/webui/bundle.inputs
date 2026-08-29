@@ -1,0 +1,34 @@
+# What internal/webui/dist and internal/webui/third_party.txt were built from,
+# by CONTENT. Written by scripts/webui-build.sh and checked by
+# scripts/webui-stale.sh, which `make build` runs so that a bundle older than
+# its sources cannot be embedded in silence. Timestamps cannot do this job: a
+# fresh clone writes webui/frontend AFTER internal/webui/dist, so every clean
+# checkout would look stale. scripts/webui-inputs.sh defines what an input is.
+42ee36e78a78b3effdb84f70c5b8ee4271f7490aa26fe439756833155bb6ae50  webui/frontend/index.html
+a63f177e3b9dce34dc981aab950482aa8ee668475adfc867d7d72e1bf0d53386  webui/frontend/package.json
+f305e33a66c34ff83f48ad21e5008f0cd977f2260d49113fba935d70c8d0a47f  webui/frontend/pnpm-lock.yaml
+37d95a8464aa3468cb568d91e4f3d7b98a33415ee79e0c0ac83d2e9601542a2d  webui/frontend/public/brand/NOTICE.txt
+21427ef3cac9eb02d0ed4b678686e4259df6187d074f0457f07481332fbc413d  webui/frontend/public/brand/PelicanPlatformLogo_Icon.png
+eccd4ece7df873ee0dfae681f3906eac63c7a020e0ba0a05799a4295d99f14c7  webui/frontend/public/brand/favicon.svg
+7be4ea32abffa734e3cee93b9fa2292d312be3b0d0db50796a646a5f7b91af76  webui/frontend/src/App.tsx
+b611f32a53aac8e3d92a3dcae0dfe2d580d95a3fa1a22de3e906c1177bcf62ec  webui/frontend/src/api/branches.ts
+5f7092929b1d500ad6791522e627d030b9168f261d465899fb40514873346c92  webui/frontend/src/api/control.ts
+18547665e21d8e178309cae2e00a6e31596c181eb8ba441815cb0566194957da  webui/frontend/src/api/events.ts
+a9db1f2c3a5f23980adf3b1cba607a6f15b3cbc9d7edab2c99c9d850d0b9c708  webui/frontend/src/api/provider.ts
+b47756978267d635779bb318d7d8c4de2f261506a7d8fdfaadddc032be34efb2  webui/frontend/src/api/session.ts
+75f12362377afdd7202eef25e1b1db2b9d8a6e3eaf8134271776564abfa42c0b  webui/frontend/src/api/types.ts
+a2f3c037dc6d3ffa4bd55f6b9b38dc069958d96c05f1221d1ceda84d82ad25ca  webui/frontend/src/brand/Brand.tsx
+2af843d3b25d983b1380619c02e81da2e404a0bb48df5a6d9297842d406cf746  webui/frontend/src/brand/brand.css
+35e2c993d57f2311aa19fa1115aac4e9a2a49191e804a5b0cf8bf748f50601de  webui/frontend/src/brand/mark.ts
+c3952e2307e37a93b53b50970d25df1632a52c0ffa11d9e9baa2739714099460  webui/frontend/src/durability.ts
+4d4d0ccfb87296ff18af8bd3be4fe5c94a1f0ace585c82b8e3d736b6d18b322c  webui/frontend/src/main.tsx
+672c394f993521fa3f4c6f164d2013734dd93141ae1153e828524035b09e1935  webui/frontend/src/routes.ts
+8b914a64478f498d7afcf4816f47859608d8788530d3719477d583c4f966e7ef  webui/frontend/src/ui/BranchPicker.tsx
+680c16326fcc66e88d9b23037c4322b195c2b5ac0de0a0c8924c682b89482214  webui/frontend/src/ui/Durability.tsx
+124ee42caccbaf3ebf49e20de7d960d9b9a16d3cadaa6581fb3542a96f9b9a8a  webui/frontend/src/ui/Notices.tsx
+1e3fd800caae31c739ceccb691ea65d6f7ffb88454e7733c42862fe750d94577  webui/frontend/src/ui/app.css
+ebc16972f45e3780cd310baab7694e567163a1c3d23bc9a81d8c06ad635f486a  webui/frontend/src/ui/icons.css
+8f3423785d9f10e78610c8b456d78ae32947586142b95409556cd08fcad490ba  webui/frontend/tools/licence-check.mjs
+d0796decb7eafb808d6a6223ef51569e76b8dc9df7db9f5448f475e0e4f263c1  webui/frontend/tools/third-party.mjs
+b809abfe0d3ae20f5e6962814392c4d74d99647e1bb5a5c1bb7e317fd9d15d56  webui/frontend/tsconfig.json
+4dbab72f4286cd21a012ccebc5d2bd8d337f3ddcafe5342d46196ca3c2993287  webui/frontend/vite.config.ts

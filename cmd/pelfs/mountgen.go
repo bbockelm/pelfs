@@ -615,7 +615,9 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	}
 	startup.mark("lease")
 
-	rstore, err := refs.New(g.inner, stateDir, trusted)
+	rstore, err := refs.NewWithPolicy(g.inner, stateDir, refs.Policy{
+		Trusted: trusted, AllowUnsigned: o.allowUnsigned,
+	})
 	g.refs = rstore
 	if err != nil {
 		return fail(err)
@@ -829,6 +831,13 @@ func runMountGen(o *cmdOpts, prefix, mountpoint string, command []string, a genA
 	}
 	ui.Info("generation {generation} mounted {mode} on {mountpoint} (catalog-native)",
 		"generation", sb.Generation, "mode", mode, "mountpoint", mountpoint)
+	// Every mount, not only the first. Somebody who inherits a volume must
+	// not have to read a superblock to learn it has no integrity root, and
+	// the pin makes the consent silent after the first time — so this line
+	// is where the loudness lives.
+	if sb.IsUnsigned() {
+		ui.Warn("UNSIGNED volume: nothing here is authenticated")
+	}
 	if passedFD {
 		// Said out loud because both halves are surprising: the mount
 		// options this process asked for went nowhere (the parent's
@@ -2711,6 +2720,7 @@ func (g *genSession) publishMountRecord() func() {
 		Session:    g.sessionID,
 		StateDir:   g.stateDir,
 		ReadOnly:   !g.rw,
+		Unsigned:   g.sb != nil && g.sb.IsUnsigned(),
 		Started:    g.started,
 	}
 	if g.rw {

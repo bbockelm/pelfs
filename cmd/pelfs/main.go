@@ -69,6 +69,8 @@ func main() {
 		code = cmdFsck(os.Args[2:])
 	case "graft":
 		code = cmdGraft(os.Args[2:])
+	case "import":
+		code = cmdImport(os.Args[2:])
 	case "repack-plan":
 		code = cmdRepackPlan(os.Args[2:])
 	case "repack":
@@ -127,6 +129,13 @@ Usage:
                                                           every conflict it cannot resolve
   pelfs mount-gen [flags] [--rw] <prefix> <mountpoint>    mount one generation
                   [--subshell] [-- <command> [args...]]   run in the mount, then unmount
+  pelfs graft  [flags] <prefix> <path> <source-url>       serve a foreign HTTP tree at
+                                                          <path>, storing none of its bytes
+  pelfs import [flags] <prefix> <path> <source-prefix>    COPY another pelfs volume's tree
+                                                          in at <path>, renumbered and
+                                                          re-signed; depends on nobody after
+  pelfs import --list <prefix>                            what this volume has imported,
+                                                          and the inode lineages it cost
   pelfs ctl    <prefix-or-mountpoint> <verb>              control a running mount
                                                           (status|stats|publish|bugreport)
   pelfs fsck   [flags] [--deep] <prefix>                  verify a published generation

@@ -2,6 +2,90 @@
 
 ## Unreleased
 
+**`pelfs import` copies another pelfs volume in, and the result depends on
+nobody.** `pelfs import <volume> <path> <source-prefix>` reads a foreign
+volume's published generation, carries every byte it needs out of that
+volume's packs and into this one's, renumbers its inodes into lineages this
+volume owns, rebuilds the catalogs and signs the lot under this volume's key.
+Afterwards nothing under `<path>` resolves anywhere else: `pelfs gc` on the
+source cannot take it away, `pelfs fsck` here is conclusive about it, and
+`pelfs rescue` can rebuild it from our packs alone. It is the opposite bargain
+from `pelfs graft`, which stores none of the bytes and depends on the source
+forever, and it buys fidelity with it — modes, owners, times, xattrs, symlinks
+and **hardlinks** all survive, where a graft publishes 0444/0555 and no links
+at all.
+
+The bytes are copied **stored** — already compressed, already encrypted —
+which is repack's own property and means an import needs no data key and
+cannot change what a chunk resolves to. Two encrypted volumes under **one**
+data key and **one** identity key are therefore one custody domain and copy
+across untouched, with the per-chunkref key ids translated on the way (an id
+indexes one volume's own key table, so the same key is a different number on
+each side). Every other combination is refused with what it would take:
+different data keys, different identity keys, and plaintext-to-encrypted in
+either direction all mean decrypting and re-chunking every byte, which is a
+real repack. It refuses rather than guesses at the other two boundaries too: a
+source that serves grafts (those bytes were never in a pack), and any chunk
+identity the source's own packs turn out not to hold (a signed generation with
+a dangling chunkref is worse than a failed import). The collision matrix at the
+destination path is `pelfs graft`'s: an empty directory is adopted, a
+populated one or a file needs `--replace` and is announced with a count, a
+non-directory on the way is named, and the volume root is refused with what to
+do instead.
+
+It also leaves the mode a volume is authenticated in alone, which only
+`pelfs rotate` may change: an import onto an unsigned volume re-loads the key
+against the head it actually publishes on, so it publishes unsigned rather
+than minting a key every reader would then reject; and an **unsigned source**
+is refused without `--allow-unsigned` — the same consent a mount of it needs —
+because nothing attests such a tree is what its owner published, and our
+signature vouches for it the moment it lands.
+
+**Interruption-safe, and resumable.** Nothing an import writes is referenced
+until the ref flips, so a killed run leaves the branch exactly where it was
+and a heap of objects the next `pelfs gc` collects — pinned by a test that
+kills the store mid-copy and reads the branch back through a cold cache. A
+checkpoint records each uploaded pack *after* it lands and the source packs it
+consumed *after that*, so a resume verifies every recorded pack against its
+trailer hash and re-copies whatever is gone. The lease is taken after the
+copy, not before it: the copy touches nothing of this volume, and holding the
+branch for the hours it takes would stop a mount checkpointing for no reason.
+
+**Inode lineages now come from one allocator.** `superblock.ImportEntry`
+records an import's provenance — source volume, generation, wire hash, signing
+key — and its inode renumbering, and `pickLineage` reads the claim so a later
+`pelfs branch` can never draw a lineage an imported tree is already using. The
+claim is permanent and the list is never trimmed: the numbers are in tags and
+retired generations too. `internal/inodemap` is the renumbering itself, one
+destination lineage per source lineage with the allocation counter carried
+through, which makes injectivity, signed-64-bit safety and within-lineage
+contiguity properties of the scheme rather than things to check; an inode in a
+lineage the map does not declare is refused, never folded into a default,
+because a quiet alias is unrecoverable where a loud refusal is not.
+
+**Why that map has to come from a walk, now measured rather than argued.** A
+superblock does not record the set of inode lineages its own tree contains:
+`Fork.Lineage` names what a generation allocates *from*, `Catalogs[].Inode`
+samples whichever directories happen to root a catalog, and `Shards` cover
+only promoted inodes. So an import that read the source's superblock instead
+of walking its catalogs would build a map missing a lineage the tree is
+actually using. `TestTheSuperblockUndercountsTheLineagesInTheTree` builds the
+ordinary shape of a volume with history — branch, publish, branch again — and
+measures the gap: the tree holds lineages `[0 1234 5678]` and the superblock
+reveals `[0 5678]`, with the middle branch's file still in the head's tree and
+no field naming its lineage. The walk is `O(catalog bytes)`, not
+`O(data bytes)`, and it stays.
+
+**This is most of the tool `docs/known-issues.md` KL-7 has been waiting for,
+and not all of it.** KL-7 is two branches cut before lineages existed, both
+allocating from lineage 0, which `pelfs merge` diagnoses and cannot fix
+because nothing renumbers an inode space. `inodemap.NewAbove` is the
+conditional form that case needs — the inodes allocated *before* the fork mean
+the same file on both sides and must not move, so only what each side
+allocated for itself is renumbered — and it is tested. What is still missing
+is a `pelfs renumber` verb to apply it, and, for a v0.1.0 branch with no fork
+record, somewhere for the cut to come from. KL-7 says so.
+
 **Volumes with no signing key, on purpose.** `pelfs init --unsigned` creates a
 volume whose superblocks carry no signature at all, for throwaway development
 on a prefix only you can write: nothing to mint, nothing to carry, nothing to

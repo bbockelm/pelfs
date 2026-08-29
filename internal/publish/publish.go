@@ -295,6 +295,23 @@ type Options struct {
 	// So only `pelfs graft` and `pelfs graft --remove` state this. To
 	// remove the LAST graft, state a non-nil empty slice.
 	Grafts []superblock.GraftEntry
+
+	// Imports REPLACES the import list this generation states; nil CARRIES
+	// THE PARENT'S FORWARD (superblock.ImportEntry, internal/importvol).
+	//
+	// Carrying forward is the default for a sharper reason than the graft
+	// list's. A graft entry is a LOCATOR and dropping one breaks reads. An
+	// import entry is a LINEAGE CLAIM and dropping one breaks nothing
+	// today — the tree reads perfectly — and lets `pelfs branch` draw a
+	// lineage the tree is already using, at which point two files get one
+	// inode number and the damage is discovered by a merge months later.
+	// A silent failure with a long fuse is the worst shape a default can
+	// have, so the default is to carry.
+	//
+	// Only `pelfs import` states this, and it states the parent's list
+	// PLUS its own entry. There is no way to remove one: see
+	// superblock.ImportEntry for why a lineage claim is permanent.
+	Imports []superblock.ImportEntry
 	// emptySource selects the empty-root source (InitVolume).
 	emptySource bool
 }
@@ -1630,6 +1647,20 @@ func (p *pipeline) buildSuperblock(packList []superblock.PackEntry, shards []sup
 		return nil, nil, fmt.Errorf("publish: the graft list is %d bytes over the %d-byte budget "+
 			"(%d grafts); remove one before adding another",
 			n-superblock.GraftBudgetBytes, superblock.GraftBudgetBytes, len(sb.Grafts))
+	}
+	// The import list: the same carry-or-state rule, for the reason
+	// Options.Imports gives — a dropped entry is a lineage this volume
+	// would hand out twice.
+	if p.o.Imports != nil {
+		sb.Imports = p.o.Imports
+	} else if p.o.Prev != nil && len(p.o.Prev.Imports) > 0 {
+		sb.Imports = append([]superblock.ImportEntry(nil), p.o.Prev.Imports...)
+	}
+	if n := superblock.EncodedLen(sb.Imports); n > superblock.ImportBudgetBytes {
+		return nil, nil, fmt.Errorf("publish: the import list is %d bytes over the %d-byte budget "+
+			"(%d imports). It cannot be trimmed: every entry is a permanent inode-lineage claim, "+
+			"and dropping one would let a later `pelfs branch` draw a lineage this tree already uses",
+			n-superblock.ImportBudgetBytes, superblock.ImportBudgetBytes, len(sb.Imports))
 	}
 	// The condemned ledgers for the derived key spaces: what this seal
 	// stopped listing, plus the parent's entries still inside the grace

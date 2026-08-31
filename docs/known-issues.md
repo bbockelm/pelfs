@@ -903,6 +903,113 @@ written down — `memtable.Journal.Located` says out loud that it is called
 off the store's lock and may be called concurrently — but nothing exercises
 a slow journal against a writer.
 
+### KL-23. Go's fuzzing engine can report its own fuzztime expiry as the test failure `context deadline exceeded`
+
+Filed at `47668cc` by opfuzzdl-agent, from the red `opfuzz` job on PR #7
+(run 33276653875). It is a bug in the Go toolchain, not in pelfs, and it is
+open upstream: **golang/go#72104** and **#72088**, both `NeedsInvestigation`,
+both watchflakes reports of Go's own `cmd/go` fuzz tests failing this way on
+Go's builders. Reproduced here against `go1.26.0`.
+
+**What it looks like.** The whole failure, with no crasher, no
+`Failing input written to`, no minimisation, and a steady exec rate right up
+to the boundary:
+
+```
+fuzz: elapsed: 2m0s, execs: 102621 (867/sec)
+--- FAIL: FuzzOps (120.12s)
+    context deadline exceeded
+FAIL
+```
+
+**The mechanism, end to end.** `-test.fuzztime <duration>` becomes
+`CoordinateFuzzingOpts.Timeout`, and `internal/fuzz/fuzz.go:105-109` turns
+it into `ctx, cancel = context.WithTimeout(ctx, opts.Timeout)`. The workers
+are cancelled through a CHILD of that context, `fuzzCtx` (`fuzz.go:112`).
+When the budget expires the coordinator's main loop takes
+`case <-doneC: stop(ctx.Err())` (`fuzz.go:228`), and `stop` is supposed to
+recognise that error as its own normal termination and drop it
+(`fuzz.go:129`):
+
+```go
+if err == fuzzCtx.Err() || isInterruptError(err) { err = nil }
+```
+
+That test races. `context.cancelCtx.cancel` publishes the PARENT's error and
+closes the parent's done channel (`context.go:561-568`) **before** it walks
+`c.children` to cancel `fuzzCtx` (`context.go:569-572`). A coordinator
+goroutine woken by that close and scheduled before the children loop runs
+observes `fuzzCtx.Err() == nil`, the suppression misses, `fuzzErr` is set to
+`context.DeadlineExceeded`, and it is what `CoordinateFuzzing` returns at
+`fuzz.go:235`. `testdeps` has a second suppression
+(`deps.go:172: if err == ctx.Err()`) but it tests the PARENT context, whose
+error is `Canceled` on ^C and never `DeadlineExceeded`, so a deadline is the
+one termination with a single racy guard. `testing/fuzz.go:368-371` then
+calls `f.Fail()` and prints the error verbatim.
+
+**Why CI and not the laptop.** The window is real but narrow, and it widens
+with CPU contention — the coordinator plus one worker process per core, on
+four vCPUs. Measured as the rate at which `ctx.Err() == fuzzCtx.Err()` is
+false at the instant the parent's done channel closes:
+
+| where | per deadline |
+|---|---|
+| host, idle, GOMAXPROCS=12 | 0.010% - 0.020% |
+| container, `--cpus 4`, GOMAXPROCS=4, idle | 0.040% |
+| container, `--cpus 4`, GOMAXPROCS=4, 5 competing processes (the CI shape) | **0.275%** |
+
+**What it is NOT.** Not KL-22, and not a slow machine: the failing run's
+exec rate (867/sec) is indistinguishable from the passing runs either side
+of it (860, 969, 989/sec), so nothing stalled — it lost a coin flip that
+this runner tosses on every fuzz job. Not PR #7 either; nothing in that
+branch is reachable from the overlay ops, and the mechanism is entirely in
+the toolchain.
+
+**What was done about it.** The `opfuzz` job budgets EXECUTIONS
+(`120000x`), not seconds. `Nx` sets `CoordinateFuzzingOpts.Limit` and leaves
+`Timeout` at 0, so `fuzz.go:105-109` never creates the deadline context and
+the racy suppression is never reached; the limit path exits through
+`stop(nil)`. This is not a smaller gate — 120000 is above every measured CI
+run (102621, 103913, 116178, 118047 execs in the 120s the job used to ask
+for) and lands in the same 2-2.5 minutes. The engine's wall clock was also
+the only bound on a HUNG fuzz target, so the launcher now passes
+`-test.timeout 15m` (`PELFS_OPFUZZ_HARDTIMEOUT`), which dumps every
+goroutine instead of letting the job's 20-minute cap kill it blind.
+
+**Reproduced on demand, on nothing but a squeezed container.** The overlay
+below is only a magnifier; the failure comes out of the unmodified
+toolchain and the unmodified launcher once the container is made to look
+like the runner — `PELFS_OPFUZZ_CPUS=2 PELFS_OPFUZZ_GOMAXPROCS=4
+scripts/opfuzz-docker.sh 1s FuzzOps`, three such loops at once so they
+contend. **2 failures in ~386 runs (0.5%)**, each printing the job's text
+verbatim at the job's exec rate:
+
+```
+fuzz: elapsed: 1s, execs: 953 (889/sec)
+--- FAIL: FuzzOps (1.09s)
+    context deadline exceeded
+FAIL
+```
+
+The budget's LENGTH is irrelevant — the race is one coin toss per run, at
+the boundary — so a 1s budget buys the same event as the job's 120s one,
+hundreds of times an hour instead of once. That is also why "run it again"
+is not a diagnosis: nothing about the run before the boundary differs.
+
+**Pinned by an executable test: no, and it cannot be from here** — the
+racing code is the toolchain's. What is pinned is the shape of the
+reproduction, which is exact: build the fuzz binary against a stdlib overlay
+that sleeps 2ms between `close(d)` and the children loop in
+`cancelCtx.cancel`, and a duration budget fails with the CI text every time
+(2/2) while a count budget passes under the identical build (3/3). Revisit
+if Go closes #72104: a duration budget is the more natural knob.
+
+**Second-order, noticed while reading the launcher and left alone.** The
+container has no repo mount, so a crasher is written to
+`/scratch/testdata/fuzz/FuzzOps` on a tmpfs that dies with the container.
+When this gate does find something, the message survives in the job log and
+the reproducing INPUT does not.
+
 ---
 
 ## `CHANGELOG.md` v0.1.0 *Known limitations*: status on main

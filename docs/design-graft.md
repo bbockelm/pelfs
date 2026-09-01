@@ -27,6 +27,15 @@ source. Decision 14. A graft-integrity failure is also its own error class
 now, so "the source changed" is distinguishable from "the network blinked"
 by a caller and by an errno (Decision 15).
 
+**And the volume can now be checked**, which was ranked item 2 and the
+last thing that made a grafted volume look broken: `pelfs fsck` reported
+every grafted file as `missing-chunk` and exited 1. It resolves grafted
+chunkrefs through the graft index the way a read does, reports what can
+go wrong with a graft at a severity that says who owns the problem —
+this volume's objects are damage, a third party's storage is a warning —
+and offers two source depths whose very different costs are stated in
+the output rather than both called "checked". Decision 4.
+
 The design content is the decisions, the interaction inventory, and the
 ranked work.
 
@@ -75,18 +84,23 @@ are fixable; neither is a reason not to do this.
 | `internal/publish/graftsource.go` | `GraftSource`: a `publish.Source` + `ContentProvider` over a spider result |
 | `internal/publish/graftsplice.go` | `GraftSpliceSource`: the splice into a POPULATED volume, plus `GraftPreflight` and the collision matrix (Decision 14) |
 | `internal/genfs/grafterr.go` | the graft-integrity error class: `ErrGraftIntegrity`, `*GraftIntegrityError` (Decision 15) |
+| `internal/graft/enumerate.go` | `Reader.Enumerate`: the sequential pass over an index object — one ranged read, one buffer, the whole-object hash and the sort order checked on the way past |
+| `internal/fsck/graft.go` | the graft arm of `fsck`: grafted blocks in the shared identity index, the severity table, the `HEAD` sweep, deep block verification, `GraftDepth` |
 | `cmd/pelfs/graft.go` | `pelfs graft`, `--refresh`, `--replace`, `--remove`, `--list`, the block/concurrency knobs, the scheme allowlist, the mount's `GraftOpener` |
 | `cmd/pelfs/graftsplice.go` | the command's side of the splice: the preflight, what it reports, and `--remove` |
 | `cmd/pelfs/mountgen.go` | `--prefetch all｜packs｜background` and what each promises |
 | `internal/genfs/graft_test.go` | the whole read path in the ORDINARY lane: good read, straddling read, fail-closed, no-opener refusal, prefetch arithmetic, a windowed index, and **offline reads after a prefetch** |
 | `internal/genfs/graftintegrity_test.go` | the error class: a changed source, a truncated one, and — the half that makes it worth having — an UNREACHABLE source that must not be classified as changed data |
 | `internal/publish/graftsplice_test.go` | the splice in the ORDINARY lane: the whole collision matrix, both nesting refusals, two grafts side by side, catalog reuse across a nested boundary, idempotence, `--remove`, and interruption safety against a dying store |
+| `internal/fsck/graft_test.go` | the severity assignment, kind by kind, in the ORDINARY lane: a healthy grafted volume clean, a chunk in neither layer still damage, a lost and a corrupt index, an entry that contradicts it, a changed / deleted / unreachable / refused source, both depths on a same-length edit, and the exit codes that follow |
+| `internal/graft/enumerate_test.go` | the pass agrees with `Lookup` in both modes, refuses a corrupt or unsorted index, and holds a flat live set at 8x the block count |
 | `internal/rawfuse/graftstatus_internal_test.go` | `EBADMSG` for an integrity failure, `EIO` for a transport one, and the separate log budget |
 | `internal/genfs/graftcache_internal_test.go` | the storage shape (one file per blob, not per block), reopen, torn blobs, both eviction passes |
 | `scripts/graft-spike-{test,docker}.sh` | the mount-backed end-to-end, now including resume and the prefetch modes |
 
-`go build ./...`, `go vet ./...`, `go test ./...` are green (38 packages,
-0 failures), and `scripts/mount-gate-docker.sh` still passes.
+`go build ./...`, `go vet ./...`, `go test ./...` are green, and
+`scripts/graft-spike-docker.sh` and `scripts/mount-gate-docker.sh` both
+pass.
 
 ---
 
@@ -362,55 +376,161 @@ mechanically a re-spider that publishes a new generation with a new index —
 the same code path `pelfs graft` already runs — plus a diff report so a
 user learns what moved.
 
-### What `fsck` should do — and the blocker in front of it
+### `fsck` on a grafted volume — built, and here is the severity table
 
-Two modes, matching the existing `--deep` precedent:
+Two modes, matching the existing `--deep` precedent, and both are now
+built. **Everything below is implemented**; the boundary note this
+section used to carry is at the end, kept because it is the argument.
 
-- **Cheap (default with `--check-grafts`): one `HEAD` per source object.**
-  `Index.Objects()` already returns exactly that list. Compare size and
-  ETag against what the graft recorded. This is `checkPacks`'s existing
-  shape (`internal/fsck/fsck.go:399` stats each pack and compares size), so
-  it is a new call site rather than new machinery.
-- **Deep (`--deep --check-grafts`): re-read and re-hash every block.** The
-  bounded verifier pool at `internal/fsck/walk.go:314` already does this
-  for pack chunks.
+- **Cheap (`--grafts=head`, the DEFAULT): one `HEAD` per source object.**
+  Presence, size, and mtime. No source bytes at all: 100,000 requests for
+  a 10 TB graft, independent of how many bytes or blocks it holds.
+- **Deep (`--grafts=deep`, and implied by `--deep`): re-read and re-hash
+  every referenced external block.** The same comparison a read makes,
+  run over the whole graft. The only mode that catches a change that kept
+  the length — which is the spike's own failure case.
+- **`--grafts=none`: touch no third party at all.**
 
-**Does a stale graft fail `fsck` or warn?** It must **warn**, and that is
-the blocker: `fsck` has no warning tier. Every `Kind` is damage,
-`Report.OK()` is `len(Problems) == 0`, and any problem exits 1
-(`cmd/pelfs/fsck.go:77`). Adding `KindGraftStale` under that model would
-make `pelfs fsck` exit 1 on a perfectly healthy volume every time an
-upstream file is republished — which is what a graft is *for*. So a
-`Severity` field on `Problem`, with `OK()` counting only errors, has to
-land **before** graft checking does. That is a change to `fsck`'s contract
-and should be its own commit.
+The graft INDEX is read on every run whatever the depth says, because a
+grafted chunkref cannot resolve without it, and resolution is not
+optional. That has a bonus: streaming the object verifies it against the
+hash the superblock signs, which a MOUNT of a large graft cannot do
+(`remote.go` reads it by window and argues, correctly, that it does not
+need to). `fsck` is the only place that check happens.
 
-**Boundary, stated because this round stopped at it.** The severity axis
-was explicitly out of scope for the scale and prefetch work, and nothing
-here touches `fsck`. Two consequences a reader should not have to
-discover:
+**The report states which claim you paid for**, because "checked" would
+otherwise cover a factor of ten thousand:
 
-- `pelfs fsck` on a grafted volume still reports **every grafted file** as
-  `missing-chunk` and exits 1. `checkChunkRef` (`internal/fsck/walk.go:263`)
-  has the same absence check `genfs.ContentOf` and `genfs.Prefetch` both
-  had, and both of those have now been taught that a graft is a location
-  rather than a hole. `fsck` is the third and last one, and its fix is
-  mechanically the same — ask the graft table first — but it cannot land
-  without the severity tier, because a stale graft must WARN.
-- Nothing here added a way for `fsck` to enumerate a graft's blocks. The
-  spike had a `graftIdentities` helper that nothing called; it was removed
-  rather than kept, because at 10.5M blocks the resident set it built is
-  336 MB and the shape a deep `fsck` wants is a sequential stream of the
-  index object — a few ranged reads. That streaming enumerator is the one
-  piece of new mechanism the `fsck` work will need from `internal/graft`,
-  and it is small.
+```
+grafts:  1 root serving 4 external chunks from 2 source objects
+source:  2 source objects stat'd by HEAD — size and mtime, no source bytes
+         read; a same-length edit is invisible to this mode
+         (--grafts=deep re-hashes every block)
+```
+```
+source:  4 external blocks re-read from the source and re-hashed
+         (3021440 bytes), 2 source objects stat'd
+```
 
-Note also that `checkChunkRef` (`internal/fsck/walk.go:263`) will report
-**every grafted file as damaged** today — `chunk %s resolves in no listed
-pack`. Making fsck graft-aware is not optional polish; without it `fsck` is
-unusable on a grafted volume.
+#### The line: this volume's objects are damage, a third party's are news
 
----
+**Does a stale graft fail `fsck` or warn?** It warns, and the severity
+axis that made that possible landed first (`Severity`, `--strict`,
+`Report.Damaged`). What that decision generalizes to is one rule, and
+every kind below follows from it rather than from taste:
+
+> **`SeverityError` is for objects THIS VOLUME owns and can repair.
+> `SeverityWarning` is for a third party's storage, and for fields no
+> reader resolves through.**
+
+| Kind | Severity | Why |
+|---|---|---|
+| `graft-index` | 🔴 error | The index lives under this volume's prefix, is hash-named, is covered by the signature, and is the ONLY record of where a grafted file's bytes are. Gone or corrupt, no reader serves a single byte under the graft, and nobody but this operator can fix it. |
+| `graft-entry` | 🔴 error | The signed entry contradicts the hash-named object it names (block count, object count), or names a configuration no reader will serve — a graft on an encrypted volume, which `genfs.openGrafts` refuses to mount. Decidable without touching any source, and not fixable by a refresh. |
+| `graft-block` | 🔴 error | The catalog and the index disagree about a block: a length mismatch, or a chunkref claiming a codec or a key over bytes a graft stores raw. The generation cannot be turned into the file it describes. |
+| `graft-source-changed` | 🟡 warning | An upstream republish is the ordinary life of a graft source — it is the event a graft EXISTS to expose. Calling it damage would fail a healthy volume's cron on somebody else's routine maintenance, and the operator who learns `fsck` cries wolf stops running `fsck`. |
+| `graft-source-missing` | 🟡 warning | **The one worth arguing about**: the files behind it are unreadable and `--refresh` will not bring them back. Still not this volume's damage — pelfs never held those bytes and never promised to (the graft's bargain is O(0) storage, and its stated price is that availability becomes the product of two systems) — and decisively, `fsck` CANNOT TELL a deletion from an expired token, a maintenance window, or a partition at this reader's position. Classifying an outage as corruption is the mistake `grafterr.go` already refuses to make. |
+| `graft-unchecked` | 🟡 warning | The source could not be asked at all: unreachable, or refused by the reader's veto. A kind of its own rather than silence, because "I did not check" is a different claim from "I checked and it was fine", and a report that swallowed the difference would let an operator believe the second. |
+| `graft-unreferenced` | 🟡 warning | A graft the namespace never resolves through: a leaked index object and a dependency on a third party that nothing uses. Costs storage and confusion, never a byte. `--remove` drops it. |
+| `graft-metadata` | 🟡 warning | `Path` after a rename (ranked item 13 — nothing routes by it, so it can only make `--list` lie), a duplicate path, a recorded block policy that could not have cut this index (it breaks `--refresh`, not reads). |
+| `missing-chunk` | 🔴 error | **Unchanged.** An identity in no pack AND no graft is still damage. The fix was "a graft is a location", not "absence is fine". |
+
+`Bytes` and `Files` on the entry are deliberately NOT checked: `Bytes`
+counts inlined files and `Files` does not, so a comparison would need to
+re-derive the inline split and would misfire. A check that can be wrong
+is worse than no check.
+
+#### What it cost to make resolution work, which is the part that could have gone badly
+
+Grafted blocks go into the **same sorted identity index as packed
+chunks** — the external sort `fsck` already spills — with a marker in the
+record's spare bits. There is no wider record and no second table: the
+ordinal field's top bit is free (a generation cannot have two billion
+packs) and the length field's top 32 bits are free (a graft block cannot
+reach 4 GiB, because `BlockPolicy.Validate` refuses a ceiling over 1 GiB
+— "the ceiling is the minimum verified read, and a read that large is a
+download"), so the source object's ordinal rides there.
+
+The consequence is that resolution costs one binary search over pages the
+kernel can reclaim, `seenChunk`'s bit-per-position dedup covers both
+populations without knowing there are two, and **nothing per grafted
+block is resident**. The alternative — a set of grafted identities — is
+the 336 MB at 10.5 million blocks that this package deleted a helper
+rather than ship.
+
+A tie is resolved **in the pack's favour**. Identity is the same BLAKE3
+function in both layers, so an identity both hold names the same bytes
+and either location is a correct read; the pack is this volume's own
+object, needs no third party, and is verifiable without leaving the
+prefix. It is also what makes a file written over a grafted one count as
+packed, which is what it is.
+
+#### The cheap mode's size check is sound under deduplication
+
+This is the one place the arithmetic could have produced false alarms on
+exactly the trees this feature is for. The index **collapses duplicate
+identities** (`Writer.Encode` keeps the lower location), so the records
+for a source object are a SUBSET of its blocks and `max(off+length)` is a
+LOWER BOUND on its size, not its size. A software area full of identical
+files would report most of its objects as "the source grew".
+
+So the bound is used only where it stays sound, and equality is claimed
+only where the records prove it:
+
+- `size < extent` → **short**, always. The generation names bytes past
+  the object's end and those reads fail today, whatever deduplication
+  did.
+- `size != extent` is claimed only when the surviving records tile
+  `[0, extent)` with no gap AND `extent` is not a multiple of the block
+  size — meaning the top record is a SHORT block, and only an object's
+  final block is short, so `extent` is where the object ended.
+- An object with **no** surviving records (every block deduplicated into
+  an earlier object) is skipped by the `HEAD` sweep entirely: nothing
+  resolves through it, so its absence breaks no read.
+
+#### mtime is the cheap mode's only signal against a same-length edit, and it is free
+
+The `HEAD` was made anyway. An object modified **after the generation was
+created** was modified after it was spidered, because the spider ran
+first — so the test is one-sided: an older mtime proves nothing and a
+newer one is real. There is exactly one false-positive mechanism, a
+source clock running ahead, and `graftMtimeSkew` (5 minutes) covers it.
+
+The **advertised digest** (ranked item 15) does NOT fall out cheaply, and
+the reason is already written down in this tree, from the other
+direction: `pelicanobj.VerifyPut` records that "neither transport
+promises a content digest in that field — the test origin derives it from
+size and mtime, and an HTTP origin's ETag is opaque by specification". So
+an ETag is either a restatement of size+mtime or an opaque token, and in
+neither case is there anything recorded at graft time to compare it
+against — the index carries no per-object digest. Item 15 needs a format
+field, not a call site, and it stays on the ranked list.
+
+#### The enumerator, and the boundary note that asked for it
+
+`fsck` needed a way to walk a graft's blocks, and the shape it wanted was
+stated when the previous round declined to build it:
+
+> The spike had a `graftIdentities` helper that nothing called; it was
+> removed rather than kept, because at 10.5M blocks the resident set it
+> builds is 336 MB and the shape a deep `fsck` wants is a sequential
+> stream of the index object — a few ranged reads.
+
+That is `graft.Reader.Enumerate`: **one** ranged request for the whole
+object, read through a 256 KiB buffer, hashed as it goes. What stays
+resident is the string table (bounded by source objects, 6 MB at 100,000
+of them however large the tree) and the buffer. Measured rather than
+asserted, at two sizes eight times apart: the live set is 550 KB at
+30,000 blocks and 587 KB at 240,000 — flat, while the object grew from
+1.4 MB to 11.5 MB.
+
+It also makes two checks nothing else was in a position to make. The
+**whole-object hash**, as above. And **sort order**: `packidx`
+deliberately does not verify order at open, because that is a pass over
+every entry and an out-of-order table answers "not found" rather than
+answering wrongly — which for a pack degrades to the caller's fallback,
+and for a graft is silently unreadable files, since a graft has no
+fallback.
 
 ## Decision 5 — The interaction inventory
 
@@ -422,7 +542,7 @@ decision, 🟢 fine as is.
 |---|---|---|---|
 | `genfs.ContentOf` (`read.go:152`) | every non-hole identity is in a listed pack, else abort | **would abort every seal over a grafted subtree.** Fixed in the spike: the graft table is consulted first, and `Content.External` is set. | 🔴 → fixed |
 | `--prefetch all` (`genfs/prefetch.go`) | everything referenced is in a pack; failures are fatal | **refused to mount**, reporting grafted chunks as `present in no listed pack` — the sentence that means damage. Fixed: grafted blocks are FETCHED into a local cache tier of their own, verified on the way in, and read offline afterwards; the only refusal left is about cache size and carries both numbers. Decision 13. | 🔴 → fixed |
-| `fsck` (`walk.go:263`) | ditto | **reports every grafted file as `missing-chunk`, exit 1.** Needs graft-awareness *and* a severity axis (Decision 4). | 🔴 |
+| `fsck` (`walk.go:263`) | ditto | **reported every grafted file as `missing-chunk`, exit 1.** Fixed: grafted blocks go into the same identity index as packed chunks, so a grafted chunkref resolves like any other and an identity in neither layer is still damage. Plus a graft-aware check with two source depths and a severity per finding (Decision 4). | 🔴 → fixed |
 | Dedup sidecar (`publish/dedup.go`, `rememberReusedChunks`) | an identity in the set means "a listed pack holds these bytes" | **silent data loss** if graft identities enter it: a locally written file's chunk is elided from upload because a third party holds the same block, and no graft record names it. **Not a coincidence** — a graft block is a whole file whenever the file is under the block size, and CDC cuts such a file into one chunk of the same bytes. Fixed in the spike via `Content.External` → `rememberExcept`. | 🟠 → fixed |
 | `memtable.Adopt` (`base.go:67`) | base records can be carried by reference | would leave a written file half-grafted. Fixed: `External` → `adoptByReading` (Decision 3). | 🟠 → fixed |
 | Graft index fetch | `graft.Fetch` read every index WHOLE at mount and hashed it | at 10 TB that is a 123 MB fetch before the first byte is served, and at 100 TB it is not a mount. Fixed: `graft.Reader` reads whole under 4 MiB and header-plus-window above, on `mpi/remote.go`'s pattern. Decision 9. | 🔴 → fixed |
@@ -995,7 +1115,7 @@ with it:
 | source changed AFTER the graft | caught on first read, by every reader | caught only after *this* reader has read *this* block once |
 | can a wrong byte be served | never | yes, on any block this reader has not read before |
 | guarantee for a SHARED volume | one, signed, the same for everyone | none; each reader has a private baseline |
-| `fsck --check-grafts` | cheap: HEAD per object; deep: rehash | **nothing to verify until it has been read**; a deep run can only *establish* pins, and establishing them means reading every byte — the eager walk, done too late to be authoritative |
+| `fsck --grafts=head｜deep` | cheap: HEAD per object; deep: rehash | **nothing to verify until it has been read**; a deep run can only *establish* pins, and establishing them means reading every byte — the eager walk, done too late to be authoritative |
 | ungraft-on-write | verified bytes enter the pack | unverified bytes can enter a signed pack |
 | cost of choosing wrong | hours you did not need to spend | a signed namespace whose contents you never saw |
 
@@ -1029,7 +1149,7 @@ whole-object checksum; that cannot verify a range (Decision 2, and
 replace block digests on the read path — but it can do two things worth
 having:
 
-- make `fsck --check-grafts` cheap and *meaningful* rather than
+- make `fsck --grafts=head` cheap and *meaningful* rather than
   size-and-mtime shaped;
 - make `--refresh` skip objects whose advertised digest is unchanged,
   which is strictly stronger than the size+mtime gate the checkpoint uses
@@ -1689,9 +1809,12 @@ Said plainly:
   pre-existing file compared byte for byte afterwards, a seal over the
   grafted volume, and a cold remount that agrees with all of it. Nothing
   in the read path or the format changed, as predicted.
-- **`fsck` still reports every grafted file as damaged** and exits 1. It
-  needs a severity axis first, which is a contract change and is
-  deliberately NOT touched here — see the boundary note under Decision 4.
+- ~~`fsck` still reports every grafted file as damaged.~~ **Done,
+  Decision 4** — and the spike's section 10 is the transcript: clean at
+  exit 0 on a healthy grafted volume, a truncated source object a warning
+  at exit 0 and an error under `--strict`, a one-byte same-length edit
+  invisible to `--grafts=head` (which says so) and caught by
+  `--grafts=deep`, and a missing index object damage at exit 1.
 - **Grafted reads are not coalesced.** `fillChunks` skips them, so a
   multi-block read is one request per block, plus one index lookup per
   block on a windowed index. The speculation trick in Decision 9 makes
@@ -1727,7 +1850,7 @@ items are done** in this round.
 | # | Work | Why it is here | Effort |
 |---|---|---|---|
 | 1 | ~~**Graft into a populated volume**~~ | **done** — Decision 14; `publish.GraftSpliceSource`, the collision matrix, both nesting refusals, the lease and the re-read, and interruption safety proven against a dying store | — |
-| 2 | **`fsck`: a `Severity` axis, then graft awareness** | `fsck` reports every grafted file as damaged and exits 1. The severity change must land first and is a contract change — see the boundary note in Decision 4 | 2 d + 2 d |
+| 2 | ~~**`fsck`: a `Severity` axis, then graft awareness**~~ | **done** — Decision 4; the severity axis landed first, then grafted blocks joined the identity index, the severity table, `--grafts=none｜head｜deep`, and `graft.Reader.Enumerate`. `pelfs fsck` is clean at exit 0 on a healthy grafted volume | — |
 | 3 | ~~`--prefetch`: FETCH grafted blocks into a local cache tier~~ | **done** — Decision 13; blobs under `packs/`, verified on the way in, offline reads proven, two-pass eviction, budget refusal with both numbers | — |
 | 4 | ~~Ranged-window index lookup~~ | **done** — Decision 9; `graft.Reader`, whole under 4 MiB, windowed above | — |
 | 5 | ~~`pelfs graft --refresh`~~ / ~~**`--remove`**~~ | **done** — refresh costs only what changed (Decision 11); `--remove` fell out of the splice (Decision 14) and is what the nesting refusals now offer | — |
@@ -1741,16 +1864,22 @@ items are done** in this round.
 | 13 | **Re-derive `GraftEntry.Path` at report time, or record the root inode** | renaming a grafted directory makes `--list` lie | 0.5 d |
 | 14 | **`pelfs graft --materialize`** | permanently ungraft a subtree (Decision 13) — distinct from prefetch, which is now built; reuses `adoptByReading` and `publish`, needs the lease and a resumable driver | 3–4 d |
 | 17 | **Report graft blobs as their own line in `pelfs cache`, and surface `PinnedEvicted`** | a prefetched graft that got evicted is invisible to the user today | 0.5 d |
-| 15 | **Use the source's advertised object digest** in `fsck --check-grafts` and to gate `--refresh` | strictly stronger than the size+mtime gate, and it is the thing to build instead of TOFU (Decision 12) | 1–2 d |
+| 15 | **Record a per-object digest at graft time**, then use it in `fsck --grafts=head` and to gate `--refresh` | still the thing to build instead of TOFU (Decision 12), but it is a FORMAT change and not a call site: an ETag is either a restatement of size+mtime or opaque (`pelicanobj.VerifyPut` says so), and the index records nothing to compare one against. Decision 4 has the finding | 2–3 d |
 | 16 | **Arena sizing for graft-heavy mounts** | the arena is tuned against decode cost, and a graft trades in round trips | investigation |
 | 18 | **Preserve grafted inode numbers across a `--refresh`** | a refresh renumbers the whole grafted subtree, so every catalog under it rebuilds even where nothing changed, and the allocator advances by the size of the graft each time. Needs a walk of the old subtree for its path→inode map (Decision 14) | 1–2 d |
 | 19 | **`overlay.Open` should retire a mismatched overlay that has nothing unsealed** | an out-of-band publish — graft, repack, merge, a second writer — strands a clean leftover overlay and `mount --rw` refuses it. `pelfs graft` warns now; the fix belongs to the write path (Decision 14) | 1 d |
 
-Item 1 is done, so the feature is usable on a volume that already has
-content in it. **Item 2 is now the only thing between it and a volume
-`fsck` can be run on** — `fsck` reports every grafted file as
-`missing-chunk` and exits 1, which the graft spike's own last section
-prints and then explains rather than failing on.
+Items 1 and 2 are done, so the feature is usable on a volume that already
+has content in it AND the volume can be checked: `pelfs fsck` is clean at
+exit 0 on a healthy grafted volume, a moved source is a warning that
+exits 0 (and 1 under `--strict`), and a lost index object is damage that
+exits 1. Section 10 of the graft spike asserts all three end to end.
+
+What is left on this list is no longer load-bearing for using the
+feature. The largest remaining red is **`merge`** (item 8), which fails
+loudly rather than silently; the cheapest real win is **`grafts/` in the
+retention key space** (item 6), which `fsck` has just made more visible
+by reporting a graft nothing references.
 
 ---
 

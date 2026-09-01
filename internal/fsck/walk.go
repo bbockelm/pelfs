@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"math"
 	"path"
 
@@ -241,15 +242,26 @@ func (c *checker) checkFile(ctx context.Context, cat catalog.Reader, j catJob, n
 			c.problem(KindChunkRefs, filePath, "extent %d identity is %d bytes, want 32", i, len(r.Identity))
 			continue
 		}
-		c.checkChunkRef(r, filePath)
+		c.checkChunkRef(ctx, r, filePath)
 	}
 }
 
 // checkChunkRef resolves one chunkref against the identity index. This is
-// the DEFAULT-mode check and it is presence-only: it proves the pack list
-// still contains an entry with that identity and the recorded stored
-// length, not that the bytes are the right bytes. Only Deep reads them.
-func (c *checker) checkChunkRef(r *catalog.ChunkRef, filePath string) {
+// the DEFAULT-mode check and it is presence-only: it proves the location
+// layers still contain an entry with that identity and the recorded
+// stored length, not that the bytes are the right bytes. Only Deep reads
+// them.
+//
+// THE INDEX HOLDS BOTH LAYERS, so a grafted chunkref resolves here like
+// any other. It used to fall through to missing-chunk — "resolves in no
+// listed pack" — for EVERY file under a graft, which is true and
+// misleading in the same sentence: a grafted chunk is in no pack BY
+// DESIGN, because its location is a foreign object rather than a hole.
+// genfs.ContentOf and genfs.Prefetch had the same absence check and were
+// taught the same thing; this was the third and last one.
+//
+// An identity in neither layer is still missing-chunk and still damage.
+func (c *checker) checkChunkRef(ctx context.Context, r *catalog.ChunkRef, filePath string) {
 	idHex := hex.EncodeToString(r.Identity)
 	var id [32]byte
 	copy(id[:], r.Identity)
@@ -260,10 +272,14 @@ func (c *checker) checkChunkRef(r *catalog.ChunkRef, filePath string) {
 	if !ok {
 		// Report per file: the same lost chunk in ten files is ten damaged
 		// files, which is what a human needs to see.
-		c.problem(KindMissingChunk, filePath, "chunk %s resolves in no listed pack", idHex)
+		c.problem(KindMissingChunk, filePath,
+			"chunk %s resolves in no listed pack%s", idHex, c.orInAnyGraft())
 		return
 	}
-	if loc.length != r.CLen {
+	if loc.graft >= 0 {
+		c.noteGraftRef(loc, filePath)
+		c.checkGraftChunkRef(r, loc, idHex, filePath)
+	} else if loc.length != r.CLen {
 		c.problem(KindChunkRefs, filePath, "chunk %s is %d stored bytes in pack %s, the chunkref says clen %d",
 			idHex, loc.length, loc.pack, r.CLen)
 	}
@@ -271,11 +287,30 @@ func (c *checker) checkChunkRef(r *catalog.ChunkRef, filePath string) {
 		return
 	}
 	c.rep.Chunks++
-	if c.o.Deep {
-		c.verify <- chunkJob{
+	if loc.graft >= 0 {
+		c.rep.GraftChunks++
+	}
+	// Deep mode is per LAYER: --deep reads packed chunks, --grafts=deep
+	// reads external ones, and a caller may ask for either without the
+	// other — re-reading a 10 TB graft is a different decision from
+	// re-reading the packs this volume wrote.
+	if (loc.graft < 0 && c.o.Deep) || (loc.graft >= 0 && c.graftDepth() == GraftDeep) {
+		select {
+		case c.verify <- chunkJob{
 			id: id, idHex: idHex, alg: r.Alg, keyID: r.KeyID, llen: r.LLen, clen: r.CLen, path: filePath,
+		}:
+		case <-ctx.Done():
 		}
 	}
+}
+
+// orInAnyGraft is the half-sentence that keeps missing-chunk honest on a
+// grafted volume: on one, "in no listed pack" is not the whole claim.
+func (c *checker) orInAnyGraft() string {
+	if len(c.grafts) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" and in none of the %d graft(s) this generation names", len(c.grafts))
 }
 
 // seenChunk reports (and records) whether a chunk identity has already
@@ -315,6 +350,12 @@ func (c *checker) shardFor(ino uint64) *superblock.ShardEntry {
 // THE WALK FINDS THEM rather than collected into a work list and run
 // afterwards.
 //
+// One pool serves both location layers. A grafted block's verification is
+// the same shape as a packed chunk's — fetch a range, hash it, compare
+// against the identity a signed catalog names — and it wants the same
+// bounded concurrency for the same reason, so it would take an argument
+// to give it a second pool rather than to share this one.
+//
 // The work list was the last structure here that grew with object count:
 // one entry per distinct chunk, each carrying a path, which at a hundred
 // million chunks is gigabytes held for the length of the walk. Streaming
@@ -322,7 +363,7 @@ func (c *checker) shardFor(ino uint64) *superblock.ShardEntry {
 // worker is busy, which is exactly the backpressure a work list was
 // hiding — and it starts fetching during the walk instead of after it.
 func (c *checker) startVerifiers(ctx context.Context) {
-	if !c.o.Deep {
+	if !c.o.Deep && !(c.graftDepth() == GraftDeep && len(c.grafts) > 0) {
 		return
 	}
 	workers := c.o.Workers
@@ -363,6 +404,10 @@ func (c *checker) stopVerifiers() {
 func (c *checker) verifyChunk(ctx context.Context, j chunkJob) {
 	// Present: checkChunkRef only queues chunks that resolved.
 	loc, _, _ := c.locate(j.id, j.clen)
+	if loc.graft >= 0 {
+		c.verifyGraftChunk(ctx, j, loc)
+		return
+	}
 	stored, err := c.readPackRange(ctx, loc)
 	if err != nil {
 		c.problem(KindChunk, j.path, "chunk %s: %v", j.idHex, err)

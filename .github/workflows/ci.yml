@@ -304,6 +304,19 @@ jobs:
     # launcher cross-compiles on the host and runs the binary in a
     # sealed, network-less, read-only container — never on the runner
     # filesystem directly. Measured 122s + 34s.
+    #
+    # The budget is an EXEC COUNT, not a duration, and 120000x is not a
+    # cut: this runner does 103k-118k execs in the 120s this used to ask
+    # for (860-990/sec across the last four runs), so the count is the
+    # same work with the machine-dependence taken out — and it sidesteps
+    # golang/go#72104, where the engine reports its own fuzztime
+    # expiry as the failure "context deadline exceeded". KL-23 has the
+    # trace. Wall clock lands in the same 2-2.5m; a runner would have to
+    # be 6x slower than this one to reach the launcher's -test.timeout.
+    #
+    # timeout-minutes stays 20: it is the outermost guard now, behind the
+    # 15m -test.timeout that turns a hung fuzz target into goroutine
+    # stacks instead of a job kill.
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -312,7 +325,7 @@ jobs:
         with:
           go-version: "1.26.0"
       - name: Op-sequence fuzzing (contained)
-        run: ./scripts/opfuzz-docker.sh 120s FuzzOps
+        run: ./scripts/opfuzz-docker.sh 120000x FuzzOps
       - name: Concurrent op stress under -race (contained)
         run: ./scripts/opfuzz-docker.sh 0 ConcurrentOpsStress
 
